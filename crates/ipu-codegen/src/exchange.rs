@@ -385,9 +385,9 @@ fn lower_static_exchanges(
             let schedule_problem = schedule_problem(phase.id.index(), &pending);
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
-                for &TransferEndpoint(tile, address) in &transfer.destinations {
+                for &TransferEndpoint(tile, address) in &transfer.physical.destinations {
                     *destination_multiplicity
-                        .entry((tile, address, transfer.words))
+                        .entry((tile, address, transfer.physical.words))
                         .or_insert(0usize) += 1;
                 }
             }
@@ -414,13 +414,13 @@ fn lower_static_exchanges(
             if options.diagnostics {
                 let repeat_iterations = pending
                     .iter()
-                    .map(|transfer| transfer.source_addresses.len())
+                    .map(|transfer| transfer.physical.source_addresses.len())
                     .max()
                     .unwrap_or(1);
                 if repeat_iterations > 1 {
                     let mut unsafe_pending = pending.clone();
                     for transfer in &mut unsafe_pending {
-                        transfer.source_addresses.truncate(1);
+                        transfer.physical.source_addresses.truncate(1);
                         transfer.refresh_source_elements();
                     }
                     let unsafe_schedule = optimize_pending_schedule(
@@ -477,10 +477,10 @@ fn lower_static_exchanges(
                     let transfer = &pending[index];
                     let timing = timings[index].ok_or(ExchangeLoweringError::Overflow)?;
                     diagnostics.record(
-                        transfer.source,
-                        transfer.source_address(),
-                        &transfer.destinations,
-                        transfer.words,
+                        transfer.physical.source,
+                        transfer.physical.source_address(),
+                        &transfer.physical.destinations,
+                        transfer.physical.words,
                         timing.start,
                         timing.end,
                         timing.blocking_tile,
@@ -938,32 +938,19 @@ struct PendingTransfer {
     reserved_source: Option<u16>,
 }
 
-impl std::ops::Deref for PendingTransfer {
-    type Target = PhysicalTransfer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.physical
-    }
-}
-
-impl std::ops::DerefMut for PendingTransfer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.physical
-    }
-}
-
 impl PendingTransfer {
     fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
-        std::iter::once(self.source)
+        std::iter::once(self.physical.source)
             .chain(self.reserved_source)
-            .chain(self.destinations.iter().map(|entry| entry.0))
+            .chain(self.physical.destinations.iter().map(|entry| entry.0))
     }
 
     fn refresh_source_elements(&mut self) {
         self.source_elements = self
+            .physical
             .source_addresses
             .iter()
-            .flat_map(|&address| effective_memory_elements(address, self.words))
+            .flat_map(|&address| effective_memory_elements(address, self.physical.words))
             .collect();
         self.source_elements.sort_unstable();
         self.source_elements.dedup();
@@ -989,10 +976,10 @@ fn attach_repeat_source_addresses(
                         .ok_or(ExchangeLoweringError::Overflow)
                 })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-            if addresses.first().copied() != Some(transfer.source_address()) {
+            if addresses.first().copied() != Some(transfer.physical.source_address()) {
                 return Err(ExchangeLoweringError::IncompatibleRepeatRows);
             }
-            transfer.source_addresses = addresses;
+            transfer.physical.source_addresses = addresses;
         }
         transfer.refresh_source_elements();
     }
@@ -1006,10 +993,11 @@ fn paired_transfer_alternatives(
 ) -> Result<Vec<Option<PendingTransfer>>, ExchangeLoweringError> {
     let mut alternatives = Vec::with_capacity(pending.len());
     for transfer in pending {
-        if transfer.width != TransferWidth::Word32
-            || transfer.words < 128
-            || transfer.words & 1 != 0
+        if transfer.physical.width != TransferWidth::Word32
+            || transfer.physical.words < 128
+            || transfer.physical.words & 1 != 0
             || transfer
+                .physical
                 .source_addresses
                 .iter()
                 .any(|address| address & 0b111 != 0)
@@ -1017,20 +1005,20 @@ fn paired_transfer_alternatives(
             alternatives.push(None);
             continue;
         }
-        let source_pair = topology.paired_logical(transfer.source)?;
+        let source_pair = topology.paired_logical(transfer.physical.source)?;
         if source_pair >= tile_count {
             alternatives.push(None);
             continue;
         }
 
         let mut by_pair = BTreeMap::<u16, Vec<TransferEndpoint>>::new();
-        for &TransferEndpoint(tile, address) in &transfer.destinations {
+        for &TransferEndpoint(tile, address) in &transfer.physical.destinations {
             by_pair
                 .entry(topology.physical(tile)? & !2)
                 .or_default()
                 .push(TransferEndpoint(tile, address));
         }
-        let mut paired_destinations = Vec::with_capacity(transfer.destinations.len());
+        let mut paired_destinations = Vec::with_capacity(transfer.physical.destinations.len());
         let all_destinations_pairable = by_pair.into_values().all(|destinations| {
             let complete_pair = destinations.len() == 2
                 && topology
@@ -1056,15 +1044,19 @@ fn paired_transfer_alternatives(
             .map(|&TransferEndpoint(tile, _)| tile)
             .collect::<Vec<_>>();
         if topology
-            .paired_multicast(transfer.source, &paired_tiles, transfer.words / 2)
+            .paired_multicast(
+                transfer.physical.source,
+                &paired_tiles,
+                transfer.physical.words / 2,
+            )
             .is_err()
         {
             alternatives.push(None);
             continue;
         }
         let mut paired = transfer.clone();
-        paired.destinations = paired_destinations;
-        paired.width = TransferWidth::Paired64;
+        paired.physical.destinations = paired_destinations;
+        paired.physical.width = TransferWidth::Paired64;
         paired.reserved_source = Some(source_pair);
         alternatives.push(Some(paired));
     }
@@ -1199,7 +1191,7 @@ fn receive_configuration(
 ) -> Result<(Vec<usize>, Vec<u32>), ExchangeLoweringError> {
     let mut receive_counts = vec![0usize; usize::from(tile_count)];
     for transfer in pending {
-        for &TransferEndpoint(tile, _) in &transfer.destinations {
+        for &TransferEndpoint(tile, _) in &transfer.physical.destinations {
             let count = receive_counts
                 .get_mut(usize::from(tile))
                 .ok_or(ExchangeLoweringError::InvalidDestination)?;
@@ -1208,7 +1200,7 @@ fn receive_configuration(
     }
     let mut incoming_bases = vec![None::<u32>; usize::from(tile_count)];
     for transfer in pending {
-        if let [TransferEndpoint(tile, address)] = transfer.destinations.as_slice() {
+        if let [TransferEndpoint(tile, address)] = transfer.physical.destinations.as_slice() {
             if receive_counts[usize::from(*tile)] == 1 {
                 incoming_bases[usize::from(*tile)] = Some(*address);
             }
@@ -1925,29 +1917,31 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
             merged.push(transfer);
             continue;
         };
-        let previous_bytes = previous.words * 4;
-        let combined_words = previous.words.checked_add(transfer.words);
-        let contiguous = previous.source == transfer.source
-            && previous.width == transfer.width
+        let previous_bytes = previous.physical.words * 4;
+        let combined_words = previous.physical.words.checked_add(transfer.physical.words);
+        let contiguous = previous.physical.source == transfer.physical.source
+            && previous.physical.width == transfer.physical.width
             && previous.source_shard == transfer.source_shard
             && previous
                 .source_offset
                 .checked_add(previous_bytes)
                 .is_some_and(|end| end == transfer.source_offset)
-            && previous.destinations.len() == transfer.destinations.len()
-            && previous.source_addresses.len() == transfer.source_addresses.len()
+            && previous.physical.destinations.len() == transfer.physical.destinations.len()
+            && previous.physical.source_addresses.len() == transfer.physical.source_addresses.len()
             && previous
+                .physical
                 .source_addresses
                 .iter()
-                .zip(&transfer.source_addresses)
+                .zip(&transfer.physical.source_addresses)
                 .all(|(&left, &right)| {
                     left.checked_add(previous_bytes)
                         .is_some_and(|end| end == right)
                 })
             && previous
+                .physical
                 .destinations
                 .iter()
-                .zip(&transfer.destinations)
+                .zip(&transfer.physical.destinations)
                 .all(
                     |(
                         &TransferEndpoint(left_tile, left_address),
@@ -1960,7 +1954,7 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
                     },
                 );
         if contiguous && combined_words.is_some_and(|words| words <= MAX_TRANSFER_WORDS) {
-            previous.words = combined_words.expect("checked above");
+            previous.physical.words = combined_words.expect("checked above");
         } else {
             merged.push(transfer);
         }
@@ -1996,7 +1990,12 @@ impl<'a> TransferScheduler<'a> {
     fn new(transfers: &'a [PendingTransfer], tile_count: u16) -> Self {
         let mut word_pressure = vec![0u64; usize::from(tile_count)];
         for transfer in transfers {
-            let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
+            let items = u64::from(
+                transfer
+                    .physical
+                    .item_count()
+                    .unwrap_or(transfer.physical.words),
+            );
             for tile in transfer.tiles() {
                 word_pressure[usize::from(tile)] += items;
             }
@@ -2016,7 +2015,7 @@ impl<'a> TransferScheduler<'a> {
             // pressure is a better matching tie-break for point-to-point work.
             dynamic_word_pressure: transfers
                 .iter()
-                .any(|transfer| transfer.destinations.len() > 1),
+                .any(|transfer| transfer.physical.destinations.len() > 1),
             dependents,
             indegrees,
             dependency_ready: vec![0; transfers.len()],
@@ -2042,9 +2041,12 @@ impl<'a> TransferScheduler<'a> {
         self.ready.push(ReadyTransfer {
             earliest_start: Reverse(earliest_start),
             endpoint_pressure,
-            fanout: transfer.destinations.len(),
-            words: transfer.item_count().unwrap_or(transfer.words),
-            source: Reverse(transfer.source),
+            fanout: transfer.physical.destinations.len(),
+            words: transfer
+                .physical
+                .item_count()
+                .unwrap_or(transfer.physical.words),
+            source: Reverse(transfer.physical.source),
             index: Reverse(index),
         });
     }
@@ -2054,24 +2056,20 @@ impl<'a> TransferScheduler<'a> {
             let candidate = self.ready.pop()?;
             let index = candidate.index.0;
             let transfer = &self.transfers[index];
-            let earliest_start = std::iter::once(self.dependency_ready[index])
-                .chain(std::iter::once(
-                    tile_availability[usize::from(transfer.source)].send,
-                ))
-                .chain(transfer.reserved_source.into_iter().map(|tile| {
-                    let availability = tile_availability[usize::from(tile)];
-                    availability.send.max(availability.receive)
-                }))
-                .chain(
-                    transfer
-                        .destinations
-                        .iter()
-                        .map(|&TransferEndpoint(tile, _)| {
-                            tile_availability[usize::from(tile)].receive
-                        }),
-                )
-                .max()
-                .unwrap_or(0);
+            let earliest_start =
+                std::iter::once(self.dependency_ready[index])
+                    .chain(std::iter::once(
+                        tile_availability[usize::from(transfer.physical.source)].send,
+                    ))
+                    .chain(transfer.reserved_source.into_iter().map(|tile| {
+                        let availability = tile_availability[usize::from(tile)];
+                        availability.send.max(availability.receive)
+                    }))
+                    .chain(transfer.physical.destinations.iter().map(
+                        |&TransferEndpoint(tile, _)| tile_availability[usize::from(tile)].receive,
+                    ))
+                    .max()
+                    .unwrap_or(0);
             if candidate.earliest_start.0 == earliest_start {
                 return Some((index, earliest_start));
             }
@@ -2083,7 +2081,12 @@ impl<'a> TransferScheduler<'a> {
         self.completed += 1;
         let transfer = &self.transfers[index];
         if self.dynamic_word_pressure {
-            let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
+            let items = u64::from(
+                transfer
+                    .physical
+                    .item_count()
+                    .unwrap_or(transfer.physical.words),
+            );
             for tile in transfer.tiles() {
                 self.word_pressure[usize::from(tile)] =
                     self.word_pressure[usize::from(tile)].saturating_sub(items);
@@ -2123,16 +2126,16 @@ struct AccessFrontier {
 fn memory_dependencies(transfers: &[PendingTransfer], tile_count: u16) -> BTreeSet<(usize, usize)> {
     let mut accesses = vec![Vec::new(); usize::from(tile_count)];
     for (index, transfer) in transfers.iter().enumerate() {
-        let bytes = u64::from(transfer.words) * 4;
-        for &address in &transfer.source_addresses {
-            accesses[usize::from(transfer.source)].push(TransferAccess {
+        let bytes = u64::from(transfer.physical.words) * 4;
+        for &address in &transfer.physical.source_addresses {
+            accesses[usize::from(transfer.physical.source)].push(TransferAccess {
                 transfer: index,
                 start: u64::from(address),
                 end: u64::from(address) + bytes,
                 write: false,
             });
         }
-        for &TransferEndpoint(tile, address) in &transfer.destinations {
+        for &TransferEndpoint(tile, address) in &transfer.physical.destinations {
             accesses[usize::from(tile)].push(TransferAccess {
                 transfer: index,
                 start: u64::from(address),
@@ -2186,14 +2189,6 @@ struct ScheduledTransfer<'a> {
     source_address: u32,
     source_elements: &'a [ExchangeMemoryElement],
     schedule_offset: u32,
-}
-
-impl std::ops::Deref for ScheduledTransfer<'_> {
-    type Target = PhysicalTransfer;
-
-    fn deref(&self) -> &Self::Target {
-        self.physical
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2268,16 +2263,17 @@ impl MaterializedSchedule {
         last_transfer: &mut [TilePredecessor],
     ) -> Result<u32, ExchangeLoweringError> {
         let transfer = &pending[index];
+        let physical = &transfer.physical;
         let (blocking_tile, latest_availability) = std::iter::once((
-            transfer.source,
-            self.tile_availability[usize::from(transfer.source)].send,
+            physical.source,
+            self.tile_availability[usize::from(physical.source)].send,
         ))
         .chain(transfer.reserved_source.into_iter().map(|tile| {
             let availability = self.tile_availability[usize::from(tile)];
             (tile, availability.send.max(availability.receive))
         }))
         .chain(
-            transfer
+            physical
                 .destinations
                 .iter()
                 .map(|&TransferEndpoint(tile, _)| {
@@ -2285,13 +2281,13 @@ impl MaterializedSchedule {
                 }),
         )
         .max_by_key(|&(tile, availability)| (availability, Reverse(tile)))
-        .unwrap_or((transfer.source, 0));
+        .unwrap_or((physical.source, 0));
         let (blocking_tile, latest_availability) = if dependency_ready > latest_availability {
-            (transfer.source, dependency_ready)
+            (physical.source, dependency_ready)
         } else {
             (blocking_tile, latest_availability)
         };
-        let predecessor = if blocking_tile == transfer.source {
+        let predecessor = if blocking_tile == physical.source {
             last_transfer[usize::from(blocking_tile)].send
         } else if transfer.reserved_source == Some(blocking_tile) {
             let predecessor = last_transfer[usize::from(blocking_tile)];
@@ -2311,8 +2307,8 @@ impl MaterializedSchedule {
             incoming_bases,
             receive_counts,
             ScheduledTransfer {
-                physical: &transfer.physical,
-                source_address: transfer.source_address(),
+                physical,
+                source_address: physical.source_address(),
                 source_elements: &transfer.source_elements,
                 schedule_offset: latest_availability,
             },
@@ -2320,14 +2316,14 @@ impl MaterializedSchedule {
             validate_encoding,
         )?;
         let payload_end = timing.payload_end;
-        self.memory_accesses[usize::from(transfer.source)]
+        self.memory_accesses[usize::from(physical.source)]
             .sends
             .push(MemoryAccess {
                 start: timing.payload_start,
                 end: timing.sender_horizon,
                 elements: transfer.source_elements.clone(),
             });
-        for ((&TransferEndpoint(tile, address), &start), &memory_end) in transfer
+        for ((&TransferEndpoint(tile, address), &start), &memory_end) in physical
             .destinations
             .iter()
             .zip(&timing.receiver_payload_starts)
@@ -2338,19 +2334,19 @@ impl MaterializedSchedule {
                 .push(MemoryAccess {
                     start,
                     end: memory_end,
-                    elements: effective_memory_elements(address, transfer.words),
+                    elements: effective_memory_elements(address, physical.words),
                 });
         }
-        self.scheduled_sends[usize::from(transfer.source)]
+        self.scheduled_sends[usize::from(physical.source)]
             .push((transfer.source_shard, transfer.source_offset));
-        self.activities[usize::from(transfer.source)].push(ExchangeActivity {
+        self.activities[usize::from(physical.source)].push(ExchangeActivity {
             transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
             kind: ExchangeActivityKind::Send,
             start_cycle: timing.payload_start,
             end_cycle: payload_end,
             memory_end_cycle: timing.sender_horizon,
-            address: transfer.source_address(),
-            words: transfer.words,
+            address: physical.source_address(),
+            words: physical.words,
         });
         if let Some(tile) = transfer.reserved_source {
             self.activities[usize::from(tile)].push(ExchangeActivity {
@@ -2359,12 +2355,12 @@ impl MaterializedSchedule {
                 start_cycle: timing.payload_start,
                 end_cycle: timing.sender_horizon,
                 memory_end_cycle: timing.sender_horizon,
-                address: transfer.source_address(),
-                words: transfer.words,
+                address: physical.source_address(),
+                words: physical.words,
             });
         }
         for (((&TransferEndpoint(tile, address), &start_cycle), &end_cycle), &memory_end_cycle) in
-            transfer
+            physical
                 .destinations
                 .iter()
                 .zip(&timing.receiver_payload_starts)
@@ -2378,25 +2374,25 @@ impl MaterializedSchedule {
                 end_cycle,
                 memory_end_cycle,
                 address,
-                words: transfer.words,
+                words: physical.words,
             });
         }
-        self.tile_availability[usize::from(transfer.source)].send = timing.payload_end;
+        self.tile_availability[usize::from(physical.source)].send = timing.payload_end;
         if let Some(tile) = transfer.reserved_source {
             self.tile_availability[usize::from(tile)].send = timing.sender_horizon;
             self.tile_availability[usize::from(tile)].receive = timing.sender_horizon;
             last_transfer[usize::from(tile)].send = Some(index);
             last_transfer[usize::from(tile)].receive = Some(index);
         }
-        for (&TransferEndpoint(tile, _), &receiver_end) in transfer
+        for (&TransferEndpoint(tile, _), &receiver_end) in physical
             .destinations
             .iter()
             .zip(&timing.receiver_payload_ends)
         {
             self.tile_availability[usize::from(tile)].receive = receiver_end;
         }
-        last_transfer[usize::from(transfer.source)].send = Some(index);
-        for &TransferEndpoint(tile, _) in &transfer.destinations {
+        last_transfer[usize::from(physical.source)].send = Some(index);
+        for &TransferEndpoint(tile, _) in &physical.destinations {
             last_transfer[usize::from(tile)].receive = Some(index);
         }
         self.order.push(index);
@@ -2537,13 +2533,18 @@ fn endpoint_work_lower_bound(pending: &[PendingTransfer], tile_count: u16) -> u3
     let mut send_words = vec![0u64; usize::from(tile_count)];
     let mut receive_words = vec![0u64; usize::from(tile_count)];
     for transfer in pending {
-        let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
-        send_words[usize::from(transfer.source)] += items;
+        let items = u64::from(
+            transfer
+                .physical
+                .item_count()
+                .unwrap_or(transfer.physical.words),
+        );
+        send_words[usize::from(transfer.physical.source)] += items;
         if let Some(tile) = transfer.reserved_source {
             send_words[usize::from(tile)] += items;
             receive_words[usize::from(tile)] += items;
         }
-        for &TransferEndpoint(tile, _) in &transfer.destinations {
+        for &TransferEndpoint(tile, _) in &transfer.physical.destinations {
             receive_words[usize::from(tile)] += items;
         }
     }
@@ -2567,7 +2568,7 @@ fn point_to_point_matching_wave_order(
     if pending.len() < 2
         || pending
             .iter()
-            .any(|transfer| transfer.destinations.len() != 1)
+            .any(|transfer| transfer.physical.destinations.len() != 1)
     {
         return None;
     }
@@ -2576,8 +2577,8 @@ fn point_to_point_matching_wave_order(
     let mut source_roles = vec![0usize; tile_count];
     let mut destination_roles = vec![0usize; tile_count];
     for transfer in pending {
-        source_roles[usize::from(transfer.source)] += 1;
-        destination_roles[usize::from(transfer.destinations[0].0)] += 1;
+        source_roles[usize::from(transfer.physical.source)] += 1;
+        destination_roles[usize::from(transfer.physical.destinations[0].0)] += 1;
     }
     let active_sources = source_roles.iter().filter(|&&roles| roles != 0).count();
     let active_destinations = destination_roles
@@ -2613,9 +2614,9 @@ fn point_to_point_matching_wave_order(
     let mut remaining_send_words = vec![0u64; tile_count];
     let mut remaining_receive_words = vec![0u64; tile_count];
     for transfer in pending {
-        let words = u64::from(transfer.item_count().ok()?);
-        remaining_send_words[usize::from(transfer.source)] += words;
-        remaining_receive_words[usize::from(transfer.destinations[0].0)] += words;
+        let words = u64::from(transfer.physical.item_count().ok()?);
+        remaining_send_words[usize::from(transfer.physical.source)] += words;
+        remaining_receive_words[usize::from(transfer.physical.destinations[0].0)] += words;
     }
 
     let mut scheduled = vec![false; pending.len()];
@@ -2624,17 +2625,22 @@ fn point_to_point_matching_wave_order(
         let mut adjacency = vec![Vec::new(); tile_count];
         for index in 0..pending.len() {
             if !scheduled[index] && indegrees[index] == 0 {
-                adjacency[usize::from(pending[index].source)].push(index);
+                adjacency[usize::from(pending[index].physical.source)].push(index);
             }
         }
         for edges in &mut adjacency {
             edges.sort_unstable_by_key(|&index| {
                 let transfer = &pending[index];
-                let destination = usize::from(transfer.destinations[0].0);
+                let destination = usize::from(transfer.physical.destinations[0].0);
                 (
                     incumbent_rank[index],
                     Reverse(remaining_receive_words[destination]),
-                    Reverse(transfer.item_count().unwrap_or(transfer.words)),
+                    Reverse(
+                        transfer
+                            .physical
+                            .item_count()
+                            .unwrap_or(transfer.physical.words),
+                    ),
                     index,
                 )
             });
@@ -2661,20 +2667,25 @@ fn point_to_point_matching_wave_order(
             let transfer = &pending[index];
             (
                 incumbent_rank[index],
-                Reverse(transfer.item_count().unwrap_or(transfer.words)),
-                transfer.source,
-                transfer.destinations[0].0,
+                Reverse(
+                    transfer
+                        .physical
+                        .item_count()
+                        .unwrap_or(transfer.physical.words),
+                ),
+                transfer.physical.source,
+                transfer.physical.destinations[0].0,
                 index,
             )
         });
         for index in wave {
             let transfer = &pending[index];
-            let words = u64::from(transfer.item_count().ok()?);
+            let words = u64::from(transfer.physical.item_count().ok()?);
             scheduled[index] = true;
             order.push(index);
-            let source = usize::from(transfer.source);
+            let source = usize::from(transfer.physical.source);
             remaining_send_words[source] = remaining_send_words[source].saturating_sub(words);
-            let destination = usize::from(transfer.destinations[0].0);
+            let destination = usize::from(transfer.physical.destinations[0].0);
             remaining_receive_words[destination] =
                 remaining_receive_words[destination].saturating_sub(words);
             for dependent in std::mem::take(&mut dependents[index]) {
@@ -2707,7 +2718,7 @@ fn maximum_ready_matching(
         let mut reaches_free_destination = false;
         while let Some(source) = queue.pop_front() {
             for &index in &adjacency[source] {
-                let destination = usize::from(pending[index].destinations[0].0);
+                let destination = usize::from(pending[index].physical.destinations[0].0);
                 if let Some(next_source) = destination_sources[destination] {
                     if distances[next_source] == usize::MAX {
                         distances[next_source] = distances[source] + 1;
@@ -2752,7 +2763,7 @@ fn augment_ready_matching(
     distances: &mut [usize],
 ) -> bool {
     for &index in &adjacency[source] {
-        let destination = usize::from(pending[index].destinations[0].0);
+        let destination = usize::from(pending[index].physical.destinations[0].0);
         let paired_source = destination_sources[destination];
         if paired_source.is_none_or(|paired_source| {
             distances[paired_source] == distances[source] + 1
@@ -2796,7 +2807,7 @@ fn repair_ready(
     neighborhood: &[bool],
 ) -> RepairReady {
     let transfer = &pending[index];
-    let earliest_start = std::iter::once(availability[usize::from(transfer.source)].send)
+    let earliest_start = std::iter::once(availability[usize::from(transfer.physical.source)].send)
         .chain(transfer.reserved_source.into_iter().map(|tile| {
             availability[usize::from(tile)]
                 .send
@@ -2804,6 +2815,7 @@ fn repair_ready(
         }))
         .chain(
             transfer
+                .physical
                 .destinations
                 .iter()
                 .map(|&TransferEndpoint(tile, _)| availability[usize::from(tile)].receive),
@@ -2811,6 +2823,7 @@ fn repair_ready(
         .max()
         .unwrap_or(0);
     let contiguous_receivers = transfer
+        .physical
         .destinations
         .iter()
         .filter(|TransferEndpoint(tile, address)| {
@@ -2895,7 +2908,12 @@ fn critical_neighborhood_order(
     let epoch_width = pending.len().isqrt().max(1);
     let mut word_pressure = vec![0u64; usize::from(tile_count)];
     for transfer in pending {
-        let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
+        let items = u64::from(
+            transfer
+                .physical
+                .item_count()
+                .unwrap_or(transfer.physical.words),
+        );
         for tile in transfer.tiles() {
             word_pressure[usize::from(tile)] += items;
         }
@@ -2936,21 +2954,24 @@ fn critical_neighborhood_order(
         }
         let transfer = &pending[index];
         let start = candidate.earliest_start.0;
-        let items = transfer.item_count().unwrap_or(transfer.words);
+        let items = transfer
+            .physical
+            .item_count()
+            .unwrap_or(transfer.physical.words);
         let end = match start.checked_add(items) {
             Some(end) => end,
             None => return incumbent.order.clone(),
         };
-        availability[usize::from(transfer.source)].send = end;
+        availability[usize::from(transfer.physical.source)].send = end;
         if let Some(tile) = transfer.reserved_source {
             availability[usize::from(tile)].send = end;
             availability[usize::from(tile)].receive = end;
         }
-        let bytes = match transfer.words.checked_mul(4) {
+        let bytes = match transfer.physical.words.checked_mul(4) {
             Some(bytes) => bytes,
             None => return incumbent.order.clone(),
         };
-        for &TransferEndpoint(tile, address) in &transfer.destinations {
+        for &TransferEndpoint(tile, address) in &transfer.physical.destinations {
             availability[usize::from(tile)].receive = end;
             next_receive_address[usize::from(tile)] = address.checked_add(bytes);
         }
@@ -3228,8 +3249,8 @@ mod tests {
             let mut matched_sources = BTreeSet::new();
             let mut matched_destinations = BTreeSet::new();
             for &index in &matching {
-                assert!(matched_sources.insert(pending[index].source));
-                assert!(matched_destinations.insert(pending[index].destinations[0].0));
+                assert!(matched_sources.insert(pending[index].physical.source));
+                assert!(matched_destinations.insert(pending[index].physical.destinations[0].0));
             }
 
             let mut reachable = vec![false; 1usize << tile_count];
@@ -3241,7 +3262,7 @@ mod tests {
                         continue;
                     }
                     for &index in edges {
-                        let destination = usize::from(pending[index].destinations[0].0);
+                        let destination = usize::from(pending[index].physical.destinations[0].0);
                         if mask & (1 << destination) == 0 {
                             next[mask | (1 << destination)] = true;
                         }
@@ -3418,10 +3439,10 @@ mod tests {
             let paired = alternatives[0]
                 .as_ref()
                 .expect("eligible transfer must have a double-width part");
-            assert_eq!(paired.source, source);
+            assert_eq!(paired.physical.source, source);
             assert_eq!(paired.reserved_source, Some(source_pair));
-            assert_eq!(paired.words, words & !1);
-            let mut paired_destinations = paired.destinations.clone();
+            assert_eq!(paired.physical.words, words & !1);
+            let mut paired_destinations = paired.physical.destinations.clone();
             paired_destinations.sort_unstable();
             let mut expected_destinations = destinations
                 .iter()
@@ -3430,13 +3451,16 @@ mod tests {
                 .collect::<Vec<_>>();
             expected_destinations.sort_unstable();
             assert_eq!(paired_destinations, expected_destinations);
-            assert_eq!(paired.source_addresses, original.source_addresses);
+            assert_eq!(
+                paired.physical.source_addresses,
+                original.physical.source_addresses
+            );
 
             let mut inexact = original.clone();
             if random.bool() {
-                inexact.words -= 1;
+                inexact.physical.words -= 1;
             } else {
-                inexact.destinations.pop();
+                inexact.physical.destinations.pop();
             }
             assert!(
                 paired_transfer_alternatives(std::slice::from_ref(&inexact), &topology, tile_count)
@@ -3490,24 +3514,20 @@ mod tests {
             while let Some((index, dependency_ready)) = scheduler.next(&availability) {
                 occurrences[index] += 1;
                 let transfer = &transfers[index];
-                let start = std::iter::once(dependency_ready)
-                    .chain(std::iter::once(
-                        availability[usize::from(transfer.source)].send,
-                    ))
-                    .chain(
-                        transfer
-                            .destinations
-                            .iter()
-                            .map(|&TransferEndpoint(tile, _)| {
-                                availability[usize::from(tile)].receive
-                            }),
-                    )
-                    .max()
-                    .unwrap_or(0);
-                let end = start.saturating_add(transfers[index].words);
+                let start =
+                    std::iter::once(dependency_ready)
+                        .chain(std::iter::once(
+                            availability[usize::from(transfer.physical.source)].send,
+                        ))
+                        .chain(transfer.physical.destinations.iter().map(
+                            |&TransferEndpoint(tile, _)| availability[usize::from(tile)].receive,
+                        ))
+                        .max()
+                        .unwrap_or(0);
+                let end = start.saturating_add(transfers[index].physical.words);
                 intervals[index] = (start, end);
-                availability[usize::from(transfer.source)].send = end;
-                for &TransferEndpoint(tile, _) in &transfer.destinations {
+                availability[usize::from(transfer.physical.source)].send = end;
+                for &TransferEndpoint(tile, _) in &transfer.physical.destinations {
                     availability[usize::from(tile)].receive = end;
                 }
                 scheduler.complete(index, end);
@@ -3521,7 +3541,7 @@ mod tests {
                 let mut send_intervals = transfers
                     .iter()
                     .enumerate()
-                    .filter(|(_, transfer)| transfer.source == tile)
+                    .filter(|(_, transfer)| transfer.physical.source == tile)
                     .map(|(index, _)| intervals[index])
                     .collect::<Vec<_>>();
                 send_intervals.sort_unstable();
@@ -3531,6 +3551,7 @@ mod tests {
                     .enumerate()
                     .filter(|(_, transfer)| {
                         transfer
+                            .physical
                             .destinations
                             .iter()
                             .any(|&TransferEndpoint(destination, _)| destination == tile)
@@ -3559,7 +3580,7 @@ mod tests {
                 incumbent.timings[index] = Some(MaterializedTiming {
                     start: index as u32,
                     end: index as u32 + 1,
-                    blocking_tile: transfer.source,
+                    blocking_tile: transfer.physical.source,
                     predecessor,
                 });
             }
