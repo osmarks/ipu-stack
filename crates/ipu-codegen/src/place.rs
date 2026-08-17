@@ -1,12 +1,12 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
+use crate::layout::MemoryClass;
 use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
 };
 use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{
-    AllocationRequirements, MemoryClass, MemoryElementRequirement, MemoryOperand,
-    OperandRequirement,
+    AllocationRequirements, MemoryElementRequirement, MemoryOperand, OperandRequirement,
 };
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_package::{

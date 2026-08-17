@@ -1,7 +1,8 @@
 //! Conversion from logical shard views to physical byte ranges.
 
+use crate::layout::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder};
 use crate::low::{LowShard, ShardView};
-use crate::mid::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision};
+use crate::mid::Precision;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -763,11 +764,11 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ShardExtent;
     use crate::low::{LowShardId, ShardDefinition};
-    use crate::mid::{
+    use crate::mid::Precision;
+    use crate::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
-        MemoryClass, Precision, TensorTiling, TensorType,
+        MemoryClass, ShardExtent, TensorTiling, TensorType,
     };
 
     fn shard(layout: Layout, dimensions: &[u32]) -> LowShard {

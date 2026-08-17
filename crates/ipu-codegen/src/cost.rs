@@ -9,10 +9,12 @@ use crate::estimate::{
     maximum_shard_bytes, operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
+use crate::layout::{
+    AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
+};
 use crate::mid::{
-    AmpOrder, BlockMajorOrder, ConversionStrategy, DeferredTransform, ElementOrder,
-    GemmDistribution, Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch,
-    OperatorRequirements, Precision, TensorAxis, TensorType, layout_conversion_strategy,
+    ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
+    OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
@@ -482,7 +484,7 @@ fn attention_endpoint_traffic(
             key_rows,
         } => (query_rows, key_rows, None),
         crate::AttentionBlocking::Materialized { query_rows, .. } => {
-            (query_rows, crate::mid::AMP_INNER_BLOCK, Some(3))
+            (query_rows, crate::layout::AMP_INNER_BLOCK, Some(3))
         }
     };
     let padded_query_dimension = plan.padding.query_dimension;
@@ -496,7 +498,7 @@ fn attention_endpoint_traffic(
         .map(u64::from)?;
     let block_rows = u64::from(key_block_rows).max(1);
     let blocks = key_rows.div_ceil(block_rows);
-    let panel_columns = u64::from(crate::mid::AMP_COLUMN_MICRO);
+    let panel_columns = u64::from(crate::layout::AMP_COLUMN_MICRO);
     let panels_per_block = u64::from(padded_query_dimension)
         .div_ceil(panel_columns)
         .saturating_add(u64::from(padded_value_dimension).div_ceil(panel_columns));
@@ -575,8 +577,8 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
         ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
             row_block,
             column_block,
-        }) if u32::from(row_block) == crate::mid::AMP_INNER_BLOCK
-            && u32::from(column_block) == crate::mid::AMP_COLUMN_MICRO =>
+        }) if u32::from(row_block) == crate::layout::AMP_INNER_BLOCK
+            && u32::from(column_block) == crate::layout::AMP_COLUMN_MICRO =>
         {
             return elements
                 .saturating_mul(IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT)
@@ -632,7 +634,7 @@ fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
         return None;
     }
     let physical_elements = maximum_shard_elements(output);
-    let fragments = physical_elements.div_ceil(u64::from(crate::mid::AMP_COLUMN_MICRO));
+    let fragments = physical_elements.div_ceil(u64::from(crate::layout::AMP_COLUMN_MICRO));
     let clear_cycles = (output
         .format
         .layout
@@ -670,7 +672,7 @@ fn split_head_panel_exchange_cycles(
         .iter()
         .find(|axis| axis.axis.resolve(source.shape.0.len()).ok() == Some(source.shape.0.len() - 1))
         .is_some_and(|axis| u32::from(axis.padding_groups) == groups);
-    let panel = crate::mid::AMP_COLUMN_MICRO;
+    let panel = crate::layout::AMP_COLUMN_MICRO;
     let panels_per_group = head_columns.div_ceil(panel);
     let segments = if source_grouped {
         u64::from(groups).saturating_mul(u64::from(panels_per_group))
@@ -722,7 +724,7 @@ fn amp_kernel_cycles(
     if inner_block == 0
         || output_column_block == 0
         || output_columns_per_tile == 0
-        || !inner_block.is_multiple_of(u64::from(crate::mid::AMP_COLUMN_MICRO))
+        || !inner_block.is_multiple_of(u64::from(crate::layout::AMP_COLUMN_MICRO))
         || !output_column_block.is_multiple_of(IPU21_AMP_KERNEL_COSTS.column_group_width)
     {
         return None;
@@ -750,7 +752,7 @@ fn amp_kernel_cycles(
         ),
         Precision::F8F143 { .. } => return None,
     };
-    let inner_micro_groups_per_call = inner_block / u64::from(crate::mid::AMP_COLUMN_MICRO);
+    let inner_micro_groups_per_call = inner_block / u64::from(crate::layout::AMP_COLUMN_MICRO);
     let call_cycles = IPU21_AMP_KERNEL_COSTS.call_cycles.saturating_add(
         inner_micro_groups_per_call.saturating_mul(
             output_column_block
@@ -911,10 +913,10 @@ fn deferred_split_input_cycles(
             } => (u64::from(query_rows), u64::from(key_rows)),
             crate::AttentionBlocking::Materialized { query_rows, .. } => (
                 u64::from(query_rows),
-                u64::from(crate::mid::AMP_INNER_BLOCK),
+                u64::from(crate::layout::AMP_INNER_BLOCK),
             ),
         },
-        _ => (rows, u64::from(crate::mid::AMP_INNER_BLOCK)),
+        _ => (rows, u64::from(crate::layout::AMP_INNER_BLOCK)),
     };
     let block_rows = key_block_rows.max(1);
     let blocks = rows.div_ceil(block_rows);
@@ -928,7 +930,7 @@ fn deferred_split_input_cycles(
         .last()
         .copied()
         .map(u64::from)?;
-    let panel_columns = u64::from(crate::mid::AMP_COLUMN_MICRO);
+    let panel_columns = u64::from(crate::layout::AMP_COLUMN_MICRO);
     let panels_per_block = physical_columns.div_ceil(panel_columns);
     let owners = rows.div_ceil(query_block_rows.max(1)).max(1);
     let panels_per_owner = blocks.saturating_mul(panels_per_block).div_ceil(owners);
@@ -1669,11 +1671,11 @@ mod tests {
             let groups = random.u16(2..=16);
             let head_columns = loop {
                 let columns = random.u32(1..=64) * 2;
-                if !columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO) {
+                if !columns.is_multiple_of(crate::layout::AMP_COLUMN_MICRO) {
                     break columns;
                 }
             };
-            let panels = head_columns.div_ceil(crate::mid::AMP_COLUMN_MICRO);
+            let panels = head_columns.div_ceil(crate::layout::AMP_COLUMN_MICRO);
             let partitions_per_group = random.u16(1..=u16::try_from(panels).unwrap());
             let column_partitions = groups * partitions_per_group;
             let rows = random.u32(1..=128);
@@ -1683,7 +1685,7 @@ mod tests {
             let logical_output_shape =
                 TensorShape::new([batch * u32::from(groups), rows, head_columns]);
             let ordinary_layout = Layout::amp_left_result_grid(
-                crate::mid::AMP_COLUMN_MICRO,
+                crate::layout::AMP_COLUMN_MICRO,
                 column_partitions,
                 1,
                 column_partitions,

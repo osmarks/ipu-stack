@@ -1,11 +1,13 @@
 //! Memory, communication, and capacity estimates shared by planning policies.
 
 use crate::graph::TensorShape;
+use crate::layout::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
+};
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AllocationRequirements, ElementOrder, GemmDistribution,
-    Layout, MemoryClass, MemoryElementRequirement, MemoryEstimate, MemoryOperand, MemoryPeaks,
-    MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization,
-    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
+    AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryEstimate,
+    MemoryOperand, MemoryPeaks, MemoryUsage, MidOperation, MidOperationKind, MidValue, MidValueId,
+    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -362,7 +364,7 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
     let column_partitions = reduction.compute.columns;
     TensorType {
         shape: output.shape.clone(),
-        format: crate::mid::TensorFormat {
+        format: crate::layout::TensorFormat {
             precision: output.format.precision,
             layout: match (&orientation, output.format.layout.order) {
                 (
@@ -1295,7 +1297,7 @@ mod tests {
             geometry: crate::GemmGeometry {
                 block: crate::GemmBlockShape {
                     inner: AMP_INNER_BLOCK,
-                    output_columns: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    output_columns: crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                 },
                 orientation: crate::GemmOrientation::Normal,
                 distribution: GemmDistribution::OutputStationary,
@@ -1369,13 +1371,13 @@ mod tests {
             let rows = u32::from(row_partitions) * random.u32(1..=8);
             let inner = AMP_INNER_BLOCK * random.u32(1..=4);
             let columns = u32::from(column_partitions)
-                * crate::mid::AMP_OUTPUT_COLUMN_BLOCK
+                * crate::layout::AMP_OUTPUT_COLUMN_BLOCK
                 * random.u32(1..=3);
             let output = TensorType::new(
                 [1, rows, columns],
                 Precision::F16,
                 Layout::amp_output_grid(
-                    crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                     tiles,
                     row_partitions,
                     column_partitions,
@@ -1398,7 +1400,7 @@ mod tests {
                 Precision::F16,
                 Layout::block_major_matrix_grid(
                     AMP_INNER_BLOCK as u16,
-                    crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                     tiles,
                     row_partitions,
                     column_partitions,
@@ -1421,7 +1423,7 @@ mod tests {
                 Precision::F16,
                 Layout::block_major_matrix_storage(
                     AMP_INNER_BLOCK as u16,
-                    crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+                    crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                     column_partitions,
                     1,
                     1,

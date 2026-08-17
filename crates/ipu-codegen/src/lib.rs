@@ -44,7 +44,11 @@ pub use kernel::{
     KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
     materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
-pub use layout::{ShardExtent, TensorRegion};
+pub use layout::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisTiling,
+    BlockMajorOrder, ElementOrder, Layout, LayoutError, MemoryClass, Padding, ShardExtent,
+    TensorAxis, TensorFormat, TensorRegion, TensorTiling, TensorType,
+};
 pub use low::{
     ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
     KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
@@ -57,19 +61,17 @@ pub use memory::{
     IPU21_STANDARD_FIXED_BYTES,
 };
 pub use mid::{
-    AccumulationPrecision, AllocationRequirements, AmpOrder, AttentionBlocking,
-    AttentionKernelFamily, AttentionPadding, AttentionPlan, AxisTiling, BlockMajorOrder,
-    BlockedGemmPlan, ConversionPlan, ConversionStrategy, CostEstimate, CostModel, ElementOrder,
-    GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode,
-    GemmOrientation, GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder,
-    IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout, LayoutError, LocalOperandStaging,
-    LoweringError, LoweringResult, MemoryClass, MemoryElementRequirement, MemoryEstimate,
+    AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionKernelFamily,
+    AttentionPadding, AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy,
+    CostEstimate, CostModel, GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid,
+    GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
+    GemmWeightLoad, GridOrder, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts,
+    LocalOperandStaging, LoweringError, LoweringResult, MemoryElementRequirement, MemoryEstimate,
     MemoryOperand, MemoryPeaks, MemorySpaceRequirements, MemoryUsage, MidGraph, MidInput,
     MidOperation, MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
     OperandMaterialization, OperandRequirement, OperationMetrics, OperatorDispatch, OperatorPlan,
-    OperatorPlanError, OperatorRequirements, OutputAliasing, Padding, ParallelReductionPlan,
-    PlanMetrics, PointwiseInputMapping, Precision, ReductionStaging, RegionMetrics, TensorAxis,
-    TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, ParallelReductionPlan, PlanMetrics,
+    PointwiseInputMapping, Precision, ReductionStaging, RegionMetrics, TileKernelSpec, lower,
 };
 pub use package::{
     CompiledPackage, CompiledTensor, CompiledTensorShard, DiagnosticCheckpoint, PackageBuildError,

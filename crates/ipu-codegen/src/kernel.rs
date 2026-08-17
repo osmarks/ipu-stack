@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
+use crate::layout::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
     AmpOrder, BlockMajorOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad,
     KernelRequirements, KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile,

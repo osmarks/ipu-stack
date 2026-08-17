@@ -8,13 +8,15 @@
 
 use crate::PipelineConfig;
 use crate::graph::{GraphInputKind, OperationId};
-use crate::layout::{ShardExtent, TensorRegion};
+use crate::layout::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
+    LayoutError, MemoryClass, ShardExtent, TensorRegion, TensorTiling, TensorType,
+};
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ConversionStrategy,
-    DeferredTransform, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass,
-    MemoryOperand, MemorySpaceRequirements, MidGraph, MidOperation, MidOperationKind, MidRepeat,
-    MidValueId, OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
-    PointwiseInputMapping, Precision, TensorTiling, TensorType, TileKernelSpec,
+    ConversionStrategy, DeferredTransform, GemmDistribution, MemoryOperand,
+    MemorySpaceRequirements, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
+    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
+    PointwiseInputMapping, Precision, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4064,7 +4066,7 @@ impl LoweringState {
                 let local_output_columns = column_end - column_start;
                 if local_output_columns == 0
                     || local_output_columns > output_column_block
-                    || !local_output_columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO)
+                    || !local_output_columns.is_multiple_of(crate::layout::AMP_COLUMN_MICRO)
                 {
                     return Err(LowLoweringError::InvalidOperatorPlan);
                 }
@@ -6056,8 +6058,8 @@ mod tests {
                                 block: crate::GemmBlockShape {
                                     inner: inner
                                         .div_ceil(u32::from(inner_partitions))
-                                        .div_ceil(crate::mid::AMP_COLUMN_MICRO)
-                                        * crate::mid::AMP_COLUMN_MICRO,
+                                        .div_ceil(crate::layout::AMP_COLUMN_MICRO)
+                                        * crate::layout::AMP_COLUMN_MICRO,
                                     output_columns,
                                 },
                                 orientation: crate::GemmOrientation::Normal,
@@ -7164,7 +7166,7 @@ mod tests {
                 right_type.format.layout.order,
                 crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
                     row_block: 64,
-                    column_block: crate::mid::AMP_COLUMN_MICRO as u16,
+                    column_block: crate::layout::AMP_COLUMN_MICRO as u16,
                 })
             );
             let low = lower_to_tiles(&mid, &config).unwrap();
