@@ -41,14 +41,6 @@ struct StressTransfer {
     timing: PhaseTransferTiming,
 }
 
-#[derive(Clone, Debug)]
-struct TransferSpec {
-    source: u16,
-    destinations: Vec<u16>,
-    words: u32,
-    schedule_offset: Option<u32>,
-}
-
 pub(crate) struct StressPackage {
     pub application: Application,
     active_tiles: u16,
@@ -467,7 +459,7 @@ pub(crate) fn build(
     let mut phase_rows = Vec::with_capacity(cases as usize);
     let mut diagnostic_rows = Vec::with_capacity(cases as usize);
     let mut row_address = ROW_BASE;
-    let mut previous_shape: Option<Vec<TransferSpec>> = None;
+    let mut previous_shape: Option<Vec<(PhysicalTransfer, Option<u32>)>> = None;
 
     for case in 0..cases {
         let mut tiles = (0..active_tiles).collect::<Vec<_>>();
@@ -492,19 +484,19 @@ pub(crate) fn build(
             (0..usize::try_from(maximum_transfers)?)
                 .map(|index| {
                     if index & 1 == 0 {
-                        TransferSpec {
-                            source: sources[(index / 2) % sources.len()],
-                            destinations: vec![receiver],
-                            words,
-                            schedule_offset: None,
-                        }
+                        (
+                            transfer_shape(sources[(index / 2) % sources.len()], [receiver], words),
+                            None,
+                        )
                     } else {
-                        TransferSpec {
-                            source: receiver,
-                            destinations: vec![sources[(index / 2 + 1) % sources.len()]],
-                            words,
-                            schedule_offset: None,
-                        }
+                        (
+                            transfer_shape(
+                                receiver,
+                                [sources[(index / 2 + 1) % sources.len()]],
+                                words,
+                            ),
+                            None,
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
@@ -524,12 +516,10 @@ pub(crate) fn build(
                     .collect::<Vec<_>>();
                 rng.shuffle(&mut destinations);
                 destinations.truncate(rng.usize(1..=3).min(destinations.len()));
-                shape.push(TransferSpec {
-                    source,
-                    destinations,
-                    words: random_words(&mut rng, maximum_words),
-                    schedule_offset: None,
-                });
+                shape.push((
+                    transfer_shape(source, destinations, random_words(&mut rng, maximum_words)),
+                    None,
+                ));
             }
             previous_shape = Some(shape.clone());
             shape
@@ -538,13 +528,14 @@ pub(crate) fn build(
         };
         let mut builder = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
         let mut validators = BTreeMap::<u16, Vec<(u32, u32, u32)>>::new();
-        for TransferSpec {
-            source,
-            destinations,
-            mut words,
-            schedule_offset,
-        } in shape
-        {
+        for (mut physical, schedule_offset) in shape {
+            let source = physical.source;
+            let destinations = physical
+                .destinations
+                .iter()
+                .map(|endpoint| endpoint.0)
+                .collect::<Vec<_>>();
+            let mut words = physical.words;
             let chained = (contiguous_receiver.is_none()
                 && !available_payloads[usize::from(source)].is_empty()
                 && rng.usize(0..4) == 0)
@@ -596,18 +587,12 @@ pub(crate) fn build(
                 .iter()
                 .map(|&tile| allocate(&mut expected_cursors, tile, bytes, DATA_LIMIT, &mut rng))
                 .collect::<Result<Vec<_>>>()?;
-            let physical = PhysicalTransfer {
-                source,
-                source_addresses: vec![source_address],
-                destinations: destinations
-                    .iter()
-                    .copied()
-                    .zip(destination_addresses.iter().copied())
-                    .map(TransferEndpoint::from)
-                    .collect(),
-                words,
-                width: TransferWidth::Word32,
-            };
+            physical.source_addresses[0] = source_address;
+            physical.words = words;
+            for (endpoint, &address) in physical.destinations.iter_mut().zip(&destination_addresses)
+            {
+                endpoint.1 = address;
+            }
             let incoming_base = (destinations.len() == 1).then_some(destination_addresses[0]);
             let transfer = physical.resolve(&topology, incoming_base)?;
             let requested_schedule_offset = schedule_offset.unwrap_or(0);
@@ -769,7 +754,12 @@ pub(crate) fn build_phase_replay(
         .exchange_phases
         .get(phase_index)
         .with_context(|| format!("exchange phase {phase_index} is out of range"))?;
-    build_physical_phase_replay(phase, phase_index, toolchain, runtime_source)
+    let problem = compiled
+        .exchange_schedule
+        .phases
+        .get(phase_index)
+        .with_context(|| format!("exchange schedule phase {phase_index} is out of range"))?;
+    build_physical_phase_replay(phase, problem, phase_index, toolchain, runtime_source)
 }
 
 pub(crate) fn build_schedule_phase_replay(
@@ -796,11 +786,18 @@ pub(crate) fn build_schedule_phase_replay(
         problem.transfers.truncate(limit);
     }
     let scheduled = ipu_codegen::schedule_exchange_problem(snapshot.tile_count, &problem)?;
-    build_physical_phase_replay(&scheduled.phase, phase_index, toolchain, runtime_source)
+    build_physical_phase_replay(
+        &scheduled.phase,
+        &problem,
+        phase_index,
+        toolchain,
+        runtime_source,
+    )
 }
 
 fn build_physical_phase_replay(
     phase: &ipu_codegen::PhysicalExchangePhase,
+    problem: &ipu_codegen::ExchangeScheduleProblem,
     phase_index: usize,
     toolchain: &Toolchain,
     runtime_source: &Path,
@@ -876,13 +873,7 @@ fn build_physical_phase_replay(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut transfers = BTreeMap::<
-        u32,
-        (
-            Option<(u16, ExchangeActivity)>,
-            Vec<(u16, ExchangeActivity)>,
-        ),
-    >::new();
+    let mut timings = vec![(None, Vec::new()); problem.transfers.len()];
     let mut initial = vec![BTreeMap::<u32, u32>::new(); usize::from(scheduled_tiles)];
     for (tile, activities) in phase.activities.iter().enumerate() {
         let tile = u16::try_from(tile)?;
@@ -894,7 +885,14 @@ fn build_physical_phase_replay(
                     activity.address
                 );
             }
-            let transfer = transfers.entry(activity.transfer).or_default();
+            let transfer = timings
+                .get_mut(usize::try_from(activity.transfer)?)
+                .with_context(|| {
+                    format!(
+                        "phase {phase_index} activity references transfer {} beyond the captured transfer list",
+                        activity.transfer
+                    )
+                })?;
             match activity.kind {
                 ExchangeActivityKind::Send => {
                     if transfer.0.replace((tile, activity)).is_some() {
@@ -907,60 +905,74 @@ fn build_physical_phase_replay(
                 ExchangeActivityKind::Receive => transfer.1.push((tile, activity)),
                 ExchangeActivityKind::PartnerBusy => {}
             }
-            for word in 0..activity.words {
-                let address = activity
-                    .address
-                    .checked_add(word.checked_mul(4).context("activity offset overflow")?)
-                    .context("activity address overflow")?;
-                initial[usize::from(tile)]
-                    .entry(address)
-                    .or_insert_with(|| replay_word(tile, address));
-            }
         }
     }
 
-    let transfers = transfers
-        .into_iter()
-        .map(|(id, (send, receives))| {
+    let transfers = problem
+        .transfers
+        .iter()
+        .zip(timings)
+        .enumerate()
+        .map(|(id, (physical, (send, mut receive_activities)))| {
+            if physical.source_addresses.len() != 1 {
+                bail!(
+                    "phase {phase_index} transfer {id} has {} repeat source addresses",
+                    physical.source_addresses.len()
+                );
+            }
             let (source, send) =
                 send.with_context(|| format!("phase {phase_index} transfer {id} has no sender"))?;
-            if receives.is_empty() {
-                bail!("phase {phase_index} transfer {id} has no receivers");
-            }
-            if receives
-                .iter()
-                .any(|(_, receive)| receive.words != send.words)
+            if source != physical.source
+                || send.address != physical.source_address()
+                || send.words != physical.words
             {
-                bail!("phase {phase_index} transfer {id} has inconsistent word counts");
+                bail!(
+                    "phase {phase_index} transfer {id} sender activity differs from its captured physical transfer"
+                );
             }
-            let width = phase
-                .activities
+            let receives = physical
+                .destinations
                 .iter()
-                .flatten()
-                .any(|activity| {
-                    activity.transfer == id && activity.kind == ExchangeActivityKind::PartnerBusy
+                .map(|&TransferEndpoint(tile, address)| {
+                    let position = receive_activities.iter().position(
+                        |&(activity_tile, activity)| {
+                            activity_tile == tile
+                                && activity.address == address
+                                && activity.words == physical.words
+                        },
+                    );
+                    position
+                        .map(|position| receive_activities.swap_remove(position).1)
+                        .with_context(|| {
+                            format!(
+                                "phase {phase_index} transfer {id} has no receive activity for tile {tile} address 0x{address:x}"
+                            )
+                        })
                 })
-                .then_some(TransferWidth::Paired64)
-                .unwrap_or(TransferWidth::Word32);
-            let physical = PhysicalTransfer {
-                source,
-                source_addresses: vec![send.address],
-                destinations: receives
-                    .iter()
-                    .map(|&(tile, receive)| TransferEndpoint(tile, receive.address))
-                    .collect(),
-                words: send.words,
-                width,
-            };
-            Ok((
-                id,
-                physical,
-                send,
-                receives
-                    .into_iter()
-                    .map(|(_, activity)| activity)
-                    .collect::<Vec<_>>(),
-            ))
+                .collect::<Result<Vec<_>>>()?;
+            if !receive_activities.is_empty() {
+                bail!(
+                    "phase {phase_index} transfer {id} has receive activities absent from its captured physical transfer"
+                );
+            }
+            for (tile, address) in std::iter::once((physical.source, physical.source_address()))
+                .chain(
+                    physical
+                        .destinations
+                        .iter()
+                        .map(|&TransferEndpoint(tile, address)| (tile, address)),
+                )
+            {
+                for word in 0..physical.words {
+                    let address = address
+                        .checked_add(word.checked_mul(4).context("transfer offset overflow")?)
+                        .context("transfer address overflow")?;
+                    initial[usize::from(tile)]
+                        .entry(address)
+                        .or_insert_with(|| replay_word(tile, address));
+                }
+            }
+            Ok((u32::try_from(id)?, physical.clone(), send, receives))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut events = Vec::new();
@@ -1590,7 +1602,7 @@ fn overlap_specs(
     tiles: &[u16],
     maximum_words: u32,
     rng: &mut fastrand::Rng,
-) -> Result<Vec<TransferSpec>> {
+) -> Result<Vec<(PhysicalTransfer, Option<u32>)>> {
     let [incoming_source, pivot, outgoing_destination] = *tiles else {
         bail!("overlap case requires exactly three tiles");
     };
@@ -1616,23 +1628,36 @@ fn overlap_specs(
     let incoming_first = case & 1 == 0;
     let incoming_target = anchor + if incoming_first { 0 } else { delta };
     let outgoing_target = anchor + if incoming_first { delta } else { 0 };
-    let incoming = TransferSpec {
-        source: incoming_source,
-        destinations: vec![pivot],
-        words,
-        schedule_offset: Some(incoming_target - incoming_start),
-    };
-    let outgoing = TransferSpec {
-        source: pivot,
-        destinations: vec![outgoing_destination],
-        words,
-        schedule_offset: Some(outgoing_target - outgoing_start),
-    };
+    let incoming = (
+        transfer_shape(incoming_source, [pivot], words),
+        Some(incoming_target - incoming_start),
+    );
+    let outgoing = (
+        transfer_shape(pivot, [outgoing_destination], words),
+        Some(outgoing_target - outgoing_start),
+    );
     Ok(if incoming_first {
         vec![incoming, outgoing]
     } else {
         vec![outgoing, incoming]
     })
+}
+
+fn transfer_shape(
+    source: u16,
+    destinations: impl IntoIterator<Item = u16>,
+    words: u32,
+) -> PhysicalTransfer {
+    PhysicalTransfer {
+        source,
+        source_addresses: vec![0],
+        destinations: destinations
+            .into_iter()
+            .map(|tile| TransferEndpoint(tile, 0))
+            .collect(),
+        words,
+        width: TransferWidth::Word32,
+    }
 }
 
 fn point_transfer(

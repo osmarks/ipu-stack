@@ -389,7 +389,7 @@ fn lower_static_exchanges(
                 activities,
                 scheduled_sends,
                 order,
-                timings,
+                dependencies,
                 ..
             } = schedule;
             let mut diagnostics = options
@@ -403,8 +403,13 @@ fn lower_static_exchanges(
                 diagnostics.maximum_endpoint_roles = endpoint_roles.into_iter().max().unwrap_or(0);
                 for &index in &order {
                     let transfer = &pending[index];
-                    let timing = timings[index].ok_or(ExchangeLoweringError::Overflow)?;
-                    diagnostics.record(index, &transfer.physical, timing);
+                    let dependency = dependencies[index].ok_or(ExchangeLoweringError::Overflow)?;
+                    let start = activities[usize::from(transfer.physical.source)]
+                        .iter()
+                        .find(|activity| activity.transfer as usize == index)
+                        .map(|activity| activity.start_cycle)
+                        .ok_or(ExchangeLoweringError::Overflow)?;
+                    diagnostics.record(index, &transfer.physical, start, dependency);
                 }
             }
             if let Some(diagnostics) = diagnostics {
@@ -685,9 +690,15 @@ impl PhaseDiagnostics {
         }
     }
 
-    fn record(&mut self, transfer: usize, physical: &PhysicalTransfer, timing: MaterializedTiming) {
+    fn record(
+        &mut self,
+        transfer: usize,
+        physical: &PhysicalTransfer,
+        start: u32,
+        dependency: ScheduleDependency,
+    ) {
         let id = self.transfers.len();
-        let predecessor = self.tiles[usize::from(timing.blocking_tile)].last_transfer;
+        let predecessor = self.tiles[usize::from(dependency.blocking_tile)].last_transfer;
         let source_pressure = &mut self.tiles[usize::from(physical.source)];
         source_pressure.send_roles += 1;
         source_pressure.send_words += u64::from(physical.words);
@@ -704,9 +715,9 @@ impl PhaseDiagnostics {
         self.maximum_fanout = self.maximum_fanout.max(physical.destinations.len());
         self.transfers.push(ScheduledTransferDiagnostic {
             transfer,
-            start: timing.start,
-            end: timing.end,
-            blocking_tile: timing.blocking_tile,
+            start,
+            end: dependency.completion,
+            blocking_tile: dependency.blocking_tile,
             predecessor,
         });
     }
@@ -1153,27 +1164,28 @@ fn optimize_owned_pending(
 
 fn critical_transfer_indices(schedule: &MaterializedSchedule) -> BTreeSet<usize> {
     let maximum_end = schedule
-        .timings
+        .dependencies
         .iter()
         .flatten()
-        .map(|timing| timing.end)
+        .map(|dependency| dependency.completion)
         .max()
         .unwrap_or(0);
     let mut pending = schedule
-        .timings
+        .dependencies
         .iter()
         .enumerate()
         .filter_map(|(index, timing)| {
             timing
                 .as_ref()
-                .is_some_and(|timing| timing.end == maximum_end)
+                .is_some_and(|dependency| dependency.completion == maximum_end)
                 .then_some(index)
         })
         .collect::<Vec<_>>();
     let mut critical = BTreeSet::new();
     while let Some(index) = pending.pop() {
         if critical.insert(index)
-            && let Some(predecessor) = schedule.timings[index].and_then(|timing| timing.predecessor)
+            && let Some(predecessor) =
+                schedule.dependencies[index].and_then(|dependency| dependency.predecessor)
         {
             pending.push(predecessor);
         }
@@ -2061,9 +2073,8 @@ struct TilePredecessor {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct MaterializedTiming {
-    start: u32,
-    end: u32,
+struct ScheduleDependency {
+    completion: u32,
     blocking_tile: u16,
     predecessor: Option<usize>,
 }
@@ -2090,7 +2101,7 @@ struct MaterializedSchedule {
     activities: Vec<Vec<ExchangeActivity>>,
     scheduled_sends: Vec<Vec<(LowShardId, u32)>>,
     order: Vec<usize>,
-    timings: Vec<Option<MaterializedTiming>>,
+    dependencies: Vec<Option<ScheduleDependency>>,
 }
 
 impl MaterializedSchedule {
@@ -2106,7 +2117,7 @@ impl MaterializedSchedule {
             activities: vec![Vec::new(); usize::from(tile_count)],
             scheduled_sends: vec![Vec::new(); usize::from(tile_count)],
             order: Vec::with_capacity(transfer_count),
-            timings: vec![None; transfer_count],
+            dependencies: vec![None; transfer_count],
         }
     }
 
@@ -2253,9 +2264,8 @@ impl MaterializedSchedule {
             last_transfer[usize::from(tile)].receive = Some(index);
         }
         self.order.push(index);
-        self.timings[index] = Some(MaterializedTiming {
-            start: timing.payload_start,
-            end: timing.payload_completion(),
+        self.dependencies[index] = Some(ScheduleDependency {
+            completion: timing.payload_completion(),
             blocking_tile,
             predecessor,
         });
@@ -2694,17 +2704,19 @@ fn critical_neighborhood_order(
     }
     let mut critical = vec![false; pending.len()];
     let mut cursor = incumbent
-        .timings
+        .dependencies
         .iter()
         .enumerate()
-        .filter_map(|(index, timing)| timing.map(|timing| (index, timing.end)))
+        .filter_map(|(index, dependency)| {
+            dependency.map(|dependency| (index, dependency.completion))
+        })
         .max_by_key(|entry| entry.1)
         .map(|entry| entry.0);
     while let Some(index) = cursor {
         if std::mem::replace(&mut critical[index], true) {
             break;
         }
-        cursor = incumbent.timings[index].and_then(|timing| timing.predecessor);
+        cursor = incumbent.dependencies[index].and_then(|dependency| dependency.predecessor);
     }
 
     let mut tile_orders = vec![Vec::new(); usize::from(tile_count)];
@@ -3321,9 +3333,8 @@ mod tests {
                 for tile in transfer.tiles() {
                     last_transfer[usize::from(tile)] = Some(index);
                 }
-                incumbent.timings[index] = Some(MaterializedTiming {
-                    start: index as u32,
-                    end: index as u32 + 1,
+                incumbent.dependencies[index] = Some(ScheduleDependency {
+                    completion: index as u32 + 1,
                     blocking_tile: transfer.physical.source,
                     predecessor,
                 });
