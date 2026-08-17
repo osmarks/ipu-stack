@@ -5,7 +5,14 @@
 //! two-word supervisor instruction: the first word carries the send fields and
 //! the second is inline PIC/XPIC payload, not an independently executed word.
 
-use super::*;
+use serde::{Deserialize, Serialize};
+
+use super::{ExchangeError, ReceiveEventKind, TileProgramSchedule};
+use crate::instruction::{
+    DELAY_OPCODE, DELAY_OPCODE_MASK, DELAY_PIC_OPCODE, DELAY_XPIC_OPCODE, LONG_OPCODE_MASK,
+    OPCODE_MASK, PIC_RECEIVE_ADDRESS_MASK, RETURN_M10_INSTRUCTION, SEND_ADDRESS_MASK, SEND_OPCODE,
+    SYNC_OPCODE, is_send_control, is_send_control_pair, is_send_off,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncomingControlStream {
@@ -420,6 +427,8 @@ fn control_key(control: IncomingControl) -> (u8, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::{ReceiveEvent, encode_send_control_pair};
+    use crate::instruction::{delay_pic, delay_xpic};
 
     #[test]
     fn sdk_receiver_row_decodes_two_word_controls_as_single_instructions() {

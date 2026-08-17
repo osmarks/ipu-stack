@@ -1569,22 +1569,6 @@ fn instruction_advance(instruction: u32) -> u32 {
     }
 }
 
-fn is_send_control(instruction: u32) -> bool {
-    instruction & SEND_CONTROL_OPCODE_MASK == SEND_PIC_OPCODE
-}
-
-fn is_send_control_pair(instruction: u32) -> bool {
-    instruction & SEND_PICP_OPCODE_MASK == SEND_PICP_OPCODE
-}
-
-fn is_send_off(instruction: u32) -> bool {
-    instruction & SEND_CONTROL_OPCODE_MASK == SEND_OFF_OPCODE
-}
-
-fn is_payload_send(instruction: u32) -> bool {
-    instruction & LONG_OPCODE_MASK == SEND_OPCODE || is_send_off(instruction)
-}
-
 fn set_instruction_advance(instruction: &mut u32, advance: u32) -> Result<(), ExchangeError> {
     if advance == 0 {
         return Err(ExchangeError::Schedule("zero event advance"));

@@ -231,3 +231,19 @@ pub(crate) const fn send_off(count_minus_one: u32, direction: u32, base_word: u3
         | ((base_word << 3) & 0x0000_3ff8)
         | (direction & 7)
 }
+
+pub(crate) fn is_send_control(instruction: u32) -> bool {
+    instruction & SEND_CONTROL_OPCODE_MASK == SEND_PIC_OPCODE
+}
+
+pub(crate) fn is_send_control_pair(instruction: u32) -> bool {
+    instruction & SEND_PICP_OPCODE_MASK == SEND_PICP_OPCODE
+}
+
+pub(crate) fn is_send_off(instruction: u32) -> bool {
+    instruction & SEND_CONTROL_OPCODE_MASK == SEND_OFF_OPCODE
+}
+
+pub(crate) fn is_payload_send(instruction: u32) -> bool {
+    instruction & LONG_OPCODE_MASK == SEND_OPCODE || is_send_off(instruction)
+}
