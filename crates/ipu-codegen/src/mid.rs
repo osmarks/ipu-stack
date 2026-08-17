@@ -34,21 +34,11 @@ use crate::operator::*;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A GEMM plan after its blocking, layouts, and dispatch have been
-/// chosen, but before graph-wide conversion and memory costs are applied.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct GemmPlan {
-    dispatch: OperatorDispatch,
-    inputs: Vec<OperandRequirement>,
-    output: OperandRequirement,
-    memory_space: MemorySpaceRequirements,
-}
-
 fn gemm_seed_plans_for_tile_count(
     options: GemmOptions,
     tile_count: u16,
     domain: &PlannerSearchDomain,
-) -> Vec<GemmPlan> {
+) -> Vec<OperatorPlan> {
     let mut candidates = (1..=tile_count)
         .rev()
         .filter(|columns| tile_count.is_multiple_of(*columns))
@@ -129,7 +119,8 @@ fn gemm_seed_plans_for_tile_count(
                     if precision == Precision::F16 && weights.memory_class == MemoryClass::Standard
                     {
                         let mut staged = candidate;
-                        staged.inputs[1].local_staging = LocalOperandStaging::MatchRemote;
+                        staged.requirements.inputs[1].local_staging =
+                            LocalOperandStaging::MatchRemote;
                         grid.push(staged);
                     }
                 }
@@ -188,53 +179,58 @@ fn amp_gemm_plan(
     left_tail: u32,
     output_columns: u32,
     tile_count: u16,
-) -> GemmPlan {
+) -> OperatorPlan {
     let operator = MidOperator::Gemm {
         options,
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    GemmPlan {
-        inputs: vec![
-            OperandRequirement::new(
+    OperatorPlan::candidate(
+        operator,
+        blocked_gemm_dispatch(operator, output_columns),
+        OperatorRequirements {
+            inputs: vec![
+                OperandRequirement::new(
+                    TensorFormat {
+                        precision,
+                        layout: Layout::amp_left(inner, tile_count),
+                    },
+                    32,
+                )
+                .with_access_tail(left_tail)
+                .with_materialization(OperandMaterialization::DispatchSlices),
+                OperandRequirement::new(
+                    TensorFormat {
+                        precision,
+                        layout: Layout::block_major_matrix_storage(
+                            inner,
+                            AMP_OUTPUT_COLUMN_BLOCK,
+                            tile_count,
+                            1,
+                            1,
+                            MemoryClass::Standard,
+                        ),
+                    },
+                    32,
+                ),
+            ],
+            output: OperandRequirement::new(
                 TensorFormat {
                     precision,
-                    layout: Layout::amp_left(inner, tile_count),
-                },
-                32,
-            )
-            .with_access_tail(left_tail)
-            .with_materialization(OperandMaterialization::DispatchSlices),
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: Layout::block_major_matrix_storage(
-                        inner,
-                        AMP_OUTPUT_COLUMN_BLOCK,
-                        tile_count,
-                        1,
-                        1,
-                        MemoryClass::Standard,
-                    ),
+                    layout: if precision == Precision::F16 {
+                        Layout::amp_left_result(tile_count)
+                    } else {
+                        Layout::amp_output(tile_count)
+                    },
                 },
                 32,
             ),
-        ],
-        output: OperandRequirement::new(
-            TensorFormat {
-                precision,
-                layout: if precision == Precision::F16 {
-                    Layout::amp_left_result(tile_count)
-                } else {
-                    Layout::amp_output(tile_count)
-                },
-            },
-            32,
-        ),
-        memory_space: MemorySpaceRequirements::default()
-            .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
-        dispatch: blocked_gemm_dispatch(operator, output_columns),
-    }
+            output_aliasing: OutputAliasing::Fresh,
+            memory_space: MemorySpaceRequirements::default()
+                .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
+        },
+        None,
+    )
 }
 
 fn amp_grid_gemm_plan(
@@ -245,7 +241,7 @@ fn amp_grid_gemm_plan(
     output_columns: u32,
     grid: AmpGridShape,
     weights: AmpWeightPlacement,
-) -> GemmPlan {
+) -> OperatorPlan {
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
         (1, MemoryClass::Standard) => Layout::block_major_matrix_grid(
             inner,
@@ -269,58 +265,63 @@ fn amp_grid_gemm_plan(
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    GemmPlan {
-        inputs: vec![
-            OperandRequirement::new(
+    OperatorPlan::candidate(
+        operator,
+        blocked_gemm_dispatch(operator, output_columns),
+        OperatorRequirements {
+            inputs: vec![
+                OperandRequirement::new(
+                    TensorFormat {
+                        precision,
+                        layout: Layout::amp_left_grid(
+                            inner,
+                            grid.result.tile_count(),
+                            grid.result.rows,
+                            grid.result.columns,
+                            grid.order,
+                        ),
+                    },
+                    32,
+                )
+                .with_access_tail(left_tail)
+                .with_materialization(OperandMaterialization::DispatchSlices),
+                OperandRequirement::new(
+                    TensorFormat {
+                        precision,
+                        layout: right_layout,
+                    },
+                    32,
+                ),
+            ],
+            output: OperandRequirement::new(
                 TensorFormat {
                     precision,
-                    layout: Layout::amp_left_grid(
-                        inner,
-                        grid.result.tile_count(),
-                        grid.result.rows,
-                        grid.result.columns,
-                        grid.order,
-                    ),
-                },
-                32,
-            )
-            .with_access_tail(left_tail)
-            .with_materialization(OperandMaterialization::DispatchSlices),
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: right_layout,
+                    layout: if precision == Precision::F16 {
+                        Layout::amp_left_result_grid(
+                            output_columns,
+                            grid.result.tile_count(),
+                            grid.result.rows,
+                            grid.result.columns,
+                            grid.order,
+                        )
+                    } else {
+                        Layout::amp_output_grid(
+                            output_columns,
+                            grid.result.tile_count(),
+                            grid.result.rows,
+                            grid.result.columns,
+                            grid.order,
+                        )
+                    },
                 },
                 32,
             ),
-        ],
-        output: OperandRequirement::new(
-            TensorFormat {
-                precision,
-                layout: if precision == Precision::F16 {
-                    Layout::amp_left_result_grid(
-                        output_columns,
-                        grid.result.tile_count(),
-                        grid.result.rows,
-                        grid.result.columns,
-                        grid.order,
-                    )
-                } else {
-                    Layout::amp_output_grid(
-                        output_columns,
-                        grid.result.tile_count(),
-                        grid.result.rows,
-                        grid.result.columns,
-                        grid.order,
-                    )
-                },
-            },
-            32,
-        ),
-        memory_space: MemorySpaceRequirements::default()
-            .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
-        dispatch: blocked_gemm_dispatch(operator, output_columns),
-    }
+            output_aliasing: OutputAliasing::Fresh,
+            memory_space: MemorySpaceRequirements::default()
+                .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
+        },
+        None,
+    )
 }
 
 fn blocked_gemm_dispatch(operator: MidOperator, output_columns: u32) -> OperatorDispatch {
@@ -2553,10 +2554,8 @@ fn gemm_plans(
     let mut plans = Vec::new();
     for &tile_count in &config.resolved_active_tile_counts {
         for seed in gemm_seed_plans_for_tile_count(options, tile_count, &config.search_domain) {
-            let operator = gemm_operator(options, &seed);
             let mut variants = vec![seed.clone()];
             variants.extend(parallel_reduction_plans(
-                operator,
                 &seed,
                 inputs,
                 output,
@@ -2580,8 +2579,7 @@ fn gemm_plans(
                     .collect::<Vec<_>>();
                 variants.extend(additions);
             }
-            for variant in variants {
-                let plan = finish_gemm_plan(options, variant);
+            for plan in variants {
                 if !plan.supports(inputs, output) {
                     continue;
                 }
@@ -2592,29 +2590,6 @@ fn gemm_plans(
         }
     }
     plans
-}
-
-fn finish_gemm_plan(options: GemmOptions, plan: GemmPlan) -> OperatorPlan {
-    OperatorPlan::candidate(
-        gemm_operator(options, &plan),
-        plan.dispatch,
-        OperatorRequirements {
-            inputs: plan.inputs,
-            output: plan.output,
-            output_aliasing: OutputAliasing::Fresh,
-            memory_space: plan.memory_space,
-        },
-        None,
-    )
-}
-
-fn gemm_operator(options: GemmOptions, plan: &GemmPlan) -> MidOperator {
-    let multiply = plan.inputs[0].format.precision;
-    MidOperator::Gemm {
-        options,
-        multiply,
-        accumulate: gemm_accumulation_precision(multiply),
-    }
 }
 
 fn gemm_plan_matches(
@@ -2644,15 +2619,15 @@ fn gemm_plan_matches(
 }
 
 fn independent_parameter_storage(
-    candidate: &GemmPlan,
+    candidate: &OperatorPlan,
     inputs: &[TensorType],
     input_index: usize,
     config: &PipelineConfig,
-) -> Vec<GemmPlan> {
+) -> Vec<OperatorPlan> {
     if !matches!(candidate.dispatch, OperatorDispatch::BlockedGemm(_)) {
         return Vec::new();
     }
-    let Some(requirement) = candidate.inputs.get(input_index) else {
+    let Some(requirement) = candidate.requirements.inputs.get(input_index) else {
         return Vec::new();
     };
     let ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
@@ -2719,22 +2694,22 @@ fn independent_parameter_storage(
         .into_iter()
         .map(|(column_partitions, inner_partitions)| {
             let mut independent = candidate.clone();
-            independent.inputs[input_index].format.layout = Layout::block_major_matrix_storage(
-                inner_block,
-                output_column_block,
-                column_partitions,
-                inner_partitions,
-                1,
-                requirement.format.layout.memory_class,
-            );
+            independent.requirements.inputs[input_index].format.layout =
+                Layout::block_major_matrix_storage(
+                    inner_block,
+                    output_column_block,
+                    column_partitions,
+                    inner_partitions,
+                    1,
+                    requirement.format.layout.memory_class,
+                );
             independent
         })
         .collect()
 }
 
 fn parallel_reduction_plans(
-    operator: MidOperator,
-    candidate: &GemmPlan,
+    candidate: &OperatorPlan,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -2742,12 +2717,11 @@ fn parallel_reduction_plans(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
-) -> Vec<GemmPlan> {
+) -> Vec<OperatorPlan> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
         .into_iter()
         .flat_map(|orientation| {
             parallel_reduction_plans_for_orientation(
-                operator,
                 candidate,
                 inputs,
                 output,
@@ -2763,8 +2737,7 @@ fn parallel_reduction_plans(
 }
 
 fn parallel_reduction_plans_for_orientation(
-    operator: MidOperator,
-    candidate: &GemmPlan,
+    candidate: &OperatorPlan,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -2773,7 +2746,7 @@ fn parallel_reduction_plans_for_orientation(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
-) -> Vec<GemmPlan> {
+) -> Vec<OperatorPlan> {
     // Residual supervisor, weight-feed, and worker setup cost after retained
     // state, measured on IPU21 independently of the four issue cycles per row.
     const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 160;
@@ -2788,7 +2761,7 @@ fn parallel_reduction_plans_for_orientation(
     }
     let output_column_block = plan.geometry.block.output_columns;
     if !matches!(
-        operator,
+        candidate.operator,
         MidOperator::Gemm {
             multiply: Precision::F16,
             ..
@@ -2819,7 +2792,13 @@ fn parallel_reduction_plans_for_orientation(
     // Each grid chooses the exact padded local K and C extents, so one tile
     // call traverses all of its AMP micro-groups without fixed K64/C64
     // boundaries.
-    let tile_count = candidate.output.format.layout.tiling.tile_count;
+    let tile_count = candidate
+        .requirements
+        .output
+        .format
+        .layout
+        .tiling
+        .tile_count;
     let column_groups = columns.div_ceil(AMP_COLUMN_MICRO);
     let inner_groups = inner.div_ceil(AMP_COLUMN_MICRO);
     let Ok(inner_groups) = u16::try_from(inner_groups) else {
@@ -2841,6 +2820,7 @@ fn parallel_reduction_plans_for_orientation(
         .and_then(|groups| u16::try_from(groups).ok())
         .filter(|groups| *groups >= column_groups);
     let output_seed_partitions = candidate
+        .requirements
         .output
         .format
         .layout
@@ -2850,8 +2830,8 @@ fn parallel_reduction_plans_for_orientation(
         .find(|axis| axis.axis == TensorAxis::FromEnd(1))
         .map(|axis| axis.partitions);
     if output_seed_partitions != Some(tile_count)
-        || candidate.inputs[1].format.layout.memory_class != MemoryClass::Standard
-        || candidate.inputs[1].local_staging != LocalOperandStaging::Direct
+        || candidate.requirements.inputs[1].format.layout.memory_class != MemoryClass::Standard
+        || candidate.requirements.inputs[1].local_staging != LocalOperandStaging::Direct
     {
         return Vec::new();
     }
@@ -2918,7 +2898,7 @@ fn parallel_reduction_plans_for_orientation(
                     .saturating_mul(u64::from(local_inner))
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                     .saturating_mul(
-                        candidate.inputs[match orientation {
+                        candidate.requirements.inputs[match orientation {
                             GemmOrientation::Normal => 0,
                             GemmOrientation::Swapped => 1,
                         }]
@@ -2931,7 +2911,7 @@ fn parallel_reduction_plans_for_orientation(
                     .saturating_mul(u64::from(local_inner))
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                     .saturating_mul(
-                        candidate.inputs[match orientation {
+                        candidate.requirements.inputs[match orientation {
                             GemmOrientation::Normal => 1,
                             GemmOrientation::Swapped => 0,
                         }]
@@ -2943,7 +2923,7 @@ fn parallel_reduction_plans_for_orientation(
                     .saturating_mul(u64::from(local_rows))
                     .saturating_mul(u64::from(local_columns))
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(candidate.output.format.precision.bytes());
+                    .saturating_mul(candidate.requirements.output.format.precision.bytes());
                 // Operand staging and the local partial coexist during
                 // convolution. Complete staging is evaluated later by the
                 // ordinary operator-memory model.
@@ -3053,26 +3033,27 @@ fn parallel_reduction_plans_for_orientation(
             let mut variant = candidate.clone();
             match orientation {
                 GemmOrientation::Normal => {
-                    variant.inputs[0].format.layout = Layout::amp_left_parallel_grid(
+                    variant.requirements.inputs[0].format.layout = Layout::amp_left_parallel_grid(
                         kernel_inner_block_u16,
                         used_tiles,
                         row_partitions,
                         column_partitions,
                         inner_partitions,
                     );
-                    variant.inputs[1].format.layout = Layout::block_major_matrix_storage(
-                        kernel_inner_block_u16,
-                        kernel_output_columns,
-                        column_partitions,
-                        inner_partitions,
-                        1,
-                        memory_class,
-                    );
+                    variant.requirements.inputs[1].format.layout =
+                        Layout::block_major_matrix_storage(
+                            kernel_inner_block_u16,
+                            kernel_output_columns,
+                            column_partitions,
+                            inner_partitions,
+                            1,
+                            memory_class,
+                        );
                     balance_parallel_gemm_columns(
-                        &mut variant.inputs[1].format.layout,
+                        &mut variant.requirements.inputs[1].format.layout,
                         TensorAxis::FromEnd(1),
                     );
-                    variant.output.format.layout = Layout::amp_left_result_grid(
+                    variant.requirements.output.format.layout = Layout::amp_left_result_grid(
                         kernel_output_columns,
                         row_partitions.saturating_mul(column_partitions),
                         row_partitions,
@@ -3080,12 +3061,12 @@ fn parallel_reduction_plans_for_orientation(
                         GridOrder::ColumnsFast,
                     );
                     balance_parallel_gemm_columns(
-                        &mut variant.output.format.layout,
+                        &mut variant.requirements.output.format.layout,
                         TensorAxis::FromEnd(1),
                     );
                 }
                 GemmOrientation::Swapped => {
-                    let mut physical_left = variant.inputs[1].clone();
+                    let mut physical_left = variant.requirements.inputs[1].clone();
                     physical_left.format.layout = Layout::amp_transposed_left_parallel_grid(
                         kernel_inner_block_u16,
                         used_tiles,
@@ -3094,7 +3075,7 @@ fn parallel_reduction_plans_for_orientation(
                         inner_partitions,
                     );
                     physical_left.materialization = OperandMaterialization::DispatchSlices;
-                    let mut physical_right = variant.inputs[0].clone();
+                    let mut physical_right = variant.requirements.inputs[0].clone();
                     physical_right.format.layout = Layout::transposed_block_major_matrix_storage(
                         kernel_inner_block_u16,
                         kernel_output_columns,
@@ -3108,19 +3089,20 @@ fn parallel_reduction_plans_for_orientation(
                         TensorAxis::FromEnd(2),
                     );
                     physical_right.materialization = OperandMaterialization::Complete;
-                    variant.inputs = vec![physical_right, physical_left];
-                    variant.output.format.layout = Layout::amp_transposed_left_result_grid(
-                        kernel_output_columns,
-                        row_partitions.saturating_mul(column_partitions),
-                        row_partitions,
-                        column_partitions,
-                        GridOrder::ColumnsFast,
-                    );
+                    variant.requirements.inputs = vec![physical_right, physical_left];
+                    variant.requirements.output.format.layout =
+                        Layout::amp_transposed_left_result_grid(
+                            kernel_output_columns,
+                            row_partitions.saturating_mul(column_partitions),
+                            row_partitions,
+                            column_partitions,
+                            GridOrder::ColumnsFast,
+                        );
                     balance_parallel_gemm_columns(
-                        &mut variant.output.format.layout,
+                        &mut variant.requirements.output.format.layout,
                         TensorAxis::FromEnd(2),
                     );
-                    variant.memory_space = MemorySpaceRequirements::default()
+                    variant.requirements.memory_space = MemorySpaceRequirements::default()
                         .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(1)]);
                 }
             }
@@ -3226,7 +3208,7 @@ fn parallel_reduction_plans_for_orientation(
                         GemmOrientation::Swapped => TensorAxis::FromEnd(2),
                     };
                     balance_parallel_gemm_columns(&mut result_layout, physical_column_axis);
-                    result_variant.output.format.layout = result_layout;
+                    result_variant.requirements.output.format.layout = result_layout;
                     result_layout_variants.push(result_variant);
                 }
             }
@@ -3237,6 +3219,7 @@ fn parallel_reduction_plans_for_orientation(
                     GemmOrientation::Swapped => (TensorAxis::FromEnd(1), normal_columns, 1),
                 };
                 let result_rows = result_layout
+                    .requirements
                     .output
                     .format
                     .layout
@@ -3252,11 +3235,13 @@ fn parallel_reduction_plans_for_orientation(
                     continue;
                 }
                 pad_axis_to_f16_exchange_word(
-                    &mut result_layout.inputs[physical_left_index].format.layout,
+                    &mut result_layout.requirements.inputs[physical_left_index]
+                        .format
+                        .layout,
                     physical_row_axis,
                 );
                 pad_axis_to_f16_exchange_word(
-                    &mut result_layout.output.format.layout,
+                    &mut result_layout.requirements.output.format.layout,
                     physical_row_axis,
                 );
                 layout_variants.push(result_layout);
@@ -3271,7 +3256,7 @@ fn parallel_reduction_plans_for_orientation(
                 }
                 for &local_staging in local_staging_options {
                     let mut staged = layout_variant.clone();
-                    staged.inputs[physical_right_index].local_staging = local_staging;
+                    staged.requirements.inputs[physical_right_index].local_staging = local_staging;
                     variants.push(staged.clone());
                     if let OperatorDispatch::BlockedGemm(plan) = &mut staged.dispatch
                         && let GemmDistribution::ParallelReduction(reduction) =
@@ -3289,6 +3274,7 @@ fn parallel_reduction_plans_for_orientation(
         .iter()
         .filter(|candidate| {
             candidate
+                .requirements
                 .output
                 .format
                 .layout
@@ -3302,12 +3288,15 @@ fn parallel_reduction_plans_for_orientation(
         variants
             .into_iter()
             .filter(|candidate| {
-                gemm_plan_matches(constraint, &candidate.dispatch, &candidate.inputs)
+                gemm_plan_matches(
+                    constraint,
+                    &candidate.dispatch,
+                    &candidate.requirements.inputs,
+                )
             })
             .collect::<Vec<_>>()
     } else {
         retain_precise_gemm_plans(
-            operator,
             variants,
             inputs,
             output,
@@ -3324,6 +3313,7 @@ fn parallel_reduction_plans_for_orientation(
         retained_grouped_variants = retained
             .iter()
             .filter(|candidate| candidate
+                .requirements
                 .output
                 .format
                 .layout
@@ -3350,7 +3340,7 @@ struct GemmPlanCompatibility {
     ),
 }
 
-fn gemm_plan_compatibility(candidate: &GemmPlan) -> GemmPlanCompatibility {
+fn gemm_plan_compatibility(candidate: &OperatorPlan) -> GemmPlanCompatibility {
     let (orientation, reduction_staging) = match candidate.dispatch {
         OperatorDispatch::BlockedGemm(plan) => (
             Some(plan.geometry.orientation),
@@ -3365,6 +3355,7 @@ fn gemm_plan_compatibility(candidate: &GemmPlan) -> GemmPlanCompatibility {
         orientation,
         reduction_staging,
         inputs: candidate
+            .requirements
             .inputs
             .iter()
             .map(|input| {
@@ -3376,9 +3367,10 @@ fn gemm_plan_compatibility(candidate: &GemmPlan) -> GemmPlanCompatibility {
             })
             .collect(),
         output: (
-            element_order_compatibility(candidate.output.format.layout.order),
-            candidate.output.format.layout.memory_class,
+            element_order_compatibility(candidate.requirements.output.format.layout.order),
+            candidate.requirements.output.format.layout.memory_class,
             candidate
+                .requirements
                 .output
                 .format
                 .layout
@@ -3392,19 +3384,18 @@ fn gemm_plan_compatibility(candidate: &GemmPlan) -> GemmPlanCompatibility {
 }
 
 fn retain_precise_gemm_plans(
-    operator: MidOperator,
-    candidates: Vec<GemmPlan>,
+    candidates: Vec<OperatorPlan>,
     inputs: &[TensorType],
     output: &TensorShape,
     costs: &impl CostModel,
     width: usize,
-) -> Vec<GemmPlan> {
+) -> Vec<OperatorPlan> {
     let ranked = candidates
         .into_iter()
         .map(|candidate| {
             let planned_inputs = inputs
                 .iter()
-                .zip(&candidate.inputs)
+                .zip(&candidate.requirements.inputs)
                 .map(|(input, requirement)| TensorType {
                     shape: input.shape.clone(),
                     format: requirement.format.clone(),
@@ -3412,33 +3403,27 @@ fn retain_precise_gemm_plans(
                 .collect::<Vec<_>>();
             let planned_output = TensorType {
                 shape: output.clone(),
-                format: candidate.output.format.clone(),
-            };
-            let requirements = OperatorRequirements {
-                inputs: candidate.inputs.clone(),
-                output: candidate.output.clone(),
-                output_aliasing: OutputAliasing::Fresh,
-                memory_space: candidate.memory_space.clone(),
+                format: candidate.requirements.output.format.clone(),
             };
             let memory = operator_memory_estimate(
                 &candidate.dispatch,
-                &requirements,
+                &candidate.requirements,
                 &planned_inputs,
                 &planned_output,
             );
             let exchange = costs.operator_exchange_footprint(
-                operator,
+                candidate.operator,
                 &candidate.dispatch,
-                &requirements,
+                &candidate.requirements,
                 &planned_inputs,
                 &planned_output,
             );
             let objective = RegionMetrics {
                 cost: CostEstimate {
                     cycles: costs.operator_cycles(
-                        operator,
+                        candidate.operator,
                         &candidate.dispatch,
-                        &requirements,
+                        &candidate.requirements,
                         &planned_inputs,
                         &planned_output,
                     ),
@@ -3451,7 +3436,7 @@ fn retain_precise_gemm_plans(
             (candidate, objective, compatibility)
         })
         .collect::<Vec<_>>();
-    let mut frontier = Vec::<(GemmPlan, RegionMetrics, GemmPlanCompatibility)>::new();
+    let mut frontier = Vec::<(OperatorPlan, RegionMetrics, GemmPlanCompatibility)>::new();
     for entry in ranked {
         if frontier
             .iter()
@@ -3506,8 +3491,11 @@ fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
     }
 }
 
-fn apply_grouped_output_layout(candidate: &mut GemmPlan, grouping: GroupedOutputLayout) -> bool {
-    if candidate.output.format.precision != Precision::F16
+fn apply_grouped_output_layout(
+    candidate: &mut OperatorPlan,
+    grouping: GroupedOutputLayout,
+) -> bool {
+    if candidate.requirements.output.format.precision != Precision::F16
         || grouping.groups == 0
         || grouping.physical_lane_multiple == 0
     {
@@ -3535,8 +3523,8 @@ fn apply_grouped_output_layout(candidate: &mut GemmPlan, grouping: GroupedOutput
         axis.padding = Padding::Zero;
         true
     };
-    configure(&mut candidate.inputs[1].format.layout)
-        && configure(&mut candidate.output.format.layout)
+    configure(&mut candidate.requirements.inputs[1].format.layout)
+        && configure(&mut candidate.requirements.output.format.layout)
 }
 
 fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxis) {
@@ -4085,14 +4073,15 @@ mod tests {
                 .collect::<Vec<_>>();
             for seed in seeds {
                 assert!(
-                    precisions.contains(&seed.inputs[0].format.precision),
+                    precisions.contains(&seed.requirements.inputs[0].format.precision),
                     "case {case}"
                 );
                 assert!(
-                    memory_classes.contains(&seed.inputs[1].format.layout.memory_class),
+                    memory_classes
+                        .contains(&seed.requirements.inputs[1].format.layout.memory_class),
                     "case {case}"
                 );
-                assert!(active.contains(&seed.output.format.layout.tiling.tile_count));
+                assert!(active.contains(&seed.requirements.output.format.layout.tiling.tile_count));
             }
 
             let selected_precision = precisions[0];
@@ -4159,9 +4148,7 @@ mod tests {
                 TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
             ];
             let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
-            let operator = gemm_operator(GemmOptions::default(), &base);
             let candidates = parallel_reduction_plans(
-                operator,
                 &base,
                 &inputs,
                 &TensorShape(vec![m, n]),
@@ -4186,9 +4173,8 @@ mod tests {
                 (reduction.result.rows, reduction.result.columns) != (1, 1)
             }));
             for candidate in candidates {
-                let plan = finish_gemm_plan(GemmOptions::default(), candidate.clone());
                 assert!(
-                    plan.supports(&inputs, &TensorShape(vec![m, n])),
+                    candidate.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
                 assert!(matches!(candidate.dispatch,
@@ -4312,19 +4298,19 @@ mod tests {
                 TensorType::new(
                     [u32::from(row_partitions), inner],
                     Precision::F16,
-                    candidate.inputs[0].format.layout.clone(),
+                    candidate.requirements.inputs[0].format.layout.clone(),
                 ),
                 TensorType::new(
                     [inner, columns],
                     Precision::F16,
-                    candidate.inputs[1].format.layout.clone(),
+                    candidate.requirements.inputs[1].format.layout.clone(),
                 ),
             ];
             let variants =
                 independent_parameter_storage(&candidate, &inputs, 1, &PipelineConfig::new(tiles));
             assert!(!variants.is_empty(), "case {case}");
             for variant in variants {
-                let tiling = &variant.inputs[1].format.layout.tiling;
+                let tiling = &variant.requirements.inputs[1].format.layout.tiling;
                 assert_eq!(tiling.replicas, 1, "case {case}");
                 assert!(tiling.tile_count <= tiles, "case {case}");
                 assert_eq!(
@@ -4338,7 +4324,7 @@ mod tests {
                     "case {case}"
                 );
                 assert!(
-                    variant.inputs[1]
+                    variant.requirements.inputs[1]
                         .format
                         .layout
                         .resolve(&inputs[1].shape)
