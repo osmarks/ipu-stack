@@ -13,7 +13,6 @@ pub use package::{
 
 mod config;
 mod cost;
-pub mod emitter;
 mod estimate;
 pub mod exchange;
 pub mod graph;
@@ -27,7 +26,6 @@ mod metrics;
 pub mod mid;
 mod operator;
 pub mod place;
-mod program;
 pub mod storage;
 pub mod tile;
 pub use config::{
@@ -90,11 +88,6 @@ pub use operator::{
     PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
 };
 pub use place::{Placement, PlacementError, place};
-pub use program::{
-    CheckpointStep, ComputeStep, ExchangePatch, ExchangeSetupPatch, ExchangeStep, HostPhase,
-    HostProgram, PlacedExchangeRow, RepeatPointer, RepeatStep, StepProfile, TileAddress,
-    TileProgram, TileStep,
-};
 pub use storage::{
     ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, block_major_matrix_coordinates,
     logical_view_byte_spans, shard_storage_bytes, view_byte_spans,

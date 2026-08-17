@@ -1,9 +1,3 @@
-use crate::emitter::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenError, CodegenOptions, GeneratedProgram,
-    HOST_RUN_SYMBOL, HOST_STAGING_SYMBOL, PATCH_ROW_SYMBOL, PATCH_WORD_SYMBOL, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
-    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit,
-};
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::ir::{MidGraph, MidOperationKind};
@@ -15,18 +9,27 @@ use crate::memory::{
 use crate::mid::lower_finalists;
 use crate::operator::Precision;
 use crate::{
-    KernelBuildPlan, PipelineConfig, TileProgram, TileProgramLowering, lower_exchanges,
-    lower_to_tiles, place, shard_storage_bytes,
+    KernelBuildPlan, PipelineConfig, TileProgramLowering, lower_exchanges, lower_to_tiles, place,
+    shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
-use ipu_target::exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
     AddressRegion, Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
     PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
     ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
     SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
 };
+use ipu_target::emit::{
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenError, CodegenOptions, GeneratedProgram,
+    HOST_RUN_SYMBOL, HOST_STAGING_SYMBOL, PATCH_ROW_SYMBOL, PATCH_WORD_SYMBOL, PRNG_SEED_SYMBOL,
+    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
+    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit,
+};
+use ipu_target::exchange::ExchangeError;
+use ipu_target::instruction::{encode_br_m, encode_setzi_m};
+use ipu_target::program::{StepProfile, TileProgram, TileStep};
+use ipu_target::topology::{Topology, c600_logical_to_physical};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -206,7 +209,8 @@ pub fn build_tile_program_package(
         "host exchange aperture",
         AddressRegion::new(
             ipu_target::exchange::EXCHANGE_WINDOW_BASE,
-            ipu_target::exchange::EXCHANGE_WINDOW_BASE + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
+            ipu_target::exchange::EXCHANGE_WINDOW_BASE
+                + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
         ),
     )?;
     memory.reserve(
@@ -471,11 +475,11 @@ pub fn build_tile_program_package(
 
 fn collect_exchange_rows(
     rows: &mut BTreeMap<u32, u32>,
-    steps: &[crate::TileStep],
+    steps: &[TileStep],
 ) -> PackageBuildResult<()> {
     for step in steps {
         match step {
-            crate::TileStep::Exchange(exchange) => {
+            TileStep::Exchange(exchange) => {
                 let bytes = u32::try_from(exchange.program.words.len())?
                     .checked_mul(4)
                     .ok_or_else(|| invalid("exchange row size overflow"))?;
@@ -488,19 +492,19 @@ fn collect_exchange_rows(
                     .and_modify(|existing| *existing = (*existing).max(end))
                     .or_insert(end);
             }
-            crate::TileStep::Repeat(repeat) => collect_exchange_rows(rows, &repeat.body)?,
-            crate::TileStep::Compute(_) | crate::TileStep::Checkpoint(_) => {}
+            TileStep::Repeat(repeat) => collect_exchange_rows(rows, &repeat.body)?,
+            TileStep::Compute(_) | TileStep::Checkpoint(_) => {}
         }
     }
     Ok(())
 }
 
-fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep]) {
+fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[TileStep]) {
     for step in steps {
         match step {
-            crate::TileStep::Compute(compute) => symbols.push(compute.symbol.clone()),
-            crate::TileStep::Repeat(repeat) => collect_compute_symbols(symbols, &repeat.body),
-            crate::TileStep::Exchange(_) | crate::TileStep::Checkpoint(_) => {}
+            TileStep::Compute(compute) => symbols.push(compute.symbol.clone()),
+            TileStep::Repeat(repeat) => collect_compute_symbols(symbols, &repeat.body),
+            TileStep::Exchange(_) | TileStep::Checkpoint(_) => {}
         }
     }
 }
@@ -765,7 +769,8 @@ fn build_package_from_objects(
         "host exchange aperture",
         AddressRegion::new(
             ipu_target::exchange::EXCHANGE_WINDOW_BASE,
-            ipu_target::exchange::EXCHANGE_WINDOW_BASE + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
+            ipu_target::exchange::EXCHANGE_WINDOW_BASE
+                + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
         ),
     )?;
     memory.reserve(
@@ -1438,9 +1443,7 @@ fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
 
 fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
     Ok(Topology::new(
-        (0..tile_count)
-            .map(ipu_target::exchange::c600_logical_to_physical)
-            .collect(),
+        (0..tile_count).map(c600_logical_to_physical).collect(),
     )?)
 }
 
@@ -1577,18 +1580,18 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
             .iter()
             .any(|tile| tile_has_halfword_copy(program, tile))
         {
-            symbols.push(crate::emitter::COPY_U16_SYMBOL.into());
+            symbols.push(ipu_target::emit::COPY_U16_SYMBOL.into());
         }
-        symbols.push(crate::emitter::COPY_U32_SYMBOL.into());
-        symbols.push(crate::emitter::COPY_U64_SYMBOL.into());
-        symbols.push(crate::emitter::COPY_STRIDED_U64_SYMBOL.into());
+        symbols.push(ipu_target::emit::COPY_U32_SYMBOL.into());
+        symbols.push(ipu_target::emit::COPY_U64_SYMBOL.into());
+        symbols.push(ipu_target::emit::COPY_STRIDED_U64_SYMBOL.into());
     }
     if program
         .tiles
         .iter()
         .any(|tile| tile_has_fill_zero(program, tile))
     {
-        symbols.push(crate::emitter::FILL_ZERO_U64_SYMBOL.into());
+        symbols.push(ipu_target::emit::FILL_ZERO_U64_SYMBOL.into());
     }
     symbols
 }
@@ -1699,7 +1702,7 @@ fn instrument_profile(
     exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
     physical_tile: u32,
-    tile_program: &mut crate::TileProgram,
+    tile_program: &mut TileProgram,
     address: u32,
 ) -> PackageBuildResult<TileProfilePlan> {
     let mut plans = Vec::with_capacity(tile_program.steps.len());
@@ -1755,7 +1758,7 @@ fn instrument_profile(
             .zip(&mut tile_program.steps)
             .enumerate()
         {
-            if let (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) =
+            if let (crate::TileWorkRef::Checkpoint(operation, _), TileStep::Checkpoint(_)) =
                 (work, &*step)
             {
                 step_profile(step).before = Some(profile_address(address, index)?);
@@ -1773,11 +1776,11 @@ fn instrument_profile(
                 continue;
             }
             let (phase, provenance) = match (work, &*step) {
-                (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
+                (crate::TileWorkRef::Exchange(id), TileStep::Exchange(_)) => {
                     let phase = &program.exchange_phases[id.index() as usize];
                     (0x8000_0000 | id.index(), &phase.provenance)
                 }
-                (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => {
+                (crate::TileWorkRef::Repeat(repeat), TileStep::Repeat(_)) => {
                     (u32::try_from(index)?, &repeat.provenance)
                 }
                 _ => return Err(invalid("inactive tile contains executable work")),
@@ -1848,11 +1851,11 @@ fn profile_step(
     logical_tile: u16,
     index: usize,
     work: crate::TileWorkRef<'_>,
-    step: &mut crate::TileStep,
+    step: &mut TileStep,
     following: Option<&crate::WorkProvenance>,
 ) -> PackageBuildResult<ProfileStep> {
     match (work, step) {
-        (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(exchange)) => {
+        (crate::TileWorkRef::Exchange(id), TileStep::Exchange(exchange)) => {
             let phase = &program.exchange_phases[id.index() as usize];
             if !exchange.active {
                 exchange_synchronization_description(
@@ -1894,7 +1897,7 @@ fn profile_step(
                 Ok(description)
             }
         }
-        (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
+        (crate::TileWorkRef::Kernel(run), TileStep::Compute(compute)) => {
             let mut description = profile_description(
                 index,
                 u32::try_from(index)?,
@@ -1923,7 +1926,7 @@ fn profile_step(
             }
             Ok(description)
         }
-        (crate::TileWorkRef::LocalCopy(copy), crate::TileStep::Compute(compute)) => {
+        (crate::TileWorkRef::LocalCopy(copy), TileStep::Compute(compute)) => {
             if let Some(provenance) = following {
                 let mut description = profile_description(
                     index,
@@ -1971,14 +1974,14 @@ fn profile_step(
                 })
             }
         }
-        (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => profile_description(
+        (crate::TileWorkRef::Repeat(repeat), TileStep::Repeat(_)) => profile_description(
             index,
             u32::try_from(index)?,
             &repeat.provenance,
             ProfileStepKind::Compute,
             "repeat",
         ),
-        (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) => {
+        (crate::TileWorkRef::Checkpoint(operation, _), TileStep::Checkpoint(_)) => {
             Ok(ProfileStep {
                 local_index: u32::try_from(index)?,
                 phase: u32::try_from(index)?,
@@ -2063,12 +2066,12 @@ fn profile_description(
     })
 }
 
-fn step_profile(step: &mut crate::TileStep) -> &mut crate::StepProfile {
+fn step_profile(step: &mut TileStep) -> &mut StepProfile {
     match step {
-        crate::TileStep::Exchange(exchange) => &mut exchange.profile,
-        crate::TileStep::Compute(compute) => &mut compute.profile,
-        crate::TileStep::Repeat(repeat) => &mut repeat.profile,
-        crate::TileStep::Checkpoint(checkpoint) => &mut checkpoint.profile,
+        TileStep::Exchange(exchange) => &mut exchange.profile,
+        TileStep::Compute(compute) => &mut compute.profile,
+        TileStep::Repeat(repeat) => &mut repeat.profile,
+        TileStep::Checkpoint(checkpoint) => &mut checkpoint.profile,
     }
 }
 

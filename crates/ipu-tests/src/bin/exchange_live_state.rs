@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ipu_driver::Device;
-use ipu_target::exchange::Topology;
+use ipu_target::topology::Topology;
 
 #[derive(Parser)]
 #[command(about = "Read live IPU21 exchange state without resetting the device")]

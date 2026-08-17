@@ -1,8 +1,8 @@
-use crate::{HostPhase, HostProgram};
 use ipu_package::{
     AddressRegion, Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice,
     SEGMENT_EXECUTE, SEGMENT_READ, Segment,
 };
+use ipu_target::program::{HostPhase, HostProgram};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::package::{PackageBuildResult, invalid};
@@ -425,7 +425,10 @@ fn phase_instructions(
     let targets = xreq_targets(physical_tile, phase)?;
     let xreq = (!targets.is_empty())
         .then(|| {
-            ipu_target::exchange::assemble_host_xreq_program_for_targets(&targets, HOST_PACKET_ADDRESS)
+            ipu_target::exchange::assemble_host_xreq_program_for_targets(
+                &targets,
+                HOST_PACKET_ADDRESS,
+            )
         })
         .transpose()?;
     Ok(match (target, xreq) {
@@ -533,9 +536,9 @@ fn active(physical_tile: u16, phase: &Phase) -> bool {
 
 fn inactive_instructions() -> Vec<u32> {
     vec![
-        ipu_target::exchange::sans(1),
-        ipu_target::exchange::SYNC_ANS_INSTRUCTION,
-        ipu_target::exchange::RETURN_M10_INSTRUCTION,
+        ipu_target::instruction::sans(1),
+        ipu_target::instruction::SYNC_ANS_INSTRUCTION,
+        ipu_target::instruction::RETURN_M10_INSTRUCTION,
     ]
 }
 

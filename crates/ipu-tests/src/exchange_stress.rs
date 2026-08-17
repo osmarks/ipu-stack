@@ -1,19 +1,22 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
-    CheckpointStep, CompiledPackage, ComputeStep, ExchangeActivity, ExchangeActivityKind,
-    ExchangeStep, PhysicalTransfer, PlacedExchangeRow, StepProfile, TileAddress, TileProgram,
-    TileProgramData, TileStep, TransferEndpoint, TransferWidth, build_tile_program_package,
-    inactive_exchange_program,
+    CompiledPackage, ExchangeActivity, ExchangeActivityKind, PhysicalTransfer, TileProgramData,
+    TransferEndpoint, TransferWidth, build_tile_program_package, inactive_exchange_program,
 };
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
-use ipu_target::exchange::{
-    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, encode_exchange_delay,
-    finalize_point_receiver, patch_receiver_address, patch_sender_address,
-    scheduled_receiver_timing,
-};
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
+use ipu_target::exchange::{
+    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, finalize_point_receiver,
+    patch_receiver_address, patch_sender_address, scheduled_receiver_timing,
+};
+use ipu_target::instruction::encode_exchange_delay;
+use ipu_target::program::{
+    CheckpointStep, ComputeStep, ExchangeStep, PlacedExchangeRow, StepProfile, TileAddress,
+    TileProgram, TileStep,
+};
+use ipu_target::topology::Topology;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -124,9 +127,9 @@ pub(crate) fn build_wide(
     let mut validated = BTreeSet::new();
     let mut row_address = WIDE_ROW_BASE;
     let setup_row = vec![
-        ipu_target::exchange::SYNC_SUPERVISOR_INSTRUCTION,
+        ipu_target::instruction::SYNC_SUPERVISOR_INSTRUCTION,
         encode_exchange_delay(0),
-        ipu_target::exchange::RETURN_M10_INSTRUCTION,
+        ipu_target::instruction::RETURN_M10_INSTRUCTION,
     ];
     let setup_end = row_address + u32::try_from(setup_row.len())? * 4;
     diagnostic_rows.push(StressRow {
@@ -237,7 +240,7 @@ pub(crate) fn build_wide(
         let phase = builder.finish()?;
         let mut rows = phase.programs;
         for row in rows.iter_mut().flatten() {
-            row.insert(0, ipu_target::exchange::SYNC_SUPERVISOR_INSTRUCTION);
+            row.insert(0, ipu_target::instruction::SYNC_SUPERVISOR_INSTRUCTION);
         }
         for (index, &destination) in destinations.iter().enumerate() {
             if receiver_mask & (1 << (index & 1)) == 0 {
@@ -248,9 +251,9 @@ pub(crate) fn build_wide(
             for row in &mut rows {
                 if row.is_none() {
                     *row = Some(vec![
-                        ipu_target::exchange::SYNC_SUPERVISOR_INSTRUCTION,
+                        ipu_target::instruction::SYNC_SUPERVISOR_INSTRUCTION,
                         encode_exchange_delay(0),
-                        ipu_target::exchange::RETURN_M10_INSTRUCTION,
+                        ipu_target::instruction::RETURN_M10_INSTRUCTION,
                     ]);
                 }
             }

@@ -1,16 +1,16 @@
 //! Encoding of finalized per-tile programs into IPU21 machine code.
 
+use crate::instruction::{
+    SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
+    encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
+    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
+};
 use crate::program::{
     ComputeStep, ExchangeSetupPatch, ExchangeStep, HostPhase, HostProgram, PlacedExchangeRow,
     RepeatStep, StepProfile, TileAddress, TileProgram, TileStep,
 };
 #[cfg(test)]
 use crate::program::{ExchangePatch, RepeatPointer};
-use ipu_target::exchange::{
-    SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
-    encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
-    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
-};
 use std::collections::BTreeMap;
 
 const INCOMING_BASE: u8 = 0xa4;
@@ -50,7 +50,7 @@ const PATCHED_BREAKPOINT_TRAP_BASE: u32 = 0x4180_1000;
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
     #[error("exchange encoding failed: {0}")]
-    Exchange(#[from] ipu_target::exchange::ExchangeError),
+    Exchange(#[from] crate::exchange::ExchangeError),
     #[error("invalid tile program: {0}")]
     Invalid(String),
 }
@@ -277,7 +277,7 @@ fn emit_steps(
                 } else {
                     if !exchange.active {
                         code.instruction(SANS_INACTIVE_INSTRUCTION);
-                        code.instruction(ipu_target::exchange::SYNC_ANS_INSTRUCTION);
+                        code.instruction(crate::instruction::SYNC_ANS_INSTRUCTION);
                     }
                 }
                 code.call(exchange.program.address, 10)?;
@@ -423,7 +423,7 @@ fn validate_exchange_program(exchange: &ExchangeStep) -> Result<()> {
         .first()
         .is_some_and(|word| *word == SYNC_SUPERVISOR_INSTRUCTION);
     if exchange.program.address & 0b11 != 0
-        || exchange.program.words.last() != Some(&ipu_target::exchange::RETURN_M10_INSTRUCTION)
+        || exchange.program.words.last() != Some(&crate::instruction::RETURN_M10_INSTRUCTION)
         || embedded_sync != exchange.sync_in_program
         || exchange
             .program
@@ -797,7 +797,6 @@ impl TileCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::inactive_exchange_program;
 
     fn symbols() -> BTreeMap<String, u32> {
         [
@@ -829,7 +828,7 @@ mod tests {
                     sync_in_program: false,
                     program: PlacedExchangeRow {
                         address: 0x60000,
-                        words: inactive_exchange_program(),
+                        words: vec![crate::instruction::RETURN_M10_INSTRUCTION],
                     },
                     setup_patch: None,
                     repeat_patches: Vec::new(),
@@ -921,7 +920,7 @@ mod tests {
                         sync_in_program: false,
                         program: PlacedExchangeRow {
                             address: 0x60000,
-                            words: vec![0, ipu_target::exchange::RETURN_M10_INSTRUCTION],
+                            words: vec![0, crate::instruction::RETURN_M10_INSTRUCTION],
                         },
                         setup_patch: None,
                         repeat_patches: vec![ExchangePatch {

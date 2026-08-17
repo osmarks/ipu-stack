@@ -4,10 +4,11 @@
 use crate::MemorySpaceRequirements;
 use crate::layout::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AmpOrder, BlockMajorOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad,
-    KernelRequirements, KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile,
-    StorageError, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
+    AmpOrder, BlockMajorOrder, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
+    KernelRun, LowProgram, LowShard, LowShardId, Precision, StorageError, TileKernelSpec,
+    TileWorkList, TileWorkRef, view_byte_spans,
 };
+use ipu_target::program::{ComputeStep, StepProfile, TileAddress};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const OUTPUT_REGISTER: u8 = 2;
@@ -1221,7 +1222,7 @@ pub fn tile_kernel_abi(
     };
     let (symbols, availability, inputs, scalars) = match kernel {
         TileKernelSpec::FillZero => (
-            KernelSymbols::Exact(crate::emitter::FILL_ZERO_U64_SYMBOL),
+            KernelSymbols::Exact(ipu_target::emit::FILL_ZERO_U64_SYMBOL),
             KernelAvailability::Implemented,
             0,
             scalar_arguments(0, &["words_per_worker", "remainder_workers"]),
@@ -1424,7 +1425,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         let bytes = output_byte_count(run)?;
         if !bytes.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {
-                symbol: crate::emitter::FILL_ZERO_U64_SYMBOL,
+                symbol: ipu_target::emit::FILL_ZERO_U64_SYMBOL,
                 count: bytes,
                 divisor: 8,
             });

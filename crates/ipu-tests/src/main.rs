@@ -2129,7 +2129,7 @@ fn gemm_right_value(inner: u32, column: u32) -> u16 {
 }
 
 fn c600_tile_count() -> u32 {
-    ipu_target::exchange::Topology::c600().tile_count() as u32
+    ipu_target::topology::Topology::c600().tile_count() as u32
 }
 
 fn write_package(application: &Application, path: &Path) -> Result<()> {

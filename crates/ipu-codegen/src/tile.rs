@@ -1,10 +1,12 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
 use crate::{
-    ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep, KernelBuildPlan, LowProgram,
-    LowShardId, PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun,
-    RepeatStep, StepProfile, TileAddress, TileProgram, TileStep, TileWorkList, TileWorkRef,
-    materialize_kernel_run,
+    ExchangePhaseId, KernelBuildPlan, LowProgram, LowShardId, PhysicalExchangePhase, Placement,
+    RepeatRun, TileWorkList, TileWorkRef, materialize_kernel_run,
+};
+use ipu_target::program::{
+    CheckpointStep, ComputeStep, ExchangePatch, ExchangeSetupPatch, ExchangeStep,
+    PlacedExchangeRow, RepeatPointer, RepeatStep, StepProfile, TileAddress, TileProgram, TileStep,
 };
 use std::collections::BTreeMap;
 
@@ -248,7 +250,7 @@ fn lower_work(
                         destination_offset: copy.destination_offset,
                         bytes: copy.bytes,
                     })?;
-                TileStep::Compute(crate::ComputeStep {
+                TileStep::Compute(ComputeStep {
                     symbol: symbol.into(),
                     output_address: TileAddress::Absolute(destination),
                     input_addresses: vec![TileAddress::Absolute(source)],
@@ -277,7 +279,7 @@ fn lower_work(
                 )?)
             }
             TileWorkRef::Checkpoint(operation, breakpoint) => {
-                TileStep::Checkpoint(crate::CheckpointStep {
+                TileStep::Checkpoint(CheckpointStep {
                     operation: operation.index(),
                     breakpoint,
                     profile: StepProfile::default(),
@@ -304,18 +306,21 @@ fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> 
             && row_bytes.checked_mul(rows) == Some(bytes))
         .then(|| {
             (
-                crate::emitter::COPY_STRIDED_U64_SYMBOL,
+                ipu_target::emit::COPY_STRIDED_U64_SYMBOL,
                 vec![row_bytes / 8, rows, source_stride, destination_stride],
             )
         });
     }
     if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
         let words = bytes / 8;
-        Some((crate::emitter::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
+        Some((
+            ipu_target::emit::COPY_U64_SYMBOL,
+            vec![words / 6, words % 6],
+        ))
     } else if bytes != 0 && bytes.is_multiple_of(4) {
-        Some((crate::emitter::COPY_U32_SYMBOL, vec![bytes / 4]))
+        Some((ipu_target::emit::COPY_U32_SYMBOL, vec![bytes / 4]))
     } else if bytes != 0 && bytes.is_multiple_of(2) {
-        Some((crate::emitter::COPY_U16_SYMBOL, vec![bytes / 2]))
+        Some((ipu_target::emit::COPY_U16_SYMBOL, vec![bytes / 2]))
     } else {
         None
     }
@@ -424,7 +429,7 @@ fn lower_inactive_work(
             })),
             TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => {}
             TileWorkRef::Checkpoint(operation, breakpoint) => {
-                steps.push(TileStep::Checkpoint(crate::CheckpointStep {
+                steps.push(TileStep::Checkpoint(CheckpointStep {
                     operation: operation.index(),
                     breakpoint,
                     profile: StepProfile::default(),
@@ -683,7 +688,8 @@ mod tests {
         ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, PlannerSearchDomain, Precision,
         TensorFormat, lower, lower_exchanges, lower_to_tiles, place,
     };
-    use ipu_target::exchange::{RETURN_M10_INSTRUCTION, Topology};
+    use ipu_target::instruction::RETURN_M10_INSTRUCTION;
+    use ipu_target::topology::Topology;
 
     #[test]
     fn randomized_gemms_finalize_to_address_resolved_tile_programs() {
@@ -778,12 +784,12 @@ mod tests {
                 pattern: crate::LocalCopyPattern::Contiguous,
             };
             let (symbol, arguments) = local_copy_call(&copy).unwrap();
-            if symbol == crate::emitter::COPY_U64_SYMBOL {
+            if symbol == ipu_target::emit::COPY_U64_SYMBOL {
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
                 assert!(arguments[1] < 6);
             } else {
-                assert_eq!(symbol, crate::emitter::COPY_U32_SYMBOL);
+                assert_eq!(symbol, ipu_target::emit::COPY_U32_SYMBOL);
                 assert_eq!(arguments, [words]);
             }
         }

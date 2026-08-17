@@ -4,14 +4,16 @@ use crate::{
     ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
     logical_view_byte_spans, view_byte_spans,
 };
-use ipu_target::exchange::{
-    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
-    RETURN_M10_INSTRUCTION, Topology, finalize_point_receiver, patch_receiver_address,
-    patch_sender_address, patch_sender_instruction, sender_address_instruction_groups,
-};
 use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
+use ipu_target::exchange::{
+    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
+    finalize_point_receiver, patch_receiver_address, patch_sender_address,
+    patch_sender_instruction, sender_address_instruction_groups,
+};
+use ipu_target::instruction::RETURN_M10_INSTRUCTION;
+use ipu_target::topology::{Topology, c600_logical_to_physical};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -1610,11 +1612,7 @@ pub fn schedule_exchange_problem(
             "tile count {tile_count} is outside the C600 topology"
         )));
     }
-    let topology = Topology::new(
-        (0..tile_count)
-            .map(ipu_target::exchange::c600_logical_to_physical)
-            .collect(),
-    )?;
+    let topology = Topology::new((0..tile_count).map(c600_logical_to_physical).collect())?;
     let pending = pending_from_problem(tile_count, problem)?;
     let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
     let OptimizedSchedule {
@@ -1735,7 +1733,8 @@ pub fn validate_exchange_schedule(
         .map(|transfer| Topology::c600().paired_logical(transfer.source))
         .collect::<Result<BTreeSet<_>, _>>()?;
     for tile in 0..size {
-        let decoded = ipu_target::exchange::parse::diagnose_plan_program(&phase.programs[tile], None)?;
+        let decoded =
+            ipu_target::exchange::parse::diagnose_plan_program(&phase.programs[tile], None)?;
         if decoded.event_cycles != phase.tile_event_cycles[tile] {
             return Err(fail(format!(
                 "phase {} tile {tile} decoded horizon {} differs from {}",
@@ -2520,7 +2519,9 @@ fn schedule_encoding_is_valid(
 ) -> Result<bool, ExchangeLoweringError> {
     match schedule.builder.clone().finish() {
         Ok(_) => Ok(true),
-        Err(ipu_target::exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
+        Err(ipu_target::exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => {
+            Ok(false)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -3664,7 +3665,9 @@ mod tests {
                     assert_eq!(*active, *local_cycles != 0);
                     assert_eq!(plan_event_cycles(program).unwrap(), *local_cycles);
                     assert!(*local_cycles <= phase.event_cycles);
-                    assert!(!program.contains(&ipu_target::exchange::SYNC_SUPERVISOR_INSTRUCTION));
+                    assert!(
+                        !program.contains(&ipu_target::instruction::SYNC_SUPERVISOR_INSTRUCTION)
+                    );
                 }
             }
         }
