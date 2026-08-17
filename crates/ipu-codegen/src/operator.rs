@@ -597,7 +597,7 @@ pub enum OperatorPlanError {
     UnsupportedGemmLayout,
 }
 
-pub(crate) fn alias_compatible(
+fn alias_compatible(
     index: usize,
     requirements: &[OperandRequirement],
     inputs: &[TensorType],
@@ -612,12 +612,12 @@ pub(crate) fn alias_compatible(
         })
 }
 
-pub(crate) fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
+fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
     requirement.allocation.alignment.is_power_of_two()
         && requirement.format.layout.resolve(shape).is_ok()
 }
 
-pub(crate) fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
+fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
     match operand {
         MemoryOperand::Output => true,
         MemoryOperand::Input(index) => usize::from(index) < input_count,
@@ -625,6 +625,89 @@ pub(crate) fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -
 }
 
 impl OperatorPlan {
+    pub(crate) fn candidate(
+        operator: MidOperator,
+        dispatch: OperatorDispatch,
+        requirements: OperatorRequirements,
+        deferred_output: Option<DeferredOutputPlan>,
+    ) -> Self {
+        let input_count = requirements.inputs.len();
+        Self {
+            operator,
+            dispatch,
+            requirements,
+            deferred_output,
+            deferred_inputs: vec![None; input_count],
+        }
+    }
+
+    pub(crate) fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
+        if self.requirements.inputs.len() != inputs.len()
+            || !valid_requirement(&self.requirements.output, output)
+            || !self
+                .requirements
+                .inputs
+                .iter()
+                .zip(inputs)
+                .all(|(requirement, input)| valid_requirement(requirement, &input.shape))
+        {
+            return false;
+        }
+        let alias_valid = match &self.requirements.output_aliasing {
+            OutputAliasing::Fresh => true,
+            OutputAliasing::MayAliasInputs(indices) => {
+                !indices.is_empty()
+                    && indices.iter().any(|index| {
+                        alias_compatible(
+                            usize::from(*index),
+                            &self.requirements.inputs,
+                            inputs,
+                            &self.requirements.output,
+                            output,
+                        )
+                    })
+            }
+            OutputAliasing::MustAliasInput(index) => alias_compatible(
+                usize::from(*index),
+                &self.requirements.inputs,
+                inputs,
+                &self.requirements.output,
+                output,
+            ),
+        };
+        if !alias_valid
+            || !self
+                .requirements
+                .memory_space
+                .distinct_element_groups
+                .iter()
+                .all(|operands| {
+                    operands.len() >= 2
+                        && operands
+                            .iter()
+                            .all(|operand| valid_memory_operand(*operand, inputs.len()))
+                        && operands.iter().enumerate().all(|(index, operand)| {
+                            !operands[..index].iter().any(|previous| previous == operand)
+                        })
+                })
+        {
+            return false;
+        }
+        let planned_inputs = inputs
+            .iter()
+            .zip(&self.requirements.inputs)
+            .map(|(input, requirement)| TensorType {
+                shape: input.shape.clone(),
+                format: requirement.format.clone(),
+            })
+            .collect::<Vec<_>>();
+        let planned_output = TensorType {
+            shape: output.clone(),
+            format: self.requirements.output.format.clone(),
+        };
+        self.validate(&planned_inputs, &planned_output).is_ok()
+    }
+
     pub fn validate(
         &self,
         inputs: &[TensorType],
