@@ -170,9 +170,10 @@ pub type OperationMetrics = PlanMetrics<MemoryEstimate>;
 pub type RegionMetrics = PlanMetrics<MemoryPeaks>;
 
 impl PlanMetrics<MemoryPeaks> {
-    fn pareto_dimensions(self) -> [u64; 7] {
+    fn pareto_dimensions(self) -> [u64; 8] {
         [
             self.cost.cycles,
+            self.cost.exchange_cycles,
             self.memory.standard,
             self.memory.interleaved,
             self.memory.total,

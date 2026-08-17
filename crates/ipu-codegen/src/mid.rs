@@ -1827,11 +1827,8 @@ struct GroupedOutputLayout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ParallelGridProxy {
-    compute: u64,
-    communication: u64,
-    temporary_bytes: u64,
-    unused_tiles: u64,
+struct ParallelGridCandidate {
+    metrics: RegionMetrics,
     grid: GemmGrid,
     physical_column_groups: u16,
     grouped: bool,
@@ -2722,11 +2719,19 @@ fn parallel_reduction_plans_for_orientation(
                 {
                     continue;
                 }
-                grids.push(ParallelGridProxy {
-                    compute,
-                    communication,
-                    temporary_bytes,
-                    unused_tiles: u64::from(tile_count - used_tiles),
+                grids.push(ParallelGridCandidate {
+                    metrics: RegionMetrics {
+                        cost: CostEstimate {
+                            cycles: compute.saturating_add(communication),
+                            exchange_cycles: communication,
+                            ..CostEstimate::default()
+                        },
+                        memory: MemoryPeaks {
+                            standard: temporary_bytes,
+                            total: temporary_bytes,
+                            ..MemoryPeaks::default()
+                        },
+                    },
                     grid: GemmGrid {
                         rows: row_partitions,
                         columns: column_partitions,
@@ -2752,20 +2757,13 @@ fn parallel_reduction_plans_for_orientation(
             })
             .collect::<Vec<_>>()
     } else {
-        // Peak temporary storage and unused tiles are independent planning
-        // constraints, so retain every non-dominated proxy tradeoff until the
-        // precise operator estimator can rank it.
-        let dominates = |left: &ParallelGridProxy, right: &ParallelGridProxy| {
+        // Inner partitioning and grouped outputs select different lowering
+        // families. Within each family the shared metrics vocabulary retains
+        // cycle, exchange, and memory tradeoffs for precise evaluation below.
+        let dominates = |left: &ParallelGridCandidate, right: &ParallelGridCandidate| {
             left.grid.inner == right.grid.inner
                 && left.grouped == right.grouped
-                && left.compute <= right.compute
-                && left.communication <= right.communication
-                && left.temporary_bytes <= right.temporary_bytes
-                && left.unused_tiles <= right.unused_tiles
-                && (left.compute < right.compute
-                    || left.communication < right.communication
-                    || left.temporary_bytes < right.temporary_bytes
-                    || left.unused_tiles < right.unused_tiles)
+                && left.metrics.dominates(right.metrics)
         };
         let mut frontier = Vec::new();
         for grid in grids {
@@ -2777,10 +2775,9 @@ fn parallel_reduction_plans_for_orientation(
         }
         frontier.sort_by_key(|grid| {
             (
-                grid.compute,
-                grid.communication,
-                grid.temporary_bytes,
-                grid.unused_tiles,
+                grid.metrics.cost.cycles,
+                grid.metrics.cost.exchange_cycles,
+                grid.metrics.memory.total,
                 grid.grid,
                 grid.grouped,
             )
@@ -2790,7 +2787,7 @@ fn parallel_reduction_plans_for_orientation(
     let proxy_frontier_grids = grids.len();
     let mut variants = Vec::new();
     for grid in grids {
-        let ParallelGridProxy {
+        let ParallelGridCandidate {
             grid:
                 GemmGrid {
                     rows: row_partitions,
