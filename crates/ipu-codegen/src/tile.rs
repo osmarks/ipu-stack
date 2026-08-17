@@ -647,19 +647,22 @@ fn layout_exchange_rows(
             }
         }
         if active && validate_placement {
-            let diagnostic = crate::diagnose_exchange_tile(phase, tile, program.address)?;
-            if let Some(conflict) = diagnostic
-                .activities
-                .iter()
-                .find(|activity| activity.conflicts_with_row)
-            {
+            let row_words =
+                u32::try_from(program.words.len()).map_err(|_| TileLoweringError::Overflow)?;
+            let row_elements =
+                ipu_target::memory::memory_elements_for_words(program.address, row_words)
+                    .collect::<Vec<_>>();
+            if let Some(conflict) = phase.activities[usize::from(tile)].iter().find(|activity| {
+                ipu_target::memory::memory_elements_for_words(activity.address, activity.words)
+                    .any(|element| row_elements.contains(&element))
+            }) {
                 return Err(TileLoweringError::ExchangeRowDataConflict {
                     tile,
                     phase: phase.id,
                     row_address: program.address,
-                    transfer: conflict.activity.transfer,
-                    kind: conflict.activity.kind,
-                    data_address: conflict.activity.address,
+                    transfer: conflict.transfer,
+                    kind: conflict.kind,
+                    data_address: conflict.address,
                 });
             }
         }
@@ -726,10 +729,8 @@ mod tests {
                 &low,
                 &placement,
                 &ipu_target::hardware::HardwareTarget::Ipu21.topology(),
-                crate::ExchangeLoweringOptions::default(),
             )
-            .unwrap()
-            .phases;
+            .unwrap();
             let filler_tiles = random.u16(1..=4);
             let lowering = TileProgramLowering::new(
                 &low,

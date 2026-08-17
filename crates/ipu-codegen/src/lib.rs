@@ -34,12 +34,9 @@ pub use config::{
     PlannerSearchDomain, ProfilingConfig,
 };
 pub use conversion::{ConversionGeometryError, ConversionMapping, CopyGeometry};
+pub(crate) use exchange::lower_exchanges;
 pub use exchange::{
-    EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
-    ExchangeLoweringError, ExchangeLoweringOptions, ExchangeScheduleProblem, ExchangeScheduleRun,
-    ExchangeScheduleSnapshot, ExchangeTileDiagnostic, LoweredExchanges, PhysicalExchangePhase,
-    diagnose_exchange_tile, inactive_exchange_program, lower_exchanges, schedule_exchange_problem,
-    validate_exchange_schedule,
+    ExchangeActivity, ExchangeLoweringError, PhysicalExchangePhase, inactive_exchange_program,
 };
 pub use graph::{
     AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,

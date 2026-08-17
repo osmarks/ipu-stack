@@ -112,13 +112,6 @@ pub struct CompiledPackage {
     pub inputs: Vec<CompiledTensor>,
     pub outputs: Vec<CompiledTensor>,
     pub precisions: BTreeMap<ValueId, Precision>,
-    /// Exact physical exchange schedules retained for low-level diagnostics.
-    /// This is build metadata and is not serialized into the application.
-    pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
-    /// Address-resolved inputs to physical exchange scheduling and row codegen.
-    pub exchange_schedule: crate::ExchangeScheduleSnapshot,
-    /// Base address used when laying out the compact per-tile exchange table.
-    pub exchange_code_base: u32,
     pub checkpoints: Vec<DiagnosticCheckpoint>,
     placement: crate::Placement,
 }
@@ -726,19 +719,13 @@ fn select_scheduled_finalist(
     for (index, mid) in finalists.into_iter().enumerate() {
         let low = lower_to_tiles(&mid, planning)?;
         let placement = place(&low)?;
-        let exchanges = lower_exchanges(
-            &low,
-            &placement,
-            &topology,
-            crate::ExchangeLoweringOptions::default(),
-        )?;
+        let exchanges = lower_exchanges(&low, &placement, &topology)?;
         let scheduled_exchange_cycles = exchanges
-            .phases
             .iter()
             .map(|phase| u64::from(phase.event_cycles))
             .sum::<u64>()
             .saturating_add(
-                (exchanges.phases.len() as u64)
+                (exchanges.len() as u64)
                     .saturating_mul(planning.target.costs().exchange_phase_cycles),
             );
         let estimated_non_exchange_cycles = mid
@@ -803,14 +790,8 @@ fn build_package_from_objects(
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
     let provisional_exchanges = build_phase("lower_exchanges_provisional", || {
-        Ok(lower_exchanges(
-            program,
-            &provisional_placement,
-            &topology,
-            crate::ExchangeLoweringOptions::default(),
-        )?)
-    })?
-    .phases;
+        Ok(lower_exchanges(program, &provisional_placement, &topology)?)
+    })?;
     let execution_tile_count = u16::try_from(config.pipeline.target.topology().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
         &provisional_exchanges,
@@ -1088,17 +1069,9 @@ fn build_package_from_objects(
         )?)
     })?;
     let lowered_exchanges = build_phase("lower_exchanges", || {
-        Ok(lower_exchanges(
-            program,
-            &placement,
-            &topology,
-            crate::ExchangeLoweringOptions {
-                diagnostics: config.pipeline.exchange_diagnostics,
-            },
-        )?)
+        Ok(lower_exchanges(program, &placement, &topology)?)
     })?;
-    let exchange_schedule = lowered_exchanges.schedule_snapshot;
-    let exchanges = lowered_exchanges.phases;
+    let exchanges = lowered_exchanges;
     let (tensors, output_tensors) = compiled_graph_tensors(mid, program, &placement, &topology)?;
     let inputs = program
         .inputs
@@ -1330,9 +1303,6 @@ fn build_package_from_objects(
         inputs: tensors,
         outputs: output_tensors,
         precisions: package_precisions(mid),
-        exchange_phases: exchanges,
-        exchange_schedule,
-        exchange_code_base,
         checkpoints: Vec::new(),
         placement,
     })

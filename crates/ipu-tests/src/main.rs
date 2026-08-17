@@ -57,40 +57,15 @@ struct Arguments {
     /// Profiling instrumentation: none, overall start/end timing, or full step traces.
     #[arg(long, default_value = "full")]
     profiling: ProfilingConfig,
-    /// Log exchange scheduling lower bounds and critical dependency chains.
+    /// Print the static exchange-stress diagnostic.
     #[arg(long)]
     exchange_diagnostics: bool,
     /// Decode every active supervisor row for this exchange-stress case.
     #[arg(long, requires = "exchange_diagnostics")]
     exchange_diagnostic_case: Option<u32>,
-    /// Replace the compiled workload with a tokenized replay of one exact
-    /// physical exchange phase and verify every touched word after execution.
-    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
-    exchange_replay_phase: Option<usize>,
-    /// Replay a phase from an exported address-resolved schedule without
-    /// recompiling the model.
-    #[arg(
-        long,
-        requires = "exchange_replay_phase",
-        conflicts_with = "export_exchange_schedule"
-    )]
-    replay_exchange_schedule: Option<PathBuf>,
-    /// Maximum number of systematically distributed words read back by an
-    /// exact exchange-phase replay.
-    #[arg(long, default_value_t = 8192)]
-    exchange_replay_samples: usize,
-    /// Replay only this prefix of the selected phase's transfer list.
-    #[arg(long, requires = "exchange_replay_phase")]
-    exchange_replay_transfer_limit: Option<usize>,
-    /// Skip this many transfers before applying the replay transfer limit.
-    #[arg(long, default_value_t = 0, requires = "exchange_replay_phase")]
-    exchange_replay_first_transfer: usize,
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
-    /// Write the address-resolved pre-scheduling exchange input and exit.
-    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "exchange_replay_phase"])]
-    export_exchange_schedule: Option<PathBuf>,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
@@ -372,9 +347,6 @@ fn main() -> Result<()> {
     if arguments.diagnostic_run && arguments.diagnostic_samples == 0 {
         bail!("--diagnostic-samples must be nonzero");
     }
-    if arguments.exchange_replay_phase.is_some() && arguments.exchange_replay_samples == 0 {
-        bail!("--exchange-replay-samples must be nonzero");
-    }
     if arguments.diagnostic_run && arguments.profile_output.is_some() {
         bail!("--diagnostic-run cannot be combined with --profile-output");
     }
@@ -534,32 +506,6 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if let Some(path) = &arguments.replay_exchange_schedule {
-        let phase = arguments
-            .exchange_replay_phase
-            .expect("clap requires a replay phase");
-        let input = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let snapshot: ipu_codegen::ExchangeScheduleSnapshot =
-            serde_json::from_reader(std::io::BufReader::new(input))
-                .with_context(|| format!("read {}", path.display()))?;
-        if snapshot.schema_version != ipu_codegen::EXCHANGE_SCHEDULE_SNAPSHOT_VERSION {
-            bail!(
-                "exchange schedule schema {} does not match supported schema {}",
-                snapshot.schema_version,
-                ipu_codegen::EXCHANGE_SCHEDULE_SNAPSHOT_VERSION
-            );
-        }
-        let replay = exchange_stress::build_schedule_phase_replay(
-            &snapshot,
-            phase,
-            arguments.exchange_replay_first_transfer,
-            arguments.exchange_replay_transfer_limit,
-            &Toolchain::from_sdk(&arguments.sdk),
-            &runtime_source,
-        )?;
-        execute_exchange_replay(&arguments, &replay, &bootloader)?;
-        return Ok(());
-    }
     let mut graph = ComputeGraph::default();
     let mut search_domain =
         PlannerSearchDomain::default().with_attention_strategy(arguments.attention_strategy);
@@ -577,7 +523,6 @@ fn main() -> Result<()> {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
         pipeline = pipeline.with_tile_memory_budget(bytes);
     }
-    pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.stream_conversions {
         pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Always;
     } else if arguments.materialize_conversions {
@@ -793,42 +738,6 @@ fn main() -> Result<()> {
         }
         None
     };
-    if let Some(path) = &arguments.export_exchange_schedule {
-        let compiled = compiled_package
-            .as_ref()
-            .context("--export-exchange-schedule requires a newly compiled package")?;
-        let output =
-            fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-        serde_json::to_writer(std::io::BufWriter::new(output), &compiled.exchange_schedule)
-            .with_context(|| format!("write {}", path.display()))?;
-        let transfers = compiled
-            .exchange_schedule
-            .phases
-            .iter()
-            .map(|phase| phase.transfers.len())
-            .sum::<usize>();
-        println!(
-            "exchangeSchedule={} tiles={} phases={} transfers={}",
-            path.display(),
-            compiled.exchange_schedule.tile_count,
-            compiled.exchange_schedule.phases.len(),
-            transfers
-        );
-        return Ok(());
-    }
-    if let Some(phase) = arguments.exchange_replay_phase {
-        let compiled = compiled_package
-            .as_ref()
-            .context("--exchange-replay-phase requires a newly compiled package")?;
-        let replay = exchange_stress::build_phase_replay(
-            compiled,
-            phase,
-            &package_config.toolchain,
-            &package_config.runtime_source,
-        )?;
-        execute_exchange_replay(&arguments, &replay, &bootloader)?;
-        return Ok(());
-    }
     let application = Application::read(
         fs::File::open(&arguments.package)
             .with_context(|| format!("open {}", arguments.package.display()))?,
@@ -1003,58 +912,6 @@ fn retry_after_reset<T>(sdk: &Path, mut attempt: impl FnMut() -> Result<T>) -> R
         }
         Err(error) => Err(error),
     }
-}
-
-fn execute_exchange_replay(
-    arguments: &Arguments,
-    replay: &exchange_stress::PhaseReplayPackage,
-    bootloader: &Path,
-) -> Result<()> {
-    write_package(&replay.application, &arguments.package)?;
-    let configuration = fs::read(&arguments.configuration)
-        .with_context(|| format!("read {}", arguments.configuration.display()))?;
-    let bootloader_bytes =
-        fs::read(bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-    retry_after_reset(&arguments.sdk, || {
-        let runtime = open_and_load_once(
-            &arguments.device,
-            &configuration,
-            &replay.application,
-            &bootloader_bytes,
-            replay.application.host_exchange.startup_mark,
-        )?;
-        let mut session = runtime.host_session(&replay.application)?;
-        session.start()?;
-        let mut serviced = false;
-        let executed = session
-            .invoke_streaming_deferred_with_poll("run", &[0; 4], |device| {
-                replay
-                    .service_readback(device, arguments.exchange_replay_samples, &mut serviced)
-                    .map_err(|error| DriverError::Invalid(error.to_string()))
-            })
-            .inspect_err(|error| {
-                tracing::error!(
-                    %error,
-                    device = %device_failure_diagnostics(&runtime, &replay.application),
-                    "exchange replay failed"
-                );
-            })?;
-        if !serviced {
-            bail!("exchange replay completed without reaching its readback trap");
-        }
-        let _ = session.collect(&executed)?;
-        diagnose_completion(
-            &runtime,
-            &replay.application,
-            Duration::from_secs(arguments.timeout_seconds),
-        )
-    })?;
-    println!(
-        "package={} exchangeReplayPhase={} hardwareTest=PASS",
-        arguments.package.display(),
-        replay.phase
-    );
-    Ok(())
 }
 
 fn run_gemm(

@@ -25,7 +25,6 @@ pub struct PipelineConfig {
     pub tile_memory_budget_bytes: u64,
     pub profiling: ProfilingConfig,
     pub diagnostic_checkpoints: bool,
-    pub exchange_diagnostics: bool,
     pub conversion_streaming: ConversionStreamingPolicy,
     pub(crate) resolved_active_tile_counts: Vec<u16>,
 }
@@ -254,7 +253,6 @@ impl PipelineConfig {
             tile_memory_budget_bytes: memory.total_bytes,
             profiling: ProfilingConfig::default(),
             diagnostic_checkpoints: false,
-            exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
             resolved_active_tile_counts: Vec::new(),
         }
