@@ -1,6 +1,6 @@
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
-use crate::low::{LowProgram, LowValue};
+use crate::low::LowProgram;
 use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
@@ -131,13 +131,8 @@ pub struct DiagnosticCheckpoint {
 
 #[derive(Clone, Debug)]
 pub struct CompiledTensor {
-    pub value: ValueId,
-    pub storage: CompiledTensorStorage,
-}
-
-#[derive(Clone, Debug)]
-pub struct CompiledTensorStorage {
     pub name: Option<String>,
+    pub value: ValueId,
     pub shape: crate::TensorShape,
     pub precision: Precision,
     pub shards: Vec<CompiledTensorShard>,
@@ -526,9 +521,7 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
-    let (mut built, mid, low) = build_package_artifacts(graph, config, false)?;
-    let topology = active_topology(low.tile_count)?;
-    built.tensors = package_tensors(&mid, &low, &built.placement, &topology)?;
+    let (built, _, _) = build_package_artifacts(graph, config, false)?;
     Ok(built)
 }
 
@@ -555,27 +548,24 @@ pub fn build_diagnostic_package(
         let tensors = operation
             .results
             .iter()
-            .map(|&value| diagnostic_tensor(&mid, &low, &built.placement, &topology, value, None))
+            .map(|&value| compiled_tensor(&mid, &low, &built.placement, &topology, value, None))
             .collect::<PackageBuildResult<Vec<_>>>()?;
         // A fully deferred view operation has no device work or independently
         // materialized boundary to stop at; its consumer's checkpoint covers
         // the fused mapping instead.
-        if tensors
-            .iter()
-            .all(|tensor| tensor.storage.shards.is_empty())
-        {
+        if tensors.iter().all(|tensor| tensor.shards.is_empty()) {
             continue;
         }
         for tensor in &tensors {
             tracing::debug!(
                 operation = source.index(),
                 value = tensor.value.index(),
-                shape = ?tensor.storage.shape.0,
-                precision = ?tensor.storage.precision,
-                shards = tensor.storage.shards.len(),
-                order = ?tensor.storage.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
-                memory_class = ?tensor.storage.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
-                first_extents = ?tensor.storage.shards.first().map(|shard| &shard.storage.extents),
+                shape = ?tensor.shape.0,
+                precision = ?tensor.precision,
+                shards = tensor.shards.len(),
+                order = ?tensor.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
+                memory_class = ?tensor.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
+                first_extents = ?tensor.shards.first().map(|shard| &shard.storage.extents),
                 "recorded diagnostic tensor"
             );
         }
@@ -585,7 +575,6 @@ pub fn build_diagnostic_package(
             tensors,
         });
     }
-    built.tensors = package_tensors(&mid, &low, &built.placement, &topology)?;
     built.checkpoints = checkpoints;
     Ok(built)
 }
@@ -607,7 +596,7 @@ fn package_tensors(
         .inputs
         .iter()
         .map(|input| {
-            diagnostic_tensor(
+            compiled_tensor(
                 mid,
                 low,
                 placement,
@@ -622,7 +611,7 @@ fn package_tensors(
         .iter()
         .enumerate()
         .map(|(index, output)| {
-            diagnostic_tensor(
+            compiled_tensor(
                 mid,
                 low,
                 placement,
@@ -687,7 +676,7 @@ fn build_package_artifacts(
     })?;
     let mut package_config = config.clone();
     package_config.pipeline = planning;
-    let built = build_package_from_objects(&low, &package_config, &objects, &kernel_plan)?;
+    let built = build_package_from_objects(&mid, &low, &package_config, &objects, &kernel_plan)?;
     Ok((built, mid, low))
 }
 
@@ -762,6 +751,7 @@ fn select_scheduled_finalist(
 }
 
 fn build_package_from_objects(
+    mid: &MidGraph,
     program: &LowProgram,
     config: &PackageConfig,
     objects: &[Vec<u8>],
@@ -871,25 +861,25 @@ fn build_package_from_objects(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
+    let provisional_tensors = package_tensors(mid, program, &provisional_placement, &topology)?;
     let provisional_inputs = program
         .inputs
         .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Host)
-        .map(|input| input_binding(program, &provisional_placement, &topology, input))
+        .zip(&provisional_tensors.inputs)
+        .filter(|(input, _)| input.kind == crate::GraphInputKind::Host)
+        .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
     let provisional_weights = program
         .inputs
         .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .map(|input| input_binding(program, &provisional_placement, &topology, input))
+        .zip(&provisional_tensors.inputs)
+        .filter(|(input, _)| input.kind == crate::GraphInputKind::Parameter)
+        .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut provisional_outputs = program
+    let mut provisional_outputs = provisional_tensors
         .outputs
         .iter()
-        .enumerate()
-        .map(|(index, output)| {
-            output_binding(program, &provisional_placement, &topology, output, index)
-        })
+        .map(CompiledTensor::binding)
         .collect::<PackageBuildResult<Vec<_>>>()?;
     if let Some(storage) = &profile_storage {
         provisional_outputs.push(cycle_binding(
@@ -1080,23 +1070,25 @@ fn build_package_from_objects(
     })?;
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
     let exchanges = lowered_exchanges.phases;
+    let tensors = package_tensors(mid, program, &placement, &topology)?;
     let inputs = program
         .inputs
         .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Host)
-        .map(|input| input_binding(program, &placement, &topology, input))
+        .zip(&tensors.inputs)
+        .filter(|(input, _)| input.kind == crate::GraphInputKind::Host)
+        .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
     let weights = program
         .inputs
         .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .map(|input| input_binding(program, &placement, &topology, input))
+        .zip(&tensors.inputs)
+        .filter(|(input, _)| input.kind == crate::GraphInputKind::Parameter)
+        .map(|(_, tensor)| tensor.binding())
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut outputs = program
+    let mut outputs = tensors
         .outputs
         .iter()
-        .enumerate()
-        .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
+        .map(CompiledTensor::binding)
         .collect::<PackageBuildResult<Vec<_>>>()?;
     if config.pipeline.profiling.records_overall_time() {
         outputs.push(cycle_binding(
@@ -1305,7 +1297,7 @@ fn build_package_from_objects(
     application.validate()?;
     Ok(CompiledPackage {
         application,
-        tensors: PackageTensorMetadata::default(),
+        tensors,
         exchanges: PackageExchangeArtifacts {
             exchange_phases: exchanges,
             exchange_schedule,
@@ -1316,7 +1308,7 @@ fn build_package_from_objects(
     })
 }
 
-fn diagnostic_tensor(
+fn compiled_tensor(
     mid: &MidGraph,
     low: &LowProgram,
     placement: &crate::Placement,
@@ -1328,27 +1320,39 @@ fn diagnostic_tensor(
         .values
         .get(value.index() as usize)
         .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
-    let low_value = low.values.iter().find(|candidate| candidate.value == value);
-    let storage = if let Some(low_value) = low_value {
-        compiled_tensor_storage(
-            low,
-            placement,
-            topology,
-            name,
-            &mid_value.tensor_type,
-            &low_value.shards,
-        )?
-    } else {
-        CompiledTensorStorage {
-            name,
-            shape: mid_value.tensor_type.shape.clone(),
-            precision: mid_value.tensor_type.format.precision,
-            shards: Vec::new(),
-        }
-    };
+    let shards = low
+        .values
+        .iter()
+        .find(|candidate| candidate.value == value)
+        .into_iter()
+        .flat_map(|value| &value.shards)
+        .filter(|id| {
+            low.shards
+                .get(id.index() as usize)
+                .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
+        })
+        .map(|id| {
+            let storage = low
+                .shards
+                .get(id.index() as usize)
+                .ok_or_else(|| invalid("compiled tensor shard is missing"))?;
+            Ok(CompiledTensorShard {
+                physical_tile: topology.physical(storage.tile)?,
+                address: placement
+                    .shard_addresses
+                    .get(id)
+                    .copied()
+                    .ok_or_else(|| invalid("compiled tensor shard placement is missing"))?,
+                storage: storage.clone(),
+            })
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
     Ok(CompiledTensor {
+        name,
         value: mid_value.origin,
-        storage,
+        shape: mid_value.tensor_type.shape.clone(),
+        precision: mid_value.tensor_type.format.precision,
+        shards,
     })
 }
 
@@ -1632,37 +1636,6 @@ fn tile_has_local_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool
         | crate::TileWorkRef::Kernel(_)
         | crate::TileWorkRef::Checkpoint(..) => false,
     })
-}
-
-fn input_binding(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    input: &crate::LowInput,
-) -> PackageBuildResult<Binding> {
-    binding(
-        program,
-        placement,
-        topology,
-        input.name.clone(),
-        &input.shards,
-    )
-}
-
-fn output_binding(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    output: &LowValue,
-    index: usize,
-) -> PackageBuildResult<Binding> {
-    binding(
-        program,
-        placement,
-        topology,
-        format!("output.{index}"),
-        &output.shards,
-    )
 }
 
 fn cycle_binding(name: &str, address: u32, tile_count: u16, topology: &Topology) -> Binding {
@@ -2118,70 +2091,7 @@ fn profile_address(base: u32, index: usize) -> PackageBuildResult<u32> {
     .ok_or_else(|| invalid("profile address overflow"))
 }
 
-fn binding(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    name: String,
-    shards: &[crate::LowShardId],
-) -> PackageBuildResult<Binding> {
-    let first = shards
-        .first()
-        .and_then(|id| program.shards.get(id.index() as usize))
-        .ok_or_else(|| invalid("binding has no shards"))?;
-    compiled_tensor_storage(
-        program,
-        placement,
-        topology,
-        Some(name),
-        &first.tensor_type,
-        shards,
-    )?
-    .binding()
-}
-
-fn compiled_tensor_storage(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    name: Option<String>,
-    tensor_type: &crate::TensorType,
-    shards: &[crate::LowShardId],
-) -> PackageBuildResult<CompiledTensorStorage> {
-    let shards = shards
-        .iter()
-        .filter(|id| {
-            program
-                .shards
-                .get(id.index() as usize)
-                .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
-        })
-        .map(|id| {
-            let storage = program
-                .shards
-                .get(id.index() as usize)
-                .ok_or_else(|| invalid("compiled tensor shard is missing"))?;
-            let address = placement
-                .shard_addresses
-                .get(id)
-                .copied()
-                .ok_or_else(|| invalid("compiled tensor shard placement is missing"))?;
-            Ok(CompiledTensorShard {
-                physical_tile: topology.physical(storage.tile)?,
-                address,
-                storage: storage.clone(),
-            })
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    Ok(CompiledTensorStorage {
-        name,
-        shape: tensor_type.shape.clone(),
-        precision: tensor_type.format.precision,
-        shards,
-    })
-}
-
-impl CompiledTensorStorage {
+impl CompiledTensor {
     pub fn binding(&self) -> PackageBuildResult<Binding> {
         let name = self
             .name

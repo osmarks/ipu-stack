@@ -158,7 +158,7 @@ fn service_checkpoint(
                 tensor.value.index()
             )
         })?;
-        if tensor.storage.shards.is_empty() {
+        if tensor.shards.is_empty() {
             tracing::warn!(
                 operation = checkpoint.operation.index(),
                 value = tensor.value.index(),
@@ -208,11 +208,11 @@ fn compare_tensor(
     rtol: f32,
     operation: u32,
 ) -> Result<(usize, f32)> {
-    let total = usize::try_from(tensor.storage.shape.elements())?;
+    let total = usize::try_from(tensor.shape.elements())?;
     let wanted = sample_indices(total, sample_limit);
     let mut actual = BTreeMap::<usize, f32>::new();
     let mut words = HashMap::<(u16, u32), u32>::new();
-    for shard in &tensor.storage.shards {
+    for shard in &tensor.shards {
         for (index, byte_offset) in shard_elements(tensor, shard)? {
             if !wanted.contains(&index) || actual.contains_key(&index) {
                 continue;
@@ -225,10 +225,7 @@ fn compare_tensor(
             let word = *words
                 .entry((shard.physical_tile, word_address))
                 .or_insert(device.read_tile_word(shard.physical_tile, word_address)?);
-            actual.insert(
-                index,
-                decode_word(word, address & 0b11, tensor.storage.precision)?,
-            );
+            actual.insert(index, decode_word(word, address & 0b11, tensor.precision)?);
         }
     }
     let mut mismatches = Vec::new();
@@ -287,7 +284,7 @@ pub(crate) fn shard_elements(
         shard: shard.storage.id,
         extents: logical_extents.clone().into(),
     };
-    let element_bytes = u32::try_from(tensor.storage.precision.bytes())?;
+    let element_bytes = u32::try_from(tensor.precision.bytes())?;
     let offsets = logical_view_byte_spans(&shard.storage, &view)?
         .into_iter()
         .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(element_bytes as usize))
@@ -303,7 +300,7 @@ pub(crate) fn shard_elements(
         let mut stride = 1u64;
         for (extent, (&width, &dimension)) in logical_extents
             .iter()
-            .zip(widths.iter().zip(&tensor.storage.shape.0))
+            .zip(widths.iter().zip(&tensor.shape.0))
             .rev()
         {
             let coordinate = remainder % u64::from(width);
@@ -342,12 +339,7 @@ pub(crate) fn prepare_inputs(
         };
         let seed = 0x4449_4147_4e4f_5354 ^ u64::from(input.value.index());
         let data = (0..input.shape.elements())
-            .map(|index| {
-                quantize(
-                    super::gaussian(seed, index) * scale,
-                    metadata.storage.precision,
-                )
-            })
+            .map(|index| quantize(super::gaussian(seed, index) * scale, metadata.precision))
             .collect();
         values.insert(
             input.value,
@@ -362,12 +354,12 @@ pub(crate) fn prepare_inputs(
         for binding in bindings {
             let metadata = metadata
                 .iter()
-                .find(|tensor| tensor.storage.name.as_deref() == Some(binding.name.as_str()))
+                .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
                 .with_context(|| format!("diagnostic metadata for {} is missing", binding.name))?;
             let tensor = &values[&metadata.value];
             let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
-            let mut covered = vec![false; usize::try_from(metadata.storage.shape.elements())?];
-            for shard in &metadata.storage.shards {
+            let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
+            for shard in &metadata.shards {
                 let slice = binding
                     .slices
                     .iter()
@@ -379,16 +371,14 @@ pub(crate) fn prepare_inputs(
                         format!("binding slice for {} shard is missing", binding.name)
                     })?;
                 for (index, offset) in shard_elements(metadata, shard)? {
-                    if u64::from(offset) + u64::try_from(metadata.storage.precision.bytes())?
-                        > slice.size
-                    {
+                    if u64::from(offset) + u64::try_from(metadata.precision.bytes())? > slice.size {
                         bail!("logical element exceeds binding {} shard", binding.name);
                     }
                     encode_value(
                         &mut bytes,
                         usize::try_from(slice.file_offset + u64::from(offset))?,
                         tensor.values[index],
-                        metadata.storage.precision,
+                        metadata.precision,
                     )?;
                     covered[index] = true;
                 }

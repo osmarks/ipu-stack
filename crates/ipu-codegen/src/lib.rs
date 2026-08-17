@@ -69,10 +69,9 @@ pub use mid::{
     TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
 };
 pub use package::{
-    CompiledPackage, CompiledTensor, CompiledTensorShard, CompiledTensorStorage,
-    DiagnosticCheckpoint, PackageBuildError, PackageBuildResult, PackageConfig,
-    PackageExchangeArtifacts, PackageTensorMetadata, TileProgramData, build_diagnostic_package,
-    build_package, build_tile_program_package,
+    CompiledPackage, CompiledTensor, CompiledTensorShard, DiagnosticCheckpoint, PackageBuildError,
+    PackageBuildResult, PackageConfig, PackageExchangeArtifacts, PackageTensorMetadata,
+    TileProgramData, build_diagnostic_package, build_package, build_tile_program_package,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{

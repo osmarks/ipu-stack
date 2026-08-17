@@ -1652,7 +1652,7 @@ fn run_siglip_mlp_benchmark(
         .tensors
         .outputs
         .iter()
-        .find(|tensor| tensor.storage.name.as_deref() == Some("output.0"))
+        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
         .context("MLP benchmark package has no logical output storage map")?;
     let expected = references
         .get(&output_metadata.value)
@@ -1804,8 +1804,8 @@ fn verify_logical_f16_output(
     expected: &[f32],
 ) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
-    if tensor.storage.precision != Precision::F16
-        || expected.len() != usize::try_from(tensor.storage.shape.elements())?
+    if tensor.precision != Precision::F16
+        || expected.len() != usize::try_from(tensor.shape.elements())?
     {
         bail!("MLP benchmark output metadata is inconsistent with its reference");
     }
@@ -1814,7 +1814,7 @@ fn verify_logical_f16_output(
     let mut mismatches = Vec::new();
     let mut mismatch_count = 0usize;
     let mut checked = 0usize;
-    for shard in &tensor.storage.shards {
+    for shard in &tensor.shards {
         let slice = binding
             .slices
             .iter()
