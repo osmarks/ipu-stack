@@ -20,7 +20,7 @@ use crate::{
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
-use ipu_target::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
+use ipu_target::exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
 use ipu_package::{
     AddressRegion, Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
     PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
@@ -205,8 +205,8 @@ pub fn build_tile_program_package(
     memory.reserve(
         "host exchange aperture",
         AddressRegion::new(
-            ipu_target::EXCHANGE_WINDOW_BASE,
-            ipu_target::EXCHANGE_WINDOW_BASE + ipu_target::EXCHANGE_WINDOW_BYTES,
+            ipu_target::exchange::EXCHANGE_WINDOW_BASE,
+            ipu_target::exchange::EXCHANGE_WINDOW_BASE + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
         ),
     )?;
     memory.reserve(
@@ -764,8 +764,8 @@ fn build_package_from_objects(
     memory.reserve(
         "host exchange aperture",
         AddressRegion::new(
-            ipu_target::EXCHANGE_WINDOW_BASE,
-            ipu_target::EXCHANGE_WINDOW_BASE + ipu_target::EXCHANGE_WINDOW_BYTES,
+            ipu_target::exchange::EXCHANGE_WINDOW_BASE,
+            ipu_target::exchange::EXCHANGE_WINDOW_BASE + ipu_target::exchange::EXCHANGE_WINDOW_BYTES,
         ),
     )?;
     memory.reserve(
@@ -1439,7 +1439,7 @@ fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
 fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
     Ok(Topology::new(
         (0..tile_count)
-            .map(ipu_target::c600_logical_to_physical)
+            .map(ipu_target::exchange::c600_logical_to_physical)
             .collect(),
     )?)
 }
@@ -1538,7 +1538,7 @@ fn link_runtime(
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
             regions: vec![
-                (SUPPORT_START, ipu_target::EXCHANGE_WINDOW_BASE),
+                (SUPPORT_START, ipu_target::exchange::EXCHANGE_WINDOW_BASE),
                 (
                     RUNTIME_EXECUTABLE_START,
                     ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,

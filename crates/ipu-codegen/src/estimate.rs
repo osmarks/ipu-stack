@@ -1066,7 +1066,7 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         right_inner_axis,
         output_column_axis,
     )?;
-    let transfer_bytes = u64::from(ipu_target::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
     let mut traffic = ExchangeEndpointTraffic::default();
     let mut left_is_remote = false;
     let mut right_is_remote = false;
@@ -1250,7 +1250,7 @@ fn add_operand_outgoing_bus_work(
     if !remote {
         return;
     }
-    let transfer_bytes = u64::from(ipu_target::MAX_TRANSFER_WORDS) * 4;
+    let transfer_bytes = u64::from(ipu_target::exchange::MAX_TRANSFER_WORDS) * 4;
     for tile in 0..operand.format.layout.tiling.tile_count {
         let bytes = maximum_shard_bytes(operand);
         traffic.add_outgoing(tile / 2, bytes, bytes.div_ceil(transfer_bytes));

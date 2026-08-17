@@ -502,7 +502,7 @@ fn layout_exchange_rows(
         };
         let has_repeat_patches = !phase.repeat_patches[usize::from(tile)].is_empty();
         let key = (
-            ipu_target::normalized_exchange_address_words(program),
+            ipu_target::exchange::normalized_exchange_address_words(program),
             has_repeat_patches.then_some(phase.id.index()),
         );
         *key_counts.entry(key).or_default() += 1;
@@ -527,7 +527,7 @@ fn layout_exchange_rows(
         let has_repeat_patches =
             tile < scheduled_tile_count && !phase.repeat_patches[usize::from(tile)].is_empty();
         let key = (
-            ipu_target::normalized_exchange_address_words(&base_program),
+            ipu_target::exchange::normalized_exchange_address_words(&base_program),
             has_repeat_patches.then_some(phase.id.index()),
         );
         let shared_count = key_counts.get(&key).copied().unwrap_or(1);
@@ -683,7 +683,7 @@ mod tests {
         ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, PlannerSearchDomain, Precision,
         TensorFormat, lower, lower_exchanges, lower_to_tiles, place,
     };
-    use ipu_target::{RETURN_M10_INSTRUCTION, Topology};
+    use ipu_target::exchange::{RETURN_M10_INSTRUCTION, Topology};
 
     #[test]
     fn randomized_gemms_finalize_to_address_resolved_tile_programs() {

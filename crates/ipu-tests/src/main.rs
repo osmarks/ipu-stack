@@ -2129,7 +2129,7 @@ fn gemm_right_value(inner: u32, column: u32) -> u16 {
 }
 
 fn c600_tile_count() -> u32 {
-    ipu_target::Topology::c600().tile_count() as u32
+    ipu_target::exchange::Topology::c600().tile_count() as u32
 }
 
 fn write_package(application: &Application, path: &Path) -> Result<()> {
@@ -2140,7 +2140,7 @@ fn write_package(application: &Application, path: &Path) -> Result<()> {
 }
 
 fn inspect_exchange_rows(application: &Application, selected_tile: Option<u32>) -> Result<String> {
-    use ipu_target::diagnostic::{PlanOperation, SendEncoding};
+    use ipu_target::exchange::parse::{PlanOperation, SendEncoding};
 
     let mut summaries = Vec::new();
     let mut selected = String::new();
@@ -2170,7 +2170,7 @@ fn inspect_exchange_rows(application: &Application, selected_tile: Option<u32>) 
             .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte exchange word")))
             .collect::<Vec<_>>();
         let diagnostic =
-            ipu_target::diagnostic::diagnose_plan_program(&words, Some(region.address))?;
+            ipu_target::exchange::parse::diagnose_plan_program(&words, Some(region.address))?;
         let mut counts = [0usize; 6];
         for instruction in &diagnostic.instructions {
             match &instruction.operation {
@@ -2314,10 +2314,10 @@ fn exchange_row_failure_diagnostic(
         .map(|(offset, (&expected, &actual))| (offset, expected, actual))
         .collect::<Vec<_>>();
     let expected_decode =
-        ipu_target::diagnostic::diagnose_plan_program(&expected, Some(region.address))
+        ipu_target::exchange::parse::diagnose_plan_program(&expected, Some(region.address))
             .map(|row| row.render_around_address(program_counter, 12));
     let actual_decode = (actual != expected).then(|| {
-        ipu_target::diagnostic::diagnose_plan_program(&actual, Some(region.address))
+        ipu_target::exchange::parse::diagnose_plan_program(&actual, Some(region.address))
             .map(|row| row.render_around_address(program_counter, 12))
     });
     Some(format!(
