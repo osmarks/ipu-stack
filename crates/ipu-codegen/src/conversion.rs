@@ -4,9 +4,69 @@ use crate::graph::TensorShape;
 use crate::layout::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Layout, LayoutError, TensorRegion,
 };
-use crate::operator::{ConversionStrategy, Precision};
+use crate::operator::{OperandRequirement, Precision, TileKernelSpec};
 use crate::storage::{StorageError, amp_micro_dimension, physical_byte_offset};
 use std::collections::BTreeMap;
+
+/// Address-independent strategy for materializing a format conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConversionStrategy {
+    LocalKernel,
+    DirectRetile,
+    DirectLogical,
+    StageLogicalThenTransform,
+}
+
+impl ConversionStrategy {
+    pub const fn uses_intersections(self) -> bool {
+        !matches!(self, Self::LocalKernel)
+    }
+}
+
+pub fn layout_conversion_strategy(
+    precision: Precision,
+    from: &Layout,
+    to: &Layout,
+) -> ConversionStrategy {
+    if from.order == to.order {
+        ConversionStrategy::DirectRetile
+    } else if precision == Precision::F32
+        || matches!(from.order, ElementOrder::RowMajor)
+            && matches!(
+                to.order,
+                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+            )
+        || matches!(to.order, ElementOrder::RowMajor)
+            && matches!(
+                from.order,
+                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+            )
+        || matches!(
+            (from.order, to.order),
+            (
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+            ) | (
+                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }),
+                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
+            )
+        )
+    {
+        ConversionStrategy::DirectLogical
+    } else {
+        ConversionStrategy::StageLogicalThenTransform
+    }
+}
+
+/// Resolved copy recipe consumed by costing and low-level lowering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversionPlan {
+    pub kernel: TileKernelSpec,
+    pub input: OperandRequirement,
+    pub output: OperandRequirement,
+    pub strategy: ConversionStrategy,
+    pub mappings: Vec<ConversionMapping>,
+}
 
 /// One regular copy nest within a conversion route.
 ///

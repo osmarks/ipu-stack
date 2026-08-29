@@ -3,7 +3,8 @@
 use crate::graph::{GraphInputKind, OperationId, ValueId};
 use crate::layout::{Layout, TensorType};
 use crate::metrics::{OperationMetrics, RegionMetrics};
-use crate::operator::{ConversionPlan, MidOperator, OperatorPlan, Precision};
+use crate::conversion::ConversionPlan;
+use crate::operator::{MidOperator, OperatorPlan, Precision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidValueId(u32);

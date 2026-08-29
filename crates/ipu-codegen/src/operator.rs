@@ -1,6 +1,5 @@
 //! Whole-device operator plans and tile-kernel specifications.
 
-use crate::ConversionMapping;
 use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions, TensorShape};
 use crate::ir::MidValueId;
 use crate::layout::{
@@ -578,78 +577,6 @@ pub struct OperatorPlan {
     pub deferred_output: Option<DeferredOutputPlan>,
     /// Deferred producer results claimed by each input operand.
     pub deferred_inputs: Vec<Option<DeferredInputPlan>>,
-}
-
-/// Address-independent recipe for materializing a format conversion.
-///
-/// Layouts determine the logical shard regions and relative physical spans;
-/// final tile identities and SRAM addresses remain a low-level concern.  The
-/// same recipe is consumed by the cost model and by tile-program lowering so
-/// planning cannot silently price a different conversion from the one emitted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ConversionStrategy {
-    /// Run one tile-local kernel over corresponding resident shards.
-    LocalKernel,
-    /// Exchange logical intersections directly into the destination layout.
-    DirectRetile,
-    /// Exchange word-aligned semantic blocks directly between differing
-    /// element orders.
-    DirectLogical,
-    /// Exchange logical values into row-major staging, then transform locally
-    /// into the destination element order.
-    StageLogicalThenTransform,
-}
-
-impl ConversionStrategy {
-    pub const fn uses_intersections(self) -> bool {
-        !matches!(self, Self::LocalKernel)
-    }
-}
-
-pub fn layout_conversion_strategy(
-    precision: Precision,
-    from: &Layout,
-    to: &Layout,
-) -> ConversionStrategy {
-    if from.order == to.order {
-        ConversionStrategy::DirectRetile
-    } else if precision == Precision::F32
-        || matches!(from.order, ElementOrder::RowMajor)
-            && matches!(
-                to.order,
-                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-            )
-        || matches!(to.order, ElementOrder::RowMajor)
-            && matches!(
-                from.order,
-                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-            )
-        || matches!(
-            (from.order, to.order),
-            (
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }),
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-            ) | (
-                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }),
-                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
-            )
-        )
-    {
-        ConversionStrategy::DirectLogical
-    } else {
-        ConversionStrategy::StageLogicalThenTransform
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConversionPlan {
-    pub kernel: TileKernelSpec,
-    pub input: OperandRequirement,
-    pub output: OperandRequirement,
-    pub strategy: ConversionStrategy,
-    /// Resolved ownership intersections and copy nests used by costing,
-    /// exchange generation, and local-copy lowering.
-    pub mappings: Vec<ConversionMapping>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]

@@ -3,7 +3,9 @@
 use crate::ConversionMapping;
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::conversion::plan_conversion_mappings;
+use crate::conversion::{
+    ConversionStrategy, layout_conversion_strategy, plan_conversion_mappings,
+};
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -16,8 +18,8 @@ use crate::layout::{
 };
 use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{
-    ConversionStrategy, DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator,
-    OperatorDispatch, OperatorRequirements, Precision, layout_conversion_strategy,
+    DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator, OperatorDispatch,
+    OperatorRequirements, Precision,
 };
 use foldhash::fast::FixedState;
 use ipu_target::cost::HardwareCosts;

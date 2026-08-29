@@ -33,7 +33,9 @@ pub use config::{
     AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
     PlannerSearchDomain, ProfilingConfig,
 };
-pub use conversion::{ConversionGeometryError, ConversionMapping, CopyGeometry};
+pub use conversion::{
+    ConversionGeometryError, ConversionMapping, ConversionPlan, ConversionStrategy, CopyGeometry,
+};
 pub(crate) use exchange::lower_exchanges;
 pub use exchange::{
     ExchangeActivity, ExchangeLoweringError, PhysicalExchangePhase, inactive_exchange_program,
@@ -71,8 +73,8 @@ pub use metrics::{
 pub use mid::{CostModel, Ipu21CostModel, LoweringError, LoweringResult, lower};
 pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,
-    AttentionPlan, BlockedGemmPlan, ConversionPlan, ConversionStrategy, GemmBlockShape,
-    GemmDistribution, GemmGeometry, GemmGrid, GemmKernelFamily, GemmKernelMode, GemmOrientation,
+    AttentionPlan, BlockedGemmPlan, GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid,
+    GemmKernelFamily, GemmKernelMode, GemmOrientation,
     GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder, LocalOperandStaging,
     MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements, MidOperator,
     OperandMaterialization, OperandRequirement, OperatorDispatch, OperatorPlan, OperatorPlanError,

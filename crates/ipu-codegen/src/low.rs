@@ -7,6 +7,7 @@
 //! remaining choices.
 
 use crate::PipelineConfig;
+use crate::conversion::ConversionStrategy;
 use crate::graph::{GraphInputKind, OperationId};
 use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::layout::{
@@ -14,9 +15,9 @@ use crate::layout::{
     LayoutError, MemoryClass, ShardExtent, TensorRegion, TensorTiling, TensorType,
 };
 use crate::operator::{
-    ConversionStrategy, DeferredTransform, GemmDistribution, MemoryOperand,
-    MemorySpaceRequirements, OperandRequirement, OperatorDispatch, OperatorRequirements,
-    OutputAliasing, PointwiseInputMapping, Precision, TileKernelSpec,
+    DeferredTransform, GemmDistribution, MemoryOperand, MemorySpaceRequirements,
+    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
+    PointwiseInputMapping, Precision, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use ipu_target::hardware::HardwareTarget;

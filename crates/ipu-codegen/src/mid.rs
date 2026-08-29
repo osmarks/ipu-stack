@@ -13,6 +13,7 @@ use crate::config::{
 };
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
+use crate::conversion::{ConversionPlan, ConversionStrategy, layout_conversion_strategy};
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity,
