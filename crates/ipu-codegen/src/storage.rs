@@ -1,6 +1,8 @@
 //! Conversion from logical shard views to physical byte ranges.
 
-use crate::layout::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, TensorRegion};
+use crate::layout::{
+    AMP_COLUMN_MICRO, BlockedOrder, LayoutError, NativeKernelOrder, StorageOrder, TensorRegion,
+};
 use crate::low::{LowShard, ShardView};
 use crate::operator::Precision;
 
@@ -20,9 +22,11 @@ pub enum StorageError {
     #[error("matrix storage requires a tensor of rank at least two")]
     MatrixRank,
     #[error("AMP {role:?} storage dimensions are incompatible with its block shape")]
-    AmpBlock { role: AmpOrder },
+    AmpBlock { role: NativeKernelOrder },
     #[error("block-major {order:?} storage dimensions are incompatible with its block shape")]
-    BlockMajorBlock { order: BlockMajorOrder },
+    BlockMajorBlock { order: BlockedOrder },
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
     #[error("tensor storage size overflowed")]
     Overflow,
 }
@@ -184,7 +188,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
 /// region. Conversion planning uses this only at layout block boundaries;
 /// enumerating individual tensor elements remains a validation facility.
 pub(crate) fn physical_byte_offset(
-    order: ElementOrder,
+    order: StorageOrder,
     precision: Precision,
     owner: &TensorRegion,
     coordinates: &[u32],
@@ -210,23 +214,32 @@ pub(crate) fn physical_byte_offset(
 }
 
 fn physical_index_for(
-    order: ElementOrder,
+    order: StorageOrder,
     precision: Precision,
     widths: &[u32],
     coordinates: &[u32],
 ) -> StorageResult<u64> {
     let rank = widths.len();
     match order {
-        ElementOrder::RowMajor => encode_row_major(widths, coordinates),
-        ElementOrder::BlockMajor(order) => {
+        StorageOrder::Linear => encode_row_major(widths, coordinates),
+        StorageOrder::Blocked(order) => {
             if rank < 2 {
                 return Err(StorageError::MatrixRank);
             }
-            let rows = widths[rank - 2];
-            let columns = widths[rank - 1];
-            let outer = encode_row_major(&widths[..rank - 2], &coordinates[..rank - 2])?;
-            let row = coordinates[rank - 2];
-            let column = coordinates[rank - 1];
+            let [row_axis, column_axis] = order.physical_axes(rank)?;
+            let mut outer_widths = Vec::with_capacity(rank - 2);
+            let mut outer_coordinates = Vec::with_capacity(rank - 2);
+            for axis in 0..rank {
+                if axis != row_axis && axis != column_axis {
+                    outer_widths.push(widths[axis]);
+                    outer_coordinates.push(coordinates[axis]);
+                }
+            }
+            let rows = widths[row_axis];
+            let columns = widths[column_axis];
+            let outer = encode_row_major(&outer_widths, &outer_coordinates)?;
+            let row = coordinates[row_axis];
+            let column = coordinates[column_axis];
             let matrix_elements = u64::from(rows) * u64::from(columns);
             let within = block_major_matrix_index(order, precision, rows, columns, row, column)?;
             outer
@@ -234,7 +247,7 @@ fn physical_index_for(
                 .and_then(|base| base.checked_add(u64::from(within)))
                 .ok_or(StorageError::Overflow)
         }
-        ElementOrder::Amp(role) => {
+        StorageOrder::Native(role) => {
             if rank < 2 {
                 return Err(StorageError::MatrixRank);
             }
@@ -243,14 +256,14 @@ fn physical_index_for(
             let outer = encode_row_major(&widths[..rank - 2], &coordinates[..rank - 2])?;
             let row = coordinates[rank - 2];
             let column = coordinates[rank - 1];
-            if role == AmpOrder::TransposedRight {
+            if role == NativeKernelOrder::TransposedRight {
                 let matrix_elements = u64::from(rows) * u64::from(columns);
                 let within = right_matrix_index(precision, columns, rows, column, row)?;
                 outer
                     .checked_mul(matrix_elements)
                     .and_then(|base| base.checked_add(u64::from(within)))
                     .ok_or(StorageError::Overflow)
-            } else if matches!(role, AmpOrder::Left | AmpOrder::Output) {
+            } else if matches!(role, NativeKernelOrder::Left | NativeKernelOrder::Output) {
                 let flat_rows = widths[..rank - 2].iter().try_fold(rows, |rows, &extent| {
                     rows.checked_mul(extent).ok_or(StorageError::Overflow)
                 })?;
@@ -295,7 +308,7 @@ fn encode_row_major(widths: &[u32], coordinates: &[u32]) -> StorageResult<u64> {
 }
 
 fn amp_matrix_index(
-    role: AmpOrder,
+    role: NativeKernelOrder,
     precision: Precision,
     rows: u32,
     columns: u32,
@@ -307,7 +320,7 @@ fn amp_matrix_index(
         return Err(StorageError::InvalidView);
     }
     match role {
-        AmpOrder::Left => {
+        NativeKernelOrder::Left => {
             let inner = amp_micro_dimension(precision);
             if !columns.is_multiple_of(inner) {
                 return Err(StorageError::AmpBlock { role });
@@ -318,11 +331,18 @@ fn amp_matrix_index(
                 .and_then(|base| base.checked_add(row * inner + column % inner))
                 .ok_or(StorageError::Overflow)
         }
-        AmpOrder::TransposedRight => right_matrix_index(precision, columns, rows, column, row),
-        AmpOrder::TransposedLeft => {
-            amp_matrix_index(AmpOrder::Left, precision, columns, rows, column, row)
+        NativeKernelOrder::TransposedRight => {
+            right_matrix_index(precision, columns, rows, column, row)
         }
-        AmpOrder::Output => {
+        NativeKernelOrder::TransposedLeft => amp_matrix_index(
+            NativeKernelOrder::Left,
+            precision,
+            columns,
+            rows,
+            column,
+            row,
+        ),
+        NativeKernelOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
             }
@@ -334,9 +354,14 @@ fn amp_matrix_index(
                 .and_then(|base| base.checked_add(row * COLUMN_MICRO + physical_column))
                 .ok_or(StorageError::Overflow)
         }
-        AmpOrder::TransposedOutput => {
-            amp_matrix_index(AmpOrder::Output, precision, columns, rows, column, row)
-        }
+        NativeKernelOrder::TransposedOutput => amp_matrix_index(
+            NativeKernelOrder::Output,
+            precision,
+            columns,
+            rows,
+            column,
+            row,
+        ),
     }
 }
 
@@ -366,36 +391,14 @@ fn right_matrix_index(
 }
 
 fn block_major_matrix_index(
-    order: BlockMajorOrder,
+    order: BlockedOrder,
     precision: Precision,
     rows: u32,
     columns: u32,
     row: u32,
     column: u32,
 ) -> StorageResult<u32> {
-    let (row_block, column_block, transposed) = match order {
-        BlockMajorOrder::Matrix {
-            row_block,
-            column_block,
-        } => (u32::from(row_block), u32::from(column_block), false),
-        BlockMajorOrder::TransposedMatrix {
-            row_block,
-            column_block,
-        } => (u32::from(row_block), u32::from(column_block), true),
-    };
-    if transposed {
-        return block_major_matrix_index(
-            BlockMajorOrder::Matrix {
-                row_block: row_block as u16,
-                column_block: column_block as u16,
-            },
-            precision,
-            columns,
-            rows,
-            column,
-            row,
-        );
-    }
+    let [row_block, column_block] = order.block_shape.map(u32::from);
     let row_micro = amp_micro_dimension(precision);
     if row >= rows
         || column >= columns
@@ -429,23 +432,15 @@ fn block_major_panel_spans(
         return Ok(None);
     }
     let rank = shard.extents.len();
-    let (inner_block, inner_axis, column_axis, column_tensor_axis) =
-        match shard.tensor_type.format.layout.order {
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
-                u32::from(row_block),
-                rank - 2,
-                rank - 1,
-                crate::TensorAxis::FromEnd(1),
-            ),
-            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { row_block, .. }) => (
-                u32::from(row_block),
-                rank - 1,
-                rank - 2,
-                crate::TensorAxis::FromEnd(2),
-            ),
-            _ => return Ok(None),
-        };
-    if shard.extents[..rank - 2] != view.extents[..rank - 2] {
+    let StorageOrder::Blocked(order) = shard.tensor_type.format.layout.order else {
+        return Ok(None);
+    };
+    let [inner_axis, column_axis] = order.physical_axes(rank)?;
+    let inner_block = u32::from(order.block_shape[0]);
+    let column_tensor_axis = order.axes[usize::from(order.permutation[1])];
+    if (0..rank).any(|axis| {
+        axis != inner_axis && axis != column_axis && shard.extents[axis] != view.extents[axis]
+    }) {
         return Ok(None);
     }
     let rows = shard.extents[inner_axis].physical_end - shard.extents[inner_axis].start;
@@ -568,16 +563,28 @@ fn physical_coordinates(
     let rank = widths.len();
     let mut coordinates = vec![0; rank];
     match shard.tensor_type.format.layout.order {
-        ElementOrder::RowMajor => decode_row_major(widths, physical, &mut coordinates),
-        ElementOrder::BlockMajor(order) => {
+        StorageOrder::Linear => decode_row_major(widths, physical, &mut coordinates),
+        StorageOrder::Blocked(order) => {
             if rank < 2 {
                 return Err(StorageError::MatrixRank);
             }
-            let rows = widths[rank - 2];
-            let columns = widths[rank - 1];
+            let [row_axis, column_axis] = order.physical_axes(rank)?;
+            let rows = widths[row_axis];
+            let columns = widths[column_axis];
             let matrix_elements = u64::from(rows) * u64::from(columns);
             let outer = physical / matrix_elements;
-            decode_row_major(&widths[..rank - 2], outer, &mut coordinates[..rank - 2]);
+            let outer_widths = (0..rank)
+                .filter(|&axis| axis != row_axis && axis != column_axis)
+                .map(|axis| widths[axis])
+                .collect::<Vec<_>>();
+            let mut outer_coordinates = vec![0; rank - 2];
+            decode_row_major(&outer_widths, outer, &mut outer_coordinates);
+            for (axis, coordinate) in (0..rank)
+                .filter(|&axis| axis != row_axis && axis != column_axis)
+                .zip(outer_coordinates)
+            {
+                coordinates[axis] = coordinate;
+            }
             let linear =
                 u32::try_from(physical % matrix_elements).map_err(|_| StorageError::Overflow)?;
             let (row, column) = block_major_matrix_coordinates(
@@ -587,16 +594,16 @@ fn physical_coordinates(
                 columns,
                 linear,
             )?;
-            coordinates[rank - 2] = row;
-            coordinates[rank - 1] = column;
+            coordinates[row_axis] = row;
+            coordinates[column_axis] = column;
         }
-        ElementOrder::Amp(role) => {
+        StorageOrder::Native(role) => {
             if rank < 2 {
                 return Err(StorageError::MatrixRank);
             }
             let rows = widths[rank - 2];
             let columns = widths[rank - 1];
-            if matches!(role, AmpOrder::Left | AmpOrder::Output) {
+            if matches!(role, NativeKernelOrder::Left | NativeKernelOrder::Output) {
                 let outer_rows = widths[..rank - 2]
                     .iter()
                     .try_fold(rows, |product, &extent| {
@@ -649,7 +656,7 @@ fn decode_row_major(widths: &[u32], mut linear: u64, output: &mut [u32]) {
 /// Maps a physical linear element in one AMP-packed matrix to its logical
 /// row and column. This is shared by package-data producers and placement.
 pub fn amp_matrix_coordinates(
-    role: AmpOrder,
+    role: NativeKernelOrder,
     precision: Precision,
     rows: u32,
     columns: u32,
@@ -657,7 +664,7 @@ pub fn amp_matrix_coordinates(
 ) -> StorageResult<(u32, u32)> {
     const COLUMN_MICRO: u32 = AMP_COLUMN_MICRO;
     match role {
-        AmpOrder::Left => {
+        NativeKernelOrder::Left => {
             let inner = amp_micro_dimension(precision);
             if !columns.is_multiple_of(inner) {
                 return Err(StorageError::AmpBlock { role });
@@ -667,13 +674,15 @@ pub fn amp_matrix_coordinates(
             let offset = linear % panel_elements;
             Ok((offset / inner, panel * inner + offset % inner))
         }
-        AmpOrder::TransposedRight => right_matrix_coordinates(precision, columns, rows, linear)
-            .map(|(column, row)| (row, column)),
-        AmpOrder::TransposedLeft => {
-            amp_matrix_coordinates(AmpOrder::Left, precision, columns, rows, linear)
+        NativeKernelOrder::TransposedRight => {
+            right_matrix_coordinates(precision, columns, rows, linear)
                 .map(|(column, row)| (row, column))
         }
-        AmpOrder::Output => {
+        NativeKernelOrder::TransposedLeft => {
+            amp_matrix_coordinates(NativeKernelOrder::Left, precision, columns, rows, linear)
+                .map(|(column, row)| (row, column))
+        }
+        NativeKernelOrder::Output => {
             if !columns.is_multiple_of(COLUMN_MICRO) {
                 return Err(StorageError::AmpBlock { role });
             }
@@ -690,8 +699,8 @@ pub fn amp_matrix_coordinates(
                 panel * COLUMN_MICRO + logical_pair * 2 + physical_column % 2,
             ))
         }
-        AmpOrder::TransposedOutput => {
-            amp_matrix_coordinates(AmpOrder::Output, precision, columns, rows, linear)
+        NativeKernelOrder::TransposedOutput => {
+            amp_matrix_coordinates(NativeKernelOrder::Output, precision, columns, rows, linear)
                 .map(|(column, row)| (row, column))
         }
     }
@@ -722,35 +731,13 @@ fn right_matrix_coordinates(
 /// Maps a physical linear element in block-major storage to its logical
 /// matrix coordinate.
 pub fn block_major_matrix_coordinates(
-    order: BlockMajorOrder,
+    order: BlockedOrder,
     precision: Precision,
     rows: u32,
     columns: u32,
     linear: u32,
 ) -> StorageResult<(u32, u32)> {
-    let (row_block, column_block, transposed) = match order {
-        BlockMajorOrder::Matrix {
-            row_block,
-            column_block,
-        } => (u32::from(row_block), u32::from(column_block), false),
-        BlockMajorOrder::TransposedMatrix {
-            row_block,
-            column_block,
-        } => (u32::from(row_block), u32::from(column_block), true),
-    };
-    if transposed {
-        return block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: row_block as u16,
-                column_block: column_block as u16,
-            },
-            precision,
-            columns,
-            rows,
-            linear,
-        )
-        .map(|(column, row)| (row, column));
-    }
+    let [row_block, column_block] = order.block_shape.map(u32::from);
     let row_micro = amp_micro_dimension(precision);
     if row_block == 0
         || column_block == 0
@@ -790,8 +777,8 @@ mod tests {
     use crate::low::{LowShardId, ShardDefinition};
     use crate::operator::Precision;
     use crate::{
-        AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
-        MemoryClass, ShardExtent, TensorTiling, TensorType,
+        AMP_COLUMN_MICRO, AMP_INNER_BLOCK, BlockedOrder, Layout, MemoryClass, NativeKernelOrder,
+        ShardExtent, StorageOrder, TensorTiling, TensorType,
     };
 
     fn shard(layout: Layout, dimensions: &[u32]) -> LowShard {
@@ -890,6 +877,54 @@ mod tests {
     }
 
     #[test]
+    fn randomized_blocked_axes_and_permutations_are_bijections() {
+        let mut random = fastrand::Rng::with_seed(0x626c_6f63_6b65_6421);
+        for _ in 0..128 {
+            let rank = random.usize(2..=5);
+            let first_axis = random.usize(0..rank);
+            let mut second_axis = random.usize(0..rank - 1);
+            if second_axis >= first_axis {
+                second_axis += 1;
+            }
+            let permutation = if random.bool() { [0, 1] } else { [1, 0] };
+            let order = BlockedOrder {
+                axes: [
+                    crate::TensorAxis::FromStart(first_axis as u16),
+                    crate::TensorAxis::FromStart(second_axis as u16),
+                ],
+                block_shape: [16, random.u16(1..=4) * 4],
+                permutation,
+            };
+            let [row_axis, column_axis] = order.physical_axes(rank).unwrap();
+            let mut dimensions = (0..rank).map(|_| random.u32(1..=4)).collect::<Vec<_>>();
+            dimensions[row_axis] = u32::from(order.block_shape[0]) * random.u32(1..=3);
+            dimensions[column_axis] = u32::from(order.block_shape[1]) * random.u32(1..=3);
+            let shard = shard(
+                Layout {
+                    order: StorageOrder::Blocked(order),
+                    tiling: TensorTiling::replicated(1),
+                    memory_class: MemoryClass::Standard,
+                },
+                &dimensions,
+            );
+            let elements = dimensions.iter().map(|&width| u64::from(width)).product();
+            let mut seen = vec![false; usize::try_from(elements).unwrap()];
+            let mut coordinates = vec![0; rank];
+            for logical in 0..elements {
+                decode_row_major(&dimensions, logical, &mut coordinates);
+                let physical = physical_index(&shard, &dimensions, &coordinates).unwrap();
+                assert!(!seen[physical as usize]);
+                seen[physical as usize] = true;
+                assert_eq!(
+                    physical_coordinates(&shard, &dimensions, physical).unwrap(),
+                    coordinates
+                );
+            }
+            assert!(seen.into_iter().all(|present| present));
+        }
+    }
+
+    #[test]
     fn randomized_word_aligned_logical_transfers_populate_packed_storage() {
         let mut random = fastrand::Rng::with_seed(0x776f_7264_5f70_6163);
         for case in 0..128 {
@@ -906,8 +941,8 @@ mod tests {
                 extents: source.extents.clone(),
             };
             for order in [
-                ElementOrder::Amp(AmpOrder::Left),
-                ElementOrder::Amp(AmpOrder::TransposedRight),
+                StorageOrder::Native(NativeKernelOrder::Left),
+                StorageOrder::Native(NativeKernelOrder::TransposedRight),
             ] {
                 let mut destination = shard(
                     Layout {
@@ -1048,11 +1083,8 @@ mod tests {
             let panels = random.u32(1..=8);
             let selected = random.u32(0..panels);
             for order in [
-                ElementOrder::Amp(AmpOrder::TransposedRight),
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                    row_block: 64,
-                    column_block: AMP_COLUMN_MICRO as u16,
-                }),
+                StorageOrder::Native(NativeKernelOrder::TransposedRight),
+                StorageOrder::Blocked(BlockedOrder::matrix(64, AMP_COLUMN_MICRO as u16)),
             ] {
                 let layout = Layout {
                     order,
@@ -1121,15 +1153,12 @@ mod tests {
             let selected = random.u32(0..panels);
             for (source_order, destination_order) in [
                 (
-                    ElementOrder::Amp(AmpOrder::Left),
-                    ElementOrder::Amp(AmpOrder::TransposedRight),
+                    StorageOrder::Native(NativeKernelOrder::Left),
+                    StorageOrder::Native(NativeKernelOrder::TransposedRight),
                 ),
                 (
-                    ElementOrder::Amp(AmpOrder::TransposedLeft),
-                    ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                        row_block: 64,
-                        column_block: AMP_COLUMN_MICRO as u16,
-                    }),
+                    StorageOrder::Native(NativeKernelOrder::TransposedLeft),
+                    StorageOrder::Blocked(BlockedOrder::matrix(64, AMP_COLUMN_MICRO as u16)),
                 ),
             ] {
                 let layout = |order| Layout {

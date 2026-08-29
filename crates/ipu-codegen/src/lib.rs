@@ -55,9 +55,9 @@ pub use kernel::{
     materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
 pub use layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisTiling,
-    BlockMajorOrder, ElementOrder, Layout, LayoutError, MemoryClass, Padding, ShardExtent,
-    TensorAxis, TensorFormat, TensorRegion, TensorTiling, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AxisTiling, BlockedOrder, Layout,
+    LayoutError, MemoryClass, NativeKernelOrder, Padding, ShardExtent, StorageOrder, TensorAxis,
+    TensorFormat, TensorRegion, TensorTiling, TensorType,
 };
 pub use low::{
     ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
@@ -74,12 +74,11 @@ pub use mid::{CostModel, Ipu21CostModel, LoweringError, LoweringResult, lower};
 pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,
     AttentionPlan, BlockedGemmPlan, GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid,
-    GemmKernelFamily, GemmKernelMode, GemmOrientation,
-    GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder, LocalOperandStaging,
-    MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements, MidOperator,
-    OperandMaterialization, OperandRequirement, OperatorDispatch, OperatorPlan, OperatorPlanError,
-    OperatorRequirements, OutputAliasing, ParallelReductionPlan, PointwiseInputMapping, Precision,
-    ReductionStaging, TileKernelSpec,
+    GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
+    GemmWeightLoad, GridOrder, LocalOperandStaging, MemoryElementRequirement, MemoryOperand,
+    MemorySpaceRequirements, MidOperator, OperandMaterialization, OperandRequirement,
+    OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
+    ParallelReductionPlan, PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{

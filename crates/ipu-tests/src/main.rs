@@ -2,9 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, CompiledTensor, ComputeGraph,
-    GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid, GemmOrientation, GemmPlanConstraint,
-    GemmResultGrid, Layout, LocalOperandStaging, MemoryClass, OperatorClass, PackageConfig,
+    AttentionStrategy, BlockedOrder, CompiledPackage, CompiledTensor, ComputeGraph, GemmBlockShape,
+    GemmDistribution, GemmGeometry, GemmGrid, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
+    Layout, LocalOperandStaging, MemoryClass, NativeKernelOrder, OperatorClass, PackageConfig,
     ParallelReductionPlan, PipelineConfig, PlannerSearchDomain, Precision, ProfilingConfig,
     ReductionStaging, TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates,
     build_diagnostic_package, build_package,
@@ -935,7 +935,7 @@ fn run_gemm(
         .context("GEMM package has no right weight binding")?;
     let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
         let (batch_index, inner) = amp_matrix_coordinates(
-            AmpOrder::Left,
+            NativeKernelOrder::Left,
             Precision::F16,
             batch,
             elements / batch,
@@ -946,10 +946,7 @@ fn run_gemm(
     })?;
     let right_bytes = packed_binding(&right, |logical_tile, linear, elements| {
         let (inner, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
-            },
+            BlockedOrder::matrix(64, 16),
             Precision::F16,
             64,
             elements / 64,
@@ -993,7 +990,7 @@ fn run_mlp_chain(
     let right1 = binding("right.1", &application.weights)?;
     let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
         let (_, inner) =
-            amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
+            amp_matrix_coordinates(NativeKernelOrder::Left, Precision::F16, 1, elements, linear)?;
         Ok(mlp_smoke_value(
             MLP_INPUT_SEED,
             u64::from(logical_tile) * u64::from(MLP_SMOKE_WIDTH) + u64::from(inner),
@@ -1002,10 +999,7 @@ fn run_mlp_chain(
     })?;
     let right0_bytes = packed_binding(&right0, |logical_tile, linear, elements| {
         let (inner, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
-            },
+            BlockedOrder::matrix(64, 16),
             Precision::F16,
             64,
             elements / 64,
@@ -1024,10 +1018,7 @@ fn run_mlp_chain(
     })?;
     let right1_bytes = packed_binding(&right1, |logical_tile, linear, elements| {
         let (inner, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
-            },
+            BlockedOrder::matrix(64, 16),
             Precision::F16,
             64,
             elements / 64,
@@ -1223,7 +1214,7 @@ fn run_attention_smoke(
         let partition = tile / heads;
         let (local_row, column) = if elements == 64 * padded_query_dimension {
             amp_matrix_coordinates(
-                AmpOrder::TransposedRight,
+                NativeKernelOrder::TransposedRight,
                 Precision::F16,
                 64,
                 padded_query_dimension,
@@ -1253,10 +1244,7 @@ fn run_attention_smoke(
         let partition = tile / heads;
         let (local_row, column) = if elements == 64 * padded_value_dimension {
             block_major_matrix_coordinates(
-                BlockMajorOrder::Matrix {
-                    row_block: 64,
-                    column_block: 16,
-                },
+                BlockedOrder::matrix(64, 16),
                 Precision::F16,
                 64,
                 padded_value_dimension,
@@ -1812,8 +1800,13 @@ fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8])
         let expected_row = mlp_smoke_reference(row);
         let elements = u32::try_from(slice.size / 2)?;
         for linear in 0..elements {
-            let (_, column) =
-                amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
+            let (_, column) = amp_matrix_coordinates(
+                NativeKernelOrder::Left,
+                Precision::F16,
+                1,
+                elements,
+                linear,
+            )?;
             if column >= 64 {
                 continue;
             }
@@ -1964,7 +1957,7 @@ fn verify_gemm_output(
         let elements = u32::try_from(slice.size / 2)?;
         for linear in 0..elements {
             let (batch_index, column) = amp_matrix_coordinates(
-                AmpOrder::Output,
+                NativeKernelOrder::Output,
                 Precision::F16,
                 batch,
                 u32::from(active_tiles) * 64,

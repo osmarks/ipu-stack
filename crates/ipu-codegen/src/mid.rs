@@ -30,8 +30,8 @@ use crate::ir::{
 };
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_NARROW_OUTPUT_COLUMN_BLOCK, AMP_OUTPUT_COLUMN_BLOCK,
-    AMP_WIDE_OUTPUT_COLUMN_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass,
-    Padding, TensorAxis, TensorFormat, TensorType,
+    AMP_WIDE_OUTPUT_COLUMN_BLOCK, Layout, MemoryClass, NativeKernelOrder, Padding, StorageOrder,
+    TensorAxis, TensorFormat, TensorType,
 };
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
@@ -726,7 +726,7 @@ type FutureFormatCompatibility = Vec<(
     ValueId,
     FutureFormatRole,
     Precision,
-    ElementOrderCompatibility,
+    StorageOrderCompatibility,
     MemoryClass,
     Vec<(TensorAxis, u16, u32)>,
 )>;
@@ -738,23 +738,23 @@ enum FutureFormatRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ElementOrderCompatibility {
-    RowMajor,
-    BlockMajorMatrix,
-    BlockMajorTransposedMatrix,
-    Amp(AmpOrder),
+enum StorageOrderCompatibility {
+    Linear,
+    Blocked {
+        axes: [TensorAxis; 2],
+        permutation: [u8; 2],
+    },
+    Native(NativeKernelOrder),
 }
 
-fn element_order_compatibility(order: ElementOrder) -> ElementOrderCompatibility {
+fn storage_order_compatibility(order: StorageOrder) -> StorageOrderCompatibility {
     match order {
-        ElementOrder::RowMajor => ElementOrderCompatibility::RowMajor,
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
-            ElementOrderCompatibility::BlockMajorMatrix
-        }
-        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
-            ElementOrderCompatibility::BlockMajorTransposedMatrix
-        }
-        ElementOrder::Amp(order) => ElementOrderCompatibility::Amp(order),
+        StorageOrder::Linear => StorageOrderCompatibility::Linear,
+        StorageOrder::Blocked(order) => StorageOrderCompatibility::Blocked {
+            axes: order.axes,
+            permutation: order.permutation,
+        },
+        StorageOrder::Native(order) => StorageOrderCompatibility::Native(order),
     }
 }
 
@@ -779,7 +779,7 @@ fn future_format_compatibility(
                 origin,
                 role,
                 format.precision,
-                element_order_compatibility(format.layout.order),
+                storage_order_compatibility(format.layout.order),
                 format.layout.memory_class,
                 axes,
             ));
@@ -1034,7 +1034,7 @@ fn plan_region_frontier(
                             branch.state.automatic_inputs.contains(id)
                                 || current.order == requirement.format.layout.order
                                 || !requirement.format.layout.order.requires_direct_population()
-                                || (current.order == ElementOrder::RowMajor
+                                || (current.order == StorageOrder::Linear
                                     && requirement
                                         .format
                                         .layout
@@ -2420,13 +2420,13 @@ fn independent_parameter_storage(
     let Some(requirement) = candidate.requirements.inputs.get(input_index) else {
         return Vec::new();
     };
-    let ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-        row_block: inner_block,
-        column_block: _,
-    }) = requirement.format.layout.order
-    else {
+    let StorageOrder::Blocked(order) = requirement.format.layout.order else {
         return Vec::new();
     };
+    if !order.is_matrix() {
+        return Vec::new();
+    }
+    let inner_block = order.block_shape[0];
     let Some(input) = inputs.get(input_index) else {
         return Vec::new();
     };
@@ -3126,9 +3126,9 @@ fn parallel_reduction_plans_for_orientation(
 struct GemmPlanCompatibility {
     orientation: Option<GemmOrientation>,
     reduction_staging: Option<ReductionStaging>,
-    inputs: Vec<(ElementOrderCompatibility, MemoryClass, LocalOperandStaging)>,
+    inputs: Vec<(StorageOrderCompatibility, MemoryClass, LocalOperandStaging)>,
     output: (
-        ElementOrderCompatibility,
+        StorageOrderCompatibility,
         MemoryClass,
         Vec<(TensorAxis, u16, u32)>,
     ),
@@ -3154,14 +3154,14 @@ fn gemm_plan_compatibility(candidate: &OperatorPlan) -> GemmPlanCompatibility {
             .iter()
             .map(|input| {
                 (
-                    element_order_compatibility(input.format.layout.order),
+                    storage_order_compatibility(input.format.layout.order),
                     input.format.layout.memory_class,
                     input.local_staging,
                 )
             })
             .collect(),
         output: (
-            element_order_compatibility(candidate.requirements.output.format.layout.order),
+            storage_order_compatibility(candidate.requirements.output.format.layout.order),
             candidate.requirements.output.format.layout.memory_class,
             candidate
                 .requirements

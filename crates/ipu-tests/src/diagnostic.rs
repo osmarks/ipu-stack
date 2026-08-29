@@ -849,7 +849,7 @@ fn quantize(value: f32, precision: Precision) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipu_codegen::{AmpOrder, amp_matrix_coordinates};
+    use ipu_codegen::{NativeKernelOrder, amp_matrix_coordinates};
 
     #[test]
     fn randomized_blas_gemm_matches_scalar_reference() -> Result<()> {
@@ -922,14 +922,14 @@ mod tests {
                             let source = base + source_word as u32;
                             let destination = base + destination_word;
                             let source_coordinates = amp_matrix_coordinates(
-                                AmpOrder::Output,
+                                NativeKernelOrder::Output,
                                 Precision::F16,
                                 rows,
                                 columns,
                                 source * 2 + lane,
                             )?;
                             let destination_coordinates = amp_matrix_coordinates(
-                                AmpOrder::Left,
+                                NativeKernelOrder::Left,
                                 Precision::F16,
                                 rows,
                                 columns,

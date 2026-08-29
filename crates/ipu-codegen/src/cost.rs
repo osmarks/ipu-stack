@@ -11,9 +11,7 @@ use crate::estimate::{
     maximum_shard_bytes, operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
-use crate::layout::{
-    AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, TensorAxis, TensorType,
-};
+use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
 use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{
     DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator, OperatorDispatch,
@@ -467,25 +465,23 @@ fn maximum_shard_elements(tensor: &TensorType) -> u64 {
 
 pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
     let cycles_per_element = match tensor.format.layout.order {
-        ElementOrder::RowMajor => return 0,
-        ElementOrder::Amp(AmpOrder::TransposedRight) => {
+        StorageOrder::Linear => return 0,
+        StorageOrder::Native(NativeKernelOrder::TransposedRight) => {
             IPU21_TARGET_COSTS.contiguous_panel_pack_cycles_per_element
         }
-        ElementOrder::Amp(AmpOrder::Left) => IPU21_TARGET_COSTS.amp_left_pack_cycles_per_element,
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-            row_block,
-            column_block,
-        }) if u32::from(row_block) == crate::layout::AMP_INNER_BLOCK
-            && u32::from(column_block) == crate::layout::AMP_COLUMN_MICRO =>
+        StorageOrder::Native(NativeKernelOrder::Left) => {
+            IPU21_TARGET_COSTS.amp_left_pack_cycles_per_element
+        }
+        StorageOrder::Blocked(order)
+            if order.is_matrix()
+                && u32::from(order.block_shape[0]) == crate::layout::AMP_INNER_BLOCK
+                && u32::from(order.block_shape[1]) == crate::layout::AMP_COLUMN_MICRO =>
         {
             return elements
                 .saturating_mul(IPU21_TARGET_COSTS.block_major_pack_cycles_per_element)
                 .saturating_add(IPU21_TARGET_COSTS.block_major_pack_startup_cycles);
         }
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) | ElementOrder::Amp(_) => {
-            IPU21_TARGET_COSTS.indexed_f16_transform_cycles_per_element
-        }
-        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
+        StorageOrder::Blocked(_) | StorageOrder::Native(_) => {
             IPU21_TARGET_COSTS.indexed_f16_transform_cycles_per_element
         }
     };
@@ -497,7 +493,7 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
 fn amp_unpack_cycles(tensor: &TensorType) -> u64 {
     if !matches!(
         tensor.format.layout.order,
-        ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+        StorageOrder::Native(NativeKernelOrder::Output | NativeKernelOrder::TransposedLeft)
     ) {
         return 0;
     }
@@ -526,7 +522,7 @@ fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
             .is_some_and(|width| width.is_multiple_of(2))
         || !matches!(
             output.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+            StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::TransposedRight)
         )
     {
         return None;
@@ -798,7 +794,7 @@ fn deferred_split_input_cycles(
         .map_or(1, u64::from);
     if matches!(
         consumer_input.format.layout.order,
-        ElementOrder::Amp(AmpOrder::Left)
+        StorageOrder::Native(NativeKernelOrder::Left)
     ) {
         if direct_panel_exchange {
             let exchange =
@@ -947,7 +943,7 @@ impl CostModel for Ipu21CostModel {
                 // matrix; preserve that distinction in the call estimate.
                 let matrices_per_tile = if matches!(
                     compute_output.format.layout.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                    StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
                 ) {
                     1
                 } else {
@@ -985,7 +981,7 @@ impl CostModel for Ipu21CostModel {
                 let streamed_blocked_standard = right.filter(|right| {
                     staged_weights
                         && right.format.layout.memory_class == MemoryClass::Standard
-                        && matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
+                        && matches!(right.format.layout.order, StorageOrder::Blocked(_))
                 });
                 let weight_feed = streamed_blocked_standard.map_or_else(
                     || {
@@ -1006,12 +1002,7 @@ impl CostModel for Ipu21CostModel {
                             .iter()
                             .find(|axis| {
                                 axis.axis
-                                    == if matches!(
-                                        right.format.layout.order,
-                                        ElementOrder::BlockMajor(
-                                            BlockMajorOrder::TransposedMatrix { .. }
-                                        )
-                                    ) {
+                                    == if matches!(right.format.layout.order, StorageOrder::Blocked(order) if order.is_transposed_matrix()) {
                                         TensorAxis::FromEnd(1)
                                     } else {
                                         TensorAxis::FromEnd(2)
@@ -1037,12 +1028,7 @@ impl CostModel for Ipu21CostModel {
                         .iter()
                         .find(|axis| {
                             axis.axis
-                                == if matches!(
-                                    right.format.layout.order,
-                                    ElementOrder::BlockMajor(
-                                        BlockMajorOrder::TransposedMatrix { .. }
-                                    )
-                                ) {
+                                == if matches!(right.format.layout.order, StorageOrder::Blocked(order) if order.is_transposed_matrix()) {
                                     TensorAxis::FromEnd(1)
                                 } else {
                                     TensorAxis::FromEnd(2)

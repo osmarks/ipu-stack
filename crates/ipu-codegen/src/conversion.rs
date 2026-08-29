@@ -2,7 +2,7 @@
 
 use crate::graph::TensorShape;
 use crate::layout::{
-    AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Layout, LayoutError, TensorRegion,
+    AMP_COLUMN_MICRO, Layout, LayoutError, NativeKernelOrder, StorageOrder, TensorRegion,
 };
 use crate::operator::{OperandRequirement, Precision, TileKernelSpec};
 use crate::storage::{StorageError, amp_micro_dimension, physical_byte_offset};
@@ -31,25 +31,21 @@ pub fn layout_conversion_strategy(
     if from.order == to.order {
         ConversionStrategy::DirectRetile
     } else if precision == Precision::F32
-        || matches!(from.order, ElementOrder::RowMajor)
+        || matches!(from.order, StorageOrder::Linear)
             && matches!(
                 to.order,
-                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
             )
-        || matches!(to.order, ElementOrder::RowMajor)
+        || matches!(to.order, StorageOrder::Linear)
             && matches!(
                 from.order,
-                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
             )
         || matches!(
             (from.order, to.order),
-            (
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }),
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-            ) | (
-                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }),
-                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
-            )
+            (StorageOrder::Blocked(source), StorageOrder::Blocked(destination))
+                if source.axes == destination.axes
+                    && source.permutation == destination.permutation
         )
     {
         ConversionStrategy::DirectLogical
@@ -225,9 +221,9 @@ fn plan_mappings(
                     }
                     ConversionStrategy::DirectLogical => (from.order, to.order, true),
                     ConversionStrategy::StageLogicalThenTransform
-                        if from.order == ElementOrder::RowMajor =>
+                        if from.order == StorageOrder::Linear =>
                     {
-                        (ElementOrder::RowMajor, ElementOrder::RowMajor, false)
+                        (StorageOrder::Linear, StorageOrder::Linear, false)
                     }
                     ConversionStrategy::DirectRetile
                     | ConversionStrategy::StageLogicalThenTransform
@@ -270,8 +266,8 @@ fn plan_mappings(
 
 fn copy_geometries(
     precision: Precision,
-    source_order: ElementOrder,
-    destination_order: ElementOrder,
+    source_order: StorageOrder,
+    destination_order: StorageOrder,
     source_storage: &TensorRegion,
     destination_storage: &TensorRegion,
     region: &TensorRegion,
@@ -378,8 +374,7 @@ fn copy_geometries(
                 let previous = &geometries[end - 1];
                 if next.contiguous_bytes != geometry.contiguous_bytes
                     || next.dimensions != geometry.dimensions
-                    || next.source_offset.checked_sub(previous.source_offset)
-                        != Some(source_stride)
+                    || next.source_offset.checked_sub(previous.source_offset) != Some(source_stride)
                     || next
                         .destination_offset
                         .checked_sub(previous.destination_offset)
@@ -390,8 +385,7 @@ fn copy_geometries(
                 end += 1;
             }
             geometry.dimensions.push(CopyDimension {
-                count: u32::try_from(end - index)
-                    .map_err(|_| ConversionGeometryError::Overflow)?,
+                count: u32::try_from(end - index).map_err(|_| ConversionGeometryError::Overflow)?,
                 source_stride,
                 destination_stride,
             });
@@ -404,11 +398,7 @@ fn copy_geometries(
             break;
         }
     }
-    let alignment = if local {
-        precision.bytes() as u32
-    } else {
-        4
-    };
+    let alignment = if local { precision.bytes() as u32 } else { 4 };
     for geometry in &geometries {
         if !geometry.source_offset.is_multiple_of(alignment)
             || !geometry.destination_offset.is_multiple_of(alignment)
@@ -452,7 +442,7 @@ fn split_unsupported_local_nests(
 }
 
 fn storage_blocks(
-    order: ElementOrder,
+    order: StorageOrder,
     precision: Precision,
     storage: &TensorRegion,
     region: &TensorRegion,
@@ -469,7 +459,7 @@ fn storage_blocks(
         .zip(&dimensions)
         .enumerate()
     {
-        let start_must_align = !(order == ElementOrder::RowMajor && axis + 1 == rank);
+        let start_must_align = !(order == StorageOrder::Linear && axis + 1 == rank);
         if storage.axis != region.axis
             || region.start < storage.start
             || region.logical_end > storage.logical_end
@@ -517,7 +507,7 @@ fn storage_blocks(
 }
 
 fn physical_block_dimensions(
-    order: ElementOrder,
+    order: StorageOrder,
     precision: Precision,
     region: &TensorRegion,
 ) -> Result<Vec<u32>, ConversionGeometryError> {
@@ -529,34 +519,29 @@ fn physical_block_dimensions(
         let row = rank - 2;
         let column = rank - 1;
         match order {
-            ElementOrder::RowMajor => {
+            StorageOrder::Linear => {
                 dimensions[column] = region[column].logical_end - region[column].start;
             }
-            ElementOrder::Amp(AmpOrder::Left) => {
+            StorageOrder::Native(NativeKernelOrder::Left) => {
                 dimensions[column] = amp_micro_dimension(precision);
             }
-            ElementOrder::Amp(AmpOrder::Output) => {
+            StorageOrder::Native(NativeKernelOrder::Output) => {
                 dimensions[column] = AMP_COLUMN_MICRO;
             }
-            ElementOrder::Amp(AmpOrder::TransposedLeft) => {
+            StorageOrder::Native(NativeKernelOrder::TransposedLeft) => {
                 dimensions[row] = amp_micro_dimension(precision);
             }
-            ElementOrder::Amp(AmpOrder::TransposedOutput) => {
+            StorageOrder::Native(NativeKernelOrder::TransposedOutput) => {
                 dimensions[row] = AMP_COLUMN_MICRO;
             }
-            ElementOrder::Amp(AmpOrder::TransposedRight) => {
+            StorageOrder::Native(NativeKernelOrder::TransposedRight) => {
                 dimensions[row] = amp_micro_dimension(precision);
                 dimensions[column] = AMP_COLUMN_MICRO;
             }
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { column_block, .. }) => {
+            StorageOrder::Blocked(order) => {
+                let [row, column] = order.physical_axes(rank)?;
                 dimensions[row] = amp_micro_dimension(precision);
-                dimensions[column] = u32::from(column_block);
-            }
-            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
-                column_block, ..
-            }) => {
-                dimensions[row] = u32::from(column_block);
-                dimensions[column] = amp_micro_dimension(precision);
+                dimensions[column] = u32::from(order.block_shape[1]);
             }
         }
     }
@@ -564,8 +549,8 @@ fn physical_block_dimensions(
 }
 
 fn logical_block_dimensions(
-    source: ElementOrder,
-    destination: ElementOrder,
+    source: StorageOrder,
+    destination: StorageOrder,
     precision: Precision,
     region: &TensorRegion,
 ) -> Result<Vec<u32>, ConversionGeometryError> {
@@ -574,46 +559,30 @@ fn logical_block_dimensions(
         return Err(ConversionGeometryError::Unsupported);
     }
     let mut dimensions = vec![1; rank];
-    match (source, destination) {
-        (
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                column_block: source_columns,
-                ..
-            }),
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                column_block: destination_columns,
-                ..
-            }),
-        ) if rank >= 2 => {
-            dimensions[rank - 2] = amp_micro_dimension(precision);
-            dimensions[rank - 1] = gcd(u32::from(source_columns), u32::from(destination_columns));
-            return Ok(dimensions);
-        }
-        (
-            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
-                column_block: source_rows,
-                ..
-            }),
-            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
-                column_block: destination_rows,
-                ..
-            }),
-        ) if rank >= 2 => {
-            dimensions[rank - 2] = gcd(u32::from(source_rows), u32::from(destination_rows));
-            dimensions[rank - 1] = amp_micro_dimension(precision);
-            return Ok(dimensions);
-        }
-        _ => {}
+    if let (StorageOrder::Blocked(source), StorageOrder::Blocked(destination)) =
+        (source, destination)
+        && source.axes == destination.axes
+        && source.permutation == destination.permutation
+    {
+        let [row, column] = source.physical_axes(rank)?;
+        dimensions[row] = amp_micro_dimension(precision);
+        dimensions[column] = gcd(
+            u32::from(source.block_shape[1]),
+            u32::from(destination.block_shape[1]),
+        );
+        return Ok(dimensions);
     }
     let contiguous_columns = |order| match order {
-        ElementOrder::RowMajor => Some(region[rank - 1].logical_end - region[rank - 1].start),
-        ElementOrder::Amp(AmpOrder::Left) => Some(amp_micro_dimension(precision)),
-        ElementOrder::Amp(AmpOrder::Output) => Some(2),
-        ElementOrder::BlockMajor(_)
-        | ElementOrder::Amp(
-            AmpOrder::TransposedLeft | AmpOrder::TransposedRight | AmpOrder::TransposedOutput,
+        StorageOrder::Linear => Some(region[rank - 1].logical_end - region[rank - 1].start),
+        StorageOrder::Native(NativeKernelOrder::Left) => Some(amp_micro_dimension(precision)),
+        StorageOrder::Native(NativeKernelOrder::Output) => Some(2),
+        StorageOrder::Blocked(_)
+        | StorageOrder::Native(
+            NativeKernelOrder::TransposedLeft
+            | NativeKernelOrder::TransposedRight
+            | NativeKernelOrder::TransposedOutput,
         ) if precision == Precision::F32 => Some(1),
-        ElementOrder::BlockMajor(_) | ElementOrder::Amp(_) => None,
+        StorageOrder::Blocked(_) | StorageOrder::Native(_) => None,
     };
     let source_columns = contiguous_columns(source).ok_or(ConversionGeometryError::Unsupported)?;
     let destination_columns =

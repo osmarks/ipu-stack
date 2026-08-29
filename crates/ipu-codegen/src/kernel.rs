@@ -4,8 +4,8 @@
 use crate::MemorySpaceRequirements;
 use crate::layout::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AmpOrder, BlockMajorOrder, ElementOrder, GemmKernelMode, GemmWeightLoad, KernelRequirements,
-    KernelRun, LowProgram, LowShard, LowShardId, Precision, StorageError, TileKernelSpec,
+    GemmKernelMode, GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, LowShard,
+    LowShardId, NativeKernelOrder, Precision, StorageError, StorageOrder, TileKernelSpec,
     TileWorkList, TileWorkRef, view_byte_spans,
 };
 use ipu_target::program::{ComputeStep, StepProfile, TileAddress};
@@ -80,10 +80,12 @@ enum UnpackSource {
 }
 
 impl UnpackSource {
-    fn from_order(order: ElementOrder) -> Option<Self> {
+    fn from_order(order: StorageOrder) -> Option<Self> {
         match order {
-            ElementOrder::Amp(AmpOrder::Output) => Some(Self::AmpOutput),
-            ElementOrder::Amp(AmpOrder::TransposedLeft) => Some(Self::AmpTransposedLeft),
+            StorageOrder::Native(NativeKernelOrder::Output) => Some(Self::AmpOutput),
+            StorageOrder::Native(NativeKernelOrder::TransposedLeft) => {
+                Some(Self::AmpTransposedLeft)
+            }
             _ => None,
         }
     }
@@ -97,16 +99,15 @@ impl UnpackSource {
 }
 
 impl RearrangeTarget {
-    fn from_order(order: ElementOrder) -> Option<Self> {
+    fn from_order(order: StorageOrder) -> Option<Self> {
         match order {
-            ElementOrder::Amp(AmpOrder::Left) => Some(Self::AmpLeft),
-            ElementOrder::Amp(AmpOrder::TransposedRight) => Some(Self::AmpTransposedRight),
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block,
-                column_block,
-            }) => Some(Self::BlockMajor {
-                row_block,
-                column_block,
+            StorageOrder::Native(NativeKernelOrder::Left) => Some(Self::AmpLeft),
+            StorageOrder::Native(NativeKernelOrder::TransposedRight) => {
+                Some(Self::AmpTransposedRight)
+            }
+            StorageOrder::Blocked(order) if order.is_matrix() => Some(Self::BlockMajor {
+                row_block: order.block_shape[0],
+                column_block: order.block_shape[1],
             }),
             _ => None,
         }
@@ -923,7 +924,7 @@ fn collect_kernels(
                 } else if let TileKernelSpec::Rearrange {
                     from:
                         crate::Layout {
-                            order: ElementOrder::RowMajor,
+                            order: StorageOrder::Linear,
                             ..
                         },
                     to: crate::Layout { order, .. },
@@ -941,7 +942,7 @@ fn collect_kernels(
                     from: crate::Layout { order, .. },
                     to:
                         crate::Layout {
-                            order: ElementOrder::RowMajor,
+                            order: StorageOrder::Linear,
                             ..
                         },
                 } = kernel
@@ -1050,7 +1051,9 @@ fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
         .checked_sub(
             if matches!(
                 output_order,
-                ElementOrder::Amp(AmpOrder::TransposedOutput | AmpOrder::TransposedLeft)
+                StorageOrder::Native(
+                    NativeKernelOrder::TransposedOutput | NativeKernelOrder::TransposedLeft
+                )
             ) {
                 2
             } else {
@@ -1319,7 +1322,7 @@ pub fn tile_kernel_abi(
         TileKernelSpec::Rearrange { from, to }
             if precision == Precision::F16
                 && UnpackSource::from_order(from.order).is_some()
-                && to.order == ElementOrder::RowMajor =>
+                && to.order == StorageOrder::Linear =>
         {
             (
                 KernelSymbols::UnpackSpecialized,
@@ -1339,12 +1342,13 @@ pub fn tile_kernel_abi(
         }
         TileKernelSpec::Rearrange { from, to }
             if precision == Precision::F16
-                && from.order == ElementOrder::RowMajor
-                && matches!(
+                && from.order == StorageOrder::Linear
+                && (matches!(
                     to.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-                        | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                ) =>
+                    StorageOrder::Native(
+                        NativeKernelOrder::Left | NativeKernelOrder::TransposedRight
+                    )
+                ) || matches!(to.order, StorageOrder::Blocked(order) if order.is_matrix())) =>
         {
             (
                 KernelSymbols::RearrangeSpecialized,
@@ -1559,15 +1563,15 @@ mod tests {
             let semantic_columns = random.u32(1..=96);
             let transposed = random.bool();
             let order = match (transposed, random.bool()) {
-                (false, false) => AmpOrder::Output,
-                (false, true) => AmpOrder::Left,
-                (true, false) => AmpOrder::TransposedOutput,
-                (true, true) => AmpOrder::TransposedLeft,
+                (false, false) => NativeKernelOrder::Output,
+                (false, true) => NativeKernelOrder::Left,
+                (true, false) => NativeKernelOrder::TransposedOutput,
+                (true, true) => NativeKernelOrder::TransposedLeft,
             };
             let format = TensorFormat {
                 precision: Precision::F16,
                 layout: Layout {
-                    order: ElementOrder::Amp(order),
+                    order: StorageOrder::Native(order),
                     tiling: TensorTiling::replicated(1),
                     memory_class: MemoryClass::Standard,
                 },
@@ -1639,7 +1643,7 @@ mod tests {
             let format = TensorFormat {
                 precision,
                 layout: Layout {
-                    order: crate::ElementOrder::RowMajor,
+                    order: crate::StorageOrder::Linear,
                     tiling: TensorTiling::replicated(1),
                     memory_class: MemoryClass::Standard,
                 },

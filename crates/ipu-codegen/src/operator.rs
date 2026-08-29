@@ -3,8 +3,8 @@
 use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions, TensorShape};
 use crate::ir::MidValueId;
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
-    MemoryClass, ShardExtent, TensorAxis, TensorFormat, TensorRegion, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, NativeKernelOrder, ShardExtent,
+    StorageOrder, TensorAxis, TensorFormat, TensorRegion, TensorType,
 };
 use crate::metrics::CostEstimate;
 
@@ -741,29 +741,30 @@ impl OperatorPlan {
                 }
                 let formats_match_orientation = match orientation {
                     GemmOrientation::Normal => {
-                        matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
-                            && matches!(
-                                right.format.layout.order,
-                                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                            )
-                            && output.format.layout.order
-                                == ElementOrder::Amp(if *multiply == Precision::F16 {
-                                    AmpOrder::Left
-                                } else {
-                                    AmpOrder::Output
-                                })
+                        matches!(
+                            left.format.layout.order,
+                            StorageOrder::Native(NativeKernelOrder::Left)
+                        ) && matches!(
+                            right.format.layout.order,
+                            StorageOrder::Blocked(order) if order.is_matrix()
+                        ) && output.format.layout.order
+                            == StorageOrder::Native(if *multiply == Precision::F16 {
+                                NativeKernelOrder::Left
+                            } else {
+                                NativeKernelOrder::Output
+                            })
                     }
                     GemmOrientation::Swapped => {
                         matches!(
                             left.format.layout.order,
-                            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
+                            StorageOrder::Blocked(order) if order.is_transposed_matrix()
                         ) && right.format.layout.order
-                            == ElementOrder::Amp(AmpOrder::TransposedLeft)
+                            == StorageOrder::Native(NativeKernelOrder::TransposedLeft)
                             && output.format.layout.order
-                                == ElementOrder::Amp(if *multiply == Precision::F16 {
-                                    AmpOrder::TransposedLeft
+                                == StorageOrder::Native(if *multiply == Precision::F16 {
+                                    NativeKernelOrder::TransposedLeft
                                 } else {
-                                    AmpOrder::TransposedOutput
+                                    NativeKernelOrder::TransposedOutput
                                 })
                     }
                 };
@@ -963,16 +964,19 @@ impl OperatorPlan {
                     || *key_rows != AMP_INNER_BLOCK
                     || padding.query_dimension == 0
                     || padding.value_dimension == 0
-                    || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
+                    || !matches!(
+                        query.format.layout.order,
+                        StorageOrder::Native(NativeKernelOrder::Left)
+                    )
                     || !matches!(
                         key.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::TransposedRight)
+                        StorageOrder::Native(NativeKernelOrder::TransposedRight)
                     )
                     || !matches!(
                         value.format.layout.order,
-                        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+                        StorageOrder::Blocked(order) if order.is_matrix()
                     )
-                    || output.format.layout.order != ElementOrder::RowMajor
+                    || output.format.layout.order != StorageOrder::Linear
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
@@ -1010,16 +1014,19 @@ impl OperatorPlan {
                     || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
                     || padding.query_dimension == 0
                     || padding.value_dimension == 0
-                    || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
+                    || !matches!(
+                        query.format.layout.order,
+                        StorageOrder::Native(NativeKernelOrder::Left)
+                    )
                     || !matches!(
                         key.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::TransposedRight)
+                        StorageOrder::Native(NativeKernelOrder::TransposedRight)
                     )
                     || !matches!(
                         value.format.layout.order,
-                        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+                        StorageOrder::Blocked(order) if order.is_matrix()
                     )
-                    || output.format.layout.order != ElementOrder::RowMajor
+                    || output.format.layout.order != StorageOrder::Linear
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count

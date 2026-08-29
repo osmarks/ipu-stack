@@ -11,8 +11,8 @@ use crate::conversion::ConversionStrategy;
 use crate::graph::{GraphInputKind, OperationId};
 use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
-    LayoutError, MemoryClass, ShardExtent, TensorRegion, TensorTiling, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, BlockedOrder, Layout, LayoutError, MemoryClass,
+    NativeKernelOrder, ShardExtent, StorageOrder, TensorRegion, TensorTiling, TensorType,
 };
 use crate::operator::{
     DeferredTransform, GemmDistribution, MemoryOperand, MemorySpaceRequirements,
@@ -1139,11 +1139,11 @@ impl LoweringState {
             let compatible = source.extents.len() == 3
                 && source.tensor_type.format.precision == Precision::F16
                 && match source.tensor_type.format.layout.order {
-                    ElementOrder::Amp(AmpOrder::Output) => {
+                    StorageOrder::Native(NativeKernelOrder::Output) => {
                         let columns = source.extents[2];
                         (columns.physical_end - columns.start).is_multiple_of(AMP_COLUMN_MICRO)
                     }
-                    ElementOrder::Amp(AmpOrder::TransposedLeft) => {
+                    StorageOrder::Native(NativeKernelOrder::TransposedLeft) => {
                         let rows = source.extents[1];
                         (rows.physical_end - rows.start).is_multiple_of(AMP_COLUMN_MICRO)
                     }
@@ -1279,7 +1279,7 @@ impl LoweringState {
         let staging_shards = if direct_panel_exchange
             || !matches!(
                 source_format.layout.order,
-                ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+                StorageOrder::Native(NativeKernelOrder::Output | NativeKernelOrder::TransposedLeft)
             ) {
             source_shards
         } else {
@@ -1573,13 +1573,16 @@ impl LoweringState {
                     .tensor_type
                     .format
                     .clone();
+                let supported_destination = match destination_format.layout.order {
+                    StorageOrder::Native(
+                        NativeKernelOrder::Left | NativeKernelOrder::TransposedRight,
+                    ) => true,
+                    StorageOrder::Blocked(order) => order.is_matrix(),
+                    StorageOrder::Linear | StorageOrder::Native(_) => false,
+                };
                 if source_format.precision != crate::Precision::F16
-                    || source_format.layout.order != ElementOrder::RowMajor
-                    || !matches!(
-                        destination_format.layout.order,
-                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                    )
+                    || source_format.layout.order != StorageOrder::Linear
+                    || !supported_destination
                 {
                     return Err(LowLoweringError::InvalidConversionPlan);
                 }
@@ -1717,13 +1720,16 @@ impl LoweringState {
                     .format
                     .clone();
                 let tile = self.shards[destination_shard.index() as usize].tile;
+                let supported_destination = match destination_format.layout.order {
+                    StorageOrder::Native(
+                        NativeKernelOrder::Left | NativeKernelOrder::TransposedRight,
+                    ) => true,
+                    StorageOrder::Blocked(order) => order.is_matrix(),
+                    StorageOrder::Linear | StorageOrder::Native(_) => false,
+                };
                 if source_format.precision == crate::Precision::F16
-                    && source_format.layout.order == ElementOrder::RowMajor
-                    && matches!(
-                        destination_format.layout.order,
-                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                    )
+                    && source_format.layout.order == StorageOrder::Linear
+                    && supported_destination
                 {
                     after_exchange_kernels.push((
                         tile,
@@ -1792,7 +1798,7 @@ impl LoweringState {
                 format: crate::TensorFormat {
                     precision,
                     layout: Layout {
-                        order: ElementOrder::RowMajor,
+                        order: StorageOrder::Linear,
                         tiling: TensorTiling::replicated(1),
                         memory_class: MemoryClass::Standard,
                     },
@@ -1922,7 +1928,7 @@ impl LoweringState {
 
         let source_shards = if matches!(
             input_type.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+            StorageOrder::Native(NativeKernelOrder::Output | NativeKernelOrder::TransposedLeft)
         ) {
             self.unpack_amp_to_row_major(
                 *input,
@@ -2101,7 +2107,7 @@ impl LoweringState {
                     rows,
                     query_dimension,
                     shape.padded_query_dimension,
-                    ElementOrder::Amp(AmpOrder::Left),
+                    StorageOrder::Native(NativeKernelOrder::Left),
                 )?
             } else {
                 canonical_query
@@ -2133,7 +2139,7 @@ impl LoweringState {
                         rows,
                         query_dimension,
                         query_dimension,
-                        ElementOrder::RowMajor,
+                        StorageOrder::Linear,
                     )
                 })
                 .transpose()?;
@@ -2142,7 +2148,7 @@ impl LoweringState {
                 rows,
                 shape.scratch_columns,
                 Precision::F16,
-                ElementOrder::Amp(AmpOrder::Left),
+                StorageOrder::Native(NativeKernelOrder::Left),
                 MemoryClass::Interleaved,
             )?;
             let key_staging = self.push_attention_buffer(
@@ -2151,7 +2157,7 @@ impl LoweringState {
                 shape.physical_staging_rows,
                 query_dimension,
                 shape.padded_query_dimension,
-                ElementOrder::Amp(AmpOrder::TransposedRight),
+                StorageOrder::Native(NativeKernelOrder::TransposedRight),
             )?;
             self.shards[key_staging.index() as usize].definition = ShardDefinition::ExchangeStaging;
             let weights = self.push_attention_scratch(
@@ -2159,7 +2165,7 @@ impl LoweringState {
                 rows,
                 shape.state_columns,
                 Precision::F16,
-                ElementOrder::Amp(AmpOrder::Left),
+                StorageOrder::Native(NativeKernelOrder::Left),
                 MemoryClass::Standard,
             )?;
             if shape.reuse_key_staging_for_state
@@ -2179,10 +2185,10 @@ impl LoweringState {
                 shape.physical_staging_rows,
                 value_dimension,
                 shape.padded_value_dimension,
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                    row_block: value_row_block,
-                    column_block: AMP_COLUMN_MICRO as u16,
-                }),
+                StorageOrder::Blocked(BlockedOrder::matrix(
+                    value_row_block,
+                    AMP_COLUMN_MICRO as u16,
+                )),
             )?;
             self.shards[value_staging.index() as usize].definition =
                 ShardDefinition::ExchangeStaging;
@@ -2332,7 +2338,7 @@ impl LoweringState {
                 valid_rows,
                 tasks[0].query_dimension,
                 padded_query_dimension,
-                ElementOrder::Amp(AmpOrder::TransposedRight),
+                StorageOrder::Native(NativeKernelOrder::TransposedRight),
                 owner_offset,
                 &mut semantic_gathers,
                 &mut physical_gathers,
@@ -2348,10 +2354,7 @@ impl LoweringState {
                 valid_rows,
                 tasks[0].value_dimension,
                 padded_value_dimension,
-                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                    row_block,
-                    column_block: AMP_COLUMN_MICRO as u16,
-                }),
+                StorageOrder::Blocked(BlockedOrder::matrix(row_block, AMP_COLUMN_MICRO as u16)),
                 owner_offset + key_panel_count,
                 &mut semantic_gathers,
                 &mut physical_gathers,
@@ -3098,7 +3101,7 @@ impl LoweringState {
         valid_rows: u32,
         logical_columns: u32,
         physical_columns: u32,
-        order: ElementOrder,
+        order: StorageOrder,
         owner_offset: u32,
         semantic_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         physical_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
@@ -3153,7 +3156,7 @@ impl LoweringState {
                         valid_rows,
                         panel_columns,
                         panel_columns,
-                        ElementOrder::RowMajor,
+                        StorageOrder::Linear,
                     )?)
                 };
                 let gather_destination = row_major.unwrap_or(packed);
@@ -3314,7 +3317,7 @@ impl LoweringState {
         rows: u32,
         columns: u32,
         precision: Precision,
-        order: ElementOrder,
+        order: StorageOrder,
         memory_class: MemoryClass,
     ) -> LowLoweringResult<LowShardId> {
         self.push_shard(LowShard {
@@ -3362,7 +3365,7 @@ impl LoweringState {
                 [elements],
                 precision,
                 Layout {
-                    order: ElementOrder::RowMajor,
+                    order: StorageOrder::Linear,
                     tiling: TensorTiling::replicated(1),
                     memory_class: MemoryClass::Standard,
                 },
@@ -3385,7 +3388,7 @@ impl LoweringState {
         physical_rows: u32,
         logical_columns: u32,
         physical_columns: u32,
-        order: ElementOrder,
+        order: StorageOrder,
     ) -> LowLoweringResult<LowShardId> {
         self.push_shard(LowShard {
             id: LowShardId(0),
@@ -4097,7 +4100,7 @@ impl LoweringState {
         let mut partial_type = output_type.clone();
         let partial_tiles = row_partitions.saturating_mul(column_partitions);
         partial_type.format.layout = match (orientation, output_type.format.layout.order) {
-            (crate::GemmOrientation::Normal, ElementOrder::Amp(AmpOrder::Left)) => {
+            (crate::GemmOrientation::Normal, StorageOrder::Native(NativeKernelOrder::Left)) => {
                 Layout::amp_left_result_grid(
                     output_column_block,
                     partial_tiles,
@@ -4106,15 +4109,16 @@ impl LoweringState {
                     crate::operator::GridOrder::ColumnsFast,
                 )
             }
-            (crate::GemmOrientation::Swapped, ElementOrder::Amp(AmpOrder::TransposedLeft)) => {
-                Layout::amp_transposed_left_result_grid(
-                    output_column_block,
-                    partial_tiles,
-                    row_partitions,
-                    column_partitions,
-                    crate::operator::GridOrder::ColumnsFast,
-                )
-            }
+            (
+                crate::GemmOrientation::Swapped,
+                StorageOrder::Native(NativeKernelOrder::TransposedLeft),
+            ) => Layout::amp_transposed_left_result_grid(
+                output_column_block,
+                partial_tiles,
+                row_partitions,
+                column_partitions,
+                crate::operator::GridOrder::ColumnsFast,
+            ),
             (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
                 output_column_block,
                 partial_tiles,
@@ -4286,14 +4290,7 @@ impl LoweringState {
 
                     let source_panel_block = right_requirement.format.layout.order.clone();
                     let source_panel_block = match source_panel_block {
-                        ElementOrder::BlockMajor(
-                            BlockMajorOrder::Matrix {
-                                row_block: block, ..
-                            }
-                            | BlockMajorOrder::TransposedMatrix {
-                                row_block: block, ..
-                            },
-                        ) => u32::from(block),
+                        StorageOrder::Blocked(order) => u32::from(order.block_shape[0]),
                         _ => AMP_INNER_BLOCK,
                     };
                     let first_panel_end = inner
@@ -5241,7 +5238,7 @@ impl LoweringState {
             .is_some_and(|shard| {
                 matches!(
                     shard.tensor_type.format.layout.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                    StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
                 )
             });
         if matches!(run.kernel, TileKernelSpec::Gemm { .. })
@@ -6049,8 +6046,8 @@ fn split_mapping_at_panel_boundaries(
 mod tests {
     use super::*;
     use crate::{
-        AxisTiling, ComputeGraph, ElementOrder, GridOrder, Ipu21CostModel, Layout, MemoryClass,
-        Padding, PipelineConfig, PlannerSearchDomain, Precision, TensorAxis, TensorFormat,
+        AxisTiling, ComputeGraph, GridOrder, Ipu21CostModel, Layout, MemoryClass, Padding,
+        PipelineConfig, PlannerSearchDomain, Precision, StorageOrder, TensorAxis, TensorFormat,
         TensorTiling, TileKernelSpec, lower,
     };
     use std::collections::BTreeSet;
@@ -6439,7 +6436,7 @@ mod tests {
                 let output = &low.shards[run.output.shard.index() as usize];
                 let flattens_outer_rows = matches!(
                     output.tensor_type.format.layout.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+                    StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
                 );
                 assert!(
                     flattens_outer_rows
@@ -6550,7 +6547,7 @@ mod tests {
             let rows = u32::from(source_rows.max(source_columns)) * random.u32(1..=4);
             let columns = u32::from(source_rows.max(source_columns)) * random.u32(1..=4) * 4;
             let layout = |row_partitions, column_partitions| Layout {
-                order: ElementOrder::RowMajor,
+                order: StorageOrder::Linear,
                 tiling: TensorTiling {
                     tile_count: tiles,
                     replicas: 1,
@@ -6605,7 +6602,7 @@ mod tests {
             let column_block = 1_u32 << random.u32(0..=3);
             let tile_count = row_partitions * column_partitions * replicas;
             let layout = Layout {
-                order: ElementOrder::RowMajor,
+                order: StorageOrder::Linear,
                 tiling: TensorTiling {
                     tile_count,
                     replicas,
@@ -6674,7 +6671,7 @@ mod tests {
                 random.u16(1..=u16::try_from(physical_blocks.min(8)).unwrap());
             let partitions = groups * partitions_per_group;
             let layout = Layout {
-                order: ElementOrder::RowMajor,
+                order: StorageOrder::Linear,
                 tiling: TensorTiling {
                     tile_count: partitions,
                     replicas: 1,
@@ -6913,7 +6910,7 @@ mod tests {
                     [rows, AMP_COLUMN_MICRO],
                     Precision::F16,
                     Layout {
-                        order: ElementOrder::Amp(AmpOrder::TransposedLeft),
+                        order: StorageOrder::Native(NativeKernelOrder::TransposedLeft),
                         tiling: TensorTiling::replicated(1),
                         memory_class: MemoryClass::Standard,
                     },
@@ -6942,10 +6939,10 @@ mod tests {
                     [rows, AMP_COLUMN_MICRO],
                     Precision::F16,
                     Layout {
-                        order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                            row_block: AMP_INNER_BLOCK as u16,
-                            column_block: AMP_COLUMN_MICRO as u16,
-                        }),
+                        order: StorageOrder::Blocked(BlockedOrder::matrix(
+                            AMP_INNER_BLOCK as u16,
+                            AMP_COLUMN_MICRO as u16,
+                        )),
                         tiling: TensorTiling::replicated(1),
                         memory_class: MemoryClass::Standard,
                     },
@@ -7298,10 +7295,10 @@ mod tests {
             let right_type = &mid.values[operation.inputs[1].index() as usize].tensor_type;
             assert_eq!(
                 right_type.format.layout.order,
-                crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
-                    row_block: 64,
-                    column_block: crate::layout::AMP_COLUMN_MICRO as u16,
-                })
+                crate::StorageOrder::Blocked(crate::BlockedOrder::matrix(
+                    64,
+                    crate::layout::AMP_COLUMN_MICRO as u16,
+                ))
             );
             let low = lower_to_tiles(&mid, &config).unwrap();
             assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {

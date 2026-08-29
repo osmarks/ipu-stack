@@ -2,115 +2,6 @@ use crate::graph::TensorShape;
 use crate::operator::{GridOrder, Precision};
 use std::ops::Range;
 
-/// AMP packing role. Block dimensions are recorded by [`AxisTiling`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AmpOrder {
-    Left,
-    /// A semantic `[K, N]` matrix packed as the left operand `[N, K]`.
-    TransposedLeft,
-    /// Semantic `[key, channel]` storage packed as the right operand of
-    /// `query * key.transpose()`.
-    TransposedRight,
-    Output,
-    /// A semantic `[M, N]` output packed as the physical output `[N, M]`.
-    TransposedOutput,
-}
-
-/// Ordinary matrix elements grouped into contiguous rectangular blocks.
-///
-/// Unlike [`AmpOrder`], this is an SRAM storage layout rather than an AMP
-/// operand micro-layout. Kernels route each naturally ordered group into the
-/// required AMP register slots with `ld*putcs` destination permutations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BlockMajorOrder {
-    /// The final two semantic axes are `[rows, columns]`.
-    Matrix { row_block: u16, column_block: u16 },
-    /// The final two semantic axes are stored as `[columns, rows]`.
-    TransposedMatrix { row_block: u16, column_block: u16 },
-}
-
-pub const AMP_INNER_BLOCK: u32 = 64;
-pub(crate) const AMP_NARROW_OUTPUT_COLUMN_BLOCK: u32 = 32;
-pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
-pub(crate) const AMP_WIDE_OUTPUT_COLUMN_BLOCK: u32 = 128;
-pub const AMP_COLUMN_MICRO: u32 = 16;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ElementOrder {
-    RowMajor,
-    BlockMajor(BlockMajorOrder),
-    Amp(AmpOrder),
-}
-
-/// Physical traversal within one 16-by-16 F16 matrix micro-panel. Layouts
-/// with the same order can exchange whole panels while changing their outer
-/// ownership and panel sequence, without an intermediate rearrangement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum F16MicroPanelOrder {
-    RowsThenColumns,
-    ColumnsThenRows,
-}
-
-impl ElementOrder {
-    /// This packing is consumed as contiguous K-major panels, while a generic
-    /// intersection rearrangement produces rectangular tensor-coordinate
-    /// views. It must therefore be selected for an automatic input or produced
-    /// by a specialized operator/local staging path.
-    pub(crate) fn requires_direct_population(&self) -> bool {
-        matches!(
-            self,
-            Self::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
-                | Self::Amp(AmpOrder::TransposedRight)
-        )
-    }
-
-    /// Whether a row-major logical staging shard can be transformed locally
-    /// into this order by the generated conversion kernels.
-    pub(crate) fn supports_row_major_population(self) -> bool {
-        matches!(
-            self,
-            Self::RowMajor
-                | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
-                | Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-        )
-    }
-
-    pub(crate) const fn f16_micro_panel_order(self) -> Option<F16MicroPanelOrder> {
-        match self {
-            Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-            | Self::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
-                Some(F16MicroPanelOrder::RowsThenColumns)
-            }
-            Self::Amp(AmpOrder::TransposedLeft)
-            | Self::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
-                Some(F16MicroPanelOrder::ColumnsThenRows)
-            }
-            Self::RowMajor | Self::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => None,
-        }
-    }
-
-    /// Smallest column span which remains a self-contained physical fragment
-    /// when canonical linear ownership divides a matrix into row segments.
-    pub(crate) fn retained_linear_column_grain(self, precision: Precision) -> Option<u32> {
-        match self {
-            Self::RowMajor => Some(1),
-            Self::Amp(AmpOrder::Left) => Some(match precision {
-                Precision::F8F143 { .. } => 32,
-                Precision::F16 => 16,
-                Precision::F32 => 8,
-            }),
-            Self::Amp(AmpOrder::Output) => Some(AMP_COLUMN_MICRO),
-            Self::BlockMajor(_) | Self::Amp(_) => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum MemoryClass {
-    Standard,
-    Interleaved,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorAxis {
     FromStart(u16),
@@ -129,6 +20,146 @@ impl TensorAxis {
             _ => Err(LayoutError::AxisOutOfRange { axis: self, rank }),
         }
     }
+}
+
+/// Kernel-native AMP register or accumulator-drain order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NativeKernelOrder {
+    Left,
+    /// A semantic `[K, N]` matrix packed as the left operand `[N, K]`.
+    TransposedLeft,
+    /// Semantic `[key, channel]` storage packed as the right operand of
+    /// `query * key.transpose()`.
+    TransposedRight,
+    Output,
+    /// A semantic `[M, N]` output packed as the physical output `[N, M]`.
+    TransposedOutput,
+}
+
+/// Ordinary elements grouped into rectangular blocks over two semantic axes.
+/// `permutation` selects which named axis is the physical row and column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockedOrder {
+    pub axes: [TensorAxis; 2],
+    pub block_shape: [u16; 2],
+    pub permutation: [u8; 2],
+}
+
+impl BlockedOrder {
+    const MATRIX_AXES: [TensorAxis; 2] = [TensorAxis::FromEnd(2), TensorAxis::FromEnd(1)];
+
+    pub const fn matrix(row_block: u16, column_block: u16) -> Self {
+        Self {
+            axes: Self::MATRIX_AXES,
+            block_shape: [row_block, column_block],
+            permutation: [0, 1],
+        }
+    }
+
+    pub const fn transposed_matrix(row_block: u16, column_block: u16) -> Self {
+        Self {
+            axes: Self::MATRIX_AXES,
+            block_shape: [row_block, column_block],
+            permutation: [1, 0],
+        }
+    }
+
+    pub fn physical_axes(self, rank: usize) -> Result<[usize; 2], LayoutError> {
+        let axes = [self.axes[0].resolve(rank)?, self.axes[1].resolve(rank)?];
+        let [row, column] = self.permutation;
+        if row > 1 || column > 1 || row == column || axes[0] == axes[1] {
+            return Err(LayoutError::InvalidStorageOrder);
+        }
+        Ok([axes[usize::from(row)], axes[usize::from(column)]])
+    }
+
+    pub fn is_matrix(self) -> bool {
+        self.axes == Self::MATRIX_AXES && self.permutation == [0, 1]
+    }
+
+    pub fn is_transposed_matrix(self) -> bool {
+        self.axes == Self::MATRIX_AXES && self.permutation == [1, 0]
+    }
+}
+
+pub const AMP_INNER_BLOCK: u32 = 64;
+pub(crate) const AMP_NARROW_OUTPUT_COLUMN_BLOCK: u32 = 32;
+pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
+pub(crate) const AMP_WIDE_OUTPUT_COLUMN_BLOCK: u32 = 128;
+pub const AMP_COLUMN_MICRO: u32 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StorageOrder {
+    Linear,
+    Blocked(BlockedOrder),
+    Native(NativeKernelOrder),
+}
+
+/// Physical traversal within one 16-by-16 F16 matrix micro-panel. Layouts
+/// with the same order can exchange whole panels while changing their outer
+/// ownership and panel sequence, without an intermediate rearrangement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum F16MicroPanelOrder {
+    RowsThenColumns,
+    ColumnsThenRows,
+}
+
+impl StorageOrder {
+    /// This packing is consumed as contiguous K-major panels, while a generic
+    /// intersection rearrangement produces rectangular tensor-coordinate
+    /// views. It must therefore be selected for an automatic input or produced
+    /// by a specialized operator/local staging path.
+    pub(crate) fn requires_direct_population(&self) -> bool {
+        matches!(
+            self,
+            Self::Blocked(order) if order.permutation == [1, 0]
+        ) || matches!(self, Self::Native(NativeKernelOrder::TransposedRight))
+    }
+
+    /// Whether a row-major logical staging shard can be transformed locally
+    /// into this order by the generated conversion kernels.
+    pub(crate) fn supports_row_major_population(self) -> bool {
+        match self {
+            Self::Linear
+            | Self::Native(NativeKernelOrder::Left | NativeKernelOrder::TransposedRight) => true,
+            Self::Blocked(order) => order.is_matrix(),
+            Self::Native(_) => false,
+        }
+    }
+
+    pub(crate) const fn f16_micro_panel_order(self) -> Option<F16MicroPanelOrder> {
+        match self {
+            Self::Native(NativeKernelOrder::Left | NativeKernelOrder::TransposedRight) => {
+                Some(F16MicroPanelOrder::RowsThenColumns)
+            }
+            Self::Native(NativeKernelOrder::TransposedLeft) | Self::Blocked(_) => {
+                Some(F16MicroPanelOrder::ColumnsThenRows)
+            }
+            Self::Linear
+            | Self::Native(NativeKernelOrder::Output | NativeKernelOrder::TransposedOutput) => None,
+        }
+    }
+
+    /// Smallest column span which remains a self-contained physical fragment
+    /// when canonical linear ownership divides a matrix into row segments.
+    pub(crate) fn retained_linear_column_grain(self, precision: Precision) -> Option<u32> {
+        match self {
+            Self::Linear => Some(1),
+            Self::Native(NativeKernelOrder::Left) => Some(match precision {
+                Precision::F8F143 { .. } => 32,
+                Precision::F16 => 16,
+                Precision::F32 => 8,
+            }),
+            Self::Native(NativeKernelOrder::Output) => Some(AMP_COLUMN_MICRO),
+            Self::Blocked(_) | Self::Native(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MemoryClass {
+    Standard,
+    Interleaved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -268,7 +299,7 @@ impl TensorTiling {
 /// assigning physical tile identities or SRAM addresses.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Layout {
-    pub order: ElementOrder,
+    pub order: StorageOrder,
     pub tiling: TensorTiling,
     pub memory_class: MemoryClass,
 }
@@ -276,7 +307,7 @@ pub struct Layout {
 impl Layout {
     pub fn row_major(tiling: TensorTiling) -> Self {
         Self {
-            order: ElementOrder::RowMajor,
+            order: StorageOrder::Linear,
             tiling,
             memory_class: MemoryClass::Standard,
         }
@@ -324,7 +355,7 @@ impl Layout {
             Padding::Zero,
         ));
         Self {
-            order: ElementOrder::Amp(AmpOrder::Left),
+            order: StorageOrder::Native(NativeKernelOrder::Left),
             tiling,
             memory_class: MemoryClass::Standard,
         }
@@ -343,7 +374,7 @@ impl Layout {
             AxisTiling::new(TensorAxis::FromEnd(1), 1, AMP_COLUMN_MICRO, Padding::Zero),
         ];
         Self {
-            order: ElementOrder::Amp(AmpOrder::TransposedRight),
+            order: StorageOrder::Native(NativeKernelOrder::TransposedRight),
             tiling: TensorTiling {
                 tile_count: heads.saturating_mul(key_partitions),
                 replicas: 1,
@@ -355,10 +386,10 @@ impl Layout {
 
     pub fn attention_block_major_key_value(heads: u16, key_partitions: u16) -> Self {
         let mut layout = Self::attention_key(heads, key_partitions);
-        layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-            row_block: AMP_INNER_BLOCK as u16,
-            column_block: AMP_COLUMN_MICRO as u16,
-        });
+        layout.order = StorageOrder::Blocked(BlockedOrder::matrix(
+            AMP_INNER_BLOCK as u16,
+            AMP_COLUMN_MICRO as u16,
+        ));
         layout
     }
 
@@ -375,7 +406,7 @@ impl Layout {
 
     pub fn amp_left(inner: u16, tile_count: u16) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Left),
+            order: StorageOrder::Native(NativeKernelOrder::Left),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
@@ -401,7 +432,7 @@ impl Layout {
 
     pub fn amp_output(tile_count: u16) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Output),
+            order: StorageOrder::Native(NativeKernelOrder::Output),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
@@ -419,7 +450,7 @@ impl Layout {
     /// drain land in this order without a post-compute permutation.
     pub fn amp_left_result(tile_count: u16) -> Self {
         let mut layout = Self::amp_output(tile_count);
-        layout.order = ElementOrder::Amp(AmpOrder::Left);
+        layout.order = StorageOrder::Native(NativeKernelOrder::Left);
         layout
     }
 
@@ -436,7 +467,7 @@ impl Layout {
             return Self::amp_left(inner, tile_count);
         }
         Self {
-            order: ElementOrder::Amp(AmpOrder::Left),
+            order: StorageOrder::Native(NativeKernelOrder::Left),
             tiling: TensorTiling {
                 tile_count,
                 replicas: column_partitions,
@@ -464,7 +495,7 @@ impl Layout {
         inner_partitions: u16,
     ) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::Left),
+            order: StorageOrder::Native(NativeKernelOrder::Left),
             tiling: TensorTiling {
                 tile_count,
                 replicas: column_partitions,
@@ -492,7 +523,7 @@ impl Layout {
         inner_partitions: u16,
     ) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::TransposedLeft),
+            order: StorageOrder::Native(NativeKernelOrder::TransposedLeft),
             tiling: TensorTiling {
                 tile_count,
                 replicas: column_partitions,
@@ -521,10 +552,7 @@ impl Layout {
         grid_order: GridOrder,
     ) -> Self {
         Self {
-            order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block: inner,
-                column_block: AMP_COLUMN_MICRO as u16,
-            }),
+            order: StorageOrder::Blocked(BlockedOrder::matrix(inner, AMP_COLUMN_MICRO as u16)),
             tiling: TensorTiling {
                 tile_count,
                 replicas: row_partitions,
@@ -562,10 +590,10 @@ impl Layout {
             .and_then(|tiles| tiles.checked_mul(copies))
             .unwrap_or(0);
         Self {
-            order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block: inner_block,
-                column_block: AMP_COLUMN_MICRO as u16,
-            }),
+            order: StorageOrder::Blocked(BlockedOrder::matrix(
+                inner_block,
+                AMP_COLUMN_MICRO as u16,
+            )),
             tiling: TensorTiling {
                 tile_count,
                 replicas: copies,
@@ -603,10 +631,10 @@ impl Layout {
             .and_then(|tiles| tiles.checked_mul(copies))
             .unwrap_or(0);
         Self {
-            order: ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
-                row_block: inner_block,
-                column_block: AMP_COLUMN_MICRO as u16,
-            }),
+            order: StorageOrder::Blocked(BlockedOrder::transposed_matrix(
+                inner_block,
+                AMP_COLUMN_MICRO as u16,
+            )),
             tiling: TensorTiling {
                 tile_count,
                 replicas: copies,
@@ -645,7 +673,7 @@ impl Layout {
             return Self::amp_output(tile_count);
         }
         Self {
-            order: ElementOrder::Amp(AmpOrder::Output),
+            order: StorageOrder::Native(NativeKernelOrder::Output),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
@@ -685,7 +713,7 @@ impl Layout {
             column_partitions,
             grid_order,
         );
-        layout.order = ElementOrder::Amp(AmpOrder::Left);
+        layout.order = StorageOrder::Native(NativeKernelOrder::Left);
         layout
     }
 
@@ -698,7 +726,7 @@ impl Layout {
         grid_order: GridOrder,
     ) -> Self {
         Self {
-            order: ElementOrder::Amp(AmpOrder::TransposedOutput),
+            order: StorageOrder::Native(NativeKernelOrder::TransposedOutput),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
@@ -738,7 +766,7 @@ impl Layout {
             column_partitions,
             grid_order,
         );
-        layout.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
+        layout.order = StorageOrder::Native(NativeKernelOrder::TransposedLeft);
         layout
     }
 
@@ -752,7 +780,7 @@ impl Layout {
             return Self::amp_output(tile_count);
         }
         Self {
-            order: ElementOrder::Amp(AmpOrder::Output),
+            order: StorageOrder::Native(NativeKernelOrder::Output),
             tiling: TensorTiling {
                 tile_count,
                 replicas: column_replicas,
@@ -778,6 +806,8 @@ pub enum LayoutError {
     AxisOutOfRange { axis: TensorAxis, rank: usize },
     #[error("tensor rank {0} cannot be represented by shard axis identifiers")]
     RankTooLarge(usize),
+    #[error("storage axes or permutation are invalid")]
+    InvalidStorageOrder,
     #[error("axis {0} is tiled more than once")]
     DuplicateAxis(usize),
     #[error("axis {axis} extent {extent} is not divisible by block size {block_size}")]
@@ -1006,6 +1036,12 @@ impl Layout {
         }
         if shape.0.len() > usize::from(u16::MAX) {
             return Err(LayoutError::RankTooLarge(shape.0.len()));
+        }
+        if let StorageOrder::Blocked(order) = self.order {
+            order.physical_axes(shape.0.len())?;
+            if order.block_shape.contains(&0) {
+                return Err(LayoutError::InvalidStorageOrder);
+            }
         }
         if let Some(grain) = self.tiling.linear_grain() {
             let elements = shape.elements();
@@ -1593,7 +1629,7 @@ mod tests {
             shape[first_axis] = random.u32(1..=97);
             shape[second_axis] = random.u32(1..=97);
             let layout = Layout {
-                order: crate::layout::ElementOrder::RowMajor,
+                order: crate::layout::StorageOrder::Linear,
                 tiling: TensorTiling {
                     tile_count: first_partitions * second_partitions * replicas,
                     replicas,

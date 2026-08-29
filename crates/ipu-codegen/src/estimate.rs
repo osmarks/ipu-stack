@@ -1,10 +1,10 @@
 //! Memory, communication, and capacity estimates shared by planning policies.
 
-use crate::graph::TensorShape;
 use crate::ConversionMapping;
+use crate::graph::TensorShape;
 use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, Layout, MemoryClass, TensorAxis, TensorRegion,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorAxis, TensorRegion,
     TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
@@ -166,57 +166,52 @@ pub(crate) fn conversion_mapping_traffic(
     precision: Precision,
     target: HardwareTarget,
 ) -> ConversionTraffic {
-    let maximum_chunk_bytes = u64::from(
-        target
-            .exchange()
-            .maximum_transfer_words,
-    ) * 4;
-    let geometry_fragments = |mapping: &ConversionMapping| {
-        if mapping.copies.is_empty() {
-            let bytes = mapping.region.logical_elements().saturating_mul(precision.bytes());
-            return bytes.div_ceil(maximum_chunk_bytes);
-        }
-        mapping.copies.iter().fold(0u64, |total, geometry| {
-            total.saturating_add(
-                geometry.copy_count().saturating_mul(
+    let maximum_chunk_bytes = u64::from(target.exchange().maximum_transfer_words) * 4;
+    let geometry_fragments =
+        |mapping: &ConversionMapping| {
+            if mapping.copies.is_empty() {
+                let bytes = mapping
+                    .region
+                    .logical_elements()
+                    .saturating_mul(precision.bytes());
+                return bytes.div_ceil(maximum_chunk_bytes);
+            }
+            mapping.copies.iter().fold(0u64, |total, geometry| {
+                total.saturating_add(geometry.copy_count().saturating_mul(
                     u64::from(geometry.contiguous_bytes).div_ceil(maximum_chunk_bytes),
-                ),
-            )
-        })
-    };
+                ))
+            })
+        };
     let geometry_bytes = |mapping: &ConversionMapping| {
         if mapping.copies.is_empty() {
-            return mapping.region.logical_elements().saturating_mul(precision.bytes());
+            return mapping
+                .region
+                .logical_elements()
+                .saturating_mul(precision.bytes());
         }
-        mapping
-            .copies
-            .iter()
-            .fold(0u64, |total, geometry| total.saturating_add(geometry.bytes()))
+        mapping.copies.iter().fold(0u64, |total, geometry| {
+            total.saturating_add(geometry.bytes())
+        })
     };
 
     let mut traffic = ConversionTraffic::default();
     let mut destination_loads = HashMap::<u32, (u16, u64, u64, u64, u64)>::new();
-    let mut remote_sources = HashMap::<
-        (u32, TensorRegion, Vec<crate::CopyGeometry>),
-        (u16, u64, u64),
-    >::new();
+    let mut remote_sources =
+        HashMap::<(u32, TensorRegion, Vec<crate::CopyGeometry>), (u16, u64, u64)>::new();
     for mapping in mappings {
         let bytes = geometry_bytes(mapping);
         let fragments = geometry_fragments(mapping);
-        let destination = destination_loads.entry(mapping.destination_shard).or_insert((
-            mapping.destination_tile,
-            0,
-            0,
-            0,
-            0,
-        ));
+        let destination = destination_loads
+            .entry(mapping.destination_shard)
+            .or_insert((mapping.destination_tile, 0, 0, 0, 0));
         destination.1 = destination.1.saturating_add(bytes);
         destination.3 = destination.3.saturating_add(1);
         if mapping.source_tile == mapping.destination_tile {
             destination.4 = destination.4.saturating_add(bytes);
             traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(bytes);
-            traffic.maximum_local_intersections =
-                traffic.maximum_local_intersections.max(mapping.copies.len().max(1) as u64);
+            traffic.maximum_local_intersections = traffic
+                .maximum_local_intersections
+                .max(mapping.copies.len().max(1) as u64);
         } else {
             destination.2 = destination.2.saturating_add(bytes);
             add_endpoint_load(
@@ -225,12 +220,13 @@ pub(crate) fn conversion_mapping_traffic(
                 bytes,
                 fragments,
             );
-            remote_sources.entry((
-                mapping.source_shard,
-                mapping.region.clone(),
-                mapping.copies.clone(),
-            ))
-            .or_insert((mapping.source_tile, bytes, fragments));
+            remote_sources
+                .entry((
+                    mapping.source_shard,
+                    mapping.region.clone(),
+                    mapping.copies.clone(),
+                ))
+                .or_insert((mapping.source_tile, bytes, fragments));
         }
     }
     for (_, total_bytes, remote_bytes, intersections, local_bytes) in
@@ -258,8 +254,7 @@ pub(crate) fn conversion_mapping_traffic(
     }
     let mut bus_loads = HashMap::<u16, (u64, u64)>::new();
     for (tile, (bytes, fragments)) in source_loads {
-        traffic.maximum_source_payload_bytes =
-            traffic.maximum_source_payload_bytes.max(bytes);
+        traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
         traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
         let bus = bus_loads.entry(tile / 2).or_default();
         bus.0 = bus.0.saturating_add(bytes);
@@ -268,8 +263,7 @@ pub(crate) fn conversion_mapping_traffic(
     for (bus, (bytes, fragments)) in bus_loads {
         traffic.maximum_source_bus_payload_bytes =
             traffic.maximum_source_bus_payload_bytes.max(bytes);
-        traffic.maximum_source_bus_fragments =
-            traffic.maximum_source_bus_fragments.max(fragments);
+        traffic.maximum_source_bus_fragments = traffic.maximum_source_bus_fragments.max(fragments);
         add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
     }
     traffic
@@ -350,7 +344,7 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
             layout: match (&orientation, output.format.layout.order) {
                 (
                     crate::GemmOrientation::Normal,
-                    crate::ElementOrder::Amp(crate::AmpOrder::Left),
+                    crate::StorageOrder::Native(crate::NativeKernelOrder::Left),
                 ) => Layout::amp_left_result_grid(
                     output_column_block,
                     row_partitions.saturating_mul(column_partitions),
@@ -360,7 +354,7 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
                 ),
                 (
                     crate::GemmOrientation::Swapped,
-                    crate::ElementOrder::Amp(crate::AmpOrder::TransposedLeft),
+                    crate::StorageOrder::Native(crate::NativeKernelOrder::TransposedLeft),
                 ) => Layout::amp_transposed_left_result_grid(
                     output_column_block,
                     row_partitions.saturating_mul(column_partitions),
@@ -806,7 +800,7 @@ pub(crate) fn gemm_requires_panel_repacking(
     output: &TensorType,
 ) -> bool {
     gemm_uses_panel_buffer(dispatch, right, output)
-        && !matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
+        && !matches!(right.format.layout.order, StorageOrder::Blocked(_))
 }
 
 pub(crate) fn gemm_exchange_phase_count(
@@ -1401,14 +1395,13 @@ mod tests {
                 ),
             );
             let dispatch = output_stationary_dispatch();
-            let local =
-                gemm_exchange_endpoint_traffic(
-                    &dispatch,
-                    &[local_left, local_right],
-                    &output,
-                    HardwareTarget::Ipu21,
-                )
-                .unwrap();
+            let local = gemm_exchange_endpoint_traffic(
+                &dispatch,
+                &[local_left, local_right],
+                &output,
+                HardwareTarget::Ipu21,
+            )
+            .unwrap();
             assert!(local.is_empty(), "case {case}");
 
             let sharded_left = TensorType::new(
@@ -1428,14 +1421,13 @@ mod tests {
                     MemoryClass::Standard,
                 ),
             );
-            let remote =
-                gemm_exchange_endpoint_traffic(
-                    &dispatch,
-                    &[sharded_left, sharded_right],
-                    &output,
-                    HardwareTarget::Ipu21,
-                )
-                .unwrap();
+            let remote = gemm_exchange_endpoint_traffic(
+                &dispatch,
+                &[sharded_left, sharded_right],
+                &output,
+                HardwareTarget::Ipu21,
+            )
+            .unwrap();
             assert!(remote.maximum_outgoing_bytes() != 0, "case {case}");
             assert!(remote.maximum_incoming_bytes() != 0, "case {case}");
             assert_eq!(
