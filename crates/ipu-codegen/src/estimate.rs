@@ -28,9 +28,6 @@ pub(crate) struct ConversionTraffic {
     pub maximum_destination_bytes: u64,
     pub maximum_remote_destination_bytes: u64,
     pub maximum_remote_destination_fragments: u64,
-    pub maximum_local_bytes: u64,
-    pub maximum_intersections: u64,
-    pub maximum_local_intersections: u64,
     pub source_bus_loads: Vec<ExchangeEndpointLoad>,
     pub remote_destination_loads: Vec<ExchangeEndpointLoad>,
 }
@@ -163,19 +160,11 @@ fn add_endpoint_load(
 /// every receiving tile; local geometries contribute no exchange traffic.
 pub(crate) fn conversion_mapping_traffic(
     mappings: &[ConversionMapping],
-    precision: Precision,
     target: HardwareTarget,
 ) -> ConversionTraffic {
     let maximum_chunk_bytes = u64::from(target.exchange().maximum_transfer_words) * 4;
     let geometry_fragments =
         |mapping: &ConversionMapping| {
-            if mapping.copies.is_empty() {
-                let bytes = mapping
-                    .region
-                    .logical_elements()
-                    .saturating_mul(precision.bytes());
-                return bytes.div_ceil(maximum_chunk_bytes);
-            }
             mapping.copies.iter().fold(0u64, |total, geometry| {
                 total.saturating_add(geometry.copy_count().saturating_mul(
                     u64::from(geometry.contiguous_bytes).div_ceil(maximum_chunk_bytes),
@@ -183,19 +172,13 @@ pub(crate) fn conversion_mapping_traffic(
             })
         };
     let geometry_bytes = |mapping: &ConversionMapping| {
-        if mapping.copies.is_empty() {
-            return mapping
-                .region
-                .logical_elements()
-                .saturating_mul(precision.bytes());
-        }
         mapping.copies.iter().fold(0u64, |total, geometry| {
             total.saturating_add(geometry.bytes())
         })
     };
 
     let mut traffic = ConversionTraffic::default();
-    let mut destination_loads = HashMap::<u32, (u16, u64, u64, u64, u64)>::new();
+    let mut destination_loads = HashMap::<u32, (u64, u64)>::new();
     let mut remote_sources =
         HashMap::<(u32, TensorRegion, Vec<crate::CopyGeometry>), (u16, u64, u64)>::new();
     for mapping in mappings {
@@ -203,17 +186,10 @@ pub(crate) fn conversion_mapping_traffic(
         let fragments = geometry_fragments(mapping);
         let destination = destination_loads
             .entry(mapping.destination_shard)
-            .or_insert((mapping.destination_tile, 0, 0, 0, 0));
-        destination.1 = destination.1.saturating_add(bytes);
-        destination.3 = destination.3.saturating_add(1);
-        if mapping.source_tile == mapping.destination_tile {
-            destination.4 = destination.4.saturating_add(bytes);
-            traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(bytes);
-            traffic.maximum_local_intersections = traffic
-                .maximum_local_intersections
-                .max(mapping.copies.len().max(1) as u64);
-        } else {
-            destination.2 = destination.2.saturating_add(bytes);
+            .or_default();
+        destination.0 = destination.0.saturating_add(bytes);
+        if mapping.source_tile != mapping.destination_tile {
+            destination.1 = destination.1.saturating_add(bytes);
             add_endpoint_load(
                 &mut traffic.remote_destination_loads,
                 mapping.destination_tile,
@@ -229,14 +205,10 @@ pub(crate) fn conversion_mapping_traffic(
                 .or_insert((mapping.source_tile, bytes, fragments));
         }
     }
-    for (_, total_bytes, remote_bytes, intersections, local_bytes) in
-        destination_loads.into_values()
-    {
+    for (total_bytes, remote_bytes) in destination_loads.into_values() {
         traffic.maximum_destination_bytes = traffic.maximum_destination_bytes.max(total_bytes);
         traffic.maximum_remote_destination_bytes =
             traffic.maximum_remote_destination_bytes.max(remote_bytes);
-        traffic.maximum_intersections = traffic.maximum_intersections.max(intersections);
-        traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
     }
     for load in &traffic.remote_destination_loads {
         traffic.maximum_remote_destination_fragments = traffic
@@ -834,13 +806,52 @@ pub(crate) fn gemm_exchange_phase_count(
 pub(crate) fn conversion_memory_estimate(
     input: &TensorType,
     output: &TensorType,
+    strategy: crate::ConversionStrategy,
+    mappings: &[crate::ConversionMapping],
 ) -> MemoryEstimate {
     let live = tensor_memory(input).saturating_add(tensor_memory(output));
+    let mut staging_by_tile = HashMap::<u16, u64>::new();
+    let mut maximum_standard_temporary_allocation = 0;
+    if strategy == crate::ConversionStrategy::StageLogicalThenTransform {
+        for shard in output
+            .format
+            .layout
+            .resolve(&output.shape)
+            .into_iter()
+            .flat_map(|layout| layout.shard_extents())
+        {
+            let bytes = shard
+                .extents
+                .logical_elements()
+                .saturating_mul(output.format.precision.bytes());
+            let tile_bytes = staging_by_tile.entry(shard.tile).or_default();
+            *tile_bytes = tile_bytes.saturating_add(bytes);
+            maximum_standard_temporary_allocation =
+                maximum_standard_temporary_allocation.max(bytes);
+        }
+    }
+    for mapping in mappings
+        .iter()
+        .filter(|mapping| !mapping.source_copies.is_empty())
+    {
+        let bytes = mapping.copies.iter().fold(0u64, |bytes, geometry| {
+            bytes.saturating_add(geometry.bytes())
+        });
+        for tile in [mapping.source_tile, mapping.destination_tile] {
+            let tile_bytes = staging_by_tile.entry(tile).or_default();
+            *tile_bytes = tile_bytes.saturating_add(bytes);
+        }
+        maximum_standard_temporary_allocation = maximum_standard_temporary_allocation.max(bytes);
+    }
+    let temporary = MemoryUsage {
+        standard: staging_by_tile.into_values().max().unwrap_or(0),
+        interleaved: 0,
+    };
     MemoryEstimate {
         live,
-        temporary: MemoryUsage::default(),
-        peak: live,
-        maximum_standard_temporary_allocation: 0,
+        temporary,
+        peak: live.saturating_add(temporary),
+        maximum_standard_temporary_allocation,
     }
 }
 

@@ -125,7 +125,12 @@ pub struct ConversionMapping {
     pub destination_tile: u16,
     pub destination_storage: TensorRegion,
     pub region: TensorRegion,
+    /// Local copies from the source layout into word-aligned transfer staging.
+    pub source_copies: Vec<CopyGeometry>,
     pub copies: Vec<CopyGeometry>,
+    /// Local copies from word-aligned transfer staging into the planned
+    /// destination storage.
+    pub destination_copies: Vec<CopyGeometry>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -140,50 +145,15 @@ pub enum ConversionGeometryError {
     Overflow,
 }
 
-#[derive(Clone)]
-struct StorageBlock {
-    origin: Vec<u32>,
-    offset: u32,
-    bytes: u32,
-}
-
-#[derive(Clone)]
-struct CopyRun {
-    source_offset: u32,
-    destination_offset: u32,
-    bytes: u32,
-}
-
 /// Resolves ownership intersections and their regular local/remote copy
 /// nests from tensor shape and layouts. No SRAM addresses or low-level shard
 /// identities participate in this decision.
-pub(crate) fn plan_conversion_mappings(
+pub(crate) fn plan_conversion(
     shape: &TensorShape,
     precision: Precision,
     from: &Layout,
     to: &Layout,
     strategy: ConversionStrategy,
-) -> Result<Vec<ConversionMapping>, ConversionGeometryError> {
-    plan_mappings(shape, precision, from, to, strategy, true)
-}
-
-pub(crate) fn plan_semantic_mappings(
-    shape: &TensorShape,
-    precision: Precision,
-    from: &Layout,
-    to: &Layout,
-    strategy: ConversionStrategy,
-) -> Result<Vec<ConversionMapping>, ConversionGeometryError> {
-    plan_mappings(shape, precision, from, to, strategy, false)
-}
-
-fn plan_mappings(
-    shape: &TensorShape,
-    precision: Precision,
-    from: &Layout,
-    to: &Layout,
-    strategy: ConversionStrategy,
-    regular: bool,
 ) -> Result<Vec<ConversionMapping>, ConversionGeometryError> {
     if strategy == ConversionStrategy::LocalKernel {
         return Ok(Vec::new());
@@ -194,11 +164,19 @@ fn plan_mappings(
     for (destination_index, destination) in destinations.into_iter().enumerate() {
         let mut intersections = BTreeMap::<TensorRegion, _>::new();
         for (source_index, source) in sources.iter().enumerate() {
-            let Some(region) = source
-                .extents
-                .logical()
-                .intersection(&destination.extents.logical())
-            else {
+            let physical_retile =
+                from.order == to.order && strategy == ConversionStrategy::DirectRetile;
+            let source_region = if physical_retile {
+                source.extents.physical()
+            } else {
+                source.extents.logical()
+            };
+            let destination_region = if physical_retile {
+                destination.extents.physical()
+            } else {
+                destination.extents.logical()
+            };
+            let Some(region) = source_region.intersection(&destination_region) else {
                 continue;
             };
             let selected = intersections
@@ -214,35 +192,73 @@ fn plan_mappings(
             } else {
                 destination.extents.clone()
             };
-            let copies = if regular {
-                let (source_order, destination_order, logical_order) = match strategy {
-                    ConversionStrategy::DirectRetile if from.order == to.order => {
-                        (from.order, to.order, false)
-                    }
-                    ConversionStrategy::DirectLogical => (from.order, to.order, true),
-                    ConversionStrategy::StageLogicalThenTransform
-                        if from.order == StorageOrder::Linear =>
-                    {
-                        (StorageOrder::Linear, StorageOrder::Linear, false)
-                    }
-                    ConversionStrategy::DirectRetile
-                    | ConversionStrategy::StageLogicalThenTransform
-                    | ConversionStrategy::LocalKernel => {
-                        return Err(ConversionGeometryError::Unsupported);
-                    }
-                };
-                copy_geometries(
-                    precision,
-                    source_order,
-                    destination_order,
-                    &source.extents,
-                    &destination_storage,
-                    &region,
-                    source.tile == destination.tile,
-                    logical_order,
-                )?
-            } else {
-                Vec::new()
+            let (source_order, destination_order, logical_order) = match strategy {
+                ConversionStrategy::DirectRetile if from.order == to.order => {
+                    (from.order, to.order, false)
+                }
+                ConversionStrategy::DirectLogical => (from.order, to.order, true),
+                ConversionStrategy::StageLogicalThenTransform => (
+                    from.order,
+                    StorageOrder::Linear,
+                    from.order != StorageOrder::Linear,
+                ),
+                ConversionStrategy::DirectRetile | ConversionStrategy::LocalKernel => {
+                    return Err(ConversionGeometryError::Unsupported);
+                }
+            };
+            let direct = copy_geometries(
+                precision,
+                source_order,
+                destination_order,
+                &source.extents,
+                &destination_storage,
+                &region,
+                source.tile == destination.tile,
+                logical_order,
+            );
+            let (source_copies, copies, destination_copies) = match direct {
+                Ok(copies) => (Vec::new(), copies, Vec::new()),
+                Err(ConversionGeometryError::Unsupported) => {
+                    let logical_storage = region.logical();
+                    let source_copies = copy_geometries(
+                        precision,
+                        source_order,
+                        StorageOrder::Linear,
+                        &source.extents,
+                        &logical_storage,
+                        &region,
+                        true,
+                        source_order != StorageOrder::Linear,
+                    )?;
+                    let destination_copies = copy_geometries(
+                        precision,
+                        StorageOrder::Linear,
+                        destination_order,
+                        &logical_storage,
+                        &destination_storage,
+                        &region,
+                        true,
+                        destination_order != StorageOrder::Linear,
+                    )?;
+                    let bytes = region
+                        .iter()
+                        .try_fold(precision.bytes() as u32, |bytes, extent| {
+                            bytes.checked_mul(extent.logical_end - extent.start)
+                        })
+                        .ok_or(ConversionGeometryError::Overflow)?;
+                    let padded_bytes = bytes.div_ceil(4) * 4;
+                    (
+                        source_copies,
+                        vec![CopyGeometry {
+                            source_offset: 0,
+                            destination_offset: 0,
+                            contiguous_bytes: padded_bytes,
+                            dimensions: Vec::new(),
+                        }],
+                        destination_copies,
+                    )
+                }
+                Err(error) => return Err(error),
             };
             mappings.push(ConversionMapping {
                 source_shard: u32::try_from(source_index)
@@ -254,7 +270,9 @@ fn plan_mappings(
                 destination_tile: destination.tile,
                 destination_storage,
                 region,
+                source_copies,
                 copies,
+                destination_copies,
             });
         }
     }
@@ -278,63 +296,153 @@ fn copy_geometries(
         return Err(ConversionGeometryError::Unsupported);
     }
     let dimensions = if logical_order {
-        logical_block_dimensions(source_order, destination_order, precision, region)?
+        vec![1; region.len()]
     } else {
         if source_order != destination_order {
             return Err(ConversionGeometryError::Unsupported);
         }
         physical_block_dimensions(source_order, precision, region)?
     };
-    let source = storage_blocks(source_order, precision, source_storage, region, &dimensions)?;
-    let destination = storage_blocks(
+    let geometries = match affine_geometries(
+        source_order,
         destination_order,
         precision,
+        source_storage,
         destination_storage,
         region,
         &dimensions,
-    )?;
-    let mut destinations = destination
-        .into_iter()
-        .map(|block| (block.origin.clone(), block))
-        .collect::<BTreeMap<_, _>>();
-    let mut source = source;
-    source.sort_by_key(|block| block.offset);
-    let mut runs = Vec::<CopyRun>::with_capacity(source.len());
-    for block in source {
-        let destination = destinations
-            .remove(&block.origin)
-            .ok_or(ConversionGeometryError::Unsupported)?;
-        if destination.bytes != block.bytes {
+        logical_order,
+    ) {
+        Ok(geometries) => geometries,
+        Err(ConversionGeometryError::Unsupported) if local && logical_order => {
+            let scalar = vec![1; region.len()];
+            affine_geometries(
+                source_order,
+                destination_order,
+                precision,
+                source_storage,
+                destination_storage,
+                region,
+                &scalar,
+                true,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
+    let alignment = if local { precision.bytes() as u32 } else { 4 };
+    for geometry in &geometries {
+        if !geometry.source_offset.is_multiple_of(alignment)
+            || !geometry.destination_offset.is_multiple_of(alignment)
+            || geometry.contiguous_bytes == 0
+            || !geometry.contiguous_bytes.is_multiple_of(alignment)
+        {
             return Err(ConversionGeometryError::Unsupported);
         }
-        if let Some(previous) = runs.last_mut()
-            && previous.source_offset.checked_add(previous.bytes) == Some(block.offset)
-            && previous.destination_offset.checked_add(previous.bytes) == Some(destination.offset)
-        {
-            previous.bytes = previous
-                .bytes
-                .checked_add(block.bytes)
-                .ok_or(ConversionGeometryError::Overflow)?;
-            continue;
+    }
+    Ok(geometries)
+}
+
+fn affine_geometries(
+    source_order: StorageOrder,
+    destination_order: StorageOrder,
+    precision: Precision,
+    source_storage: &TensorRegion,
+    destination_storage: &TensorRegion,
+    region: &TensorRegion,
+    dimensions: &[u32],
+    logical_order: bool,
+) -> Result<Vec<CopyGeometry>, ConversionGeometryError> {
+    let mut pending = vec![region.clone()];
+    let mut geometries = Vec::new();
+    while let Some(region) = pending.pop() {
+        if logical_order {
+            let cells = [
+                (
+                    affine_cell_dimensions(source_order, precision, region.len())?,
+                    source_storage,
+                ),
+                (
+                    affine_cell_dimensions(destination_order, precision, region.len())?,
+                    destination_storage,
+                ),
+            ];
+            let mut split = None;
+            'orders: for (dimensions, storage) in cells {
+                for (axis, (&dimension, extent)) in
+                    dimensions.iter().zip(storage.iter()).enumerate()
+                {
+                    if dimension == 0 {
+                        continue;
+                    }
+                    let local = region[axis].start - extent.start;
+                    let boundary = extent
+                        .start
+                        .checked_add(
+                            local
+                                .checked_div(dimension)
+                                .and_then(|cell| cell.checked_add(1))
+                                .and_then(|cell| cell.checked_mul(dimension))
+                                .ok_or(ConversionGeometryError::Overflow)?,
+                        )
+                        .ok_or(ConversionGeometryError::Overflow)?;
+                    if boundary < region[axis].logical_end {
+                        split = Some((axis, boundary));
+                        break 'orders;
+                    }
+                }
+            }
+            if let Some((axis, boundary)) = split {
+                let mut first = region.clone();
+                let mut second = region;
+                first[axis].logical_end = boundary;
+                first[axis].physical_end = boundary;
+                second[axis].start = boundary;
+                pending.push(second);
+                pending.push(first);
+                continue;
+            }
         }
-        runs.push(CopyRun {
-            source_offset: block.offset,
-            destination_offset: destination.offset,
-            bytes: block.bytes,
-        });
+        match affine_geometry(
+            source_order,
+            destination_order,
+            precision,
+            source_storage,
+            destination_storage,
+            &region,
+            dimensions,
+        ) {
+            Ok(geometry) => geometries.push(geometry),
+            Err(ConversionGeometryError::Unsupported) => {
+                let Some((axis, count)) = region
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(axis, extent)| {
+                        let count = (extent.logical_end - extent.start) / dimensions[axis];
+                        (count > 1).then_some((axis, count))
+                    })
+                    .max_by_key(|&(_, count)| count)
+                else {
+                    return Err(ConversionGeometryError::Unsupported);
+                };
+                let split = region[axis].start + count.div_ceil(2) * dimensions[axis];
+                let mut first = region.clone();
+                let mut second = region;
+                first[axis].logical_end = split;
+                first[axis].physical_end = split;
+                second[axis].start = split;
+                pending.push(second);
+                pending.push(first);
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if !destinations.is_empty() {
-        return Err(ConversionGeometryError::Unsupported);
-    }
-    let mut geometries = runs
-        .into_iter()
-        .map(|run| CopyGeometry {
-            source_offset: run.source_offset,
-            destination_offset: run.destination_offset,
-            contiguous_bytes: run.bytes,
-            dimensions: Vec::new(),
-        })
-        .collect::<Vec<_>>();
+    compact_geometries(geometries)
+}
+
+fn compact_geometries(
+    mut geometries: Vec<CopyGeometry>,
+) -> Result<Vec<CopyGeometry>, ConversionGeometryError> {
+    geometries.sort_by_key(|geometry| geometry.source_offset);
     loop {
         let mut compacted = Vec::new();
         let mut merged = false;
@@ -395,115 +503,161 @@ fn copy_geometries(
         }
         geometries = compacted;
         if !merged {
-            break;
+            return Ok(geometries);
         }
     }
-    let alignment = if local { precision.bytes() as u32 } else { 4 };
-    for geometry in &geometries {
-        if !geometry.source_offset.is_multiple_of(alignment)
-            || !geometry.destination_offset.is_multiple_of(alignment)
-            || geometry.contiguous_bytes == 0
-            || !geometry.contiguous_bytes.is_multiple_of(alignment)
-        {
-            return Err(ConversionGeometryError::Unsupported);
-        }
-    }
-    if local {
-        geometries = split_unsupported_local_nests(geometries)?;
-    }
-    Ok(geometries)
 }
 
-fn split_unsupported_local_nests(
-    geometries: Vec<CopyGeometry>,
-) -> Result<Vec<CopyGeometry>, ConversionGeometryError> {
-    let mut supported = Vec::new();
-    for mut geometry in geometries {
-        let retain_inner = geometry.dimensions.first().is_some_and(|dimension| {
-            geometry.contiguous_bytes.is_multiple_of(8)
-                && u64::from(geometry.contiguous_bytes) * u64::from(dimension.count) <= 512
-        });
-        let outer = geometry.dimensions.split_off(usize::from(retain_inner));
-        let offsets = CopyGeometry {
-            dimensions: outer,
-            ..geometry.clone()
-        }
-        .offsets()
-        .ok_or(ConversionGeometryError::Overflow)?;
-        for (source_offset, destination_offset) in offsets {
-            supported.push(CopyGeometry {
-                source_offset,
-                destination_offset,
-                ..geometry.clone()
-            });
-        }
-    }
-    Ok(supported)
-}
-
-fn storage_blocks(
+fn affine_cell_dimensions(
     order: StorageOrder,
     precision: Precision,
-    storage: &TensorRegion,
+    rank: usize,
+) -> Result<Vec<u32>, ConversionGeometryError> {
+    let mut dimensions = vec![0; rank];
+    if rank < 2 || order == StorageOrder::Linear {
+        return Ok(dimensions);
+    }
+    let row = rank - 2;
+    let column = rank - 1;
+    match order {
+        StorageOrder::Linear => {}
+        StorageOrder::Native(NativeKernelOrder::Left) => {
+            dimensions[column] = amp_micro_dimension(precision);
+        }
+        StorageOrder::Native(NativeKernelOrder::TransposedLeft) => {
+            dimensions[row] = amp_micro_dimension(precision);
+        }
+        StorageOrder::Native(NativeKernelOrder::TransposedRight) => {
+            dimensions[row] = amp_micro_dimension(precision);
+            dimensions[column] = AMP_COLUMN_MICRO;
+        }
+        StorageOrder::Native(NativeKernelOrder::Output) => dimensions[column] = 2,
+        StorageOrder::Native(NativeKernelOrder::TransposedOutput) => dimensions[row] = 2,
+        StorageOrder::Blocked(order) => {
+            let [row, column] = order.physical_axes(rank)?;
+            dimensions[row] = amp_micro_dimension(precision);
+            dimensions[column] = u32::from(order.block_shape[1]);
+        }
+    }
+    Ok(dimensions)
+}
+
+fn affine_geometry(
+    source_order: StorageOrder,
+    destination_order: StorageOrder,
+    precision: Precision,
+    source_storage: &TensorRegion,
+    destination_storage: &TensorRegion,
     region: &TensorRegion,
     dimensions: &[u32],
-) -> Result<Vec<StorageBlock>, ConversionGeometryError> {
-    let rank = storage.len();
-    if rank == 0 || rank != region.len() || rank != dimensions.len() {
+) -> Result<CopyGeometry, ConversionGeometryError> {
+    let rank = region.len();
+    if rank == 0
+        || source_storage.len() != rank
+        || destination_storage.len() != rank
+        || dimensions.len() != rank
+    {
         return Err(ConversionGeometryError::Unsupported);
     }
-    let dimensions = dimensions.to_vec();
-    for (axis, ((storage, region), &block)) in storage
+    for (axis, (((source, destination), region), &block)) in source_storage
         .iter()
+        .zip(destination_storage.iter())
         .zip(region.iter())
-        .zip(&dimensions)
+        .zip(dimensions)
         .enumerate()
     {
-        let start_must_align = !(order == StorageOrder::Linear && axis + 1 == rank);
-        if storage.axis != region.axis
-            || region.start < storage.start
-            || region.logical_end > storage.logical_end
+        let source_must_align = !(source_order == StorageOrder::Linear && axis + 1 == rank);
+        let destination_must_align =
+            !(destination_order == StorageOrder::Linear && axis + 1 == rank);
+        if source.axis != region.axis
+            || destination.axis != region.axis
+            || region.start < source.start
+            || region.start < destination.start
+            || region.logical_end > source.physical_end
+            || region.logical_end > destination.physical_end
             || block == 0
-            || start_must_align && !(region.start - storage.start).is_multiple_of(block)
+            || source_must_align && !(region.start - source.start).is_multiple_of(block)
+            || destination_must_align && !(region.start - destination.start).is_multiple_of(block)
             || !(region.logical_end - region.start).is_multiple_of(block)
         {
             return Err(ConversionGeometryError::Unsupported);
         }
     }
-    let block_elements = dimensions
+    let block_bytes = dimensions
         .iter()
-        .try_fold(1u32, |elements, dimension| elements.checked_mul(*dimension));
-    let block_bytes = block_elements
+        .try_fold(1u32, |elements, dimension| elements.checked_mul(*dimension))
         .and_then(|elements| elements.checked_mul(precision.bytes() as u32))
         .ok_or(ConversionGeometryError::Overflow)?;
     let starts = region.iter().map(|extent| extent.start).collect::<Vec<_>>();
-    let ends = region
-        .iter()
-        .map(|extent| extent.logical_end)
-        .collect::<Vec<_>>();
-    let mut coordinates = starts.clone();
-    let mut blocks = Vec::new();
-    loop {
-        blocks.push(StorageBlock {
-            origin: coordinates.clone(),
-            offset: physical_byte_offset(order, precision, storage, &coordinates)?,
-            bytes: block_bytes,
+    let source_offset = physical_byte_offset(source_order, precision, source_storage, &starts)?;
+    let destination_offset =
+        physical_byte_offset(destination_order, precision, destination_storage, &starts)?;
+    let mut copy_dimensions = Vec::new();
+    let mut axis_strides = vec![None; rank];
+    for axis in 0..rank {
+        let count = (region[axis].logical_end - region[axis].start) / dimensions[axis];
+        if count <= 1 {
+            continue;
+        }
+        let mut next = starts.clone();
+        next[axis] += dimensions[axis];
+        let source_stride = physical_byte_offset(source_order, precision, source_storage, &next)?
+            .checked_sub(source_offset)
+            .ok_or(ConversionGeometryError::Unsupported)?;
+        let destination_stride =
+            physical_byte_offset(destination_order, precision, destination_storage, &next)?
+                .checked_sub(destination_offset)
+                .ok_or(ConversionGeometryError::Unsupported)?;
+        let mut last = starts.clone();
+        last[axis] += (count - 1) * dimensions[axis];
+        let source_end = source_offset
+            .checked_add((count - 1) * source_stride)
+            .ok_or(ConversionGeometryError::Overflow)?;
+        let destination_end = destination_offset
+            .checked_add((count - 1) * destination_stride)
+            .ok_or(ConversionGeometryError::Overflow)?;
+        if physical_byte_offset(source_order, precision, source_storage, &last)? != source_end
+            || physical_byte_offset(destination_order, precision, destination_storage, &last)?
+                != destination_end
+        {
+            return Err(ConversionGeometryError::Unsupported);
+        }
+        axis_strides[axis] = Some((source_stride, destination_stride));
+        copy_dimensions.push(CopyDimension {
+            count,
+            source_stride,
+            destination_stride,
         });
-        let mut axis = rank;
-        loop {
-            if axis == 0 {
-                return Ok(blocks);
-            }
-            axis -= 1;
-            coordinates[axis] = coordinates[axis]
-                .checked_add(dimensions[axis])
+    }
+    let mut last = starts;
+    let mut expected_source = source_offset;
+    let mut expected_destination = destination_offset;
+    for (axis, &dimension) in dimensions.iter().enumerate() {
+        let count = (region[axis].logical_end - region[axis].start) / dimension;
+        last[axis] += (count - 1) * dimension;
+        if let Some((source_stride, destination_stride)) = axis_strides[axis] {
+            expected_source = expected_source
+                .checked_add((count - 1) * source_stride)
                 .ok_or(ConversionGeometryError::Overflow)?;
-            if coordinates[axis] < ends[axis] {
-                break;
-            }
-            coordinates[axis] = starts[axis];
+            expected_destination = expected_destination
+                .checked_add((count - 1) * destination_stride)
+                .ok_or(ConversionGeometryError::Overflow)?;
         }
     }
+    if physical_byte_offset(source_order, precision, source_storage, &last)? != expected_source
+        || physical_byte_offset(destination_order, precision, destination_storage, &last)?
+            != expected_destination
+    {
+        return Err(ConversionGeometryError::Unsupported);
+    }
+    copy_dimensions
+        .sort_by_key(|dimension| dimension.source_stride.max(dimension.destination_stride));
+    Ok(CopyGeometry {
+        source_offset,
+        destination_offset,
+        contiguous_bytes: block_bytes,
+        dimensions: copy_dimensions,
+    })
 }
 
 fn physical_block_dimensions(
@@ -548,59 +702,116 @@ fn physical_block_dimensions(
     Ok(dimensions)
 }
 
-fn logical_block_dimensions(
-    source: StorageOrder,
-    destination: StorageOrder,
-    precision: Precision,
-    region: &TensorRegion,
-) -> Result<Vec<u32>, ConversionGeometryError> {
-    let rank = region.len();
-    if rank == 0 {
-        return Err(ConversionGeometryError::Unsupported);
-    }
-    let mut dimensions = vec![1; rank];
-    if let (StorageOrder::Blocked(source), StorageOrder::Blocked(destination)) =
-        (source, destination)
-        && source.axes == destination.axes
-        && source.permutation == destination.permutation
-    {
-        let [row, column] = source.physical_axes(rank)?;
-        dimensions[row] = amp_micro_dimension(precision);
-        dimensions[column] = gcd(
-            u32::from(source.block_shape[1]),
-            u32::from(destination.block_shape[1]),
-        );
-        return Ok(dimensions);
-    }
-    let contiguous_columns = |order| match order {
-        StorageOrder::Linear => Some(region[rank - 1].logical_end - region[rank - 1].start),
-        StorageOrder::Native(NativeKernelOrder::Left) => Some(amp_micro_dimension(precision)),
-        StorageOrder::Native(NativeKernelOrder::Output) => Some(2),
-        StorageOrder::Blocked(_)
-        | StorageOrder::Native(
-            NativeKernelOrder::TransposedLeft
-            | NativeKernelOrder::TransposedRight
-            | NativeKernelOrder::TransposedOutput,
-        ) if precision == Precision::F32 => Some(1),
-        StorageOrder::Blocked(_) | StorageOrder::Native(_) => None,
-    };
-    let source_columns = contiguous_columns(source).ok_or(ConversionGeometryError::Unsupported)?;
-    let destination_columns =
-        contiguous_columns(destination).ok_or(ConversionGeometryError::Unsupported)?;
-    let columns = gcd(source_columns, destination_columns);
-    if columns
-        .checked_mul(precision.bytes() as u32)
-        .is_none_or(|bytes| bytes < 4)
-    {
-        return Err(ConversionGeometryError::Unsupported);
-    }
-    dimensions[rank - 1] = columns;
-    Ok(dimensions)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{BlockedOrder, ShardExtent, TensorAxis};
+    use std::collections::BTreeMap;
 
-fn gcd(mut left: u32, mut right: u32) -> u32 {
-    while right != 0 {
-        (left, right) = (right, left % right);
+    #[test]
+    fn randomized_affine_geometries_preserve_logical_elements() {
+        let mut random = fastrand::Rng::with_seed(0x636f_7079_6765_6f6d);
+        for case in 0..128 {
+            let rank = random.usize(2..=4);
+            let mut shape = (0..rank).map(|_| random.u32(1..=3)).collect::<Vec<_>>();
+            shape[rank - 2] = 16 * random.u32(1..=3);
+            shape[rank - 1] = 16 * random.u32(1..=3);
+            let first_axis = random.usize(..rank);
+            let second_axis = (first_axis + random.usize(1..rank)) % rank;
+            shape[first_axis] = 16 * random.u32(1..=3);
+            shape[second_axis] = 16 * random.u32(1..=3);
+            let arbitrary_blocked = StorageOrder::Blocked(BlockedOrder {
+                axes: [
+                    TensorAxis::FromStart(first_axis as u16),
+                    TensorAxis::FromStart(second_axis as u16),
+                ],
+                block_shape: [16, 16],
+                permutation: if random.bool() { [0, 1] } else { [1, 0] },
+            });
+            let orders = [
+                StorageOrder::Linear,
+                StorageOrder::Blocked(BlockedOrder::matrix(16, 16)),
+                StorageOrder::Blocked(BlockedOrder::transposed_matrix(16, 16)),
+                arbitrary_blocked,
+                StorageOrder::Native(NativeKernelOrder::Left),
+                StorageOrder::Native(NativeKernelOrder::TransposedLeft),
+                StorageOrder::Native(NativeKernelOrder::TransposedRight),
+                StorageOrder::Native(NativeKernelOrder::Output),
+                StorageOrder::Native(NativeKernelOrder::TransposedOutput),
+            ];
+            let storage = shape
+                .iter()
+                .enumerate()
+                .map(|(axis, &end)| ShardExtent {
+                    axis: axis as u16,
+                    start: 0,
+                    logical_end: end,
+                    physical_end: end,
+                })
+                .collect::<Vec<_>>()
+                .into();
+            let precision = if random.bool() {
+                Precision::F16
+            } else {
+                Precision::F32
+            };
+            let source_order = orders[random.usize(..orders.len())];
+            let destination_order = orders[random.usize(..orders.len())];
+            let geometries = copy_geometries(
+                precision,
+                source_order,
+                destination_order,
+                &storage,
+                &storage,
+                &storage,
+                true,
+                true,
+            )
+            .unwrap_or_else(|error| {
+                panic!("case {case}: {source_order:?} -> {destination_order:?}: {error}")
+            });
+            let element_bytes = precision.bytes() as u32;
+            let mut copied = BTreeMap::new();
+            for geometry in geometries {
+                for (source, destination) in geometry.offsets().unwrap() {
+                    for byte in (0..geometry.contiguous_bytes).step_by(element_bytes as usize) {
+                        assert_eq!(
+                            copied.insert(source + byte, destination + byte),
+                            None,
+                            "case {case}: duplicate source element"
+                        );
+                    }
+                }
+            }
+            let mut coordinates = vec![0; rank];
+            loop {
+                let source =
+                    physical_byte_offset(source_order, precision, &storage, &coordinates).unwrap();
+                let destination =
+                    physical_byte_offset(destination_order, precision, &storage, &coordinates)
+                        .unwrap();
+                assert_eq!(
+                    copied.remove(&source),
+                    Some(destination),
+                    "case {case}: {shape:?} {precision:?} {source_order:?} -> {destination_order:?} at {coordinates:?}"
+                );
+                let mut axis = rank;
+                loop {
+                    if axis == 0 {
+                        assert!(copied.is_empty(), "case {case}: extra copied elements");
+                        break;
+                    }
+                    axis -= 1;
+                    coordinates[axis] += 1;
+                    if coordinates[axis] < shape[axis] {
+                        break;
+                    }
+                    coordinates[axis] = 0;
+                }
+                if axis == 0 && coordinates.iter().all(|&coordinate| coordinate == 0) {
+                    break;
+                }
+            }
+        }
     }
-    left
 }

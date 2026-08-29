@@ -3,7 +3,7 @@
 use crate::ConversionMapping;
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::conversion::{ConversionStrategy, layout_conversion_strategy, plan_conversion_mappings};
+use crate::conversion::{ConversionStrategy, layout_conversion_strategy, plan_conversion};
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -149,7 +149,7 @@ pub trait CostModel: Sync {
     fn rearrangement_cost(
         &self,
         shape: &TensorShape,
-        precision: Precision,
+        _precision: Precision,
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
@@ -163,11 +163,11 @@ pub trait CostModel: Sync {
         from: &Layout,
         to: &Layout,
     ) -> CostEstimate {
-        let strategy = layout_conversion_strategy(precision, from, to);
-        let Ok(mappings) = plan_conversion_mappings(shape, precision, from, to, strategy) else {
+        let requested = layout_conversion_strategy(precision, from, to);
+        let Ok(mappings) = plan_conversion(shape, precision, from, to, requested) else {
             return impossible_conversion_cost();
         };
-        self.rearrangement_cost(shape, precision, strategy, from, to, &mappings)
+        self.rearrangement_cost(shape, precision, requested, from, to, &mappings)
     }
 }
 
@@ -244,6 +244,44 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
         self.inner.cast_cycles(input, to)
+    }
+
+    fn layout_conversion_cost(
+        &self,
+        shape: &TensorShape,
+        precision: Precision,
+        from: &Layout,
+        to: &Layout,
+    ) -> CostEstimate {
+        let requested = layout_conversion_strategy(precision, from, to);
+        let key = (
+            shape.clone(),
+            precision,
+            requested,
+            from.clone(),
+            to.clone(),
+        );
+        let cached = self
+            .rearrangements
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .clone();
+        *cached.get_or_init(|| {
+            let Ok(mappings) = plan_conversion(shape, precision, from, to, requested) else {
+                return impossible_conversion_cost();
+            };
+            let mut cost = self
+                .inner
+                .rearrangement_cost(shape, precision, requested, from, to, &mappings);
+            let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
+            cost.cycles = cost
+                .cycles
+                .saturating_mul(u64::from(self.spatial_capacity))
+                .div_ceil(u64::from(active_tiles));
+            cost
+        })
     }
 
     fn operator_exchange_cycles(
@@ -1396,7 +1434,7 @@ impl CostModel for Ipu21CostModel {
     fn rearrangement_cost(
         &self,
         _shape: &TensorShape,
-        precision: Precision,
+        _precision: Precision,
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
@@ -1405,24 +1443,52 @@ impl CostModel for Ipu21CostModel {
         if mappings.is_empty() && strategy.uses_intersections() {
             return impossible_conversion_cost();
         }
-        let traffic = conversion_mapping_traffic(mappings, precision, self.target());
-        let direct_retile = matches!(
-            strategy,
-            ConversionStrategy::DirectRetile | ConversionStrategy::DirectLogical
-        );
+        let traffic = conversion_mapping_traffic(mappings, self.target());
         let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(&traffic);
         let exchange_cycles = exchange_endpoint_cycles(&endpoint_traffic, 1);
-        let (local_bytes, local_calls) = if direct_retile {
-            (
-                traffic.maximum_local_bytes,
-                traffic.maximum_local_intersections,
-            )
-        } else {
-            (
-                traffic.maximum_destination_bytes.saturating_mul(2),
-                traffic.maximum_intersections,
-            )
+        let mut local_work = HashMap::<u16, (u64, u64)>::new();
+        let mut add_geometry = |tile, geometry: &crate::CopyGeometry| {
+            let work = local_work.entry(tile).or_default();
+            work.0 = work.0.saturating_add(geometry.bytes());
+            let retains_inner = geometry.dimensions.first().is_some_and(|dimension| {
+                geometry.contiguous_bytes.is_multiple_of(8)
+                    && u64::from(geometry.contiguous_bytes) * u64::from(dimension.count) <= 512
+            });
+            let calls = geometry
+                .dimensions
+                .iter()
+                .skip(usize::from(retains_inner))
+                .fold(1u64, |calls, dimension| {
+                    calls.saturating_mul(u64::from(dimension.count))
+                });
+            work.1 = work.1.saturating_add(calls);
         };
+        for mapping in mappings {
+            for geometry in &mapping.source_copies {
+                add_geometry(mapping.source_tile, geometry);
+            }
+            for geometry in &mapping.destination_copies {
+                add_geometry(mapping.destination_tile, geometry);
+            }
+            if mapping.source_tile == mapping.destination_tile {
+                for geometry in &mapping.copies {
+                    add_geometry(mapping.source_tile, geometry);
+                }
+            }
+        }
+        let (mut local_bytes, mut local_calls) = local_work
+            .into_values()
+            .max_by_key(|&(bytes, calls)| {
+                bytes
+                    .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+                    .saturating_add(calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles))
+            })
+            .unwrap_or_default();
+        if strategy == ConversionStrategy::StageLogicalThenTransform {
+            local_bytes =
+                local_bytes.saturating_add(traffic.maximum_destination_bytes.saturating_mul(2));
+            local_calls = local_calls.saturating_add(1);
+        }
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));

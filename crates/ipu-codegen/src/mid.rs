@@ -12,8 +12,7 @@ use crate::config::{
     PlannerSearchDomain,
 };
 use crate::conversion::{
-    ConversionGeometryError, ConversionPlan, ConversionStrategy, layout_conversion_strategy,
-    plan_conversion_mappings, plan_semantic_mappings,
+    ConversionPlan, ConversionStrategy, layout_conversion_strategy, plan_conversion,
 };
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
@@ -3574,7 +3573,12 @@ fn ensure_format(
         let from = tensor_type.format.precision;
         tensor_type.format.precision = target.precision;
         let result = state.derived_value(value, tensor_type.clone());
-        let memory = conversion_memory_estimate(&original.tensor_type, &tensor_type);
+        let memory = conversion_memory_estimate(
+            &original.tensor_type,
+            &tensor_type,
+            ConversionStrategy::LocalKernel,
+            &[],
+        );
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
@@ -3611,24 +3615,19 @@ fn ensure_format(
         let result = state.derived_value(value, tensor_type.clone());
         let strategy =
             layout_conversion_strategy(tensor_type.format.precision, &from, &target.layout);
-        let mappings = plan_conversion_mappings(
+        let mappings = plan_conversion(
             &tensor_type.shape,
             tensor_type.format.precision,
             &from,
             &target.layout,
             strategy,
         )
-        .or_else(|error| match error {
-            ConversionGeometryError::Unsupported => plan_semantic_mappings(
-                &tensor_type.shape,
-                tensor_type.format.precision,
-                &from,
-                &target.layout,
-                strategy,
-            ),
-            error => Err(error),
-        })
-        .expect("resolved layouts must have a semantic conversion route");
+        .unwrap_or_else(|error| {
+            panic!(
+                "conversion {:?} {strategy:?} from {from:?} to {:?}: {error}",
+                tensor_type.shape, target.layout
+            )
+        });
         let rearrangement = costs.rearrangement_cost(
             &tensor_type.shape,
             tensor_type.format.precision,
@@ -3637,7 +3636,8 @@ fn ensure_format(
             &target.layout,
             &mappings,
         );
-        let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type);
+        let memory =
+            conversion_memory_estimate(&current.tensor_type, &tensor_type, strategy, &mappings);
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
