@@ -4,6 +4,7 @@ use crate::{
     ExchangePhaseId, KernelBuildPlan, LowProgram, LowShardId, PhysicalExchangePhase, Placement,
     RepeatRun, TileWorkList, TileWorkRef, materialize_kernel_run,
 };
+use ipu_target::instruction::RETURN_M10_INSTRUCTION;
 use ipu_target::program::{
     CheckpointStep, ComputeStep, ExchangePatch, ExchangeSetupPatch, ExchangeStep,
     PlacedExchangeRow, RepeatPointer, RepeatStep, StepProfile, TileAddress, TileProgram, TileStep,
@@ -502,6 +503,8 @@ fn layout_exchange_rows(
                 .programs
                 .get(usize::from(tile))
                 .ok_or(TileLoweringError::MissingExchangeRow(tile))?
+                .as_deref()
+                .unwrap_or(&[RETURN_M10_INSTRUCTION])
         } else {
             continue;
         };
@@ -516,16 +519,16 @@ fn layout_exchange_rows(
     for phase in exchanges {
         let (active, base_program) = if tile < scheduled_tile_count {
             let index = usize::from(tile);
-            let active = *phase
-                .active
-                .get(index)
-                .ok_or(TileLoweringError::MissingExchangeRow(tile))?;
             let program = phase
                 .programs
                 .get(index)
-                .cloned()
                 .ok_or(TileLoweringError::MissingExchangeRow(tile))?;
-            (active, program)
+            (
+                program.is_some(),
+                program
+                    .clone()
+                    .unwrap_or_else(crate::inactive_exchange_program),
+            )
         } else {
             (false, crate::inactive_exchange_program())
         };
@@ -691,7 +694,6 @@ mod tests {
         ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, PlannerSearchDomain, Precision,
         TensorFormat, lower, lower_exchanges, lower_to_tiles, place,
     };
-    use ipu_target::instruction::RETURN_M10_INSTRUCTION;
 
     #[test]
     fn randomized_gemms_finalize_to_address_resolved_tile_programs() {
@@ -728,7 +730,7 @@ mod tests {
             let exchanges = lower_exchanges(
                 &low,
                 &placement,
-                &ipu_target::hardware::HardwareTarget::Ipu21.topology(),
+                ipu_target::hardware::HardwareTarget::Ipu21,
             )
             .unwrap();
             let filler_tiles = random.u16(1..=4);

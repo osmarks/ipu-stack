@@ -19,6 +19,7 @@ use crate::operator::{
     OutputAliasing, PointwiseInputMapping, Precision, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
+use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -458,7 +459,7 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
     if config.tile_count == 0 {
         return Err(LowLoweringError::EmptyTileGroup);
     }
-    let mut state = LoweringState::new(graph, config.tile_count)?;
+    let mut state = LoweringState::new(graph, config.tile_count, config.target)?;
     let tiles = state.lower_region(
         &graph.operations,
         &graph.outputs,
@@ -611,6 +612,7 @@ enum AttentionOperand {
 }
 
 struct LoweringState {
+    target: HardwareTarget,
     tile_count: u16,
     shards: Vec<LowShard>,
     canonical: Vec<Vec<LowShardId>>,
@@ -637,8 +639,9 @@ impl LoweringState {
         shard
     }
 
-    fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
+    fn new(graph: &MidGraph, tile_count: u16, target: HardwareTarget) -> LowLoweringResult<Self> {
         let mut state = Self {
+            target,
             tile_count,
             shards: Vec::new(),
             canonical: vec![Vec::new(); graph.values.len()],
@@ -2872,7 +2875,8 @@ impl LoweringState {
         &self,
         mappings: &[(ShardView, ShardView)],
     ) -> LowLoweringResult<Option<u64>> {
-        let maximum_bytes = ipu_target::hardware::HardwareTarget::Ipu21
+        let maximum_bytes = self
+            .target
             .exchange()
             .maximum_transfer_words
             .checked_mul(4)
@@ -2958,7 +2962,7 @@ impl LoweringState {
         let elements = bytes.div_ceil(shard.tensor_type.format.precision.bytes().max(1));
         let packed_cycles = crate::cost::row_major_pack_cycles(&shard.tensor_type, elements);
         let clear_cycles = if self.shard_has_padding(destination) {
-            ipu_target::hardware::HardwareTarget::Ipu21
+            self.target
                 .costs()
                 .kernel_launch_cycles
                 .saturating_add(bytes.div_ceil(8 * 6))
@@ -2966,11 +2970,7 @@ impl LoweringState {
             0
         };
         let fragment_cycles = fragments
-            .saturating_mul(
-                ipu_target::hardware::HardwareTarget::Ipu21
-                    .costs()
-                    .logical_fragment_cycles,
-            )
+            .saturating_mul(self.target.costs().logical_fragment_cycles)
             .saturating_add(clear_cycles);
         let direct = fragment_cycles < packed_cycles;
         tracing::trace!(

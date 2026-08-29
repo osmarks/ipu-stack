@@ -1,8 +1,8 @@
 //! Physical exchange programs generated from logical shard transfers.
 
 use crate::{
-    ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
-    logical_view_byte_spans, view_byte_spans,
+    ByteSpan, ExchangeOrder, ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement,
+    ShardDefinition, logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
 };
 use ipu_package::ExchangeActivityKind;
 use ipu_target::exchange::{
@@ -14,6 +14,7 @@ use ipu_target::instruction::RETURN_M10_INSTRUCTION;
 use ipu_target::memory::{MemoryElement, memory_elements_for_words};
 use ipu_target::topology::Topology;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -23,10 +24,9 @@ use ipu_target::exchange::plan_event_cycles;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalExchangePhase {
     pub id: ExchangePhaseId,
-    /// Whether each logical tile participates in this phase's timed program.
-    pub active: Vec<bool>,
-    /// Synchronization-free timed supervisor program indexed by logical tile.
-    pub programs: Vec<Vec<u32>>,
+    /// Synchronization-free timed supervisor program, or `None` when the
+    /// logical tile has no work in this phase.
+    pub programs: Vec<Option<Vec<u32>>>,
     /// Per-tile base used by point-to-point receive rows in this phase.
     pub incoming_bases: Vec<u32>,
     pub event_cycles: u32,
@@ -77,8 +77,10 @@ pub enum ExchangeLoweringError {
 pub(crate) fn lower_exchanges(
     program: &LowProgram,
     placement: &Placement,
-    topology: &Topology,
+    target: HardwareTarget,
 ) -> Result<Vec<PhysicalExchangePhase>, ExchangeLoweringError> {
+    let topology = target.topology().prefix(program.tile_count)?;
+    let maximum_transfer_words = target.exchange().maximum_transfer_words;
     let mut repeat_inputs = BTreeMap::<LowShardId, Vec<LowShardId>>::new();
     for repeat in &program.repeat_runs {
         for iterated in &repeat.iterated {
@@ -104,27 +106,28 @@ pub(crate) fn lower_exchanges(
                 .par_iter()
                 .enumerate()
                 .map(|(index, transfer)| {
-                    prepare_transfer(program, placement, transfer).inspect_err(|error| {
-                        tracing::error!(
-                            phase = phase.id.index(),
-                            transfer = index,
-                            provenance = ?phase.provenance,
-                            source = ?transfer.source,
-                            destinations = ?transfer.destinations,
-                            ?error,
-                            "failed to prepare logical exchange transfer"
-                        );
-                    })
+                    prepare_transfer(program, placement, transfer, maximum_transfer_words)
+                        .inspect_err(|error| {
+                            tracing::error!(
+                                phase = phase.id.index(),
+                                transfer = index,
+                                provenance = ?phase.provenance,
+                                source = ?transfer.source,
+                                destinations = ?transfer.destinations,
+                                ?error,
+                                "failed to prepare logical exchange transfer"
+                            );
+                        })
                 })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?
                 .into_iter()
                 .flatten()
                 .collect();
-            let mut pending = coalesce_pending_transfers(pending);
+            let mut pending = coalesce_pending_transfers(pending, maximum_transfer_words);
             attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
             let incoming_bases = incoming_bases(&pending, program.tile_count)?;
             let schedule = materialize_greedy_schedule(
-                topology,
+                &topology,
                 &pending,
                 &incoming_bases,
                 program.tile_count,
@@ -138,20 +141,14 @@ pub(crate) fn lower_exchanges(
             let horizon = builder.event_cycles();
             let phase_programs = builder.finish()?;
             debug_assert_eq!(phase_programs.event_cycles, horizon);
-            let active = phase_programs
-                .programs
-                .iter()
-                .map(Option::is_some)
-                .collect::<Vec<_>>();
-            let programs = phase_programs
-                .programs
-                .into_iter()
-                .map(|program| program.unwrap_or_else(inactive_exchange_program))
-                .collect::<Vec<_>>();
+            let programs = phase_programs.programs;
             let repeat_patches = programs
                 .iter()
                 .enumerate()
                 .map(|(tile, program)| {
+                    let Some(program) = program else {
+                        return Ok(Vec::new());
+                    };
                     let address_groups = sender_address_instruction_groups(program)?;
                     if address_groups.len() != scheduled_sends[tile].len() {
                         return Err(ExchangeLoweringError::IncompatibleRepeatRows);
@@ -195,7 +192,6 @@ pub(crate) fn lower_exchanges(
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             Ok(PhysicalExchangePhase {
                 id: phase.id,
-                active,
                 programs,
                 incoming_bases: incoming_bases
                     .into_iter()
@@ -213,12 +209,10 @@ fn prepare_transfer(
     program: &LowProgram,
     placement: &Placement,
     transfer: &LogicalExchange,
+    maximum_transfer_words: u32,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
-    if let crate::low::ExchangeOrder::Planned(geometry) = transfer.order {
-        return prepare_planned_transfer(program, placement, transfer, geometry);
-    }
     let source = &program.shards[transfer.source.shard.index() as usize];
-    let logical_order = transfer.order == crate::low::ExchangeOrder::Semantic
+    let logical_order = transfer.order == ExchangeOrder::Semantic
         && transfer.destinations.iter().any(|view| {
             program.shards[view.shard.index() as usize]
                 .tensor_type
@@ -232,6 +226,54 @@ fn prepare_transfer(
         .get(&source.id)
         .copied()
         .ok_or(ExchangeLoweringError::UnplacedShard)?;
+    let (source_spans, planned_destination_spans) =
+        if let ExchangeOrder::Planned(geometry) = transfer.order {
+            if geometry.rows == 0
+                || geometry.row_bytes == 0
+                || geometry.source_offset & 0b11 != 0
+                || geometry.destination_offset & 0b11 != 0
+                || geometry.row_bytes & 0b11 != 0
+            {
+                return Err(ExchangeLoweringError::UnalignedPayload);
+            }
+            let mut source_spans = Vec::with_capacity(geometry.rows as usize);
+            let mut destination_spans = Vec::with_capacity(geometry.rows as usize);
+            for row in 0..geometry.rows {
+                source_spans.push(ByteSpan {
+                    offset: geometry
+                        .source_offset
+                        .checked_add(
+                            row.checked_mul(geometry.source_stride)
+                                .ok_or(ExchangeLoweringError::Overflow)?,
+                        )
+                        .ok_or(ExchangeLoweringError::Overflow)?,
+                    bytes: geometry.row_bytes,
+                });
+                destination_spans.push(ByteSpan {
+                    offset: geometry
+                        .destination_offset
+                        .checked_add(
+                            row.checked_mul(geometry.destination_stride)
+                                .ok_or(ExchangeLoweringError::Overflow)?,
+                        )
+                        .ok_or(ExchangeLoweringError::Overflow)?,
+                    bytes: geometry.row_bytes,
+                });
+            }
+            (source_spans, Some(destination_spans))
+        } else if logical_order {
+            (logical_view_byte_spans(source, &transfer.source)?, None)
+        } else {
+            (view_byte_spans(source, &transfer.source)?, None)
+        };
+    let source_limit = shard_storage_bytes(source)?;
+    if source_spans.iter().any(|span| {
+        span.offset
+            .checked_add(span.bytes)
+            .is_none_or(|end| end > source_limit)
+    }) {
+        return Err(ExchangeLoweringError::UnalignedPayload);
+    }
     let destinations = transfer
         .destinations
         .iter()
@@ -247,10 +289,20 @@ fn prepare_transfer(
                     .get(&view.shard)
                     .copied()
                     .ok_or(ExchangeLoweringError::UnplacedShard)?,
-                if logical_order {
-                    logical_view_byte_spans(shard, view)?
+                if let Some(destination_spans) = &planned_destination_spans {
+                    let destination_limit = shard_storage_bytes(shard)?;
+                    if destination_spans.iter().any(|span| {
+                        span.offset
+                            .checked_add(span.bytes)
+                            .is_none_or(|end| end > destination_limit)
+                    }) {
+                        return Err(ExchangeLoweringError::UnalignedPayload);
+                    }
+                    Cow::Borrowed(destination_spans.as_slice())
+                } else if logical_order {
+                    Cow::Owned(logical_view_byte_spans(shard, view)?)
                 } else {
-                    view_byte_spans(shard, view)?
+                    Cow::Owned(view_byte_spans(shard, view)?)
                 },
             ))
         })
@@ -258,11 +310,6 @@ fn prepare_transfer(
     if destinations.is_empty() {
         return Err(ExchangeLoweringError::SizeMismatch);
     }
-    let source_spans = if logical_order {
-        logical_view_byte_spans(source, &transfer.source)?
-    } else {
-        view_byte_spans(source, &transfer.source)?
-    };
     let source_bytes = source_spans.iter().try_fold(0u32, |total, span| {
         total
             .checked_add(span.bytes)
@@ -288,9 +335,7 @@ fn prepare_transfer(
             return Err(ExchangeLoweringError::UnalignedPayload);
         }
         let mut chunk_bytes = (source_span.bytes - source_offset).min(
-            HardwareTarget::Ipu21
-                .exchange()
-                .maximum_transfer_words
+            maximum_transfer_words
                 .checked_mul(4)
                 .ok_or(ExchangeLoweringError::Overflow)?,
         );
@@ -360,126 +405,6 @@ fn prepare_transfer(
         .any(|((index, offset), (_, _, spans))| *index != spans.len() || *offset != 0)
     {
         return Err(ExchangeLoweringError::SizeMismatch);
-    }
-    Ok(pending)
-}
-
-fn prepare_planned_transfer(
-    program: &LowProgram,
-    placement: &Placement,
-    transfer: &LogicalExchange,
-    geometry: crate::CopyGeometry,
-) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
-    let source = &program.shards[transfer.source.shard.index() as usize];
-    let source_base = placement
-        .shard_addresses
-        .get(&source.id)
-        .copied()
-        .ok_or(ExchangeLoweringError::UnplacedShard)?;
-    let destinations = transfer
-        .destinations
-        .iter()
-        .map(|view| {
-            let shard = &program.shards[view.shard.index() as usize];
-            if matches!(shard.definition, ShardDefinition::Alias(_)) {
-                return Err(ExchangeLoweringError::InvalidDestination);
-            }
-            Ok((
-                shard.tile,
-                placement
-                    .shard_addresses
-                    .get(&view.shard)
-                    .copied()
-                    .ok_or(ExchangeLoweringError::UnplacedShard)?,
-            ))
-        })
-        .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-    if destinations.is_empty()
-        || geometry.rows == 0
-        || geometry.row_bytes == 0
-        || geometry.source_offset & 0b11 != 0
-        || geometry.destination_offset & 0b11 != 0
-        || geometry.row_bytes & 0b11 != 0
-    {
-        return Err(ExchangeLoweringError::UnalignedPayload);
-    }
-    let source_limit = crate::shard_storage_bytes(source)?;
-    let destination_limits = transfer
-        .destinations
-        .iter()
-        .map(|view| crate::shard_storage_bytes(&program.shards[view.shard.index() as usize]))
-        .collect::<Result<Vec<_>, _>>()?;
-    let maximum_chunk_bytes = HardwareTarget::Ipu21
-        .exchange()
-        .maximum_transfer_words
-        .checked_mul(4)
-        .ok_or(ExchangeLoweringError::Overflow)?;
-    let mut pending = Vec::new();
-    for row in 0..geometry.rows {
-        let source_offset = geometry
-            .source_offset
-            .checked_add(
-                row.checked_mul(geometry.source_stride)
-                    .ok_or(ExchangeLoweringError::Overflow)?,
-            )
-            .ok_or(ExchangeLoweringError::Overflow)?;
-        let destination_offset = geometry
-            .destination_offset
-            .checked_add(
-                row.checked_mul(geometry.destination_stride)
-                    .ok_or(ExchangeLoweringError::Overflow)?,
-            )
-            .ok_or(ExchangeLoweringError::Overflow)?;
-        let mut copied = 0u32;
-        while copied < geometry.row_bytes {
-            let bytes = (geometry.row_bytes - copied).min(maximum_chunk_bytes);
-            if bytes & 0b11 != 0
-                || source_offset
-                    .checked_add(copied)
-                    .and_then(|offset| offset.checked_add(bytes))
-                    .is_none_or(|end| end > source_limit)
-                || destination_limits.iter().any(|&limit| {
-                    destination_offset
-                        .checked_add(copied)
-                        .and_then(|offset| offset.checked_add(bytes))
-                        .is_none_or(|end| end > limit)
-                })
-            {
-                return Err(ExchangeLoweringError::UnalignedPayload);
-            }
-            let relative_source = source_offset
-                .checked_add(copied)
-                .ok_or(ExchangeLoweringError::Overflow)?;
-            let source_address = source_base
-                .checked_add(relative_source)
-                .ok_or(ExchangeLoweringError::Overflow)?;
-            let destination_entries = destinations
-                .iter()
-                .map(|&(tile, base)| {
-                    Ok(TransferEndpoint(
-                        tile,
-                        base.checked_add(destination_offset)
-                            .and_then(|address| address.checked_add(copied))
-                            .ok_or(ExchangeLoweringError::Overflow)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-            pending.push(PendingTransfer {
-                physical: PhysicalTransfer {
-                    source: source.tile,
-                    source_addresses: vec![source_address],
-                    destinations: destination_entries,
-                    words: bytes / 4,
-                    width: TransferWidth::Word32,
-                },
-                source_shard: source.id,
-                source_offset: relative_source,
-                source_elements: memory_elements_for_words(source_address, bytes / 4).collect(),
-            });
-            copied = copied
-                .checked_add(bytes)
-                .ok_or(ExchangeLoweringError::Overflow)?;
-        }
     }
     Ok(pending)
 }
@@ -566,7 +491,10 @@ fn incoming_bases(
 /// Combines physically contiguous source and destination spans into one
 /// hardware message. Separate SEND messages require separate receive events,
 /// even when they select the same source tile.
-fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTransfer> {
+fn coalesce_pending_transfers(
+    transfers: Vec<PendingTransfer>,
+    maximum_transfer_words: u32,
+) -> Vec<PendingTransfer> {
     let mut merged = Vec::<PendingTransfer>::with_capacity(transfers.len());
     for transfer in transfers {
         let Some(previous) = merged.last_mut() else {
@@ -609,11 +537,7 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
                                 .is_some_and(|end| end == right_address)
                     },
                 );
-        if contiguous
-            && combined_words.is_some_and(|words| {
-                words <= HardwareTarget::Ipu21.exchange().maximum_transfer_words
-            })
-        {
+        if contiguous && combined_words.is_some_and(|words| words <= maximum_transfer_words) {
             previous.physical.words = combined_words.expect("checked above");
         } else {
             merged.push(transfer);
@@ -1248,12 +1172,10 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&mid, &config).unwrap();
             let placement = place(&low).unwrap();
-            let phases =
-                lower_exchanges(&low, &placement, &HardwareTarget::Ipu21.topology()).unwrap();
+            let phases = lower_exchanges(&low, &placement, HardwareTarget::Ipu21).unwrap();
             assert_eq!(phases.len(), low.exchange_phases.len());
             for phase in phases {
                 assert_eq!(phase.programs.len(), usize::from(tiles));
-                assert_eq!(phase.active.len(), usize::from(tiles));
                 assert_eq!(phase.activities.len(), usize::from(tiles));
                 assert!(phase.event_cycles != 0);
                 assert!(phase.activities.iter().flatten().next().is_some());
@@ -1263,10 +1185,12 @@ mod tests {
                         assert!(activity.end_cycle <= phase.event_cycles);
                     }
                 }
-                for (active, program) in phase.active.iter().zip(&phase.programs) {
+                for program in &phase.programs {
+                    let active = program.is_some();
+                    let program = program.as_deref().unwrap_or(&[RETURN_M10_INSTRUCTION]);
                     assert_eq!(program.last(), Some(&RETURN_M10_INSTRUCTION));
-                    assert_eq!(*active, program.len() > 1);
-                    assert_eq!(*active, plan_event_cycles(program).unwrap() != 0);
+                    assert_eq!(active, program.len() > 1);
+                    assert_eq!(active, plan_event_cycles(program).unwrap() != 0);
                     assert!(plan_event_cycles(program).unwrap() <= phase.event_cycles);
                     assert!(
                         !program.contains(&ipu_target::instruction::SYNC_SUPERVISOR_INSTRUCTION)

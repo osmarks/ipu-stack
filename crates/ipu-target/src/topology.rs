@@ -181,8 +181,6 @@ pub(crate) fn paired_time_to_mux(source: u32, destination: u32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn c600_mapping_is_a_permutation() {
         let topology = crate::hardware::HardwareTarget::Ipu21.topology();

@@ -714,12 +714,11 @@ fn select_scheduled_finalist(
         return Ok((mid, low));
     }
 
-    let topology = active_topology(planning.target, planning.tile_count)?;
     let mut ranked = Vec::with_capacity(finalists.len());
     for (index, mid) in finalists.into_iter().enumerate() {
         let low = lower_to_tiles(&mid, planning)?;
         let placement = place(&low)?;
-        let exchanges = lower_exchanges(&low, &placement, &topology)?;
+        let exchanges = lower_exchanges(&low, &placement, planning.target)?;
         let scheduled_exchange_cycles = exchanges
             .iter()
             .map(|phase| u64::from(phase.event_cycles))
@@ -790,7 +789,11 @@ fn build_package_from_objects(
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
     let provisional_exchanges = build_phase("lower_exchanges_provisional", || {
-        Ok(lower_exchanges(program, &provisional_placement, &topology)?)
+        Ok(lower_exchanges(
+            program,
+            &provisional_placement,
+            config.pipeline.target,
+        )?)
     })?;
     let execution_tile_count = u16::try_from(config.pipeline.target.topology().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
@@ -1069,7 +1072,11 @@ fn build_package_from_objects(
         )?)
     })?;
     let lowered_exchanges = build_phase("lower_exchanges", || {
-        Ok(lower_exchanges(program, &placement, &topology)?)
+        Ok(lower_exchanges(
+            program,
+            &placement,
+            config.pipeline.target,
+        )?)
     })?;
     let exchanges = lowered_exchanges;
     let (tensors, output_tensors) = compiled_graph_tensors(mid, program, &placement, &topology)?;
