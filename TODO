@@ -1,0 +1,42 @@
+Correctness:
+
+- Copy kernels should use high-performance ldst instructions where bank constraints allow.
+- Must ask models to review for weird hacks thoroughly and remove them.
+- Also duplicate code.
+- Should automate finding tuning parameters at some point.
+- Refactor code across modules e.g. effective_memory_elements is in ipu-exchange for some reason.
+- Adjust placements to minimize delays in exchange/pairing (has not worked ever).
+- Keep cost models updated.
+- Does Add work?
+- Why so much standard memory reliance? Scaling issue.
+- Something something "unmaterializable plan".
+- Fix attention (works, slow).
+- Paired transfer usability (has not worked ever).
+- Is exchange sufficiently dense? Cutover delays?
+- Factorize cost models.
+- Remove redundant formats.
+- Move memory classes somewhere.
+- Exchange density?
+- Put EXECUTABLE_MEMORY_LIMIT and such in the right place.
+- Code sharing with deferred things.
+- prepare_attention_blocks is also wrong.
+- finish_gemm_plan etc is suspicious
+- plans_for_operation maybe duplicates something
+- ParallelGridProxy?!
+- IPU21_PLANNED_DATA_BYTES factor
+- objective duplication
+- `let column_grain` is really long. Lots of long chains like this → hard to read.
+- Generally wrong abstractions. Trace through code?
+- Merge topology and target
+- Fix copy descriptors
+
+Completeness:
+
+- LayerNorm.
+- MAP head.
+- Other ops? Subtract, but that's pretty trivial.
+- Inplace, fusion, or something.
+- Positional encoding.
+- Input projection (probably this is just batched MLP).
+- FP8 support!
+- Run full model.

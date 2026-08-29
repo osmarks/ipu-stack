@@ -1,0 +1,6 @@
+- It's more important that this done right than that this can be done quickly, and you can stop and ask me things if necessary.
+- Add as few additional functions or data structures as possible to achieve your goals.
+- No layer violations. If a change would require moving things between compiler layers or mixing behaviour between layers, ask before making it.
+- Unit tests must be randomized and property-based, and not just test exact equivalence to some value.
+- If you think there's a "cleaner final boundary" for a feature or change, surface it.
+- If making a specified refactor, check all files using the old version to check that the refactor is done completely.
