@@ -178,8 +178,9 @@ pub(crate) fn conversion_mapping_traffic(
         }
         mapping.copies.iter().fold(0u64, |total, geometry| {
             total.saturating_add(
-                u64::from(geometry.rows)
-                    .saturating_mul(u64::from(geometry.row_bytes).div_ceil(maximum_chunk_bytes)),
+                geometry.copy_count().saturating_mul(
+                    u64::from(geometry.contiguous_bytes).div_ceil(maximum_chunk_bytes),
+                ),
             )
         })
     };

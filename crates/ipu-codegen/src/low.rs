@@ -133,7 +133,7 @@ pub struct LogicalExchange {
     pub order: ExchangeOrder,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ExchangeOrder {
     /// Preserve tensor coordinates, converting between physical layouts.
     #[default]
@@ -1523,6 +1523,7 @@ impl LoweringState {
                 };
                 for geometry in &mapping.copies {
                     if source_shard.tile == destination_shard.tile {
+                        let dimension = geometry.dimensions.first();
                         local_copies.push((
                             destination_shard.tile,
                             LocalCopy {
@@ -1532,21 +1533,21 @@ impl LoweringState {
                                 destination_offset: geometry.destination_offset,
                                 bytes: u32::try_from(geometry.bytes())
                                     .map_err(|_| LowLoweringError::IdOverflow)?,
-                                pattern: if geometry.rows == 1 {
-                                    LocalCopyPattern::Contiguous
-                                } else {
+                                pattern: if let Some(dimension) = dimension {
                                     LocalCopyPattern::Strided {
-                                        rows: geometry.rows,
-                                        row_bytes: geometry.row_bytes,
-                                        source_stride: geometry.source_stride,
-                                        destination_stride: geometry.destination_stride,
+                                        rows: dimension.count,
+                                        row_bytes: geometry.contiguous_bytes,
+                                        source_stride: dimension.source_stride,
+                                        destination_stride: dimension.destination_stride,
                                     }
+                                } else {
+                                    LocalCopyPattern::Contiguous
                                 },
                             },
                         ));
                     } else {
                         transfers
-                            .entry((source_view.clone(), *geometry))
+                            .entry((source_view.clone(), geometry.clone()))
                             .or_default()
                             .push(destination_view.clone());
                     }
@@ -3323,7 +3324,7 @@ impl LoweringState {
                 [rows, columns],
                 precision,
                 Layout {
-                    order,
+                    order: order.clone(),
                     tiling: TensorTiling::replicated(1),
                     memory_class,
                 },
@@ -5085,7 +5086,7 @@ impl LoweringState {
                 LogicalExchange {
                     source,
                     destinations,
-                    order,
+                    order: order.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -5131,7 +5132,7 @@ impl LoweringState {
                 LogicalExchange {
                     source,
                     destinations,
-                    order,
+                    order: order.clone(),
                 }
             }));
         }

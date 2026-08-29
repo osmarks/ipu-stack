@@ -68,27 +68,52 @@ pub struct ConversionPlan {
     pub mappings: Vec<ConversionMapping>,
 }
 
-/// One regular copy nest within a conversion route.
-///
-/// `contiguous_axes` identifies the semantic axes folded into each row.
-/// `repeated_axis` identifies the next layout axis traversed by the two byte
-/// strides. A single-row geometry is an ordinary contiguous copy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// One arbitrary-rank affine copy nest within a conversion route.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CopyGeometry {
     pub source_offset: u32,
     pub destination_offset: u32,
-    /// Half-open semantic axis range folded into one contiguous row.
-    pub contiguous_axes: (u16, u16),
-    pub repeated_axis: Option<u16>,
-    pub rows: u32,
-    pub row_bytes: u32,
+    pub contiguous_bytes: u32,
+    /// Inner to outer affine dimensions.
+    pub dimensions: Vec<CopyDimension>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CopyDimension {
+    pub count: u32,
     pub source_stride: u32,
     pub destination_stride: u32,
 }
 
 impl CopyGeometry {
+    pub fn copy_count(&self) -> u64 {
+        self.dimensions.iter().fold(1, |copies, dimension| {
+            copies.saturating_mul(u64::from(dimension.count))
+        })
+    }
+
     pub fn bytes(&self) -> u64 {
-        u64::from(self.rows) * u64::from(self.row_bytes)
+        u64::from(self.contiguous_bytes).saturating_mul(self.copy_count())
+    }
+
+    pub(crate) fn offsets(&self) -> Option<Vec<(u32, u32)>> {
+        let mut offsets = vec![(self.source_offset, self.destination_offset)];
+        for dimension in &self.dimensions {
+            let inner = offsets.clone();
+            offsets.clear();
+            offsets.reserve(inner.len().checked_mul(dimension.count as usize)?);
+            for index in 0..dimension.count {
+                let source_delta = index.checked_mul(dimension.source_stride)?;
+                let destination_delta = index.checked_mul(dimension.destination_stride)?;
+                for &(source, destination) in &inner {
+                    offsets.push((
+                        source.checked_add(source_delta)?,
+                        destination.checked_add(destination_delta)?,
+                    ));
+                }
+            }
+        }
+        Some(offsets)
     }
 }
 
@@ -124,16 +149,13 @@ struct StorageBlock {
     origin: Vec<u32>,
     offset: u32,
     bytes: u32,
-    contiguous_start: u16,
 }
 
 #[derive(Clone)]
 struct CopyRun {
-    origin: Vec<u32>,
     source_offset: u32,
     destination_offset: u32,
     bytes: u32,
-    contiguous_start: u16,
 }
 
 /// Resolves ownership intersections and their regular local/remote copy
@@ -149,9 +171,6 @@ pub(crate) fn plan_conversion_mappings(
     plan_mappings(shape, precision, from, to, strategy, true)
 }
 
-/// Resolves the same ownership route without requiring a regular copy nest.
-/// Low lowering may materialize these semantic regions conservatively, but
-/// does not rediscover their ownership from concrete shards.
 pub(crate) fn plan_semantic_mappings(
     shape: &TensorShape,
     precision: Precision,
@@ -300,132 +319,136 @@ fn copy_geometries(
                 .bytes
                 .checked_add(block.bytes)
                 .ok_or(ConversionGeometryError::Overflow)?;
-            previous.contiguous_start = previous
-                .contiguous_start
-                .min(block.contiguous_start)
-                .min(destination.contiguous_start);
             continue;
         }
         runs.push(CopyRun {
-            origin: block.origin,
             source_offset: block.offset,
             destination_offset: destination.offset,
             bytes: block.bytes,
-            contiguous_start: block.contiguous_start.min(destination.contiguous_start),
         });
     }
     if !destinations.is_empty() {
         return Err(ConversionGeometryError::Unsupported);
     }
-    let rank = u16::try_from(region.len()).map_err(|_| ConversionGeometryError::Overflow)?;
-    let mut geometries = Vec::new();
-    let mut index = 0;
-    while index < runs.len() {
-        let first = &runs[index];
-        let mut end = index + 1;
-        let mut repeated_axis = None;
-        let mut source_stride = first.bytes;
-        let mut destination_stride = first.bytes;
-        if let Some(second) = runs.get(end)
-            && second.bytes == first.bytes
-        {
-            repeated_axis = changed_axis(&first.origin, &second.origin);
-            source_stride = second
-                .source_offset
-                .checked_sub(first.source_offset)
-                .unwrap_or(0);
-            destination_stride = second
+    let mut geometries = runs
+        .into_iter()
+        .map(|run| CopyGeometry {
+            source_offset: run.source_offset,
+            destination_offset: run.destination_offset,
+            contiguous_bytes: run.bytes,
+            dimensions: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    loop {
+        let mut compacted = Vec::new();
+        let mut merged = false;
+        let mut index = 0;
+        while index < geometries.len() {
+            let mut geometry = geometries[index].clone();
+            let mut end = index + 1;
+            let Some(second) = geometries.get(end).filter(|second| {
+                second.contiguous_bytes == geometry.contiguous_bytes
+                    && second.dimensions == geometry.dimensions
+            }) else {
+                compacted.push(geometry);
+                index = end;
+                continue;
+            };
+            let Some(source_stride) = second.source_offset.checked_sub(geometry.source_offset)
+            else {
+                compacted.push(geometry);
+                index = end;
+                continue;
+            };
+            let Some(destination_stride) = second
                 .destination_offset
-                .checked_sub(first.destination_offset)
-                .unwrap_or(0);
-            if repeated_axis.is_some() && source_stride != 0 && destination_stride != 0 {
-                end += 1;
-                while let Some(run) = runs.get(end) {
-                    let previous = &runs[end - 1];
-                    if run.bytes != first.bytes
-                        || changed_axis(&previous.origin, &run.origin) != repeated_axis
-                        || run.source_offset.checked_sub(previous.source_offset)
-                            != Some(source_stride)
-                        || run
-                            .destination_offset
-                            .checked_sub(previous.destination_offset)
-                            != Some(destination_stride)
-                    {
-                        break;
-                    }
-                    end += 1;
-                }
-            } else {
-                repeated_axis = None;
-                source_stride = first.bytes;
-                destination_stride = first.bytes;
-                end = index + 1;
+                .checked_sub(geometry.destination_offset)
+            else {
+                compacted.push(geometry);
+                index = end;
+                continue;
+            };
+            if source_stride == 0 || destination_stride == 0 {
+                compacted.push(geometry);
+                index = end;
+                continue;
             }
+            end += 1;
+            while let Some(next) = geometries.get(end) {
+                let previous = &geometries[end - 1];
+                if next.contiguous_bytes != geometry.contiguous_bytes
+                    || next.dimensions != geometry.dimensions
+                    || next.source_offset.checked_sub(previous.source_offset)
+                        != Some(source_stride)
+                    || next
+                        .destination_offset
+                        .checked_sub(previous.destination_offset)
+                        != Some(destination_stride)
+                {
+                    break;
+                }
+                end += 1;
+            }
+            geometry.dimensions.push(CopyDimension {
+                count: u32::try_from(end - index)
+                    .map_err(|_| ConversionGeometryError::Overflow)?,
+                source_stride,
+                destination_stride,
+            });
+            compacted.push(geometry);
+            merged = true;
+            index = end;
         }
-        let rows = u32::try_from(end - index).map_err(|_| ConversionGeometryError::Overflow)?;
-        let geometry = CopyGeometry {
-            source_offset: first.source_offset,
-            destination_offset: first.destination_offset,
-            contiguous_axes: (first.contiguous_start, rank),
-            repeated_axis,
-            rows,
-            row_bytes: first.bytes,
-            source_stride,
-            destination_stride,
-        };
-        if geometry.source_offset & 0b11 != 0
-            || geometry.destination_offset & 0b11 != 0
-            || geometry.row_bytes == 0
-            || geometry.row_bytes & 0b11 != 0
+        geometries = compacted;
+        if !merged {
+            break;
+        }
+    }
+    let alignment = if local {
+        precision.bytes() as u32
+    } else {
+        4
+    };
+    for geometry in &geometries {
+        if !geometry.source_offset.is_multiple_of(alignment)
+            || !geometry.destination_offset.is_multiple_of(alignment)
+            || geometry.contiguous_bytes == 0
+            || !geometry.contiguous_bytes.is_multiple_of(alignment)
         {
             return Err(ConversionGeometryError::Unsupported);
         }
-        if local && geometry.rows > 1 && (geometry.row_bytes & 0b111 != 0 || geometry.bytes() > 512)
-        {
-            for row in 0..geometry.rows {
-                geometries.push(CopyGeometry {
-                    source_offset: geometry
-                        .source_offset
-                        .checked_add(
-                            row.checked_mul(geometry.source_stride)
-                                .ok_or(ConversionGeometryError::Overflow)?,
-                        )
-                        .ok_or(ConversionGeometryError::Overflow)?,
-                    destination_offset: geometry
-                        .destination_offset
-                        .checked_add(
-                            row.checked_mul(geometry.destination_stride)
-                                .ok_or(ConversionGeometryError::Overflow)?,
-                        )
-                        .ok_or(ConversionGeometryError::Overflow)?,
-                    contiguous_axes: geometry.contiguous_axes,
-                    repeated_axis: None,
-                    rows: 1,
-                    row_bytes: geometry.row_bytes,
-                    source_stride: geometry.row_bytes,
-                    destination_stride: geometry.row_bytes,
-                });
-            }
-        } else {
-            geometries.push(geometry);
-        }
-        index = end;
+    }
+    if local {
+        geometries = split_unsupported_local_nests(geometries)?;
     }
     Ok(geometries)
 }
 
-fn changed_axis(left: &[u32], right: &[u32]) -> Option<u16> {
-    let mut changed = None;
-    for (axis, (&left, &right)) in left.iter().zip(right).enumerate() {
-        if left == right {
-            continue;
+fn split_unsupported_local_nests(
+    geometries: Vec<CopyGeometry>,
+) -> Result<Vec<CopyGeometry>, ConversionGeometryError> {
+    let mut supported = Vec::new();
+    for mut geometry in geometries {
+        let retain_inner = geometry.dimensions.first().is_some_and(|dimension| {
+            geometry.contiguous_bytes.is_multiple_of(8)
+                && u64::from(geometry.contiguous_bytes) * u64::from(dimension.count) <= 512
+        });
+        let outer = geometry.dimensions.split_off(usize::from(retain_inner));
+        let offsets = CopyGeometry {
+            dimensions: outer,
+            ..geometry.clone()
         }
-        if right < left || changed.is_some() {
-            return None;
+        .offsets()
+        .ok_or(ConversionGeometryError::Overflow)?;
+        for (source_offset, destination_offset) in offsets {
+            supported.push(CopyGeometry {
+                source_offset,
+                destination_offset,
+                ..geometry.clone()
+            });
         }
-        changed = u16::try_from(axis).ok();
     }
-    changed
+    Ok(supported)
 }
 
 fn storage_blocks(
@@ -463,12 +486,6 @@ fn storage_blocks(
     let block_bytes = block_elements
         .and_then(|elements| elements.checked_mul(precision.bytes() as u32))
         .ok_or(ConversionGeometryError::Overflow)?;
-    let contiguous_start = dimensions
-        .iter()
-        .position(|dimension| *dimension > 1)
-        .unwrap_or(rank - 1);
-    let contiguous_start =
-        u16::try_from(contiguous_start).map_err(|_| ConversionGeometryError::Overflow)?;
     let starts = region.iter().map(|extent| extent.start).collect::<Vec<_>>();
     let ends = region
         .iter()
@@ -481,7 +498,6 @@ fn storage_blocks(
             origin: coordinates.clone(),
             offset: physical_byte_offset(order, precision, storage, &coordinates)?,
             bytes: block_bytes,
-            contiguous_start,
         });
         let mut axis = rank;
         loop {

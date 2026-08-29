@@ -227,37 +227,26 @@ fn prepare_transfer(
         .copied()
         .ok_or(ExchangeLoweringError::UnplacedShard)?;
     let (source_spans, planned_destination_spans) =
-        if let ExchangeOrder::Planned(geometry) = transfer.order {
-            if geometry.rows == 0
-                || geometry.row_bytes == 0
+        if let ExchangeOrder::Planned(geometry) = &transfer.order {
+            if geometry.copy_count() == 0
+                || geometry.contiguous_bytes == 0
                 || geometry.source_offset & 0b11 != 0
                 || geometry.destination_offset & 0b11 != 0
-                || geometry.row_bytes & 0b11 != 0
+                || geometry.contiguous_bytes & 0b11 != 0
             {
                 return Err(ExchangeLoweringError::UnalignedPayload);
             }
-            let mut source_spans = Vec::with_capacity(geometry.rows as usize);
-            let mut destination_spans = Vec::with_capacity(geometry.rows as usize);
-            for row in 0..geometry.rows {
+            let offsets = geometry.offsets().ok_or(ExchangeLoweringError::Overflow)?;
+            let mut source_spans = Vec::with_capacity(offsets.len());
+            let mut destination_spans = Vec::with_capacity(offsets.len());
+            for (source_offset, destination_offset) in offsets {
                 source_spans.push(ByteSpan {
-                    offset: geometry
-                        .source_offset
-                        .checked_add(
-                            row.checked_mul(geometry.source_stride)
-                                .ok_or(ExchangeLoweringError::Overflow)?,
-                        )
-                        .ok_or(ExchangeLoweringError::Overflow)?,
-                    bytes: geometry.row_bytes,
+                    offset: source_offset,
+                    bytes: geometry.contiguous_bytes,
                 });
                 destination_spans.push(ByteSpan {
-                    offset: geometry
-                        .destination_offset
-                        .checked_add(
-                            row.checked_mul(geometry.destination_stride)
-                                .ok_or(ExchangeLoweringError::Overflow)?,
-                        )
-                        .ok_or(ExchangeLoweringError::Overflow)?,
-                    bytes: geometry.row_bytes,
+                    offset: destination_offset,
+                    bytes: geometry.contiguous_bytes,
                 });
             }
             (source_spans, Some(destination_spans))
