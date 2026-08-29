@@ -11,9 +11,12 @@ use crate::config::{
     AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
     PlannerSearchDomain,
 };
+use crate::conversion::{
+    ConversionGeometryError, ConversionPlan, ConversionStrategy, layout_conversion_strategy,
+    plan_conversion_mappings, plan_semantic_mappings,
+};
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
-use crate::conversion::{ConversionPlan, ConversionStrategy, layout_conversion_strategy};
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity,
@@ -3608,21 +3611,24 @@ fn ensure_format(
         let result = state.derived_value(value, tensor_type.clone());
         let strategy =
             layout_conversion_strategy(tensor_type.format.precision, &from, &target.layout);
-        let mappings = crate::conversion::plan_conversion_mappings(
+        let mappings = plan_conversion_mappings(
             &tensor_type.shape,
             tensor_type.format.precision,
             &from,
             &target.layout,
             strategy,
         )
-        .unwrap_or_else(|error| {
-            panic!(
-                "selected layout conversion must have regular copy geometry: {error}; shape={:?}; precision={:?}; from={from:?}; to={:?}",
-                tensor_type.shape,
+        .or_else(|error| match error {
+            ConversionGeometryError::Unsupported => plan_semantic_mappings(
+                &tensor_type.shape,
                 tensor_type.format.precision,
-                target.layout,
-            )
-        });
+                &from,
+                &target.layout,
+                strategy,
+            ),
+            error => Err(error),
+        })
+        .expect("resolved layouts must have a semantic conversion route");
         let rearrangement = costs.rearrangement_cost(
             &tensor_type.shape,
             tensor_type.format.precision,

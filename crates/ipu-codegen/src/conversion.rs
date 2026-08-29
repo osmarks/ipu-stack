@@ -146,6 +146,30 @@ pub(crate) fn plan_conversion_mappings(
     to: &Layout,
     strategy: ConversionStrategy,
 ) -> Result<Vec<ConversionMapping>, ConversionGeometryError> {
+    plan_mappings(shape, precision, from, to, strategy, true)
+}
+
+/// Resolves the same ownership route without requiring a regular copy nest.
+/// Low lowering may materialize these semantic regions conservatively, but
+/// does not rediscover their ownership from concrete shards.
+pub(crate) fn plan_semantic_mappings(
+    shape: &TensorShape,
+    precision: Precision,
+    from: &Layout,
+    to: &Layout,
+    strategy: ConversionStrategy,
+) -> Result<Vec<ConversionMapping>, ConversionGeometryError> {
+    plan_mappings(shape, precision, from, to, strategy, false)
+}
+
+fn plan_mappings(
+    shape: &TensorShape,
+    precision: Precision,
+    from: &Layout,
+    to: &Layout,
+    strategy: ConversionStrategy,
+    regular: bool,
+) -> Result<Vec<ConversionMapping>, ConversionGeometryError> {
     if strategy == ConversionStrategy::LocalKernel {
         return Ok(Vec::new());
     }
@@ -170,38 +194,41 @@ pub(crate) fn plan_conversion_mappings(
             }
         }
         for (region, (source_index, source)) in intersections {
-            let (source_order, destination_order, logical_order) = match strategy {
-                ConversionStrategy::DirectRetile if from.order == to.order => {
-                    (from.order, to.order, false)
-                }
-                ConversionStrategy::DirectLogical => (from.order, to.order, true),
-                ConversionStrategy::StageLogicalThenTransform
-                    if from.order == ElementOrder::RowMajor =>
-                {
-                    (ElementOrder::RowMajor, ElementOrder::RowMajor, false)
-                }
-                ConversionStrategy::DirectRetile
-                | ConversionStrategy::StageLogicalThenTransform
-                | ConversionStrategy::LocalKernel => {
-                    return Err(ConversionGeometryError::Unsupported);
-                }
-            };
-            let local = source.tile == destination.tile;
             let destination_storage = if strategy == ConversionStrategy::StageLogicalThenTransform {
                 destination.extents.logical()
             } else {
                 destination.extents.clone()
             };
-            let copies = copy_geometries(
-                precision,
-                source_order,
-                destination_order,
-                &source.extents,
-                &destination_storage,
-                &region,
-                local,
-                logical_order,
-            )?;
+            let copies = if regular {
+                let (source_order, destination_order, logical_order) = match strategy {
+                    ConversionStrategy::DirectRetile if from.order == to.order => {
+                        (from.order, to.order, false)
+                    }
+                    ConversionStrategy::DirectLogical => (from.order, to.order, true),
+                    ConversionStrategy::StageLogicalThenTransform
+                        if from.order == ElementOrder::RowMajor =>
+                    {
+                        (ElementOrder::RowMajor, ElementOrder::RowMajor, false)
+                    }
+                    ConversionStrategy::DirectRetile
+                    | ConversionStrategy::StageLogicalThenTransform
+                    | ConversionStrategy::LocalKernel => {
+                        return Err(ConversionGeometryError::Unsupported);
+                    }
+                };
+                copy_geometries(
+                    precision,
+                    source_order,
+                    destination_order,
+                    &source.extents,
+                    &destination_storage,
+                    &region,
+                    source.tile == destination.tile,
+                    logical_order,
+                )?
+            } else {
+                Vec::new()
+            };
             mappings.push(ConversionMapping {
                 source_shard: u32::try_from(source_index)
                     .map_err(|_| ConversionGeometryError::Overflow)?,
@@ -543,10 +570,7 @@ fn logical_block_dimensions(
             }),
         ) if rank >= 2 => {
             dimensions[rank - 2] = amp_micro_dimension(precision);
-            dimensions[rank - 1] = gcd(
-                u32::from(source_columns),
-                u32::from(destination_columns),
-            );
+            dimensions[rank - 1] = gcd(u32::from(source_columns), u32::from(destination_columns));
             return Ok(dimensions);
         }
         (

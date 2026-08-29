@@ -3,9 +3,7 @@
 use crate::ConversionMapping;
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::conversion::{
-    ConversionStrategy, layout_conversion_strategy, plan_conversion_mappings,
-};
+use crate::conversion::{ConversionStrategy, layout_conversion_strategy, plan_conversion_mappings};
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -1391,8 +1389,7 @@ impl CostModel for Ipu21CostModel {
             };
             return exchange_endpoint_footprint(&traffic, phases);
         }
-        let Some(traffic) =
-            gemm_exchange_endpoint_traffic(dispatch, inputs, output, self.target())
+        let Some(traffic) = gemm_exchange_endpoint_traffic(dispatch, inputs, output, self.target())
         else {
             return ExchangeFootprint::default();
         };
@@ -1412,15 +1409,17 @@ impl CostModel for Ipu21CostModel {
 
     fn rearrangement_cost(
         &self,
-        shape: &TensorShape,
+        _shape: &TensorShape,
         precision: Precision,
         strategy: ConversionStrategy,
         from: &Layout,
         to: &Layout,
         mappings: &[ConversionMapping],
     ) -> CostEstimate {
-        let _ = (shape, precision);
-        let traffic = conversion_mapping_traffic(mappings, self.target());
+        if mappings.is_empty() && strategy.uses_intersections() {
+            return impossible_conversion_cost();
+        }
+        let traffic = conversion_mapping_traffic(mappings, precision, self.target());
         let direct_retile = matches!(
             strategy,
             ConversionStrategy::DirectRetile | ConversionStrategy::DirectLogical

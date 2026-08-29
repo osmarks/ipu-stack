@@ -163,6 +163,7 @@ fn add_endpoint_load(
 /// every receiving tile; local geometries contribute no exchange traffic.
 pub(crate) fn conversion_mapping_traffic(
     mappings: &[ConversionMapping],
+    precision: Precision,
     target: HardwareTarget,
 ) -> ConversionTraffic {
     let maximum_chunk_bytes = u64::from(
@@ -171,6 +172,10 @@ pub(crate) fn conversion_mapping_traffic(
             .maximum_transfer_words,
     ) * 4;
     let geometry_fragments = |mapping: &ConversionMapping| {
+        if mapping.copies.is_empty() {
+            let bytes = mapping.region.logical_elements().saturating_mul(precision.bytes());
+            return bytes.div_ceil(maximum_chunk_bytes);
+        }
         mapping.copies.iter().fold(0u64, |total, geometry| {
             total.saturating_add(
                 u64::from(geometry.rows)
@@ -179,6 +184,9 @@ pub(crate) fn conversion_mapping_traffic(
         })
     };
     let geometry_bytes = |mapping: &ConversionMapping| {
+        if mapping.copies.is_empty() {
+            return mapping.region.logical_elements().saturating_mul(precision.bytes());
+        }
         mapping
             .copies
             .iter()
@@ -207,7 +215,7 @@ pub(crate) fn conversion_mapping_traffic(
             destination.4 = destination.4.saturating_add(bytes);
             traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(bytes);
             traffic.maximum_local_intersections =
-                traffic.maximum_local_intersections.max(mapping.copies.len() as u64);
+                traffic.maximum_local_intersections.max(mapping.copies.len().max(1) as u64);
         } else {
             destination.2 = destination.2.saturating_add(bytes);
             add_endpoint_load(

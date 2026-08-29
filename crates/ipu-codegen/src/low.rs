@@ -1451,71 +1451,116 @@ impl LoweringState {
                 }
             }
         }
-        let mut transfers = BTreeMap::<(ShardView, crate::CopyGeometry), Vec<ShardView>>::new();
-        let mut local_copies = Vec::new();
-        for mapping in &plan.mappings {
-            let source = inputs
-                .get(mapping.source_shard as usize)
-                .copied()
-                .ok_or(LowLoweringError::InvalidConversionPlan)?;
-            let destination = staging
-                .get(mapping.destination_shard as usize)
-                .copied()
-                .ok_or(LowLoweringError::InvalidConversionPlan)?;
-            let source_shard = &self.shards[source.index() as usize];
-            let destination_shard = &self.shards[destination.index() as usize];
-            if source_shard.extents != mapping.source_storage
-                || destination_shard.extents != mapping.destination_storage
-            {
-                return Err(LowLoweringError::InvalidConversionPlan);
-            }
-            let source_view = ShardView {
-                shard: source,
-                extents: mapping.region.clone(),
-            };
-            let destination_view = ShardView {
-                shard: destination,
-                extents: mapping.region.clone(),
-            };
-            for geometry in &mapping.copies {
-                if source_shard.tile == destination_shard.tile {
-                    local_copies.push((
-                        destination_shard.tile,
-                        LocalCopy {
-                            source,
-                            source_offset: geometry.source_offset,
-                            destination,
-                            destination_offset: geometry.destination_offset,
-                            bytes: u32::try_from(geometry.bytes())
-                                .map_err(|_| LowLoweringError::IdOverflow)?,
-                            pattern: if geometry.rows == 1 {
-                                LocalCopyPattern::Contiguous
-                            } else {
-                                LocalCopyPattern::Strided {
-                                    rows: geometry.rows,
-                                    row_bytes: geometry.row_bytes,
-                                    source_stride: geometry.source_stride,
-                                    destination_stride: geometry.destination_stride,
-                                }
-                            },
+        let semantic = plan
+            .mappings
+            .iter()
+            .all(|mapping| mapping.copies.is_empty());
+        if !semantic
+            && plan
+                .mappings
+                .iter()
+                .any(|mapping| mapping.copies.is_empty())
+        {
+            return Err(LowLoweringError::InvalidConversionPlan);
+        }
+        let bound = plan
+            .mappings
+            .iter()
+            .map(|mapping| {
+                let source = inputs
+                    .get(mapping.source_shard as usize)
+                    .copied()
+                    .ok_or(LowLoweringError::InvalidConversionPlan)?;
+                let destination = staging
+                    .get(mapping.destination_shard as usize)
+                    .copied()
+                    .ok_or(LowLoweringError::InvalidConversionPlan)?;
+                if self.shards[source.index() as usize].extents != mapping.source_storage
+                    || self.shards[destination.index() as usize].extents
+                        != mapping.destination_storage
+                {
+                    return Err(LowLoweringError::InvalidConversionPlan);
+                }
+                Ok((mapping, source, destination))
+            })
+            .collect::<LowLoweringResult<Vec<_>>>()?;
+        if semantic {
+            let mappings = bound
+                .into_iter()
+                .map(|(mapping, source, destination)| {
+                    (
+                        ShardView {
+                            shard: source,
+                            extents: mapping.region.clone(),
                         },
-                    ));
-                } else {
-                    transfers
-                        .entry((source_view.clone(), *geometry))
-                        .or_default()
-                        .push(destination_view.clone());
+                        ShardView {
+                            shard: destination,
+                            extents: mapping.region.clone(),
+                        },
+                    )
+                })
+                .collect();
+            self.lower_mapped_views(
+                mappings,
+                plan.strategy != ConversionStrategy::DirectRetile,
+                ExchangeOrder::Semantic,
+                operation_provenance(operation, kind),
+                tiles,
+            )?;
+        } else {
+            let mut transfers = BTreeMap::<(ShardView, crate::CopyGeometry), Vec<ShardView>>::new();
+            let mut local_copies = Vec::new();
+            for (mapping, source, destination) in bound {
+                let source_shard = &self.shards[source.index() as usize];
+                let destination_shard = &self.shards[destination.index() as usize];
+                let source_view = ShardView {
+                    shard: source,
+                    extents: mapping.region.clone(),
+                };
+                let destination_view = ShardView {
+                    shard: destination,
+                    extents: mapping.region.clone(),
+                };
+                for geometry in &mapping.copies {
+                    if source_shard.tile == destination_shard.tile {
+                        local_copies.push((
+                            destination_shard.tile,
+                            LocalCopy {
+                                source,
+                                source_offset: geometry.source_offset,
+                                destination,
+                                destination_offset: geometry.destination_offset,
+                                bytes: u32::try_from(geometry.bytes())
+                                    .map_err(|_| LowLoweringError::IdOverflow)?,
+                                pattern: if geometry.rows == 1 {
+                                    LocalCopyPattern::Contiguous
+                                } else {
+                                    LocalCopyPattern::Strided {
+                                        rows: geometry.rows,
+                                        row_bytes: geometry.row_bytes,
+                                        source_stride: geometry.source_stride,
+                                        destination_stride: geometry.destination_stride,
+                                    }
+                                },
+                            },
+                        ));
+                    } else {
+                        transfers
+                            .entry((source_view.clone(), *geometry))
+                            .or_default()
+                            .push(destination_view.clone());
+                    }
                 }
             }
-        }
-        if staged {
-            for (tile, copy) in local_copies.drain(..) {
+            if staged {
+                for (tile, copy) in local_copies.drain(..) {
+                    self.append_local_copy(tiles, tile, copy)?;
+                }
+            }
+            self.append_planned_phase(transfers, operation_provenance(operation, kind), tiles)?;
+            for (tile, copy) in local_copies {
                 self.append_local_copy(tiles, tile, copy)?;
             }
-        }
-        self.append_planned_phase(transfers, operation_provenance(operation, kind), tiles)?;
-        for (tile, copy) in local_copies {
-            self.append_local_copy(tiles, tile, copy)?;
         }
         if staged {
             for (&staging, &destination) in staging.iter().zip(&outputs) {
