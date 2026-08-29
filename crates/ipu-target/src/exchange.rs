@@ -58,6 +58,26 @@ pub struct ExchangeConstants {
     pub host_command_route_cycles: u32,
 }
 
+impl ExchangeConstants {
+    pub const fn estimated_row_bytes(
+        &self,
+        phases: u64,
+        maximum_transfer_chunks_per_tile: u64,
+    ) -> u64 {
+        // The entry sync and terminal return are shared. Six encoded chunks
+        // per logical chunk account for executable rows, address offsets, and
+        // per-use patch values in the IPU21 package representation.
+        let words_per_chunk = self.plan_words.saturating_sub(2) as u64;
+        phases
+            .saturating_add(
+                maximum_transfer_chunks_per_tile
+                    .saturating_mul(words_per_chunk)
+                    .saturating_mul(6),
+            )
+            .saturating_mul(4)
+    }
+}
+
 pub(crate) const IPU21_EXCHANGE_CONSTANTS: ExchangeConstants = ExchangeConstants {
     plan_words: PLAN_WORDS,
     maximum_transfer_words: MAX_TRANSFER_WORDS,

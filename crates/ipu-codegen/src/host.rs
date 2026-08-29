@@ -3,16 +3,13 @@ use ipu_package::{
     SEGMENT_EXECUTE, SEGMENT_READ, Segment,
 };
 use ipu_target::program::{HostPhase, HostProgram};
+use ipu_target::{exchange::ExchangeConstants, hardware::HardwareTarget};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use super::package::{PackageBuildResult, invalid};
 
-const EXCHANGE: &ipu_target::exchange::ExchangeConstants =
-    ipu_target::hardware::HardwareTarget::Ipu21.exchange();
-const HOST_DATA_START: u32 = EXCHANGE.host_page_bytes;
-const HOST_PACKET_ADDRESS: u32 = EXCHANGE.window_base;
-const HOST_CLOSE_ADDRESS: u32 = EXCHANGE.window_base + 0x160;
-const HOST_STAGING_ADDRESS: u32 = EXCHANGE.window_base + 0x180;
+const HOST_CLOSE_OFFSET: u32 = 0x160;
+const HOST_STAGING_OFFSET: u32 = 0x180;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -56,6 +53,7 @@ pub(crate) struct HostPackagePlan {
 }
 
 pub(crate) fn plan(
+    target: HardwareTarget,
     weights: &[Binding],
     inputs: &[Binding],
     outputs: &[Binding],
@@ -63,6 +61,7 @@ pub(crate) fn plan(
     base: u32,
     data_ranges: &[Vec<AddressRegion>],
 ) -> PackageBuildResult<HostPackagePlan> {
+    let exchange = target.exchange();
     if data_ranges.len() != usize::from(execution_tiles) {
         return Err(invalid("host plan has no data ranges for every tile"));
     }
@@ -79,9 +78,9 @@ pub(crate) fn plan(
     let mut weight_cursor = 0;
     let mut input_cursor = 0;
     let mut output_cursor = 0;
-    let pending_weights = collect(weights, Direction::ToTile, &mut weight_cursor)?;
-    let pending_inputs = collect(inputs, Direction::ToTile, &mut input_cursor)?;
-    let pending_outputs = collect(outputs, Direction::ToHost, &mut output_cursor)?;
+    let pending_weights = collect(weights, Direction::ToTile, &mut weight_cursor, exchange)?;
+    let pending_inputs = collect(inputs, Direction::ToTile, &mut input_cursor, exchange)?;
+    let pending_outputs = collect(outputs, Direction::ToHost, &mut output_cursor, exchange)?;
     let participating = pending_weights
         .iter()
         .chain(&pending_inputs)
@@ -93,16 +92,19 @@ pub(crate) fn plan(
         .enumerate()
         .map(|(slot, tile)| Ok((tile, u32::try_from(slot)?)))
         .collect::<PackageBuildResult<BTreeMap<_, _>>>()?;
-    let (mut weight_phases, weight_slices, weight_ends) = batch(pending_weights, &slots)?;
-    let (mut input_phases, input_slices, input_ends) = batch(pending_inputs, &slots)?;
-    let (output_phases, output_slices, output_ends) = batch(pending_outputs, &slots)?;
+    let (mut weight_phases, weight_slices, weight_ends) =
+        batch(pending_weights, &slots, exchange)?;
+    let (mut input_phases, input_slices, input_ends) =
+        batch(pending_inputs, &slots, exchange)?;
+    let (output_phases, output_slices, output_ends) =
+        batch(pending_outputs, &slots, exchange)?;
     for transfer in weight_phases
         .iter_mut()
         .chain(&mut input_phases)
         .flat_map(|phase| &mut phase.transfers)
     {
         transfer.copy_destination = Some(transfer.tile_address);
-        transfer.tile_address = HOST_STAGING_ADDRESS;
+        transfer.tile_address = exchange.window_base + HOST_STAGING_OFFSET;
         ipu_target::exchange::plan_host_to_tile(
             transfer.physical_tile,
             transfer.tile_address,
@@ -134,6 +136,7 @@ pub(crate) fn plan(
             &phases,
             base,
             &data_ranges[usize::from(physical_tile)],
+            exchange,
         )?;
         maximum_end = maximum_end.max(planned.end);
         let weight_end = weight_phases.len();
@@ -174,7 +177,7 @@ pub(crate) fn plan(
         input_batch_ends: input_ends,
         output_batch_ends: output_ends,
     });
-    let data_bytes = u64::from(EXCHANGE.host_page_bytes)
+    let data_bytes = u64::from(exchange.host_page_bytes)
         .checked_mul(u64::try_from(slots.len().max(1))?)
         .ok_or_else(|| invalid("host page arena overflow"))?;
     Ok(HostPackagePlan {
@@ -187,7 +190,7 @@ pub(crate) fn plan(
             pages: vec![
                 HostPage {
                     index: 0,
-                    size: u64::from(EXCHANGE.host_page_bytes),
+                    size: u64::from(exchange.host_page_bytes),
                 },
                 HostPage {
                     index: 1,
@@ -198,7 +201,7 @@ pub(crate) fn plan(
             calls,
         },
         end: maximum_end,
-        staging_address: HOST_STAGING_ADDRESS,
+        staging_address: exchange.window_base + HOST_STAGING_OFFSET,
     })
 }
 
@@ -206,12 +209,19 @@ fn collect(
     bindings: &[Binding],
     direction: Direction,
     cursor: &mut u64,
+    exchange: &ExchangeConstants,
 ) -> PackageBuildResult<Vec<PendingTransfer>> {
     let mut result = Vec::new();
     for binding in bindings {
         let base = *cursor;
         for slice in &binding.slices {
-            append_slice(&mut result, direction, slice, base)?;
+            append_slice(
+                &mut result,
+                direction,
+                slice,
+                base,
+                exchange.host_page_bytes,
+            )?;
         }
         *cursor = cursor
             .checked_add(binding_size(binding)?)
@@ -225,6 +235,7 @@ fn append_slice(
     direction: Direction,
     slice: &RegionSlice,
     file_base: u64,
+    host_page_bytes: u32,
 ) -> PackageBuildResult<()> {
     let mut tile_address = slice.tile_address;
     let mut file_offset = file_base
@@ -232,7 +243,7 @@ fn append_slice(
         .ok_or_else(|| invalid("host file offset overflow"))?;
     let mut remaining = u32::try_from(slice.size)?;
     while remaining != 0 {
-        let bytes = remaining.min(EXCHANGE.host_page_bytes);
+        let bytes = remaining.min(host_page_bytes);
         result.push(PendingTransfer {
             transfer: Transfer {
                 direction,
@@ -268,6 +279,7 @@ fn binding_size(binding: &Binding) -> PackageBuildResult<u64> {
 fn batch(
     pending: Vec<PendingTransfer>,
     slots: &BTreeMap<u16, u32>,
+    exchange: &ExchangeConstants,
 ) -> PackageBuildResult<(Vec<Phase>, Vec<HostSlice>, Vec<u32>)> {
     let mut queues = BTreeMap::<u16, VecDeque<_>>::new();
     for transfer in pending {
@@ -286,9 +298,10 @@ fn batch(
                 continue;
             };
             let page_offset = slots[&tile]
-                .checked_mul(EXCHANGE.host_page_bytes)
+                .checked_mul(exchange.host_page_bytes)
                 .ok_or_else(|| invalid("host page offset overflow"))?;
-            pending.transfer.host_offset = HOST_DATA_START
+            pending.transfer.host_offset = exchange
+                .host_page_bytes
                 .checked_add(page_offset)
                 .ok_or_else(|| invalid("host exchange offset overflow"))?;
             slices.push(HostSlice {
@@ -316,6 +329,7 @@ fn plan_tile(
     phases: &[Phase],
     base: u32,
     data_ranges: &[AddressRegion],
+    exchange: &ExchangeConstants,
 ) -> PackageBuildResult<PlannedTile> {
     let follower = align_up(base, 8)?;
     let mut cursor = follower + 12;
@@ -336,7 +350,7 @@ fn plan_tile(
             });
             continue;
         }
-        let (instructions, packet_words) = phase_instructions(physical_tile, phase)?;
+        let (instructions, packet_words) = phase_instructions(physical_tile, phase, exchange)?;
         cursor = align_up(cursor, 8)?;
         let address = cursor;
         let data = words(&instructions);
@@ -354,13 +368,13 @@ fn plan_tile(
         let packet = PacketCopy {
             source: packet_source,
             destination: if xreq_targets(physical_tile, phase)?.is_empty() {
-                HOST_PACKET_ADDRESS + 8
+                exchange.window_base + 8
             } else {
-                HOST_PACKET_ADDRESS
+                exchange.window_base
             },
             words: u32::try_from(packet_words.len())?,
         };
-        let descriptors = descriptor_words(physical_tile, phase, packet)?;
+        let descriptors = descriptor_words(physical_tile, phase, packet, exchange)?;
         let descriptor_data = words(&descriptors);
         let table = data_arena.allocate(u32::try_from(descriptor_data.len())?, 4)?;
         segments.push(segment(table, descriptor_data, SEGMENT_READ));
@@ -420,16 +434,17 @@ impl DataArena {
 fn phase_instructions(
     physical_tile: u16,
     phase: &Phase,
+    exchange: &ExchangeConstants,
 ) -> PackageBuildResult<(Vec<u32>, Vec<u32>)> {
     let target = target(physical_tile, phase)
-        .map(|transfer| target_program(transfer, HOST_PACKET_ADDRESS + 8))
+        .map(|transfer| target_program(transfer, exchange.window_base + 8, exchange))
         .transpose()?;
     let targets = xreq_targets(physical_tile, phase)?;
     let xreq = (!targets.is_empty())
         .then(|| {
             ipu_target::exchange::assemble_host_xreq_program_for_targets(
                 &targets,
-                HOST_PACKET_ADDRESS,
+                exchange.window_base,
             )
         })
         .transpose()?;
@@ -441,7 +456,7 @@ fn phase_instructions(
                 ipu_target::exchange::wrap_combined_host_operation(
                     physical_tile,
                     &target.instructions,
-                    HOST_PACKET_ADDRESS,
+                    exchange.window_base,
                 )?,
                 packets,
             )
@@ -461,6 +476,7 @@ fn phase_instructions(
 fn target_program(
     transfer: Transfer,
     packet_address: u32,
+    exchange: &ExchangeConstants,
 ) -> PackageBuildResult<ipu_target::exchange::TileToHostProgram> {
     Ok(match transfer.direction {
         Direction::ToTile => ipu_target::exchange::assemble_host_to_tile_target_program(
@@ -476,7 +492,7 @@ fn target_program(
             transfer.host_offset,
             transfer.bytes,
             packet_address,
-            HOST_CLOSE_ADDRESS,
+            exchange.window_base + HOST_CLOSE_OFFSET,
         )?,
     })
 }
@@ -485,6 +501,7 @@ fn descriptor_words(
     physical_tile: u16,
     phase: &Phase,
     packet: PacketCopy,
+    exchange: &ExchangeConstants,
 ) -> PackageBuildResult<Vec<u32>> {
     let target = target(physical_tile, phase);
     let copy_words = target
@@ -494,8 +511,8 @@ fn descriptor_words(
         return Err(invalid("host descriptor is not encodable"));
     }
     let packet_destination = match packet.destination {
-        HOST_PACKET_ADDRESS => 0,
-        address if address == HOST_PACKET_ADDRESS + 8 => 1 << 23,
+        address if address == exchange.window_base => 0,
+        address if address == exchange.window_base + 8 => 1 << 23,
         _ => return Err(invalid("host packet destination is not encodable")),
     };
     Ok(vec![

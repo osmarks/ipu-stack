@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 const IPU21_TARGET_COSTS: &HardwareCosts = HardwareTarget::Ipu21.costs();
 
 pub trait CostModel: Sync {
+    fn target(&self) -> HardwareTarget;
+
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -226,6 +228,10 @@ impl<'a, C> MemoizedCostModel<'a, C> {
 }
 
 impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
+    fn target(&self) -> HardwareTarget {
+        self.inner.target()
+    }
+
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -685,15 +691,20 @@ fn estimated_operator_exchange_cycles(
             ..
         }) => {
             let compute_output = gemm_partial_tensor(dispatch, output);
-            let endpoint = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
-                .unwrap_or_else(|| {
-                    ExchangeEndpointTraffic::from_maxima(
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                    )
-                });
+            let endpoint = gemm_exchange_endpoint_traffic(
+                dispatch,
+                inputs,
+                &compute_output,
+                HardwareTarget::Ipu21,
+            )
+            .unwrap_or_else(|| {
+                ExchangeEndpointTraffic::from_maxima(
+                    u64::MAX / 16,
+                    u64::MAX / 16,
+                    u64::MAX / 16,
+                    u64::MAX / 16,
+                )
+            });
             let remote_partials_per_stage = match reduction.staging {
                 crate::ReductionStaging::Complete => reduction.compute.inner.saturating_sub(1),
                 crate::ReductionStaging::Streamed => 1,
@@ -726,15 +737,20 @@ fn estimated_operator_exchange_cycles(
         }
         OperatorDispatch::BlockedGemm(_) => {
             let compute_output = gemm_partial_tensor(dispatch, output);
-            let traffic = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
-                .unwrap_or_else(|| {
-                    ExchangeEndpointTraffic::from_maxima(
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                    )
-                });
+            let traffic = gemm_exchange_endpoint_traffic(
+                dispatch,
+                inputs,
+                &compute_output,
+                HardwareTarget::Ipu21,
+            )
+            .unwrap_or_else(|| {
+                ExchangeEndpointTraffic::from_maxima(
+                    u64::MAX / 16,
+                    u64::MAX / 16,
+                    u64::MAX / 16,
+                    u64::MAX / 16,
+                )
+            });
             exchange_endpoint_cycles(
                 &traffic,
                 gemm_exchange_phase_count(dispatch, inputs, &compute_output),
@@ -867,6 +883,10 @@ fn deferred_split_input_cycles(
 }
 
 impl CostModel for Ipu21CostModel {
+    fn target(&self) -> HardwareTarget {
+        HardwareTarget::Ipu21
+    }
+
     fn operator_cycles(
         &self,
         operator: MidOperator,
@@ -1369,7 +1389,9 @@ impl CostModel for Ipu21CostModel {
             };
             return exchange_endpoint_footprint(&traffic, phases);
         }
-        let Some(traffic) = gemm_exchange_endpoint_traffic(dispatch, inputs, output) else {
+        let Some(traffic) =
+            gemm_exchange_endpoint_traffic(dispatch, inputs, output, self.target())
+        else {
             return ExchangeFootprint::default();
         };
         exchange_endpoint_footprint(&traffic, phases)
@@ -1396,7 +1418,7 @@ impl CostModel for Ipu21CostModel {
         mappings: &[ConversionMapping],
     ) -> CostEstimate {
         let _ = (shape, precision);
-        let traffic = conversion_mapping_traffic(mappings);
+        let traffic = conversion_mapping_traffic(mappings, self.target());
         let direct_retile = matches!(
             strategy,
             ConversionStrategy::DirectRetile | ConversionStrategy::DirectLogical

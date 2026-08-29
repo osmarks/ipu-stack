@@ -146,13 +146,13 @@ pub struct CompiledTensorShard {
 /// through driver diagnostics. A zero-payload `run` rendezvous starts execution
 /// after loading, so breakpoints in the program cannot race the loader.
 pub fn build_tile_program_package(
+    target: HardwareTarget,
     programs: &[TileProgram],
     data: &[TileProgramData],
     outputs: &[Binding],
     toolchain: &Toolchain,
     runtime_source: &std::path::Path,
 ) -> PackageBuildResult<Application> {
-    let target = HardwareTarget::Ipu21;
     let topology = target.topology();
     let execution_tiles = u16::try_from(topology.tile_count())?;
     if programs.len() != usize::from(execution_tiles)
@@ -162,7 +162,7 @@ pub fn build_tile_program_package(
             .any(|(tile, program)| usize::from(program.tile) != tile)
     {
         return Err(invalid(
-            "finalized tile programs must cover every C600 logical tile in order",
+            "finalized tile programs must cover every target logical tile in order",
         ));
     }
     if data
@@ -306,6 +306,7 @@ pub fn build_tile_program_package(
     )?;
     let provisional_ranges = memory.free_ranges(host_bounds.clone());
     let provisional_host = host::plan(
+        target,
         &[],
         std::slice::from_ref(&launch),
         &run_outputs,
@@ -330,6 +331,7 @@ pub fn build_tile_program_package(
     })?;
     let host_ranges = memory.free_ranges(host_bounds.clone());
     let host = host::plan(
+        target,
         &[],
         std::slice::from_ref(&launch),
         &run_outputs,
@@ -924,6 +926,7 @@ fn build_package_from_objects(
             provisional_placement.tile_auxiliary_ranges[usize::from(logical)].clone();
     }
     let provisional_host = host::plan(
+        config.pipeline.target,
         &provisional_weights,
         &provisional_inputs,
         &provisional_outputs,
@@ -954,6 +957,7 @@ fn build_package_from_objects(
         .as_ref()
         .map_or(sizing_host_base, |code| code.range.start);
     let provisional_host = host::plan(
+        config.pipeline.target,
         &provisional_weights,
         &provisional_inputs,
         &provisional_outputs,
@@ -1129,6 +1133,7 @@ fn build_package_from_objects(
         TILE_MEMORY_BASE + ipu_target::memory::TILE_MEMORY_SIZE,
     ));
     let host = host::plan(
+        config.pipeline.target,
         &weights,
         &inputs,
         &outputs,

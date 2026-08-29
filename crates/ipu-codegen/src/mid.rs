@@ -32,7 +32,7 @@ use crate::layout::{
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
 use crate::operator::*;
-use ipu_target::hardware::HardwareMemoryConstraints;
+use ipu_target::hardware::HardwareTarget;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -539,7 +539,7 @@ pub(crate) fn lower_finalists(
                 &branch.operations,
                 &outputs,
                 &branch.state.values,
-                config.target.memory_constraints(),
+                config.target,
             );
             tracing::info!(
                 finalist,
@@ -918,7 +918,7 @@ fn plan_region_frontier(
                     required_outputs,
                     graph,
                     &constraints.allocation_copies,
-                    config.target.memory_constraints(),
+                    config.target,
                 );
                 if peak.fits_with_budget(
                     config.target.memory_constraints(),
@@ -1083,7 +1083,7 @@ fn plan_region_frontier(
                         required_outputs,
                         graph,
                         &constraints.allocation_copies,
-                        config.target.memory_constraints(),
+                        config.target,
                     );
                     (next, peak)
                 })
@@ -1190,7 +1190,7 @@ fn plan_region_frontier(
                 required_outputs,
                 graph,
                 &constraints.allocation_copies,
-                config.target.memory_constraints(),
+                config.target,
             );
             (peak.fits_with_budget(
                 config.target.memory_constraints(),
@@ -1762,7 +1762,7 @@ fn beam_memory_peak(
     required_outputs: &[ValueId],
     graph: &ComputeGraph,
     allocation_multiplicity: &BTreeMap<ValueId, u32>,
-    memory_constraints: HardwareMemoryConstraints,
+    target: HardwareTarget,
 ) -> MemoryPeaks {
     let live_origins = source[operation_index + 1..]
         .iter()
@@ -1789,7 +1789,7 @@ fn beam_memory_peak(
         &live,
         &branch.state.values,
         &multiplicity,
-        memory_constraints,
+        target,
     )
 }
 
@@ -3220,7 +3220,7 @@ fn retain_precise_gemm_plans(
                     exchange_footprint: exchange,
                     ..CostEstimate::default()
                 },
-                memory: memory.peaks(exchange.estimated_row_bytes()),
+                memory: memory.peaks(exchange.estimated_row_bytes(costs.target())),
             };
             let compatibility = gemm_plan_compatibility(&candidate);
             (candidate, objective, compatibility)
@@ -3507,7 +3507,7 @@ fn lower_repeat(
         &yields,
         &state.values,
         &body_allocation_multiplicity,
-        config.target.memory_constraints(),
+        config.target,
     );
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
@@ -4201,6 +4201,10 @@ mod tests {
     struct ColumnParityCost;
 
     impl CostModel for ColumnParityCost {
+        fn target(&self) -> HardwareTarget {
+            HardwareTarget::Ipu21
+        }
+
         fn operator_cycles(
             &self,
             operator: MidOperator,
@@ -4777,7 +4781,7 @@ mod tests {
                 "random case {case}"
             );
             assert!(
-                consumer.metrics.cost.exchange_row_bytes() != 0,
+                consumer.metrics.cost.exchange_row_bytes(config.target) != 0,
                 "random case {case}"
             );
             assert_eq!(

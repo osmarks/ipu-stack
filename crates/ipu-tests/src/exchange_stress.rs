@@ -372,6 +372,7 @@ pub(crate) fn build_wide(
         })
         .collect::<Result<Vec<_>>>()?;
     let application = build_tile_program_package(
+        ipu_target::hardware::HardwareTarget::Ipu21,
         &programs,
         &data,
         &output_bindings,
@@ -725,7 +726,14 @@ pub(crate) fn build(
             data,
         })
         .collect::<Vec<_>>();
-    let application = build_tile_program_package(&programs, &data, &[], toolchain, runtime_source)?;
+    let application = build_tile_program_package(
+        ipu_target::hardware::HardwareTarget::Ipu21,
+        &programs,
+        &data,
+        &[],
+        toolchain,
+        runtime_source,
+    )?;
     eprintln!(
         "exchangeStress seed={seed:#x} pattern={} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
         if overlap_sweep { "overlap" } else { "random" },

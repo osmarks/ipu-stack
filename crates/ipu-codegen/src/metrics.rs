@@ -1,7 +1,7 @@
 //! Shared cycle and per-tile memory metrics used by operator and region planning.
 
 use crate::layout::MemoryClass;
-use ipu_target::hardware::HardwareMemoryConstraints;
+use ipu_target::hardware::{HardwareMemoryConstraints, HardwareTarget};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CostEstimate {
@@ -17,8 +17,8 @@ pub struct ExchangeFootprint {
 }
 
 impl CostEstimate {
-    pub const fn exchange_row_bytes(self) -> u64 {
-        self.exchange_footprint.estimated_row_bytes()
+    pub const fn exchange_row_bytes(self, target: HardwareTarget) -> u64 {
+        self.exchange_footprint.estimated_row_bytes(target)
     }
 
     pub const fn sequence(self, next: Self) -> Self {
@@ -58,26 +58,10 @@ impl CostEstimate {
 }
 
 impl ExchangeFootprint {
-    pub const fn estimated_row_bytes(self) -> u64 {
-        // A primitive plan contributes its synchronization-free body to the
-        // consolidated per-phase row. The entry sync and terminal return are
-        // shared by the caller and consolidated row respectively. Mid-level
-        // byte volume cannot see where independently tiled source and
-        // destination spans meet, or the address tables needed by shared
-        // executable rows. Six encoded chunks per logical chunk tracks the
-        // combined executable, offset, and per-use value storage on IPU21.
-        let words_per_chunk = (ipu_target::hardware::HardwareTarget::Ipu21
+    pub const fn estimated_row_bytes(self, target: HardwareTarget) -> u64 {
+        target
             .exchange()
-            .plan_words
-            - 2) as u64;
-        let encoded_chunks_per_logical_chunk = 6;
-        self.phases
-            .saturating_add(
-                self.maximum_transfer_chunks_per_tile
-                    .saturating_mul(words_per_chunk)
-                    .saturating_mul(encoded_chunks_per_logical_chunk),
-            )
-            .saturating_mul(4)
+            .estimated_row_bytes(self.phases, self.maximum_transfer_chunks_per_tile)
     }
 }
 

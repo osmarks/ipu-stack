@@ -12,6 +12,7 @@ use crate::operator::{
     AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
     OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
 };
+use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -162,9 +163,10 @@ fn add_endpoint_load(
 /// every receiving tile; local geometries contribute no exchange traffic.
 pub(crate) fn conversion_mapping_traffic(
     mappings: &[ConversionMapping],
+    target: HardwareTarget,
 ) -> ConversionTraffic {
     let maximum_chunk_bytes = u64::from(
-        ipu_target::hardware::HardwareTarget::Ipu21
+        target
             .exchange()
             .maximum_transfer_words,
     ) * 4;
@@ -844,7 +846,7 @@ pub(crate) fn region_peak_memory(
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
-    constraints: ipu_target::hardware::HardwareMemoryConstraints,
+    target: HardwareTarget,
 ) -> MemoryPeaks {
     region_peak_memory_with_multiplicity(
         initial,
@@ -852,7 +854,7 @@ pub(crate) fn region_peak_memory(
         outputs,
         values,
         &BTreeMap::new(),
-        constraints,
+        target,
     )
 }
 
@@ -862,8 +864,9 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     outputs: &[MidValueId],
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
-    constraints: ipu_target::hardware::HardwareMemoryConstraints,
+    target: HardwareTarget,
 ) -> MemoryPeaks {
+    let constraints = target.memory_constraints();
     let requirements = allocation_requirements(operations);
     let streamed_aliases = operations
         .iter()
@@ -951,7 +954,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     observe(&mut peaks, &live_values, MemoryUsage::default());
     let exchange_rows = operations
         .iter()
-        .map(|operation| operation.metrics.cost.exchange_row_bytes())
+        .map(|operation| operation.metrics.cost.exchange_row_bytes(target))
         .fold(0u64, u64::saturating_add);
     peaks.exchange_rows = exchange_rows;
     peaks.standard = peaks.standard.saturating_add(exchange_rows);
@@ -978,6 +981,7 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
     dispatch: &OperatorDispatch,
     inputs: &[TensorType],
     compute_output: &TensorType,
+    target: HardwareTarget,
 ) -> Option<ExchangeEndpointTraffic> {
     let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return Some(ExchangeEndpointTraffic::default());
@@ -1038,11 +1042,7 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         right_inner_axis,
         output_column_axis,
     )?;
-    let transfer_bytes = u64::from(
-        ipu_target::hardware::HardwareTarget::Ipu21
-            .exchange()
-            .maximum_transfer_words,
-    ) * 4;
+    let transfer_bytes = u64::from(target.exchange().maximum_transfer_words) * 4;
     let mut traffic = ExchangeEndpointTraffic::default();
     let mut left_is_remote = false;
     let mut right_is_remote = false;
@@ -1054,8 +1054,8 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         let incoming = left_remote.saturating_add(right_remote);
         traffic.add_incoming(tile, incoming, incoming.div_ceil(transfer_bytes));
     }
-    add_operand_outgoing_bus_work(&mut traffic, left, left_is_remote);
-    add_operand_outgoing_bus_work(&mut traffic, right, right_is_remote);
+    add_operand_outgoing_bus_work(&mut traffic, left, left_is_remote, transfer_bytes);
+    add_operand_outgoing_bus_work(&mut traffic, right, right_is_remote, transfer_bytes);
     Some(traffic)
 }
 
@@ -1224,15 +1224,11 @@ fn add_operand_outgoing_bus_work(
     traffic: &mut ExchangeEndpointTraffic,
     operand: &TensorType,
     remote: bool,
+    transfer_bytes: u64,
 ) {
     if !remote {
         return;
     }
-    let transfer_bytes = u64::from(
-        ipu_target::hardware::HardwareTarget::Ipu21
-            .exchange()
-            .maximum_transfer_words,
-    ) * 4;
     for tile in 0..operand.format.layout.tiling.tile_count {
         let bytes = maximum_shard_bytes(operand);
         traffic.add_outgoing(tile / 2, bytes, bytes.div_ceil(transfer_bytes));
@@ -1397,8 +1393,13 @@ mod tests {
             );
             let dispatch = output_stationary_dispatch();
             let local =
-                gemm_exchange_endpoint_traffic(&dispatch, &[local_left, local_right], &output)
-                    .unwrap();
+                gemm_exchange_endpoint_traffic(
+                    &dispatch,
+                    &[local_left, local_right],
+                    &output,
+                    HardwareTarget::Ipu21,
+                )
+                .unwrap();
             assert!(local.is_empty(), "case {case}");
 
             let sharded_left = TensorType::new(
@@ -1419,8 +1420,13 @@ mod tests {
                 ),
             );
             let remote =
-                gemm_exchange_endpoint_traffic(&dispatch, &[sharded_left, sharded_right], &output)
-                    .unwrap();
+                gemm_exchange_endpoint_traffic(
+                    &dispatch,
+                    &[sharded_left, sharded_right],
+                    &output,
+                    HardwareTarget::Ipu21,
+                )
+                .unwrap();
             assert!(remote.maximum_outgoing_bytes() != 0, "case {case}");
             assert!(remote.maximum_incoming_bytes() != 0, "case {case}");
             assert_eq!(
@@ -1486,6 +1492,7 @@ mod tests {
                 &dispatch,
                 &[left.clone(), resident_right],
                 &compute_output,
+                HardwareTarget::Ipu21,
             )
             .unwrap();
             assert!(resident.is_empty(), "case {case}");
@@ -1506,9 +1513,13 @@ mod tests {
             let expected_outgoing = expected_incoming.saturating_mul(u64::from(
                 sharded_right.format.layout.tiling.tile_count.min(2),
             ));
-            let streamed =
-                gemm_exchange_endpoint_traffic(&dispatch, &[left, sharded_right], &compute_output)
-                    .unwrap();
+            let streamed = gemm_exchange_endpoint_traffic(
+                &dispatch,
+                &[left, sharded_right],
+                &compute_output,
+                HardwareTarget::Ipu21,
+            )
+            .unwrap();
             assert_eq!(
                 streamed.maximum_incoming_bytes(),
                 expected_incoming,
