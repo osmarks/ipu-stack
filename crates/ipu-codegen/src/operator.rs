@@ -1,12 +1,12 @@
 //! Whole-device operator plans and tile-kernel specifications.
 
-use crate::graph::{AddOptions, AttentionOptions, GemmOptions, SplitHeadsOptions, TensorShape};
+use crate::conversion::DeferredTransform;
+use crate::graph::{AddOptions, AttentionOptions, GemmOptions, TensorShape};
 use crate::ir::MidValueId;
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, NativeKernelOrder, ShardExtent,
-    StorageOrder, TensorAxis, TensorFormat, TensorRegion, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, NativeKernelOrder, StorageOrder,
+    TensorAxis, TensorFormat, TensorType,
 };
-use crate::metrics::CostEstimate;
 
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,7 +44,6 @@ pub enum MidOperator {
     },
     Gelu,
     Add(AddOptions),
-    SplitHeads(SplitHeadsOptions),
     FlashAttention {
         options: AttentionOptions,
         accumulate: AccumulationPrecision,
@@ -138,10 +137,6 @@ pub enum OperatorDispatch {
     },
     BlockedGemm(BlockedGemmPlan),
     Attention(AttentionPlan),
-    /// Redistribute packed projection columns into independent attention
-    /// streams. The byte mapping is performed directly by local copies and
-    /// exchanges, without a tile kernel.
-    SplitHeads,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -201,97 +196,6 @@ impl AttentionPlan {
             },
         )
     }
-}
-
-/// A logical value transformation whose physical materialization may be
-/// deferred until a consumer requests bounded slices.  The transform is
-/// independent of either producer or consumer operator kinds, so additional
-/// view-like operators can participate without adding pairs of dispatch
-/// special cases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DeferredTransform {
-    /// Split the final input axis into `parts` equal-width slices and fold the
-    /// new part axis into the leading output axis.
-    SplitLastAxisIntoLeading { parts: u32 },
-}
-
-impl DeferredTransform {
-    /// Map one rectangular output slice back to a rectangular producer slice.
-    /// Returning `None` means that the requested slice crosses a transform
-    /// discontinuity and must be divided before dispatch.
-    pub fn map_slice(
-        self,
-        source_shape: &TensorShape,
-        output_shape: &TensorShape,
-        output: &TensorRegion,
-    ) -> Option<DeferredSliceMapping> {
-        match self {
-            Self::SplitLastAxisIntoLeading { parts } => {
-                let [source_batch, source_rows, source_columns] = source_shape.0.as_slice() else {
-                    return None;
-                };
-                let [output_streams, output_rows, output_columns] = output_shape.0.as_slice()
-                else {
-                    return None;
-                };
-                let [stream, rows, columns] = output.extents.as_slice() else {
-                    return None;
-                };
-                let (stream_start, stream_end) = (stream.start, stream.logical_end);
-                if parts == 0
-                    || stream.axis != 0
-                    || rows.axis != 1
-                    || columns.axis != 2
-                    || stream_end != stream_start.checked_add(1)?
-                    || *output_streams != source_batch.checked_mul(parts)?
-                    || output_rows != source_rows
-                    || source_columns != &output_columns.checked_mul(parts)?
-                    || stream_end > *output_streams
-                    || rows.logical_end > *output_rows
-                    || columns.logical_end > *output_columns
-                {
-                    return None;
-                }
-                let batch = stream_start / parts;
-                let part = stream_start % parts;
-                let column_base = part.checked_mul(*output_columns)?;
-                Some(DeferredSliceMapping {
-                    source: TensorRegion::new([
-                        ShardExtent {
-                            axis: 0,
-                            start: batch,
-                            logical_end: batch.checked_add(1)?,
-                            physical_end: batch.checked_add(1)?,
-                        },
-                        *rows,
-                        ShardExtent {
-                            axis: 2,
-                            start: column_base.checked_add(columns.start)?,
-                            logical_end: column_base.checked_add(columns.logical_end)?,
-                            physical_end: column_base.checked_add(columns.logical_end)?,
-                        },
-                    ]),
-                    destination_source_axes: vec![1, 2],
-                })
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeferredSliceMapping {
-    pub source: TensorRegion,
-    /// Source axes retained, in destination-axis order. Removed axes select a
-    /// slice but do not occupy storage in the consumer's dispatch buffer.
-    pub destination_source_axes: Vec<usize>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DeferredOutputPlan {
-    pub source_input: usize,
-    pub transform: DeferredTransform,
-    /// Cost restored if no later consumer claims this offer.
-    pub unfused_cost: CostEstimate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,7 +336,6 @@ impl OperatorDispatch {
     fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
-            Self::SplitHeads => EmptyOutputShardPolicy::Reject,
             Self::BlockedGemm(_) | Self::Attention(_) => EmptyOutputShardPolicy::Reject,
         }
     }
@@ -572,9 +475,6 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
-    /// A view transformation offered by this plan. It is materialized normally
-    /// unless a later plan records a matching entry in `deferred_inputs`.
-    pub deferred_output: Option<DeferredOutputPlan>,
     /// Deferred producer results claimed by each input operand.
     pub deferred_inputs: Vec<Option<DeferredInputPlan>>,
 }
@@ -627,14 +527,12 @@ impl OperatorPlan {
         operator: MidOperator,
         dispatch: OperatorDispatch,
         requirements: OperatorRequirements,
-        deferred_output: Option<DeferredOutputPlan>,
     ) -> Self {
         let input_count = requirements.inputs.len();
         Self {
             operator,
             dispatch,
             requirements,
-            deferred_output,
             deferred_inputs: vec![None; input_count],
         }
     }
@@ -1059,19 +957,6 @@ impl OperatorPlan {
                     .any(|input| input.format.layout.tiling.tile_count != output_tiles)
                 {
                     Err(OperatorPlanError::IncompatibleTileGroups)
-                } else {
-                    Ok(())
-                }
-            }
-            (MidOperator::SplitHeads(_), OperatorDispatch::SplitHeads) => {
-                let [input] = inputs else {
-                    return Err(OperatorPlanError::OperandArity);
-                };
-                if input.shape.0.len() != 3
-                    || output.shape.0.len() != 3
-                    || input.format.precision != output.format.precision
-                {
-                    Err(OperatorPlanError::InvalidBlocking)
                 } else {
                     Ok(())
                 }

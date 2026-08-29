@@ -3,7 +3,9 @@
 use crate::ConversionMapping;
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::conversion::{ConversionStrategy, layout_conversion_strategy, plan_conversion};
+use crate::conversion::{
+    ConversionStrategy, DeferredTransform, layout_conversion_strategy, plan_conversion,
+};
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
     gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
@@ -14,8 +16,8 @@ use crate::graph::TensorShape;
 use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
 use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{
-    DeferredTransform, GemmDistribution, LocalOperandStaging, MidOperator, OperatorDispatch,
-    OperatorRequirements, Precision,
+    GemmDistribution, LocalOperandStaging, MidOperator, OperatorDispatch, OperatorRequirements,
+    Precision,
 };
 use foldhash::fast::FixedState;
 use ipu_target::cost::HardwareCosts;
@@ -393,28 +395,6 @@ fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
 }
 
-/// Conservative endpoint proxy for an operator-internal redistribution which
-/// has not yet been expanded into an explicit conversion plan.
-fn tensor_transition_endpoint_traffic(
-    source: &TensorType,
-    destination: &TensorType,
-) -> ExchangeEndpointTraffic {
-    let transfer_bytes = u64::from(
-        ipu_target::hardware::HardwareTarget::Ipu21
-            .exchange()
-            .maximum_transfer_words,
-    ) * 4;
-    let outgoing = maximum_shard_bytes(source)
-        .saturating_mul(u64::from(source.format.layout.tiling.tile_count.min(2)));
-    let incoming = maximum_shard_bytes(destination);
-    ExchangeEndpointTraffic::from_maxima(
-        outgoing,
-        incoming,
-        outgoing.div_ceil(transfer_bytes),
-        incoming.div_ceil(transfer_bytes),
-    )
-}
-
 fn exchange_endpoint_footprint(
     traffic: &ExchangeEndpointTraffic,
     phases: u64,
@@ -538,17 +518,6 @@ fn amp_unpack_cycles(tensor: &TensorType) -> u64 {
     maximum_shard_elements(tensor)
         .saturating_mul(IPU21_TARGET_COSTS.indexed_f16_transform_cycles_per_element)
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-}
-
-fn split_heads_uses_micro_panel_exchange(source: &TensorType, output: &TensorType) -> bool {
-    source
-        .format
-        .supports_f16_micro_panel_exchange(&output.format)
-        && output
-            .shape
-            .0
-            .last()
-            .is_some_and(|width| width.is_multiple_of(2))
 }
 
 fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
@@ -793,9 +762,6 @@ fn estimated_operator_exchange_cycles(
         OperatorDispatch::Attention(_) => attention_endpoint_traffic(inputs, output, dispatch)
             .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
             .unwrap_or(u64::MAX / 8),
-        OperatorDispatch::SplitHeads => inputs.first().map_or(0, |input| {
-            exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
-        }),
         OperatorDispatch::Pointwise { .. } => 0,
     }
 }
@@ -1165,7 +1131,6 @@ impl CostModel for Ipu21CostModel {
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                     OperatorDispatch::Pointwise { .. } => 0,
                     OperatorDispatch::Attention(_) => 0,
-                    OperatorDispatch::SplitHeads => 0,
                 };
                 let kernel = amp_kernel_cycles(
                     multiply,
@@ -1274,46 +1239,18 @@ impl CostModel for Ipu21CostModel {
             MidOperator::Add(_) => spatial_occupancy_adjusted_elements
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::SplitHeads(_) => {
-                let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-                if let Some(input) = inputs.first()
-                    && split_heads_uses_micro_panel_exchange(input, output)
-                {
-                    return exchange.saturating_add(
-                        split_head_panel_exchange_cycles(input, output, output).unwrap_or(0),
-                    );
-                }
-                let source_unpack = inputs.first().map_or(0, amp_unpack_cycles);
-                let destination_pack =
-                    row_major_pack_cycles(output, maximum_shard_elements(output));
-                let materialization = split_heads_word_fragment_cycles(output)
-                    .map_or(destination_pack, |direct| direct.min(destination_pack));
-                source_unpack
-                    .saturating_add(materialization)
-                    .saturating_add(exchange)
-            }
         }
     }
 
     fn operator_exchange_cycles(
         &self,
-        operator: MidOperator,
+        _operator: MidOperator,
         dispatch: &OperatorDispatch,
         _requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
-        let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-        if matches!(operator, MidOperator::SplitHeads(_))
-            && let Some(input) = inputs.first()
-            && split_heads_uses_micro_panel_exchange(input, output)
-        {
-            exchange.saturating_add(
-                split_head_panel_exchange_cycles(input, output, output).unwrap_or(0),
-            )
-        } else {
-            exchange
-        }
+        estimated_operator_exchange_cycles(dispatch, inputs, output)
     }
 
     fn deferred_input_cycles(
@@ -1359,7 +1296,6 @@ impl CostModel for Ipu21CostModel {
         output: &TensorType,
     ) -> ExchangeFootprint {
         let phases = match dispatch {
-            OperatorDispatch::SplitHeads => 1,
             OperatorDispatch::Attention(plan) => match plan.blocking {
                 crate::AttentionBlocking::Flash { key_rows, .. } => inputs
                     .get(1)
@@ -1397,15 +1333,6 @@ impl CostModel for Ipu21CostModel {
         };
         if phases == 0 {
             return ExchangeFootprint::default();
-        }
-        if matches!(dispatch, OperatorDispatch::SplitHeads) {
-            let Some(input) = inputs.first() else {
-                return ExchangeFootprint::default();
-            };
-            return exchange_endpoint_footprint(
-                &tensor_transition_endpoint_traffic(input, output),
-                phases,
-            );
         }
         if matches!(dispatch, OperatorDispatch::Attention(_)) {
             let Some((traffic, _)) = attention_endpoint_traffic(inputs, output, dispatch) else {

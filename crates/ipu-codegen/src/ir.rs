@@ -1,9 +1,9 @@
 //! Layout-aware mid-level graph records.
 
+use crate::conversion::{ConversionPlan, DeferredTransform};
 use crate::graph::{GraphInputKind, OperationId, ValueId};
 use crate::layout::{Layout, TensorType};
 use crate::metrics::{OperationMetrics, RegionMetrics};
-use crate::conversion::ConversionPlan;
 use crate::operator::{MidOperator, OperatorPlan, Precision};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -35,6 +35,7 @@ pub struct MidValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
     Operator(OperatorPlan),
+    View(DeferredTransform),
     CastPrecision { from: Precision, to: Precision },
     Rearrange { from: Layout, to: Layout },
     Repeat(MidRepeat),
@@ -54,7 +55,8 @@ impl MidOperation {
     pub fn operator_plan(&self) -> Option<&OperatorPlan> {
         match &self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
-            MidOperationKind::CastPrecision { .. }
+            MidOperationKind::View(_)
+            | MidOperationKind::CastPrecision { .. }
             | MidOperationKind::Rearrange { .. }
             | MidOperationKind::Repeat(_) => None,
         }
@@ -63,7 +65,8 @@ impl MidOperation {
     pub fn operator_plan_mut(&mut self) -> Option<&mut OperatorPlan> {
         match &mut self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
-            MidOperationKind::CastPrecision { .. }
+            MidOperationKind::View(_)
+            | MidOperationKind::CastPrecision { .. }
             | MidOperationKind::Rearrange { .. }
             | MidOperationKind::Repeat(_) => None,
         }

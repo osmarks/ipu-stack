@@ -199,7 +199,7 @@ pub(crate) fn conversion_mapping_traffic(
             remote_sources
                 .entry((
                     mapping.source_shard,
-                    mapping.region.clone(),
+                    mapping.source_region.clone(),
                     mapping.copies.clone(),
                 ))
                 .or_insert((mapping.source_tile, bytes, fragments));

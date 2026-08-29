@@ -7,7 +7,7 @@
 //! remaining choices.
 
 use crate::PipelineConfig;
-use crate::conversion::ConversionStrategy;
+use crate::conversion::{ConversionStrategy, DeferredTransform};
 use crate::graph::{GraphInputKind, OperationId};
 use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::layout::{
@@ -15,9 +15,8 @@ use crate::layout::{
     NativeKernelOrder, ShardExtent, StorageOrder, TensorRegion, TensorTiling, TensorType,
 };
 use crate::operator::{
-    DeferredTransform, GemmDistribution, MemoryOperand, MemorySpaceRequirements,
-    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing,
-    PointwiseInputMapping, Precision, TileKernelSpec,
+    GemmDistribution, MemoryOperand, MemorySpaceRequirements, OperandRequirement, OperatorDispatch,
+    OperatorRequirements, OutputAliasing, PointwiseInputMapping, Precision, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use ipu_target::hardware::HardwareTarget;
@@ -1063,20 +1062,12 @@ impl LoweringState {
         let mut checkpoint = 0u8;
         for (index, operation) in operations.iter().enumerate() {
             let started = Instant::now();
-            if self.defer_fused_output(operation, operations, retained_values, &mut tiles)? {
-                tracing::info!(
-                    operation = index,
-                    source = ?operation.source.map(OperationId::index),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "deferred fused-operator materialization"
-                );
-                continue;
-            }
             if self.defer_conversion(
                 operation,
                 operations.get(index + 1),
                 operations,
                 retained_values,
+                &mut tiles,
             )? {
                 tracing::info!(
                     operation = index,
@@ -1108,7 +1099,9 @@ impl LoweringState {
             if checkpoints
                 && matches!(
                     operation.kind,
-                    MidOperationKind::Operator(_) | MidOperationKind::Repeat(_)
+                    MidOperationKind::Operator(_)
+                        | MidOperationKind::View(_)
+                        | MidOperationKind::Repeat(_)
                 )
                 && let Some(source) = operation.source
             {
@@ -1209,116 +1202,18 @@ impl LoweringState {
         Ok(Some(staging_shards))
     }
 
-    fn defer_fused_output(
-        &mut self,
-        operation: &MidOperation,
-        operations: &[MidOperation],
-        retained_values: &[MidValueId],
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<bool> {
-        let Some(offered) = operation
-            .operator_plan()
-            .and_then(|plan| plan.deferred_output)
-        else {
-            return Ok(false);
-        };
-        let [result] = operation.results.as_slice() else {
-            return Ok(false);
-        };
-        let Some(source) = operation.inputs.get(offered.source_input) else {
-            return Ok(false);
-        };
-        let uses = operations
-            .iter()
-            .flat_map(|operation| &operation.inputs)
-            .chain(retained_values)
-            .filter(|value| **value == *result)
-            .count();
-        let claimed = operations.iter().any(|candidate| {
-            candidate.operator_plan().is_some_and(|plan| {
-                plan.deferred_inputs.iter().flatten().any(|input| {
-                    input.producer == *result
-                        && input.source == *source
-                        && input.transform == offered.transform
-                })
-            })
-        });
-        if uses != 1 || !claimed {
-            tracing::debug!(
-                source = ?operation.source.map(OperationId::index),
-                ?result,
-                uses,
-                claimed,
-                "cannot defer fused output because its consumer contract is not exclusive"
-            );
-            return Ok(false);
-        }
-        let DeferredTransform::SplitLastAxisIntoLeading { parts } = offered.transform;
-        let columns = self.shards[self.value_shards(*source)?[0].index() as usize]
-            .tensor_type
-            .shape
-            .0[2];
-        if parts == 0 || !columns.is_multiple_of(parts) {
-            return Ok(false);
-        }
-        let source_shards = self.value_shards(*source)?.to_vec();
-        let source_format = &self.shards[source_shards[0].index() as usize]
-            .tensor_type
-            .format;
-        let result_format = &self.shards[self.value_shards(*result)?[0].index() as usize]
-            .tensor_type
-            .format;
-        let direct_panel_exchange = source_format.supports_f16_micro_panel_exchange(result_format);
-        tracing::debug!(
-            source = ?operation.source.map(OperationId::index),
-            source_order = ?source_format.layout.order,
-            result_order = ?result_format.layout.order,
-            direct_panel_exchange,
-            "selected deferred-output storage"
-        );
-        let staging_shards = if direct_panel_exchange
-            || !matches!(
-                source_format.layout.order,
-                StorageOrder::Native(NativeKernelOrder::Output | NativeKernelOrder::TransposedLeft)
-            ) {
-            source_shards
-        } else {
-            let Some(staging) = self.unpack_amp_to_row_major(
-                *source,
-                WorkProvenance {
-                    operation: operation.source,
-                    value: Some(*result),
-                    reason: WorkReason::OperatorKernel,
-                },
-                tiles,
-            )?
-            else {
-                return Ok(false);
-            };
-            staging
-        };
-        self.deferred_values.insert(
-            *result,
-            DeferredValue {
-                transform: offered.transform,
-                shards: staging_shards,
-            },
-        );
-        for shard in self.value_shards(*result)?.to_vec() {
-            self.shards[shard.index() as usize].definition = ShardDefinition::Unmaterialized;
-        }
-        Ok(true)
-    }
-
     fn defer_conversion(
         &mut self,
         operation: &MidOperation,
         next: Option<&MidOperation>,
         operations: &[MidOperation],
         retained_values: &[MidValueId],
+        tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<bool> {
-        let (MidOperationKind::Rearrange { .. }, Some(next)) = (&operation.kind, next) else {
-            return Ok(false);
+        let transform = match operation.kind {
+            MidOperationKind::View(transform) => Some(transform),
+            MidOperationKind::Rearrange { .. } => None,
+            _ => return Ok(false),
         };
         let Some(plan) = &operation.conversion_plan else {
             return Err(LowLoweringError::MissingConversionPlan);
@@ -1342,6 +1237,16 @@ impl LoweringState {
         if uses != 1 {
             return Ok(false);
         }
+        let next = if transform.is_some() {
+            operations
+                .iter()
+                .find(|candidate| candidate.inputs.contains(result))
+        } else {
+            next
+        };
+        let Some(next) = next else {
+            return Ok(false);
+        };
         let Some(input_index) = next.inputs.iter().position(|input| input == result) else {
             return Ok(false);
         };
@@ -1354,7 +1259,36 @@ impl LoweringState {
         if !streamable {
             return Ok(false);
         }
-        self.deferred_conversions.insert(*result, *source);
+        if let Some(transform) = transform {
+            let source_shards = self.value_shards(*source)?.to_vec();
+            let source_format = &self.shards[source_shards[0].index() as usize]
+                .tensor_type
+                .format;
+            let result_format = &self.shards[self.value_shards(*result)?[0].index() as usize]
+                .tensor_type
+                .format;
+            let direct = source_format.supports_f16_micro_panel_exchange(result_format);
+            let shards = if direct
+                || !matches!(
+                    source_format.layout.order,
+                    StorageOrder::Native(
+                        NativeKernelOrder::Output | NativeKernelOrder::TransposedLeft
+                    )
+                ) {
+                source_shards
+            } else {
+                self.unpack_amp_to_row_major(
+                    *source,
+                    operation_provenance(operation, &operation.kind),
+                    tiles,
+                )?
+                .ok_or(LowLoweringError::InvalidConversionPlan)?
+            };
+            self.deferred_values
+                .insert(*result, DeferredValue { transform, shards });
+        } else {
+            self.deferred_conversions.insert(*result, *source);
+        }
         for shard in self.value_shards(*result)?.to_vec() {
             self.shards[shard.index() as usize].definition = ShardDefinition::Unmaterialized;
         }
@@ -1535,7 +1469,7 @@ impl LoweringState {
             let source_view = if transfer_source == source {
                 ShardView {
                     shard: source,
-                    extents: mapping.region.clone(),
+                    extents: mapping.source_region.clone(),
                 }
             } else {
                 self.full_view(transfer_source)
@@ -1543,7 +1477,7 @@ impl LoweringState {
             let destination_view = if transfer_destination == destination {
                 ShardView {
                     shard: destination,
-                    extents: mapping.region.clone(),
+                    extents: mapping.destination_region.clone(),
                 }
             } else {
                 self.full_view(transfer_destination)
@@ -1623,168 +1557,6 @@ impl LoweringState {
         Ok(())
     }
 
-    fn lower_mapped_views(
-        &mut self,
-        mappings: Vec<(ShardView, ShardView)>,
-        logical_order: bool,
-        exchange_order: ExchangeOrder,
-        provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
-        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-        let mut before_exchange = Vec::new();
-        let mut after_exchange = Vec::new();
-        let mut after_exchange_kernels = Vec::new();
-        let mut grouped = BTreeMap::<LowShardId, Vec<(ShardView, ShardView)>>::new();
-        for mapping in mappings {
-            grouped.entry(mapping.1.shard).or_default().push(mapping);
-        }
-        for (destination_shard, mut mappings) in grouped {
-            let destination_format = &self.shards[destination_shard.index() as usize]
-                .tensor_type
-                .format;
-            let destination_unaligned = mappings.iter().try_fold(
-                false,
-                |unaligned, (_, destination)| -> LowLoweringResult<bool> {
-                    let spans = logical_view_byte_spans(
-                        &self.shards[destination.shard.index() as usize],
-                        destination,
-                    )?;
-                    Ok(unaligned
-                        || spans
-                            .iter()
-                            .any(|span| span.offset & 0b11 != 0 || span.bytes & 0b11 != 0))
-                },
-            )?;
-            let requires_materialization = logical_order
-                && (mappings.iter().any(|(source, _)| {
-                    self.shards[source.shard.index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .order
-                        != destination_format.layout.order
-                }) || destination_unaligned);
-            let direct_logical = requires_materialization
-                && self.mappings_benefit_from_word_exchange(&mappings, destination_shard)?;
-            let stage_destination = requires_materialization && !direct_logical;
-            if direct_logical && self.shard_has_padding(destination_shard) {
-                self.append_fill_zero(tiles, destination_shard, provenance.clone())?;
-            }
-            let staging = if stage_destination {
-                Some(self.push_conversion_staging(destination_shard)?)
-            } else {
-                None
-            };
-            for (mut source, mut destination) in mappings.drain(..) {
-                if let Some(staging) = staging {
-                    destination.shard = staging;
-                    for extent in &mut source.extents {
-                        extent.physical_end = extent.logical_end;
-                    }
-                    for extent in &mut destination.extents {
-                        extent.physical_end = extent.logical_end;
-                    }
-                }
-                let source_tile = self.shards[source.shard.index() as usize].tile;
-                let destination_tile = self.shards[destination.shard.index() as usize].tile;
-                if source_tile == destination_tile {
-                    let copies = if staging.is_some() {
-                        &mut before_exchange
-                    } else {
-                        &mut after_exchange
-                    };
-                    if logical_order {
-                        append_logical_span_copies(
-                            &self.shards,
-                            &source,
-                            &destination,
-                            destination_tile,
-                            copies,
-                        )?;
-                    } else {
-                        append_span_copies(
-                            &self.shards,
-                            &source,
-                            &destination,
-                            destination_tile,
-                            copies,
-                        )?;
-                    }
-                } else {
-                    transfers.entry(source).or_default().push(destination);
-                }
-            }
-            if let Some(staging) = staging {
-                let destination = self.logical_view(destination_shard);
-                let staging = self.full_view(staging);
-                let source_format = self.shards[staging.shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .clone();
-                let destination_format = self.shards[destination_shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .clone();
-                let tile = self.shards[destination_shard.index() as usize].tile;
-                let supported_destination = match destination_format.layout.order {
-                    StorageOrder::Native(
-                        NativeKernelOrder::Left | NativeKernelOrder::TransposedRight,
-                    ) => true,
-                    StorageOrder::Blocked(order) => order.is_matrix(),
-                    StorageOrder::Linear | StorageOrder::Native(_) => false,
-                };
-                if source_format.precision == crate::Precision::F16
-                    && source_format.layout.order == StorageOrder::Linear
-                    && supported_destination
-                {
-                    after_exchange_kernels.push((
-                        tile,
-                        KernelRun::new(
-                            provenance.clone(),
-                            TileKernelSpec::Rearrange {
-                                from: source_format.layout.clone(),
-                                to: destination_format.layout.clone(),
-                            },
-                            vec![KernelOperand {
-                                views: vec![staging],
-                            }],
-                            self.full_view(destination_shard),
-                            KernelRequirements::Conversion {
-                                input: OperandRequirement::new(source_format, 2),
-                                output: OperandRequirement::new(destination_format, 2),
-                                memory_space: MemorySpaceRequirements::default()
-                                    .with_distinct_elements([
-                                        MemoryOperand::Input(0),
-                                        MemoryOperand::Output,
-                                    ]),
-                            },
-                        ),
-                    ));
-                } else {
-                    append_logical_span_copies(
-                        &self.shards,
-                        &staging,
-                        &destination,
-                        tile,
-                        &mut after_exchange,
-                    )?;
-                }
-            }
-        }
-        for (tile, copy) in before_exchange {
-            self.append_local_copy(tiles, tile, copy)?;
-        }
-        self.append_ordered_phase(transfers, provenance, exchange_order, tiles)?;
-        for (tile, copy) in after_exchange {
-            self.append_local_copy(tiles, tile, copy)?;
-        }
-        for (tile, run) in after_exchange_kernels {
-            self.append_kernel(tiles, tile, run)?;
-        }
-        Ok(())
-    }
-
     fn push_conversion_staging(
         &mut self,
         destination: LowShardId,
@@ -1844,14 +1616,6 @@ impl LoweringState {
         })
     }
 
-    fn logical_view(&self, shard: LowShardId) -> ShardView {
-        let mut view = self.full_view(shard);
-        for extent in &mut view.extents {
-            extent.physical_end = extent.logical_end;
-        }
-        view
-    }
-
     fn lower_operator(
         &mut self,
         operation: &MidOperation,
@@ -1885,182 +1649,7 @@ impl LoweringState {
                     tiles,
                 ),
             },
-            OperatorDispatch::SplitHeads => {
-                self.lower_split_heads(operation, &plan.operator, tiles)
-            }
         }
-    }
-
-    fn lower_split_heads(
-        &mut self,
-        operation: &MidOperation,
-        operator: &crate::MidOperator,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
-        let crate::MidOperator::SplitHeads(options) = operator else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [input] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
-        };
-        let input_type = self
-            .value_shards(*input)?
-            .first()
-            .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        if input_type.shape.0.len() != 3 || options.heads == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let head_width = input_type.shape.0[2] / options.heads;
-        if head_width == 0 || head_width * options.heads != input_type.shape.0[2] {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let output_shards = self.value_shards(*result)?.to_vec();
-        let output_type = output_shards
-            .first()
-            .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let original_sources = self.value_shards(*input)?.to_vec();
-        let direct_panel_exchange = input_type
-            .format
-            .supports_f16_micro_panel_exchange(&output_type.format);
-        tracing::debug!(
-            source = ?operation.source.map(OperationId::index),
-            source_order = ?input_type.format.layout.order,
-            destination_order = ?output_type.format.layout.order,
-            direct_panel_exchange,
-            "selected split-head exchange strategy"
-        );
-        if direct_panel_exchange {
-            let mappings = self.split_head_mappings(
-                &original_sources,
-                &output_shards,
-                options.heads,
-                head_width,
-            )?;
-            if let Some(mappings) = self.f16_micro_panel_mappings(mappings)? {
-                tracing::info!(
-                    source = ?operation.source.map(OperationId::index),
-                    mappings = mappings.len(),
-                    "lowering split transform as physical micro-panel exchange"
-                );
-                return self.lower_mapped_views(
-                    mappings,
-                    false,
-                    ExchangeOrder::Physical,
-                    WorkProvenance {
-                        operation: operation.source,
-                        value: Some(*result),
-                        reason: WorkReason::OperatorInputs,
-                    },
-                    tiles,
-                );
-            }
-        }
-
-        let source_shards = if matches!(
-            input_type.format.layout.order,
-            StorageOrder::Native(NativeKernelOrder::Output | NativeKernelOrder::TransposedLeft)
-        ) {
-            self.unpack_amp_to_row_major(
-                *input,
-                WorkProvenance {
-                    operation: operation.source,
-                    value: Some(*result),
-                    reason: WorkReason::OperatorKernel,
-                },
-                tiles,
-            )?
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?
-        } else {
-            self.value_shards(*input)?.to_vec()
-        };
-
-        let mappings =
-            self.split_head_mappings(&source_shards, &output_shards, options.heads, head_width)?;
-        self.lower_mapped_views(
-            mappings,
-            true,
-            ExchangeOrder::Semantic,
-            WorkProvenance {
-                operation: operation.source,
-                value: Some(*result),
-                reason: WorkReason::OperatorInputs,
-            },
-            tiles,
-        )
-    }
-
-    fn split_head_mappings(
-        &self,
-        source_shards: &[LowShardId],
-        output_shards: &[LowShardId],
-        heads: u32,
-        head_width: u32,
-    ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
-        let mut mappings = Vec::new();
-        for &output in output_shards {
-            let output_extents = self.shards[output.index() as usize].extents.clone();
-            let tile = self.shards[output.index() as usize].tile;
-            if output_extents.len() != 3 {
-                return Err(LowLoweringError::InvalidOperatorPlan);
-            }
-            // A legal layout may assign several complete attention streams to
-            // one tile. Split that allocation into per-stream views here: the
-            // batch/head reshape is semantic, but it does not require the
-            // ownership layout itself to shard the stream axis one-by-one.
-            for stream in output_extents[0].start..output_extents[0].logical_end {
-                let mut stream_extents = output_extents.clone();
-                stream_extents[0].start = stream;
-                stream_extents[0].logical_end = stream + 1;
-                stream_extents[0].physical_end = stream + 1;
-                let (target, column_base) =
-                    split_head_source_extents(&stream_extents, heads, head_width)?;
-                for (mut source_extents, source) in
-                    self.intersecting_shard_set(&source_shards, &target, tile)
-                {
-                    let mut destination_extents = vec![
-                        stream_extents[0],
-                        source_extents[1],
-                        ShardExtent {
-                            axis: 2,
-                            start: source_extents[2].start - column_base,
-                            logical_end: source_extents[2].logical_end - column_base,
-                            physical_end: source_extents[2].logical_end - column_base,
-                        },
-                    ];
-                    let source_shard = &self.shards[source.index() as usize];
-                    let complete_head = source_extents[2].start == column_base
-                        && source_extents[2].logical_end == column_base + head_width
-                        && source_shard.extents[2].start == column_base
-                        && source_shard.extents[2].logical_end == column_base + head_width;
-                    if complete_head {
-                        let source_padding = source_shard.extents[2]
-                            .physical_end
-                            .saturating_sub(source_extents[2].logical_end);
-                        let destination_padding = output_extents[2]
-                            .physical_end
-                            .saturating_sub(output_extents[2].logical_end);
-                        let padding = source_padding.min(destination_padding);
-                        source_extents[2].physical_end += padding;
-                        destination_extents[2].physical_end += padding;
-                    }
-                    let source_view = ShardView {
-                        shard: source,
-                        extents: source_extents.into(),
-                    };
-                    let destination_view = ShardView {
-                        shard: output,
-                        extents: destination_extents.into(),
-                    };
-                    mappings.push((source_view, destination_view));
-                }
-            }
-        }
-        Ok(mappings)
     }
 
     /// Splits corresponding views at each allocation's F16 micro-panel
@@ -2916,8 +2505,9 @@ impl LoweringState {
             self.intersecting_shard_set(&deferred_shards, &target, destination_tile)
         {
             let destination_extents = mapping
-                .destination_source_axes
+                .source_axes
                 .iter()
+                .flatten()
                 .enumerate()
                 .map(|(destination_axis, &source_axis)| {
                     let source = source_extents
@@ -5850,6 +5440,7 @@ fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> Wo
         reason: match kind {
             MidOperationKind::CastPrecision { .. } => WorkReason::PrecisionCast,
             MidOperationKind::Rearrange { .. } => WorkReason::LayoutRearrangement,
+            MidOperationKind::View(_) => WorkReason::LayoutRearrangement,
             MidOperationKind::Operator(_) => WorkReason::OperatorKernel,
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },
@@ -5916,49 +5507,6 @@ fn shard_extents(tensor_type: &TensorType) -> LowLoweringResult<Vec<(u16, Tensor
         .into_iter()
         .map(|shard| (shard.tile, shard.extents))
         .collect())
-}
-
-fn split_head_source_extents(
-    output: &[ShardExtent],
-    heads: u32,
-    head_width: u32,
-) -> LowLoweringResult<(Vec<ShardExtent>, u32)> {
-    if output.len() != 3
-        || heads == 0
-        || output[0].logical_end - output[0].start != 1
-        || output[2].logical_end > head_width
-    {
-        return Err(LowLoweringError::InvalidOperatorPlan);
-    }
-    let stream = output[0].start;
-    let batch = stream / heads;
-    let head = stream % heads;
-    let column_base = head
-        .checked_mul(head_width)
-        .ok_or(LowLoweringError::IdOverflow)?;
-    Ok((
-        vec![
-            ShardExtent {
-                axis: 0,
-                start: batch,
-                logical_end: batch + 1,
-                physical_end: batch + 1,
-            },
-            ShardExtent {
-                axis: 1,
-                start: output[1].start,
-                logical_end: output[1].logical_end,
-                physical_end: output[1].logical_end,
-            },
-            ShardExtent {
-                axis: 2,
-                start: column_base + output[2].start,
-                logical_end: column_base + output[2].logical_end,
-                physical_end: column_base + output[2].logical_end,
-            },
-        ],
-        column_base,
-    ))
 }
 
 fn split_mapping_at_panel_boundaries(
@@ -6912,58 +6460,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn randomized_split_head_mappings_are_bijective_rectangles() {
-        let mut random = fastrand::Rng::with_seed(0x6d61_7070_6564_5f68);
-        for _ in 0..CASES * 8 {
-            let batch = random.u32(1..=8);
-            let heads = random.u32(1..=32);
-            let rows = random.u32(1..=256);
-            let width = random.u32(1..=128);
-            let stream = random.u32(0..batch * heads);
-            let row_start = random.u32(0..rows);
-            let row_end = random.u32(row_start + 1..=rows);
-            let column_start = random.u32(0..width);
-            let column_end = random.u32(column_start + 1..=width);
-            let output = vec![
-                ShardExtent {
-                    axis: 0,
-                    start: stream,
-                    logical_end: stream + 1,
-                    physical_end: stream + 1,
-                },
-                ShardExtent {
-                    axis: 1,
-                    start: row_start,
-                    logical_end: row_end,
-                    physical_end: row_end,
-                },
-                ShardExtent {
-                    axis: 2,
-                    start: column_start,
-                    logical_end: column_end,
-                    physical_end: column_end,
-                },
-            ];
-            let (source, base) = split_head_source_extents(&output, heads, width).unwrap();
-
-            assert_eq!(source[0].start, stream / heads);
-            assert_eq!(source[1], output[1]);
-            assert_eq!(source[2].start, base + column_start);
-            assert_eq!(source[2].logical_end, base + column_end);
-            assert_eq!(
-                source
-                    .iter()
-                    .map(|extent| extent.logical_end - extent.start)
-                    .product::<u32>(),
-                output
-                    .iter()
-                    .map(|extent| extent.logical_end - extent.start)
-                    .product::<u32>()
-            );
         }
     }
 

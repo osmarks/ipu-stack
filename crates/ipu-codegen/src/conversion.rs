@@ -3,6 +3,7 @@
 use crate::graph::TensorShape;
 use crate::layout::{
     AMP_COLUMN_MICRO, Layout, LayoutError, NativeKernelOrder, StorageOrder, TensorRegion,
+    TensorType,
 };
 use crate::operator::{OperandRequirement, Precision, TileKernelSpec};
 use crate::storage::{StorageError, amp_micro_dimension, physical_byte_offset};
@@ -124,13 +125,137 @@ pub struct ConversionMapping {
     pub destination_shard: u32,
     pub destination_tile: u16,
     pub destination_storage: TensorRegion,
-    pub region: TensorRegion,
+    pub source_region: TensorRegion,
+    pub destination_region: TensorRegion,
     /// Local copies from the source layout into word-aligned transfer staging.
     pub source_copies: Vec<CopyGeometry>,
     pub copies: Vec<CopyGeometry>,
     /// Local copies from word-aligned transfer staging into the planned
     /// destination storage.
     pub destination_copies: Vec<CopyGeometry>,
+}
+
+/// A logical view whose physical materialization may be deferred until a
+/// consumer requests bounded slices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeferredTransform {
+    /// Split the final input axis into `parts` equal-width slices and fold the
+    /// new part axis into the leading output axis.
+    SplitLastAxisIntoLeading { parts: u32 },
+}
+
+impl DeferredTransform {
+    pub fn map_slices(
+        self,
+        source_shape: &TensorShape,
+        output_shape: &TensorShape,
+        output: &TensorRegion,
+    ) -> Option<Vec<DeferredSliceMapping>> {
+        let streams = output.extents.first()?;
+        (streams.start..streams.logical_end)
+            .map(|stream| {
+                let mut slice = output.clone();
+                slice.extents[0].start = stream;
+                slice.extents[0].logical_end = stream.checked_add(1)?;
+                slice.extents[0].physical_end = stream.checked_add(1)?;
+                self.map_slice(source_shape, output_shape, &slice)
+            })
+            .collect()
+    }
+
+    pub(crate) fn map_slice(
+        self,
+        source_shape: &TensorShape,
+        output_shape: &TensorShape,
+        output: &TensorRegion,
+    ) -> Option<DeferredSliceMapping> {
+        let Self::SplitLastAxisIntoLeading { parts } = self;
+        let [source_batch, source_rows, source_columns] = source_shape.0.as_slice() else {
+            return None;
+        };
+        let [output_streams, output_rows, output_columns] = output_shape.0.as_slice() else {
+            return None;
+        };
+        let [stream, rows, columns] = output.extents.as_slice() else {
+            return None;
+        };
+        if parts == 0
+            || stream.axis != 0
+            || rows.axis != 1
+            || columns.axis != 2
+            || stream.logical_end != stream.start.checked_add(1)?
+            || *output_streams != source_batch.checked_mul(parts)?
+            || output_rows != source_rows
+            || source_columns != &output_columns.checked_mul(parts)?
+            || stream.logical_end > *output_streams
+            || rows.logical_end > *output_rows
+            || columns.logical_end > *output_columns
+        {
+            return None;
+        }
+        let batch = stream.start / parts;
+        let column_base = (stream.start % parts).checked_mul(*output_columns)?;
+        Some(DeferredSliceMapping {
+            source: TensorRegion::new([
+                crate::ShardExtent {
+                    axis: 0,
+                    start: batch,
+                    logical_end: batch.checked_add(1)?,
+                    physical_end: batch.checked_add(1)?,
+                },
+                *rows,
+                crate::ShardExtent {
+                    axis: 2,
+                    start: column_base.checked_add(columns.start)?,
+                    logical_end: column_base.checked_add(columns.logical_end)?,
+                    physical_end: column_base.checked_add(columns.logical_end)?,
+                },
+            ]),
+            destination: output.clone(),
+            source_axes: vec![None, Some(1), Some(2)],
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredSliceMapping {
+    pub source: TensorRegion,
+    pub destination: TensorRegion,
+    /// Source axis corresponding to each destination axis. `None` selects a
+    /// fixed source coordinate.
+    pub source_axes: Vec<Option<usize>>,
+}
+
+impl DeferredSliceMapping {
+    pub fn project_source(&self, source: &TensorRegion) -> Option<TensorRegion> {
+        if source.len() != self.source.len() || self.source_axes.len() != self.destination.len() {
+            return None;
+        }
+        self.source_axes
+            .iter()
+            .zip(self.destination.iter())
+            .enumerate()
+            .map(|(axis, (source_axis, destination))| {
+                let Some(source_axis) = source_axis else {
+                    return Some(*destination);
+                };
+                let selected = source.get(*source_axis)?;
+                let base = self.source.get(*source_axis)?.start;
+                Some(crate::ShardExtent {
+                    axis: u16::try_from(axis).ok()?,
+                    start: destination
+                        .start
+                        .checked_add(selected.start.checked_sub(base)?)?,
+                    logical_end: destination
+                        .start
+                        .checked_add(selected.logical_end.checked_sub(base)?)?,
+                    physical_end: destination
+                        .start
+                        .checked_add(selected.logical_end.checked_sub(base)?)?,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -192,94 +317,190 @@ pub(crate) fn plan_conversion(
             } else {
                 destination.extents.clone()
             };
-            let (source_order, destination_order, logical_order) = match strategy {
-                ConversionStrategy::DirectRetile if from.order == to.order => {
-                    (from.order, to.order, false)
-                }
-                ConversionStrategy::DirectLogical => (from.order, to.order, true),
-                ConversionStrategy::StageLogicalThenTransform => (
-                    from.order,
-                    StorageOrder::Linear,
-                    from.order != StorageOrder::Linear,
-                ),
-                ConversionStrategy::DirectRetile | ConversionStrategy::LocalKernel => {
-                    return Err(ConversionGeometryError::Unsupported);
-                }
-            };
-            let direct = copy_geometries(
+            mappings.push(plan_mapping(
                 precision,
-                source_order,
-                destination_order,
-                &source.extents,
-                &destination_storage,
-                &region,
-                source.tile == destination.tile,
-                logical_order,
-            );
-            let (source_copies, copies, destination_copies) = match direct {
-                Ok(copies) => (Vec::new(), copies, Vec::new()),
-                Err(ConversionGeometryError::Unsupported) => {
-                    let logical_storage = region.logical();
-                    let source_copies = copy_geometries(
-                        precision,
-                        source_order,
-                        StorageOrder::Linear,
-                        &source.extents,
-                        &logical_storage,
-                        &region,
-                        true,
-                        source_order != StorageOrder::Linear,
-                    )?;
-                    let destination_copies = copy_geometries(
-                        precision,
-                        StorageOrder::Linear,
-                        destination_order,
-                        &logical_storage,
-                        &destination_storage,
-                        &region,
-                        true,
-                        destination_order != StorageOrder::Linear,
-                    )?;
-                    let bytes = region
-                        .iter()
-                        .try_fold(precision.bytes() as u32, |bytes, extent| {
-                            bytes.checked_mul(extent.logical_end - extent.start)
-                        })
-                        .ok_or(ConversionGeometryError::Overflow)?;
-                    let padded_bytes = bytes.div_ceil(4) * 4;
-                    (
-                        source_copies,
-                        vec![CopyGeometry {
-                            source_offset: 0,
-                            destination_offset: 0,
-                            contiguous_bytes: padded_bytes,
-                            dimensions: Vec::new(),
-                        }],
-                        destination_copies,
-                    )
-                }
-                Err(error) => return Err(error),
-            };
-            mappings.push(ConversionMapping {
-                source_shard: u32::try_from(source_index)
-                    .map_err(|_| ConversionGeometryError::Overflow)?,
-                source_tile: source.tile,
-                source_storage: source.extents.clone(),
-                destination_shard: u32::try_from(destination_index)
-                    .map_err(|_| ConversionGeometryError::Overflow)?,
-                destination_tile: destination.tile,
-                destination_storage,
-                region,
-                source_copies,
-                copies,
-                destination_copies,
-            });
+                from.order,
+                to.order,
+                strategy,
+                ConversionMapping {
+                    source_shard: u32::try_from(source_index)
+                        .map_err(|_| ConversionGeometryError::Overflow)?,
+                    source_tile: source.tile,
+                    source_storage: source.extents.clone(),
+                    destination_shard: u32::try_from(destination_index)
+                        .map_err(|_| ConversionGeometryError::Overflow)?,
+                    destination_tile: destination.tile,
+                    destination_storage,
+                    source_region: region.clone(),
+                    destination_region: region,
+                    source_copies: Vec::new(),
+                    copies: Vec::new(),
+                    destination_copies: Vec::new(),
+                },
+            )?);
         }
     }
     if mappings.is_empty() {
         return Err(ConversionGeometryError::Unsupported);
     }
     Ok(mappings)
+}
+
+pub(crate) fn plan_view_conversion(
+    source: &TensorType,
+    destination: &TensorType,
+    transform: DeferredTransform,
+) -> Result<(ConversionStrategy, Vec<ConversionMapping>), ConversionGeometryError> {
+    let strategy = layout_conversion_strategy(
+        source.format.precision,
+        &source.format.layout,
+        &destination.format.layout,
+    );
+    let sources = source.format.layout.resolve(&source.shape)?.shard_extents();
+    let destinations = destination
+        .format
+        .layout
+        .resolve(&destination.shape)?
+        .shard_extents();
+    let mut mappings = Vec::new();
+    for (destination_index, output) in destinations.into_iter().enumerate() {
+        let destination_storage = if strategy == ConversionStrategy::StageLogicalThenTransform {
+            output.extents.logical()
+        } else {
+            output.extents.clone()
+        };
+        for view in transform
+            .map_slices(&source.shape, &destination.shape, &output.extents.logical())
+            .ok_or(ConversionGeometryError::Unsupported)?
+        {
+            let mut intersections = BTreeMap::<TensorRegion, _>::new();
+            for (source_index, input) in sources.iter().enumerate() {
+                let Some(region) = input.extents.logical().intersection(&view.source) else {
+                    continue;
+                };
+                let selected = intersections.entry(region).or_insert((source_index, input));
+                if input.tile == output.tile {
+                    *selected = (source_index, input);
+                }
+            }
+            for (source_region, (source_index, input)) in intersections {
+                let destination_region = view
+                    .project_source(&source_region)
+                    .ok_or(ConversionGeometryError::Unsupported)?;
+                mappings.push(plan_mapping(
+                    source.format.precision,
+                    source.format.layout.order,
+                    destination.format.layout.order,
+                    strategy,
+                    ConversionMapping {
+                        source_shard: u32::try_from(source_index)
+                            .map_err(|_| ConversionGeometryError::Overflow)?,
+                        source_tile: input.tile,
+                        source_storage: input.extents.clone(),
+                        destination_shard: u32::try_from(destination_index)
+                            .map_err(|_| ConversionGeometryError::Overflow)?,
+                        destination_tile: output.tile,
+                        destination_storage: destination_storage.clone(),
+                        source_region,
+                        destination_region,
+                        source_copies: Vec::new(),
+                        copies: Vec::new(),
+                        destination_copies: Vec::new(),
+                    },
+                )?);
+            }
+        }
+    }
+    if mappings.is_empty() {
+        return Err(ConversionGeometryError::Unsupported);
+    }
+    Ok((strategy, mappings))
+}
+
+fn plan_mapping(
+    precision: Precision,
+    from: StorageOrder,
+    to: StorageOrder,
+    strategy: ConversionStrategy,
+    mut mapping: ConversionMapping,
+) -> Result<ConversionMapping, ConversionGeometryError> {
+    let (source_order, destination_order, logical_order) = match strategy {
+        ConversionStrategy::DirectRetile if from == to => (from, to, false),
+        ConversionStrategy::DirectLogical => (from, to, true),
+        ConversionStrategy::StageLogicalThenTransform => {
+            (from, StorageOrder::Linear, from != StorageOrder::Linear)
+        }
+        ConversionStrategy::DirectRetile | ConversionStrategy::LocalKernel => {
+            return Err(ConversionGeometryError::Unsupported);
+        }
+    };
+    let direct = copy_geometries_between(
+        precision,
+        (
+            source_order,
+            &mapping.source_storage,
+            &mapping.source_region,
+        ),
+        (
+            destination_order,
+            &mapping.destination_storage,
+            &mapping.destination_region,
+        ),
+        mapping.source_tile == mapping.destination_tile,
+        logical_order,
+    );
+    let (source_copies, copies, destination_copies) = match direct {
+        Ok(copies) => (Vec::new(), copies, Vec::new()),
+        Err(ConversionGeometryError::Unsupported) => {
+            let logical_storage = mapping.destination_region.logical();
+            let source_copies = copy_geometries_between(
+                precision,
+                (
+                    source_order,
+                    &mapping.source_storage,
+                    &mapping.source_region,
+                ),
+                (
+                    StorageOrder::Linear,
+                    &logical_storage,
+                    &mapping.destination_region,
+                ),
+                true,
+                source_order != StorageOrder::Linear,
+            )?;
+            let destination_copies = copy_geometries(
+                precision,
+                StorageOrder::Linear,
+                destination_order,
+                &logical_storage,
+                &mapping.destination_storage,
+                &mapping.destination_region,
+                true,
+                destination_order != StorageOrder::Linear,
+            )?;
+            let bytes = mapping
+                .source_region
+                .logical_elements()
+                .checked_mul(precision.bytes())
+                .and_then(|bytes| u32::try_from(bytes).ok())
+                .ok_or(ConversionGeometryError::Overflow)?;
+            (
+                source_copies,
+                vec![CopyGeometry {
+                    source_offset: 0,
+                    destination_offset: 0,
+                    contiguous_bytes: bytes.div_ceil(4) * 4,
+                    dimensions: Vec::new(),
+                }],
+                destination_copies,
+            )
+        }
+        Err(error) => return Err(error),
+    };
+    mapping.source_copies = source_copies;
+    mapping.copies = copies;
+    mapping.destination_copies = destination_copies;
+    Ok(mapping)
 }
 
 fn copy_geometries(
@@ -340,6 +561,83 @@ fn copy_geometries(
         }
     }
     Ok(geometries)
+}
+
+fn copy_geometries_between(
+    precision: Precision,
+    source: (StorageOrder, &TensorRegion, &TensorRegion),
+    destination: (StorageOrder, &TensorRegion, &TensorRegion),
+    local: bool,
+    logical_order: bool,
+) -> Result<Vec<CopyGeometry>, ConversionGeometryError> {
+    let (source_order, source_storage, source_region) = source;
+    let (destination_order, destination_storage, destination_region) = destination;
+    if source_storage.len() != destination_storage.len()
+        || source_storage.len() != source_region.len()
+        || source_region.len() != destination_region.len()
+    {
+        return Err(ConversionGeometryError::Unsupported);
+    }
+    let mut normalized_source = Vec::with_capacity(source_region.len());
+    let mut normalized_destination = Vec::with_capacity(source_region.len());
+    let mut normalized_region = Vec::with_capacity(source_region.len());
+    for (axis, (((source_storage, destination_storage), source), destination)) in source_storage
+        .iter()
+        .zip(destination_storage.iter())
+        .zip(source_region.iter())
+        .zip(destination_region.iter())
+        .enumerate()
+    {
+        let source_width = source.logical_end - source.start;
+        if source_width != destination.logical_end - destination.start
+            || source.start < source_storage.start
+            || destination.start < destination_storage.start
+        {
+            return Err(ConversionGeometryError::Unsupported);
+        }
+        let source_delta = source.start - source_storage.start;
+        let destination_delta = destination.start - destination_storage.start;
+        let common_start = source_delta.max(destination_delta);
+        let source_start = common_start - source_delta;
+        let destination_start = common_start - destination_delta;
+        let axis = u16::try_from(axis).map_err(|_| ConversionGeometryError::Overflow)?;
+        let extent = |start: u32,
+                      storage: &crate::ShardExtent|
+         -> Result<crate::ShardExtent, ConversionGeometryError> {
+            Ok(crate::ShardExtent {
+                axis,
+                start,
+                logical_end: start
+                    .checked_add(storage.logical_end - storage.start)
+                    .ok_or(ConversionGeometryError::Overflow)?,
+                physical_end: start
+                    .checked_add(storage.physical_end - storage.start)
+                    .ok_or(ConversionGeometryError::Overflow)?,
+            })
+        };
+        normalized_source.push(extent(source_start, source_storage)?);
+        normalized_destination.push(extent(destination_start, destination_storage)?);
+        normalized_region.push(crate::ShardExtent {
+            axis,
+            start: common_start,
+            logical_end: common_start
+                .checked_add(source_width)
+                .ok_or(ConversionGeometryError::Overflow)?,
+            physical_end: common_start
+                .checked_add(source_width)
+                .ok_or(ConversionGeometryError::Overflow)?,
+        });
+    }
+    copy_geometries(
+        precision,
+        source_order,
+        destination_order,
+        &normalized_source.into(),
+        &normalized_destination.into(),
+        &normalized_region.into(),
+        local,
+        logical_order,
+    )
 }
 
 fn affine_geometries(
@@ -739,17 +1037,46 @@ mod tests {
                 StorageOrder::Native(NativeKernelOrder::Output),
                 StorageOrder::Native(NativeKernelOrder::TransposedOutput),
             ];
-            let storage = shape
+            let source_starts = shape
                 .iter()
-                .enumerate()
-                .map(|(axis, &end)| ShardExtent {
-                    axis: axis as u16,
-                    start: 0,
-                    logical_end: end,
-                    physical_end: end,
-                })
-                .collect::<Vec<_>>()
-                .into();
+                .map(|_| 16 * random.u32(0..=1))
+                .collect::<Vec<_>>();
+            let destination_starts = shape
+                .iter()
+                .map(|_| 16 * random.u32(0..=1))
+                .collect::<Vec<_>>();
+            let mut storage = |starts: &[u32]| {
+                shape
+                    .iter()
+                    .zip(starts)
+                    .enumerate()
+                    .map(|(axis, (&width, &start))| ShardExtent {
+                        axis: axis as u16,
+                        start: 0,
+                        logical_end: start + width + 16 * random.u32(0..=1),
+                        physical_end: start + width + 16,
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            };
+            let region = |starts: &[u32]| {
+                shape
+                    .iter()
+                    .zip(starts)
+                    .enumerate()
+                    .map(|(axis, (&width, &start))| ShardExtent {
+                        axis: axis as u16,
+                        start,
+                        logical_end: start + width,
+                        physical_end: start + width,
+                    })
+                    .collect::<Vec<_>>()
+                    .into()
+            };
+            let source_storage = storage(&source_starts);
+            let destination_storage = storage(&destination_starts);
+            let source_region = region(&source_starts);
+            let destination_region = region(&destination_starts);
             let precision = if random.bool() {
                 Precision::F16
             } else {
@@ -757,13 +1084,10 @@ mod tests {
             };
             let source_order = orders[random.usize(..orders.len())];
             let destination_order = orders[random.usize(..orders.len())];
-            let geometries = copy_geometries(
+            let geometries = copy_geometries_between(
                 precision,
-                source_order,
-                destination_order,
-                &storage,
-                &storage,
-                &storage,
+                (source_order, &source_storage, &source_region),
+                (destination_order, &destination_storage, &destination_region),
                 true,
                 true,
             )
@@ -785,11 +1109,30 @@ mod tests {
             }
             let mut coordinates = vec![0; rank];
             loop {
-                let source =
-                    physical_byte_offset(source_order, precision, &storage, &coordinates).unwrap();
-                let destination =
-                    physical_byte_offset(destination_order, precision, &storage, &coordinates)
-                        .unwrap();
+                let source_coordinates = coordinates
+                    .iter()
+                    .zip(&source_starts)
+                    .map(|(coordinate, start)| coordinate + start)
+                    .collect::<Vec<_>>();
+                let destination_coordinates = coordinates
+                    .iter()
+                    .zip(&destination_starts)
+                    .map(|(coordinate, start)| coordinate + start)
+                    .collect::<Vec<_>>();
+                let source = physical_byte_offset(
+                    source_order,
+                    precision,
+                    &source_storage,
+                    &source_coordinates,
+                )
+                .unwrap();
+                let destination = physical_byte_offset(
+                    destination_order,
+                    precision,
+                    &destination_storage,
+                    &destination_coordinates,
+                )
+                .unwrap();
                 assert_eq!(
                     copied.remove(&source),
                     Some(destination),

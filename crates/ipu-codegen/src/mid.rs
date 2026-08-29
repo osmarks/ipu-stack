@@ -12,7 +12,8 @@ use crate::config::{
     PlannerSearchDomain,
 };
 use crate::conversion::{
-    ConversionPlan, ConversionStrategy, layout_conversion_strategy, plan_conversion,
+    ConversionPlan, ConversionStrategy, DeferredTransform, layout_conversion_strategy,
+    plan_conversion, plan_view_conversion,
 };
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
@@ -252,7 +253,6 @@ fn amp_gemm_plan(
             memory_space: MemorySpaceRequirements::default()
                 .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
         },
-        None,
     )
 }
 
@@ -344,7 +344,6 @@ fn amp_grid_gemm_plan(
             memory_space: MemorySpaceRequirements::default()
                 .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
         },
-        None,
     )
 }
 
@@ -696,21 +695,8 @@ struct FutureValueState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct FutureDeferredState {
-    origin: ValueId,
-    source_type: TensorType,
-    source_automatic_input: bool,
-    source_parameter: bool,
-    source_storage_class: u32,
-    transform: DeferredTransform,
-    unfused_cost: CostEstimate,
-    claimed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FutureBeamState {
     values: Vec<FutureValueState>,
-    deferred: Vec<FutureDeferredState>,
     equal_formats_satisfied: Vec<(ValueId, ValueId, bool)>,
 }
 
@@ -723,18 +709,11 @@ struct RankedBeamBranch {
 
 type FutureFormatCompatibility = Vec<(
     ValueId,
-    FutureFormatRole,
     Precision,
     StorageOrderCompatibility,
     MemoryClass,
     Vec<(TensorAxis, u16, u32)>,
 )>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum FutureFormatRole {
-    Value,
-    DeferredSource,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum StorageOrderCompatibility {
@@ -766,7 +745,7 @@ fn future_format_compatibility(
         let Some(&id) = branch.values.get(&origin) else {
             continue;
         };
-        let mut add = |role, format: &TensorFormat| {
+        let mut add = |format: &TensorFormat| {
             let axes = format
                 .layout
                 .tiling
@@ -776,32 +755,13 @@ fn future_format_compatibility(
                 .collect();
             formats.push((
                 origin,
-                role,
                 format.precision,
                 storage_order_compatibility(format.layout.order),
                 format.layout.memory_class,
                 axes,
             ));
         };
-        add(
-            FutureFormatRole::Value,
-            &branch.state.get(id).tensor_type.format,
-        );
-        let deferred_source = branch
-            .operations
-            .iter()
-            .rev()
-            .find(|operation| operation.results.first() == Some(&id))
-            .and_then(|operation| {
-                let offer = operation.operator_plan()?.deferred_output?;
-                operation.inputs.get(offer.source_input).copied()
-            });
-        if let Some(source) = deferred_source {
-            add(
-                FutureFormatRole::DeferredSource,
-                &branch.state.get(source).tensor_type.format,
-            );
-        }
+        add(&branch.state.get(id).tensor_type.format);
     }
     formats
 }
@@ -983,6 +943,90 @@ fn plan_region_frontier(
                 &output_shape,
                 config,
             );
+            if matches!(operation.kind, OperationKind::SplitHeads(_)) {
+                let [source_value] = input_ids.as_slice() else {
+                    continue;
+                };
+                let Some(&rows) = output_shape.0.get(1) else {
+                    continue;
+                };
+                let Ok(streams) = u16::try_from(output_shape.0[0]) else {
+                    continue;
+                };
+                if streams == 0 {
+                    continue;
+                }
+                let query_partitions = rows.min(u32::from(config.tile_count / streams));
+                let key_partitions = rows
+                    .div_ceil(AMP_INNER_BLOCK)
+                    .min(u32::from(config.tile_count / streams));
+                let layouts = if direct_consumer_layouts.is_empty() {
+                    [
+                        (query_partitions != 0).then(|| {
+                            Layout::attention_query(
+                                streams,
+                                u16::try_from(query_partitions).unwrap_or(u16::MAX),
+                            )
+                        }),
+                        (key_partitions != 0).then(|| {
+                            Layout::attention_key(
+                                streams,
+                                u16::try_from(key_partitions).unwrap_or(u16::MAX),
+                            )
+                        }),
+                        (key_partitions != 0).then(|| {
+                            Layout::attention_block_major_key_value(
+                                streams,
+                                u16::try_from(key_partitions).unwrap_or(u16::MAX),
+                            )
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                } else {
+                    direct_consumer_layouts
+                };
+                saw_legal_plan |= !layouts.is_empty();
+                let evaluated = layouts
+                    .into_par_iter()
+                    .filter_map(|layout| {
+                        let mut next = branch.clone();
+                        apply_selected_view(
+                            operation,
+                            output_shape.clone(),
+                            layout,
+                            *source_value,
+                            costs,
+                            &mut next,
+                        )?;
+                        let peak = beam_memory_peak(
+                            &next,
+                            &initial,
+                            source,
+                            operation_index,
+                            required_outputs,
+                            graph,
+                            &constraints.allocation_copies,
+                            config.target,
+                        );
+                        Some((next, peak))
+                    })
+                    .collect::<Vec<_>>();
+                for (mut next, peak) in evaluated {
+                    if peak.fits_with_budget(
+                        config.target.memory_constraints(),
+                        config.standard_memory_reservation_bytes,
+                        config.tile_memory_budget_bytes,
+                    ) {
+                        next.peak_memory = peak;
+                        expanded.push(next);
+                    } else {
+                        rejected_memory.push(peak);
+                    }
+                }
+                continue;
+            }
             let parameter_inputs = input_ids
                 .iter()
                 .map(|id| branch.state.parameter_values.contains(id))
@@ -1016,7 +1060,6 @@ fn plan_region_frontier(
                     costs,
                     distributed_result_is_useful,
                     grouped_output,
-                    &direct_consumer_layouts,
                 );
                 plan_cache.entry(cache_key).or_insert(generated)
             };
@@ -1174,7 +1217,7 @@ fn plan_region_frontier(
             pareto_dominated = dominated,
             equivalent,
             diversity_representatives = diversity,
-            best_cycles = deferred_aware_branch_score(&expanded[0], &future_origins),
+            best_cycles = branch_cycles(&expanded[0]),
             generated_plan_sets,
             plan_cache_hits,
             "retained planning beam"
@@ -1208,7 +1251,7 @@ fn plan_region_frontier(
         .collect::<Vec<_>>();
     let mut beam = beam;
     beam.sort_by_key(|branch| {
-        deferred_aware_branch_score(branch, &BTreeSet::new()).saturating_add(format_equality_cost(
+        branch_cycles(branch).saturating_add(format_equality_cost(
             branch,
             &constraints.required_equal_formats,
             costs,
@@ -1216,9 +1259,6 @@ fn plan_region_frontier(
     });
     if beam.is_empty() {
         return Err(LoweringError::NoCandidate(source[0].id));
-    }
-    for branch in &mut beam {
-        restore_unclaimed_deferred_costs(&mut branch.operations);
     }
     Ok(beam)
 }
@@ -1276,9 +1316,11 @@ fn retain_pareto_beam(
         let signature = future_beam_state(&branch, future_origins, constraints);
         let objective = RegionMetrics {
             cost: CostEstimate {
-                cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
-                    format_equality_cost(&branch, &constraints.required_equal_formats, costs),
-                ),
+                cycles: branch_cycles(&branch).saturating_add(format_equality_cost(
+                    &branch,
+                    &constraints.required_equal_formats,
+                    costs,
+                )),
                 ..CostEstimate::default()
             },
             memory: branch.peak_memory,
@@ -1378,7 +1420,7 @@ fn retain_pareto_beam(
         .filter_map(|(index, entry)| selected.contains(&index).then_some(entry.branch))
         .collect::<Vec<_>>();
     retained.sort_by_cached_key(|branch| {
-        deferred_aware_branch_score(branch, future_origins).saturating_add(format_equality_cost(
+        branch_cycles(branch).saturating_add(format_equality_cost(
             branch,
             &constraints.required_equal_formats,
             costs,
@@ -1392,7 +1434,6 @@ fn future_beam_state(
     future_origins: &BTreeSet<ValueId>,
     constraints: &RegionPlanningConstraints,
 ) -> FutureBeamState {
-    let claims = deferred_claims(&branch.operations);
     let mut storage_classes = BTreeMap::<MidValueId, u32>::new();
     let mut next_storage_class = 0u32;
     let mut storage_class = |id: MidValueId| {
@@ -1404,7 +1445,6 @@ fn future_beam_state(
         })
     };
     let mut values = Vec::new();
-    let mut deferred_sources = Vec::new();
     for &origin in future_origins {
         let Some(&id) = branch.values.get(&origin) else {
             continue;
@@ -1421,36 +1461,7 @@ fn future_beam_state(
                 .unwrap_or(1),
             storage_class: storage_class(id),
         });
-        let offer =
-            branch.operations.iter().rev().find_map(|operation| {
-                (operation.results.first() == Some(&id)).then_some(operation)
-            });
-        let Some((operation, offer)) = offer.and_then(|operation| {
-            operation
-                .operator_plan()
-                .and_then(|plan| plan.deferred_output)
-                .map(|offer| (operation, offer))
-        }) else {
-            continue;
-        };
-        let Some(&source) = operation.inputs.get(offer.source_input) else {
-            continue;
-        };
-        deferred_sources.push((origin, id, source, offer));
     }
-    let deferred = deferred_sources
-        .into_iter()
-        .map(|(origin, result, source, offer)| FutureDeferredState {
-            origin,
-            source_type: branch.state.get(source).tensor_type.clone(),
-            source_automatic_input: branch.state.automatic_inputs.contains(&source),
-            source_parameter: branch.state.parameter_values.contains(&source),
-            source_storage_class: storage_class(source),
-            transform: offer.transform,
-            unfused_cost: offer.unfused_cost,
-            claimed: claims.contains(&result),
-        })
-        .collect();
     let equal_formats_satisfied = constraints
         .required_equal_formats
         .iter()
@@ -1468,59 +1479,16 @@ fn future_beam_state(
         .collect();
     FutureBeamState {
         values,
-        deferred,
         equal_formats_satisfied,
     }
 }
 
-fn deferred_claims(operations: &[MidOperation]) -> BTreeSet<MidValueId> {
-    operations
+fn branch_cycles(branch: &BeamBranch) -> u64 {
+    branch
+        .operations
         .iter()
-        .filter_map(|operation| operation.operator_plan())
-        .flat_map(|plan| plan.deferred_inputs.iter().flatten())
-        .map(|input| input.producer)
-        .collect()
-}
-
-fn deferred_aware_branch_score(
-    branch: &BeamBranch,
-    possible_future_consumers: &BTreeSet<ValueId>,
-) -> u64 {
-    let claims = deferred_claims(&branch.operations);
-    branch.operations.iter().fold(0u64, |cycles, operation| {
-        let pending = operation
-            .operator_plan()
-            .and_then(|plan| plan.deferred_output)
-            .filter(|_| {
-                operation.results.first().is_some_and(|result| {
-                    !claims.contains(result)
-                        && !possible_future_consumers.contains(&branch.state.get(*result).origin)
-                })
-            })
-            .map_or(0, |offer| offer.unfused_cost.cycles);
-        cycles
-            .saturating_add(operation.metrics.cost.cycles)
-            .saturating_add(pending)
-    })
-}
-
-fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
-    let claims = deferred_claims(operations);
-    for operation in operations {
-        let Some(offer) = operation
-            .operator_plan()
-            .and_then(|plan| plan.deferred_output)
-        else {
-            continue;
-        };
-        if operation
-            .results
-            .first()
-            .is_some_and(|result| !claims.contains(result))
-        {
-            operation.metrics.cost = offer.unfused_cost;
-        }
-    }
+        .map(|operation| operation.metrics.cost.cycles)
+        .sum()
 }
 
 fn format_equality_cost(
@@ -1669,18 +1637,16 @@ fn apply_selected_plan(
         else {
             continue;
         };
-        let Some(offered) = operations[producer_index]
-            .operator_plan()
-            .and_then(|producer| producer.deferred_output)
-        else {
-            continue;
+        let (source, transform, producer_cycles) = match &operations[producer_index].kind {
+            MidOperationKind::View(transform) => (
+                operations[producer_index].inputs[0],
+                *transform,
+                operations[producer_index].metrics.cost.cycles,
+            ),
+            _ => continue,
         };
-        let Some(&source) = operations[producer_index].inputs.get(offered.source_input) else {
-            continue;
-        };
-        let producer_cycles = offered.unfused_cost.cycles;
         let fused_cycles = costs.deferred_input_cycles(
-            offered.transform,
+            transform,
             &state.get(source).tensor_type,
             &state.get(original).tensor_type,
             &converted_types[input_index],
@@ -1690,7 +1656,7 @@ fn apply_selected_plan(
         operator_cycles = operator_cycles.saturating_add(fused_cycles);
         operator_exchange_cycles =
             operator_exchange_cycles.saturating_add(costs.deferred_input_exchange_cycles(
-                offered.transform,
+                transform,
                 &state.get(source).tensor_type,
                 &state.get(original).tensor_type,
                 &converted_types[input_index],
@@ -1700,8 +1666,9 @@ fn apply_selected_plan(
         deferred_inputs[input_index] = Some(DeferredInputPlan {
             producer: original,
             source,
-            transform: offered.transform,
+            transform,
         });
+        operations[producer_index].metrics.cost = CostEstimate::default();
     }
     tracing::trace!(
         source = operation.id.index(),
@@ -1727,17 +1694,6 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
-    let mut deferred_output = plan.deferred_output;
-    if let Some(offer) = &mut deferred_output {
-        offer.unfused_cost = CostEstimate {
-            cycles: operator_cycles,
-            exchange_cycles: operator_exchange_cycles,
-            exchange_footprint: exchange,
-        };
-        operator_cycles = 0;
-        operator_exchange_cycles = 0;
-    }
-    plan.deferred_output = deferred_output;
     plan.deferred_inputs = deferred_inputs;
     operations.push(MidOperation {
         source: Some(operation.id),
@@ -1755,6 +1711,66 @@ fn apply_selected_plan(
         },
     });
     values.insert(operation.results[0], result);
+}
+
+fn apply_selected_view(
+    operation: &Operation,
+    output_shape: TensorShape,
+    output_layout: Layout,
+    source: MidValueId,
+    costs: &impl CostModel,
+    branch: &mut BeamBranch,
+) -> Option<()> {
+    let transform = match operation.kind {
+        OperationKind::SplitHeads(options) => DeferredTransform::SplitLastAxisIntoLeading {
+            parts: options.heads,
+        },
+        _ => return None,
+    };
+    let source_type = &branch.state.get(source).tensor_type;
+    let output_type = TensorType {
+        shape: output_shape,
+        format: TensorFormat {
+            precision: source_type.format.precision,
+            layout: output_layout,
+        },
+    };
+    let (strategy, mappings) = plan_view_conversion(source_type, &output_type, transform).ok()?;
+    let cost = costs.rearrangement_cost(
+        &output_type.shape,
+        output_type.format.precision,
+        strategy,
+        &source_type.format.layout,
+        &output_type.format.layout,
+        &mappings,
+    );
+    let memory = conversion_memory_estimate(source_type, &output_type, strategy, &mappings);
+    let input = OperandRequirement::new(source_type.format.clone(), 8);
+    let output = OperandRequirement::new(output_type.format.clone(), 8)
+        .with_materialization(OperandMaterialization::DispatchSlices);
+    let kernel = TileKernelSpec::Rearrange {
+        from: source_type.format.layout.clone(),
+        to: output_type.format.layout.clone(),
+    };
+    let result = branch
+        .state
+        .value(operation.results[0], output_type.clone());
+    branch.operations.push(MidOperation {
+        source: Some(operation.id),
+        inputs: vec![source],
+        results: vec![result],
+        kind: MidOperationKind::View(transform),
+        conversion_plan: Some(ConversionPlan {
+            kernel,
+            input,
+            output,
+            strategy,
+            mappings,
+        }),
+        metrics: OperationMetrics { cost, memory },
+    });
+    branch.values.insert(operation.results[0], result);
+    Some(())
 }
 
 fn beam_memory_peak(
@@ -1962,7 +1978,6 @@ fn plans_for_operation(
     costs: &impl CostModel,
     distributed_result_is_useful: bool,
     grouped_output: Option<GroupedOutputLayout>,
-    direct_consumer_layouts: &[Layout],
 ) -> Vec<OperatorPlan> {
     let mut plans = Vec::new();
     let gemm_constraint = config
@@ -1970,59 +1985,6 @@ fn plans_for_operation(
         .gemm_plan_constraints
         .iter()
         .find(|constraint| constraint.source_operation == operation.id.index());
-    if let OperationKind::SplitHeads(options) = operation.kind
-        && let [input] = inputs
-        && output.0.len() == 3
-        && let (Ok(streams), Ok(rows)) = (u16::try_from(output.0[0]), u16::try_from(output.0[1]))
-        && streams != 0
-    {
-        let query_partitions = rows.min(config.tile_count / streams);
-        let key_partitions = u16::try_from(output.0[1].div_ceil(AMP_INNER_BLOCK))
-            .unwrap_or(u16::MAX)
-            .min(config.tile_count / streams);
-        let layouts = if direct_consumer_layouts.is_empty() {
-            [
-                (query_partitions != 0).then(|| Layout::attention_query(streams, query_partitions)),
-                (key_partitions != 0).then(|| Layout::attention_key(streams, key_partitions)),
-                (key_partitions != 0)
-                    .then(|| Layout::attention_block_major_key_value(streams, key_partitions)),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-        } else {
-            direct_consumer_layouts.to_vec()
-        };
-        for layout in layouts {
-            let plan = OperatorPlan {
-                operator: MidOperator::SplitHeads(options),
-                dispatch: OperatorDispatch::SplitHeads,
-                requirements: OperatorRequirements {
-                    inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
-                    output: OperandRequirement::new(
-                        TensorFormat {
-                            precision: input.format.precision,
-                            layout,
-                        },
-                        8,
-                    ),
-                    output_aliasing: OutputAliasing::Fresh,
-                    memory_space: MemorySpaceRequirements::default(),
-                },
-                deferred_output: Some(DeferredOutputPlan {
-                    source_input: 0,
-                    transform: DeferredTransform::SplitLastAxisIntoLeading {
-                        parts: options.heads,
-                    },
-                    unfused_cost: CostEstimate::default(),
-                }),
-                deferred_inputs: vec![None],
-            };
-            if !plans.contains(&plan) {
-                plans.push(plan);
-            }
-        }
-    }
     if let OperationKind::FlashAttention(options) = operation.kind
         && config
             .search_domain
@@ -2102,7 +2064,6 @@ fn plans_for_operation(
                         output_aliasing: OutputAliasing::Fresh,
                         memory_space: MemorySpaceRequirements::default(),
                     },
-                    deferred_output: None,
                     deferred_inputs: vec![None; 3],
                 });
             }
@@ -2140,7 +2101,6 @@ fn plans_for_operation(
                         output_aliasing: OutputAliasing::Fresh,
                         memory_space: MemorySpaceRequirements::default(),
                     },
-                    deferred_output: None,
                     deferred_inputs: vec![None; 3],
                 });
             }
@@ -2247,7 +2207,6 @@ fn pointwise_plans(
                     output_aliasing: aliasing,
                     memory_space: MemorySpaceRequirements::default(),
                 },
-                deferred_output: None,
                 deferred_inputs: vec![None; inputs.len()],
             };
             if !plans.contains(&plan) {
@@ -2442,9 +2401,7 @@ fn independent_parameter_storage(
     let inner_blocks = inner.div_ceil(u32::from(inner_block));
     let output_column_block = match candidate.dispatch {
         OperatorDispatch::BlockedGemm(plan) => plan.geometry.block.output_columns,
-        OperatorDispatch::Pointwise { .. }
-        | OperatorDispatch::Attention(_)
-        | OperatorDispatch::SplitHeads => {
+        OperatorDispatch::Pointwise { .. } | OperatorDispatch::Attention(_) => {
             return Vec::new();
         }
     };
@@ -4200,7 +4157,9 @@ mod tests {
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.precision, after.format.precision);
                 }
-                MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {}
+                MidOperationKind::Operator(_)
+                | MidOperationKind::View(_)
+                | MidOperationKind::Repeat(_) => {}
             }
         }
     }
@@ -4756,17 +4715,16 @@ mod tests {
             let producers = lowered
                 .operations
                 .iter()
-                .filter(|operation| {
-                    matches!(operation.operator(), Some(MidOperator::SplitHeads(_)))
-                })
+                .filter(|operation| matches!(operation.kind, MidOperationKind::View(_)))
                 .collect::<Vec<_>>();
             assert_eq!(producers.len(), split.len(), "random case {case}");
             assert!(
                 producers.iter().all(|operation| {
                     operation.metrics.cost.cycles == 0
-                        && operation
-                            .operator_plan()
-                            .is_some_and(|plan| plan.deferred_output.is_some())
+                        && operation.conversion_plan.as_ref().is_some_and(|plan| {
+                            plan.output.materialization == OperandMaterialization::DispatchSlices
+                                && !plan.mappings.is_empty()
+                        })
                 }),
                 "random case {case}"
             );
@@ -4821,7 +4779,7 @@ mod tests {
     }
 
     #[test]
-    fn randomized_unclaimed_deferred_offers_restore_materialization_cost() {
+    fn randomized_unclaimed_views_retain_materialization_cost() {
         let mut random = fastrand::Rng::with_seed(0x756e_636c_6169_6d65);
         for case in 0..RANDOM_CASES / 8 {
             let batch = random.u32(1..=4);
@@ -4841,17 +4799,20 @@ mod tests {
             let operation = lowered
                 .operations
                 .iter()
-                .find(|operation| matches!(operation.operator(), Some(MidOperator::SplitHeads(_))))
+                .find(|operation| matches!(operation.kind, MidOperationKind::View(_)))
                 .unwrap();
-            let offer = operation
-                .operator_plan()
-                .and_then(|plan| plan.deferred_output)
-                .unwrap();
-            assert_eq!(
-                operation.metrics.cost.cycles, offer.unfused_cost.cycles,
+            assert!(operation.metrics.cost.cycles != 0, "random case {case}");
+            assert!(
+                operation
+                    .conversion_plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.mappings.is_empty()),
                 "random case {case}"
             );
-            assert!(operation.metrics.cost.cycles != 0, "random case {case}");
+            let tiled = crate::low::lower_to_tiles(&lowered, &config)
+                .unwrap_or_else(|error| panic!("random case {case}: {error}"));
+            crate::KernelBuildPlan::from_program(&tiled)
+                .unwrap_or_else(|error| panic!("random case {case}: {error}"));
         }
     }
 }
