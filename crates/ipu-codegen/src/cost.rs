@@ -1053,22 +1053,27 @@ impl CostModel for Ipu21CostModel {
                     gemm_uses_panel_buffer(dispatch, right, &compute_output)
                         && right.format.precision == Precision::F16
                 });
-                let staged_local_weights = staged_weights
-                    && requirements
-                        .inputs
-                        .get(right_index)
-                        .is_some_and(|requirement| {
-                            requirement.local_staging == LocalOperandStaging::MatchRemote
-                        });
+                let staging = requirements
+                    .inputs
+                    .get(right_index)
+                    .map_or_else(LocalOperandStaging::default, |requirement| {
+                        requirement.local_staging
+                    });
+                let staged_local_weights = staged_weights && staging.stages_local();
                 let streamed_blocked_standard = right.filter(|right| {
                     staged_weights
+                        && staging.memory_class() == MemoryClass::Interleaved
+                        && !staging.stages_local()
                         && right.format.layout.memory_class == MemoryClass::Standard
                         && matches!(right.format.layout.order, StorageOrder::Blocked(_))
                 });
                 let weight_feed = streamed_blocked_standard.map_or_else(
                     || {
                         right_bytes_consumed.div_ceil(
-                            if resident_interleaved_weights || staged_weights {
+                            if resident_interleaved_weights
+                                || (staged_weights
+                                    && staging.memory_class() == MemoryClass::Interleaved)
+                            {
                                 IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle
                             } else {
                                 IPU21_TARGET_COSTS.standard_load_bytes_per_cycle
@@ -1148,7 +1153,13 @@ impl CostModel for Ipu21CostModel {
                     // but the critical-path tile performs one local population
                     // for every block it computes rather than one divided share
                     // of the operator's K traffic.
-                    standard_to_interleaved_copy_cycles(right_bytes_consumed)
+                    if staging.memory_class() == MemoryClass::Interleaved {
+                        standard_to_interleaved_copy_cycles(right_bytes_consumed)
+                    } else {
+                        right_bytes_consumed
+                            .saturating_mul(2)
+                            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+                    }
                 } else {
                     0
                 };

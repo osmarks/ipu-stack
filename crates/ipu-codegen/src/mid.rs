@@ -129,7 +129,7 @@ fn gemm_seed_plans_for_tile_count(
                     {
                         let mut staged = candidate;
                         staged.requirements.inputs[1].local_staging =
-                            LocalOperandStaging::MatchRemote;
+                            LocalOperandStaging::Staged(MemoryClass::Interleaved);
                         grid.push(staged);
                     }
                 }
@@ -315,7 +315,14 @@ fn amp_grid_gemm_plan(
                         layout: right_layout,
                     },
                     32,
-                ),
+                )
+                .with_local_staging(LocalOperandStaging::Direct(
+                    if precision == Precision::F16 && weights.inner_partitions > 1 {
+                        MemoryClass::Interleaved
+                    } else {
+                        weights.memory_class
+                    },
+                )),
             ],
             output: OperandRequirement::new(
                 TensorFormat {
@@ -2540,7 +2547,9 @@ fn parallel_reduction_plans_for_orientation(
         .map(|axis| axis.partitions);
     if output_seed_partitions != Some(tile_count)
         || candidate.requirements.inputs[1].format.layout.memory_class != MemoryClass::Standard
-        || candidate.requirements.inputs[1].local_staging != LocalOperandStaging::Direct
+        || candidate.requirements.inputs[1]
+            .local_staging
+            .stages_local()
     {
         return Vec::new();
     }
@@ -2783,10 +2792,10 @@ fn parallel_reduction_plans_for_orientation(
                 GemmOrientation::Swapped => 0,
             };
             let local_staging_options: &[_] = match orientation {
-                GemmOrientation::Normal => &[LocalOperandStaging::Direct],
+                GemmOrientation::Normal => &[LocalOperandStaging::Direct(MemoryClass::Interleaved)],
                 GemmOrientation::Swapped => &[
-                    LocalOperandStaging::Direct,
-                    LocalOperandStaging::MatchRemote,
+                    LocalOperandStaging::Direct(MemoryClass::Interleaved),
+                    LocalOperandStaging::Staged(MemoryClass::Interleaved),
                 ],
             };
             let mut result_layout_variants = Vec::new();

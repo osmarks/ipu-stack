@@ -163,7 +163,9 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                             ),
                         },
                         weight_memory_class: MemoryClass::Interleaved,
-                        local_weight_staging: crate::LocalOperandStaging::Direct,
+                        local_weight_staging: crate::LocalOperandStaging::Direct(
+                            MemoryClass::Interleaved,
+                        ),
                     }),
             )
             .with_input(left, left_format)

@@ -22,7 +22,6 @@ use crate::operator::{
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -788,57 +787,6 @@ impl LoweringState {
         Ok(id)
     }
 
-    fn interleaved_capacity_available(
-        &self,
-        tile: u16,
-        bytes: u32,
-        access_tail: u32,
-    ) -> LowLoweringResult<bool> {
-        let used = self
-            .shards
-            .iter()
-            .filter(|shard| {
-                shard.tile == tile
-                    && shard.tensor_type.format.layout.memory_class
-                        == crate::MemoryClass::Interleaved
-                    && !matches!(
-                        shard.definition,
-                        ShardDefinition::Alias(_)
-                            | ShardDefinition::WritableAlias(_)
-                            | ShardDefinition::ExchangeStaging
-                    )
-            })
-            .try_fold(0u32, |total, shard| {
-                total
-                    .checked_add(crate::shard_storage_bytes(shard)?)
-                    .and_then(|total| total.checked_add(access_tail))
-                    .ok_or(LowLoweringError::IdOverflow)
-            })?;
-        Ok(used
-            .checked_add(bytes)
-            .and_then(|total| total.checked_add(access_tail))
-            .is_some_and(|total| total <= ipu_target::memory::IPU21_INTERLEAVED_REGION_BYTES))
-    }
-
-    fn right_shard_for_block(
-        &self,
-        right_shards: &[LowShardId],
-        tile: u16,
-        column_start: u32,
-        column_end: u32,
-        inner_start: u32,
-        inner_end: u32,
-    ) -> Option<LowShardId> {
-        self.right_shards_for_block(
-            right_shards,
-            column_start,
-            column_end,
-            inner_start,
-            inner_end,
-        )
-        .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != tile))
-    }
-
     fn right_shards_for_block<'a>(
         &'a self,
         right_shards: &'a [LowShardId],
@@ -884,61 +832,6 @@ impl LoweringState {
             .iter()
             .copied()
             .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != tile))
-    }
-
-    fn use_uniform_interleaved_gemm_staging(
-        &self,
-        output_shards: &[LowShardId],
-        right_shards: &[LowShardId],
-        columns: Range<u32>,
-        inner: Range<u32>,
-        access_tail: u32,
-    ) -> LowLoweringResult<bool> {
-        let mut candidates = Vec::with_capacity(output_shards.len());
-        for output in output_shards {
-            let tile = self.shards[output.index() as usize].tile;
-            let Some(right) = self.right_shard_for_block(
-                right_shards,
-                tile,
-                columns.start,
-                columns.end,
-                inner.start,
-                inner.end,
-            ) else {
-                return Ok(false);
-            };
-            let shard = &self.shards[right.index() as usize];
-            if shard.tile != tile || shard.tensor_type.format.precision != crate::Precision::F16 {
-                return Ok(false);
-            }
-            let rank = shard.extents.len();
-            if rank < 2 {
-                return Ok(false);
-            }
-            let view = self.narrow_view(
-                right,
-                &[
-                    (rank - 2, inner.start, inner.end),
-                    (rank - 1, columns.start, columns.end),
-                ],
-            )?;
-            let spans = view_byte_spans(shard, &view)?;
-            if spans.len() <= 1 {
-                return Ok(false);
-            }
-            let bytes = spans.iter().try_fold(0u32, |total, span| {
-                total
-                    .checked_add(span.bytes)
-                    .ok_or(LowLoweringError::IdOverflow)
-            })?;
-            candidates.push((tile, bytes));
-        }
-        for (tile, bytes) in candidates {
-            if !self.interleaved_capacity_available(tile, bytes, access_tail)? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     fn value_shards(&self, value: MidValueId) -> LowLoweringResult<&[LowShardId]> {

@@ -330,8 +330,8 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
             _ => return Err("memory must be standard or interleaved".into()),
         },
         local_weight_staging: match *local {
-            "direct" => LocalOperandStaging::Direct,
-            "match-remote" => LocalOperandStaging::MatchRemote,
+            "direct" => LocalOperandStaging::Direct(MemoryClass::Interleaved),
+            "match-remote" => LocalOperandStaging::Staged(MemoryClass::Interleaved),
             _ => return Err("local staging must be direct or match-remote".into()),
         },
     })

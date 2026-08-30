@@ -389,11 +389,28 @@ impl AllocationRequirements {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LocalOperandStaging {
-    #[default]
-    Direct,
-    MatchRemote,
+    Direct(MemoryClass),
+    Staged(MemoryClass),
+}
+
+impl Default for LocalOperandStaging {
+    fn default() -> Self {
+        Self::Direct(MemoryClass::Standard)
+    }
+}
+
+impl LocalOperandStaging {
+    pub(crate) const fn memory_class(self) -> MemoryClass {
+        match self {
+            Self::Direct(memory_class) | Self::Staged(memory_class) => memory_class,
+        }
+    }
+
+    pub(crate) const fn stages_local(self) -> bool {
+        matches!(self, Self::Staged(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -411,7 +428,7 @@ impl OperandRequirement {
                 alignment,
                 ..AllocationRequirements::default()
             },
-            local_staging: LocalOperandStaging::Direct,
+            local_staging: LocalOperandStaging::default(),
             materialization: OperandMaterialization::Complete,
         }
     }

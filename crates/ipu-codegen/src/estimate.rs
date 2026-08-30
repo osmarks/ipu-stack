@@ -402,7 +402,8 @@ pub(crate) fn operator_memory_estimate(
             .saturating_add(u64::from(requirement.allocation.access_tail_bytes));
         temporary.add_class(left.format.layout.memory_class, bytes);
     }
-    if let (OperatorDispatch::BlockedGemm(plan), Some(right)) = (dispatch, inputs.get(1))
+    if let (OperatorDispatch::BlockedGemm(plan), Some(right), Some(requirement)) =
+        (dispatch, inputs.get(1), requirements.inputs.get(1))
         && right.format.precision == Precision::F16
         && !matches!(
             plan.geometry.distribution,
@@ -415,10 +416,11 @@ pub(crate) fn operator_memory_estimate(
         let output_columns =
             maximum_axis_shard_extent(output, output.shape.0.len().saturating_sub(1));
         let panels = output_columns.div_ceil(u64::from(plan.geometry.block.output_columns));
-        temporary.interleaved = panels
+        let bytes = panels
             .saturating_mul(u64::from(plan.geometry.block.inner))
             .saturating_mul(u64::from(plan.geometry.block.output_columns))
             .saturating_mul(right.format.precision.bytes());
+        temporary.add_class(requirement.local_staging.memory_class(), bytes);
     }
     if let OperatorDispatch::Attention(crate::AttentionPlan {
         blocking:
