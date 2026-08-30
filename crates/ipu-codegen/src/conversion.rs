@@ -5,7 +5,7 @@ use crate::layout::{
     AMP_COLUMN_MICRO, Layout, LayoutError, NativeKernelOrder, StorageOrder, TensorRegion,
     TensorType,
 };
-use crate::operator::{OperandRequirement, Precision, TileKernelSpec};
+use crate::operator::Precision;
 use crate::storage::{StorageError, amp_micro_dimension, physical_byte_offset};
 use std::collections::BTreeMap;
 
@@ -49,15 +49,6 @@ pub fn layout_conversion_strategy(
     } else {
         ConversionStrategy::StageLogicalThenTransform
     }
-}
-
-/// Resolved copy recipe consumed by costing and low-level lowering.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConversionPlan {
-    pub kernel: TileKernelSpec,
-    pub input: OperandRequirement,
-    pub output: OperandRequirement,
-    pub strategy: ConversionStrategy,
 }
 
 /// One arbitrary-rank affine copy nest within a conversion route.

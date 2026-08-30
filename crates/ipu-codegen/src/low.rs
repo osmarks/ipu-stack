@@ -363,8 +363,6 @@ pub enum LowLoweringError {
     MissingOperatorPlan,
     #[error("operator plan is incompatible with its values or block dimensions")]
     InvalidOperatorPlan,
-    #[error("conversion operation is missing its selected plan")]
-    MissingConversionPlan,
     #[error("conversion plan is incompatible with its input or output")]
     InvalidConversionPlan,
     #[error("repeat structure is inconsistent with its inputs, arguments, yields, or results")]
@@ -1102,7 +1100,7 @@ impl LoweringState {
                 && matches!(
                     operation.kind,
                     MidOperationKind::Operator(_)
-                        | MidOperationKind::View(_)
+                        | MidOperationKind::View(..)
                         | MidOperationKind::Repeat(_)
                 )
                 && let Some(source) = operation.source
@@ -1212,18 +1210,21 @@ impl LoweringState {
         retained_values: &[MidValueId],
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<bool> {
-        let transform = match operation.kind {
-            MidOperationKind::View(transform) => Some(transform),
-            MidOperationKind::Rearrange { .. } => None,
+        let (transform, strategy, materialization) = match &operation.kind {
+            MidOperationKind::View(transform, strategy) => (
+                Some(*transform),
+                *strategy,
+                crate::OperandMaterialization::DispatchSlices,
+            ),
+            MidOperationKind::Rearrange(strategy, materialization) => {
+                (None, *strategy, *materialization)
+            }
             _ => return Ok(false),
         };
-        let Some(plan) = &operation.conversion_plan else {
-            return Err(LowLoweringError::MissingConversionPlan);
-        };
-        if !plan.strategy.uses_intersections() {
+        if !strategy.uses_intersections() {
             return Ok(false);
         }
-        if plan.output.materialization != crate::OperandMaterialization::DispatchSlices {
+        if materialization != crate::OperandMaterialization::DispatchSlices {
             return Ok(false);
         }
         let ([source], [result]) = (operation.inputs.as_slice(), operation.results.as_slice())
@@ -1303,18 +1304,15 @@ impl LoweringState {
         kind: &MidOperationKind,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        let plan = operation
-            .conversion_plan
-            .as_ref()
-            .ok_or(LowLoweringError::MissingConversionPlan)?;
-        match plan.strategy {
-            ConversionStrategy::LocalKernel => {
-                self.lower_local_conversion(operation, kind, plan, tiles)
-            }
+        let (strategy, _) = operation
+            .conversion()
+            .ok_or(LowLoweringError::InvalidConversionPlan)?;
+        match strategy {
+            ConversionStrategy::LocalKernel => self.lower_local_conversion(operation, kind, tiles),
             ConversionStrategy::DirectRetile
             | ConversionStrategy::DirectLogical
             | ConversionStrategy::StageLogicalThenTransform => {
-                self.lower_intersection_conversion(operation, kind, plan, tiles)
+                self.lower_intersection_conversion(operation, kind, strategy, tiles)
             }
         }
     }
@@ -1323,7 +1321,6 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         kind: &MidOperationKind,
-        plan: &crate::ConversionPlan,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [input] = operation.inputs.as_slice() else {
@@ -1331,6 +1328,29 @@ impl LoweringState {
         };
         let [result] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
+        };
+        let input_format = self.shards[self.value_shards(*input)?[0].index() as usize]
+            .tensor_type
+            .format
+            .clone();
+        let output_format = self.shards[self.value_shards(*result)?[0].index() as usize]
+            .tensor_type
+            .format
+            .clone();
+        let kernel = match kind {
+            MidOperationKind::CastPrecision => TileKernelSpec::Cast {
+                from: input_format.precision,
+                to: output_format.precision,
+            },
+            MidOperationKind::View(..) | MidOperationKind::Rearrange(..) => {
+                TileKernelSpec::Rearrange {
+                    from: input_format.layout.clone(),
+                    to: output_format.layout.clone(),
+                }
+            }
+            MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {
+                return Err(LowLoweringError::InvalidConversionPlan);
+            }
         };
         for output in self.value_shards(*result)?.to_vec() {
             let tile = self.shards[output.index() as usize].tile;
@@ -1340,14 +1360,14 @@ impl LoweringState {
                 tile,
                 KernelRun::new(
                     operation_provenance(operation, kind),
-                    plan.kernel.clone(),
+                    kernel.clone(),
                     vec![KernelOperand {
                         views: vec![self.full_view(input)],
                     }],
                     self.full_view(output),
                     KernelRequirements::Conversion {
-                        input: plan.input.clone(),
-                        output: plan.output.clone(),
+                        input: OperandRequirement::new(input_format.clone(), 8),
+                        output: OperandRequirement::new(output_format.clone(), 8),
                         memory_space: MemorySpaceRequirements::default(),
                     },
                 ),
@@ -1360,7 +1380,7 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         kind: &MidOperationKind,
-        plan: &crate::ConversionPlan,
+        strategy: ConversionStrategy,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [input] = operation.inputs.as_slice() else {
@@ -1380,35 +1400,35 @@ impl LoweringState {
             .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
             .ok_or(LowLoweringError::InvalidConversionPlan)?;
         let mappings = match kind {
-            MidOperationKind::View(transform) => {
-                let (strategy, mappings) =
+            MidOperationKind::View(transform, _) => {
+                let (resolved_strategy, mappings) =
                     plan_view_conversion(&source_type, &destination_type, *transform)
                         .map_err(|_| LowLoweringError::InvalidConversionPlan)?;
-                if strategy != plan.strategy {
+                if resolved_strategy != strategy {
                     return Err(LowLoweringError::InvalidConversionPlan);
                 }
                 mappings
             }
-            MidOperationKind::Rearrange { .. } => plan_conversion(
+            MidOperationKind::Rearrange(..) => plan_conversion(
                 &destination_type.shape,
                 destination_type.format.precision,
                 &source_type.format.layout,
                 &destination_type.format.layout,
-                plan.strategy,
+                strategy,
             )
             .map_err(|error| {
                 tracing::error!(
                     ?error,
                     source = ?source_type,
                     destination = ?destination_type,
-                    strategy = ?plan.strategy,
+                    ?strategy,
                     "failed to materialize selected conversion geometry"
                 );
                 LowLoweringError::InvalidConversionPlan
             })?,
             _ => return Err(LowLoweringError::InvalidConversionPlan),
         };
-        let staged = plan.strategy == ConversionStrategy::StageLogicalThenTransform;
+        let staged = strategy == ConversionStrategy::StageLogicalThenTransform;
         let staging = if staged {
             outputs
                 .iter()
@@ -1417,7 +1437,7 @@ impl LoweringState {
         } else {
             outputs.clone()
         };
-        if plan.strategy == ConversionStrategy::DirectLogical {
+        if strategy == ConversionStrategy::DirectLogical {
             for &output in &outputs {
                 if self.shard_has_padding(output) {
                     self.append_fill_zero(tiles, output, operation_provenance(operation, kind))?;
@@ -5465,11 +5485,12 @@ fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (
             }
             let requirement = operation
                 .operator_plan()
-                .and_then(|plan| plan.requirements.inputs.get(index))
-                .or_else(|| operation.conversion_plan.as_ref().map(|plan| &plan.input));
+                .and_then(|plan| plan.requirements.inputs.get(index));
             if let Some(requirement) = requirement {
                 alignment = alignment.max(requirement.allocation.alignment);
                 access_tail = access_tail.max(requirement.allocation.access_tail_bytes);
+            } else if operation.conversion().is_some() {
+                alignment = alignment.max(8);
             }
         }
     }
@@ -5481,9 +5502,10 @@ fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> Wo
         operation: operation.source,
         value: operation.results.first().copied(),
         reason: match kind {
-            MidOperationKind::CastPrecision { .. } => WorkReason::PrecisionCast,
-            MidOperationKind::Rearrange { .. } => WorkReason::LayoutRearrangement,
-            MidOperationKind::View(_) => WorkReason::LayoutRearrangement,
+            MidOperationKind::CastPrecision => WorkReason::PrecisionCast,
+            MidOperationKind::Rearrange(..) | MidOperationKind::View(..) => {
+                WorkReason::LayoutRearrangement
+            }
             MidOperationKind::Operator(_) => WorkReason::OperatorKernel,
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },
@@ -6065,9 +6087,8 @@ mod tests {
                 .operations
                 .iter()
                 .filter_map(|operation| {
-                    operation.conversion_plan.as_ref().and_then(|plan| {
-                        (plan.output.materialization
-                            == crate::OperandMaterialization::DispatchSlices)
+                    operation.conversion().and_then(|(_, materialization)| {
+                        (materialization == crate::OperandMaterialization::DispatchSlices)
                             .then(|| operation.results[0])
                     })
                 })

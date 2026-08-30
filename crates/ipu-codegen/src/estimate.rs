@@ -298,14 +298,15 @@ fn allocation_requirements(
                 }
             }
         }
-        if let Some(plan) = &operation.conversion_plan {
-            if let Some(&id) = operation.inputs.first() {
-                let requirement = requirements.entry(id).or_default();
-                requirement.merge(plan.input.allocation);
-            }
-            if let Some(&id) = operation.results.first() {
-                let requirement = requirements.entry(id).or_default();
-                requirement.merge(plan.output.allocation);
+        if operation.conversion().is_some() {
+            for id in operation
+                .inputs
+                .first()
+                .into_iter()
+                .chain(operation.results.first())
+            {
+                let requirement = requirements.entry(*id).or_default();
+                requirement.alignment = requirement.alignment.max(8);
             }
         }
     }
@@ -785,8 +786,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     let streamed_aliases = operations
         .iter()
         .filter_map(|operation| {
-            let plan = operation.conversion_plan.as_ref()?;
-            if plan.output.materialization != OperandMaterialization::DispatchSlices {
+            if operation.conversion()?.1 != OperandMaterialization::DispatchSlices {
                 return None;
             }
             Some((*operation.results.first()?, *operation.inputs.first()?))

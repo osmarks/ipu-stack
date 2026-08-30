@@ -34,8 +34,7 @@ pub use config::{
     PlannerSearchDomain, ProfilingConfig,
 };
 pub use conversion::{
-    ConversionGeometryError, ConversionMapping, ConversionPlan, ConversionStrategy, CopyGeometry,
-    DeferredTransform,
+    ConversionGeometryError, ConversionMapping, ConversionStrategy, CopyGeometry, DeferredTransform,
 };
 pub(crate) use exchange::lower_exchanges;
 pub use exchange::{

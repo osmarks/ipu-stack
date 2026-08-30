@@ -11,9 +11,7 @@ use crate::config::{
     AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
     PlannerSearchDomain,
 };
-use crate::conversion::{
-    ConversionPlan, ConversionStrategy, DeferredTransform, layout_conversion_strategy,
-};
+use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
 use crate::estimate::{
@@ -578,7 +576,7 @@ pub(crate) fn lower_finalists(
                     .collect::<BTreeSet<_>>(),
                 conversion_sources = ?branch.operations
                     .iter()
-                    .filter(|operation| operation.conversion_plan.is_some())
+                    .filter(|operation| operation.conversion().is_some())
                     .map(|operation| operation.source)
                     .collect::<Vec<_>>(),
                 "retained operator-plan finalist"
@@ -598,13 +596,13 @@ pub(crate) fn lower_finalists(
                     .collect::<Vec<_>>(),
                 conversions = ?branch.operations
                     .iter()
-                    .filter_map(|operation| operation.conversion_plan.as_ref().map(|plan| (
+                    .filter_map(|operation| Some((
                         operation.source,
-                        &plan.input.format.layout,
-                        &plan.output.format.layout,
+                        &branch.state.get(*operation.inputs.first()?).tensor_type.format.layout,
+                        &branch.state.get(*operation.results.first()?).tensor_type.format.layout,
                         operation.metrics.cost.cycles,
                         operation.metrics.cost.exchange_cycles,
-                    )))
+                    )).filter(|_| operation.conversion().is_some()))
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
             );
@@ -1563,8 +1561,8 @@ fn apply_selected_plan(
         let streamed_source = operations[conversion_start..]
             .last_mut()
             .and_then(|conversion| {
-                let streamed = conversion.conversion_plan.as_ref().is_some_and(|plan| {
-                    plan.output.materialization == OperandMaterialization::DispatchSlices
+                let streamed = conversion.conversion().is_some_and(|(_, materialization)| {
+                    materialization == OperandMaterialization::DispatchSlices
                 });
                 if streamed {
                     conversion.metrics.cost.cycles = 0;
@@ -1616,13 +1614,9 @@ fn apply_selected_plan(
             || operations.iter().any(|candidate| {
                 candidate.inputs.as_slice() == [original]
                     && candidate.results.as_slice() == [converted]
-                    && candidate
-                        .conversion_plan
-                        .as_ref()
-                        .is_some_and(|conversion| {
-                            conversion.output.materialization
-                                == OperandMaterialization::DispatchSlices
-                        })
+                    && candidate.conversion().is_some_and(|(_, materialization)| {
+                        materialization == OperandMaterialization::DispatchSlices
+                    })
             });
         if !conversion_is_streamed
             || !single_use_inputs.get(input_index).copied().unwrap_or(false)
@@ -1637,7 +1631,7 @@ fn apply_selected_plan(
             continue;
         };
         let (source, transform, producer_cycles) = match &operations[producer_index].kind {
-            MidOperationKind::View(transform) => (
+            MidOperationKind::View(transform, _) => (
                 operations[producer_index].inputs[0],
                 *transform,
                 operations[producer_index].metrics.cost.cycles,
@@ -1699,7 +1693,6 @@ fn apply_selected_plan(
         inputs: converted,
         results: vec![result],
         kind: MidOperationKind::Operator(plan),
-        conversion_plan: None,
         metrics: OperationMetrics {
             cost: CostEstimate {
                 cycles: operator_cycles,
@@ -1743,13 +1736,6 @@ fn apply_selected_view(
     );
     let cost = costs.rearrangement_cost(source_type, &output_type, strategy);
     let memory = conversion_memory_estimate(source_type, &output_type, strategy);
-    let input = OperandRequirement::new(source_type.format.clone(), 8);
-    let output = OperandRequirement::new(output_type.format.clone(), 8)
-        .with_materialization(OperandMaterialization::DispatchSlices);
-    let kernel = TileKernelSpec::Rearrange {
-        from: source_type.format.layout.clone(),
-        to: output_type.format.layout.clone(),
-    };
     let result = branch
         .state
         .value(operation.results[0], output_type.clone());
@@ -1757,13 +1743,7 @@ fn apply_selected_view(
         source: Some(operation.id),
         inputs: vec![source],
         results: vec![result],
-        kind: MidOperationKind::View(transform),
-        conversion_plan: Some(ConversionPlan {
-            kernel,
-            input,
-            output,
-            strategy,
-        }),
+        kind: MidOperationKind::View(transform, strategy),
         metrics: OperationMetrics { cost, memory },
     });
     branch.values.insert(operation.results[0], result);
@@ -3493,7 +3473,6 @@ fn lower_repeat(
                 },
             },
         }),
-        conversion_plan: None,
         metrics: OperationMetrics {
             cost: body_metrics.repeated(repeat.count),
             memory: MemoryEstimate {
@@ -3524,7 +3503,6 @@ fn ensure_format(
     let original = state.get(value).clone();
     if original.tensor_type.format.precision != target.precision {
         let mut tensor_type = original.tensor_type.clone();
-        let from = tensor_type.format.precision;
         tensor_type.format.precision = target.precision;
         let result = state.derived_value(value, tensor_type.clone());
         let memory = conversion_memory_estimate(
@@ -3536,19 +3514,7 @@ fn ensure_format(
             source: Some(source),
             inputs: vec![value],
             results: vec![result],
-            kind: MidOperationKind::CastPrecision {
-                from,
-                to: target.precision,
-            },
-            conversion_plan: Some(ConversionPlan {
-                kernel: TileKernelSpec::Cast {
-                    from,
-                    to: target.precision,
-                },
-                input: OperandRequirement::new(original.tensor_type.format.clone(), 8),
-                output: OperandRequirement::new(tensor_type.format.clone(), 8),
-                strategy: ConversionStrategy::LocalKernel,
-            }),
+            kind: MidOperationKind::CastPrecision,
             metrics: OperationMetrics {
                 cost: CostEstimate {
                     cycles: costs.cast_cycles(&original.tensor_type, target.precision),
@@ -3573,20 +3539,7 @@ fn ensure_format(
             source: Some(source),
             inputs: vec![value],
             results: vec![result],
-            kind: MidOperationKind::Rearrange {
-                from: from.clone(),
-                to: target.layout.clone(),
-            },
-            conversion_plan: Some(ConversionPlan {
-                kernel: TileKernelSpec::Rearrange {
-                    from: from.clone(),
-                    to: target.layout.clone(),
-                },
-                input: OperandRequirement::new(current.tensor_type.format.clone(), 8),
-                output: OperandRequirement::new(tensor_type.format.clone(), 8)
-                    .with_materialization(materialization),
-                strategy,
-            }),
+            kind: MidOperationKind::Rearrange(strategy, materialization),
             metrics: OperationMetrics {
                 cost: rearrangement,
                 memory,
@@ -4118,20 +4071,26 @@ mod tests {
             let before = &value(lowered, *input).tensor_type;
             let after = &value(lowered, *result).tensor_type;
             match &operation.kind {
-                MidOperationKind::CastPrecision { from, to } => {
-                    assert_eq!(*from, before.format.precision);
-                    assert_eq!(*to, after.format.precision);
+                MidOperationKind::CastPrecision => {
+                    assert_ne!(before.format.precision, after.format.precision);
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.layout, after.format.layout);
                 }
-                MidOperationKind::Rearrange { from, to } => {
-                    assert_eq!(from, &before.format.layout);
-                    assert_eq!(to, &after.format.layout);
+                MidOperationKind::Rearrange(strategy, _) => {
+                    assert_ne!(before.format.layout, after.format.layout);
+                    assert_eq!(
+                        *strategy,
+                        layout_conversion_strategy(
+                            before.format.precision,
+                            &before.format.layout,
+                            &after.format.layout,
+                        )
+                    );
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.precision, after.format.precision);
                 }
                 MidOperationKind::Operator(_)
-                | MidOperationKind::View(_)
+                | MidOperationKind::View(..)
                 | MidOperationKind::Repeat(_) => {}
             }
         }
@@ -4685,16 +4644,18 @@ mod tests {
             let producers = lowered
                 .operations
                 .iter()
-                .filter(|operation| matches!(operation.kind, MidOperationKind::View(_)))
+                .filter(|operation| matches!(operation.kind, MidOperationKind::View(..)))
                 .collect::<Vec<_>>();
             assert_eq!(producers.len(), split.len(), "random case {case}");
             assert!(
                 producers.iter().all(|operation| {
                     operation.metrics.cost.cycles == 0
-                        && operation.conversion_plan.as_ref().is_some_and(|plan| {
-                            plan.output.materialization == OperandMaterialization::DispatchSlices
-                                && plan.strategy.uses_intersections()
-                        })
+                        && operation
+                            .conversion()
+                            .is_some_and(|(strategy, materialization)| {
+                                materialization == OperandMaterialization::DispatchSlices
+                                    && strategy.uses_intersections()
+                            })
                 }),
                 "random case {case}"
             );
@@ -4769,14 +4730,13 @@ mod tests {
             let operation = lowered
                 .operations
                 .iter()
-                .find(|operation| matches!(operation.kind, MidOperationKind::View(_)))
+                .find(|operation| matches!(operation.kind, MidOperationKind::View(..)))
                 .unwrap();
             assert!(operation.metrics.cost.cycles != 0, "random case {case}");
             assert!(
                 operation
-                    .conversion_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.strategy.uses_intersections()),
+                    .conversion()
+                    .is_some_and(|(strategy, _)| strategy.uses_intersections()),
                 "random case {case}"
             );
             let tiled = crate::low::lower_to_tiles(&lowered, &config)

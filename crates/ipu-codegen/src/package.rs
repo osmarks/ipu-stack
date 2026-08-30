@@ -549,7 +549,9 @@ pub fn build_diagnostic_package(
     for operation in &mid.operations {
         if !matches!(
             operation.kind,
-            MidOperationKind::Operator(_) | MidOperationKind::View(_) | MidOperationKind::Repeat(_)
+            MidOperationKind::Operator(_)
+                | MidOperationKind::View(..)
+                | MidOperationKind::Repeat(_)
         ) {
             continue;
         }

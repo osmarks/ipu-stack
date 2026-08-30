@@ -1,10 +1,10 @@
 //! Layout-aware mid-level graph records.
 
-use crate::conversion::{ConversionPlan, DeferredTransform};
+use crate::conversion::{ConversionStrategy, DeferredTransform};
 use crate::graph::{GraphInputKind, OperationId, ValueId};
-use crate::layout::{Layout, TensorType};
+use crate::layout::TensorType;
 use crate::metrics::{OperationMetrics, RegionMetrics};
-use crate::operator::{MidOperator, OperatorPlan, Precision};
+use crate::operator::{MidOperator, OperandMaterialization, OperatorPlan};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidValueId(u32);
@@ -35,9 +35,9 @@ pub struct MidValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
     Operator(OperatorPlan),
-    View(DeferredTransform),
-    CastPrecision { from: Precision, to: Precision },
-    Rearrange { from: Layout, to: Layout },
+    View(DeferredTransform, ConversionStrategy),
+    CastPrecision,
+    Rearrange(ConversionStrategy, OperandMaterialization),
     Repeat(MidRepeat),
 }
 
@@ -47,17 +47,32 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
-    pub conversion_plan: Option<ConversionPlan>,
     pub metrics: OperationMetrics,
 }
 
 impl MidOperation {
+    pub fn conversion(&self) -> Option<(ConversionStrategy, OperandMaterialization)> {
+        match &self.kind {
+            MidOperationKind::View(_, strategy) => {
+                Some((*strategy, OperandMaterialization::DispatchSlices))
+            }
+            MidOperationKind::CastPrecision => Some((
+                ConversionStrategy::LocalKernel,
+                OperandMaterialization::Complete,
+            )),
+            MidOperationKind::Rearrange(strategy, materialization) => {
+                Some((*strategy, *materialization))
+            }
+            MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => None,
+        }
+    }
+
     pub fn operator_plan(&self) -> Option<&OperatorPlan> {
         match &self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
-            MidOperationKind::View(_)
-            | MidOperationKind::CastPrecision { .. }
-            | MidOperationKind::Rearrange { .. }
+            MidOperationKind::View(..)
+            | MidOperationKind::CastPrecision
+            | MidOperationKind::Rearrange(..)
             | MidOperationKind::Repeat(_) => None,
         }
     }
@@ -65,9 +80,9 @@ impl MidOperation {
     pub fn operator_plan_mut(&mut self) -> Option<&mut OperatorPlan> {
         match &mut self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
-            MidOperationKind::View(_)
-            | MidOperationKind::CastPrecision { .. }
-            | MidOperationKind::Rearrange { .. }
+            MidOperationKind::View(..)
+            | MidOperationKind::CastPrecision
+            | MidOperationKind::Rearrange(..)
             | MidOperationKind::Repeat(_) => None,
         }
     }
