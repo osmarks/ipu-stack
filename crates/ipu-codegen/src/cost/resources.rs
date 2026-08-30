@@ -1,5 +1,6 @@
-//! Memory, communication, and capacity estimates shared by planning policies.
+//! Structural memory, capacity, and communication estimates.
 
+use super::exchange::ExchangeEndpointTraffic;
 use crate::graph::TensorShape;
 use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
@@ -14,122 +15,6 @@ use crate::operator::{
 use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ExchangeEndpointLoad {
-    pub bytes: u64,
-    pub fragments: u64,
-}
-
-impl ExchangeEndpointLoad {
-    fn add(&mut self, bytes: u64, fragments: u64) {
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.fragments = self.fragments.saturating_add(fragments);
-    }
-}
-
-/// Resource-indexed work for one or more transfers which share an exchange
-/// phase. Sends from an adjacent tile pair occupy one shared bus; receives are
-/// independent per tile. Keeping those roles separate allows independently
-/// produced traffic estimates to be combined before finding the bottleneck.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ExchangeEndpointTraffic {
-    pub outgoing_buses: Vec<ExchangeEndpointLoad>,
-    pub incoming_tiles: Vec<ExchangeEndpointLoad>,
-}
-
-impl ExchangeEndpointTraffic {
-    pub(crate) fn from_maxima(
-        outgoing_bytes: u64,
-        incoming_bytes: u64,
-        outgoing_fragments: u64,
-        incoming_fragments: u64,
-    ) -> Self {
-        let mut traffic = Self::default();
-        traffic.add_outgoing(0, outgoing_bytes, outgoing_fragments);
-        traffic.add_incoming(0, incoming_bytes, incoming_fragments);
-        traffic
-    }
-
-    pub(crate) fn add_outgoing(&mut self, bus: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(&mut self.outgoing_buses, bus, bytes, fragments);
-    }
-
-    pub(crate) fn add_incoming(&mut self, tile: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(&mut self.incoming_tiles, tile, bytes, fragments);
-    }
-
-    pub(crate) fn merge(&mut self, other: &Self) {
-        for (bus, load) in other.outgoing_buses.iter().copied().enumerate() {
-            self.add_outgoing(bus as u16, load.bytes, load.fragments);
-        }
-        for (tile, load) in other.incoming_tiles.iter().copied().enumerate() {
-            self.add_incoming(tile as u16, load.bytes, load.fragments);
-        }
-    }
-
-    pub(crate) fn maximum_outgoing_bytes(&self) -> u64 {
-        self.outgoing_buses
-            .iter()
-            .map(|load| load.bytes)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn maximum_incoming_bytes(&self) -> u64 {
-        self.incoming_tiles
-            .iter()
-            .map(|load| load.bytes)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn maximum_payload_bytes(&self) -> u64 {
-        self.maximum_outgoing_bytes()
-            .max(self.maximum_incoming_bytes())
-    }
-
-    pub(crate) fn maximum_outgoing_fragments(&self) -> u64 {
-        self.outgoing_buses
-            .iter()
-            .map(|load| load.fragments)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn maximum_incoming_fragments(&self) -> u64 {
-        self.incoming_tiles
-            .iter()
-            .map(|load| load.fragments)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn maximum_fragments(&self) -> u64 {
-        self.maximum_outgoing_fragments()
-            .max(self.maximum_incoming_fragments())
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.maximum_payload_bytes() == 0
-    }
-}
-
-fn add_endpoint_load(
-    loads: &mut Vec<ExchangeEndpointLoad>,
-    endpoint: u16,
-    bytes: u64,
-    fragments: u64,
-) {
-    if bytes == 0 && fragments == 0 {
-        return;
-    }
-    loads.resize(
-        loads.len().max(usize::from(endpoint).saturating_add(1)),
-        ExchangeEndpointLoad::default(),
-    );
-    loads[usize::from(endpoint)].add(bytes, fragments);
-}
 
 fn layout_extents(shape: &TensorShape, layout: &Layout) -> Option<Vec<(u16, TensorRegion)>> {
     Some(
@@ -205,6 +90,9 @@ pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
     usage
 }
 
+/// Interleaved working-set lower bound used to discard impossible parallel
+/// GEMM grids before their concrete layouts and staging policies are expanded.
+/// Exact candidates are checked again by [`operator_memory_estimate`].
 fn allocation_memory(tensor: &TensorType, requirement: AllocationRequirements) -> MemoryUsage {
     let mut bytes =
         maximum_shard_bytes(tensor).saturating_add(u64::from(requirement.access_tail_bytes));

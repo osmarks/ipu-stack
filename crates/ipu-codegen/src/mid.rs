@@ -16,9 +16,9 @@ use crate::conversion::{
     layout_conversion_strategy,
 };
 pub use crate::cost::{CostModel, Ipu21CostModel};
-use crate::cost::{MemoizedCostModel, parallel_reduction_preselection_metrics};
-use crate::estimate::{
-    conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
+use crate::cost::{
+    MemoizedCostModel, conversion_memory_estimate, operator_memory_estimate,
+    parallel_reduction_preselection_metrics, region_peak_memory,
     region_peak_memory_with_multiplicity,
 };
 use crate::graph::{
@@ -2590,12 +2590,13 @@ fn parallel_reduction_plans_for_orientation(
                     columns: column_partitions,
                     inner: inner_partitions,
                 };
+                let block = GemmBlockShape {
+                    inner: local_inner.saturating_mul(AMP_COLUMN_MICRO),
+                    output_columns: local_columns.saturating_mul(AMP_COLUMN_MICRO),
+                };
                 let Some(metrics) = parallel_reduction_preselection_metrics(
                     config.target,
-                    GemmBlockShape {
-                        inner: local_inner.saturating_mul(AMP_COLUMN_MICRO),
-                        output_columns: local_columns.saturating_mul(AMP_COLUMN_MICRO),
-                    },
+                    block,
                     grid,
                     orientation,
                     inputs,
@@ -2604,7 +2605,7 @@ fn parallel_reduction_plans_for_orientation(
                     continue;
                 };
                 let constraints = config.target.memory_constraints();
-                if metrics.memory.total > constraints.total_bytes {
+                if !metrics.memory.fits(constraints) {
                     continue;
                 }
                 grids.push(ParallelGridCandidate {

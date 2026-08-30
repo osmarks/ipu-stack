@@ -756,12 +756,12 @@ fn randomized_partition_padding_preserves_logical_groups() {
             assert_eq!(allocated, physical_width, "case {case}");
         }
         assert_eq!(
-            crate::estimate::physical_elements(&tensor.shape, &tensor.format.layout),
+            crate::cost::physical_elements(&tensor.shape, &tensor.format.layout),
             u64::from(rows) * u64::from(groups) * u64::from(physical_width),
             "case {case}"
         );
         assert_eq!(
-            crate::estimate::maximum_shard_bytes(&tensor),
+            crate::cost::maximum_shard_bytes(&tensor),
             u64::from(rows)
                 * u64::from(
                     physical_blocks.div_ceil(u32::from(partitions_per_group)) * physical_multiple,

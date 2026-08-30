@@ -14,7 +14,6 @@ pub use package::{
 mod config;
 mod conversion;
 mod cost;
-mod estimate;
 pub mod exchange;
 pub mod graph;
 mod host;

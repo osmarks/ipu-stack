@@ -1,25 +1,23 @@
-//! Analytical IPU21 cycle estimation used during operator planning.
+//! Analytical IPU21 kernel and conversion timing used during operator planning.
 
+use super::exchange::{self, ExchangeEndpointTraffic};
+use super::resources::{
+    average_shard_bytes, gemm_exchange_endpoint_traffic, gemm_exchange_phase_count,
+    gemm_partial_tensor, gemm_requires_panel_repacking, gemm_uses_panel_buffer,
+    maximum_axis_shard_extent, maximum_shard_bytes, physical_elements,
+};
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
 use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
-use crate::estimate::{
-    ExchangeEndpointTraffic, average_shard_bytes, gemm_exchange_endpoint_traffic,
-    gemm_exchange_phase_count, gemm_partial_tensor, gemm_requires_panel_repacking,
-    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes, physical_elements,
-};
 use crate::graph::TensorShape;
 use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
-use crate::metrics::{CostEstimate, ExchangeFootprint, MemoryPeaks, RegionMetrics};
+use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{
-    GemmBlockShape, GemmDistribution, GemmGrid, GemmOrientation, LocalOperandStaging, MidOperator,
-    OperatorDispatch, OperatorRequirements, Precision,
+    GemmDistribution, LocalOperandStaging, MidOperator, OperatorDispatch, OperatorRequirements,
+    Precision,
 };
-use foldhash::fast::FixedState;
 use ipu_target::cost::HardwareCosts;
 use ipu_target::hardware::HardwareTarget;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
 
 const IPU21_TARGET_COSTS: &HardwareCosts = HardwareTarget::Ipu21.costs();
 
@@ -202,212 +200,7 @@ impl SpatialOccupancy {
     }
 }
 
-pub(crate) struct MemoizedCostModel<'a, C> {
-    inner: &'a C,
-    spatial_capacity: u16,
-    rearrangements: Mutex<RearrangementCache>,
-}
-
-type RearrangementKey = (TensorType, TensorType, ConversionStrategy);
-type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<CostEstimate>>, FixedState>;
-
-impl<'a, C> MemoizedCostModel<'a, C> {
-    pub(crate) fn new(inner: &'a C, spatial_capacity: u16) -> Self {
-        Self {
-            inner,
-            spatial_capacity,
-            rearrangements: Mutex::new(HashMap::default()),
-        }
-    }
-}
-
-impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
-    fn target(&self) -> HardwareTarget {
-        self.inner.target()
-    }
-
-    fn operator_cycles(
-        &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        self.inner
-            .operator_cycles(operator, dispatch, requirements, inputs, output)
-    }
-
-    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
-        self.inner.cast_cycles(input, to)
-    }
-
-    fn layout_conversion_cost(
-        &self,
-        shape: &TensorShape,
-        precision: Precision,
-        from: &Layout,
-        to: &Layout,
-    ) -> CostEstimate {
-        let requested = layout_conversion_strategy(precision, from, to);
-        let source = TensorType::new(shape.0.clone(), precision, from.clone());
-        let destination = TensorType::new(shape.0.clone(), precision, to.clone());
-        let key = (source.clone(), destination.clone(), requested);
-        let cached = self
-            .rearrangements
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .clone();
-        *cached.get_or_init(|| {
-            let mut cost = self
-                .inner
-                .rearrangement_cost(&source, &destination, requested);
-            let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
-            cost.cycles = cost
-                .cycles
-                .saturating_mul(u64::from(self.spatial_capacity))
-                .div_ceil(u64::from(active_tiles));
-            cost
-        })
-    }
-
-    fn operator_exchange_cycles(
-        &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        self.inner
-            .operator_exchange_cycles(operator, dispatch, requirements, inputs, output)
-    }
-
-    fn operator_exchange_footprint(
-        &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> ExchangeFootprint {
-        self.inner
-            .operator_exchange_footprint(operator, dispatch, requirements, inputs, output)
-    }
-
-    fn deferred_input_cycles(
-        &self,
-        transform: DeferredTransform,
-        source: &TensorType,
-        logical_output: &TensorType,
-        consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
-        producer_cycles: u64,
-    ) -> u64 {
-        self.inner.deferred_input_cycles(
-            transform,
-            source,
-            logical_output,
-            consumer_input,
-            consumer_dispatch,
-            producer_cycles,
-        )
-    }
-
-    fn deferred_input_exchange_cycles(
-        &self,
-        transform: DeferredTransform,
-        source: &TensorType,
-        logical_output: &TensorType,
-        consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
-        producer_cycles: u64,
-    ) -> u64 {
-        self.inner.deferred_input_exchange_cycles(
-            transform,
-            source,
-            logical_output,
-            consumer_input,
-            consumer_dispatch,
-            producer_cycles,
-        )
-    }
-
-    fn rearrangement_cost(
-        &self,
-        source: &TensorType,
-        destination: &TensorType,
-        strategy: ConversionStrategy,
-    ) -> CostEstimate {
-        let key = (source.clone(), destination.clone(), strategy);
-        let cached = self
-            .rearrangements
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .clone();
-        *cached.get_or_init(|| {
-            let mut cost = self.inner.rearrangement_cost(source, destination, strategy);
-            let active_tiles = source
-                .format
-                .layout
-                .tiling
-                .tile_count
-                .max(destination.format.layout.tiling.tile_count);
-            // The inner model reports occupied work. Reduced-grid conversions
-            // leave spatial issue slots idle, so convert that work into a phase
-            // horizon using the occupancy of this particular planning target.
-            cost.cycles = cost
-                .cycles
-                .saturating_mul(u64::from(self.spatial_capacity))
-                .div_ceil(u64::from(active_tiles));
-            cost
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
 pub struct Ipu21CostModel;
-
-fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
-    if traffic.is_empty() || phases == 0 {
-        return 0;
-    }
-    let payload_cycles = traffic
-        .maximum_payload_bytes()
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
-    let cutover_cycles = traffic
-        .maximum_fragments()
-        .saturating_mul(IPU21_TARGET_COSTS.logical_fragment_cycles);
-    payload_cycles
-        .max(cutover_cycles)
-        .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
-}
-
-fn exchange_endpoint_footprint(
-    traffic: &ExchangeEndpointTraffic,
-    phases: u64,
-) -> ExchangeFootprint {
-    if traffic.is_empty() || phases == 0 {
-        return ExchangeFootprint::default();
-    }
-    let transfer_bytes = u64::from(
-        ipu_target::hardware::HardwareTarget::Ipu21
-            .exchange()
-            .maximum_transfer_words,
-    ) * 4;
-    ExchangeFootprint {
-        phases,
-        maximum_transfer_chunks_per_tile: traffic
-            .maximum_payload_bytes()
-            .div_ceil(transfer_bytes)
-            .max(traffic.maximum_fragments())
-            .max(phases),
-    }
-}
 
 fn attention_endpoint_traffic(
     inputs: &[TensorType],
@@ -670,15 +463,6 @@ fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
-fn exchange_cost(traffic: &ExchangeEndpointTraffic, phases: u64) -> CostEstimate {
-    let cycles = exchange_endpoint_cycles(traffic, phases);
-    CostEstimate {
-        cycles,
-        exchange_cycles: cycles,
-        exchange_footprint: exchange_endpoint_footprint(traffic, phases),
-    }
-}
-
 fn estimated_operator_exchange(
     dispatch: &OperatorDispatch,
     inputs: &[TensorType],
@@ -734,8 +518,11 @@ fn estimated_operator_exchange(
                 2,
                 u64::from(reduction.compute.inner.saturating_sub(1)),
             );
-            exchange_cost(&endpoint, 1)
-                .sequence(exchange_cost(&reduction, u64::from(reduction_epochs)))
+            exchange::cost(&endpoint, 1, HardwareTarget::Ipu21).sequence(exchange::cost(
+                &reduction,
+                u64::from(reduction_epochs),
+                HardwareTarget::Ipu21,
+            ))
         }
         OperatorDispatch::BlockedGemm(_) => {
             let compute_output = gemm_partial_tensor(dispatch, output);
@@ -753,13 +540,14 @@ fn estimated_operator_exchange(
                     u64::MAX / 16,
                 )
             });
-            exchange_cost(
+            exchange::cost(
                 &traffic,
                 gemm_exchange_phase_count(dispatch, inputs, &compute_output),
+                HardwareTarget::Ipu21,
             )
         }
         OperatorDispatch::Attention(_) => attention_endpoint_traffic(inputs, output, dispatch)
-            .map(|(traffic, phases)| exchange_cost(&traffic, phases))
+            .map(|(traffic, phases)| exchange::cost(&traffic, phases, HardwareTarget::Ipu21))
             .unwrap_or_else(impossible_conversion_cost),
         OperatorDispatch::Pointwise(_) => CostEstimate::default(),
     }
@@ -883,83 +671,6 @@ fn deferred_split_input_cycles(
 
 /// Cheap ranking used before concrete blocked-GEMM layouts are expanded into
 /// the full operator candidate set.
-pub(crate) fn parallel_reduction_preselection_metrics(
-    target: HardwareTarget,
-    block: GemmBlockShape,
-    compute_grid: GemmGrid,
-    orientation: GemmOrientation,
-    inputs: &[TensorType],
-    output_precision: Precision,
-) -> Option<RegionMetrics> {
-    let [left, right] = inputs else { return None };
-    let costs = target.costs();
-    let outer_rows = left.shape.0[..left.shape.0.len().saturating_sub(2)]
-        .iter()
-        .fold(1u64, |product, &extent| {
-            product.saturating_mul(u64::from(extent))
-        });
-    let logical_rows = match orientation {
-        GemmOrientation::Normal => left.shape.0[left.shape.0.len() - 2],
-        GemmOrientation::Swapped => right.shape.0[right.shape.0.len() - 1],
-    };
-    let local_rows = logical_rows.div_ceil(u32::from(compute_grid.rows));
-    let local_columns = block.output_columns.div_ceil(crate::AMP_COLUMN_MICRO);
-    let local_inner = block.inner.div_ceil(crate::AMP_COLUMN_MICRO);
-    let row_run_cycles = outer_rows
-        .saturating_mul(u64::from(local_rows))
-        .saturating_mul(4)
-        .saturating_add(costs.amp_grid_search_setup_cycles);
-    let compute = u64::from(local_columns)
-        .saturating_mul(u64::from(local_inner))
-        .saturating_mul(row_run_cycles);
-    let communication = u64::from(local_columns)
-        .saturating_mul(u64::from(local_inner))
-        .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
-        .saturating_add(
-            u64::from(local_rows)
-                .saturating_mul(u64::from(local_columns))
-                .saturating_mul(u64::from(compute_grid.inner.saturating_sub(1))),
-        );
-    let (left_precision, right_precision) = match orientation {
-        GemmOrientation::Normal => (left.format.precision, right.format.precision),
-        GemmOrientation::Swapped => (right.format.precision, left.format.precision),
-    };
-    let left_bytes = outer_rows
-        .saturating_mul(u64::from(local_rows))
-        .saturating_mul(u64::from(local_inner))
-        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
-        .saturating_mul(left_precision.bytes());
-    let right_bytes = u64::from(local_columns)
-        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
-        .saturating_mul(u64::from(local_inner))
-        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
-        .saturating_mul(right_precision.bytes());
-    let partial_bytes = outer_rows
-        .saturating_mul(u64::from(local_rows))
-        .saturating_mul(u64::from(local_columns))
-        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
-        .saturating_mul(output_precision.bytes());
-    let temporary_bytes = left_bytes
-        .saturating_add(right_bytes)
-        .saturating_add(partial_bytes)
-        .max(partial_bytes.saturating_mul(4));
-    if right_bytes.saturating_add(partial_bytes) > target.memory_constraints().interleaved_bytes {
-        return None;
-    }
-    Some(RegionMetrics {
-        cost: CostEstimate {
-            cycles: compute.saturating_add(communication),
-            exchange_cycles: communication,
-            ..CostEstimate::default()
-        },
-        memory: MemoryPeaks {
-            standard: temporary_bytes,
-            total: temporary_bytes,
-            ..MemoryPeaks::default()
-        },
-    })
-}
-
 impl CostModel for Ipu21CostModel {
     fn target(&self) -> HardwareTarget {
         HardwareTarget::Ipu21
@@ -1448,8 +1159,11 @@ impl CostModel for Ipu21CostModel {
         } else {
             ExchangeEndpointTraffic::default()
         };
-        let exchange_cycles =
-            exchange_endpoint_cycles(&endpoint_traffic, u64::from(changes_ownership));
+        let exchange = exchange::cost(
+            &endpoint_traffic,
+            u64::from(changes_ownership),
+            HardwareTarget::Ipu21,
+        );
         let changes_order = source.format.layout.order != destination.format.layout.order;
         let block_elements = |tensor: &TensorType| match tensor.format.layout.order {
             StorageOrder::Linear => maximum_shard_elements(tensor).max(1),
@@ -1502,12 +1216,9 @@ impl CostModel for Ipu21CostModel {
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
         CostEstimate {
-            cycles: exchange_cycles.saturating_add(local_cycles),
-            exchange_cycles,
-            exchange_footprint: exchange_endpoint_footprint(
-                &endpoint_traffic,
-                u64::from(changes_ownership),
-            ),
+            cycles: exchange.cycles.saturating_add(local_cycles),
+            exchange_cycles: exchange.exchange_cycles,
+            exchange_footprint: exchange.exchange_footprint,
         }
     }
 }
@@ -1550,7 +1261,8 @@ mod tests {
             let incoming = traffic.maximum_incoming_bytes();
             let phases = random.u64(1..=32);
             let fixed = phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles);
-            let cycles = exchange_endpoint_cycles(&traffic, phases);
+            let estimate = exchange::cost(&traffic, phases, HardwareTarget::Ipu21);
+            let cycles = estimate.cycles;
             assert_eq!(
                 cycles.saturating_sub(fixed),
                 outgoing
@@ -1569,9 +1281,9 @@ mod tests {
                 traffic.maximum_incoming_fragments(),
                 traffic.maximum_outgoing_fragments(),
             );
-            let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
+            let reversed = exchange::cost(&reversed_traffic, phases, HardwareTarget::Ipu21).cycles;
             assert_eq!(cycles, reversed, "case {case}");
-            let footprint = exchange_endpoint_footprint(&traffic, phases);
+            let footprint = estimate.exchange_footprint;
             let transfer_bytes = u64::from(
                 ipu_target::hardware::HardwareTarget::Ipu21
                     .exchange()
