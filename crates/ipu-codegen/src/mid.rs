@@ -1539,7 +1539,7 @@ fn operation_graph_inputs(operation: &Operation, graph: &ComputeGraph) -> Vec<Va
 fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,
-    mut plan: OperatorPlan,
+    plan: OperatorPlan,
     single_use_inputs: &[bool],
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
@@ -1610,7 +1610,6 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
-    let mut deferred_inputs = vec![None; converted.len()];
     for (input_index, ((&original, &converted), requirement)) in original_input_ids
         .iter()
         .zip(&converted)
@@ -1663,11 +1662,6 @@ fn apply_selected_plan(
                 &plan.dispatch,
                 producer_cycles,
             ));
-        deferred_inputs[input_index] = Some(DeferredInputPlan {
-            producer: original,
-            source,
-            transform,
-        });
         operations[producer_index].metrics.cost = CostEstimate::default();
     }
     tracing::trace!(
@@ -1694,7 +1688,6 @@ fn apply_selected_plan(
         &converted_types,
         &state.get(result).tensor_type,
     );
-    plan.deferred_inputs = deferred_inputs;
     operations.push(MidOperation {
         source: Some(operation.id),
         inputs: converted,
@@ -2048,7 +2041,6 @@ fn plans_for_operation(
                         output_aliasing: OutputAliasing::Fresh,
                         memory_space: MemorySpaceRequirements::default(),
                     },
-                    deferred_inputs: vec![None; 3],
                 });
             }
             if config.search_domain.attention_strategy != AttentionStrategy::Flash {
@@ -2085,7 +2077,6 @@ fn plans_for_operation(
                         output_aliasing: OutputAliasing::Fresh,
                         memory_space: MemorySpaceRequirements::default(),
                     },
-                    deferred_inputs: vec![None; 3],
                 });
             }
         }
@@ -2183,7 +2174,6 @@ fn pointwise_plans(
                     output_aliasing: aliasing,
                     memory_space: MemorySpaceRequirements::default(),
                 },
-                deferred_inputs: vec![None; inputs.len()],
             };
             if !plans.contains(&plan) {
                 plans.push(plan);
@@ -4603,9 +4593,6 @@ mod tests {
                     )
                 })
                 .unwrap();
-            let claims = &consumer.operator_plan().unwrap().deferred_inputs;
-            assert_eq!(claims.len(), split.len(), "random case {case}");
-            assert!(claims.iter().all(Option::is_some), "random case {case}");
             assert!(
                 consumer.metrics.cost.exchange_footprint.phases >= 2,
                 "random case {case}"

@@ -516,11 +516,9 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
     })
 }
 
-type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<LowShardId>)>;
-
-struct DeferredValue {
-    transform: DeferredTransform,
-    shards: Vec<LowShardId>,
+enum DeferredValue {
+    Conversion(MidValueId),
+    View(DeferredTransform, Vec<LowShardId>),
 }
 
 struct PreparedDistributedPanel {
@@ -643,9 +641,7 @@ struct LoweringState {
     local_copies: Vec<LocalCopy>,
     repeat_runs: Vec<RepeatRun>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
-    deferred_conversions: BTreeMap<MidValueId, MidValueId>,
     deferred_values: BTreeMap<MidValueId, DeferredValue>,
-    intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
 impl LoweringState {
@@ -672,9 +668,7 @@ impl LoweringState {
             local_copies: Vec::new(),
             repeat_runs: Vec::new(),
             kernel_metadata: Vec::new(),
-            deferred_conversions: BTreeMap::new(),
             deferred_values: BTreeMap::new(),
-            intersection_cache: BTreeMap::new(),
         };
         let parameter_origins = graph
             .inputs
@@ -949,17 +943,13 @@ impl LoweringState {
             .ok_or(LowLoweringError::UnknownValue(value))
     }
 
-    fn deferred_root(&self, mut value: MidValueId) -> Option<MidValueId> {
-        let mut remaining = self.deferred_conversions.len().saturating_add(1);
-        while !self.deferred_values.contains_key(&value) {
-            value = *self.deferred_conversions.get(&value)?;
-            remaining = remaining.checked_sub(1)?;
+    fn deferred_view(&self, mut value: MidValueId) -> Option<&DeferredValue> {
+        loop {
+            match self.deferred_values.get(&value)? {
+                DeferredValue::Conversion(source) => value = *source,
+                view @ DeferredValue::View(..) => return Some(view),
+            }
         }
-        Some(value)
-    }
-
-    fn has_deferred_value(&self, value: MidValueId) -> bool {
-        self.deferred_root(value).is_some()
     }
 
     fn deferred_supports_physical_exchange(
@@ -967,14 +957,10 @@ impl LoweringState {
         value: MidValueId,
         destination: LowShardId,
     ) -> bool {
-        let Some(root) = self.deferred_root(value) else {
+        let Some(DeferredValue::View(_, shards)) = self.deferred_view(value) else {
             return false;
         };
-        let Some(source) = self
-            .deferred_values
-            .get(&root)
-            .and_then(|deferred| deferred.shards.first())
-        else {
+        let Some(source) = shards.first() else {
             return false;
         };
         self.value_shards(value)
@@ -1008,38 +994,6 @@ impl LoweringState {
             .copied()
             .find(|shard| self.shards[shard.index() as usize].tile == tile)
             .ok_or(LowLoweringError::UnknownValue(value))
-    }
-
-    fn intersecting_shards(
-        &mut self,
-        source: MidValueId,
-        target: &[ShardExtent],
-        local_tile: u16,
-    ) -> LowLoweringResult<Vec<(Vec<ShardExtent>, LowShardId)>> {
-        let key = (source, target.to_vec());
-        if !self.intersection_cache.contains_key(&key) {
-            let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<LowShardId>>::new();
-            for shard in self.value_shards(source)?.to_vec() {
-                if let Some(extents) =
-                    intersect_extents(&self.shards[shard.index() as usize].extents, target)
-                {
-                    groups.entry(extents).or_default().push(shard);
-                }
-            }
-            self.intersection_cache
-                .insert(key.clone(), groups.into_iter().collect());
-        }
-        Ok(self.intersection_cache[&key]
-            .iter()
-            .map(|(extents, candidates)| {
-                let selected = candidates
-                    .iter()
-                    .copied()
-                    .find(|shard| self.shards[shard.index() as usize].tile == local_tile)
-                    .unwrap_or(candidates[0]);
-                (extents.clone(), selected)
-            })
-            .collect())
     }
 
     fn intersecting_shard_set(
@@ -1310,9 +1264,10 @@ impl LoweringState {
                 .ok_or(LowLoweringError::InvalidConversionPlan)?
             };
             self.deferred_values
-                .insert(*result, DeferredValue { transform, shards });
+                .insert(*result, DeferredValue::View(transform, shards));
         } else {
-            self.deferred_conversions.insert(*result, *source);
+            self.deferred_values
+                .insert(*result, DeferredValue::Conversion(*source));
         }
         for shard in self.value_shards(*result)?.to_vec() {
             self.shards[shard.index() as usize].definition = ShardDefinition::Unmaterialized;
@@ -1774,9 +1729,9 @@ impl LoweringState {
                 .0
                 .last()
                 .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-            let deferred_query = self.has_deferred_value(query);
+            let deferred_query = self.deferred_view(query).is_some();
             let query_shard = if deferred_query {
-                self.push_attention_buffer(
+                self.push_matrix_buffer(
                     tile,
                     rows,
                     rows,
@@ -1801,14 +1756,13 @@ impl LoweringState {
             .ok_or(LowLoweringError::IdOverflow)?;
             let direct_query = deferred_query
                 && (self.deferred_supports_physical_exchange(query, query_shard)
-                    || self.deferred_panel_benefits_from_word_exchange(
-                        query,
-                        &query_region,
+                    || self.mappings_benefit_from_word_exchange(
+                        &self.deferred_region_mappings(query, &query_region, query_shard)?,
                         query_shard,
                     )?);
             let query_receive = (deferred_query && !direct_query)
                 .then(|| {
-                    self.push_attention_buffer(
+                    self.push_matrix_buffer(
                         tile,
                         rows,
                         rows,
@@ -1826,7 +1780,7 @@ impl LoweringState {
                 StorageOrder::Native(NativeKernelOrder::Left),
                 MemoryClass::Interleaved,
             )?;
-            let key_staging = self.push_attention_buffer(
+            let key_staging = self.push_matrix_buffer(
                 tile,
                 shape.logical_staging_rows,
                 shape.physical_staging_rows,
@@ -1854,7 +1808,7 @@ impl LoweringState {
                 self.shards[weights.index() as usize].definition =
                     ShardDefinition::Alias(key_staging);
             }
-            let value_staging = self.push_attention_buffer(
+            let value_staging = self.push_matrix_buffer(
                 tile,
                 shape.logical_staging_rows,
                 shape.physical_staging_rows,
@@ -1893,7 +1847,7 @@ impl LoweringState {
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        if !self.has_deferred_value(query) {
+        if self.deferred_view(query).is_none() {
             return Ok(());
         }
         let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
@@ -1918,7 +1872,7 @@ impl LoweringState {
                 (0, task.query_dimension),
             ])
             .ok_or(LowLoweringError::IdOverflow)?;
-            self.gather_deferred_panel(
+            self.materialize_deferred_region(
                 query,
                 &region,
                 task.query_receive.unwrap_or(task.query),
@@ -2094,7 +2048,7 @@ impl LoweringState {
         if key_shards.len() != value_shards.len() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        if self.has_deferred_value(*key) != self.has_deferred_value(*value) {
+        if self.deferred_view(*key).is_some() != self.deferred_view(*value).is_some() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
@@ -2119,7 +2073,7 @@ impl LoweringState {
             reason: WorkReason::OperatorKernel,
         };
         self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
-        let deferred_key_value = self.has_deferred_value(*key);
+        let deferred_key_value = self.deferred_view(*key).is_some();
         let prepared_blocks = if deferred_key_value {
             self.prepare_attention_blocks(
                 *key,
@@ -2378,7 +2332,7 @@ impl LoweringState {
         if query_block_rows == 0
             || padded_key_rows == 0
             || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
-            || self.has_deferred_value(*key) != self.has_deferred_value(*value)
+            || self.deferred_view(*key).is_some() != self.deferred_view(*value).is_some()
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -2410,7 +2364,7 @@ impl LoweringState {
             reason: WorkReason::OperatorKernel,
         };
         self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
-        let prepared = if self.has_deferred_value(*key) {
+        let prepared = if self.deferred_view(*key).is_some() {
             self.prepare_attention_blocks(
                 *key,
                 *value,
@@ -2526,35 +2480,45 @@ impl LoweringState {
         Ok(())
     }
 
-    fn deferred_panel_mappings(
+    fn deferred_region_mappings(
         &self,
         value: MidValueId,
         logical_target: &TensorRegion,
         destination: LowShardId,
     ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
-        let deferred_root = self
-            .deferred_root(value)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let deferred = self
-            .deferred_values
-            .get(&deferred_root)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let deferred_shards = deferred.shards.clone();
-        let logical_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
-        let source_type = &self.shards[deferred.shards[0].index() as usize].tensor_type;
-        let mapping = deferred
-            .transform
-            .map_slice(&source_type.shape, &logical_type.shape, logical_target)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let target = mapping.source;
+        let mut source_value = value;
+        let (source_shards, target, source_axes) = loop {
+            match self.deferred_values.get(&source_value) {
+                Some(DeferredValue::Conversion(source)) => source_value = *source,
+                Some(DeferredValue::View(transform, shards)) => {
+                    let logical_type =
+                        &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
+                    let source_type = &self.shards[shards[0].index() as usize].tensor_type;
+                    let mapping = transform
+                        .map_slice(&source_type.shape, &logical_type.shape, logical_target)
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    break (shards.clone(), mapping.source, mapping.source_axes);
+                }
+                None => {
+                    break (
+                        self.value_shards(source_value)?.to_vec(),
+                        logical_target.clone(),
+                        (0..logical_target.len()).map(Some).collect(),
+                    );
+                }
+            }
+        };
         let destination_tile = self.shards[destination.index() as usize].tile;
+        let destination_extents = &self.shards[destination.index() as usize].extents;
+        if destination_extents.len() != source_axes.iter().flatten().count() {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
         let mut covered = 0u64;
         let mut mappings = Vec::new();
         for (source_extents, source) in
-            self.intersecting_shard_set(&deferred_shards, &target, destination_tile)
+            self.intersecting_shard_set(&source_shards, &target, destination_tile)
         {
-            let destination_extents = mapping
-                .source_axes
+            let mapped_extents = source_axes
                 .iter()
                 .flatten()
                 .enumerate()
@@ -2566,30 +2530,32 @@ impl LoweringState {
                         .get(source_axis)
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?
                         .start;
+                    let destination_base = destination_extents
+                        .get(destination_axis)
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?
+                        .start;
                     Ok(ShardExtent {
                         axis: u16::try_from(destination_axis)
                             .map_err(|_| LowLoweringError::IdOverflow)?,
-                        start: source.start - base,
-                        logical_end: source.logical_end - base,
-                        physical_end: source.logical_end - base,
+                        start: destination_base + source.start - base,
+                        logical_end: destination_base + source.logical_end - base,
+                        physical_end: destination_base + source.logical_end - base,
                     })
                 })
                 .collect::<LowLoweringResult<Vec<_>>>()?;
-            covered = covered.saturating_add(
-                u64::from(source_extents[1].logical_end - source_extents[1].start)
-                    * u64::from(source_extents[2].logical_end - source_extents[2].start),
-            );
+            covered = covered
+                .saturating_add(TensorRegion::new(source_extents.clone()).logical_elements());
             let source_view = ShardView {
                 shard: source,
                 extents: source_extents.into(),
             };
             let destination_view = ShardView {
                 shard: destination,
-                extents: destination_extents.into(),
+                extents: mapped_extents.into(),
             };
             mappings.push((source_view, destination_view));
         }
-        if covered != logical_target.logical_elements() {
+        if covered != target.logical_elements() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         Ok(mappings)
@@ -2708,17 +2674,7 @@ impl LoweringState {
         Ok(direct)
     }
 
-    fn deferred_panel_benefits_from_word_exchange(
-        &self,
-        value: MidValueId,
-        region: &TensorRegion,
-        destination: LowShardId,
-    ) -> LowLoweringResult<bool> {
-        let mappings = self.deferred_panel_mappings(value, region, destination)?;
-        self.mappings_benefit_from_word_exchange(&mappings, destination)
-    }
-
-    fn gather_deferred_panel(
+    fn materialize_deferred_region(
         &self,
         value: MidValueId,
         region: &TensorRegion,
@@ -2728,7 +2684,7 @@ impl LoweringState {
         local_copies: &mut Vec<(u16, LocalCopy)>,
     ) -> LowLoweringResult<()> {
         let destination_tile = self.shards[destination.index() as usize].tile;
-        let mappings = self.deferred_panel_mappings(value, region, destination)?;
+        let mappings = self.deferred_region_mappings(value, region, destination)?;
         for (source_view, destination_view) in mappings {
             let mappings = if order == ExchangeOrder::Physical {
                 self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
@@ -2801,7 +2757,7 @@ impl LoweringState {
                     % stream_destinations.len();
                 let tile = stream_destinations[owner];
                 let tile = self.shards[tile.index() as usize].tile;
-                let packed = self.push_attention_buffer(
+                let packed = self.push_matrix_buffer(
                     tile,
                     valid_rows,
                     AMP_INNER_BLOCK,
@@ -2817,14 +2773,17 @@ impl LoweringState {
                 .ok_or(LowLoweringError::IdOverflow)?;
                 let physical = self.deferred_supports_physical_exchange(value, packed);
                 let word_exchange = !physical
-                    && self.deferred_panel_benefits_from_word_exchange(value, &region, packed)?;
+                    && self.mappings_benefit_from_word_exchange(
+                        &self.deferred_region_mappings(value, &region, packed)?,
+                        packed,
+                    )?;
                 if word_exchange && self.shard_has_padding(packed) {
                     self.append_fill_zero(tiles, packed, provenance.clone())?;
                 }
                 let row_major = if physical || word_exchange {
                     None
                 } else {
-                    Some(self.push_attention_buffer(
+                    Some(self.push_matrix_buffer(
                         tile,
                         valid_rows,
                         valid_rows,
@@ -2835,7 +2794,7 @@ impl LoweringState {
                 };
                 let gather_destination = row_major.unwrap_or(packed);
                 let mut local_copies = Vec::new();
-                self.gather_deferred_panel(
+                self.materialize_deferred_region(
                     value,
                     &region,
                     gather_destination,
@@ -3055,7 +3014,7 @@ impl LoweringState {
         })
     }
 
-    fn push_attention_buffer(
+    fn push_matrix_buffer(
         &mut self,
         tile: u16,
         logical_rows: u32,
@@ -3274,9 +3233,9 @@ impl LoweringState {
     ) -> LowLoweringResult<ShardView> {
         let target = self.local_shard(value, tile)?;
         let target_view = self.narrow_view(target, ranges)?;
-        let Some(source_value) = self.deferred_conversions.get(&value).copied() else {
+        if !self.deferred_values.contains_key(&value) {
             return Ok(target_view);
-        };
+        }
 
         let staging = self.push_shard(LowShard {
             id: LowShardId(0),
@@ -3285,34 +3244,14 @@ impl LoweringState {
             extents: target_view.extents.clone(),
             definition: ShardDefinition::ExchangeStaging,
         })?;
-        let intersections = self.intersecting_shards(source_value, &target_view.extents, tile)?;
-        if intersections.is_empty() {
-            return Err(LowLoweringError::InvalidConversionPlan);
-        }
-        for (extents, source) in intersections {
-            let source_view = ShardView {
-                shard: source,
-                extents: extents.clone().into(),
-            };
-            let destination_view = ShardView {
-                shard: staging,
-                extents: extents.into(),
-            };
-            if self.shards[source.index() as usize].tile == tile {
-                append_logical_span_copies(
-                    &self.shards,
-                    &source_view,
-                    &destination_view,
-                    tile,
-                    local_copies,
-                )?;
-            } else {
-                transfers
-                    .entry(source_view)
-                    .or_default()
-                    .push(destination_view);
-            }
-        }
+        self.materialize_deferred_region(
+            value,
+            &target_view.extents.logical(),
+            staging,
+            ExchangeOrder::Semantic,
+            transfers,
+            local_copies,
+        )?;
         Ok(self.full_view(staging))
     }
 
@@ -3590,9 +3529,9 @@ impl LoweringState {
                     transfers,
                     WorkProvenance {
                         operation: operation.source,
-                        value: (!self.deferred_conversions.contains_key(left_value))
+                        value: (!self.deferred_values.contains_key(left_value))
                             .then_some(*right_value),
-                        reason: if self.deferred_conversions.contains_key(left_value) {
+                        reason: if self.deferred_values.contains_key(left_value) {
                             WorkReason::OperatorInputs
                         } else {
                             WorkReason::OperatorInput { input: 1 }
@@ -4699,9 +4638,9 @@ impl LoweringState {
                     transfers,
                     WorkProvenance {
                         operation: operation.source,
-                        value: (!self.deferred_conversions.contains_key(left_value))
+                        value: (!self.deferred_values.contains_key(left_value))
                             .then_some(*right_value),
-                        reason: if self.deferred_conversions.contains_key(left_value) {
+                        reason: if self.deferred_values.contains_key(left_value) {
                             WorkReason::OperatorInputs
                         } else {
                             WorkReason::OperatorInput { input: 1 }
@@ -6156,6 +6095,90 @@ mod tests {
                         "case {case}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn randomized_deferred_views_materialize_arbitrary_regions() {
+        let mut random = fastrand::Rng::with_seed(0x7669_6577_5f72_6567);
+        for case in 0..CASES {
+            let batch = random.u32(1..=4);
+            let heads = random.u32(2..=6);
+            let rows = random.u32(1..=2) * AMP_INNER_BLOCK;
+            let width = random.u32(1..=2) * AMP_COLUMN_MICRO;
+            let tiles = u16::try_from(batch * heads).unwrap();
+            let mut graph = ComputeGraph::new();
+            let input = graph
+                .host_input("input", [batch, rows, heads * width])
+                .unwrap();
+            let output = graph.split_heads(input, heads).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(tiles).with_automatic_input(input, Precision::F16);
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let operation = mid
+                .operations
+                .iter()
+                .find(|operation| matches!(operation.kind, MidOperationKind::View(..)))
+                .unwrap();
+            let MidOperationKind::View(transform, ..) = operation.kind else {
+                unreachable!()
+            };
+            let (source, result) = (operation.inputs[0], operation.results[0]);
+            let mut state = LoweringState::new(&mid, tiles, config.target).unwrap();
+            state.deferred_values.insert(
+                result,
+                DeferredValue::View(transform, state.value_shards(source).unwrap().to_vec()),
+            );
+
+            let stream = random.u32(0..batch * heads);
+            let row_start = random.u32(0..rows);
+            let row_end = random.u32(row_start + 1..=rows);
+            let column_start = random.u32(0..width);
+            let column_end = random.u32(column_start + 1..=width);
+            let region = TensorRegion::logical_bounds([
+                (stream, stream + 1),
+                (row_start, row_end),
+                (column_start, column_end),
+            ])
+            .unwrap();
+            let destination = state
+                .push_matrix_buffer(
+                    random.u16(0..tiles),
+                    row_end - row_start,
+                    row_end - row_start,
+                    column_end - column_start,
+                    column_end - column_start,
+                    StorageOrder::Linear,
+                )
+                .unwrap();
+            let mappings = state
+                .deferred_region_mappings(result, &region, destination)
+                .unwrap_or_else(|error| panic!("case {case}: {error}"));
+            assert_eq!(
+                mappings
+                    .iter()
+                    .map(|(source, _)| source.extents.logical_elements())
+                    .sum::<u64>(),
+                region.logical_elements(),
+                "case {case}"
+            );
+            for (source, destination) in mappings {
+                assert_eq!(
+                    [
+                        source.extents[0].start,
+                        source.extents[1].start - row_start,
+                        source.extents[2].start - (stream % heads) * width - column_start,
+                        u32::try_from(source.extents.logical_elements()).unwrap(),
+                    ],
+                    [
+                        stream / heads,
+                        destination.extents[0].start,
+                        destination.extents[1].start,
+                        u32::try_from(destination.extents.logical_elements()).unwrap(),
+                    ],
+                    "case {case}"
+                );
             }
         }
     }

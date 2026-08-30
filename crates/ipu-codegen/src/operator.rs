@@ -1,8 +1,6 @@
 //! Whole-device operator plans and tile-kernel specifications.
 
-use crate::conversion::DeferredTransform;
 use crate::graph::{AddOptions, AttentionOptions, GemmOptions, TensorShape};
-use crate::ir::MidValueId;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, NativeKernelOrder, StorageOrder,
     TensorAxis, TensorFormat, TensorType,
@@ -137,13 +135,6 @@ impl AttentionPlan {
             },
         ]
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeferredInputPlan {
-    pub producer: MidValueId,
-    pub source: MidValueId,
-    pub transform: DeferredTransform,
 }
 
 /// Which operand remains resident while a blocked whole-device GEMM is run.
@@ -403,8 +394,6 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: OperatorRequirements,
-    /// Deferred producer results claimed by each input operand.
-    pub deferred_inputs: Vec<Option<DeferredInputPlan>>,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -456,12 +445,10 @@ impl OperatorPlan {
         dispatch: OperatorDispatch,
         requirements: OperatorRequirements,
     ) -> Self {
-        let input_count = requirements.inputs.len();
         Self {
             operator,
             dispatch,
             requirements,
-            deferred_inputs: vec![None; input_count],
         }
     }
 
