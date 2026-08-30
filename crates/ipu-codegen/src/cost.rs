@@ -670,11 +670,20 @@ fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
-fn estimated_operator_exchange_cycles(
+fn exchange_cost(traffic: &ExchangeEndpointTraffic, phases: u64) -> CostEstimate {
+    let cycles = exchange_endpoint_cycles(traffic, phases);
+    CostEstimate {
+        cycles,
+        exchange_cycles: cycles,
+        exchange_footprint: exchange_endpoint_footprint(traffic, phases),
+    }
+}
+
+fn estimated_operator_exchange(
     dispatch: &OperatorDispatch,
     inputs: &[TensorType],
     output: &TensorType,
-) -> u64 {
+) -> CostEstimate {
     match dispatch {
         OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
             geometry:
@@ -725,10 +734,8 @@ fn estimated_operator_exchange_cycles(
                 2,
                 u64::from(reduction.compute.inner.saturating_sub(1)),
             );
-            exchange_endpoint_cycles(&endpoint, 1).saturating_add(exchange_endpoint_cycles(
-                &reduction,
-                u64::from(reduction_epochs),
-            ))
+            exchange_cost(&endpoint, 1)
+                .sequence(exchange_cost(&reduction, u64::from(reduction_epochs)))
         }
         OperatorDispatch::BlockedGemm(_) => {
             let compute_output = gemm_partial_tensor(dispatch, output);
@@ -746,15 +753,15 @@ fn estimated_operator_exchange_cycles(
                     u64::MAX / 16,
                 )
             });
-            exchange_endpoint_cycles(
+            exchange_cost(
                 &traffic,
                 gemm_exchange_phase_count(dispatch, inputs, &compute_output),
             )
         }
         OperatorDispatch::Attention(_) => attention_endpoint_traffic(inputs, output, dispatch)
-            .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
-            .unwrap_or(u64::MAX / 8),
-        OperatorDispatch::Pointwise(_) => 0,
+            .map(|(traffic, phases)| exchange_cost(&traffic, phases))
+            .unwrap_or_else(impossible_conversion_cost),
+        OperatorDispatch::Pointwise(_) => CostEstimate::default(),
     }
 }
 
@@ -1145,7 +1152,7 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     0
                 };
-                let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
+                let exchange = estimated_operator_exchange(dispatch, inputs, output).cycles;
                 let reduction_work = match dispatch {
                     OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
                         geometry:
@@ -1258,7 +1265,7 @@ impl CostModel for Ipu21CostModel {
                             .saturating_mul(2)
                             .div_ceil(128);
                         let blocks = key_rows.div_ceil(u64::from(*key_block_rows));
-                        let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
+                        let exchange = estimated_operator_exchange(dispatch, inputs, output).cycles;
                         arithmetic
                             .saturating_add(
                                 blocks
@@ -1280,9 +1287,9 @@ impl CostModel for Ipu21CostModel {
                             .saturating_add(
                                 4u64.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
                             )
-                            .saturating_add(estimated_operator_exchange_cycles(
-                                dispatch, inputs, output,
-                            ))
+                            .saturating_add(
+                                estimated_operator_exchange(dispatch, inputs, output).cycles,
+                            )
                     }
                     _ => query_rows
                         .saturating_mul(key_rows)
@@ -1311,7 +1318,7 @@ impl CostModel for Ipu21CostModel {
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
-        estimated_operator_exchange_cycles(dispatch, inputs, output)
+        estimated_operator_exchange(dispatch, inputs, output).exchange_cycles
     }
 
     fn deferred_input_cycles(
@@ -1356,56 +1363,7 @@ impl CostModel for Ipu21CostModel {
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
-        let phases = match dispatch {
-            OperatorDispatch::Attention(plan) => match plan.blocking {
-                crate::AttentionBlocking::Flash { key_rows, .. } => inputs
-                    .get(1)
-                    .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
-                    .copied()
-                    .map_or(0, u64::from)
-                    .div_ceil(u64::from(key_rows).max(1))
-                    .saturating_add(2),
-                crate::AttentionBlocking::Materialized { .. } => 3,
-            },
-            _ => gemm_exchange_phase_count(dispatch, inputs, output),
-        };
-        let phases = match dispatch {
-            OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
-                geometry:
-                    crate::GemmGeometry {
-                        distribution: GemmDistribution::ParallelReduction(reduction),
-                        ..
-                    },
-                ..
-            }) => {
-                let remote_partials_per_stage = match reduction.staging {
-                    crate::ReductionStaging::Complete => reduction.compute.inner.saturating_sub(1),
-                    crate::ReductionStaging::Streamed => 1,
-                };
-                1u64.saturating_add(u64::from(
-                    reduction
-                        .compute
-                        .inner
-                        .saturating_sub(1)
-                        .div_ceil(remote_partials_per_stage.max(1)),
-                ))
-            }
-            _ => phases,
-        };
-        if phases == 0 {
-            return ExchangeFootprint::default();
-        }
-        if matches!(dispatch, OperatorDispatch::Attention(_)) {
-            let Some((traffic, _)) = attention_endpoint_traffic(inputs, output, dispatch) else {
-                return ExchangeFootprint::default();
-            };
-            return exchange_endpoint_footprint(&traffic, phases);
-        }
-        let Some(traffic) = gemm_exchange_endpoint_traffic(dispatch, inputs, output, self.target())
-        else {
-            return ExchangeFootprint::default();
-        };
-        exchange_endpoint_footprint(&traffic, phases)
+        estimated_operator_exchange(dispatch, inputs, output).exchange_footprint
     }
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {

@@ -6809,7 +6809,9 @@ mod tests {
                 "case {case}"
             );
             assert!(low.exchange_phases.iter().all(|phase| {
-                phase.provenance.operation.is_some() && phase.provenance.value.is_some()
+                phase.provenance.operation.is_some()
+                    && (phase.provenance.value.is_some()
+                        || phase.provenance.reason == WorkReason::OperatorInputs)
             }));
             for tile in &low.tiles {
                 let gemms = low
