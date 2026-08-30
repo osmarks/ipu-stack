@@ -3,8 +3,7 @@
 use super::exchange::ExchangeEndpointTraffic;
 use crate::graph::TensorShape;
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorRegion,
-    TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorRegion, TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
 use crate::mid::{MidOperation, MidOperationKind, MidValue, MidValueId};
@@ -1063,6 +1062,7 @@ mod tests {
                 [rows, columns],
                 Precision::F16,
                 Layout::amp_output_grid(
+                    crate::GemmOrientation::Normal,
                     64,
                     tiles,
                     row_partitions,
@@ -1097,6 +1097,7 @@ mod tests {
                 [1, rows, columns],
                 Precision::F16,
                 Layout::amp_output_grid(
+                    crate::GemmOrientation::Normal,
                     crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                     tiles,
                     row_partitions,
@@ -1146,6 +1147,7 @@ mod tests {
                 [1, inner, columns],
                 Precision::F16,
                 Layout::block_major_matrix_storage(
+                    crate::GemmOrientation::Normal,
                     AMP_INNER_BLOCK as u16,
                     crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                     column_partitions,
@@ -1190,6 +1192,7 @@ mod tests {
                 [1, rows, inner],
                 Precision::F16,
                 Layout::amp_left_parallel_grid(
+                    crate::GemmOrientation::Normal,
                     inner_block,
                     tiles,
                     row_partitions,
@@ -1201,6 +1204,7 @@ mod tests {
                 [1, inner, columns],
                 Precision::F16,
                 Layout::block_major_matrix_storage(
+                    crate::GemmOrientation::Normal,
                     inner_block,
                     column_block,
                     column_partitions,
@@ -1213,6 +1217,7 @@ mod tests {
                 [1, rows, columns],
                 Precision::F16,
                 Layout::amp_left_result_grid(
+                    crate::GemmOrientation::Normal,
                     column_block,
                     row_partitions * column_partitions,
                     row_partitions,
@@ -1235,6 +1240,7 @@ mod tests {
                 [1, inner, columns],
                 Precision::F16,
                 Layout::block_major_matrix_storage(
+                    crate::GemmOrientation::Normal,
                     inner_block,
                     column_block,
                     column_partitions,

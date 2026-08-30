@@ -100,6 +100,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let left_format = TensorFormat {
             precision: Precision::F16,
             layout: Layout::amp_left_parallel_grid(
+                crate::GemmOrientation::Normal,
                 64,
                 tiles,
                 row_partitions,
@@ -110,6 +111,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let right_format = TensorFormat {
             precision: Precision::F16,
             layout: Layout::block_major_matrix_storage(
+                crate::GemmOrientation::Normal,
                 64,
                 output_columns,
                 column_partitions,
@@ -252,6 +254,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
         let right_format = TensorFormat {
             precision: Precision::F16,
             layout: Layout::block_major_matrix_storage(
+                crate::GemmOrientation::Normal,
                 64,
                 64,
                 1,
@@ -845,7 +848,14 @@ fn randomized_gemm_grid_orders_align_operands_and_pair_shared_payloads() {
             let output = TensorType::new(
                 [rows, columns],
                 Precision::F16,
-                Layout::amp_output_grid(64, tiles, row_partitions, column_partitions, order),
+                Layout::amp_output_grid(
+                    crate::GemmOrientation::Normal,
+                    64,
+                    tiles,
+                    row_partitions,
+                    column_partitions,
+                    order,
+                ),
             );
             let left = shard_extents(&left).unwrap();
             let right = shard_extents(&right).unwrap();
@@ -1331,6 +1341,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let right_format = TensorFormat {
             precision: Precision::F16,
             layout: Layout::block_major_matrix_storage(
+                crate::GemmOrientation::Normal,
                 64,
                 64,
                 column_partitions,

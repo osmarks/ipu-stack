@@ -1349,6 +1349,7 @@ mod tests {
             let logical_output_shape =
                 TensorShape::new([batch * u32::from(groups), rows, head_columns]);
             let ordinary_layout = Layout::amp_left_result_grid(
+                crate::GemmOrientation::Normal,
                 crate::layout::AMP_COLUMN_MICRO,
                 column_partitions,
                 1,

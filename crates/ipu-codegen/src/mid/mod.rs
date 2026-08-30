@@ -2450,7 +2450,14 @@ mod tests {
             let output = TensorType::new(
                 [m, n],
                 Precision::F16,
-                Layout::amp_output_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
+                Layout::amp_output_grid(
+                    GemmOrientation::Normal,
+                    64,
+                    tiles,
+                    rows,
+                    columns,
+                    GridOrder::ColumnsFast,
+                ),
             );
             let operator = MidOperator::Gemm {
                 options: GemmOptions::default(),
@@ -2775,6 +2782,7 @@ mod tests {
             let right = format(
                 Precision::F16,
                 Layout::block_major_matrix_storage(
+                    GemmOrientation::Normal,
                     64,
                     AMP_OUTPUT_COLUMN_BLOCK,
                     tiles,

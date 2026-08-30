@@ -177,6 +177,7 @@ pub(super) fn amp_grid_gemm_plan(
             geometry.order,
         ),
         (inner_partitions, memory_class) => Layout::block_major_matrix_storage(
+            GemmOrientation::Normal,
             inner,
             storage_column_block,
             grid.columns,
@@ -230,6 +231,7 @@ pub(super) fn amp_grid_gemm_plan(
                     precision,
                     layout: if precision == Precision::F16 {
                         Layout::amp_left_result_grid(
+                            GemmOrientation::Normal,
                             storage_column_block,
                             grid.tile_count(),
                             grid.rows,
@@ -238,6 +240,7 @@ pub(super) fn amp_grid_gemm_plan(
                         )
                     } else {
                         Layout::amp_output_grid(
+                            GemmOrientation::Normal,
                             storage_column_block,
                             grid.tile_count(),
                             grid.rows,
@@ -553,6 +556,7 @@ pub(super) fn independent_parameter_storage(
             let mut independent = candidate.clone();
             independent.requirements.inputs[input_index].format.layout =
                 Layout::block_major_matrix_storage(
+                    GemmOrientation::Normal,
                     inner_block,
                     output_column_block,
                     column_partitions,
@@ -816,6 +820,7 @@ fn parallel_reduction_plans_for_orientation(
             match orientation {
                 GemmOrientation::Normal => {
                     variant.requirements.inputs[0].format.layout = Layout::amp_left_parallel_grid(
+                        orientation,
                         kernel_inner_block_u16,
                         used_tiles,
                         row_partitions,
@@ -824,6 +829,7 @@ fn parallel_reduction_plans_for_orientation(
                     );
                     variant.requirements.inputs[1].format.layout =
                         Layout::block_major_matrix_storage(
+                            orientation,
                             kernel_inner_block_u16,
                             kernel_output_columns,
                             column_partitions,
@@ -836,6 +842,7 @@ fn parallel_reduction_plans_for_orientation(
                         TensorAxis::FromEnd(1),
                     );
                     variant.requirements.output.format.layout = Layout::amp_left_result_grid(
+                        orientation,
                         kernel_output_columns,
                         row_partitions.saturating_mul(column_partitions),
                         row_partitions,
@@ -849,7 +856,8 @@ fn parallel_reduction_plans_for_orientation(
                 }
                 GemmOrientation::Swapped => {
                     let mut physical_left = variant.requirements.inputs[1].clone();
-                    physical_left.format.layout = Layout::amp_transposed_left_parallel_grid(
+                    physical_left.format.layout = Layout::amp_left_parallel_grid(
+                        orientation,
                         kernel_inner_block_u16,
                         used_tiles,
                         row_partitions,
@@ -858,7 +866,8 @@ fn parallel_reduction_plans_for_orientation(
                     );
                     physical_left.materialization = OperandMaterialization::DispatchSlices;
                     let mut physical_right = variant.requirements.inputs[0].clone();
-                    physical_right.format.layout = Layout::transposed_block_major_matrix_storage(
+                    physical_right.format.layout = Layout::block_major_matrix_storage(
+                        orientation,
                         kernel_inner_block_u16,
                         kernel_output_columns,
                         column_partitions,
@@ -872,14 +881,14 @@ fn parallel_reduction_plans_for_orientation(
                     );
                     physical_right.materialization = OperandMaterialization::Complete;
                     variant.requirements.inputs = vec![physical_right, physical_left];
-                    variant.requirements.output.format.layout =
-                        Layout::amp_transposed_left_result_grid(
-                            kernel_output_columns,
-                            row_partitions.saturating_mul(column_partitions),
-                            row_partitions,
-                            column_partitions,
-                            GridOrder::ColumnsFast,
-                        );
+                    variant.requirements.output.format.layout = Layout::amp_left_result_grid(
+                        orientation,
+                        kernel_output_columns,
+                        row_partitions.saturating_mul(column_partitions),
+                        row_partitions,
+                        column_partitions,
+                        GridOrder::ColumnsFast,
+                    );
                     balance_parallel_gemm_columns(
                         &mut variant.requirements.output.format.layout,
                         TensorAxis::FromEnd(2),
@@ -970,22 +979,14 @@ fn parallel_reduction_plans_for_orientation(
                         plan.geometry.result.columns = result_columns;
                         plan.geometry.order = grid_order;
                     }
-                    let mut result_layout = match orientation {
-                        GemmOrientation::Normal => Layout::amp_left_result_grid(
-                            result_column_block,
-                            result_rows.saturating_mul(result_columns),
-                            result_rows,
-                            result_columns,
-                            grid_order,
-                        ),
-                        GemmOrientation::Swapped => Layout::amp_transposed_left_result_grid(
-                            result_column_block,
-                            result_rows.saturating_mul(result_columns),
-                            result_rows,
-                            result_columns,
-                            grid_order,
-                        ),
-                    };
+                    let mut result_layout = Layout::amp_left_result_grid(
+                        orientation,
+                        result_column_block,
+                        result_rows.saturating_mul(result_columns),
+                        result_rows,
+                        result_columns,
+                        grid_order,
+                    );
                     let physical_column_axis = orientation.column_axis();
                     balance_parallel_gemm_columns(&mut result_layout, physical_column_axis);
                     result_variant.requirements.output.format.layout = result_layout;

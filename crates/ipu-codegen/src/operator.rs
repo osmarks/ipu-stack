@@ -289,40 +289,23 @@ impl BlockedGemmPlan {
         let rows = reduction.compute.rows;
         let columns = reduction.compute.columns;
         let tiles = rows.checked_mul(columns)?;
-        let mut layout = match (self.geometry.orientation, output.format.layout.order) {
-            (GemmOrientation::Normal, StorageOrder::Native(NativeKernelOrder::Left)) => {
-                Layout::amp_left_result_grid(
-                    self.geometry.block.output_columns,
-                    tiles,
-                    rows,
-                    columns,
-                    GridOrder::ColumnsFast,
-                )
-            }
-            (GemmOrientation::Swapped, StorageOrder::Native(NativeKernelOrder::TransposedLeft)) => {
-                Layout::amp_transposed_left_result_grid(
-                    self.geometry.block.output_columns,
-                    tiles,
-                    rows,
-                    columns,
-                    GridOrder::ColumnsFast,
-                )
-            }
-            (GemmOrientation::Normal, _) => Layout::amp_output_grid(
-                self.geometry.block.output_columns,
-                tiles,
-                rows,
-                columns,
-                GridOrder::ColumnsFast,
-            ),
-            (GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
-                self.geometry.block.output_columns,
-                tiles,
-                rows,
-                columns,
-                GridOrder::ColumnsFast,
-            ),
+        let left_order = match self.geometry.orientation {
+            GemmOrientation::Normal => NativeKernelOrder::Left,
+            GemmOrientation::Swapped => NativeKernelOrder::TransposedLeft,
         };
+        let constructor = if output.format.layout.order == StorageOrder::Native(left_order) {
+            Layout::amp_left_result_grid
+        } else {
+            Layout::amp_output_grid
+        };
+        let mut layout = constructor(
+            self.geometry.orientation,
+            self.geometry.block.output_columns,
+            tiles,
+            rows,
+            columns,
+            GridOrder::ColumnsFast,
+        );
         let axis = layout
             .tiling
             .axes

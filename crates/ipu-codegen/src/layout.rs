@@ -1,5 +1,5 @@
 use crate::graph::TensorShape;
-use crate::operator::{GridOrder, Precision};
+use crate::operator::{GemmOrientation, GridOrder, Precision};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -421,6 +421,7 @@ impl Layout {
 
     pub fn block_major_matrix(row_block: u16, tile_count: u16) -> Self {
         Self::block_major_matrix_storage(
+            GemmOrientation::Normal,
             row_block,
             AMP_OUTPUT_COLUMN_BLOCK,
             tile_count,
@@ -488,6 +489,7 @@ impl Layout {
     /// are true shards; the column coordinate is a replica because the same
     /// activation range is consumed by each output-column group.
     pub fn amp_left_parallel_grid(
+        orientation: GemmOrientation,
         inner: u16,
         tile_count: u16,
         row_partitions: u16,
@@ -495,46 +497,21 @@ impl Layout {
         inner_partitions: u16,
     ) -> Self {
         Self {
-            order: StorageOrder::Native(NativeKernelOrder::Left),
+            order: StorageOrder::Native(match orientation {
+                GemmOrientation::Normal => NativeKernelOrder::Left,
+                GemmOrientation::Swapped => NativeKernelOrder::TransposedLeft,
+            }),
             tiling: TensorTiling {
                 tile_count,
                 replicas: column_partitions,
                 axes: vec![
                     AxisTiling::new(
-                        TensorAxis::FromEnd(1),
+                        orientation.column_axis(),
                         inner_partitions,
                         u32::from(inner),
                         Padding::Zero,
                     ),
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
-                ],
-            },
-            memory_class: MemoryClass::Standard,
-        }
-    }
-
-    /// A semantic right-hand matrix `[K, N]` packed as the physical left
-    /// operand `[N, K]` on a row-by-column-by-K dispatch grid.
-    pub fn amp_transposed_left_parallel_grid(
-        inner: u16,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        inner_partitions: u16,
-    ) -> Self {
-        Self {
-            order: StorageOrder::Native(NativeKernelOrder::TransposedLeft),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: column_partitions,
-                axes: vec![
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(2),
-                        inner_partitions,
-                        u32::from(inner),
-                        Padding::Zero,
-                    ),
-                    AxisTiling::new(TensorAxis::FromEnd(1), row_partitions, 1, Padding::Reject),
+                    AxisTiling::new(orientation.row_axis(), row_partitions, 1, Padding::Reject),
                 ],
             },
             memory_class: MemoryClass::Standard,
@@ -578,6 +555,7 @@ impl Layout {
     /// selected memory class. Column and row sharding select the owner set;
     /// `copies` controls persistent replication independently of consumers.
     pub fn block_major_matrix_storage(
+        orientation: GemmOrientation,
         inner_block: u16,
         output_column_block: u32,
         column_partitions: u16,
@@ -590,64 +568,27 @@ impl Layout {
             .and_then(|tiles| tiles.checked_mul(copies))
             .unwrap_or(0);
         Self {
-            order: StorageOrder::Blocked(BlockedOrder::matrix(
-                inner_block,
-                AMP_COLUMN_MICRO as u16,
-            )),
+            order: StorageOrder::Blocked(match orientation {
+                GemmOrientation::Normal => {
+                    BlockedOrder::matrix(inner_block, AMP_COLUMN_MICRO as u16)
+                }
+                GemmOrientation::Swapped => {
+                    BlockedOrder::transposed_matrix(inner_block, AMP_COLUMN_MICRO as u16)
+                }
+            }),
             tiling: TensorTiling {
                 tile_count,
                 replicas: copies,
                 axes: vec![
                     AxisTiling::new(
-                        TensorAxis::FromEnd(1),
+                        orientation.column_axis(),
                         column_partitions,
                         output_column_block,
                         Padding::Zero,
                     )
                     .with_tile_stride(1),
                     AxisTiling::new(
-                        TensorAxis::FromEnd(2),
-                        inner_partitions,
-                        u32::from(inner_block),
-                        Padding::Zero,
-                    ),
-                ],
-            },
-            memory_class,
-        }
-    }
-
-    /// A semantic matrix `[M, K]` stored in transposed contiguous blocks.
-    pub fn transposed_block_major_matrix_storage(
-        inner_block: u16,
-        output_column_block: u32,
-        column_partitions: u16,
-        inner_partitions: u16,
-        copies: u16,
-        memory_class: MemoryClass,
-    ) -> Self {
-        let tile_count = column_partitions
-            .checked_mul(inner_partitions)
-            .and_then(|tiles| tiles.checked_mul(copies))
-            .unwrap_or(0);
-        Self {
-            order: StorageOrder::Blocked(BlockedOrder::transposed_matrix(
-                inner_block,
-                AMP_COLUMN_MICRO as u16,
-            )),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: copies,
-                axes: vec![
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(2),
-                        column_partitions,
-                        output_column_block,
-                        Padding::Zero,
-                    )
-                    .with_tile_stride(1),
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(1),
+                        orientation.row_axis(),
                         inner_partitions,
                         u32::from(inner_block),
                         Padding::Zero,
@@ -660,26 +601,31 @@ impl Layout {
 
     /// AMP output distributed over both matrix axes on one tile grid.
     pub fn amp_output_grid(
+        orientation: GemmOrientation,
         output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
         column_partitions: u16,
         grid_order: GridOrder,
     ) -> Self {
-        if output_column_block == AMP_OUTPUT_COLUMN_BLOCK
+        if orientation == GemmOrientation::Normal
+            && output_column_block == AMP_OUTPUT_COLUMN_BLOCK
             && column_partitions == 1
             && row_partitions == tile_count
         {
             return Self::amp_output(tile_count);
         }
         Self {
-            order: StorageOrder::Native(NativeKernelOrder::Output),
+            order: StorageOrder::Native(match orientation {
+                GemmOrientation::Normal => NativeKernelOrder::Output,
+                GemmOrientation::Swapped => NativeKernelOrder::TransposedOutput,
+            }),
             tiling: TensorTiling {
                 tile_count,
                 replicas: 1,
                 axes: vec![
                     AxisTiling::new(
-                        TensorAxis::FromEnd(1),
+                        orientation.column_axis(),
                         column_partitions,
                         output_column_block,
                         Padding::Zero,
@@ -688,7 +634,7 @@ impl Layout {
                         GridOrder::ColumnsFast => 1,
                         GridOrder::RowsFast => row_partitions,
                     }),
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject)
+                    AxisTiling::new(orientation.row_axis(), row_partitions, 1, Padding::Reject)
                         .with_tile_stride(match grid_order {
                             GridOrder::ColumnsFast => column_partitions,
                             GridOrder::RowsFast => 1,
@@ -700,6 +646,7 @@ impl Layout {
     }
 
     pub fn amp_left_result_grid(
+        orientation: GemmOrientation,
         output_column_block: u32,
         tile_count: u16,
         row_partitions: u16,
@@ -707,66 +654,17 @@ impl Layout {
         grid_order: GridOrder,
     ) -> Self {
         let mut layout = Self::amp_output_grid(
+            orientation,
             output_column_block,
             tile_count,
             row_partitions,
             column_partitions,
             grid_order,
         );
-        layout.order = StorageOrder::Native(NativeKernelOrder::Left);
-        layout
-    }
-
-    /// A semantic output `[M, N]` packed as the physical AMP output `[N, M]`.
-    pub fn amp_transposed_output_grid(
-        output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        grid_order: GridOrder,
-    ) -> Self {
-        Self {
-            order: StorageOrder::Native(NativeKernelOrder::TransposedOutput),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: 1,
-                axes: vec![
-                    AxisTiling::new(
-                        TensorAxis::FromEnd(2),
-                        column_partitions,
-                        output_column_block,
-                        Padding::Zero,
-                    )
-                    .with_tile_stride(match grid_order {
-                        GridOrder::ColumnsFast => 1,
-                        GridOrder::RowsFast => row_partitions,
-                    }),
-                    AxisTiling::new(TensorAxis::FromEnd(1), row_partitions, 1, Padding::Reject)
-                        .with_tile_stride(match grid_order {
-                            GridOrder::ColumnsFast => column_partitions,
-                            GridOrder::RowsFast => 1,
-                        }),
-                ],
-            },
-            memory_class: MemoryClass::Interleaved,
-        }
-    }
-
-    pub fn amp_transposed_left_result_grid(
-        output_column_block: u32,
-        tile_count: u16,
-        row_partitions: u16,
-        column_partitions: u16,
-        grid_order: GridOrder,
-    ) -> Self {
-        let mut layout = Self::amp_transposed_output_grid(
-            output_column_block,
-            tile_count,
-            row_partitions,
-            column_partitions,
-            grid_order,
-        );
-        layout.order = StorageOrder::Native(NativeKernelOrder::TransposedLeft);
+        layout.order = StorageOrder::Native(match orientation {
+            GemmOrientation::Normal => NativeKernelOrder::Left,
+            GemmOrientation::Swapped => NativeKernelOrder::TransposedLeft,
+        });
         layout
     }
 

@@ -812,7 +812,15 @@ mod tests {
                 (Layout::amp_left(64, 1), rows, 64),
                 (Layout::block_major_matrix(64, 1), 64, 64),
                 (
-                    Layout::block_major_matrix_storage(64, 64, 1, 1, 1, MemoryClass::Interleaved),
+                    Layout::block_major_matrix_storage(
+                        crate::GemmOrientation::Normal,
+                        64,
+                        64,
+                        1,
+                        1,
+                        1,
+                        MemoryClass::Interleaved,
+                    ),
                     64,
                     64,
                 ),
@@ -1023,6 +1031,7 @@ mod tests {
             let batches = random.u32(1..=4);
             let shard = shard(
                 Layout::block_major_matrix_storage(
+                    crate::GemmOrientation::Normal,
                     64,
                     output_column_block,
                     1,
