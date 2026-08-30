@@ -113,6 +113,7 @@ impl LoweringState {
                     value: None,
                     reason: WorkReason::OperatorInputs,
                 },
+                semantic_exchange,
                 tiles,
             )?;
             for (tile, run) in runs {

@@ -544,6 +544,7 @@ impl LoweringState {
                         input: orientation.physical_right_input() as u16,
                     },
                 },
+                semantic_exchange,
                 tiles,
             )?;
             for (tile, copy) in local_copies {
@@ -742,13 +743,14 @@ impl LoweringState {
                 .zip(reduction_runs)
                 .enumerate()
             {
-                self.append_physical_phase(
+                self.append_phase(
                     transfers,
                     WorkProvenance {
                         operation: operation.source,
                         value: Some(*output_value),
                         reason: WorkReason::OperatorInputs,
                     },
+                    physical_exchange,
                     tiles,
                 )?;
                 if stage == 0 {
@@ -972,6 +974,7 @@ impl LoweringState {
                         WorkReason::OperatorInput { input: 1 }
                     },
                 },
+                semantic_exchange,
                 tiles,
             )?;
             for (tile, copy) in local_copies {

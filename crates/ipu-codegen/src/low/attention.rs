@@ -204,14 +204,15 @@ impl LoweringState {
         for (tile, copy) in local_copies {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        self.append_ordered_phase(
+        let order = if physical {
+            ExchangeOrder::Physical
+        } else {
+            ExchangeOrder::Semantic
+        };
+        self.append_phase(
             transfers,
             provenance,
-            if physical {
-                ExchangeOrder::Physical
-            } else {
-                ExchangeOrder::Semantic
-            },
+            |source| (source, order.clone()),
             tiles,
         )?;
         if !physical {
@@ -313,7 +314,14 @@ impl LoweringState {
                 value_panels,
             });
         }
-        self.append_mixed_phase(semantic_gathers, physical_gathers, provenance, tiles)?;
+        let gathers =
+            semantic_gathers
+                .into_iter()
+                .map(|(source, destinations)| ((source, ExchangeOrder::Semantic), destinations))
+                .chain(physical_gathers.into_iter().map(|(source, destinations)| {
+                    ((source, ExchangeOrder::Physical), destinations)
+                }));
+        self.append_phase(gathers, provenance, |ordered| ordered, tiles)?;
         for block in &prepared {
             for panel in block.key_panels.iter().chain(&block.value_panels) {
                 if let Some(row_major) = panel.row_major {
@@ -463,7 +471,7 @@ impl LoweringState {
                     &mut transfers,
                     tiles,
                 )?;
-                self.append_phase(transfers, exchange_provenance, tiles)?;
+                self.append_phase(transfers, exchange_provenance, semantic_exchange, tiles)?;
                 task_sources.extend(
                     tasks
                         .iter()
@@ -503,7 +511,7 @@ impl LoweringState {
                     }
                     task_sources.push((operands[0], operands[1], valid_key_rows));
                 }
-                self.append_phase(transfers, exchange_provenance, tiles)?;
+                self.append_phase(transfers, exchange_provenance, semantic_exchange, tiles)?;
             }
             for (task, (key_operand, value_operand, valid_key_rows)) in
                 tasks.iter().zip(task_sources)
@@ -671,7 +679,7 @@ impl LoweringState {
                 )?;
             }
         }
-        self.append_physical_phase(transfers, provenance, tiles)
+        self.append_phase(transfers, provenance, physical_exchange, tiles)
     }
 
     pub(super) fn lower_materialized_attention(

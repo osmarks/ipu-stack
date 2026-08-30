@@ -150,6 +150,14 @@ pub enum ExchangeOrder {
     Planned(crate::CopyGeometry),
 }
 
+fn semantic_exchange(source: ShardView) -> (ShardView, ExchangeOrder) {
+    (source, ExchangeOrder::Semantic)
+}
+
+fn physical_exchange(source: ShardView) -> (ShardView, ExchangeOrder) {
+    (source, ExchangeOrder::Physical)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExchangePhase {
     pub id: ExchangePhaseId,
@@ -1467,7 +1475,12 @@ impl LoweringState {
         for (tile, copy) in source_copies {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        self.append_planned_phase(transfers, operation_provenance(operation, kind), tiles)?;
+        self.append_phase(
+            transfers,
+            operation_provenance(operation, kind),
+            |(source, geometry)| (source, ExchangeOrder::Planned(geometry)),
+            tiles,
+        )?;
         for (tile, copy) in local_copies.into_iter().chain(destination_copies) {
             self.append_local_copy(tiles, tile, copy)?;
         }
@@ -1933,98 +1946,26 @@ impl LoweringState {
         )
     }
 
-    fn append_phase(
+    fn append_phase<K>(
         &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
+        transfers: impl IntoIterator<Item = (K, Vec<ShardView>)>,
         provenance: WorkProvenance,
+        mut order: impl FnMut(K) -> (ShardView, ExchangeOrder),
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        self.append_ordered_phase(transfers, provenance, ExchangeOrder::Semantic, tiles)
-    }
-
-    fn append_physical_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
-        self.append_ordered_phase(transfers, provenance, ExchangeOrder::Physical, tiles)
-    }
-
-    fn append_ordered_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        order: ExchangeOrder,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
-        let transfers = transfers
+        let mut transfers = transfers
             .into_iter()
-            .map(|(source, mut destinations)| {
+            .map(|(key, mut destinations)| {
+                let (source, order) = order(key);
                 destinations.sort_unstable();
                 destinations.dedup();
                 LogicalExchange {
                     source,
                     destinations,
-                    order: order.clone(),
+                    order,
                 }
             })
             .collect::<Vec<_>>();
-        self.append_exchange_phase(transfers, provenance, tiles)
-    }
-
-    fn append_planned_phase(
-        &mut self,
-        transfers: BTreeMap<(ShardView, crate::CopyGeometry), Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
-        let transfers = transfers
-            .into_iter()
-            .map(|((source, geometry), mut destinations)| {
-                destinations.sort_unstable();
-                destinations.dedup();
-                LogicalExchange {
-                    source,
-                    destinations,
-                    order: ExchangeOrder::Planned(geometry),
-                }
-            })
-            .collect();
-        self.append_exchange_phase(transfers, provenance, tiles)
-    }
-
-    fn append_mixed_phase(
-        &mut self,
-        semantic: BTreeMap<ShardView, Vec<ShardView>>,
-        physical: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
-        let mut transfers = Vec::with_capacity(semantic.len().saturating_add(physical.len()));
-        for (order, mappings) in [
-            (ExchangeOrder::Semantic, semantic),
-            (ExchangeOrder::Physical, physical),
-        ] {
-            transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
-                destinations.sort_unstable();
-                destinations.dedup();
-                LogicalExchange {
-                    source,
-                    destinations,
-                    order: order.clone(),
-                }
-            }));
-        }
-        self.append_exchange_phase(transfers, provenance, tiles)
-    }
-
-    fn append_exchange_phase(
-        &mut self,
-        mut transfers: Vec<LogicalExchange>,
-        provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
         if transfers.is_empty() {
             return Ok(());
         }
