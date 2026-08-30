@@ -1,132 +1,30 @@
-//! Machine-readable ABI contracts for tile-local kernel calls.
+//! Tile-kernel ABI, specialization builds, and placed call materialization.
+
+mod build;
+mod materialize;
+mod spec;
+
+pub use build::*;
+pub use materialize::materialize_kernel_run;
+pub use spec::*;
 
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
 use crate::layout::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AccumulationPrecision, GemmKernelMode, GemmWeightLoad, KernelRequirements, KernelRun, Layout,
-    LowProgram, LowShard, LowShardId, NativeKernelOrder, Precision, StorageError, StorageOrder,
-    TileWorkList, TileWorkRef, view_byte_spans,
+    GemmKernelMode, GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, NativeKernelOrder,
+    Precision, StorageError, StorageOrder, TileWorkList, TileWorkRef,
 };
-use ipu_target::program::{ComputeStep, StepProfile, TileAddress};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const OUTPUT_REGISTER: u8 = 2;
 pub const FIRST_INPUT_REGISTER: u8 = 3;
 pub const RETURN_REGISTER: u8 = 10;
 
-/// A concrete tile-local callable produced during low lowering.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TileKernelSpec {
-    FillZero,
-    Gemm {
-        multiply: Precision,
-        accumulate: AccumulationPrecision,
-        mode: GemmKernelMode,
-        weights: GemmWeightLoad,
-        inner_block: u32,
-        output_columns: u32,
-        rows: u32,
-    },
-    Gelu,
-    ReductionSum {
-        partials: u16,
-    },
-    Add,
-    AttentionSoftmax {
-        query_rows: u32,
-        head_dimension: u32,
-        key_columns: u32,
-        padded_key_columns: u32,
-    },
-    AttentionMerge {
-        query_rows: u32,
-        value_dimension: u32,
-        padded_value_dimension: u32,
-        key_block_columns: u32,
-        initial: bool,
-        final_block: bool,
-    },
-    Cast {
-        from: Precision,
-        to: Precision,
-    },
-    Rearrange {
-        from: Layout,
-        to: Layout,
-        matrices: u32,
-        logical_rows: u32,
-        physical_rows: u32,
-        logical_columns: u32,
-        physical_columns: u32,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KernelSymbols {
-    Exact(&'static str),
-    Planned,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelAvailability {
-    Implemented,
-    Required,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScalarArgument {
-    pub register: u8,
-    pub name: &'static str,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelAbi {
-    pub symbols: KernelSymbols,
-    pub availability: KernelAvailability,
-    pub output_register: u8,
-    pub input_registers: Vec<u8>,
-    pub scalar_arguments: Vec<ScalarArgument>,
-    pub return_register: u8,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelCompilation {
-    pub source: &'static str,
-    pub name: String,
-    pub optimization: Option<KernelOptimization>,
-    pub definitions: Vec<(&'static str, String)>,
-    pub retained_symbols: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelOptimization {
-    Size,
-    Speed,
-}
-
-impl KernelCompilation {
-    pub fn compiler_flags(&self) -> Vec<String> {
-        self.optimization
-            .map(|optimization| match optimization {
-                KernelOptimization::Size => "-Os".to_owned(),
-                KernelOptimization::Speed => "-O2".to_owned(),
-            })
-            .into_iter()
-            .chain(
-                self.definitions
-                    .iter()
-                    .map(|(name, value)| format!("-D{name}={value}")),
-            )
-            .collect()
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
     symbols: BTreeMap<TileKernelSpec, String>,
-    gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), Vec<u32>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -413,8 +311,6 @@ impl KernelBuildPlan {
                     retained_symbols,
                 });
             }
-            plan.gemm_rows
-                .insert((precision, weights, inner_block, output_columns), values);
         }
         if gelu {
             plan.compilations.push(KernelCompilation {
@@ -780,80 +676,6 @@ impl KernelBuildPlan {
             .iter()
             .flat_map(|compilation| compilation.retained_symbols.iter().map(String::as_str))
     }
-}
-
-/// Resolves one scheduled call after placement has assigned each shard base.
-/// Layout conversion supplies the byte offset; the build plan supplies the
-/// linked specialization and ABI scalar values.
-pub fn materialize_kernel_run(
-    run: &KernelRun,
-    shards: &[LowShard],
-    shard_addresses: &BTreeMap<LowShardId, u32>,
-    plan: &KernelBuildPlan,
-    overrides: &BTreeMap<LowShardId, TileAddress>,
-) -> Result<ComputeStep, KernelMaterializationError> {
-    let call = plan.call(run)?;
-    let resolve = |view: &crate::ShardView| {
-        let shard = shards.get(view.shard.index() as usize).ok_or(
-            KernelMaterializationError::UnplacedShard(view.shard.index()),
-        )?;
-        let spans = view_byte_spans(shard, view)?;
-        let [span] = spans.as_slice() else {
-            return Err(KernelMaterializationError::FragmentedView {
-                shard: view.shard.index(),
-                spans: spans.len(),
-            });
-        };
-        let base = overrides.get(&view.shard).copied().unwrap_or_else(|| {
-            TileAddress::Absolute(
-                shard_addresses
-                    .get(&view.shard)
-                    .copied()
-                    .unwrap_or_default(),
-            )
-        });
-        if !overrides.contains_key(&view.shard) && !shard_addresses.contains_key(&view.shard) {
-            return Err(KernelMaterializationError::UnplacedShard(
-                view.shard.index(),
-            ));
-        }
-        add_address_offset(base, span.offset)
-    };
-    let output_address = resolve(&run.output)?;
-    let input_addresses = run
-        .inputs
-        .iter()
-        .map(|operand| resolve(&operand.views[0]))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ComputeStep {
-        symbol: call.symbol,
-        output_address,
-        input_addresses,
-        arguments: call.arguments,
-        profile: StepProfile::default(),
-    })
-}
-
-fn add_address_offset(
-    address: TileAddress,
-    offset: u32,
-) -> Result<TileAddress, KernelMaterializationError> {
-    Ok(match address {
-        TileAddress::Absolute(address) => TileAddress::Absolute(
-            address
-                .checked_add(offset)
-                .ok_or(KernelMaterializationError::AddressOverflow)?,
-        ),
-        TileAddress::RepeatPointer {
-            index,
-            offset: existing,
-        } => TileAddress::RepeatPointer {
-            index,
-            offset: existing
-                .checked_add(offset)
-                .ok_or(KernelMaterializationError::AddressOverflow)?,
-        },
-    })
 }
 
 fn collect_kernels(
@@ -1449,13 +1271,19 @@ mod tests {
                 .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
                 .collect::<BTreeMap<_, _>>();
             assert_eq!(plan.compilations.len(), 1);
-            let planned_rows = plan.gemm_rows.values().next().unwrap();
+            let planned_rows = plan.compilations[0]
+                .definitions
+                .iter()
+                .find_map(|(name, value)| {
+                    (name == &"GEMM_SMALL_ROWS").then(|| value.parse::<u32>().unwrap())
+                })
+                .unwrap();
             assert!(
                 plan.compilations[0]
                     .definitions
                     .iter()
                     .any(|(name, value)| name == &"GEMM_SMALL_ROWS"
-                        && value == &planned_rows[0].to_string())
+                        && value == &planned_rows.to_string())
             );
             assert!(
                 plan.compilations[0]

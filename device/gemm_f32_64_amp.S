@@ -9,6 +9,18 @@
 #ifndef GEMM_LARGE_ROWS
 #define GEMM_LARGE_ROWS GEMM_SMALL_ROWS
 #endif
+#ifndef GEMM_INIT_SMALL_SYMBOL
+#define GEMM_INIT_SMALL_SYMBOL ipu_stack_gemm_f32_init_small_rows
+#endif
+#ifndef GEMM_INIT_LARGE_SYMBOL
+#define GEMM_INIT_LARGE_SYMBOL ipu_stack_gemm_f32_init_large_rows
+#endif
+#ifndef GEMM_ACCUMULATE_SMALL_SYMBOL
+#define GEMM_ACCUMULATE_SMALL_SYMBOL ipu_stack_gemm_f32_accumulate_small_rows
+#endif
+#ifndef GEMM_ACCUMULATE_LARGE_SYMBOL
+#define GEMM_ACCUMULATE_LARGE_SYMBOL ipu_stack_gemm_f32_accumulate_large_rows
+#endif
 
 	.text
 	.allow_optimizations
@@ -197,10 +209,15 @@
 	.size \name, .-\name
 	.endm
 
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_init_small_rows, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_init_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_init_large_rows, GEMM_LARGE_ROWS, ipu_stack_gemm_f32_init_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_accumulate_small_rows, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_accumulate_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_accumulate_large_rows, GEMM_LARGE_ROWS, ipu_stack_gemm_f32_accumulate_common
+#ifdef GEMM_SINGLE_ROWS
+	GEMM_SPECIALIZATION GEMM_INIT_SMALL_SYMBOL, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_init_common
+	GEMM_SPECIALIZATION GEMM_ACCUMULATE_SMALL_SYMBOL, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_accumulate_common
+#else
+	GEMM_SPECIALIZATION GEMM_INIT_SMALL_SYMBOL, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_init_common
+	GEMM_SPECIALIZATION GEMM_INIT_LARGE_SYMBOL, GEMM_LARGE_ROWS, ipu_stack_gemm_f32_init_common
+	GEMM_SPECIALIZATION GEMM_ACCUMULATE_SMALL_SYMBOL, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_accumulate_common
+	GEMM_SPECIALIZATION GEMM_ACCUMULATE_LARGE_SYMBOL, GEMM_LARGE_ROWS, ipu_stack_gemm_f32_accumulate_common
+#endif
 
 	.worker
 	.p2align 3
