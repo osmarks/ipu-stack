@@ -1,6 +1,7 @@
 //! Address-independent layout-conversion routes and copy geometry.
 
 use crate::graph::TensorShape;
+use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidValue};
 use crate::layout::{
     AMP_COLUMN_MICRO, Layout, LayoutError, NativeKernelOrder, StorageOrder, TensorRegion,
     TensorType,
@@ -401,6 +402,59 @@ pub(crate) fn plan_view_conversion(
         return Err(ConversionGeometryError::Unsupported);
     }
     Ok((strategy, mappings))
+}
+
+pub(crate) fn finalize_conversion_plans(
+    graph: &mut MidGraph,
+) -> Result<(), ConversionGeometryError> {
+    finalize_operations(&mut graph.operations, &graph.values)
+}
+
+fn finalize_operations(
+    operations: &mut [MidOperation],
+    values: &[MidValue],
+) -> Result<(), ConversionGeometryError> {
+    for operation in operations {
+        match &mut operation.kind {
+            MidOperationKind::View(transform, strategy, mappings) => {
+                let source = &values
+                    .get(operation.inputs[0].index() as usize)
+                    .ok_or(ConversionGeometryError::Unsupported)?
+                    .tensor_type;
+                let destination = &values
+                    .get(operation.results[0].index() as usize)
+                    .ok_or(ConversionGeometryError::Unsupported)?
+                    .tensor_type;
+                let (resolved, planned) = plan_view_conversion(source, destination, *transform)?;
+                if resolved != *strategy {
+                    return Err(ConversionGeometryError::Unsupported);
+                }
+                *mappings = planned;
+            }
+            MidOperationKind::Rearrange(strategy, _, mappings) => {
+                let source = &values
+                    .get(operation.inputs[0].index() as usize)
+                    .ok_or(ConversionGeometryError::Unsupported)?
+                    .tensor_type;
+                let destination = &values
+                    .get(operation.results[0].index() as usize)
+                    .ok_or(ConversionGeometryError::Unsupported)?
+                    .tensor_type;
+                *mappings = plan_conversion(
+                    &destination.shape,
+                    destination.format.precision,
+                    &source.format.layout,
+                    &destination.format.layout,
+                    *strategy,
+                )?;
+            }
+            MidOperationKind::Repeat(repeat) => {
+                finalize_operations(&mut repeat.body.operations, values)?;
+            }
+            MidOperationKind::Operator(_) | MidOperationKind::CastPrecision => {}
+        }
+    }
+    Ok(())
 }
 
 fn plan_mapping(

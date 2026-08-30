@@ -11,7 +11,10 @@ use crate::config::{
     AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
     PlannerSearchDomain,
 };
-use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
+use crate::conversion::{
+    ConversionGeometryError, ConversionStrategy, DeferredTransform, finalize_conversion_plans,
+    layout_conversion_strategy,
+};
 pub use crate::cost::{CostModel, Ipu21CostModel};
 use crate::cost::{MemoizedCostModel, parallel_reduction_preselection_metrics};
 use crate::estimate::{
@@ -427,6 +430,8 @@ pub enum LoweringError {
     UnsupportedGemmBatching(OperationId),
     #[error("internal lowering error: value {0:?} is unavailable")]
     UnknownValue(ValueId),
+    #[error(transparent)]
+    ConversionGeometry(#[from] ConversionGeometryError),
 }
 
 pub type LoweringResult<T> = std::result::Result<T, LoweringError>;
@@ -606,7 +611,7 @@ pub(crate) fn lower_finalists(
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
             );
-            Ok(MidGraph {
+            let mut graph = MidGraph {
                 inputs: inputs.clone(),
                 values: branch.state.values,
                 operations: branch.operations,
@@ -615,7 +620,9 @@ pub(crate) fn lower_finalists(
                     cost,
                     memory: peak_memory,
                 },
-            })
+            };
+            finalize_conversion_plans(&mut graph)?;
+            Ok(graph)
         })
         .collect()
 }
@@ -1631,7 +1638,7 @@ fn apply_selected_plan(
             continue;
         };
         let (source, transform, producer_cycles) = match &operations[producer_index].kind {
-            MidOperationKind::View(transform, _) => (
+            MidOperationKind::View(transform, _, _) => (
                 operations[producer_index].inputs[0],
                 *transform,
                 operations[producer_index].metrics.cost.cycles,
@@ -1743,7 +1750,7 @@ fn apply_selected_view(
         source: Some(operation.id),
         inputs: vec![source],
         results: vec![result],
-        kind: MidOperationKind::View(transform, strategy),
+        kind: MidOperationKind::View(transform, strategy, Vec::new()),
         metrics: OperationMetrics { cost, memory },
     });
     branch.values.insert(operation.results[0], result);
@@ -3464,7 +3471,7 @@ fn ensure_format(
             source: Some(source),
             inputs: vec![value],
             results: vec![result],
-            kind: MidOperationKind::Rearrange(strategy, materialization),
+            kind: MidOperationKind::Rearrange(strategy, materialization, Vec::new()),
             metrics: OperationMetrics {
                 cost: rearrangement,
                 memory,
@@ -4001,7 +4008,7 @@ mod tests {
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.layout, after.format.layout);
                 }
-                MidOperationKind::Rearrange(strategy, _) => {
+                MidOperationKind::Rearrange(strategy, _, mappings) => {
                     assert_ne!(before.format.layout, after.format.layout);
                     assert_eq!(
                         *strategy,
@@ -4013,10 +4020,12 @@ mod tests {
                     );
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.precision, after.format.precision);
+                    assert!(!mappings.is_empty());
                 }
-                MidOperationKind::Operator(_)
-                | MidOperationKind::View(..)
-                | MidOperationKind::Repeat(_) => {}
+                MidOperationKind::View(_, strategy, mappings) => {
+                    assert!(!strategy.uses_intersections() || !mappings.is_empty());
+                }
+                MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {}
             }
         }
     }

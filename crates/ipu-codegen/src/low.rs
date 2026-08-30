@@ -7,9 +7,7 @@
 //! remaining choices.
 
 use crate::PipelineConfig;
-use crate::conversion::{
-    ConversionStrategy, DeferredTransform, plan_conversion, plan_view_conversion,
-};
+use crate::conversion::{ConversionStrategy, DeferredTransform};
 use crate::graph::{GraphInputKind, OperationId};
 use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::kernel::TileKernelSpec;
@@ -1235,12 +1233,12 @@ impl LoweringState {
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<bool> {
         let (transform, strategy, materialization) = match &operation.kind {
-            MidOperationKind::View(transform, strategy) => (
+            MidOperationKind::View(transform, strategy, _) => (
                 Some(*transform),
                 *strategy,
                 crate::OperandMaterialization::DispatchSlices,
             ),
-            MidOperationKind::Rearrange(strategy, materialization) => {
+            MidOperationKind::Rearrange(strategy, materialization, _) => {
                 (None, *strategy, *materialization)
             }
             _ => return Ok(false),
@@ -1415,41 +1413,9 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
-        let source_type = inputs
-            .first()
-            .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(LowLoweringError::InvalidConversionPlan)?;
-        let destination_type = outputs
-            .first()
-            .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(LowLoweringError::InvalidConversionPlan)?;
         let mappings = match kind {
-            MidOperationKind::View(transform, _) => {
-                let (resolved_strategy, mappings) =
-                    plan_view_conversion(&source_type, &destination_type, *transform)
-                        .map_err(|_| LowLoweringError::InvalidConversionPlan)?;
-                if resolved_strategy != strategy {
-                    return Err(LowLoweringError::InvalidConversionPlan);
-                }
-                mappings
-            }
-            MidOperationKind::Rearrange(..) => plan_conversion(
-                &destination_type.shape,
-                destination_type.format.precision,
-                &source_type.format.layout,
-                &destination_type.format.layout,
-                strategy,
-            )
-            .map_err(|error| {
-                tracing::error!(
-                    ?error,
-                    source = ?source_type,
-                    destination = ?destination_type,
-                    ?strategy,
-                    "failed to materialize selected conversion geometry"
-                );
-                LowLoweringError::InvalidConversionPlan
-            })?,
+            MidOperationKind::View(_, _, mappings)
+            | MidOperationKind::Rearrange(_, _, mappings) => mappings,
             _ => return Err(LowLoweringError::InvalidConversionPlan),
         };
         let staged = strategy == ConversionStrategy::StageLogicalThenTransform;
