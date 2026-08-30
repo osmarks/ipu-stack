@@ -550,7 +550,7 @@ pub fn build_diagnostic_package(
         if !matches!(
             operation.kind,
             MidOperationKind::Operator(_)
-                | MidOperationKind::View(..)
+                | MidOperationKind::Convert(Some(_), ..)
                 | MidOperationKind::Repeat(_)
         ) {
             continue;

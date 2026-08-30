@@ -1283,7 +1283,7 @@ fn apply_selected_plan(
             continue;
         };
         let (source, transform, producer_cycles) = match &operations[producer_index].kind {
-            MidOperationKind::View(transform, _, _) => (
+            MidOperationKind::Convert(Some(transform), ..) => (
                 operations[producer_index].inputs[0],
                 *transform,
                 operations[producer_index].metrics.cost.cycles,
@@ -1389,7 +1389,12 @@ fn apply_selected_view(
         source: Some(operation.id),
         inputs: vec![source],
         results: vec![result],
-        kind: MidOperationKind::View(transform, strategy, Vec::new()),
+        kind: MidOperationKind::Convert(
+            Some(transform),
+            strategy,
+            OperandMaterialization::DispatchSlices,
+            Vec::new(),
+        ),
         metrics: OperationMetrics { cost, memory },
     });
     branch.values.insert(operation.results[0], result);
@@ -2026,7 +2031,7 @@ fn ensure_format(
             source: Some(source),
             inputs: vec![value],
             results: vec![result],
-            kind: MidOperationKind::Rearrange(strategy, materialization, Vec::new()),
+            kind: MidOperationKind::Convert(None, strategy, materialization, Vec::new()),
             metrics: OperationMetrics {
                 cost: rearrangement,
                 memory,
@@ -2589,21 +2594,20 @@ mod tests {
                     assert_eq!(before.shape, after.shape);
                     assert_eq!(before.format.layout, after.format.layout);
                 }
-                MidOperationKind::Rearrange(strategy, _, mappings) => {
-                    assert_ne!(before.format.layout, after.format.layout);
-                    assert_eq!(
-                        *strategy,
-                        layout_conversion_strategy(
-                            before.format.precision,
-                            &before.format.layout,
-                            &after.format.layout,
-                        )
-                    );
-                    assert_eq!(before.shape, after.shape);
-                    assert_eq!(before.format.precision, after.format.precision);
-                    assert!(!mappings.is_empty());
-                }
-                MidOperationKind::View(_, strategy, mappings) => {
+                MidOperationKind::Convert(transform, strategy, _, mappings) => {
+                    if transform.is_none() {
+                        assert_ne!(before.format.layout, after.format.layout);
+                        assert_eq!(
+                            *strategy,
+                            layout_conversion_strategy(
+                                before.format.precision,
+                                &before.format.layout,
+                                &after.format.layout,
+                            )
+                        );
+                        assert_eq!(before.shape, after.shape);
+                        assert_eq!(before.format.precision, after.format.precision);
+                    }
                     assert!(!strategy.uses_intersections() || !mappings.is_empty());
                 }
                 MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {}
@@ -3157,7 +3161,9 @@ mod tests {
             let producers = lowered
                 .operations
                 .iter()
-                .filter(|operation| matches!(operation.kind, MidOperationKind::View(..)))
+                .filter(|operation| {
+                    matches!(operation.kind, MidOperationKind::Convert(Some(_), ..))
+                })
                 .collect::<Vec<_>>();
             assert_eq!(producers.len(), split.len(), "random case {case}");
             assert!(
@@ -3240,7 +3246,7 @@ mod tests {
             let operation = lowered
                 .operations
                 .iter()
-                .find(|operation| matches!(operation.kind, MidOperationKind::View(..)))
+                .find(|operation| matches!(operation.kind, MidOperationKind::Convert(Some(_), ..)))
                 .unwrap();
             assert!(operation.metrics.cost.cycles != 0, "random case {case}");
             assert!(

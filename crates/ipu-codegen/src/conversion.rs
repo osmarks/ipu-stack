@@ -416,7 +416,7 @@ fn finalize_operations(
 ) -> Result<(), ConversionGeometryError> {
     for operation in operations {
         match &mut operation.kind {
-            MidOperationKind::View(transform, strategy, mappings) => {
+            MidOperationKind::Convert(transform, strategy, _, mappings) => {
                 let source = &values
                     .get(operation.inputs[0].index() as usize)
                     .ok_or(ConversionGeometryError::Unsupported)?
@@ -425,28 +425,22 @@ fn finalize_operations(
                     .get(operation.results[0].index() as usize)
                     .ok_or(ConversionGeometryError::Unsupported)?
                     .tensor_type;
-                let (resolved, planned) = plan_view_conversion(source, destination, *transform)?;
-                if resolved != *strategy {
-                    return Err(ConversionGeometryError::Unsupported);
-                }
-                *mappings = planned;
-            }
-            MidOperationKind::Rearrange(strategy, _, mappings) => {
-                let source = &values
-                    .get(operation.inputs[0].index() as usize)
-                    .ok_or(ConversionGeometryError::Unsupported)?
-                    .tensor_type;
-                let destination = &values
-                    .get(operation.results[0].index() as usize)
-                    .ok_or(ConversionGeometryError::Unsupported)?
-                    .tensor_type;
-                *mappings = plan_conversion(
-                    &destination.shape,
-                    destination.format.precision,
-                    &source.format.layout,
-                    &destination.format.layout,
-                    *strategy,
-                )?;
+                *mappings = if let Some(transform) = transform {
+                    let (resolved, planned) =
+                        plan_view_conversion(source, destination, *transform)?;
+                    if resolved != *strategy {
+                        return Err(ConversionGeometryError::Unsupported);
+                    }
+                    planned
+                } else {
+                    plan_conversion(
+                        &destination.shape,
+                        destination.format.precision,
+                        &source.format.layout,
+                        &destination.format.layout,
+                        *strategy,
+                    )?
+                };
             }
             MidOperationKind::Repeat(repeat) => {
                 finalize_operations(&mut repeat.body.operations, values)?;

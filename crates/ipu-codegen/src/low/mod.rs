@@ -1031,7 +1031,7 @@ impl LoweringState {
                 && matches!(
                     operation.kind,
                     MidOperationKind::Operator(_)
-                        | MidOperationKind::View(..)
+                        | MidOperationKind::Convert(Some(_), ..)
                         | MidOperationKind::Repeat(_)
                 )
                 && let Some(source) = operation.source
@@ -1144,13 +1144,8 @@ impl LoweringState {
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<bool> {
         let (transform, strategy, materialization) = match &operation.kind {
-            MidOperationKind::View(transform, strategy, _) => (
-                Some(*transform),
-                *strategy,
-                crate::OperandMaterialization::DispatchSlices,
-            ),
-            MidOperationKind::Rearrange(strategy, materialization, _) => {
-                (None, *strategy, *materialization)
+            MidOperationKind::Convert(transform, strategy, materialization, _) => {
+                (*transform, *strategy, *materialization)
             }
             _ => return Ok(false),
         };
@@ -1276,7 +1271,7 @@ impl LoweringState {
                 from: input_format.precision,
                 to: output_format.precision,
             }),
-            MidOperationKind::View(..) | MidOperationKind::Rearrange(..) => None,
+            MidOperationKind::Convert(..) => None,
             MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {
                 return Err(LowLoweringError::InvalidConversionPlan);
             }
@@ -1287,14 +1282,12 @@ impl LoweringState {
             let input_view = self.full_view(input);
             let output_view = self.full_view(output);
             let kernel = match kind {
-                MidOperationKind::View(..) | MidOperationKind::Rearrange(..) => {
-                    rearrange_kernel_spec(
-                        input_format.layout.clone(),
-                        output_format.layout.clone(),
-                        &input_view,
-                        &output_view,
-                    )?
-                }
+                MidOperationKind::Convert(..) => rearrange_kernel_spec(
+                    input_format.layout.clone(),
+                    output_format.layout.clone(),
+                    &input_view,
+                    &output_view,
+                )?,
                 _ => static_kernel
                     .clone()
                     .ok_or(LowLoweringError::InvalidConversionPlan)?,
@@ -1336,8 +1329,7 @@ impl LoweringState {
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
         let mappings = match kind {
-            MidOperationKind::View(_, _, mappings)
-            | MidOperationKind::Rearrange(_, _, mappings) => mappings,
+            MidOperationKind::Convert(_, _, _, mappings) => mappings,
             _ => return Err(LowLoweringError::InvalidConversionPlan),
         };
         let staged = strategy == ConversionStrategy::StageLogicalThenTransform;
@@ -2706,9 +2698,7 @@ fn operation_provenance(operation: &MidOperation, kind: &MidOperationKind) -> Wo
         value: operation.results.first().copied(),
         reason: match kind {
             MidOperationKind::CastPrecision => WorkReason::PrecisionCast,
-            MidOperationKind::Rearrange(..) | MidOperationKind::View(..) => {
-                WorkReason::LayoutRearrangement
-            }
+            MidOperationKind::Convert(..) => WorkReason::LayoutRearrangement,
             MidOperationKind::Operator(_) => WorkReason::OperatorKernel,
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },

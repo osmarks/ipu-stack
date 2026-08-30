@@ -466,9 +466,9 @@ fn randomized_deferred_views_materialize_arbitrary_regions() {
         let operation = mid
             .operations
             .iter()
-            .find(|operation| matches!(operation.kind, MidOperationKind::View(..)))
+            .find(|operation| matches!(operation.kind, MidOperationKind::Convert(Some(_), ..)))
             .unwrap();
-        let MidOperationKind::View(transform, ..) = operation.kind else {
+        let MidOperationKind::Convert(Some(transform), ..) = operation.kind else {
             unreachable!()
         };
         let (source, result) = (operation.inputs[0], operation.results[0]);

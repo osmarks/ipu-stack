@@ -35,17 +35,13 @@ pub struct MidValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
     Operator(OperatorPlan),
-    View(
-        DeferredTransform,
-        ConversionStrategy,
-        Vec<ConversionMapping>,
-    ),
-    CastPrecision,
-    Rearrange(
+    Convert(
+        Option<DeferredTransform>,
         ConversionStrategy,
         OperandMaterialization,
         Vec<ConversionMapping>,
     ),
+    CastPrecision,
     Repeat(MidRepeat),
 }
 
@@ -61,16 +57,13 @@ pub struct MidOperation {
 impl MidOperation {
     pub fn conversion(&self) -> Option<(ConversionStrategy, OperandMaterialization)> {
         match &self.kind {
-            MidOperationKind::View(_, strategy, _) => {
-                Some((*strategy, OperandMaterialization::DispatchSlices))
+            MidOperationKind::Convert(_, strategy, materialization, _) => {
+                Some((*strategy, *materialization))
             }
             MidOperationKind::CastPrecision => Some((
                 ConversionStrategy::LocalKernel,
                 OperandMaterialization::Complete,
             )),
-            MidOperationKind::Rearrange(strategy, materialization, _) => {
-                Some((*strategy, *materialization))
-            }
             MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => None,
         }
     }
@@ -78,9 +71,8 @@ impl MidOperation {
     pub fn operator_plan(&self) -> Option<&OperatorPlan> {
         match &self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
-            MidOperationKind::View(..)
+            MidOperationKind::Convert(..)
             | MidOperationKind::CastPrecision
-            | MidOperationKind::Rearrange(..)
             | MidOperationKind::Repeat(_) => None,
         }
     }
@@ -88,9 +80,8 @@ impl MidOperation {
     pub fn operator_plan_mut(&mut self) -> Option<&mut OperatorPlan> {
         match &mut self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
-            MidOperationKind::View(..)
+            MidOperationKind::Convert(..)
             | MidOperationKind::CastPrecision
-            | MidOperationKind::Rearrange(..)
             | MidOperationKind::Repeat(_) => None,
         }
     }
