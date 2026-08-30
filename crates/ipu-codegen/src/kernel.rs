@@ -65,10 +65,7 @@ pub enum TileKernelSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelSymbols {
     Exact(&'static str),
-    RowSpecialized { small: String, large: String },
-    AttentionStageSpecialized,
-    RearrangeSpecialized,
-    UnpackSpecialized,
+    Planned,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,11 +125,8 @@ impl KernelCompilation {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
+    symbols: BTreeMap<TileKernelSpec, String>,
     gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), Vec<u32>>,
-    gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
-    attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
-    rearrange_symbols: BTreeMap<(RearrangeTarget, u32, u32, u32, u32), String>,
-    unpack_symbols: BTreeMap<(UnpackSource, u32, u32, u32, u32), String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -241,17 +235,94 @@ fn specialized_gemm_symbol(
     weight_suffix: &str,
     inner_block: u32,
     output_columns: u32,
-    size: &str,
-    small_rows: u32,
-    large_rows: u32,
+    rows: u32,
 ) -> String {
     let operation = match mode {
         GemmKernelMode::Initialize => "init",
         GemmKernelMode::Accumulate => "accumulate",
     };
     format!(
-        "ipu_stack_gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_k{inner_block}_c{output_columns}_r{small_rows}_r{large_rows}"
+        "ipu_stack_gemm_{prefix}_{operation}{weight_suffix}_k{inner_block}_c{output_columns}_r{rows}"
     )
+}
+
+fn specialized_kernel_symbol(kernel: &TileKernelSpec) -> Result<String, KernelAbiError> {
+    match kernel {
+        TileKernelSpec::Gemm {
+            multiply,
+            mode,
+            weights,
+            inner_block,
+            output_columns,
+            rows,
+            ..
+        } => {
+            let prefix = match multiply {
+                Precision::F16 => "f16",
+                Precision::F32 => "f32",
+                Precision::F8F143 { .. } => return Err(KernelAbiError::RequirementMismatch),
+            };
+            let weights = if *weights == GemmWeightLoad::Interleaved {
+                "_interleaved"
+            } else {
+                ""
+            };
+            Ok(specialized_gemm_symbol(
+                prefix,
+                *mode,
+                weights,
+                *inner_block,
+                *output_columns,
+                *rows,
+            ))
+        }
+        TileKernelSpec::Rearrange {
+            from,
+            to,
+            logical_rows,
+            physical_rows,
+            logical_columns,
+            physical_columns,
+            ..
+        } => {
+            let (prefix, order, logical_rows, physical_rows, logical_columns, physical_columns) =
+                if from.order == StorageOrder::Linear {
+                    let target = RearrangeTarget::from_order(to.order)
+                        .ok_or(KernelAbiError::RequirementMismatch)?;
+                    let (_, logical_rows, physical_rows, logical_columns, physical_columns) =
+                        rearrangement_specialization(
+                            target,
+                            *logical_rows,
+                            *physical_rows,
+                            *logical_columns,
+                            *physical_columns,
+                        );
+                    (
+                        "ipu_stack_rearrange_row_major_to_amp_f16",
+                        target.codelet_index(),
+                        logical_rows,
+                        physical_rows,
+                        logical_columns,
+                        physical_columns,
+                    )
+                } else {
+                    let source = UnpackSource::from_order(from.order)
+                        .ok_or(KernelAbiError::RequirementMismatch)?;
+                    (
+                        "ipu_stack_unpack_amp_to_row_major_f16",
+                        source.codelet_index(),
+                        *logical_rows,
+                        *physical_rows,
+                        *logical_columns,
+                        *physical_columns,
+                    )
+                };
+            Ok(format!(
+                "{prefix}_o{order}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
+            ))
+        }
+        _ => Err(KernelAbiError::RequirementMismatch),
+    }
 }
 
 impl KernelBuildPlan {
@@ -264,6 +335,7 @@ impl KernelBuildPlan {
         let mut rearrangements = BTreeSet::new();
         let mut unpacks = BTreeSet::new();
         let mut attention_stages = Vec::new();
+        let mut planned_kernels = BTreeSet::new();
         for tile in &program.tiles {
             collect_kernels(
                 program,
@@ -274,6 +346,7 @@ impl KernelBuildPlan {
                 &mut rearrangements,
                 &mut unpacks,
                 &mut attention_stages,
+                &mut planned_kernels,
             )?;
         }
         let mut plan = Self::default();
@@ -293,38 +366,21 @@ impl KernelBuildPlan {
                 let small = pair[0];
                 let large = *pair.last().expect("nonempty GEMM row pair");
                 let symbols = [
-                    (GemmKernelMode::Initialize, "small", small),
-                    (GemmKernelMode::Initialize, "large", large),
-                    (GemmKernelMode::Accumulate, "small", small),
-                    (GemmKernelMode::Accumulate, "large", large),
+                    (GemmKernelMode::Initialize, small),
+                    (GemmKernelMode::Initialize, large),
+                    (GemmKernelMode::Accumulate, small),
+                    (GemmKernelMode::Accumulate, large),
                 ]
-                .map(|(mode, size, _)| {
+                .map(|(mode, rows)| {
                     specialized_gemm_symbol(
                         prefix,
                         mode,
                         weight_suffix,
                         inner_block,
                         output_columns,
-                        size,
-                        small,
-                        large,
+                        rows,
                     )
                 });
-                for (mode, row_index) in [
-                    (GemmKernelMode::Initialize, 0usize),
-                    (GemmKernelMode::Accumulate, 2usize),
-                ] {
-                    plan.gemm_symbols.insert(
-                        (precision, weights, inner_block, output_columns, mode, small),
-                        symbols[row_index].clone(),
-                    );
-                    if pair.len() == 2 {
-                        plan.gemm_symbols.insert(
-                            (precision, weights, inner_block, output_columns, mode, large),
-                            symbols[row_index + 1].clone(),
-                        );
-                    }
-                }
                 let single_rows = pair.len() == 1;
                 let mut definitions = vec![
                     ("GEMM_SMALL_ROWS", small.to_string()),
@@ -411,16 +467,6 @@ impl KernelBuildPlan {
                 ],
                 retained_symbols: vec![call.clone()],
             });
-            plan.unpack_symbols.insert(
-                (
-                    order,
-                    logical_rows,
-                    physical_rows,
-                    logical_columns,
-                    physical_columns,
-                ),
-                call,
-            );
         }
         for (order, logical_rows, physical_rows, logical_columns, physical_columns) in
             rearrangements
@@ -456,16 +502,6 @@ impl KernelBuildPlan {
                     ],
                     retained_symbols: vec![call.clone()],
                 });
-                plan.rearrange_symbols.insert(
-                    (
-                        order,
-                        logical_rows,
-                        physical_rows,
-                        logical_columns,
-                        physical_columns,
-                    ),
-                    call,
-                );
                 continue;
             }
             if order
@@ -487,16 +523,6 @@ impl KernelBuildPlan {
                     ],
                     retained_symbols: vec![call.clone()],
                 });
-                plan.rearrange_symbols.insert(
-                    (
-                        order,
-                        logical_rows,
-                        physical_rows,
-                        logical_columns,
-                        physical_columns,
-                    ),
-                    call,
-                );
                 continue;
             }
             if order == RearrangeTarget::AmpTransposedRight
@@ -512,16 +538,6 @@ impl KernelBuildPlan {
                     definitions: vec![("REARRANGE_CALL_SYMBOL", call.clone())],
                     retained_symbols: vec![call.clone()],
                 });
-                plan.rearrange_symbols.insert(
-                    (
-                        order,
-                        logical_rows,
-                        physical_rows,
-                        logical_columns,
-                        physical_columns,
-                    ),
-                    call,
-                );
                 continue;
             }
             plan.compilations.push(KernelCompilation {
@@ -551,16 +567,6 @@ impl KernelBuildPlan {
                 ],
                 retained_symbols: vec![call.clone()],
             });
-            plan.rearrange_symbols.insert(
-                (
-                    order,
-                    logical_rows,
-                    physical_rows,
-                    logical_columns,
-                    physical_columns,
-                ),
-                call,
-            );
         }
         if has_worker_codelets || !attention_stages.is_empty() {
             plan.compilations.push(KernelCompilation {
@@ -673,7 +679,7 @@ impl KernelBuildPlan {
                 if !retained_symbols.contains(&symbol) {
                     retained_symbols.push(symbol.clone());
                 }
-                plan.attention_stage_symbols.push((kernel, rows, symbol));
+                plan.symbols.insert(kernel, symbol);
             }
             let scale_bits = (1.0_f32 / (head_dimension as f32).sqrt()).to_bits();
             let softmax_definitions = vec![
@@ -740,6 +746,12 @@ impl KernelBuildPlan {
                 retained_symbols: merge_symbols,
             });
         }
+        for kernel in planned_kernels {
+            if !plan.symbols.contains_key(&kernel) {
+                plan.symbols
+                    .insert(kernel.clone(), specialized_kernel_symbol(&kernel)?);
+            }
+        }
         Ok(plan)
     }
 
@@ -749,87 +761,13 @@ impl KernelBuildPlan {
         if abi.availability != KernelAvailability::Implemented {
             return Err(KernelAbiError::Unavailable(kernel.clone()));
         }
-        let symbol = match (&abi.symbols, kernel) {
-            (KernelSymbols::Exact(symbol), _) => (*symbol).to_owned(),
-            (
-                KernelSymbols::RowSpecialized { .. },
-                TileKernelSpec::Gemm {
-                    multiply,
-                    mode,
-                    weights,
-                    inner_block,
-                    output_columns,
-                    rows,
-                    ..
-                },
-            ) => {
-                let planned = self
-                    .gemm_rows
-                    .get(&(*multiply, *weights, *inner_block, *output_columns))
-                    .ok_or(KernelAbiError::UnplannedGemmRows(*rows))?;
-                if !planned.contains(rows) {
-                    return Err(KernelAbiError::UnplannedGemmRows(*rows));
-                }
-                self.gemm_symbols
-                    .get(&(
-                        *multiply,
-                        *weights,
-                        *inner_block,
-                        *output_columns,
-                        *mode,
-                        *rows,
-                    ))
-                    .cloned()
-                    .ok_or(KernelAbiError::UnplannedGemmRows(*rows))?
-            }
-            (KernelSymbols::AttentionStageSpecialized, _) => {
-                let rows = match kernel {
-                    TileKernelSpec::AttentionSoftmax { query_rows, .. }
-                    | TileKernelSpec::AttentionMerge { query_rows, .. } => *query_rows,
-                    _ => return Err(KernelAbiError::RequirementMismatch),
-                };
-                self.attention_stage_symbols
-                    .iter()
-                    .find(|(planned, planned_rows, _)| planned == kernel && *planned_rows == rows)
-                    .map(|(_, _, symbol)| symbol.clone())
-                    .ok_or(KernelAbiError::RequirementMismatch)?
-            }
-            (KernelSymbols::RearrangeSpecialized, TileKernelSpec::Rearrange { .. }) => self
-                .rearrange_symbols
-                .get(&rearrangement_specialization(
-                    match kernel {
-                        TileKernelSpec::Rearrange {
-                            to: crate::Layout { order, .. },
-                            ..
-                        } => RearrangeTarget::from_order(*order)
-                            .ok_or(KernelAbiError::RequirementMismatch)?,
-                        _ => return Err(KernelAbiError::RequirementMismatch),
-                    },
-                    matrix_extent(run, true, false)?,
-                    matrix_extent(run, false, false)?,
-                    matrix_extent(run, true, true)?,
-                    matrix_extent(run, false, true)?,
-                ))
+        let symbol = match abi.symbols {
+            KernelSymbols::Exact(symbol) => symbol.to_owned(),
+            KernelSymbols::Planned => self
+                .symbols
+                .get(kernel)
                 .cloned()
                 .ok_or(KernelAbiError::RequirementMismatch)?,
-            (
-                KernelSymbols::UnpackSpecialized,
-                TileKernelSpec::Rearrange {
-                    from: crate::Layout { order, .. },
-                    ..
-                },
-            ) => self
-                .unpack_symbols
-                .get(&(
-                    UnpackSource::from_order(*order).ok_or(KernelAbiError::RequirementMismatch)?,
-                    input_matrix_extent(run, true, false)?,
-                    input_matrix_extent(run, false, false)?,
-                    input_matrix_extent(run, true, true)?,
-                    input_matrix_extent(run, false, true)?,
-                ))
-                .cloned()
-                .ok_or(KernelAbiError::RequirementMismatch)?,
-            _ => return Err(KernelAbiError::RequirementMismatch),
         };
         Ok(PlannedKernelCall {
             symbol,
@@ -927,6 +865,7 @@ fn collect_kernels(
     rearrangements: &mut BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     unpacks: &mut BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
+    planned_kernels: &mut BTreeSet<TileKernelSpec>,
 ) -> Result<(), KernelAbiError> {
     for work in program.work(tile) {
         match work {
@@ -935,6 +874,9 @@ fn collect_kernels(
                 let kernel = &run.kernel;
                 if abi.availability != KernelAvailability::Implemented {
                     return Err(KernelAbiError::Unavailable(kernel.clone()));
+                }
+                if abi.symbols == KernelSymbols::Planned {
+                    planned_kernels.insert(kernel.clone());
                 }
                 if let TileKernelSpec::Gemm {
                     multiply,
@@ -1020,61 +962,12 @@ fn collect_kernels(
                 rearrangements,
                 unpacks,
                 attention_stages,
+                planned_kernels,
             )?,
             TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) | TileWorkRef::Checkpoint(..) => {}
         }
     }
     Ok(())
-}
-
-fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, KernelAbiError> {
-    let rank = run.output.extents.len();
-    let axis = rank
-        .checked_sub(if columns { 1 } else { 2 })
-        .ok_or(KernelAbiError::RequirementMismatch)?;
-    let extent = &run.output.extents[axis];
-    Ok(if logical {
-        extent.logical_end - extent.start
-    } else {
-        extent.physical_end - extent.start
-    })
-}
-
-fn input_matrix_extent(
-    run: &KernelRun,
-    logical: bool,
-    columns: bool,
-) -> Result<u32, KernelAbiError> {
-    let view = run
-        .inputs
-        .first()
-        .and_then(|operand| operand.views.first())
-        .ok_or(KernelAbiError::RequirementMismatch)?;
-    let rank = view.extents.len();
-    let axis = rank
-        .checked_sub(if columns { 1 } else { 2 })
-        .ok_or(KernelAbiError::RequirementMismatch)?;
-    let extent = &view.extents[axis];
-    Ok(if logical {
-        extent.logical_end - extent.start
-    } else {
-        extent.physical_end - extent.start
-    })
-}
-
-fn matrix_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
-    let view = run
-        .inputs
-        .first()
-        .and_then(|operand| operand.views.first())
-        .ok_or(KernelAbiError::RequirementMismatch)?;
-    view.extents[..view.extents.len().saturating_sub(2)]
-        .iter()
-        .try_fold(1u32, |product, extent| {
-            product
-                .checked_mul(extent.physical_end - extent.start)
-                .ok_or(KernelAbiError::ElementCountOverflow)
-        })
 }
 
 fn rearrangement_specialization(
@@ -1130,11 +1023,30 @@ fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbi
             },
             "words_per_worker" => output_byte_count(run).map(|bytes| bytes / 8 / 6),
             "remainder_workers" => output_byte_count(run).map(|bytes| bytes / 8 % 6),
-            "logical_rows" => matrix_extent(run, true, false),
-            "physical_rows" => matrix_extent(run, false, false),
-            "matrices" => matrix_count(run),
-            "logical_columns" => matrix_extent(run, true, true),
-            "physical_columns" => matrix_extent(run, false, true),
+            "matrices" => match run.kernel {
+                TileKernelSpec::Rearrange { matrices, .. } => Ok(matrices),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "logical_rows" => match run.kernel {
+                TileKernelSpec::Rearrange { logical_rows, .. } => Ok(logical_rows),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "physical_rows" => match run.kernel {
+                TileKernelSpec::Rearrange { physical_rows, .. } => Ok(physical_rows),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "logical_columns" => match run.kernel {
+                TileKernelSpec::Rearrange {
+                    logical_columns, ..
+                } => Ok(logical_columns),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            "physical_columns" => match run.kernel {
+                TileKernelSpec::Rearrange {
+                    physical_columns, ..
+                } => Ok(physical_columns),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
             "target_order" => match &run.kernel {
                 TileKernelSpec::Rearrange {
                     to: crate::Layout { order, .. },
@@ -1185,11 +1097,7 @@ pub fn tile_kernel_abi(
             scalar_arguments(0, &["words_per_worker", "remainder_workers"]),
         ),
         TileKernelSpec::Gemm {
-            multiply,
-            mode,
-            weights,
-            output_columns,
-            ..
+            multiply, weights, ..
         } => {
             if !matches!(requirements, KernelRequirements::Operator(_)) {
                 return Err(KernelAbiError::RequirementMismatch);
@@ -1197,13 +1105,21 @@ pub fn tile_kernel_abi(
             if *weights == GemmWeightLoad::Interleaved && *multiply != Precision::F16 {
                 return Err(KernelAbiError::RequirementMismatch);
             }
-            let symbols = gemm_symbols(*multiply, *mode, *weights, *output_columns);
             let scalars = if matches!(multiply, Precision::F8F143 { .. }) {
                 scalar_arguments(2, &["scale_exponent"])
             } else {
                 Vec::new()
             };
-            (symbols.0, symbols.1, 2, scalars)
+            (
+                KernelSymbols::Planned,
+                if matches!(multiply, Precision::F8F143 { .. }) {
+                    KernelAvailability::Required
+                } else {
+                    KernelAvailability::Implemented
+                },
+                2,
+                scalars,
+            )
         }
         TileKernelSpec::Gelu => {
             let symbol = gelu_symbol(requirements).unwrap_or("ipu_stack_unsupported_gelu");
@@ -1243,13 +1159,13 @@ pub fn tile_kernel_abi(
             ),
         ),
         TileKernelSpec::AttentionSoftmax { .. } => (
-            KernelSymbols::AttentionStageSpecialized,
+            KernelSymbols::Planned,
             KernelAvailability::Implemented,
             1,
             Vec::new(),
         ),
         TileKernelSpec::AttentionMerge { .. } => (
-            KernelSymbols::AttentionStageSpecialized,
+            KernelSymbols::Planned,
             KernelAvailability::Implemented,
             2,
             scalar_arguments(2, &["initial_block", "final_block"]),
@@ -1266,7 +1182,7 @@ pub fn tile_kernel_abi(
                 && to.order == StorageOrder::Linear =>
         {
             (
-                KernelSymbols::UnpackSpecialized,
+                KernelSymbols::Planned,
                 KernelAvailability::Implemented,
                 1,
                 scalar_arguments(
@@ -1292,7 +1208,7 @@ pub fn tile_kernel_abi(
                 ) || matches!(to.order, StorageOrder::Blocked(order) if order.is_matrix())) =>
         {
             (
-                KernelSymbols::RearrangeSpecialized,
+                KernelSymbols::Planned,
                 KernelAvailability::Implemented,
                 1,
                 scalar_arguments(
@@ -1396,60 +1312,6 @@ fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
     (input_layout == output_layout).then_some("ipu_stack_gelu_tanh_approx_f16")
 }
 
-fn gemm_symbols(
-    precision: Precision,
-    mode: GemmKernelMode,
-    weights: GemmWeightLoad,
-    output_columns: u32,
-) -> (KernelSymbols, KernelAvailability) {
-    let weight_suffix = if weights == GemmWeightLoad::Interleaved {
-        "_interleaved"
-    } else {
-        ""
-    };
-    let prefix = match precision {
-        Precision::F16 => "f16",
-        Precision::F32 => "f32",
-        Precision::F8F143 { .. } => "f8",
-    };
-    let row_symbols = |operation: &str| KernelSymbols::RowSpecialized {
-        small: format!(
-            "ipu_stack_gemm_{prefix}_{operation}_small_rows{weight_suffix}_c{output_columns}"
-        ),
-        large: format!(
-            "ipu_stack_gemm_{prefix}_{operation}_large_rows{weight_suffix}_c{output_columns}"
-        ),
-    };
-    let symbols = match (precision, mode, weights) {
-        (Precision::F16, GemmKernelMode::Initialize, GemmWeightLoad::Interleaved) => {
-            row_symbols("init")
-        }
-        (Precision::F16, GemmKernelMode::Accumulate, GemmWeightLoad::Interleaved) => {
-            row_symbols("accumulate")
-        }
-        (Precision::F16, GemmKernelMode::Initialize, GemmWeightLoad::Standard) => {
-            row_symbols("init")
-        }
-        (Precision::F16, GemmKernelMode::Accumulate, GemmWeightLoad::Standard) => {
-            row_symbols("accumulate")
-        }
-        (Precision::F32, GemmKernelMode::Initialize, _) => row_symbols("init"),
-        (Precision::F32, GemmKernelMode::Accumulate, _) => row_symbols("accumulate"),
-        (Precision::F8F143 { .. }, GemmKernelMode::Initialize, _) => {
-            KernelSymbols::Exact("ipu_stack_gemm_f8_init")
-        }
-        (Precision::F8F143 { .. }, GemmKernelMode::Accumulate, _) => {
-            KernelSymbols::Exact("ipu_stack_gemm_f8_accumulate")
-        }
-    };
-    let availability = if matches!(precision, Precision::F8F143 { .. }) {
-        KernelAvailability::Required
-    } else {
-        KernelAvailability::Implemented
-    };
-    (symbols, availability)
-}
-
 fn exact_symbol(
     precision: Precision,
     f16_symbol: &'static str,
@@ -1542,7 +1404,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(abi.availability, KernelAvailability::Implemented);
-            assert!(matches!(abi.symbols, KernelSymbols::RowSpecialized { .. }));
+            assert_eq!(abi.symbols, KernelSymbols::Planned);
             assert_eq!(abi.input_registers, [3, 4]);
             assert_eq!(abi.return_register, 10);
         }
