@@ -51,7 +51,7 @@ pub use ir::{
 };
 pub use kernel::{
     KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
-    KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
+    KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument, TileKernelSpec,
     materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
 pub use layout::{
@@ -78,7 +78,7 @@ pub use operator::{
     GemmWeightLoad, GridOrder, LocalOperandStaging, MemoryElementRequirement, MemoryOperand,
     MemorySpaceRequirements, MidOperator, OperandMaterialization, OperandRequirement,
     OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    ParallelReductionPlan, PointwiseInputMapping, Precision, ReductionStaging, TileKernelSpec,
+    ParallelReductionPlan, PointwiseInputMapping, Precision, ReductionStaging,
 };
 pub use place::{Placement, PlacementError, place};
 pub use storage::{

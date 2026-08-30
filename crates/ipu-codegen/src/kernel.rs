@@ -4,9 +4,9 @@
 use crate::MemorySpaceRequirements;
 use crate::layout::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    GemmKernelMode, GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, LowShard,
-    LowShardId, NativeKernelOrder, Precision, StorageError, StorageOrder, TileKernelSpec,
-    TileWorkList, TileWorkRef, view_byte_spans,
+    AccumulationPrecision, AttentionOptions, GemmKernelMode, GemmWeightLoad, KernelRequirements,
+    KernelRun, Layout, LowProgram, LowShard, LowShardId, NativeKernelOrder, Precision,
+    StorageError, StorageOrder, TileWorkList, TileWorkRef, view_byte_spans,
 };
 use ipu_target::program::{ComputeStep, StepProfile, TileAddress};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +14,49 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const OUTPUT_REGISTER: u8 = 2;
 pub const FIRST_INPUT_REGISTER: u8 = 3;
 pub const RETURN_REGISTER: u8 = 10;
+
+/// A concrete tile-local callable produced during low lowering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TileKernelSpec {
+    FillZero,
+    Gemm {
+        multiply: Precision,
+        accumulate: AccumulationPrecision,
+        mode: GemmKernelMode,
+        weights: GemmWeightLoad,
+        inner_block: u32,
+        output_columns: u32,
+    },
+    Gelu,
+    ReductionSum {
+        partials: u16,
+    },
+    Add,
+    FlashAttention {
+        options: AttentionOptions,
+        accumulate: AccumulationPrecision,
+    },
+    AttentionSoftmax {
+        head_dimension: u32,
+        key_columns: u32,
+        padded_key_columns: u32,
+    },
+    AttentionMerge {
+        value_dimension: u32,
+        padded_value_dimension: u32,
+        key_block_columns: u32,
+        initial: bool,
+        final_block: bool,
+    },
+    Cast {
+        from: Precision,
+        to: Precision,
+    },
+    Rearrange {
+        from: Layout,
+        to: Layout,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelSymbols {

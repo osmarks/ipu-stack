@@ -50,49 +50,6 @@ pub enum MidOperator {
     },
 }
 
-/// A tile-local callable selected by a whole-device operator plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileKernelSpec {
-    FillZero,
-    Gemm {
-        multiply: Precision,
-        accumulate: AccumulationPrecision,
-        mode: GemmKernelMode,
-        weights: GemmWeightLoad,
-        inner_block: u32,
-        output_columns: u32,
-    },
-    Gelu,
-    ReductionSum {
-        partials: u16,
-    },
-    Add,
-    FlashAttention {
-        options: AttentionOptions,
-        accumulate: AccumulationPrecision,
-    },
-    AttentionSoftmax {
-        head_dimension: u32,
-        key_columns: u32,
-        padded_key_columns: u32,
-    },
-    AttentionMerge {
-        value_dimension: u32,
-        padded_value_dimension: u32,
-        key_block_columns: u32,
-        initial: bool,
-        final_block: bool,
-    },
-    Cast {
-        from: Precision,
-        to: Precision,
-    },
-    Rearrange {
-        from: Layout,
-        to: Layout,
-    },
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GemmKernelMode {
     Initialize,
@@ -162,36 +119,23 @@ pub struct AttentionPlan {
 }
 
 impl AttentionPlan {
-    pub fn query_key_kernel(&self) -> TileKernelSpec {
-        let output_columns = match self.blocking {
+    pub fn gemm_blocks(&self) -> [GemmBlockShape; 2] {
+        let key_columns = match self.blocking {
             AttentionBlocking::Flash { key_rows, .. } => key_rows,
             AttentionBlocking::Materialized {
                 padded_key_rows, ..
             } => padded_key_rows,
         };
-        self.kernel.kernel(
-            GemmKernelMode::Initialize,
+        [
             GemmBlockShape {
                 inner: self.padding.query_dimension,
-                output_columns,
+                output_columns: key_columns,
             },
-        )
-    }
-
-    pub fn probability_value_kernel(&self) -> TileKernelSpec {
-        let inner = match self.blocking {
-            AttentionBlocking::Flash { key_rows, .. } => key_rows,
-            AttentionBlocking::Materialized {
-                padded_key_rows, ..
-            } => padded_key_rows,
-        };
-        self.kernel.kernel(
-            GemmKernelMode::Initialize,
             GemmBlockShape {
-                inner,
+                inner: key_columns,
                 output_columns: self.padding.value_dimension,
             },
-        )
+        ]
     }
 }
 
@@ -257,19 +201,6 @@ pub struct GemmKernelFamily {
     pub multiply: Precision,
     pub accumulate: AccumulationPrecision,
     pub weights: GemmWeightLoad,
-}
-
-impl GemmKernelFamily {
-    pub fn kernel(self, mode: GemmKernelMode, block: GemmBlockShape) -> TileKernelSpec {
-        TileKernelSpec::Gemm {
-            multiply: self.multiply,
-            accumulate: self.accumulate,
-            mode,
-            weights: self.weights,
-            inner_block: block.inner,
-            output_columns: block.output_columns,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

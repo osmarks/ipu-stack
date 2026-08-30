@@ -12,13 +12,14 @@ use crate::conversion::{
 };
 use crate::graph::{GraphInputKind, OperationId};
 use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
+use crate::kernel::TileKernelSpec;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, BlockedOrder, Layout, LayoutError, MemoryClass,
     NativeKernelOrder, ShardExtent, StorageOrder, TensorRegion, TensorTiling, TensorType,
 };
 use crate::operator::{
-    GemmDistribution, MemoryOperand, MemorySpaceRequirements, OperandRequirement, OperatorDispatch,
-    OperatorRequirements, OutputAliasing, PointwiseInputMapping, Precision, TileKernelSpec,
+    GemmDistribution, GemmKernelMode, MemoryOperand, MemorySpaceRequirements, OperandRequirement,
+    OperatorDispatch, OperatorRequirements, OutputAliasing, PointwiseInputMapping, Precision,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use ipu_target::hardware::HardwareTarget;
@@ -566,6 +567,29 @@ struct AttentionBufferShape {
     padded_query_dimension: u32,
     padded_value_dimension: u32,
     reuse_key_staging_for_state: bool,
+}
+
+fn gemm_kernel_spec(
+    family: crate::GemmKernelFamily,
+    mode: crate::GemmKernelMode,
+    block: crate::GemmBlockShape,
+) -> TileKernelSpec {
+    TileKernelSpec::Gemm {
+        multiply: family.multiply,
+        accumulate: family.accumulate,
+        mode,
+        weights: family.weights,
+        inner_block: block.inner,
+        output_columns: block.output_columns,
+    }
+}
+
+fn attention_kernel_specs(plan: &crate::AttentionPlan) -> (TileKernelSpec, TileKernelSpec) {
+    let [query_key, probability_value] = plan.gemm_blocks();
+    (
+        gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, query_key),
+        gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, probability_value),
+    )
 }
 
 impl AttentionBufferShape {
@@ -2088,8 +2112,7 @@ impl LoweringState {
         else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let query_key = plan.query_key_kernel();
-        let probability_value = plan.probability_value_kernel();
+        let (query_key, probability_value) = attention_kernel_specs(plan);
         let padded_value_dimension = plan.padding.value_dimension;
         let [query, key, value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -2378,8 +2401,7 @@ impl LoweringState {
         else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let query_key = plan.query_key_kernel();
-        let probability_value = plan.probability_value_kernel();
+        let (query_key, probability_value) = attention_kernel_specs(plan);
         let padded_value_dimension = plan.padding.value_dimension;
         let [query, key, value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -3344,12 +3366,10 @@ impl LoweringState {
         let inner_block = plan.geometry.block.inner;
         let output_column_block = plan.geometry.block.output_columns;
         let orientation = plan.geometry.orientation;
-        let initialize = plan
-            .kernel
-            .kernel(crate::GemmKernelMode::Initialize, plan.geometry.block);
-        let accumulate = plan
-            .kernel
-            .kernel(crate::GemmKernelMode::Accumulate, plan.geometry.block);
+        let initialize =
+            gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, plan.geometry.block);
+        let accumulate =
+            gemm_kernel_spec(plan.kernel, GemmKernelMode::Accumulate, plan.geometry.block);
         if orientation != crate::GemmOrientation::Normal {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -3638,12 +3658,10 @@ impl LoweringState {
         let inner_block = plan.geometry.block.inner;
         let output_column_block = plan.geometry.block.output_columns;
         let orientation = plan.geometry.orientation;
-        let initialize = plan
-            .kernel
-            .kernel(crate::GemmKernelMode::Initialize, plan.geometry.block);
-        let accumulate = plan
-            .kernel
-            .kernel(crate::GemmKernelMode::Accumulate, plan.geometry.block);
+        let initialize =
+            gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, plan.geometry.block);
+        let accumulate =
+            gemm_kernel_spec(plan.kernel, GemmKernelMode::Accumulate, plan.geometry.block);
         let row_partitions = reduction.compute.rows;
         let column_partitions = reduction.compute.columns;
         let inner_partitions = reduction.compute.inner;
