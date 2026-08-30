@@ -1,7 +1,6 @@
 //! Structural memory, capacity, and communication estimates.
 
 use super::exchange::ExchangeEndpointTraffic;
-use crate::OperatorSchedule;
 use crate::graph::TensorShape;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorRegion, TensorType,
@@ -12,6 +11,7 @@ use crate::operator::{
     AllocationRequirements, MemoryElementRequirement, MemoryOperand, OperandMaterialization,
     Precision,
 };
+use crate::{OperatorSchedule, ScheduleStep};
 use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -74,7 +74,7 @@ pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64
 }
 
 pub(crate) fn gemm_partial_tensor(schedule: &OperatorSchedule, output: &TensorType) -> TensorType {
-    let Some(plan) = schedule.gemm_plan() else {
+    let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() else {
         return output.clone();
     };
     plan.partial_tensor(output)
@@ -194,8 +194,19 @@ pub(crate) fn operator_memory_estimate(
     );
     let mut temporary = MemoryUsage::default();
     let mut maximum_standard_temporary_allocation = 0u64;
-    if let (Some(plan), Some(first), Some(second)) =
-        (schedule.gemm_plan(), inputs.first(), inputs.get(1))
+    let gemm = match schedule.steps.first() {
+        Some(ScheduleStep::Gemm(gemm)) => Some(gemm),
+        _ => None,
+    };
+    let reduction_staging = schedule.steps.get(1).and_then(|step| match step {
+        ScheduleStep::Reduce { staging, .. } => Some(*staging),
+        _ => None,
+    });
+    let attention = match schedule.steps.as_slice() {
+        [ScheduleStep::Attention(attention)] => Some(attention),
+        _ => None,
+    };
+    if let (Some(plan), Some(first), Some(second)) = (gemm, inputs.first(), inputs.get(1))
         && plan.geometry.compute.inner > 1
     {
         let compute = plan.geometry.compute;
@@ -263,7 +274,7 @@ pub(crate) fn operator_memory_estimate(
             partial_bytes
         };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
-        let staged_remote_partials = match schedule.reduction_staging() {
+        let staged_remote_partials = match reduction_staging {
             Some(crate::ReductionStaging::Complete) => compute.inner.saturating_sub(1),
             Some(crate::ReductionStaging::Streamed) => 1,
             None => 0,
@@ -278,11 +289,9 @@ pub(crate) fn operator_memory_estimate(
             interleaved: convolution.interleaved.max(reduction.interleaved),
         };
     }
-    if let (Some(plan), Some(left), Some(requirement)) = (
-        schedule.gemm_plan(),
-        inputs.first(),
-        requirements.inputs.first(),
-    ) && requirement.materialization == OperandMaterialization::DispatchSlices
+    if let (Some(plan), Some(left), Some(requirement)) =
+        (gemm, inputs.first(), requirements.inputs.first())
+        && requirement.materialization == OperandMaterialization::DispatchSlices
         && plan.geometry.compute.inner == 1
     {
         let inner = left.shape.0.last().copied().map_or(1, u64::from).max(1);
@@ -292,11 +301,9 @@ pub(crate) fn operator_memory_estimate(
             .saturating_add(u64::from(requirement.allocation.access_tail_bytes));
         temporary.add_class(left.format.layout.memory_class, bytes);
     }
-    if let (Some(plan), Some(right), Some(requirement)) = (
-        schedule.gemm_plan(),
-        inputs.get(1),
-        requirements.inputs.get(1),
-    ) && right.format.precision == Precision::F16
+    if let (Some(plan), Some(right), Some(requirement)) =
+        (gemm, inputs.get(1), requirements.inputs.get(1))
+        && right.format.precision == Precision::F16
         && plan.geometry.compute.inner == 1
         && gemm_uses_panel_buffer(schedule, right, output)
     {
@@ -311,18 +318,17 @@ pub(crate) fn operator_memory_estimate(
             .saturating_mul(right.format.precision.bytes());
         temporary.add_class(requirement.local_staging.memory_class(), bytes);
     }
-    if let Some(crate::AttentionPlan {
+    if let Some(crate::AttentionMap {
         blocking:
             crate::AttentionBlocking::Flash {
                 query_rows: query_block_rows,
                 key_rows: key_block_rows,
             },
-        padding,
+        query_dimension: padded_query_dimension,
+        value_dimension: padded_value_dimension,
         ..
-    }) = schedule.attention_plan()
+    }) = attention
     {
-        let padded_query_dimension = &padding.query_dimension;
-        let padded_value_dimension = &padding.value_dimension;
         let element_bytes = inputs.first().map_or(Precision::F16.bytes(), |input| {
             input.format.precision.bytes()
         });
@@ -378,18 +384,17 @@ pub(crate) fn operator_memory_estimate(
                 .saturating_mul(Precision::F32.bytes()),
         );
     }
-    if let Some(crate::AttentionPlan {
+    if let Some(crate::AttentionMap {
         blocking:
             crate::AttentionBlocking::Materialized {
                 query_rows: query_block_rows,
                 padded_key_rows,
             },
-        padding,
+        query_dimension: padded_query_dimension,
+        value_dimension: padded_value_dimension,
         ..
-    }) = schedule.attention_plan()
+    }) = attention
     {
-        let padded_query_dimension = &padding.query_dimension;
-        let padded_value_dimension = &padding.value_dimension;
         let element_bytes = inputs.first().map_or(Precision::F16.bytes(), |input| {
             input.format.precision.bytes()
         });
@@ -461,7 +466,7 @@ pub(crate) fn gemm_uses_panel_buffer(
     right: &TensorType,
     output: &TensorType,
 ) -> bool {
-    let Some(plan) = schedule.gemm_plan() else {
+    let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() else {
         return false;
     };
     let inner_block = plan.geometry.block.inner;
@@ -506,7 +511,7 @@ pub(crate) fn gemm_exchange_phase_count(
     inputs: &[TensorType],
     _output: &TensorType,
 ) -> u64 {
-    let Some(plan) = schedule.gemm_plan() else {
+    let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() else {
         return 0;
     };
     let inner_block = plan.geometry.block.inner;
@@ -728,7 +733,7 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
     compute_output: &TensorType,
     target: HardwareTarget,
 ) -> Option<ExchangeEndpointTraffic> {
-    let Some(plan) = schedule.gemm_plan() else {
+    let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() else {
         return Some(ExchangeEndpointTraffic::default());
     };
     let [first, second] = inputs else {
@@ -1004,13 +1009,18 @@ mod tests {
     use crate::{OperandRequirement, OperatorRequirements};
 
     fn output_stationary_schedule() -> OperatorSchedule {
-        OperatorSchedule::blocked_gemm(
-            crate::MidOperator::Gemm {
+        OperatorSchedule {
+            operator: crate::MidOperator::Gemm {
                 options: crate::GemmOptions::default(),
                 multiply: Precision::F16,
                 accumulate: crate::AccumulationPrecision::F16,
             },
-            crate::BlockedGemmPlan {
+            steps: vec![ScheduleStep::Gemm(crate::GemmMap {
+                inputs: [
+                    crate::ScheduleValue::Input(0),
+                    crate::ScheduleValue::Input(1),
+                ],
+                output: crate::ScheduleValue::Output,
                 kernel: crate::GemmKernelFamily {
                     multiply: Precision::F16,
                     accumulate: crate::AccumulationPrecision::F16,
@@ -1033,8 +1043,8 @@ mod tests {
                     },
                     order: crate::GridOrder::ColumnsFast,
                 },
-            },
-            OperatorRequirements {
+            })],
+            requirements: OperatorRequirements {
                 inputs: Vec::new(),
                 output: OperandRequirement::new(
                     crate::TensorFormat {
@@ -1046,7 +1056,7 @@ mod tests {
                 output_aliasing: crate::OutputAliasing::Fresh,
                 memory_space: crate::MemorySpaceRequirements::default(),
             },
-        )
+        }
     }
 
     fn parallel_reduction_schedule(
@@ -1055,9 +1065,7 @@ mod tests {
         inner_partitions: u16,
     ) -> OperatorSchedule {
         let mut schedule = output_stationary_schedule();
-        let operator = schedule.operator;
-        let requirements = schedule.requirements.clone();
-        let Some(plan) = schedule.gemm_plan_mut() else {
+        let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first_mut() else {
             unreachable!();
         };
         plan.geometry.result = crate::GemmResultGrid {
@@ -1069,8 +1077,12 @@ mod tests {
             columns: column_partitions,
             inner: inner_partitions,
         };
-        let mut schedule = OperatorSchedule::blocked_gemm(operator, *plan, requirements);
-        schedule.set_reduction_staging(crate::ReductionStaging::Streamed);
+        plan.output = crate::ScheduleValue::Temporary(0);
+        schedule.steps.push(ScheduleStep::Reduce {
+            input: crate::ScheduleValue::Temporary(0),
+            output: crate::ScheduleValue::Output,
+            staging: crate::ReductionStaging::Streamed,
+        });
         schedule
     }
 

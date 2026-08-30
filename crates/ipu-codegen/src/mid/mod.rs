@@ -14,7 +14,7 @@ mod ir;
 use consumers::{direct_consumer_layouts, operator_accepts_input_layout};
 #[cfg(test)]
 use gemm::{
-    AmpWeightPlacement, amp_grid_gemm_plan, blocked_gemm_plan, gemm_accumulation_precision,
+    AmpWeightPlacement, amp_grid_gemm_plan, gemm_accumulation_precision, gemm_map,
     gemm_seed_plans_for_tile_count, independent_parameter_storage, parallel_reduction_plans,
 };
 use gemm::{GroupedOutputLayout, gemm_plan_matches, gemm_plans, grouped_output_layout};
@@ -46,7 +46,10 @@ use crate::layout::{
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
 use crate::operator::*;
-use crate::schedule::{KernelMap, OperatorSchedule, ScheduleAccess, ScheduleStep, ScheduleValue};
+use crate::schedule::{
+    AttentionBlocking, AttentionMap, KernelMap, OperatorSchedule, ScheduleAccess, ScheduleStep,
+    ScheduleValue,
+};
 use ipu_target::hardware::HardwareTarget;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1525,10 +1528,6 @@ fn plans_for_operation(
                 accumulate: AccumulationPrecision::F32,
                 weights: GemmWeightLoad::Standard,
             };
-            let padding = AttentionPadding {
-                query_dimension: padded_query_dimension,
-                value_dimension: padded_value_dimension,
-            };
             let requirements = OperatorRequirements {
                 inputs: [query_format, key_format, value_format]
                     .into_iter()
@@ -1555,17 +1554,27 @@ fn plans_for_operation(
                     },
                 ),
             ];
-            plans.extend(blockings.into_iter().flatten().map(|blocking| {
-                OperatorSchedule::attention(
-                    operator,
-                    AttentionPlan {
-                        kernel,
-                        blocking,
-                        padding,
-                    },
-                    requirements.clone(),
-                )
-            }));
+            plans.extend(
+                blockings
+                    .into_iter()
+                    .flatten()
+                    .map(|blocking| OperatorSchedule {
+                        operator,
+                        steps: vec![ScheduleStep::Attention(AttentionMap {
+                            inputs: [
+                                ScheduleValue::Input(0),
+                                ScheduleValue::Input(1),
+                                ScheduleValue::Input(2),
+                            ],
+                            output: ScheduleValue::Output,
+                            kernel,
+                            blocking,
+                            query_dimension: padded_query_dimension,
+                            value_dimension: padded_value_dimension,
+                        })],
+                        requirements: requirements.clone(),
+                    }),
+            );
         }
     }
     match operation.kind {
@@ -2351,7 +2360,7 @@ mod tests {
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
             distributed_result_cases += usize::from(candidates.iter().any(|candidate| {
-                let Some(plan) = candidate.gemm_plan() else {
+                let Some(ScheduleStep::Gemm(plan)) = candidate.steps.first() else {
                     return false;
                 };
                 if plan.geometry.compute.inner < 2 {
@@ -2368,7 +2377,7 @@ mod tests {
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
-                let Some(plan) = candidate.gemm_plan() else {
+                let Some(ScheduleStep::Gemm(plan)) = candidate.steps.first() else {
                     panic!("parallel GEMM candidate has non-GEMM schedule");
                 };
                 if plan.geometry.compute.inner < 2 {
@@ -2388,8 +2397,8 @@ mod tests {
                     &partial.format.layout,
                     &partial.shape
                 ));
-                assert!(matches!(candidate.gemm_plan(),
-                    Some(BlockedGemmPlan {
+                assert!(matches!(candidate.steps.first(),
+                    Some(ScheduleStep::Gemm(crate::GemmMap {
                         geometry: GemmGeometry {
                             block: GemmBlockShape { inner: inner_block, output_columns: output_column_block },
                             orientation,
@@ -2397,7 +2406,7 @@ mod tests {
                             ..
                         },
                         ..
-                    }) if actual_rows * actual_columns * actual <= tiles
+                    })) if actual_rows * actual_columns * actual <= tiles
                         && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
                         && u32::from(*actual_rows)
                             <= [m, n][orientation.physical_left_input()]
@@ -2455,7 +2464,7 @@ mod tests {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
             };
-            let gemm = blocked_gemm_plan(
+            let gemm = gemm_map(
                 operator,
                 GemmGeometry {
                     block: GemmBlockShape {
@@ -2478,7 +2487,11 @@ mod tests {
                 output_aliasing: OutputAliasing::Fresh,
                 memory_space: MemorySpaceRequirements::default(),
             };
-            let schedule = OperatorSchedule::blocked_gemm(operator, gemm, requirements.clone());
+            let schedule = OperatorSchedule {
+                operator,
+                steps: vec![ScheduleStep::Gemm(gemm)],
+                requirements: requirements.clone(),
+            };
             let standard_cost =
                 Ipu21CostModel.operator_cycles(&schedule, &[left.clone(), standard], &output);
             let direct_cost = Ipu21CostModel.operator_cycles(&schedule, &[left, direct], &output);
@@ -2910,11 +2923,10 @@ mod tests {
                     requirements.output.format.layout.memory_class,
                     MemoryClass::Interleaved
                 );
-                let orientation = operation
-                    .operator_plan()
-                    .and_then(|plan| plan.gemm_plan())
-                    .map(|plan| plan.geometry.orientation)
-                    .unwrap();
+                let orientation = match operation.operator_plan().unwrap().steps.first() {
+                    Some(ScheduleStep::Gemm(gemm)) => gemm.geometry.orientation,
+                    _ => panic!("GEMM operation lacks a GEMM schedule step"),
+                };
                 let physical_left = orientation.physical_left_input();
                 assert_eq!(
                     requirements.memory_space.distinct_element_groups,

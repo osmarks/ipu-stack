@@ -345,7 +345,7 @@ impl LoweringState {
     fn prepare_attention(
         &mut self,
         operation: &MidOperation,
-        plan: &crate::AttentionPlan,
+        plan: &crate::AttentionMap,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<AttentionLowering> {
         let [query, key, value] = operation.inputs.as_slice() else {
@@ -419,7 +419,7 @@ impl LoweringState {
     pub(super) fn lower_blocked_attention(
         &mut self,
         operation: &MidOperation,
-        plan: &crate::AttentionPlan,
+        plan: &crate::AttentionMap,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -431,7 +431,7 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
         let [query_key_block, probability_value_block] = plan.gemm_blocks();
-        let padded_value_dimension = plan.padding.value_dimension;
+        let padded_value_dimension = plan.value_dimension;
         if key_block_rows != AMP_INNER_BLOCK || query_block_rows == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
@@ -685,7 +685,7 @@ impl LoweringState {
     pub(super) fn lower_materialized_attention(
         &mut self,
         operation: &MidOperation,
-        plan: &crate::AttentionPlan,
+        plan: &crate::AttentionMap,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -697,7 +697,7 @@ impl LoweringState {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
         let [query_key_block, probability_value_block] = plan.gemm_blocks();
-        let padded_value_dimension = plan.padding.value_dimension;
+        let padded_value_dimension = plan.value_dimension;
         if query_block_rows == 0
             || padded_key_rows == 0
             || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)

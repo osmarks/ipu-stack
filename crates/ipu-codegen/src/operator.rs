@@ -5,6 +5,7 @@ use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, NativeKernelOrder, StorageOrder,
     TensorAxis, TensorFormat, TensorType,
 };
+use crate::schedule::{AttentionBlocking, AttentionMap};
 
 /// In-memory representation of one tensor element.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -120,67 +121,6 @@ impl GemmOrientation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AttentionPadding {
-    pub query_dimension: u32,
-    pub value_dimension: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AttentionBlocking {
-    Flash {
-        query_rows: u32,
-        key_rows: u32,
-    },
-    Materialized {
-        query_rows: u32,
-        padded_key_rows: u32,
-    },
-}
-
-impl AttentionBlocking {
-    pub const fn query_rows(self) -> u32 {
-        match self {
-            Self::Flash { query_rows, .. } | Self::Materialized { query_rows, .. } => query_rows,
-        }
-    }
-
-    pub const fn key_block_rows(self) -> u32 {
-        match self {
-            Self::Flash { key_rows, .. } => key_rows,
-            Self::Materialized { .. } => AMP_INNER_BLOCK,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AttentionPlan {
-    pub kernel: GemmKernelFamily,
-    pub blocking: AttentionBlocking,
-    pub padding: AttentionPadding,
-}
-
-impl AttentionPlan {
-    pub fn gemm_blocks(&self) -> [GemmBlockShape; 2] {
-        let key_columns = match self.blocking {
-            AttentionBlocking::Materialized {
-                padded_key_rows, ..
-            } => padded_key_rows,
-            blocking => blocking.key_block_rows(),
-        };
-        [
-            GemmBlockShape {
-                inner: self.padding.query_dimension,
-                output_columns: key_columns,
-            },
-            GemmBlockShape {
-                inner: key_columns,
-                output_columns: self.padding.value_dimension,
-            },
-        ]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GemmGrid {
     pub rows: u16,
     pub columns: u16,
@@ -232,79 +172,6 @@ pub struct GemmGeometry {
     pub order: GridOrder,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockedGemmPlan {
-    pub kernel: GemmKernelFamily,
-    pub geometry: GemmGeometry,
-}
-
-impl BlockedGemmPlan {
-    /// Tensor produced by the compute grid before a parallel K reduction.
-    ///
-    /// This is part of the selected whole-device plan: costing and low
-    /// materialization must use the same partial ownership and padding.
-    pub(crate) fn partial_tensor(&self, output: &TensorType) -> Option<TensorType> {
-        if self.geometry.compute.inner < 2 {
-            return Some(output.clone());
-        }
-        let output_rank = output.shape.0.len();
-        let output_column_axis = self
-            .geometry
-            .orientation
-            .column_axis()
-            .resolve(output_rank)
-            .ok()?;
-        let column_tiling = *output
-            .format
-            .layout
-            .tiling
-            .axes
-            .iter()
-            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))?;
-        let rows = self.geometry.compute.rows;
-        let columns = self.geometry.compute.columns;
-        let tiles = rows.checked_mul(columns)?;
-        let left_order = match self.geometry.orientation {
-            GemmOrientation::Normal => NativeKernelOrder::Left,
-            GemmOrientation::Swapped => NativeKernelOrder::TransposedLeft,
-        };
-        let constructor = if output.format.layout.order == StorageOrder::Native(left_order) {
-            Layout::amp_left_result_grid
-        } else {
-            Layout::amp_output_grid
-        };
-        let mut layout = constructor(
-            self.geometry.orientation,
-            self.geometry.block.output_columns,
-            tiles,
-            rows,
-            columns,
-            GridOrder::ColumnsFast,
-        );
-        let axis = layout
-            .tiling
-            .axes
-            .iter_mut()
-            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))?;
-        axis.block_size = column_tiling.block_size;
-        axis.padding_multiple = column_tiling.block_size;
-        if column_tiling.partitions == columns {
-            axis.block_size = column_tiling.block_size;
-            axis.padding_multiple = column_tiling.padding_multiple;
-            axis.shard_padding_multiple = column_tiling.shard_padding_multiple;
-        }
-        let partial = TensorType {
-            shape: output.shape.clone(),
-            format: TensorFormat {
-                precision: output.format.precision,
-                layout,
-            },
-        };
-        partial.format.layout.resolve(&partial.shape).ok()?;
-        Some(partial)
-    }
-}
-
 /// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
 /// are keyed by the source graph operation and bypass beam pruning and
 /// conservative whole-graph memory rejection. Concrete placement remains the
@@ -340,7 +207,7 @@ impl crate::OperatorSchedule {
     fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
         match self.steps.first() {
             Some(crate::ScheduleStep::KernelMap(_)) => EmptyOutputShardPolicy::Skip,
-            Some(crate::ScheduleStep::BlockedGemm(_) | crate::ScheduleStep::Attention(_)) => {
+            Some(crate::ScheduleStep::Gemm(_) | crate::ScheduleStep::Attention(_)) => {
                 EmptyOutputShardPolicy::Reject
             }
             Some(crate::ScheduleStep::Reduce { .. }) | None => EmptyOutputShardPolicy::Reject,
@@ -623,8 +490,35 @@ impl crate::OperatorSchedule {
                 MidOperator::Gemm {
                     options, multiply, ..
                 },
-                [crate::ScheduleStep::BlockedGemm(plan), ..],
+                [crate::ScheduleStep::Gemm(plan), ..],
             ) => {
+                if plan.inputs
+                    != [
+                        crate::ScheduleValue::Input(0),
+                        crate::ScheduleValue::Input(1),
+                    ]
+                {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                }
+                let reduction = self.steps.get(1).and_then(|step| match step {
+                    crate::ScheduleStep::Reduce {
+                        input,
+                        output,
+                        staging,
+                    } => Some((input, output, staging)),
+                    _ => None,
+                });
+                if plan.geometry.compute.inner > 1 {
+                    if plan.output != crate::ScheduleValue::Temporary(0)
+                        || reduction.is_none_or(|(input, output, _)| {
+                            *input != plan.output || *output != crate::ScheduleValue::Output
+                        })
+                    {
+                        return Err(OperatorPlanError::DispatchMismatch);
+                    }
+                } else if plan.output != crate::ScheduleValue::Output || reduction.is_some() {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                }
                 let inner_block = &plan.geometry.block.inner;
                 let output_column_block = &plan.geometry.block.output_columns;
                 let compute = plan.geometry.compute;
@@ -720,7 +614,7 @@ impl crate::OperatorSchedule {
                         || !result_columns.is_multiple_of(compute.columns)
                         || result_row_partitions.saturating_mul(result_column_partitions)
                             > compute.inner
-                        || self.reduction_staging().is_none()
+                        || reduction.is_none()
                         || axis_partitions(row_axis) != result_rows
                         || axis_partitions(column_axis) != result_columns
                     {
@@ -728,7 +622,7 @@ impl crate::OperatorSchedule {
                     }
                 } else if compute.rows != plan.geometry.result.rows
                     || compute.columns != plan.geometry.result.columns
-                    || self.reduction_staging().is_some()
+                    || reduction.is_some()
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
@@ -826,17 +720,30 @@ impl crate::OperatorSchedule {
                     accumulate,
                 },
                 [
-                    crate::ScheduleStep::Attention(AttentionPlan {
+                    crate::ScheduleStep::Attention(AttentionMap {
+                        inputs: scheduled_inputs,
+                        output: scheduled_output,
                         kernel,
                         blocking:
                             AttentionBlocking::Flash {
                                 query_rows,
                                 key_rows,
                             },
-                        padding,
+                        query_dimension,
+                        value_dimension,
                     }),
                 ],
             ) => {
+                if *scheduled_inputs
+                    != [
+                        crate::ScheduleValue::Input(0),
+                        crate::ScheduleValue::Input(1),
+                        crate::ScheduleValue::Input(2),
+                    ]
+                    || *scheduled_output != crate::ScheduleValue::Output
+                {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                }
                 let [query, key, value] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
@@ -844,8 +751,8 @@ impl crate::OperatorSchedule {
                     || *accumulate != AccumulationPrecision::F32
                     || *query_rows == 0
                     || *key_rows != AMP_INNER_BLOCK
-                    || padding.query_dimension == 0
-                    || padding.value_dimension == 0
+                    || *query_dimension == 0
+                    || *value_dimension == 0
                     || !matches!(
                         query.format.layout.order,
                         StorageOrder::Native(NativeKernelOrder::Left)
@@ -877,17 +784,30 @@ impl crate::OperatorSchedule {
                     accumulate,
                 },
                 [
-                    crate::ScheduleStep::Attention(AttentionPlan {
+                    crate::ScheduleStep::Attention(AttentionMap {
+                        inputs: scheduled_inputs,
+                        output: scheduled_output,
                         kernel,
                         blocking:
                             AttentionBlocking::Materialized {
                                 query_rows,
                                 padded_key_rows,
                             },
-                        padding,
+                        query_dimension,
+                        value_dimension,
                     }),
                 ],
             ) => {
+                if *scheduled_inputs
+                    != [
+                        crate::ScheduleValue::Input(0),
+                        crate::ScheduleValue::Input(1),
+                        crate::ScheduleValue::Input(2),
+                    ]
+                    || *scheduled_output != crate::ScheduleValue::Output
+                {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                }
                 let [query, key, value] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
@@ -896,8 +816,8 @@ impl crate::OperatorSchedule {
                     || *query_rows == 0
                     || *padded_key_rows == 0
                     || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
-                    || padding.query_dimension == 0
-                    || padding.value_dimension == 0
+                    || *query_dimension == 0
+                    || *value_dimension == 0
                     || !matches!(
                         query.format.layout.order,
                         StorageOrder::Native(NativeKernelOrder::Left)

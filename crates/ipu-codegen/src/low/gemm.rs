@@ -18,7 +18,7 @@ impl GemmLowering {
     fn bind(
         state: &LoweringState,
         operation: &MidOperation,
-        plan: &crate::BlockedGemmPlan,
+        plan: &crate::GemmMap,
     ) -> LowLoweringResult<GemmLowering> {
         let [left_value, right_value] = operation.inputs.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -62,11 +62,17 @@ impl LoweringState {
     pub(super) fn lower_blocked_gemm(
         &mut self,
         operation: &MidOperation,
-        plan: &crate::BlockedGemmPlan,
+        plan: &crate::GemmMap,
         reduction_staging: Option<ReductionStaging>,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        if plan.inputs != [ScheduleValue::Input(0), ScheduleValue::Input(1)]
+            || (plan.geometry.compute.inner > 1 && plan.output != ScheduleValue::Temporary(0))
+            || (plan.geometry.compute.inner == 1 && plan.output != ScheduleValue::Output)
+        {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
         let gemm = GemmLowering::bind(self, operation, plan)?;
         if plan.geometry.compute.inner > 1 {
             return self.lower_parallel_reduction_gemm(
@@ -115,7 +121,7 @@ impl LoweringState {
     fn lower_parallel_reduction_gemm(
         &mut self,
         operation: &MidOperation,
-        plan: &crate::BlockedGemmPlan,
+        plan: &crate::GemmMap,
         reduction_staging: ReductionStaging,
         requirements: &OperatorRequirements,
         gemm: GemmLowering,

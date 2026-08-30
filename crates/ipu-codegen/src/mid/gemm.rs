@@ -1,5 +1,4 @@
 use super::{StorageOrderCompatibility, storage_order_compatibility};
-use crate::OperatorSchedule;
 use crate::config::{OperatorClass, PipelineConfig, PlannerSearchDomain};
 use crate::cost::{CostModel, operator_memory_estimate, parallel_reduction_preselection_metrics};
 use crate::graph::{GemmOptions, Operation, OperationKind, TensorShape, ValueId};
@@ -10,6 +9,7 @@ use crate::layout::{
 };
 use crate::metrics::{CostEstimate, RegionMetrics, pareto_frontier};
 use crate::operator::*;
+use crate::{GemmMap, OperatorSchedule, ScheduleStep, ScheduleValue};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,10 +196,24 @@ pub(super) fn amp_grid_gemm_plan(
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    OperatorSchedule::blocked_gemm(
+    let gemm = gemm_map(operator, geometry);
+    let output = if geometry.compute.inner > 1 {
+        ScheduleValue::Temporary(0)
+    } else {
+        ScheduleValue::Output
+    };
+    let mut steps = vec![ScheduleStep::Gemm(GemmMap { output, ..gemm })];
+    if geometry.compute.inner > 1 {
+        steps.push(ScheduleStep::Reduce {
+            input: output,
+            output: ScheduleValue::Output,
+            staging: ReductionStaging::Complete,
+        });
+    }
+    OperatorSchedule {
         operator,
-        blocked_gemm_plan(operator, geometry),
-        OperatorRequirements {
+        steps,
+        requirements: OperatorRequirements {
             inputs: vec![
                 OperandRequirement::new(
                     TensorFormat {
@@ -260,7 +274,7 @@ pub(super) fn amp_grid_gemm_plan(
             memory_space: MemorySpaceRequirements::default()
                 .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
         },
-    )
+    }
 }
 
 pub(super) fn grouped_output_layout(
@@ -288,7 +302,7 @@ pub(super) fn grouped_output_layout(
     })
 }
 
-pub(super) fn blocked_gemm_plan(operator: MidOperator, geometry: GemmGeometry) -> BlockedGemmPlan {
+pub(super) fn gemm_map(operator: MidOperator, geometry: GemmGeometry) -> GemmMap {
     let MidOperator::Gemm {
         multiply,
         accumulate,
@@ -297,7 +311,9 @@ pub(super) fn blocked_gemm_plan(operator: MidOperator, geometry: GemmGeometry) -
     else {
         unreachable!("blocked GEMM schedule requires a GEMM operator")
     };
-    BlockedGemmPlan {
+    GemmMap {
+        inputs: [ScheduleValue::Input(0), ScheduleValue::Input(1)],
+        output: ScheduleValue::Output,
         kernel: GemmKernelFamily {
             multiply,
             accumulate,
@@ -464,7 +480,7 @@ pub(super) fn gemm_plan_matches(
     schedule: &OperatorSchedule,
     inputs: &[OperandRequirement],
 ) -> bool {
-    let Some(plan) = schedule.gemm_plan() else {
+    let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() else {
         return false;
     };
     if plan.geometry.compute.inner < 2 {
@@ -474,8 +490,12 @@ pub(super) fn gemm_plan_matches(
     let Some(weight) = inputs.get(weight_index) else {
         return false;
     };
+    let reduction_staging = schedule.steps.get(1).and_then(|step| match step {
+        ScheduleStep::Reduce { staging, .. } => Some(*staging),
+        _ => None,
+    });
     plan.geometry == constraint.geometry
-        && schedule.reduction_staging() == constraint.reduction_staging
+        && reduction_staging == constraint.reduction_staging
         && weight.format.layout.memory_class == constraint.weight_memory_class
         && weight.local_staging == constraint.local_weight_staging
 }
@@ -486,9 +506,9 @@ pub(super) fn independent_parameter_storage(
     input_index: usize,
     config: &PipelineConfig,
 ) -> Vec<OperatorSchedule> {
-    if candidate.gemm_plan().is_none() {
+    let Some(ScheduleStep::Gemm(gemm)) = candidate.steps.first() else {
         return Vec::new();
-    }
+    };
     let Some(requirement) = candidate.requirements.inputs.get(input_index) else {
         return Vec::new();
     };
@@ -513,10 +533,7 @@ pub(super) fn independent_parameter_storage(
         return Vec::new();
     };
     let inner_blocks = inner.div_ceil(u32::from(inner_block));
-    let output_column_block = candidate
-        .gemm_plan()
-        .map(|plan| plan.geometry.block.output_columns)
-        .unwrap_or(0);
+    let output_column_block = gemm.geometry.block.output_columns;
     if output_column_block < AMP_OUTPUT_COLUMN_BLOCK {
         return Vec::new();
     }
@@ -606,9 +623,10 @@ fn parallel_reduction_plans_for_orientation(
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<OperatorSchedule> {
-    let Some(plan) = candidate.gemm_plan().copied() else {
+    let Some(ScheduleStep::Gemm(plan)) = candidate.steps.first() else {
         return Vec::new();
     };
+    let plan = *plan;
     if plan.geometry.compute.inner != 1 {
         return Vec::new();
     }
@@ -888,7 +906,7 @@ fn parallel_reduction_plans_for_orientation(
                         .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(1)]);
                 }
             }
-            if let Some(plan) = variant.gemm_plan_mut() {
+            if let Some(ScheduleStep::Gemm(plan)) = variant.steps.first_mut() {
                 plan.kernel.weights = if memory_class == MemoryClass::Interleaved {
                     GemmWeightLoad::Interleaved
                 } else {
@@ -911,8 +929,13 @@ fn parallel_reduction_plans_for_orientation(
                     },
                     order: GridOrder::ColumnsFast,
                 };
+                plan.output = ScheduleValue::Temporary(0);
             }
-            variant.set_reduction_staging(ReductionStaging::Complete);
+            variant.steps.push(ScheduleStep::Reduce {
+                input: ScheduleValue::Temporary(0),
+                output: ScheduleValue::Output,
+                staging: ReductionStaging::Complete,
+            });
             let physical_right_index = orientation.physical_right_input();
             let local_staging_options: &[_] = match orientation {
                 GemmOrientation::Normal => &[LocalOperandStaging::Direct(MemoryClass::Interleaved)],
@@ -958,7 +981,7 @@ fn parallel_reduction_plans_for_orientation(
                         continue;
                     }
                     let mut result_variant = variant.clone();
-                    if let Some(plan) = result_variant.gemm_plan_mut()
+                    if let Some(ScheduleStep::Gemm(plan)) = result_variant.steps.first_mut()
                         && plan.geometry.compute.inner > 1
                     {
                         plan.geometry.result.rows = result_rows;
@@ -1025,7 +1048,9 @@ fn parallel_reduction_plans_for_orientation(
                     let mut staged = layout_variant.clone();
                     staged.requirements.inputs[physical_right_index].local_staging = local_staging;
                     variants.push(staged.clone());
-                    staged.set_reduction_staging(ReductionStaging::Streamed);
+                    if let Some(ScheduleStep::Reduce { staging, .. }) = staged.steps.get_mut(1) {
+                        *staging = ReductionStaging::Streamed;
+                    }
                     variants.push(staged);
                 }
             }
@@ -1099,10 +1124,13 @@ struct GemmPlanCompatibility {
 }
 
 fn gemm_plan_compatibility(candidate: &OperatorSchedule) -> GemmPlanCompatibility {
-    let (orientation, reduction_staging) = match candidate.gemm_plan() {
-        Some(plan) => (
+    let (orientation, reduction_staging) = match candidate.steps.first() {
+        Some(ScheduleStep::Gemm(plan)) => (
             Some(plan.geometry.orientation),
-            candidate.reduction_staging(),
+            candidate.steps.get(1).and_then(|step| match step {
+                ScheduleStep::Reduce { staging, .. } => Some(*staging),
+                _ => None,
+            }),
         ),
         _ => (None, None),
     };

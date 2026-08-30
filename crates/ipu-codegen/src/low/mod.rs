@@ -659,9 +659,9 @@ fn rearrange_kernel_spec(
 }
 
 impl AttentionBufferShape {
-    fn from_plan(plan: &crate::AttentionPlan, key_rows: u32) -> Self {
-        let padded_query_dimension = plan.padding.query_dimension;
-        let padded_value_dimension = plan.padding.value_dimension;
+    fn from_plan(plan: &crate::AttentionMap, key_rows: u32) -> Self {
+        let padded_query_dimension = plan.query_dimension;
+        let padded_value_dimension = plan.value_dimension;
         match plan.blocking {
             crate::AttentionBlocking::Flash {
                 query_rows,
@@ -1611,13 +1611,20 @@ impl LoweringState {
             [ScheduleStep::KernelMap(_)] => {
                 self.lower_schedule(operation, plan, &plan.requirements, tiles)
             }
-            [ScheduleStep::BlockedGemm(gemm)] => {
+            [ScheduleStep::Gemm(gemm)] => {
                 self.lower_blocked_gemm(operation, gemm, None, &plan.requirements, tiles)
             }
             [
-                ScheduleStep::BlockedGemm(gemm),
-                ScheduleStep::Reduce { staging },
+                ScheduleStep::Gemm(gemm),
+                ScheduleStep::Reduce {
+                    input,
+                    output,
+                    staging,
+                },
             ] => {
+                if *input != gemm.output || *output != ScheduleValue::Output {
+                    return Err(LowLoweringError::InvalidOperatorPlan);
+                }
                 self.lower_blocked_gemm(operation, gemm, Some(*staging), &plan.requirements, tiles)
             }
             [ScheduleStep::Attention(attention)] => match attention.blocking {

@@ -71,15 +71,17 @@ pub use mid::{
     MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId, lower,
 };
 pub use operator::{
-    AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,
-    AttentionPlan, BlockedGemmPlan, GemmBlockShape, GemmGeometry, GemmGrid, GemmKernelFamily,
-    GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder,
-    LocalOperandStaging, MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements,
-    MidOperator, OperandMaterialization, OperandRequirement, OperatorPlanError,
-    OperatorRequirements, OutputAliasing, Precision, ReductionStaging,
+    AccumulationPrecision, AllocationRequirements, GemmBlockShape, GemmGeometry, GemmGrid,
+    GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
+    GemmWeightLoad, GridOrder, LocalOperandStaging, MemoryElementRequirement, MemoryOperand,
+    MemorySpaceRequirements, MidOperator, OperandMaterialization, OperandRequirement,
+    OperatorPlanError, OperatorRequirements, OutputAliasing, Precision, ReductionStaging,
 };
 pub use place::{Placement, PlacementError, place};
-pub use schedule::{KernelMap, OperatorSchedule, ScheduleAccess, ScheduleStep, ScheduleValue};
+pub use schedule::{
+    AttentionBlocking, AttentionMap, GemmMap, KernelMap, OperatorSchedule, ScheduleAccess,
+    ScheduleStep, ScheduleValue,
+};
 pub use storage::{
     ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, block_major_matrix_coordinates,
     logical_view_byte_spans, shard_storage_bytes, view_byte_spans,

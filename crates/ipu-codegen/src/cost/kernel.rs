@@ -8,12 +8,12 @@ use super::resources::{
 };
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::OperatorSchedule;
 use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
 use crate::graph::TensorShape;
 use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
 use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::operator::{LocalOperandStaging, MidOperator, Precision};
+use crate::{OperatorSchedule, ScheduleStep};
 use ipu_target::cost::HardwareCosts;
 use ipu_target::hardware::HardwareTarget;
 
@@ -195,15 +195,15 @@ fn attention_endpoint_traffic(
     output: &TensorType,
     schedule: &OperatorSchedule,
 ) -> Option<(ExchangeEndpointTraffic, u64)> {
-    let Some(plan) = schedule.attention_plan() else {
+    let [ScheduleStep::Attention(plan)] = schedule.steps.as_slice() else {
         return Some((ExchangeEndpointTraffic::default(), 0));
     };
     let query_block_rows = plan.blocking.query_rows();
     let key_block_rows = plan.blocking.key_block_rows();
     let phases =
         matches!(plan.blocking, crate::AttentionBlocking::Materialized { .. }).then_some(3);
-    let padded_query_dimension = plan.padding.query_dimension;
-    let padded_value_dimension = plan.padding.value_dimension;
+    let padded_query_dimension = plan.query_dimension;
+    let padded_value_dimension = plan.value_dimension;
     let key = inputs.get(1)?;
     let key_rows = key
         .shape
@@ -385,7 +385,7 @@ fn amp_kernel_cycles(
     output_columns_per_tile: u64,
     k: u64,
 ) -> Option<u64> {
-    let Some(plan) = schedule.gemm_plan() else {
+    let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() else {
         return None;
     };
     let inner_block = u64::from(plan.geometry.block.inner);
@@ -451,7 +451,7 @@ fn estimated_operator_exchange(
     inputs: &[TensorType],
     output: &TensorType,
 ) -> CostEstimate {
-    if let Some(plan) = schedule.gemm_plan() {
+    if let Some(ScheduleStep::Gemm(plan)) = schedule.steps.first() {
         if plan.geometry.compute.inner > 1 {
             let compute = plan.geometry.compute;
             let result = plan.geometry.result;
@@ -470,10 +470,12 @@ fn estimated_operator_exchange(
                     u64::MAX / 16,
                 )
             });
-            let remote_partials_per_stage = match schedule.reduction_staging() {
-                Some(crate::ReductionStaging::Complete) => compute.inner.saturating_sub(1),
-                Some(crate::ReductionStaging::Streamed) => 1,
-                None => 0,
+            let remote_partials_per_stage = match schedule.steps.get(1) {
+                Some(ScheduleStep::Reduce { staging, .. }) => match staging {
+                    crate::ReductionStaging::Complete => compute.inner.saturating_sub(1),
+                    crate::ReductionStaging::Streamed => 1,
+                },
+                _ => 0,
             };
             let reduction_epochs = compute
                 .inner
@@ -521,7 +523,7 @@ fn estimated_operator_exchange(
                 HardwareTarget::Ipu21,
             )
         }
-    } else if schedule.attention_plan().is_some() {
+    } else if matches!(schedule.steps.as_slice(), [ScheduleStep::Attention(_)]) {
         attention_endpoint_traffic(inputs, output, schedule)
             .map(|(traffic, phases)| exchange::cost(&traffic, phases, HardwareTarget::Ipu21))
             .unwrap_or_else(impossible_conversion_cost)
@@ -581,8 +583,8 @@ fn deferred_split_input_cycles(
         ));
     }
 
-    let (query_block_rows, key_block_rows) = match consumer_dispatch.attention_plan() {
-        Some(plan) => (
+    let (query_block_rows, key_block_rows) = match consumer_dispatch.steps.as_slice() {
+        [ScheduleStep::Attention(plan)] => (
             u64::from(plan.blocking.query_rows()),
             u64::from(plan.blocking.key_block_rows()),
         ),
@@ -654,16 +656,26 @@ impl CostModel for Ipu21CostModel {
         output: &TensorType,
     ) -> u64 {
         let requirements = &schedule.requirements;
+        let gemm = match schedule.steps.first() {
+            Some(ScheduleStep::Gemm(gemm)) => Some(gemm),
+            _ => None,
+        };
+        let reduction_staging = schedule.steps.get(1).and_then(|step| match step {
+            ScheduleStep::Reduce { staging, .. } => Some(*staging),
+            _ => None,
+        });
+        let attention = match schedule.steps.as_slice() {
+            [ScheduleStep::Attention(attention)] => Some(attention),
+            _ => None,
+        };
         let elements = physical_elements(&output.shape, &output.format.layout);
         let spatial_occupancy = SpatialOccupancy::for_output(output);
         let spatial_occupancy_adjusted_elements = spatial_occupancy.latency_work();
         match schedule.operator {
             MidOperator::Gemm { multiply, .. } => {
-                let orientation = schedule
-                    .gemm_plan()
-                    .map_or(crate::GemmOrientation::Normal, |plan| {
-                        plan.geometry.orientation
-                    });
+                let orientation = gemm.map_or(crate::GemmOrientation::Normal, |plan| {
+                    plan.geometry.orientation
+                });
                 let left_index = orientation.physical_left_input();
                 let right_index = orientation.physical_right_input();
                 let compute_output = gemm_partial_tensor(schedule, output);
@@ -682,7 +694,7 @@ impl CostModel for Ipu21CostModel {
                     .and_then(|axis| left_shape.0.get(axis))
                     .copied()
                     .unwrap_or(1) as u64;
-                let compute_k = match schedule.gemm_plan() {
+                let compute_k = match gemm {
                     Some(plan) => k.div_ceil(u64::from(plan.geometry.compute.inner)),
                     _ => k,
                 };
@@ -843,11 +855,11 @@ impl CostModel for Ipu21CostModel {
                     0
                 };
                 let exchange = estimated_operator_exchange(schedule, inputs, output).cycles;
-                let reduction_work = match schedule.gemm_plan() {
+                let reduction_work = match gemm {
                     Some(plan) if plan.geometry.compute.inner > 1 => {
                         let compute = plan.geometry.compute;
                         let result = plan.geometry.result;
-                        let remote_partials_per_stage = match schedule.reduction_staging() {
+                        let remote_partials_per_stage = match reduction_staging {
                             Some(crate::ReductionStaging::Complete) => {
                                 compute.inner.saturating_sub(1)
                             }
@@ -883,7 +895,7 @@ impl CostModel for Ipu21CostModel {
                     }
                     _ => 0,
                 };
-                let calls = match schedule.gemm_plan() {
+                let calls = match gemm {
                     Some(plan) => compute_k
                         .div_ceil(u64::from(plan.geometry.block.inner))
                         .saturating_mul(kernel_output_columns)
@@ -932,8 +944,8 @@ impl CostModel for Ipu21CostModel {
                     .map_or(1, u64::from);
                 let output_values_per_query = value_dimension.max(1);
                 let query_rows = elements.div_ceil(output_values_per_query);
-                match schedule.attention_plan() {
-                    Some(crate::AttentionPlan {
+                match attention {
+                    Some(crate::AttentionMap {
                         blocking:
                             crate::AttentionBlocking::Flash {
                                 key_rows: key_block_rows,
@@ -956,7 +968,7 @@ impl CostModel for Ipu21CostModel {
                             )
                             .saturating_add(exchange)
                     }
-                    Some(crate::AttentionPlan {
+                    Some(crate::AttentionMap {
                         blocking: crate::AttentionBlocking::Materialized { .. },
                         ..
                     }) => {
