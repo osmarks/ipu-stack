@@ -119,15 +119,6 @@ impl GemmOrientation {
     }
 }
 
-/// Shape-independent recipe which expands into ordered device-wide exchange
-/// and tile-kernel phases after concrete shards are known.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OperatorDispatch {
-    Pointwise(PointwiseInputMapping),
-    BlockedGemm(BlockedGemmPlan),
-    Attention(AttentionPlan),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AttentionPadding {
     pub query_dimension: u32,
@@ -189,17 +180,6 @@ impl AttentionPlan {
     }
 }
 
-/// Which operand remains resident while a blocked whole-device GEMM is run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GemmDistribution {
-    #[default]
-    OutputStationary,
-    /// Distribute independent row, output-column, and K block ranges. Each
-    /// row/K activation shard is replicated over the column groups, computes
-    /// one local partial, and is reduced over K onto the output owner.
-    ParallelReduction(ParallelReductionPlan),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GemmGrid {
     pub rows: u16,
@@ -227,12 +207,6 @@ impl GemmResultGrid {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParallelReductionPlan {
-    pub compute: GemmGrid,
-    pub staging: ReductionStaging,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GemmBlockShape {
     pub inner: u32,
@@ -250,11 +224,12 @@ pub struct GemmKernelFamily {
 pub struct GemmGeometry {
     pub block: GemmBlockShape,
     pub orientation: GemmOrientation,
+    /// Spatial row, output-column, and K partitions which invoke kernels.
+    pub compute: GemmGrid,
     /// Spatial ownership of the final result. Parallel reductions may spread
     /// roots over former K-partition tiles.
     pub result: GemmResultGrid,
     pub order: GridOrder,
-    pub distribution: GemmDistribution,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,9 +244,9 @@ impl BlockedGemmPlan {
     /// This is part of the selected whole-device plan: costing and low
     /// materialization must use the same partial ownership and padding.
     pub(crate) fn partial_tensor(&self, output: &TensorType) -> Option<TensorType> {
-        let GemmDistribution::ParallelReduction(reduction) = self.geometry.distribution else {
+        if self.geometry.compute.inner < 2 {
             return Some(output.clone());
-        };
+        }
         let output_rank = output.shape.0.len();
         let output_column_axis = self
             .geometry
@@ -286,8 +261,8 @@ impl BlockedGemmPlan {
             .axes
             .iter()
             .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))?;
-        let rows = reduction.compute.rows;
-        let columns = reduction.compute.columns;
+        let rows = self.geometry.compute.rows;
+        let columns = self.geometry.compute.columns;
         let tiles = rows.checked_mul(columns)?;
         let left_order = match self.geometry.orientation {
             GemmOrientation::Normal => NativeKernelOrder::Left,
@@ -338,6 +313,7 @@ impl BlockedGemmPlan {
 pub struct GemmPlanConstraint {
     pub source_operation: u32,
     pub geometry: GemmGeometry,
+    pub reduction_staging: Option<ReductionStaging>,
     pub weight_memory_class: MemoryClass,
     pub local_weight_staging: LocalOperandStaging,
 }
@@ -354,27 +330,20 @@ pub enum ReductionStaging {
     Streamed,
 }
 
-/// How a pointwise kernel's input shards are selected for each output shard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointwiseInputMapping {
-    /// Each input view is selected by its logical overlap with the output and
-    /// singleton dimensions may be broadcast.
-    BroadcastToOutput,
-    /// Each input must already have a shard resident on the output tile.
-    TileLocal,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmptyOutputShardPolicy {
     Skip,
     Reject,
 }
 
-impl OperatorDispatch {
+impl crate::OperatorSchedule {
     fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
-        match self {
-            Self::Pointwise(_) => EmptyOutputShardPolicy::Skip,
-            Self::BlockedGemm(_) | Self::Attention(_) => EmptyOutputShardPolicy::Reject,
+        match self.steps.first() {
+            Some(crate::ScheduleStep::KernelMap(_)) => EmptyOutputShardPolicy::Skip,
+            Some(crate::ScheduleStep::BlockedGemm(_) | crate::ScheduleStep::Attention(_)) => {
+                EmptyOutputShardPolicy::Reject
+            }
+            Some(crate::ScheduleStep::Reduce { .. }) | None => EmptyOutputShardPolicy::Reject,
         }
     }
 }
@@ -392,7 +361,7 @@ pub struct OperandRequirement {
     /// How a locally resident operand should be consumed when other tiles use
     /// an operator-local staging buffer for the same operand.
     pub local_staging: LocalOperandStaging,
-    /// Whether a dispatch may populate and consume bounded operand slices
+    /// Whether a schedule may populate and consume bounded operand slices
     /// instead of materializing the complete required format first.
     pub materialization: OperandMaterialization,
 }
@@ -528,7 +497,7 @@ pub struct OperatorRequirements {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperatorPlan {
     pub operator: MidOperator,
-    pub dispatch: OperatorDispatch,
+    pub schedule: crate::OperatorSchedule,
     pub requirements: OperatorRequirements,
 }
 
@@ -536,13 +505,13 @@ pub struct OperatorPlan {
 pub enum OperatorPlanError {
     #[error("operator plan operand arity does not match its requirements")]
     OperandArity,
-    #[error("operator plan dispatch does not match the selected operator")]
+    #[error("operator plan schedule does not match the selected operator")]
     DispatchMismatch,
     #[error("operator plan uses zero or incompatible block dimensions")]
     InvalidBlocking,
     #[error("operator plan requires corresponding activation and output tile groups")]
     IncompatibleTileGroups,
-    #[error("operator dispatch does not support empty output shards")]
+    #[error("operator schedule does not support empty output shards")]
     EmptyOutputShard,
     #[error("blocked GEMM currently requires non-transposed AMP left/right/output formats")]
     UnsupportedGemmLayout,
@@ -578,12 +547,12 @@ fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
 impl OperatorPlan {
     pub(crate) fn candidate(
         operator: MidOperator,
-        dispatch: OperatorDispatch,
+        schedule: crate::OperatorSchedule,
         requirements: OperatorRequirements,
     ) -> Self {
         Self {
             operator,
-            dispatch,
+            schedule,
             requirements,
         }
     }
@@ -663,26 +632,26 @@ impl OperatorPlan {
         if inputs.len() != self.requirements.inputs.len() {
             return Err(OperatorPlanError::OperandArity);
         }
-        if self.dispatch.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
+        if self.schedule.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
             && layout_has_empty_shards(&output.format.layout, &output.shape)
         {
             return Err(OperatorPlanError::EmptyOutputShard);
         }
-        match (&self.operator, &self.dispatch) {
+        match (&self.operator, self.schedule.steps.as_slice()) {
             (
                 MidOperator::Gemm {
                     options, multiply, ..
                 },
-                OperatorDispatch::BlockedGemm(plan),
+                [crate::ScheduleStep::BlockedGemm(plan), ..],
             ) => {
                 let inner_block = &plan.geometry.block.inner;
                 let output_column_block = &plan.geometry.block.output_columns;
-                let distribution = &plan.geometry.distribution;
+                let compute = plan.geometry.compute;
                 let orientation = &plan.geometry.orientation;
                 let [left, right] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
-                if matches!(distribution, GemmDistribution::OutputStationary)
+                if compute.inner == 1
                     && left.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                 {
@@ -756,28 +725,31 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
-                if let GemmDistribution::ParallelReduction(reduction) = distribution {
+                if compute.inner > 1 {
                     let result_rows = plan.geometry.result.rows;
                     let result_columns = plan.geometry.result.columns;
-                    let result_row_partitions =
-                        result_rows.checked_div(reduction.compute.rows).unwrap_or(0);
-                    let result_column_partitions = result_columns
-                        .checked_div(reduction.compute.columns)
-                        .unwrap_or(0);
-                    if reduction.compute.rows == 0
-                        || reduction.compute.columns == 0
-                        || reduction.compute.inner < 2
+                    let result_row_partitions = result_rows.checked_div(compute.rows).unwrap_or(0);
+                    let result_column_partitions =
+                        result_columns.checked_div(compute.columns).unwrap_or(0);
+                    if compute.rows == 0
+                        || compute.columns == 0
                         || result_rows == 0
                         || result_columns == 0
-                        || !result_rows.is_multiple_of(reduction.compute.rows)
-                        || !result_columns.is_multiple_of(reduction.compute.columns)
+                        || !result_rows.is_multiple_of(compute.rows)
+                        || !result_columns.is_multiple_of(compute.columns)
                         || result_row_partitions.saturating_mul(result_column_partitions)
-                            > reduction.compute.inner
+                            > compute.inner
+                        || self.schedule.reduction_staging().is_none()
                         || axis_partitions(row_axis) != result_rows
                         || axis_partitions(column_axis) != result_columns
                     {
                         return Err(OperatorPlanError::InvalidBlocking);
                     }
+                } else if compute.rows != plan.geometry.result.rows
+                    || compute.columns != plan.geometry.result.columns
+                    || self.schedule.reduction_staging().is_some()
+                {
+                    return Err(OperatorPlanError::InvalidBlocking);
                 }
                 let [physical_left, physical_right] = orientation.physical_order([left, right]);
                 let left_layout = physical_left
@@ -832,8 +804,7 @@ impl OperatorPlan {
                     .column_axis()
                     .resolve(left_padded.0.len())
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let balanced_output_columns =
-                    matches!(distribution, GemmDistribution::ParallelReduction(_));
+                let balanced_output_columns = compute.inner > 1;
                 let output_shard_alignment = if balanced_output_columns {
                     AMP_COLUMN_MICRO
                 } else {
@@ -849,7 +820,15 @@ impl OperatorPlan {
                 }
                 Ok(())
             }
-            (MidOperator::Gelu | MidOperator::Add(_), OperatorDispatch::Pointwise(_)) => {
+            (MidOperator::Gelu | MidOperator::Add(_), [crate::ScheduleStep::KernelMap(map)]) => {
+                if map.output != crate::ScheduleValue::Output
+                    || map.inputs.len() != inputs.len()
+                    || !map.inputs.iter().enumerate().all(|(index, (value, _))| {
+                        *value == crate::ScheduleValue::Input(index as u16)
+                    })
+                {
+                    return Err(OperatorPlanError::DispatchMismatch);
+                }
                 let output_tiles = output.format.layout.tiling.tile_count;
                 if inputs
                     .iter()
@@ -865,15 +844,17 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
-                OperatorDispatch::Attention(AttentionPlan {
-                    kernel,
-                    blocking:
-                        AttentionBlocking::Flash {
-                            query_rows,
-                            key_rows,
-                        },
-                    padding,
-                }),
+                [
+                    crate::ScheduleStep::Attention(AttentionPlan {
+                        kernel,
+                        blocking:
+                            AttentionBlocking::Flash {
+                                query_rows,
+                                key_rows,
+                            },
+                        padding,
+                    }),
+                ],
             ) => {
                 let [query, key, value] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
@@ -914,15 +895,17 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
-                OperatorDispatch::Attention(AttentionPlan {
-                    kernel,
-                    blocking:
-                        AttentionBlocking::Materialized {
-                            query_rows,
-                            padded_key_rows,
-                        },
-                    padding,
-                }),
+                [
+                    crate::ScheduleStep::Attention(AttentionPlan {
+                        kernel,
+                        blocking:
+                            AttentionBlocking::Materialized {
+                                query_rows,
+                                padded_key_rows,
+                            },
+                        padding,
+                    }),
+                ],
             ) => {
                 let [query, key, value] = inputs else {
                     return Err(OperatorPlanError::OperandArity);

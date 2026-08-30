@@ -63,15 +63,23 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         plan: &crate::BlockedGemmPlan,
+        reduction_staging: Option<ReductionStaging>,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let gemm = GemmLowering::bind(self, operation, plan)?;
-        if matches!(
-            plan.geometry.distribution,
-            GemmDistribution::ParallelReduction(_)
-        ) {
-            return self.lower_parallel_reduction_gemm(operation, plan, requirements, gemm, tiles);
+        if plan.geometry.compute.inner > 1 {
+            return self.lower_parallel_reduction_gemm(
+                operation,
+                plan,
+                reduction_staging.ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                requirements,
+                gemm,
+                tiles,
+            );
+        }
+        if reduction_staging.is_some() {
+            return Err(LowLoweringError::InvalidOperatorPlan);
         }
         if plan.geometry.orientation != crate::GemmOrientation::Normal {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -108,32 +116,29 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         plan: &crate::BlockedGemmPlan,
+        reduction_staging: ReductionStaging,
         requirements: &OperatorRequirements,
         gemm: GemmLowering,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
         let (inner_block, output_column_block) = (gemm.block.inner, gemm.block.output_columns);
         let orientation = plan.geometry.orientation;
         let kernel_family = gemm.kernel;
-        let row_partitions = reduction.compute.rows;
-        let column_partitions = reduction.compute.columns;
-        let inner_partitions = reduction.compute.inner;
+        let row_partitions = plan.geometry.compute.rows;
+        let column_partitions = plan.geometry.compute.columns;
+        let inner_partitions = plan.geometry.compute.inner;
         let result_row_partitions = plan
             .geometry
             .result
             .rows
-            .checked_div(reduction.compute.rows)
+            .checked_div(row_partitions)
             .unwrap_or(0);
         let result_column_partitions = plan
             .geometry
             .result
             .columns
-            .checked_div(reduction.compute.columns)
+            .checked_div(column_partitions)
             .unwrap_or(0);
-        let reduction_staging = reduction.staging;
         let semantic_left_value = gemm.left_value;
         let semantic_right_value = gemm.right_value;
         let output_value = gemm.output_value;
@@ -234,7 +239,7 @@ impl LoweringState {
                             .enumerate()
                             .map(|(axis, extent)| (axis, extent.start, extent.physical_end))
                             .collect::<Vec<_>>();
-                        let view = self.dispatch_input_view(
+                        let view = self.schedule_input_view(
                             *left_value,
                             left_shard.tile,
                             &restrictions,
@@ -820,7 +825,7 @@ impl LoweringState {
                     let left_view = if let Some(view) = left_views.get(&tile) {
                         view.clone()
                     } else {
-                        let view = self.dispatch_input_view(
+                        let view = self.schedule_input_view(
                             gemm.left_value,
                             tile,
                             &[(gemm.left_rank - 1, inner_start, inner_end)],

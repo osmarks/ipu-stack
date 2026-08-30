@@ -16,8 +16,11 @@ use crate::layout::{
 };
 use crate::mid::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::operator::{
-    GemmDistribution, GemmKernelMode, MemoryOperand, MemorySpaceRequirements, OperandRequirement,
-    OperatorDispatch, OperatorRequirements, OutputAliasing, PointwiseInputMapping, Precision,
+    GemmKernelMode, MemoryOperand, MemorySpaceRequirements, OperandRequirement,
+    OperatorRequirements, OutputAliasing, Precision, ReductionStaging,
+};
+use crate::schedule::{
+    OperatorSchedule, ScheduleAccess, ScheduleDomain, ScheduleStep, ScheduleValue,
 };
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use ipu_target::hardware::HardwareTarget;
@@ -101,7 +104,7 @@ pub enum ShardDefinition {
     Alias(LowShardId),
     /// Alias intentionally used as an in-place operation destination.
     WritableAlias(LowShardId),
-    /// Canonical format placeholder replaced by dispatch-local staging.
+    /// Canonical format placeholder replaced by schedule-local staging.
     Unmaterialized,
 }
 
@@ -1606,19 +1609,24 @@ impl LoweringState {
         let plan = operation
             .operator_plan()
             .ok_or(LowLoweringError::MissingOperatorPlan)?;
-        match &plan.dispatch {
-            OperatorDispatch::Pointwise(input_mapping) => {
-                let kernel = match plan.operator {
-                    crate::MidOperator::Gelu => TileKernelSpec::Gelu,
-                    crate::MidOperator::Add(_) => TileKernelSpec::Add,
-                    _ => return Err(LowLoweringError::InvalidOperatorPlan),
-                };
-                self.lower_pointwise(operation, kernel, *input_mapping, &plan.requirements, tiles)
+        match plan.schedule.steps.as_slice() {
+            [ScheduleStep::KernelMap(_)] => {
+                self.lower_schedule(operation, &plan.schedule, &plan.requirements, tiles)
             }
-            OperatorDispatch::BlockedGemm(dispatch) => {
-                self.lower_blocked_gemm(operation, dispatch, &plan.requirements, tiles)
+            [ScheduleStep::BlockedGemm(gemm)] => {
+                self.lower_blocked_gemm(operation, gemm, None, &plan.requirements, tiles)
             }
-            OperatorDispatch::Attention(attention) => match attention.blocking {
+            [
+                ScheduleStep::BlockedGemm(gemm),
+                ScheduleStep::Reduce { staging },
+            ] => self.lower_blocked_gemm(
+                operation,
+                gemm,
+                Some(*staging),
+                &plan.requirements,
+                tiles,
+            ),
+            [ScheduleStep::Attention(attention)] => match attention.blocking {
                 crate::AttentionBlocking::Flash { .. } => {
                     self.lower_blocked_attention(operation, attention, &plan.requirements, tiles)
                 }
@@ -1629,6 +1637,7 @@ impl LoweringState {
                     tiles,
                 ),
             },
+            _ => Err(LowLoweringError::InvalidOperatorPlan),
         }
     }
 

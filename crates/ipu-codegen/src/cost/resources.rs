@@ -1,6 +1,7 @@
 //! Structural memory, capacity, and communication estimates.
 
 use super::exchange::ExchangeEndpointTraffic;
+use crate::OperatorSchedule;
 use crate::graph::TensorShape;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorRegion, TensorType,
@@ -8,8 +9,8 @@ use crate::layout::{
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
 use crate::mid::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::operator::{
-    AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
-    OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,
+    AllocationRequirements, MemoryElementRequirement, MemoryOperand, OperandMaterialization,
+    OperatorRequirements, Precision,
 };
 use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -72,8 +73,8 @@ pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64
         .map_or(u64::MAX, u64::from)
 }
 
-pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorType) -> TensorType {
-    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
+pub(crate) fn gemm_partial_tensor(schedule: &OperatorSchedule, output: &TensorType) -> TensorType {
+    let Some(plan) = schedule.gemm_plan() else {
         return output.clone();
     };
     plan.partial_tensor(output)
@@ -176,7 +177,7 @@ fn maximum_standard_allocation(
 }
 
 pub(crate) fn operator_memory_estimate(
-    dispatch: &OperatorDispatch,
+    schedule: &OperatorSchedule,
     requirements: &OperatorRequirements,
     inputs: &[TensorType],
     output: &TensorType,
@@ -193,10 +194,11 @@ pub(crate) fn operator_memory_estimate(
     );
     let mut temporary = MemoryUsage::default();
     let mut maximum_standard_temporary_allocation = 0u64;
-    if let (OperatorDispatch::BlockedGemm(plan), Some(first), Some(second)) =
-        (dispatch, inputs.first(), inputs.get(1))
-        && let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution
+    if let (Some(plan), Some(first), Some(second)) =
+        (schedule.gemm_plan(), inputs.first(), inputs.get(1))
+        && plan.geometry.compute.inner > 1
     {
+        let compute = plan.geometry.compute;
         let orientation = plan.geometry.orientation;
         let output_column_block = plan.geometry.block.output_columns;
         let [left, right] = orientation.physical_order([first, second]);
@@ -212,10 +214,10 @@ pub(crate) fn operator_memory_estimate(
             .expect("GEMM operand rank validated");
         let inner_blocks = right.shape.0[right_inner_axis].div_ceil(AMP_INNER_BLOCK);
         let column_blocks = right.shape.0[right_column_axis].div_ceil(output_column_block);
-        let right_staging = u64::from(inner_blocks.div_ceil(u32::from(reduction.compute.inner)))
+        let right_staging = u64::from(inner_blocks.div_ceil(u32::from(compute.inner)))
             .saturating_mul(u64::from(AMP_INNER_BLOCK))
             .saturating_mul(u64::from(
-                column_blocks.div_ceil(u32::from(reduction.compute.columns)),
+                column_blocks.div_ceil(u32::from(compute.columns)),
             ))
             .saturating_mul(u64::from(output_column_block))
             .saturating_mul(right.format.precision.bytes());
@@ -250,20 +252,21 @@ pub(crate) fn operator_memory_estimate(
         // Compute retains one local partial alongside operand staging. The
         // later reduction ping-pongs an accumulator and result while its
         // staging policy bounds the simultaneously resident remote partials.
-        let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(dispatch, output));
+        let partial_bytes = maximum_shard_bytes(&gemm_partial_tensor(schedule, output));
         let reduction_partial_bytes = if plan.geometry.result
             != (crate::GemmResultGrid {
-                rows: reduction.compute.rows,
-                columns: reduction.compute.columns,
+                rows: compute.rows,
+                columns: compute.columns,
             }) {
             maximum_shard_bytes(output)
         } else {
             partial_bytes
         };
         convolution.interleaved = convolution.interleaved.saturating_add(partial_bytes);
-        let staged_remote_partials = match reduction.staging {
-            crate::ReductionStaging::Complete => reduction.compute.inner.saturating_sub(1),
-            crate::ReductionStaging::Streamed => 1,
+        let staged_remote_partials = match schedule.reduction_staging() {
+            Some(crate::ReductionStaging::Complete) => compute.inner.saturating_sub(1),
+            Some(crate::ReductionStaging::Streamed) => 1,
+            None => 0,
         };
         let reduction = MemoryUsage {
             standard: reduction_partial_bytes
@@ -275,13 +278,12 @@ pub(crate) fn operator_memory_estimate(
             interleaved: convolution.interleaved.max(reduction.interleaved),
         };
     }
-    if let (OperatorDispatch::BlockedGemm(plan), Some(left), Some(requirement)) =
-        (dispatch, inputs.first(), requirements.inputs.first())
-        && requirement.materialization == OperandMaterialization::DispatchSlices
-        && !matches!(
-            plan.geometry.distribution,
-            GemmDistribution::ParallelReduction(_)
-        )
+    if let (Some(plan), Some(left), Some(requirement)) = (
+        schedule.gemm_plan(),
+        inputs.first(),
+        requirements.inputs.first(),
+    ) && requirement.materialization == OperandMaterialization::DispatchSlices
+        && plan.geometry.compute.inner == 1
     {
         let inner = left.shape.0.last().copied().map_or(1, u64::from).max(1);
         let bytes = maximum_shard_bytes(left)
@@ -290,14 +292,13 @@ pub(crate) fn operator_memory_estimate(
             .saturating_add(u64::from(requirement.allocation.access_tail_bytes));
         temporary.add_class(left.format.layout.memory_class, bytes);
     }
-    if let (OperatorDispatch::BlockedGemm(plan), Some(right), Some(requirement)) =
-        (dispatch, inputs.get(1), requirements.inputs.get(1))
-        && right.format.precision == Precision::F16
-        && !matches!(
-            plan.geometry.distribution,
-            GemmDistribution::ParallelReduction(_)
-        )
-        && gemm_uses_panel_buffer(dispatch, right, output)
+    if let (Some(plan), Some(right), Some(requirement)) = (
+        schedule.gemm_plan(),
+        inputs.get(1),
+        requirements.inputs.get(1),
+    ) && right.format.precision == Precision::F16
+        && plan.geometry.compute.inner == 1
+        && gemm_uses_panel_buffer(schedule, right, output)
     {
         // Each local output-column panel has one final kernel buffer reused
         // across K phases. Remote bytes can be exchanged directly into it.
@@ -310,7 +311,7 @@ pub(crate) fn operator_memory_estimate(
             .saturating_mul(right.format.precision.bytes());
         temporary.add_class(requirement.local_staging.memory_class(), bytes);
     }
-    if let OperatorDispatch::Attention(crate::AttentionPlan {
+    if let Some(crate::AttentionPlan {
         blocking:
             crate::AttentionBlocking::Flash {
                 query_rows: query_block_rows,
@@ -318,7 +319,7 @@ pub(crate) fn operator_memory_estimate(
             },
         padding,
         ..
-    }) = dispatch
+    }) = schedule.attention_plan()
     {
         let padded_query_dimension = &padding.query_dimension;
         let padded_value_dimension = &padding.value_dimension;
@@ -377,7 +378,7 @@ pub(crate) fn operator_memory_estimate(
                 .saturating_mul(Precision::F32.bytes()),
         );
     }
-    if let OperatorDispatch::Attention(crate::AttentionPlan {
+    if let Some(crate::AttentionPlan {
         blocking:
             crate::AttentionBlocking::Materialized {
                 query_rows: query_block_rows,
@@ -385,7 +386,7 @@ pub(crate) fn operator_memory_estimate(
             },
         padding,
         ..
-    }) = dispatch
+    }) = schedule.attention_plan()
     {
         let padded_query_dimension = &padding.query_dimension;
         let padded_value_dimension = &padding.value_dimension;
@@ -456,11 +457,11 @@ pub(crate) fn operator_memory_estimate(
 }
 
 pub(crate) fn gemm_uses_panel_buffer(
-    dispatch: &OperatorDispatch,
+    schedule: &OperatorSchedule,
     right: &TensorType,
     output: &TensorType,
 ) -> bool {
-    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
+    let Some(plan) = schedule.gemm_plan() else {
         return false;
     };
     let inner_block = plan.geometry.block.inner;
@@ -492,20 +493,20 @@ pub(crate) fn gemm_uses_panel_buffer(
 }
 
 pub(crate) fn gemm_requires_panel_repacking(
-    dispatch: &OperatorDispatch,
+    schedule: &OperatorSchedule,
     right: &TensorType,
     output: &TensorType,
 ) -> bool {
-    gemm_uses_panel_buffer(dispatch, right, output)
+    gemm_uses_panel_buffer(schedule, right, output)
         && !matches!(right.format.layout.order, StorageOrder::Blocked(_))
 }
 
 pub(crate) fn gemm_exchange_phase_count(
-    dispatch: &OperatorDispatch,
+    schedule: &OperatorSchedule,
     inputs: &[TensorType],
     _output: &TensorType,
 ) -> u64 {
-    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
+    let Some(plan) = schedule.gemm_plan() else {
         return 0;
     };
     let inner_block = plan.geometry.block.inner;
@@ -722,20 +723,20 @@ fn allocation_root(mut id: MidValueId, aliases: &BTreeMap<MidValueId, MidValueId
 }
 
 pub(crate) fn gemm_exchange_endpoint_traffic(
-    dispatch: &OperatorDispatch,
+    schedule: &OperatorSchedule,
     inputs: &[TensorType],
     compute_output: &TensorType,
     target: HardwareTarget,
 ) -> Option<ExchangeEndpointTraffic> {
-    let OperatorDispatch::BlockedGemm(plan) = dispatch else {
+    let Some(plan) = schedule.gemm_plan() else {
         return Some(ExchangeEndpointTraffic::default());
     };
     let [first, second] = inputs else {
         return None;
     };
     let [left, right] = plan.geometry.orientation.physical_order([first, second]);
-    if let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution {
-        // The parallel dispatch grid contains a K axis which is deliberately
+    if plan.geometry.compute.inner > 1 {
+        // The parallel schedule grid contains a K axis which is deliberately
         // absent from `compute_output`: every K group produces a partial with
         // the same logical output extent. Consequently, matching operand and
         // partial-output tile numbers cannot determine locality. The physical
@@ -744,9 +745,9 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
         // those explicit replica counts creates operator-internal traffic.
         return Some(parallel_gemm_operand_traffic(
             left,
-            reduction.compute.columns,
+            plan.geometry.compute.columns,
             right,
-            reduction.compute.rows,
+            plan.geometry.compute.rows,
         ));
     }
     let orientation = plan.geometry.orientation;
@@ -1001,8 +1002,8 @@ fn tile_axis_plans(tensor: &TensorType) -> Option<Vec<TileAxisPlan>> {
 mod tests {
     use super::*;
 
-    fn output_stationary_dispatch() -> OperatorDispatch {
-        OperatorDispatch::BlockedGemm(crate::BlockedGemmPlan {
+    fn output_stationary_schedule() -> OperatorSchedule {
+        OperatorSchedule::blocked_gemm(crate::BlockedGemmPlan {
             kernel: crate::GemmKernelFamily {
                 multiply: Precision::F16,
                 accumulate: crate::AccumulationPrecision::F16,
@@ -1014,39 +1015,41 @@ mod tests {
                     output_columns: crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
                 },
                 orientation: crate::GemmOrientation::Normal,
+                compute: crate::GemmGrid {
+                    rows: 1,
+                    columns: 1,
+                    inner: 1,
+                },
                 result: crate::GemmResultGrid {
                     rows: 1,
                     columns: 1,
                 },
                 order: crate::GridOrder::ColumnsFast,
-                distribution: GemmDistribution::OutputStationary,
             },
         })
     }
 
-    fn parallel_reduction_dispatch(
+    fn parallel_reduction_schedule(
         row_partitions: u16,
         column_partitions: u16,
         inner_partitions: u16,
-    ) -> OperatorDispatch {
-        let mut dispatch = output_stationary_dispatch();
-        let OperatorDispatch::BlockedGemm(plan) = &mut dispatch else {
+    ) -> OperatorSchedule {
+        let mut schedule = output_stationary_schedule();
+        let Some(plan) = schedule.gemm_plan_mut() else {
             unreachable!();
         };
         plan.geometry.result = crate::GemmResultGrid {
             rows: row_partitions,
             columns: column_partitions,
         };
-        plan.geometry.distribution =
-            GemmDistribution::ParallelReduction(crate::ParallelReductionPlan {
-                compute: crate::GemmGrid {
-                    rows: row_partitions,
-                    columns: column_partitions,
-                    inner: inner_partitions,
-                },
-                staging: crate::ReductionStaging::Streamed,
-            });
-        dispatch
+        plan.geometry.compute = crate::GemmGrid {
+            rows: row_partitions,
+            columns: column_partitions,
+            inner: inner_partitions,
+        };
+        let mut schedule = OperatorSchedule::blocked_gemm(*plan);
+        schedule.set_reduction_staging(crate::ReductionStaging::Streamed);
+        schedule
     }
 
     #[test]
@@ -1128,9 +1131,9 @@ mod tests {
                     crate::operator::GridOrder::ColumnsFast,
                 ),
             );
-            let dispatch = output_stationary_dispatch();
+            let schedule = output_stationary_schedule();
             let local = gemm_exchange_endpoint_traffic(
-                &dispatch,
+                &schedule,
                 &[local_left, local_right],
                 &output,
                 HardwareTarget::Ipu21,
@@ -1157,7 +1160,7 @@ mod tests {
                 ),
             );
             let remote = gemm_exchange_endpoint_traffic(
-                &dispatch,
+                &schedule,
                 &[sharded_left, sharded_right],
                 &output,
                 HardwareTarget::Ipu21,
@@ -1225,10 +1228,10 @@ mod tests {
                     crate::operator::GridOrder::ColumnsFast,
                 ),
             );
-            let dispatch =
-                parallel_reduction_dispatch(row_partitions, column_partitions, inner_partitions);
+            let schedule =
+                parallel_reduction_schedule(row_partitions, column_partitions, inner_partitions);
             let resident = gemm_exchange_endpoint_traffic(
-                &dispatch,
+                &schedule,
                 &[left.clone(), resident_right],
                 &compute_output,
                 HardwareTarget::Ipu21,
@@ -1254,7 +1257,7 @@ mod tests {
                 sharded_right.format.layout.tiling.tile_count.min(2),
             ));
             let streamed = gemm_exchange_endpoint_traffic(
-                &dispatch,
+                &schedule,
                 &[left, sharded_right],
                 &compute_output,
                 HardwareTarget::Ipu21,

@@ -1,11 +1,12 @@
 //! Thread-safe memoization for repeated conversion estimates.
 
 use super::kernel::CostModel;
+use crate::OperatorSchedule;
 use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
 use crate::graph::TensorShape;
 use crate::layout::{Layout, TensorType};
 use crate::metrics::{CostEstimate, ExchangeFootprint};
-use crate::operator::{MidOperator, OperatorDispatch, OperatorRequirements, Precision};
+use crate::operator::{MidOperator, OperatorRequirements, Precision};
 use foldhash::fast::FixedState;
 use ipu_target::hardware::HardwareTarget;
 use std::collections::HashMap;
@@ -69,13 +70,13 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
     fn operator_cycles(
         &self,
         operator: MidOperator,
-        dispatch: &OperatorDispatch,
+        schedule: &OperatorSchedule,
         requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
         self.inner
-            .operator_cycles(operator, dispatch, requirements, inputs, output)
+            .operator_cycles(operator, schedule, requirements, inputs, output)
     }
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
@@ -98,25 +99,25 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
     fn operator_exchange_cycles(
         &self,
         operator: MidOperator,
-        dispatch: &OperatorDispatch,
+        schedule: &OperatorSchedule,
         requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
         self.inner
-            .operator_exchange_cycles(operator, dispatch, requirements, inputs, output)
+            .operator_exchange_cycles(operator, schedule, requirements, inputs, output)
     }
 
     fn operator_exchange_footprint(
         &self,
         operator: MidOperator,
-        dispatch: &OperatorDispatch,
+        schedule: &OperatorSchedule,
         requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
         self.inner
-            .operator_exchange_footprint(operator, dispatch, requirements, inputs, output)
+            .operator_exchange_footprint(operator, schedule, requirements, inputs, output)
     }
 
     fn deferred_input_cycles(
@@ -125,7 +126,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         source: &TensorType,
         logical_output: &TensorType,
         consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
+        consumer_dispatch: &OperatorSchedule,
         producer_cycles: u64,
     ) -> u64 {
         self.inner.deferred_input_cycles(
@@ -144,7 +145,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         source: &TensorType,
         logical_output: &TensorType,
         consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
+        consumer_dispatch: &OperatorSchedule,
         producer_cycles: u64,
     ) -> u64 {
         self.inner.deferred_input_exchange_cycles(

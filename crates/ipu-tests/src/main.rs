@@ -3,9 +3,9 @@ use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
     AttentionStrategy, BlockedOrder, CompiledPackage, CompiledTensor, ComputeGraph, GemmBlockShape,
-    GemmDistribution, GemmGeometry, GemmGrid, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
+    GemmGeometry, GemmGrid, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
     Layout, LocalOperandStaging, MemoryClass, NativeKernelOrder, OperatorClass, PackageConfig,
-    ParallelReductionPlan, PipelineConfig, PlannerSearchDomain, Precision, ProfilingConfig,
+    PipelineConfig, PlannerSearchDomain, Precision, ProfilingConfig,
     ReductionStaging, TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates,
     build_diagnostic_package, build_package,
 };
@@ -310,20 +310,18 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
                 output_columns: *output_column_block,
             },
             orientation,
+            compute: GemmGrid {
+                rows: *row_partitions,
+                columns: *column_partitions,
+                inner: *inner_partitions,
+            },
             result: GemmResultGrid {
                 rows: result_rows,
                 columns: result_columns,
             },
             order: ipu_codegen::GridOrder::ColumnsFast,
-            distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
-                compute: GemmGrid {
-                    rows: *row_partitions,
-                    columns: *column_partitions,
-                    inner: *inner_partitions,
-                },
-                staging,
-            }),
         },
+        reduction_staging: Some(staging),
         weight_memory_class: match *memory {
             "standard" => MemoryClass::Standard,
             "interleaved" => MemoryClass::Interleaved,

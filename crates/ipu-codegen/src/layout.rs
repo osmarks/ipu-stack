@@ -485,7 +485,7 @@ impl Layout {
         }
     }
 
-    /// AMP left operand for a row-by-column-by-K dispatch grid. K and rows
+    /// AMP left operand for a row-by-column-by-K compute grid. K and rows
     /// are true shards; the column coordinate is a replica because the same
     /// activation range is consumed by each output-column group.
     pub fn amp_left_parallel_grid(

@@ -1,14 +1,22 @@
 use super::*;
 
 impl LoweringState {
-    pub(super) fn lower_pointwise(
+    pub(super) fn lower_schedule(
         &mut self,
         operation: &MidOperation,
-        kernel: TileKernelSpec,
-        input_mapping: PointwiseInputMapping,
+        schedule: &OperatorSchedule,
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let [ScheduleStep::KernelMap(map)] = schedule.steps.as_slice() else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        if map.domain != ScheduleDomain::OutputShards
+            || map.output != ScheduleValue::Output
+            || map.inputs.len() != operation.inputs.len()
+        {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
         let [result] = operation.results.as_slice() else {
             return Err(LowLoweringError::ResultArity);
         };
@@ -24,17 +32,24 @@ impl LoweringState {
                 continue;
             }
             let tile = self.shards[output.index() as usize].tile;
-            let sources = operation
+            let sources = map
                 .inputs
                 .iter()
-                .map(|input| {
-                    Ok(match input_mapping {
-                        PointwiseInputMapping::BroadcastToOutput => self
+                .map(|(value, access)| {
+                    let ScheduleValue::Input(index) = value else {
+                        return Err(LowLoweringError::InvalidOperatorPlan);
+                    };
+                    let input = operation
+                        .inputs
+                        .get(usize::from(*index))
+                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    Ok(match access {
+                        ScheduleAccess::LogicalOverlap => self
                             .value_shards(*input)?
                             .iter()
                             .find_map(|source| self.broadcast_view(*source, output))
                             .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-                        PointwiseInputMapping::TileLocal => {
+                        ScheduleAccess::TileLocal => {
                             let output_extents = &self.shards[output.index() as usize].extents;
                             let source = self
                                 .value_shards(*input)?
@@ -58,12 +73,14 @@ impl LoweringState {
                 }
                 let inputs = sources
                     .iter()
-                    .map(|source| {
-                        let source_view = match input_mapping {
-                            PointwiseInputMapping::BroadcastToOutput => self
+                    .enumerate()
+                    .map(|(index, source)| {
+                        let access = map.inputs[index].1;
+                        let source_view = match access {
+                            ScheduleAccess::LogicalOverlap => self
                                 .broadcast_view_for_extents(source.shard, output, &output_extents)
                                 .ok_or(LowLoweringError::InvalidOperatorPlan)?,
-                            PointwiseInputMapping::TileLocal => source.clone(),
+                            ScheduleAccess::TileLocal => source.clone(),
                         };
                         let view = if self.shards[source_view.shard.index() as usize].tile == tile {
                             source_view
@@ -94,7 +111,7 @@ impl LoweringState {
                             value: operation.results.first().copied(),
                             reason: WorkReason::OperatorKernel,
                         },
-                        kernel.clone(),
+                        map.kernel.clone(),
                         inputs,
                         ShardView {
                             shard: output,
@@ -171,7 +188,7 @@ impl LoweringState {
         })
     }
 
-    pub(super) fn dispatch_input_view(
+    pub(super) fn schedule_input_view(
         &mut self,
         value: MidValueId,
         tile: u16,

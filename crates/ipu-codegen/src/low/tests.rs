@@ -148,22 +148,18 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                                 output_columns,
                             },
                             orientation: crate::GemmOrientation::Normal,
+                            compute: crate::GemmGrid {
+                                rows: row_partitions,
+                                columns: column_partitions,
+                                inner: inner_partitions,
+                            },
                             result: crate::GemmResultGrid {
                                 rows: row_partitions.saturating_mul(result_row_partitions),
                                 columns: column_partitions.saturating_mul(result_column_partitions),
                             },
                             order: crate::GridOrder::ColumnsFast,
-                            distribution: GemmDistribution::ParallelReduction(
-                                crate::ParallelReductionPlan {
-                                    compute: crate::GemmGrid {
-                                        rows: row_partitions,
-                                        columns: column_partitions,
-                                        inner: inner_partitions,
-                                    },
-                                    staging: reduction_staging,
-                                },
-                            ),
                         },
+                        reduction_staging: Some(reduction_staging),
                         weight_memory_class: MemoryClass::Interleaved,
                         local_weight_staging: crate::LocalOperandStaging::Direct(
                             MemoryClass::Interleaved,
@@ -295,7 +291,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
 }
 
 #[test]
-fn randomized_pointwise_dispatch_skips_empty_output_shards() {
+fn randomized_pointwise_schedule_skips_empty_output_shards() {
     let mut random = fastrand::Rng::with_seed(0x656d_7074);
     for case in 0..CASES {
         let tiles = random.u16(2..=32);
@@ -332,7 +328,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
 }
 
 #[test]
-fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
+fn randomized_schedule_streaming_defers_one_use_rearrangements() {
     let mut random = fastrand::Rng::with_seed(0x7374_7265_616d);
     for case in 0..8 {
         let batch = random.u32(1..=4);

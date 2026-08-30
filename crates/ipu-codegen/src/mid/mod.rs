@@ -14,7 +14,7 @@ mod ir;
 use consumers::{direct_consumer_layouts, operator_accepts_input_layout};
 #[cfg(test)]
 use gemm::{
-    AmpWeightPlacement, amp_grid_gemm_plan, blocked_gemm_dispatch, gemm_accumulation_precision,
+    AmpWeightPlacement, amp_grid_gemm_plan, blocked_gemm_schedule, gemm_accumulation_precision,
     gemm_seed_plans_for_tile_count, independent_parameter_storage, parallel_reduction_plans,
 };
 use gemm::{GroupedOutputLayout, gemm_plan_matches, gemm_plans, grouped_output_layout};
@@ -22,6 +22,7 @@ pub use ir::{
     MidGraph, MidInput, MidOperation, MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId,
 };
 
+use crate::TileKernelSpec;
 #[cfg(test)]
 use crate::config::PlannerSearchDomain;
 use crate::config::{AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig};
@@ -45,6 +46,9 @@ use crate::layout::{
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
 use crate::operator::*;
+use crate::schedule::{
+    KernelMap, OperatorSchedule, ScheduleAccess, ScheduleDomain, ScheduleStep, ScheduleValue,
+};
 use ipu_target::hardware::HardwareTarget;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -238,7 +242,7 @@ pub(crate) fn lower_finalists(
                     .iter()
                     .filter_map(|operation| operation.operator_plan().map(|plan| (
                         operation.source,
-                        &plan.dispatch,
+                        &plan.schedule,
                         plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
                         &plan.requirements.output.format.layout,
                         operation.metrics.cost.cycles,
@@ -1242,7 +1246,7 @@ fn apply_selected_plan(
         .collect::<Vec<_>>();
     let mut operator_cycles = costs.operator_transition_cycles(
         plan.operator,
-        &plan.dispatch,
+        &plan.schedule,
         &plan.requirements,
         &source_types,
         &converted_types,
@@ -1250,7 +1254,7 @@ fn apply_selected_plan(
     );
     let mut operator_exchange_cycles = costs.operator_transition_exchange_cycles(
         plan.operator,
-        &plan.dispatch,
+        &plan.schedule,
         &plan.requirements,
         &source_types,
         &converted_types,
@@ -1295,7 +1299,7 @@ fn apply_selected_plan(
             &state.get(source).tensor_type,
             &state.get(original).tensor_type,
             &converted_types[input_index],
-            &plan.dispatch,
+            &plan.schedule,
             producer_cycles,
         );
         operator_cycles = operator_cycles.saturating_add(fused_cycles);
@@ -1305,7 +1309,7 @@ fn apply_selected_plan(
                 &state.get(source).tensor_type,
                 &state.get(original).tensor_type,
                 &converted_types[input_index],
-                &plan.dispatch,
+                &plan.schedule,
                 producer_cycles,
             ));
         operations[producer_index].metrics.cost = CostEstimate::default();
@@ -1313,7 +1317,7 @@ fn apply_selected_plan(
     tracing::trace!(
         source = operation.id.index(),
         cycles = operator_cycles,
-        dispatch = ?plan.dispatch,
+        schedule = ?plan.schedule,
         input_layouts = ?converted_types
             .iter()
             .map(|input| &input.format.layout)
@@ -1323,13 +1327,13 @@ fn apply_selected_plan(
     );
     let exchange = costs.operator_exchange_footprint(
         plan.operator,
-        &plan.dispatch,
+        &plan.schedule,
         &plan.requirements,
         &converted_types,
         &state.get(result).tensor_type,
     );
     let memory = operator_memory_estimate(
-        &plan.dispatch,
+        &plan.schedule,
         &plan.requirements,
         &converted_types,
         &state.get(result).tensor_type,
@@ -1459,7 +1463,7 @@ fn plan_fits_operator_memory(
         format: plan.requirements.output.format.clone(),
     };
     let peak = operator_memory_estimate(
-        &plan.dispatch,
+        &plan.schedule,
         &plan.requirements,
         &planned_inputs,
         &planned_output,
@@ -1579,7 +1583,7 @@ fn plans_for_operation(
                     .flatten()
                     .map(|blocking| OperatorPlan {
                         operator,
-                        dispatch: OperatorDispatch::Attention(AttentionPlan {
+                        schedule: OperatorSchedule::attention(AttentionPlan {
                             kernel,
                             blocking,
                             padding,
@@ -1624,7 +1628,7 @@ fn plans_for_operation(
     });
     if let Some(constraint) = gemm_constraint {
         plans.retain(|plan| {
-            gemm_plan_matches(constraint, &plan.dispatch, &plan.requirements.inputs)
+            gemm_plan_matches(constraint, &plan.schedule, &plan.requirements.inputs)
         });
         tracing::info!(
             source_operation = constraint.source_operation,
@@ -1643,9 +1647,9 @@ fn pointwise_plans(
     output: &TensorShape,
     config: &PipelineConfig,
 ) -> Vec<OperatorPlan> {
-    let mapping = match operator {
-        MidOperator::Gelu => PointwiseInputMapping::TileLocal,
-        MidOperator::Add(_) => PointwiseInputMapping::BroadcastToOutput,
+    let access = match operator {
+        MidOperator::Gelu => ScheduleAccess::TileLocal,
+        MidOperator::Add(_) => ScheduleAccess::LogicalOverlap,
         _ => return Vec::new(),
     };
     let mut plans = Vec::new();
@@ -1673,7 +1677,20 @@ fn pointwise_plans(
             );
             let plan = OperatorPlan {
                 operator,
-                dispatch: OperatorDispatch::Pointwise(mapping),
+                schedule: OperatorSchedule {
+                    steps: vec![ScheduleStep::KernelMap(KernelMap {
+                        domain: ScheduleDomain::OutputShards,
+                        kernel: match operator {
+                            MidOperator::Gelu => TileKernelSpec::Gelu,
+                            MidOperator::Add(_) => TileKernelSpec::Add,
+                            _ => unreachable!(),
+                        },
+                        inputs: (0..inputs.len())
+                            .map(|index| (ScheduleValue::Input(index as u16), access))
+                            .collect(),
+                        output: ScheduleValue::Output,
+                    })],
+                },
                 requirements: OperatorRequirements {
                     inputs: (0..inputs.len())
                         .map(|_| OperandRequirement::new(format.clone(), 8))
@@ -2330,12 +2347,16 @@ mod tests {
                         output_columns,
                     },
                     orientation: GemmOrientation::Normal,
+                    compute: GemmGrid {
+                        rows: 1,
+                        columns: tiles,
+                        inner: 1,
+                    },
                     result: GemmResultGrid {
                         rows: 1,
                         columns: tiles,
                     },
                     order: GridOrder::ColumnsFast,
-                    distribution: GemmDistribution::OutputStationary,
                 },
                 output_columns,
                 AmpWeightPlacement::resident(MemoryClass::Standard),
@@ -2360,17 +2381,16 @@ mod tests {
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
             distributed_result_cases += usize::from(candidates.iter().any(|candidate| {
-                let OperatorDispatch::BlockedGemm(plan) = candidate.dispatch else {
+                let Some(plan) = candidate.schedule.gemm_plan() else {
                     return false;
                 };
-                let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution
-                else {
+                if plan.geometry.compute.inner < 2 {
                     return false;
-                };
+                }
                 plan.geometry.result
                     != GemmResultGrid {
-                        rows: reduction.compute.rows,
-                        columns: reduction.compute.columns,
+                        rows: plan.geometry.compute.rows,
+                        columns: plan.geometry.compute.columns,
                     }
             }));
             for candidate in candidates {
@@ -2378,13 +2398,12 @@ mod tests {
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
-                let OperatorDispatch::BlockedGemm(plan) = &candidate.dispatch else {
-                    panic!("parallel GEMM candidate has non-GEMM dispatch");
+                let Some(plan) = candidate.schedule.gemm_plan() else {
+                    panic!("parallel GEMM candidate has non-GEMM schedule");
                 };
-                let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution
-                else {
+                if plan.geometry.compute.inner < 2 {
                     panic!("parallel GEMM candidate has no reduction plan");
-                };
+                }
                 let partial = plan
                     .partial_tensor(&TensorType {
                         shape: TensorShape(vec![m, n]),
@@ -2393,31 +2412,28 @@ mod tests {
                     .expect("supported parallel plan has a realizable partial layout");
                 assert_eq!(
                     partial.format.layout.tiling.tile_count,
-                    reduction.compute.rows * reduction.compute.columns
+                    plan.geometry.compute.rows * plan.geometry.compute.columns
                 );
                 assert!(!layout_has_empty_shards(
                     &partial.format.layout,
                     &partial.shape
                 ));
-                assert!(matches!(candidate.dispatch,
-                    OperatorDispatch::BlockedGemm(BlockedGemmPlan {
+                assert!(matches!(candidate.schedule.gemm_plan(),
+                    Some(BlockedGemmPlan {
                         geometry: GemmGeometry {
                             block: GemmBlockShape { inner: inner_block, output_columns: output_column_block },
                             orientation,
-                            distribution: GemmDistribution::ParallelReduction(ParallelReductionPlan {
-                                compute: GemmGrid { rows: actual_rows, columns: actual_columns, inner: actual },
-                                ..
-                            }),
+                            compute: GemmGrid { rows: actual_rows, columns: actual_columns, inner: actual },
                             ..
                         },
                         ..
                     }) if actual_rows * actual_columns * actual <= tiles
                         && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
-                        && u32::from(actual_rows)
+                        && u32::from(*actual_rows)
                             <= [m, n][orientation.physical_left_input()]
-                        && u32::from(actual_columns) * output_column_block
+                        && u32::from(*actual_columns) * output_column_block
                             >= [m, n][orientation.physical_right_input()]
-                        && u32::from(actual) * inner_block >= k
+                        && u32::from(*actual) * inner_block >= k
                 ));
             }
         }
@@ -2469,7 +2485,7 @@ mod tests {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
             };
-            let dispatch = blocked_gemm_dispatch(
+            let schedule = blocked_gemm_schedule(
                 operator,
                 GemmGeometry {
                     block: GemmBlockShape {
@@ -2477,9 +2493,13 @@ mod tests {
                         output_columns: AMP_OUTPUT_COLUMN_BLOCK,
                     },
                     orientation: GemmOrientation::Normal,
+                    compute: GemmGrid {
+                        rows,
+                        columns,
+                        inner: 1,
+                    },
                     result: GemmResultGrid { rows, columns },
                     order: GridOrder::ColumnsFast,
-                    distribution: GemmDistribution::OutputStationary,
                 },
             );
             let requirements = OperatorRequirements {
@@ -2490,14 +2510,14 @@ mod tests {
             };
             let standard_cost = Ipu21CostModel.operator_cycles(
                 operator,
-                &dispatch,
+                &schedule,
                 &requirements,
                 &[left.clone(), standard],
                 &output,
             );
             let direct_cost = Ipu21CostModel.operator_cycles(
                 operator,
-                &dispatch,
+                &schedule,
                 &requirements,
                 &[left, direct],
                 &output,
@@ -2522,12 +2542,16 @@ mod tests {
                     output_columns: AMP_OUTPUT_COLUMN_BLOCK,
                 },
                 orientation: GemmOrientation::Normal,
+                compute: GemmGrid {
+                    rows: row_partitions,
+                    columns: column_partitions,
+                    inner: 1,
+                },
                 result: GemmResultGrid {
                     rows: row_partitions,
                     columns: column_partitions,
                 },
                 order: GridOrder::ColumnsFast,
-                distribution: GemmDistribution::OutputStationary,
             };
             let candidate = amp_grid_gemm_plan(
                 GemmOptions::default(),
@@ -2625,7 +2649,7 @@ mod tests {
         fn operator_cycles(
             &self,
             operator: MidOperator,
-            _dispatch: &OperatorDispatch,
+            _dispatch: &OperatorSchedule,
             _requirements: &OperatorRequirements,
             _inputs: &[TensorType],
             output: &TensorType,
@@ -2928,10 +2952,11 @@ mod tests {
                     requirements.output.format.layout.memory_class,
                     MemoryClass::Interleaved
                 );
-                let orientation = match operation.operator_plan().map(|plan| &plan.dispatch) {
-                    Some(OperatorDispatch::BlockedGemm(plan)) => plan.geometry.orientation,
-                    _ => unreachable!(),
-                };
+                let orientation = operation
+                    .operator_plan()
+                    .and_then(|plan| plan.schedule.gemm_plan())
+                    .map(|plan| plan.geometry.orientation)
+                    .unwrap();
                 let physical_left = orientation.physical_left_input();
                 assert_eq!(
                     requirements.memory_space.distinct_element_groups,

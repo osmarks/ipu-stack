@@ -25,6 +25,7 @@ mod metrics;
 pub mod mid;
 mod operator;
 pub mod place;
+mod schedule;
 pub mod storage;
 pub mod tile;
 pub use config::{
@@ -71,14 +72,16 @@ pub use mid::{
 };
 pub use operator::{
     AccumulationPrecision, AllocationRequirements, AttentionBlocking, AttentionPadding,
-    AttentionPlan, BlockedGemmPlan, GemmBlockShape, GemmDistribution, GemmGeometry, GemmGrid,
-    GemmKernelFamily, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid,
-    GemmWeightLoad, GridOrder, LocalOperandStaging, MemoryElementRequirement, MemoryOperand,
-    MemorySpaceRequirements, MidOperator, OperandMaterialization, OperandRequirement,
-    OperatorDispatch, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    ParallelReductionPlan, PointwiseInputMapping, Precision, ReductionStaging,
+    AttentionPlan, BlockedGemmPlan, GemmBlockShape, GemmGeometry, GemmGrid, GemmKernelFamily,
+    GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmResultGrid, GemmWeightLoad, GridOrder,
+    LocalOperandStaging, MemoryElementRequirement, MemoryOperand, MemorySpaceRequirements,
+    MidOperator, OperandMaterialization, OperandRequirement, OperatorPlan, OperatorPlanError,
+    OperatorRequirements, OutputAliasing, Precision, ReductionStaging,
 };
 pub use place::{Placement, PlacementError, place};
+pub use schedule::{
+    KernelMap, OperatorSchedule, ScheduleAccess, ScheduleDomain, ScheduleStep, ScheduleValue,
+};
 pub use storage::{
     ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, block_major_matrix_coordinates,
     logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
