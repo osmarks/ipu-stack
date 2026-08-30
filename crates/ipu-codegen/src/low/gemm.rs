@@ -1,5 +1,73 @@
 use super::*;
 
+struct GemmLowering {
+    left_value: MidValueId,
+    right_value: MidValueId,
+    output_value: MidValueId,
+    left_shards: Vec<LowShardId>,
+    right_shards: Vec<LowShardId>,
+    output_shards: Vec<LowShardId>,
+    left_rank: usize,
+    right_rank: usize,
+    output_rank: usize,
+    block: crate::GemmBlockShape,
+    initialize: TileKernelSpec,
+    accumulate: TileKernelSpec,
+}
+
+impl GemmLowering {
+    fn bind(
+        state: &LoweringState,
+        operation: &MidOperation,
+        plan: &crate::BlockedGemmPlan,
+    ) -> LowLoweringResult<GemmLowering> {
+        let [left_value, right_value] = operation.inputs.as_slice() else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let [output_value] = operation.results.as_slice() else {
+            return Err(LowLoweringError::ResultArity);
+        };
+        let inner_block = plan.geometry.block.inner;
+        let output_column_block = plan.geometry.block.output_columns;
+        if inner_block == 0 || output_column_block == 0 {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let left_shards = state.value_shards(*left_value)?.to_vec();
+        let right_shards = state.value_shards(*right_value)?.to_vec();
+        let output_shards = state.value_shards(*output_value)?.to_vec();
+        let left_rank = state.shards[left_shards[0].index() as usize].extents.len();
+        let right_rank = state.shards[right_shards[0].index() as usize].extents.len();
+        let output_rank = state.shards[output_shards[0].index() as usize]
+            .extents
+            .len();
+        if left_rank < 2 || right_rank < 2 || output_rank < 2 {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        Ok(GemmLowering {
+            left_value: *left_value,
+            right_value: *right_value,
+            output_value: *output_value,
+            left_shards,
+            right_shards,
+            output_shards,
+            left_rank,
+            right_rank,
+            output_rank,
+            block: plan.geometry.block,
+            initialize: gemm_kernel_spec(
+                plan.kernel,
+                GemmKernelMode::Initialize,
+                plan.geometry.block,
+            ),
+            accumulate: gemm_kernel_spec(
+                plan.kernel,
+                GemmKernelMode::Accumulate,
+                plan.geometry.block,
+            ),
+        })
+    }
+}
+
 impl LoweringState {
     pub(super) fn lower_blocked_gemm(
         &mut self,
@@ -8,28 +76,35 @@ impl LoweringState {
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
+        let gemm = GemmLowering::bind(self, operation, plan)?;
         if matches!(
             plan.geometry.distribution,
             GemmDistribution::ParallelReduction(_)
         ) {
-            return self.lower_parallel_reduction_gemm(operation, plan, requirements, tiles);
+            return self.lower_parallel_reduction_gemm(operation, plan, requirements, gemm, tiles);
         }
-        let inner_block = plan.geometry.block.inner;
-        let output_column_block = plan.geometry.block.output_columns;
-        let orientation = plan.geometry.orientation;
-        let initialize =
-            gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, plan.geometry.block);
-        let accumulate =
-            gemm_kernel_spec(plan.kernel, GemmKernelMode::Accumulate, plan.geometry.block);
-        if orientation != crate::GemmOrientation::Normal {
+        if plan.geometry.orientation != crate::GemmOrientation::Normal {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let [left_value, right_value] = operation.inputs.as_slice() else {
+        let left_type = &self.shards[gemm.left_shards[0].index() as usize].tensor_type;
+        let output_type = &self.shards[gemm.output_shards[0].index() as usize].tensor_type;
+        let inner_extent = left_type
+            .format
+            .layout
+            .resolve(&left_type.shape)?
+            .padded_shape()
+            .0[gemm.left_rank - 1];
+        let column_extent = output_type
+            .format
+            .layout
+            .resolve(&output_type.shape)?
+            .padded_shape()
+            .0[gemm.output_rank - 1];
+        if !inner_extent.is_multiple_of(gemm.block.inner)
+            || !column_extent.is_multiple_of(gemm.block.output_columns)
+        {
             return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [output_value] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
-        };
+        }
         if requirements.inputs[1]
             .format
             .layout
@@ -40,36 +115,18 @@ impl LoweringState {
         {
             return self.lower_streamed_blocked_gemm(
                 operation,
-                initialize,
-                accumulate,
-                inner_block,
-                output_column_block,
+                gemm,
+                [inner_extent, column_extent],
                 requirements,
                 tiles,
             );
         }
-        if inner_block == 0 || output_column_block == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let left_shards = self.value_shards(*left_value)?.to_vec();
-        let right_shards = self.value_shards(*right_value)?.to_vec();
-        let output_shards = self.value_shards(*output_value)?.to_vec();
-        let left_type = &self.shards[left_shards[0].index() as usize].tensor_type;
-        let output_type = &self.shards[output_shards[0].index() as usize].tensor_type;
-        let left_rank = left_type.shape.0.len();
-        let output_rank = output_type.shape.0.len();
-        if left_rank < 2 || output_rank < 2 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let left_layout = left_type.format.layout.resolve(&left_type.shape)?;
-        let output_layout = output_type.format.layout.resolve(&output_type.shape)?;
-        let inner_extent = left_layout.padded_shape().0[left_rank - 1];
-        let column_extent = output_layout.padded_shape().0[output_rank - 1];
-        if !inner_extent.is_multiple_of(inner_block)
-            || !column_extent.is_multiple_of(output_column_block)
-        {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
+        let (left_value, right_value, output_value) =
+            (&gemm.left_value, &gemm.right_value, &gemm.output_value);
+        let (right_shards, output_shards) = (&gemm.right_shards, &gemm.output_shards);
+        let (left_rank, output_rank) = (gemm.left_rank, gemm.output_rank);
+        let (inner_block, output_column_block) = (gemm.block.inner, gemm.block.output_columns);
+        let (initialize, accumulate) = (&gemm.initialize, &gemm.accumulate);
 
         let panels_per_phase = column_extent / output_column_block;
         let phase_column_width = output_column_block
@@ -301,18 +358,16 @@ impl LoweringState {
         operation: &MidOperation,
         plan: &crate::BlockedGemmPlan,
         requirements: &OperatorRequirements,
+        gemm: GemmLowering,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let inner_block = plan.geometry.block.inner;
-        let output_column_block = plan.geometry.block.output_columns;
+        let (inner_block, output_column_block) = (gemm.block.inner, gemm.block.output_columns);
         let orientation = plan.geometry.orientation;
-        let initialize =
-            gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, plan.geometry.block);
-        let accumulate =
-            gemm_kernel_spec(plan.kernel, GemmKernelMode::Accumulate, plan.geometry.block);
+        let initialize = gemm.initialize;
+        let accumulate = gemm.accumulate;
         let row_partitions = reduction.compute.rows;
         let column_partitions = reduction.compute.columns;
         let inner_partitions = reduction.compute.inner;
@@ -329,15 +384,16 @@ impl LoweringState {
             .checked_div(reduction.compute.columns)
             .unwrap_or(0);
         let reduction_staging = reduction.staging;
-        let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [output_value] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
-        };
-        if inner_block == 0
-            || output_column_block == 0
-            || row_partitions == 0
+        let semantic_left_value = gemm.left_value;
+        let semantic_right_value = gemm.right_value;
+        let output_value = gemm.output_value;
+        let semantic_left_shards = gemm.left_shards;
+        let semantic_right_shards = gemm.right_shards;
+        let output_shards = gemm.output_shards;
+        let semantic_left_rank = gemm.left_rank;
+        let semantic_right_rank = gemm.right_rank;
+        let output_rank = gemm.output_rank;
+        if row_partitions == 0
             || column_partitions == 0
             || inner_partitions < 2
             || result_row_partitions == 0
@@ -346,16 +402,33 @@ impl LoweringState {
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let (left_value, right_value, left_requirement, right_requirement) = match orientation {
+        let (
+            left_value,
+            right_value,
+            left_shards,
+            right_shards,
+            left_rank,
+            right_rank,
+            left_requirement,
+            right_requirement,
+        ) = match orientation {
             crate::GemmOrientation::Normal => (
-                semantic_left_value,
-                semantic_right_value,
+                &semantic_left_value,
+                &semantic_right_value,
+                semantic_left_shards,
+                semantic_right_shards,
+                semantic_left_rank,
+                semantic_right_rank,
                 &requirements.inputs[0],
                 &requirements.inputs[1],
             ),
             crate::GemmOrientation::Swapped => (
-                semantic_right_value,
-                semantic_left_value,
+                &semantic_right_value,
+                &semantic_left_value,
+                semantic_right_shards,
+                semantic_left_shards,
+                semantic_right_rank,
+                semantic_left_rank,
                 &requirements.inputs[1],
                 &requirements.inputs[0],
             ),
@@ -364,15 +437,7 @@ impl LoweringState {
         if orientation == crate::GemmOrientation::Swapped {
             kernel_requirements.inputs.swap(0, 1);
         }
-        let left_shards = self.value_shards(*left_value)?.to_vec();
-        let right_shards = self.value_shards(*right_value)?.to_vec();
-        let output_shards = self.value_shards(*output_value)?.to_vec();
-        let left_rank = self.shards[left_shards[0].index() as usize].extents.len();
-        let right_rank = self.shards[right_shards[0].index() as usize].extents.len();
-        let output_rank = self.shards[output_shards[0].index() as usize].extents.len();
-        if left_rank < 2 || output_rank < 2 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
+        let output_value = &output_value;
         let (
             left_row_axis,
             left_inner_axis,
@@ -1144,45 +1209,20 @@ impl LoweringState {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn lower_streamed_blocked_gemm(
         &mut self,
         operation: &MidOperation,
-        initialize: TileKernelSpec,
-        accumulate: TileKernelSpec,
-        inner_block: u32,
-        output_column_block: u32,
+        gemm: GemmLowering,
+        [inner_extent, column_extent]: [u32; 2],
         requirements: &OperatorRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        let [left_value, right_value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [output_value] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
-        };
-        if inner_block == 0 || output_column_block == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let left_shards = self.value_shards(*left_value)?.to_vec();
-        let right_shards = self.value_shards(*right_value)?.to_vec();
-        let output_shards = self.value_shards(*output_value)?.to_vec();
-        let left_type = &self.shards[left_shards[0].index() as usize].tensor_type;
-        let output_type = &self.shards[output_shards[0].index() as usize].tensor_type;
-        let left_rank = left_type.shape.0.len();
-        let output_rank = output_type.shape.0.len();
-        if left_rank < 2 || output_rank < 2 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let left_layout = left_type.format.layout.resolve(&left_type.shape)?;
-        let output_layout = output_type.format.layout.resolve(&output_type.shape)?;
-        let inner_extent = left_layout.padded_shape().0[left_rank - 1];
-        let column_extent = output_layout.padded_shape().0[output_rank - 1];
-        if !inner_extent.is_multiple_of(inner_block)
-            || !column_extent.is_multiple_of(output_column_block)
-        {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
+        let (left_value, right_value, output_value) =
+            (&gemm.left_value, &gemm.right_value, &gemm.output_value);
+        let (right_shards, output_shards) = (&gemm.right_shards, &gemm.output_shards);
+        let (left_rank, output_rank) = (gemm.left_rank, gemm.output_rank);
+        let (inner_block, output_column_block) = (gemm.block.inner, gemm.block.output_columns);
+        let (initialize, accumulate) = (&gemm.initialize, &gemm.accumulate);
         let staging_bytes = inner_block
             .checked_mul(output_column_block)
             .and_then(|elements| {

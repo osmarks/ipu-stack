@@ -1,5 +1,15 @@
 use super::*;
 
+struct AttentionLowering {
+    key_shards: Vec<LowShardId>,
+    value_shards: Vec<LowShardId>,
+    key_rows: u32,
+    tasks: Vec<AttentionTask>,
+    prepared: Vec<PreparedAttentionBlock>,
+    exchange_provenance: WorkProvenance,
+    kernel_provenance: WorkProvenance,
+}
+
 impl LoweringState {
     fn build_attention_tasks(
         &mut self,
@@ -324,6 +334,80 @@ impl LoweringState {
         Ok(prepared)
     }
 
+    fn prepare_attention(
+        &mut self,
+        operation: &MidOperation,
+        plan: &crate::AttentionPlan,
+        tiles: &mut [TileWorkList],
+    ) -> LowLoweringResult<AttentionLowering> {
+        let [query, key, value] = operation.inputs.as_slice() else {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        };
+        let [result] = operation.results.as_slice() else {
+            return Err(LowLoweringError::ResultArity);
+        };
+        let key_shards = self.value_shards(*key)?.to_vec();
+        let value_shards = self.value_shards(*value)?.to_vec();
+        let deferred = self.deferred_view(*key).is_some();
+        if key_shards.len() != value_shards.len()
+            || deferred != self.deferred_view(*value).is_some()
+        {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let key_rows = self.shards[key_shards[0].index() as usize]
+            .tensor_type
+            .shape
+            .0[1];
+        if key_rows == 0 {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        if let crate::AttentionBlocking::Materialized {
+            padded_key_rows, ..
+        } = plan.blocking
+            && key_rows > padded_key_rows
+        {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let shape = AttentionBufferShape::from_plan(plan, key_rows);
+        let tasks = self.build_attention_tasks(*query, *result, shape)?;
+        if tasks.is_empty() {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        let exchange_provenance = WorkProvenance {
+            operation: operation.source,
+            value: Some(*key),
+            reason: WorkReason::OperatorInputs,
+        };
+        let kernel_provenance = WorkProvenance {
+            operation: operation.source,
+            value: Some(*result),
+            reason: WorkReason::OperatorKernel,
+        };
+        self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
+        let prepared = if deferred {
+            self.prepare_attention_blocks(
+                *key,
+                *value,
+                &tasks,
+                key_rows,
+                shape,
+                exchange_provenance,
+                tiles,
+            )?
+        } else {
+            Vec::new()
+        };
+        Ok(AttentionLowering {
+            key_shards,
+            value_shards,
+            key_rows,
+            tasks,
+            prepared,
+            exchange_provenance,
+            kernel_provenance,
+        })
+    }
+
     pub(super) fn lower_blocked_attention(
         &mut self,
         operation: &MidOperation,
@@ -340,59 +424,24 @@ impl LoweringState {
         };
         let (query_key, probability_value) = attention_kernel_specs(plan);
         let padded_value_dimension = plan.padding.value_dimension;
-        let [query, key, value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
-        };
         if key_block_rows != AMP_INNER_BLOCK || query_block_rows == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let key_shards = self.value_shards(*key)?.to_vec();
-        let value_shards = self.value_shards(*value)?.to_vec();
-        if key_shards.len() != value_shards.len() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        if self.deferred_view(*key).is_some() != self.deferred_view(*value).is_some() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let key_rows = self.shards[self.value_shards(*key)?[0].index() as usize]
-            .tensor_type
-            .shape
-            .0[1];
-        let buffer_shape = AttentionBufferShape::from_plan(plan, key_rows);
-        let tasks = self.build_attention_tasks(*query, *result, buffer_shape)?;
+        let AttentionLowering {
+            key_shards,
+            value_shards,
+            key_rows,
+            tasks,
+            prepared: prepared_blocks,
+            exchange_provenance,
+            kernel_provenance,
+        } = self.prepare_attention(operation, plan, tiles)?;
+        let deferred_key_value = !prepared_blocks.is_empty();
         let blocks = usize::try_from(key_rows.div_ceil(key_block_rows))
             .map_err(|_| LowLoweringError::IdOverflow)?;
         if blocks == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let exchange_provenance = WorkProvenance {
-            operation: operation.source,
-            value: Some(*key),
-            reason: WorkReason::OperatorInputs,
-        };
-        let kernel_provenance = WorkProvenance {
-            operation: operation.source,
-            value: Some(*result),
-            reason: WorkReason::OperatorKernel,
-        };
-        self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
-        let deferred_key_value = self.deferred_view(*key).is_some();
-        let prepared_blocks = if deferred_key_value {
-            self.prepare_attention_blocks(
-                *key,
-                *value,
-                &tasks,
-                key_rows,
-                buffer_shape,
-                exchange_provenance,
-                tiles,
-            )?
-        } else {
-            Vec::new()
-        };
         for block in 0..blocks {
             let block_start =
                 u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)? * key_block_rows;
@@ -629,60 +678,22 @@ impl LoweringState {
         };
         let (query_key, probability_value) = attention_kernel_specs(plan);
         let padded_value_dimension = plan.padding.value_dimension;
-        let [query, key, value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        };
-        let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
-        };
         if query_block_rows == 0
             || padded_key_rows == 0
             || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
-            || self.deferred_view(*key).is_some() != self.deferred_view(*value).is_some()
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let key_shards = self.value_shards(*key)?.to_vec();
-        let value_shards = self.value_shards(*value)?.to_vec();
-        if key_shards.len() != value_shards.len() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let key_rows = self.shards[key_shards[0].index() as usize]
-            .tensor_type
-            .shape
-            .0[1];
-        if key_rows == 0 || key_rows > padded_key_rows {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let buffer_shape = AttentionBufferShape::from_plan(plan, key_rows);
-        let tasks = self.build_attention_tasks(*query, *result, buffer_shape)?;
-        if tasks.is_empty() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let exchange_provenance = WorkProvenance {
-            operation: operation.source,
-            value: Some(*key),
-            reason: WorkReason::OperatorInputs,
-        };
-        let kernel_provenance = WorkProvenance {
-            operation: operation.source,
-            value: Some(*result),
-            reason: WorkReason::OperatorKernel,
-        };
-        self.materialize_attention_queries(*query, &tasks, exchange_provenance, tiles)?;
-        let prepared = if self.deferred_view(*key).is_some() {
-            self.prepare_attention_blocks(
-                *key,
-                *value,
-                &tasks,
-                key_rows,
-                buffer_shape,
-                exchange_provenance,
-                tiles,
-            )?
-        } else {
-            Vec::new()
-        };
+        let AttentionLowering {
+            key_shards,
+            value_shards,
+            key_rows,
+            tasks,
+            prepared,
+            exchange_provenance,
+            kernel_provenance,
+            ..
+        } = self.prepare_attention(operation, plan, tiles)?;
         self.append_materialized_attention_input(
             AttentionOperand::Key,
             &key_shards,
