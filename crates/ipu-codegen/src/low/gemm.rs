@@ -152,67 +152,25 @@ impl LoweringState {
         {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
-        let (
-            left_value,
-            right_value,
-            left_shards,
-            right_shards,
-            left_rank,
-            right_rank,
-            left_requirement,
-            right_requirement,
-        ) = match orientation {
-            crate::GemmOrientation::Normal => (
-                &semantic_left_value,
-                &semantic_right_value,
-                semantic_left_shards,
-                semantic_right_shards,
-                semantic_left_rank,
-                semantic_right_rank,
-                &requirements.inputs[0],
-                &requirements.inputs[1],
-            ),
-            crate::GemmOrientation::Swapped => (
-                &semantic_right_value,
-                &semantic_left_value,
-                semantic_right_shards,
-                semantic_left_shards,
-                semantic_right_rank,
-                semantic_left_rank,
-                &requirements.inputs[1],
-                &requirements.inputs[0],
-            ),
-        };
+        let [left_value, right_value] =
+            orientation.physical_order([&semantic_left_value, &semantic_right_value]);
+        let [left_shards, right_shards] =
+            orientation.physical_order([semantic_left_shards, semantic_right_shards]);
+        let [left_rank, right_rank] =
+            orientation.physical_order([semantic_left_rank, semantic_right_rank]);
+        let [left_requirement, right_requirement] =
+            orientation.physical_order([&requirements.inputs[0], &requirements.inputs[1]]);
         let mut kernel_requirements = requirements.clone();
         if orientation == crate::GemmOrientation::Swapped {
             kernel_requirements.inputs.swap(0, 1);
         }
         let output_value = &output_value;
-        let (
-            left_row_axis,
-            left_inner_axis,
-            right_inner_axis,
-            right_column_axis,
-            output_row_axis,
-            output_column_axis,
-        ) = match orientation {
-            crate::GemmOrientation::Normal => (
-                left_rank - 2,
-                left_rank - 1,
-                right_rank - 2,
-                right_rank - 1,
-                output_rank - 2,
-                output_rank - 1,
-            ),
-            crate::GemmOrientation::Swapped => (
-                left_rank - 1,
-                left_rank - 2,
-                right_rank - 1,
-                right_rank - 2,
-                output_rank - 1,
-                output_rank - 2,
-            ),
-        };
+        let left_row_axis = orientation.row_axis().resolve(left_rank)?;
+        let left_inner_axis = orientation.column_axis().resolve(left_rank)?;
+        let right_inner_axis = orientation.row_axis().resolve(right_rank)?;
+        let right_column_axis = orientation.column_axis().resolve(right_rank)?;
+        let output_row_axis = orientation.row_axis().resolve(output_rank)?;
+        let output_column_axis = orientation.column_axis().resolve(output_rank)?;
         let output_type = self.shards[output_shards[0].index() as usize]
             .tensor_type
             .clone();
@@ -583,10 +541,7 @@ impl LoweringState {
                     operation: operation.source,
                     value: Some(*right_value),
                     reason: WorkReason::OperatorInput {
-                        input: match orientation {
-                            crate::GemmOrientation::Normal => 1,
-                            crate::GemmOrientation::Swapped => 0,
-                        },
+                        input: orientation.physical_right_input() as u16,
                     },
                 },
                 tiles,

@@ -543,10 +543,7 @@ pub(super) fn gemm_plan_matches(
     ) {
         return false;
     }
-    let weight_index = match plan.geometry.orientation {
-        GemmOrientation::Normal => 1,
-        GemmOrientation::Swapped => 0,
-    };
+    let weight_index = plan.geometry.orientation.physical_right_input();
     let Some(weight) = inputs.get(weight_index) else {
         return false;
     };
@@ -716,10 +713,7 @@ fn parallel_reduction_plans_for_orientation(
         return Vec::new();
     };
     let normal_rows = left.shape.0[left.shape.0.len() - 2];
-    let (rows, columns) = match orientation {
-        GemmOrientation::Normal => (normal_rows, normal_columns),
-        GemmOrientation::Swapped => (normal_columns, normal_rows),
-    };
+    let [rows, columns] = orientation.physical_order([normal_rows, normal_columns]);
     // Generate the shape-specialized family once from the ordinary C64 seed.
     // Each grid chooses the exact padded local K and C extents, so one tile
     // call traverses all of its AMP micro-groups without fixed K64/C64
@@ -1004,10 +998,7 @@ fn parallel_reduction_plans_for_orientation(
                     }),
                 };
             }
-            let physical_right_index = match orientation {
-                GemmOrientation::Normal => 1,
-                GemmOrientation::Swapped => 0,
-            };
+            let physical_right_index = orientation.physical_right_input();
             let local_staging_options: &[_] = match orientation {
                 GemmOrientation::Normal => &[LocalOperandStaging::Direct(MemoryClass::Interleaved)],
                 GemmOrientation::Swapped => &[
@@ -1078,10 +1069,7 @@ fn parallel_reduction_plans_for_orientation(
                             grid_order,
                         ),
                     };
-                    let physical_column_axis = match orientation {
-                        GemmOrientation::Normal => TensorAxis::FromEnd(1),
-                        GemmOrientation::Swapped => TensorAxis::FromEnd(2),
-                    };
+                    let physical_column_axis = orientation.column_axis();
                     balance_parallel_gemm_columns(&mut result_layout, physical_column_axis);
                     result_variant.requirements.output.format.layout = result_layout;
                     result_layout_variants.push(result_variant);
@@ -1089,10 +1077,10 @@ fn parallel_reduction_plans_for_orientation(
             }
             let mut layout_variants = Vec::new();
             for mut result_layout in result_layout_variants {
-                let (physical_row_axis, physical_rows, physical_left_index) = match orientation {
-                    GemmOrientation::Normal => (TensorAxis::FromEnd(2), normal_rows, 0),
-                    GemmOrientation::Swapped => (TensorAxis::FromEnd(1), normal_columns, 1),
-                };
+                let physical_row_axis = orientation.row_axis();
+                let physical_rows =
+                    [normal_rows, normal_columns][orientation.physical_left_input()];
+                let physical_left_index = orientation.physical_left_input();
                 let result_rows = result_layout
                     .requirements
                     .output

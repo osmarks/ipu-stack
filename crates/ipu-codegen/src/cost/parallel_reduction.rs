@@ -22,10 +22,11 @@ pub(crate) fn parallel_reduction_preselection_metrics(
         .fold(1u64, |product, &extent| {
             product.saturating_mul(u64::from(extent))
         });
-    let logical_rows = match orientation {
-        GemmOrientation::Normal => left.shape.0[left.shape.0.len() - 2],
-        GemmOrientation::Swapped => right.shape.0[right.shape.0.len() - 1],
-    };
+    let [physical_left, physical_right] = orientation.physical_order([left, right]);
+    let logical_rows = physical_left.shape.0[orientation
+        .row_axis()
+        .resolve(physical_left.shape.0.len())
+        .ok()?];
     let local_rows = logical_rows.div_ceil(u32::from(grid.rows));
     let local_columns = block.output_columns.div_ceil(AMP_COLUMN_MICRO);
     let local_inner = block.inner.div_ceil(AMP_COLUMN_MICRO);
@@ -46,10 +47,8 @@ pub(crate) fn parallel_reduction_preselection_metrics(
                 .saturating_mul(u64::from(local_columns))
                 .saturating_mul(u64::from(grid.inner.saturating_sub(1))),
         );
-    let (left_precision, right_precision) = match orientation {
-        GemmOrientation::Normal => (left.format.precision, right.format.precision),
-        GemmOrientation::Swapped => (right.format.precision, left.format.precision),
-    };
+    let left_precision = physical_left.format.precision;
+    let right_precision = physical_right.format.precision;
     let left_bytes = outer_rows
         .saturating_mul(u64::from(local_rows))
         .saturating_mul(u64::from(local_inner))

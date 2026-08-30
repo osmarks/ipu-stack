@@ -2426,14 +2426,10 @@ mod tests {
                         ..
                     }) if actual_rows * actual_columns * actual <= tiles
                         && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
-                        && u32::from(actual_rows) <= match orientation {
-                            GemmOrientation::Normal => m,
-                            GemmOrientation::Swapped => n,
-                        }
-                        && u32::from(actual_columns) * output_column_block >= match orientation {
-                            GemmOrientation::Normal => n,
-                            GemmOrientation::Swapped => m,
-                        }
+                        && u32::from(actual_rows)
+                            <= [m, n][orientation.physical_left_input()]
+                        && u32::from(actual_columns) * output_column_block
+                            >= [m, n][orientation.physical_right_input()]
                         && u32::from(actual) * inner_block >= k
                 ));
             }
@@ -2941,10 +2937,7 @@ mod tests {
                     Some(OperatorDispatch::BlockedGemm(plan)) => plan.geometry.orientation,
                     _ => unreachable!(),
                 };
-                let physical_left = match orientation {
-                    GemmOrientation::Normal => 0usize,
-                    GemmOrientation::Swapped => 1usize,
-                };
+                let physical_left = orientation.physical_left_input();
                 assert_eq!(
                     requirements.memory_space.distinct_element_groups,
                     [vec![

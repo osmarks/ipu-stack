@@ -82,6 +82,43 @@ pub enum GemmOrientation {
     Swapped,
 }
 
+impl GemmOrientation {
+    pub const fn physical_left_input(self) -> usize {
+        match self {
+            Self::Normal => 0,
+            Self::Swapped => 1,
+        }
+    }
+
+    pub const fn physical_right_input(self) -> usize {
+        1 - self.physical_left_input()
+    }
+
+    pub const fn row_axis(self) -> TensorAxis {
+        match self {
+            Self::Normal => TensorAxis::FromEnd(2),
+            Self::Swapped => TensorAxis::FromEnd(1),
+        }
+    }
+
+    pub const fn column_axis(self) -> TensorAxis {
+        match self {
+            Self::Normal => TensorAxis::FromEnd(1),
+            Self::Swapped => TensorAxis::FromEnd(2),
+        }
+    }
+
+    pub(crate) fn physical_order<T>(self, values: [T; 2]) -> [T; 2] {
+        match self {
+            Self::Normal => values,
+            Self::Swapped => {
+                let [left, right] = values;
+                [right, left]
+            }
+        }
+    }
+}
+
 /// Shape-independent recipe which expands into ordered device-wide exchange
 /// and tile-kernel phases after concrete shards are known.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,10 +258,12 @@ impl BlockedGemmPlan {
             return Some(output.clone());
         };
         let output_rank = output.shape.0.len();
-        let output_column_axis = output_rank.checked_sub(match self.geometry.orientation {
-            GemmOrientation::Normal => 1,
-            GemmOrientation::Swapped => 2,
-        })?;
+        let output_column_axis = self
+            .geometry
+            .orientation
+            .column_axis()
+            .resolve(output_rank)
+            .ok()?;
         let column_tiling = *output
             .format
             .layout
@@ -701,14 +740,8 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
-                let row_axis = match orientation {
-                    GemmOrientation::Normal => TensorAxis::FromEnd(2),
-                    GemmOrientation::Swapped => TensorAxis::FromEnd(1),
-                };
-                let column_axis = match orientation {
-                    GemmOrientation::Normal => TensorAxis::FromEnd(1),
-                    GemmOrientation::Swapped => TensorAxis::FromEnd(2),
-                };
+                let row_axis = orientation.row_axis();
+                let column_axis = orientation.column_axis();
                 let axis_partitions = |axis| {
                     output
                         .format
@@ -748,10 +781,7 @@ impl OperatorPlan {
                         return Err(OperatorPlanError::InvalidBlocking);
                     }
                 }
-                let physical_left = match orientation {
-                    GemmOrientation::Normal => left,
-                    GemmOrientation::Swapped => right,
-                };
+                let [physical_left, physical_right] = orientation.physical_order([left, right]);
                 let left_layout = physical_left
                     .format
                     .layout
@@ -764,29 +794,23 @@ impl OperatorPlan {
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let left_padded = left_layout.padded_shape();
                 let output_padded = output_layout.padded_shape();
-                let output_column_axis = output_padded.0.len()
-                    - match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 2,
-                    };
+                let output_column_axis = orientation
+                    .column_axis()
+                    .resolve(output_padded.0.len())
+                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let columns_per_output_shard = output_layout
                     .maximum_axis_extent(output_column_axis)
                     .ok_or(OperatorPlanError::InvalidBlocking)?;
-                let physical_right = match orientation {
-                    GemmOrientation::Normal => right,
-                    GemmOrientation::Swapped => left,
-                };
                 let right_layout = physical_right
                     .format
                     .layout
                     .resolve(&physical_right.shape)
                     .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let right_padded = right_layout.padded_shape();
-                let right_column_axis = right_padded.0.len()
-                    - match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 2,
-                    };
+                let right_column_axis = orientation
+                    .column_axis()
+                    .resolve(right_padded.0.len())
+                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let columns_per_right_shard = right_layout
                     .maximum_axis_extent(right_column_axis)
                     .ok_or(OperatorPlanError::InvalidBlocking)?;
@@ -806,11 +830,10 @@ impl OperatorPlan {
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }
-                let physical_left_inner_axis = left_padded.0.len()
-                    - match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 2,
-                    };
+                let physical_left_inner_axis = orientation
+                    .column_axis()
+                    .resolve(left_padded.0.len())
+                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
                 let balanced_output_columns =
                     matches!(distribution, GemmDistribution::ParallelReduction(_));
                 let output_shard_alignment = if balanced_output_columns {

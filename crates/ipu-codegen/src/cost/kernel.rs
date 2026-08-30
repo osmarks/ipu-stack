@@ -693,11 +693,8 @@ impl CostModel for Ipu21CostModel {
                     OperatorDispatch::BlockedGemm(plan) => plan.geometry.orientation,
                     _ => crate::GemmOrientation::Normal,
                 };
-                let (left_index, right_index, left_inner_from_end, output_column_from_end) =
-                    match orientation {
-                        crate::GemmOrientation::Normal => (0, 1, 1, 1),
-                        crate::GemmOrientation::Swapped => (1, 0, 2, 2),
-                    };
+                let left_index = orientation.physical_left_input();
+                let right_index = orientation.physical_right_input();
                 let compute_output = gemm_partial_tensor(dispatch, output);
                 let output_elements_per_tile =
                     SpatialOccupancy::for_output(&compute_output).latency_work();
@@ -707,9 +704,11 @@ impl CostModel for Ipu21CostModel {
                     .resolve(&inputs[left_index].shape)
                     .map(|resolved| resolved.padded_shape().clone())
                     .unwrap_or_else(|_| inputs[left_index].shape.clone());
-                let k = left_shape
-                    .0
-                    .get(left_shape.0.len().saturating_sub(left_inner_from_end))
+                let k = orientation
+                    .column_axis()
+                    .resolve(left_shape.0.len())
+                    .ok()
+                    .and_then(|axis| left_shape.0.get(axis))
                     .copied()
                     .unwrap_or(1) as u64;
                 let compute_k = match dispatch {
@@ -728,7 +727,10 @@ impl CostModel for Ipu21CostModel {
                 };
                 let output_columns_per_tile = maximum_axis_shard_extent(
                     &compute_output,
-                    output.shape.0.len().saturating_sub(output_column_from_end),
+                    orientation
+                        .column_axis()
+                        .resolve(output.shape.0.len())
+                        .unwrap_or(0),
                 );
                 // AMP left/output storage deliberately flattens outer axes
                 // into its row dimension. Transposed and matrix-major orders

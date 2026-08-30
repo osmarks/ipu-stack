@@ -3,7 +3,7 @@
 use super::exchange::ExchangeEndpointTraffic;
 use crate::graph::TensorShape;
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorAxis, TensorRegion,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorRegion,
     TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
@@ -200,15 +200,17 @@ pub(crate) fn operator_memory_estimate(
     {
         let orientation = plan.geometry.orientation;
         let output_column_block = plan.geometry.block.output_columns;
-        let (left, right, left_requirement) = match orientation {
-            crate::GemmOrientation::Normal => (first, second, requirements.inputs.first()),
-            crate::GemmOrientation::Swapped => (second, first, requirements.inputs.get(1)),
-        };
+        let [left, right] = orientation.physical_order([first, second]);
+        let left_requirement = requirements.inputs.get(orientation.physical_left_input());
         let right_rank = right.shape.0.len();
-        let (right_inner_axis, right_column_axis) = match orientation {
-            crate::GemmOrientation::Normal => (right_rank - 2, right_rank - 1),
-            crate::GemmOrientation::Swapped => (right_rank - 1, right_rank - 2),
-        };
+        let right_inner_axis = orientation
+            .row_axis()
+            .resolve(right_rank)
+            .expect("GEMM operand rank validated");
+        let right_column_axis = orientation
+            .column_axis()
+            .resolve(right_rank)
+            .expect("GEMM operand rank validated");
         let inner_blocks = right.shape.0[right_inner_axis].div_ceil(AMP_INNER_BLOCK);
         let column_blocks = right.shape.0[right_column_axis].div_ceil(output_column_block);
         let right_staging = u64::from(inner_blocks.div_ceil(u32::from(reduction.compute.inner)))
@@ -231,10 +233,9 @@ pub(crate) fn operator_memory_estimate(
                 .distinct_element_groups
                 .iter()
                 .any(|operands| {
-                    operands.contains(&MemoryOperand::Input(match orientation {
-                        crate::GemmOrientation::Normal => 0,
-                        crate::GemmOrientation::Swapped => 1,
-                    }))
+                    operands.contains(&MemoryOperand::Input(
+                        orientation.physical_left_input() as u16
+                    ))
                 });
             if left_must_be_distinct {
                 left_staging = left_staging
@@ -470,32 +471,23 @@ pub(crate) fn gemm_uses_panel_buffer(
     if rank < 2 || output_rank < 2 {
         return true;
     }
-    let streamed = right.format.layout.tiling.axes.iter().any(|axis| {
-        axis.axis
-            == match orientation {
-                crate::GemmOrientation::Normal => TensorAxis::FromEnd(2),
-                crate::GemmOrientation::Swapped => TensorAxis::FromEnd(1),
-            }
-            && axis.partitions > 1
-    });
+    let streamed = right
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .any(|axis| axis.axis == orientation.row_axis() && axis.partitions > 1);
     if streamed {
         return true;
     }
     if right.format.layout.memory_class == MemoryClass::Interleaved {
         return false;
     }
-    let k = right.shape.0[rank
-        - match orientation {
-            crate::GemmOrientation::Normal => 2,
-            crate::GemmOrientation::Swapped => 1,
-        }];
+    let k = right.shape.0[orientation.row_axis().resolve(rank).unwrap()];
     let columns = maximum_axis_shard_extent(
         output,
-        output_rank
-            - match orientation {
-                crate::GemmOrientation::Normal => 1,
-                crate::GemmOrientation::Swapped => 2,
-            },
+        orientation.column_axis().resolve(output_rank).unwrap(),
     );
     k > inner_block && columns > 16
 }
@@ -519,19 +511,15 @@ pub(crate) fn gemm_exchange_phase_count(
     };
     let inner_block = plan.geometry.block.inner;
     let orientation = plan.geometry.orientation;
-    let Some(left) = inputs.get(match orientation {
-        crate::GemmOrientation::Normal => 0,
-        crate::GemmOrientation::Swapped => 1,
-    }) else {
+    let Some(left) = inputs.get(orientation.physical_left_input()) else {
         return 0;
     };
-    let Some(&inner) = left.shape.0.get(
-        left.shape.0.len()
-            - match orientation {
-                crate::GemmOrientation::Normal => 1,
-                crate::GemmOrientation::Swapped => 2,
-            },
-    ) else {
+    let Some(&inner) = orientation
+        .column_axis()
+        .resolve(left.shape.0.len())
+        .ok()
+        .and_then(|axis| left.shape.0.get(axis))
+    else {
         return 0;
     };
     u64::from(inner).div_ceil(u64::from(inner_block))
@@ -746,10 +734,7 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
     let [first, second] = inputs else {
         return None;
     };
-    let (left, right) = match plan.geometry.orientation {
-        crate::GemmOrientation::Normal => (first, second),
-        crate::GemmOrientation::Swapped => (second, first),
-    };
+    let [left, right] = plan.geometry.orientation.physical_order([first, second]);
     if let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution {
         // The parallel dispatch grid contains a K axis which is deliberately
         // absent from `compute_output`: every K group produces a partial with
@@ -772,18 +757,12 @@ pub(crate) fn gemm_exchange_endpoint_traffic(
     if left_rank < 2 || right_rank < 2 || output_rank < 2 {
         return None;
     }
-    let (left_row_axis, left_inner_axis, right_inner_axis, right_column_axis) = match orientation {
-        crate::GemmOrientation::Normal => {
-            (left_rank - 2, left_rank - 1, right_rank - 2, right_rank - 1)
-        }
-        crate::GemmOrientation::Swapped => {
-            (left_rank - 1, left_rank - 2, right_rank - 1, right_rank - 2)
-        }
-    };
-    let (output_row_axis, output_column_axis) = match orientation {
-        crate::GemmOrientation::Normal => (output_rank - 2, output_rank - 1),
-        crate::GemmOrientation::Swapped => (output_rank - 1, output_rank - 2),
-    };
+    let left_row_axis = orientation.row_axis().resolve(left_rank).ok()?;
+    let left_inner_axis = orientation.column_axis().resolve(left_rank).ok()?;
+    let right_inner_axis = orientation.row_axis().resolve(right_rank).ok()?;
+    let right_column_axis = orientation.column_axis().resolve(right_rank).ok()?;
+    let output_row_axis = orientation.row_axis().resolve(output_rank).ok()?;
+    let output_column_axis = orientation.column_axis().resolve(output_rank).ok()?;
     let output_plans = tile_axis_plans(compute_output)?;
     let left_plan = GemmOperandTrafficPlan::new(
         left,
