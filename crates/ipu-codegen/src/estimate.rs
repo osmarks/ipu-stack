@@ -192,55 +192,8 @@ pub(crate) fn gemm_partial_tensor(dispatch: &OperatorDispatch, output: &TensorTy
     let OperatorDispatch::BlockedGemm(plan) = dispatch else {
         return output.clone();
     };
-    let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution else {
-        return output.clone();
-    };
-    let output_column_block = plan.geometry.block.output_columns;
-    let orientation = plan.geometry.orientation;
-    let row_partitions = reduction.compute.rows;
-    let column_partitions = reduction.compute.columns;
-    TensorType {
-        shape: output.shape.clone(),
-        format: crate::layout::TensorFormat {
-            precision: output.format.precision,
-            layout: match (&orientation, output.format.layout.order) {
-                (
-                    crate::GemmOrientation::Normal,
-                    crate::StorageOrder::Native(crate::NativeKernelOrder::Left),
-                ) => Layout::amp_left_result_grid(
-                    output_column_block,
-                    row_partitions.saturating_mul(column_partitions),
-                    row_partitions,
-                    column_partitions,
-                    crate::operator::GridOrder::ColumnsFast,
-                ),
-                (
-                    crate::GemmOrientation::Swapped,
-                    crate::StorageOrder::Native(crate::NativeKernelOrder::TransposedLeft),
-                ) => Layout::amp_transposed_left_result_grid(
-                    output_column_block,
-                    row_partitions.saturating_mul(column_partitions),
-                    row_partitions,
-                    column_partitions,
-                    crate::operator::GridOrder::ColumnsFast,
-                ),
-                (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
-                    output_column_block,
-                    row_partitions.saturating_mul(column_partitions),
-                    row_partitions,
-                    column_partitions,
-                    crate::operator::GridOrder::ColumnsFast,
-                ),
-                (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
-                    output_column_block,
-                    row_partitions.saturating_mul(column_partitions),
-                    row_partitions,
-                    column_partitions,
-                    crate::operator::GridOrder::ColumnsFast,
-                ),
-            },
-        },
-    }
+    plan.partial_tensor(output)
+        .unwrap_or_else(|| output.clone())
 }
 
 pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {

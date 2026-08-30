@@ -3807,6 +3807,27 @@ mod tests {
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
+                let OperatorDispatch::BlockedGemm(plan) = &candidate.dispatch else {
+                    panic!("parallel GEMM candidate has non-GEMM dispatch");
+                };
+                let GemmDistribution::ParallelReduction(reduction) = plan.geometry.distribution
+                else {
+                    panic!("parallel GEMM candidate has no reduction plan");
+                };
+                let partial = plan
+                    .partial_tensor(&TensorType {
+                        shape: TensorShape(vec![m, n]),
+                        format: candidate.requirements.output.format.clone(),
+                    })
+                    .expect("supported parallel plan has a realizable partial layout");
+                assert_eq!(
+                    partial.format.layout.tiling.tile_count,
+                    reduction.compute.rows * reduction.compute.columns
+                );
+                assert!(!layout_has_empty_shards(
+                    &partial.format.layout,
+                    &partial.shape
+                ));
                 assert!(matches!(candidate.dispatch,
                     OperatorDispatch::BlockedGemm(BlockedGemmPlan {
                         geometry: GemmGeometry {

@@ -466,110 +466,17 @@ impl LoweringState {
         let output_type = self.shards[output_shards[0].index() as usize]
             .tensor_type
             .clone();
-        let logical_columns = output_type.shape.0[output_column_axis];
-        let output_layout = output_type.format.layout.resolve(&output_type.shape)?;
-        let physical_columns = output_layout.padded_shape().0[output_column_axis];
-        let column_grain = output_type
-            .format
-            .layout
-            .tiling
-            .axes
-            .iter()
-            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
-            .map(|axis| axis.block_size)
-            .filter(|grain| *grain != 0)
+        let partial_type = plan
+            .partial_tensor(&output_type)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let column_tiling = output_type
-            .format
-            .layout
-            .tiling
-            .axes
-            .iter()
-            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
-        let column_blocks = physical_columns / column_grain;
-        if !physical_columns.is_multiple_of(column_grain)
-            || column_blocks < u32::from(column_partitions)
-        {
-            return Err(LowLoweringError::InvalidOperatorPlan);
-        }
-        let short_blocks = column_blocks / u32::from(column_partitions);
-        let long_partitions = column_blocks % u32::from(column_partitions);
+        let partial_layout = partial_type.format.layout.resolve(&partial_type.shape)?;
         let columns = (0..u32::from(column_partitions))
             .map(|partition| {
-                if column_tiling.partitions == column_partitions {
-                    return output_layout
-                        .axis_bounds(output_column_axis, partition)
-                        .ok_or(LowLoweringError::InvalidOperatorPlan);
-                }
-                let start_blocks = partition
-                    .saturating_mul(short_blocks)
-                    .saturating_add(partition.min(long_partitions));
-                let blocks = short_blocks + u32::from(partition < long_partitions);
-                let start = start_blocks.saturating_mul(column_grain);
-                let physical_end = start_blocks
-                    .saturating_add(blocks)
-                    .saturating_mul(column_grain);
-                Ok((
-                    start,
-                    physical_end.min(logical_columns).max(start),
-                    physical_end,
-                ))
+                partial_layout
+                    .axis_bounds(output_column_axis, partition)
+                    .ok_or(LowLoweringError::InvalidOperatorPlan)
             })
             .collect::<LowLoweringResult<Vec<_>>>()?;
-        let mut partial_type = output_type.clone();
-        let partial_tiles = row_partitions.saturating_mul(column_partitions);
-        partial_type.format.layout = match (orientation, output_type.format.layout.order) {
-            (crate::GemmOrientation::Normal, StorageOrder::Native(NativeKernelOrder::Left)) => {
-                Layout::amp_left_result_grid(
-                    output_column_block,
-                    partial_tiles,
-                    row_partitions,
-                    column_partitions,
-                    crate::operator::GridOrder::ColumnsFast,
-                )
-            }
-            (
-                crate::GemmOrientation::Swapped,
-                StorageOrder::Native(NativeKernelOrder::TransposedLeft),
-            ) => Layout::amp_transposed_left_result_grid(
-                output_column_block,
-                partial_tiles,
-                row_partitions,
-                column_partitions,
-                crate::operator::GridOrder::ColumnsFast,
-            ),
-            (crate::GemmOrientation::Normal, _) => Layout::amp_output_grid(
-                output_column_block,
-                partial_tiles,
-                row_partitions,
-                column_partitions,
-                crate::operator::GridOrder::ColumnsFast,
-            ),
-            (crate::GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
-                output_column_block,
-                partial_tiles,
-                row_partitions,
-                column_partitions,
-                crate::operator::GridOrder::ColumnsFast,
-            ),
-        };
-        if let Some(axis) = partial_type
-            .format
-            .layout
-            .tiling
-            .axes
-            .iter_mut()
-            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
-        {
-            axis.block_size = column_grain;
-            axis.padding_multiple = column_grain;
-            if column_tiling.partitions == column_partitions {
-                axis.block_size = column_tiling.block_size;
-                axis.padding_multiple = column_tiling.padding_multiple;
-                axis.shard_padding_multiple = column_tiling.shard_padding_multiple;
-            }
-        }
 
         let mut replica_groups = BTreeMap::<TensorRegion, Vec<LowShardId>>::new();
         for left in left_shards.iter().copied() {

@@ -211,6 +211,88 @@ pub struct BlockedGemmPlan {
     pub geometry: GemmGeometry,
 }
 
+impl BlockedGemmPlan {
+    /// Tensor produced by the compute grid before a parallel K reduction.
+    ///
+    /// This is part of the selected whole-device plan: costing and low
+    /// materialization must use the same partial ownership and padding.
+    pub(crate) fn partial_tensor(&self, output: &TensorType) -> Option<TensorType> {
+        let GemmDistribution::ParallelReduction(reduction) = self.geometry.distribution else {
+            return Some(output.clone());
+        };
+        let output_rank = output.shape.0.len();
+        let output_column_axis = output_rank.checked_sub(match self.geometry.orientation {
+            GemmOrientation::Normal => 1,
+            GemmOrientation::Swapped => 2,
+        })?;
+        let column_tiling = *output
+            .format
+            .layout
+            .tiling
+            .axes
+            .iter()
+            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))?;
+        let rows = reduction.compute.rows;
+        let columns = reduction.compute.columns;
+        let tiles = rows.checked_mul(columns)?;
+        let mut layout = match (self.geometry.orientation, output.format.layout.order) {
+            (GemmOrientation::Normal, StorageOrder::Native(NativeKernelOrder::Left)) => {
+                Layout::amp_left_result_grid(
+                    self.geometry.block.output_columns,
+                    tiles,
+                    rows,
+                    columns,
+                    GridOrder::ColumnsFast,
+                )
+            }
+            (GemmOrientation::Swapped, StorageOrder::Native(NativeKernelOrder::TransposedLeft)) => {
+                Layout::amp_transposed_left_result_grid(
+                    self.geometry.block.output_columns,
+                    tiles,
+                    rows,
+                    columns,
+                    GridOrder::ColumnsFast,
+                )
+            }
+            (GemmOrientation::Normal, _) => Layout::amp_output_grid(
+                self.geometry.block.output_columns,
+                tiles,
+                rows,
+                columns,
+                GridOrder::ColumnsFast,
+            ),
+            (GemmOrientation::Swapped, _) => Layout::amp_transposed_output_grid(
+                self.geometry.block.output_columns,
+                tiles,
+                rows,
+                columns,
+                GridOrder::ColumnsFast,
+            ),
+        };
+        let axis = layout
+            .tiling
+            .axes
+            .iter_mut()
+            .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))?;
+        axis.block_size = column_tiling.block_size;
+        axis.padding_multiple = column_tiling.block_size;
+        if column_tiling.partitions == columns {
+            axis.block_size = column_tiling.block_size;
+            axis.padding_multiple = column_tiling.padding_multiple;
+            axis.shard_padding_multiple = column_tiling.shard_padding_multiple;
+        }
+        let partial = TensorType {
+            shape: output.shape.clone(),
+            format: TensorFormat {
+                precision: output.format.precision,
+                layout,
+            },
+        };
+        partial.format.layout.resolve(&partial.shape).ok()?;
+        Some(partial)
+    }
+}
+
 /// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
 /// are keyed by the source graph operation and bypass beam pruning and
 /// conservative whole-graph memory rejection. Concrete placement remains the
