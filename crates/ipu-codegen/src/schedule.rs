@@ -1,13 +1,15 @@
 //! Parametric whole-device work selected by mid-level planning.
 
-use crate::{AttentionPlan, BlockedGemmPlan, ReductionStaging, TileKernelSpec};
+use crate::{
+    AttentionPlan, BlockedGemmPlan, MidOperator, OperatorRequirements, ReductionStaging,
+    TileKernelSpec,
+};
 
 /// A value consumed or produced by an operator schedule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScheduleValue {
     Input(u16),
     Output,
-    Temporary(u16),
 }
 
 /// How a mapped kernel obtains one input for each output shard.
@@ -19,15 +21,8 @@ pub enum ScheduleAccess {
     TileLocal,
 }
 
-/// The logical shards over which a kernel invocation is repeated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScheduleDomain {
-    OutputShards,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelMap {
-    pub domain: ScheduleDomain,
     pub kernel: TileKernelSpec,
     pub inputs: Vec<(ScheduleValue, ScheduleAccess)>,
     pub output: ScheduleValue,
@@ -45,23 +40,39 @@ pub enum ScheduleStep {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OperatorSchedule {
+    pub operator: MidOperator,
     pub steps: Vec<ScheduleStep>,
+    pub requirements: OperatorRequirements,
 }
 
 impl OperatorSchedule {
-    pub(crate) fn blocked_gemm(plan: BlockedGemmPlan) -> Self {
+    pub(crate) fn blocked_gemm(
+        operator: MidOperator,
+        plan: BlockedGemmPlan,
+        requirements: OperatorRequirements,
+    ) -> Self {
         let mut steps = vec![ScheduleStep::BlockedGemm(plan)];
         if plan.geometry.compute.inner > 1 {
             steps.push(ScheduleStep::Reduce {
                 staging: ReductionStaging::Complete,
             });
         }
-        Self { steps }
+        Self {
+            operator,
+            steps,
+            requirements,
+        }
     }
 
-    pub(crate) fn attention(plan: AttentionPlan) -> Self {
+    pub(crate) fn attention(
+        operator: MidOperator,
+        plan: AttentionPlan,
+        requirements: OperatorRequirements,
+    ) -> Self {
         Self {
+            operator,
             steps: vec![ScheduleStep::Attention(plan)],
+            requirements,
         }
     }
 

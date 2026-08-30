@@ -10,7 +10,7 @@ use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
 use crate::mid::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::operator::{
     AllocationRequirements, MemoryElementRequirement, MemoryOperand, OperandMaterialization,
-    OperatorRequirements, Precision,
+    Precision,
 };
 use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -178,10 +178,10 @@ fn maximum_standard_allocation(
 
 pub(crate) fn operator_memory_estimate(
     schedule: &OperatorSchedule,
-    requirements: &OperatorRequirements,
     inputs: &[TensorType],
     output: &TensorType,
 ) -> MemoryEstimate {
+    let requirements = &schedule.requirements;
     let live = inputs.iter().zip(&requirements.inputs).fold(
         tensor_memory(output),
         |usage, (input, requirement)| {
@@ -1001,32 +1001,52 @@ fn tile_axis_plans(tensor: &TensorType) -> Option<Vec<TileAxisPlan>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{OperandRequirement, OperatorRequirements};
 
     fn output_stationary_schedule() -> OperatorSchedule {
-        OperatorSchedule::blocked_gemm(crate::BlockedGemmPlan {
-            kernel: crate::GemmKernelFamily {
+        OperatorSchedule::blocked_gemm(
+            crate::MidOperator::Gemm {
+                options: crate::GemmOptions::default(),
                 multiply: Precision::F16,
                 accumulate: crate::AccumulationPrecision::F16,
-                weights: crate::GemmWeightLoad::Standard,
             },
-            geometry: crate::GemmGeometry {
-                block: crate::GemmBlockShape {
-                    inner: AMP_INNER_BLOCK,
-                    output_columns: crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
+            crate::BlockedGemmPlan {
+                kernel: crate::GemmKernelFamily {
+                    multiply: Precision::F16,
+                    accumulate: crate::AccumulationPrecision::F16,
+                    weights: crate::GemmWeightLoad::Standard,
                 },
-                orientation: crate::GemmOrientation::Normal,
-                compute: crate::GemmGrid {
-                    rows: 1,
-                    columns: 1,
-                    inner: 1,
+                geometry: crate::GemmGeometry {
+                    block: crate::GemmBlockShape {
+                        inner: AMP_INNER_BLOCK,
+                        output_columns: crate::layout::AMP_OUTPUT_COLUMN_BLOCK,
+                    },
+                    orientation: crate::GemmOrientation::Normal,
+                    compute: crate::GemmGrid {
+                        rows: 1,
+                        columns: 1,
+                        inner: 1,
+                    },
+                    result: crate::GemmResultGrid {
+                        rows: 1,
+                        columns: 1,
+                    },
+                    order: crate::GridOrder::ColumnsFast,
                 },
-                result: crate::GemmResultGrid {
-                    rows: 1,
-                    columns: 1,
-                },
-                order: crate::GridOrder::ColumnsFast,
             },
-        })
+            OperatorRequirements {
+                inputs: Vec::new(),
+                output: OperandRequirement::new(
+                    crate::TensorFormat {
+                        precision: Precision::F16,
+                        layout: Layout::row_major(crate::TensorTiling::replicated(1)),
+                    },
+                    8,
+                ),
+                output_aliasing: crate::OutputAliasing::Fresh,
+                memory_space: crate::MemorySpaceRequirements::default(),
+            },
+        )
     }
 
     fn parallel_reduction_schedule(
@@ -1035,6 +1055,8 @@ mod tests {
         inner_partitions: u16,
     ) -> OperatorSchedule {
         let mut schedule = output_stationary_schedule();
+        let operator = schedule.operator;
+        let requirements = schedule.requirements.clone();
         let Some(plan) = schedule.gemm_plan_mut() else {
             unreachable!();
         };
@@ -1047,7 +1069,7 @@ mod tests {
             columns: column_partitions,
             inner: inner_partitions,
         };
-        let mut schedule = OperatorSchedule::blocked_gemm(*plan);
+        let mut schedule = OperatorSchedule::blocked_gemm(operator, *plan, requirements);
         schedule.set_reduction_staging(crate::ReductionStaging::Streamed);
         schedule
     }

@@ -14,7 +14,7 @@ mod ir;
 use consumers::{direct_consumer_layouts, operator_accepts_input_layout};
 #[cfg(test)]
 use gemm::{
-    AmpWeightPlacement, amp_grid_gemm_plan, blocked_gemm_schedule, gemm_accumulation_precision,
+    AmpWeightPlacement, amp_grid_gemm_plan, blocked_gemm_plan, gemm_accumulation_precision,
     gemm_seed_plans_for_tile_count, independent_parameter_storage, parallel_reduction_plans,
 };
 use gemm::{GroupedOutputLayout, gemm_plan_matches, gemm_plans, grouped_output_layout};
@@ -46,9 +46,7 @@ use crate::layout::{
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
 use crate::operator::*;
-use crate::schedule::{
-    KernelMap, OperatorSchedule, ScheduleAccess, ScheduleDomain, ScheduleStep, ScheduleValue,
-};
+use crate::schedule::{KernelMap, OperatorSchedule, ScheduleAccess, ScheduleStep, ScheduleValue};
 use ipu_target::hardware::HardwareTarget;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -242,7 +240,7 @@ pub(crate) fn lower_finalists(
                     .iter()
                     .filter_map(|operation| operation.operator_plan().map(|plan| (
                         operation.source,
-                        &plan.schedule,
+                        plan,
                         plan.requirements.inputs.iter().map(|input| &input.format.layout).collect::<Vec<_>>(),
                         &plan.requirements.output.format.layout,
                         operation.metrics.cost.cycles,
@@ -510,7 +508,7 @@ fn plan_region_frontier(
                 operator_accepts_input_layout(&operation.kind, index, config).then_some(index)
             })
             .collect::<BTreeSet<_>>();
-        let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<OperatorPlan>>::new();
+        let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<OperatorSchedule>>::new();
         let mut plan_cache_hits = 0usize;
         let mut generated_plan_sets = 0usize;
         for branch in beam {
@@ -1189,7 +1187,7 @@ fn operation_graph_inputs(operation: &Operation, graph: &ComputeGraph) -> Vec<Va
 fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,
-    plan: OperatorPlan,
+    plan: OperatorSchedule,
     single_use_inputs: &[bool],
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
@@ -1245,17 +1243,13 @@ fn apply_selected_plan(
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
     let mut operator_cycles = costs.operator_transition_cycles(
-        plan.operator,
-        &plan.schedule,
-        &plan.requirements,
+        &plan,
         &source_types,
         &converted_types,
         &state.get(result).tensor_type,
     );
     let mut operator_exchange_cycles = costs.operator_transition_exchange_cycles(
-        plan.operator,
-        &plan.schedule,
-        &plan.requirements,
+        &plan,
         &source_types,
         &converted_types,
         &state.get(result).tensor_type,
@@ -1299,7 +1293,7 @@ fn apply_selected_plan(
             &state.get(source).tensor_type,
             &state.get(original).tensor_type,
             &converted_types[input_index],
-            &plan.schedule,
+            &plan,
             producer_cycles,
         );
         operator_cycles = operator_cycles.saturating_add(fused_cycles);
@@ -1309,7 +1303,7 @@ fn apply_selected_plan(
                 &state.get(source).tensor_type,
                 &state.get(original).tensor_type,
                 &converted_types[input_index],
-                &plan.schedule,
+                &plan,
                 producer_cycles,
             ));
         operations[producer_index].metrics.cost = CostEstimate::default();
@@ -1317,7 +1311,7 @@ fn apply_selected_plan(
     tracing::trace!(
         source = operation.id.index(),
         cycles = operator_cycles,
-        schedule = ?plan.schedule,
+        schedule = ?plan,
         input_layouts = ?converted_types
             .iter()
             .map(|input| &input.format.layout)
@@ -1325,19 +1319,9 @@ fn apply_selected_plan(
         output_layout = ?state.get(result).tensor_type.format.layout,
         "costed operator plan"
     );
-    let exchange = costs.operator_exchange_footprint(
-        plan.operator,
-        &plan.schedule,
-        &plan.requirements,
-        &converted_types,
-        &state.get(result).tensor_type,
-    );
-    let memory = operator_memory_estimate(
-        &plan.schedule,
-        &plan.requirements,
-        &converted_types,
-        &state.get(result).tensor_type,
-    );
+    let exchange =
+        costs.operator_exchange_footprint(&plan, &converted_types, &state.get(result).tensor_type);
+    let memory = operator_memory_estimate(&plan, &converted_types, &state.get(result).tensor_type);
     operations.push(MidOperation {
         source: Some(operation.id),
         inputs: converted,
@@ -1445,7 +1429,7 @@ fn beam_memory_peak(
 }
 
 fn plan_fits_operator_memory(
-    plan: &OperatorPlan,
+    plan: &OperatorSchedule,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -1462,13 +1446,7 @@ fn plan_fits_operator_memory(
         shape: output.clone(),
         format: plan.requirements.output.format.clone(),
     };
-    let peak = operator_memory_estimate(
-        &plan.schedule,
-        &plan.requirements,
-        &planned_inputs,
-        &planned_output,
-    )
-    .peak;
+    let peak = operator_memory_estimate(plan, &planned_inputs, &planned_output).peak;
     let constraints = config.target.memory_constraints();
     peak.interleaved <= constraints.interleaved_bytes
         && peak
@@ -1486,7 +1464,7 @@ fn plans_for_operation(
     costs: &impl CostModel,
     distributed_result_is_useful: bool,
     grouped_output: Option<GroupedOutputLayout>,
-) -> Vec<OperatorPlan> {
+) -> Vec<OperatorSchedule> {
     let mut plans = Vec::new();
     let gemm_constraint = config
         .search_domain
@@ -1577,20 +1555,17 @@ fn plans_for_operation(
                     },
                 ),
             ];
-            plans.extend(
-                blockings
-                    .into_iter()
-                    .flatten()
-                    .map(|blocking| OperatorPlan {
-                        operator,
-                        schedule: OperatorSchedule::attention(AttentionPlan {
-                            kernel,
-                            blocking,
-                            padding,
-                        }),
-                        requirements: requirements.clone(),
-                    }),
-            );
+            plans.extend(blockings.into_iter().flatten().map(|blocking| {
+                OperatorSchedule::attention(
+                    operator,
+                    AttentionPlan {
+                        kernel,
+                        blocking,
+                        padding,
+                    },
+                    requirements.clone(),
+                )
+            }));
         }
     }
     match operation.kind {
@@ -1627,9 +1602,7 @@ fn plans_for_operation(
         plan.supports(inputs, output) && plan_fits_operator_memory(plan, inputs, output, config)
     });
     if let Some(constraint) = gemm_constraint {
-        plans.retain(|plan| {
-            gemm_plan_matches(constraint, &plan.schedule, &plan.requirements.inputs)
-        });
+        plans.retain(|plan| gemm_plan_matches(constraint, plan, &plan.requirements.inputs));
         tracing::info!(
             source_operation = constraint.source_operation,
             matching_plans = plans.len(),
@@ -1646,7 +1619,7 @@ fn pointwise_plans(
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
-) -> Vec<OperatorPlan> {
+) -> Vec<OperatorSchedule> {
     let access = match operator {
         MidOperator::Gelu => ScheduleAccess::TileLocal,
         MidOperator::Add(_) => ScheduleAccess::LogicalOverlap,
@@ -1675,22 +1648,19 @@ fn pointwise_plans(
                     .filter_map(|(index, input)| (input.shape == *output).then_some(index as u16))
                     .collect(),
             );
-            let plan = OperatorPlan {
+            let plan = OperatorSchedule {
                 operator,
-                schedule: OperatorSchedule {
-                    steps: vec![ScheduleStep::KernelMap(KernelMap {
-                        domain: ScheduleDomain::OutputShards,
-                        kernel: match operator {
-                            MidOperator::Gelu => TileKernelSpec::Gelu,
-                            MidOperator::Add(_) => TileKernelSpec::Add,
-                            _ => unreachable!(),
-                        },
-                        inputs: (0..inputs.len())
-                            .map(|index| (ScheduleValue::Input(index as u16), access))
-                            .collect(),
-                        output: ScheduleValue::Output,
-                    })],
-                },
+                steps: vec![ScheduleStep::KernelMap(KernelMap {
+                    kernel: match operator {
+                        MidOperator::Gelu => TileKernelSpec::Gelu,
+                        MidOperator::Add(_) => TileKernelSpec::Add,
+                        _ => unreachable!(),
+                    },
+                    inputs: (0..inputs.len())
+                        .map(|index| (ScheduleValue::Input(index as u16), access))
+                        .collect(),
+                    output: ScheduleValue::Output,
+                })],
                 requirements: OperatorRequirements {
                     inputs: (0..inputs.len())
                         .map(|_| OperandRequirement::new(format.clone(), 8))
@@ -2381,7 +2351,7 @@ mod tests {
                 "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
             );
             distributed_result_cases += usize::from(candidates.iter().any(|candidate| {
-                let Some(plan) = candidate.schedule.gemm_plan() else {
+                let Some(plan) = candidate.gemm_plan() else {
                     return false;
                 };
                 if plan.geometry.compute.inner < 2 {
@@ -2398,7 +2368,7 @@ mod tests {
                     candidate.supports(&inputs, &TensorShape(vec![m, n])),
                     "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
                 );
-                let Some(plan) = candidate.schedule.gemm_plan() else {
+                let Some(plan) = candidate.gemm_plan() else {
                     panic!("parallel GEMM candidate has non-GEMM schedule");
                 };
                 if plan.geometry.compute.inner < 2 {
@@ -2418,7 +2388,7 @@ mod tests {
                     &partial.format.layout,
                     &partial.shape
                 ));
-                assert!(matches!(candidate.schedule.gemm_plan(),
+                assert!(matches!(candidate.gemm_plan(),
                     Some(BlockedGemmPlan {
                         geometry: GemmGeometry {
                             block: GemmBlockShape { inner: inner_block, output_columns: output_column_block },
@@ -2485,7 +2455,7 @@ mod tests {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
             };
-            let schedule = blocked_gemm_schedule(
+            let gemm = blocked_gemm_plan(
                 operator,
                 GemmGeometry {
                     block: GemmBlockShape {
@@ -2508,20 +2478,10 @@ mod tests {
                 output_aliasing: OutputAliasing::Fresh,
                 memory_space: MemorySpaceRequirements::default(),
             };
-            let standard_cost = Ipu21CostModel.operator_cycles(
-                operator,
-                &schedule,
-                &requirements,
-                &[left.clone(), standard],
-                &output,
-            );
-            let direct_cost = Ipu21CostModel.operator_cycles(
-                operator,
-                &schedule,
-                &requirements,
-                &[left, direct],
-                &output,
-            );
+            let schedule = OperatorSchedule::blocked_gemm(operator, gemm, requirements.clone());
+            let standard_cost =
+                Ipu21CostModel.operator_cycles(&schedule, &[left.clone(), standard], &output);
+            let direct_cost = Ipu21CostModel.operator_cycles(&schedule, &[left, direct], &output);
             assert!(direct_cost < standard_cost);
         }
     }
@@ -2648,9 +2608,7 @@ mod tests {
 
         fn operator_cycles(
             &self,
-            operator: MidOperator,
-            _dispatch: &OperatorSchedule,
-            _requirements: &OperatorRequirements,
+            schedule: &OperatorSchedule,
             _inputs: &[TensorType],
             output: &TensorType,
         ) -> u64 {
@@ -2659,7 +2617,7 @@ mod tests {
             } else {
                 Precision::F32
             };
-            match operator {
+            match schedule.operator {
                 MidOperator::Gemm { multiply, .. } if multiply == preferred => 0,
                 MidOperator::Gemm { .. } => 1,
                 _ => 0,
@@ -2954,7 +2912,7 @@ mod tests {
                 );
                 let orientation = operation
                     .operator_plan()
-                    .and_then(|plan| plan.schedule.gemm_plan())
+                    .and_then(|plan| plan.gemm_plan())
                     .map(|plan| plan.geometry.orientation)
                     .unwrap();
                 let physical_left = orientation.physical_left_input();

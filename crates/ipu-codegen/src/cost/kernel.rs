@@ -13,7 +13,7 @@ use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion
 use crate::graph::TensorShape;
 use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
 use crate::metrics::{CostEstimate, ExchangeFootprint};
-use crate::operator::{LocalOperandStaging, MidOperator, OperatorRequirements, Precision};
+use crate::operator::{LocalOperandStaging, MidOperator, Precision};
 use ipu_target::cost::HardwareCosts;
 use ipu_target::hardware::HardwareTarget;
 
@@ -24,18 +24,14 @@ pub trait CostModel: Sync {
 
     fn operator_cycles(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64;
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
     fn operator_exchange_cycles(
         &self,
-        _operator: MidOperator,
-        _dispatch: &OperatorSchedule,
-        _requirements: &OperatorRequirements,
+        _schedule: &OperatorSchedule,
         _inputs: &[TensorType],
         _output: &TensorType,
     ) -> u64 {
@@ -43,9 +39,7 @@ pub trait CostModel: Sync {
     }
     fn operator_transition_cycles(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         source_inputs: &[TensorType],
         inputs: &[TensorType],
         output: &TensorType,
@@ -53,13 +47,13 @@ pub trait CostModel: Sync {
         source_inputs
             .iter()
             .zip(inputs)
-            .zip(&requirements.inputs)
+            .zip(&schedule.requirements.inputs)
             .filter(|((source, input), requirement)| {
                 requirement.materialization == crate::OperandMaterialization::DispatchSlices
                     && source.format.layout != input.format.layout
             })
             .fold(
-                self.operator_cycles(operator, schedule, requirements, inputs, output),
+                self.operator_cycles(schedule, inputs, output),
                 |cycles, ((source, input), _)| {
                     cycles.saturating_add(
                         self.layout_conversion_cost(
@@ -75,9 +69,7 @@ pub trait CostModel: Sync {
     }
     fn operator_transition_exchange_cycles(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         source_inputs: &[TensorType],
         inputs: &[TensorType],
         output: &TensorType,
@@ -85,13 +77,13 @@ pub trait CostModel: Sync {
         source_inputs
             .iter()
             .zip(inputs)
-            .zip(&requirements.inputs)
+            .zip(&schedule.requirements.inputs)
             .filter(|((source, input), requirement)| {
                 requirement.materialization == crate::OperandMaterialization::DispatchSlices
                     && source.format.layout != input.format.layout
             })
             .fold(
-                self.operator_exchange_cycles(operator, schedule, requirements, inputs, output),
+                self.operator_exchange_cycles(schedule, inputs, output),
                 |cycles, ((source, input), _)| {
                     cycles.saturating_add(
                         self.layout_conversion_cost(
@@ -107,9 +99,7 @@ pub trait CostModel: Sync {
     }
     fn operator_exchange_footprint(
         &self,
-        _operator: MidOperator,
-        _dispatch: &OperatorSchedule,
-        _requirements: &OperatorRequirements,
+        _schedule: &OperatorSchedule,
         _inputs: &[TensorType],
         _output: &TensorType,
     ) -> ExchangeFootprint {
@@ -659,16 +649,15 @@ impl CostModel for Ipu21CostModel {
 
     fn operator_cycles(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
+        let requirements = &schedule.requirements;
         let elements = physical_elements(&output.shape, &output.format.layout);
         let spatial_occupancy = SpatialOccupancy::for_output(output);
         let spatial_occupancy_adjusted_elements = spatial_occupancy.latency_work();
-        match operator {
+        match schedule.operator {
             MidOperator::Gemm { multiply, .. } => {
                 let orientation = schedule
                     .gemm_plan()
@@ -1005,9 +994,7 @@ impl CostModel for Ipu21CostModel {
 
     fn operator_exchange_cycles(
         &self,
-        _operator: MidOperator,
         schedule: &OperatorSchedule,
-        _requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
@@ -1050,9 +1037,7 @@ impl CostModel for Ipu21CostModel {
 
     fn operator_exchange_footprint(
         &self,
-        _operator: MidOperator,
         schedule: &OperatorSchedule,
-        _requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
@@ -1199,19 +1184,20 @@ mod tests {
     use super::*;
     use crate::{
         KernelMap, OperandRequirement, OperatorRequirements, OperatorSchedule, OutputAliasing,
-        ScheduleAccess, ScheduleDomain, ScheduleStep, ScheduleValue, TensorFormat, TileKernelSpec,
+        ScheduleAccess, ScheduleStep, ScheduleValue, TensorFormat, TileKernelSpec,
     };
 
     const CASES: usize = 32;
 
-    fn pointwise_schedule() -> OperatorSchedule {
+    fn pointwise_schedule(operator: MidOperator, format: TensorFormat) -> OperatorSchedule {
         OperatorSchedule {
+            operator,
             steps: vec![ScheduleStep::KernelMap(KernelMap {
-                domain: ScheduleDomain::OutputShards,
                 kernel: TileKernelSpec::Gelu,
                 inputs: vec![(ScheduleValue::Input(0), ScheduleAccess::TileLocal)],
                 output: ScheduleValue::Output,
             })],
+            requirements: pointwise_requirements(format),
         }
     }
 
@@ -1296,16 +1282,12 @@ mod tests {
                 MidOperator::Add(crate::AddOptions::default()),
             ] {
                 let sharded_cycles = Ipu21CostModel.operator_cycles(
-                    operator,
-                    &pointwise_schedule(),
-                    &pointwise_requirements(sharded.format.clone()),
+                    &pointwise_schedule(operator, sharded.format.clone()),
                     std::slice::from_ref(&sharded),
                     &sharded,
                 );
                 let unsharded_cycles = Ipu21CostModel.operator_cycles(
-                    operator,
-                    &pointwise_schedule(),
-                    &pointwise_requirements(unsharded.format.clone()),
+                    &pointwise_schedule(operator, unsharded.format.clone()),
                     std::slice::from_ref(&unsharded),
                     &unsharded,
                 );

@@ -19,9 +19,7 @@ use crate::operator::{
     GemmKernelMode, MemoryOperand, MemorySpaceRequirements, OperandRequirement,
     OperatorRequirements, OutputAliasing, Precision, ReductionStaging,
 };
-use crate::schedule::{
-    OperatorSchedule, ScheduleAccess, ScheduleDomain, ScheduleStep, ScheduleValue,
-};
+use crate::schedule::{OperatorSchedule, ScheduleAccess, ScheduleStep, ScheduleValue};
 use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
 use ipu_target::hardware::HardwareTarget;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1609,9 +1607,9 @@ impl LoweringState {
         let plan = operation
             .operator_plan()
             .ok_or(LowLoweringError::MissingOperatorPlan)?;
-        match plan.schedule.steps.as_slice() {
+        match plan.steps.as_slice() {
             [ScheduleStep::KernelMap(_)] => {
-                self.lower_schedule(operation, &plan.schedule, &plan.requirements, tiles)
+                self.lower_schedule(operation, plan, &plan.requirements, tiles)
             }
             [ScheduleStep::BlockedGemm(gemm)] => {
                 self.lower_blocked_gemm(operation, gemm, None, &plan.requirements, tiles)
@@ -1619,13 +1617,9 @@ impl LoweringState {
             [
                 ScheduleStep::BlockedGemm(gemm),
                 ScheduleStep::Reduce { staging },
-            ] => self.lower_blocked_gemm(
-                operation,
-                gemm,
-                Some(*staging),
-                &plan.requirements,
-                tiles,
-            ),
+            ] => {
+                self.lower_blocked_gemm(operation, gemm, Some(*staging), &plan.requirements, tiles)
+            }
             [ScheduleStep::Attention(attention)] => match attention.blocking {
                 crate::AttentionBlocking::Flash { .. } => {
                     self.lower_blocked_attention(operation, attention, &plan.requirements, tiles)

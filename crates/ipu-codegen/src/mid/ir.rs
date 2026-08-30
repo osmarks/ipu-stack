@@ -1,10 +1,11 @@
 //! Layout-aware mid-level graph records.
 
+use crate::OperatorSchedule;
 use crate::conversion::{ConversionMapping, ConversionStrategy, DeferredTransform};
 use crate::graph::{GraphInputKind, OperationId, ValueId};
 use crate::layout::TensorType;
 use crate::metrics::{OperationMetrics, RegionMetrics};
-use crate::operator::{MidOperator, OperandMaterialization, OperatorPlan};
+use crate::operator::{MidOperator, OperandMaterialization};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidValueId(u32);
@@ -34,7 +35,7 @@ pub struct MidValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
-    Operator(OperatorPlan),
+    Operator(OperatorSchedule),
     Convert(
         Option<DeferredTransform>,
         ConversionStrategy,
@@ -68,7 +69,7 @@ impl MidOperation {
         }
     }
 
-    pub fn operator_plan(&self) -> Option<&OperatorPlan> {
+    pub fn operator_plan(&self) -> Option<&OperatorSchedule> {
         match &self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
             MidOperationKind::Convert(..)
@@ -77,7 +78,7 @@ impl MidOperation {
         }
     }
 
-    pub fn operator_plan_mut(&mut self) -> Option<&mut OperatorPlan> {
+    pub fn operator_plan_mut(&mut self) -> Option<&mut OperatorSchedule> {
         match &mut self.kind {
             MidOperationKind::Operator(plan) => Some(plan),
             MidOperationKind::Convert(..)

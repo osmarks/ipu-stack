@@ -494,13 +494,6 @@ pub struct OperatorRequirements {
     pub memory_space: MemorySpaceRequirements,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OperatorPlan {
-    pub operator: MidOperator,
-    pub schedule: crate::OperatorSchedule,
-    pub requirements: OperatorRequirements,
-}
-
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OperatorPlanError {
     #[error("operator plan operand arity does not match its requirements")]
@@ -544,19 +537,7 @@ fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
     }
 }
 
-impl OperatorPlan {
-    pub(crate) fn candidate(
-        operator: MidOperator,
-        schedule: crate::OperatorSchedule,
-        requirements: OperatorRequirements,
-    ) -> Self {
-        Self {
-            operator,
-            schedule,
-            requirements,
-        }
-    }
-
+impl crate::OperatorSchedule {
     pub(crate) fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
         if self.requirements.inputs.len() != inputs.len()
             || !valid_requirement(&self.requirements.output, output)
@@ -632,12 +613,12 @@ impl OperatorPlan {
         if inputs.len() != self.requirements.inputs.len() {
             return Err(OperatorPlanError::OperandArity);
         }
-        if self.schedule.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
+        if self.empty_output_shard_policy() == EmptyOutputShardPolicy::Reject
             && layout_has_empty_shards(&output.format.layout, &output.shape)
         {
             return Err(OperatorPlanError::EmptyOutputShard);
         }
-        match (&self.operator, self.schedule.steps.as_slice()) {
+        match (&self.operator, self.steps.as_slice()) {
             (
                 MidOperator::Gemm {
                     options, multiply, ..
@@ -739,7 +720,7 @@ impl OperatorPlan {
                         || !result_columns.is_multiple_of(compute.columns)
                         || result_row_partitions.saturating_mul(result_column_partitions)
                             > compute.inner
-                        || self.schedule.reduction_staging().is_none()
+                        || self.reduction_staging().is_none()
                         || axis_partitions(row_axis) != result_rows
                         || axis_partitions(column_axis) != result_columns
                     {
@@ -747,7 +728,7 @@ impl OperatorPlan {
                     }
                 } else if compute.rows != plan.geometry.result.rows
                     || compute.columns != plan.geometry.result.columns
-                    || self.schedule.reduction_staging().is_some()
+                    || self.reduction_staging().is_some()
                 {
                     return Err(OperatorPlanError::InvalidBlocking);
                 }

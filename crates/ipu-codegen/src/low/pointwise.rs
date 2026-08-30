@@ -11,10 +11,7 @@ impl LoweringState {
         let [ScheduleStep::KernelMap(map)] = schedule.steps.as_slice() else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        if map.domain != ScheduleDomain::OutputShards
-            || map.output != ScheduleValue::Output
-            || map.inputs.len() != operation.inputs.len()
-        {
+        if map.output != ScheduleValue::Output || map.inputs.len() != operation.inputs.len() {
             return Err(LowLoweringError::InvalidOperatorPlan);
         }
         let [result] = operation.results.as_slice() else {

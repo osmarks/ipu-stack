@@ -6,7 +6,7 @@ use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion
 use crate::graph::TensorShape;
 use crate::layout::{Layout, TensorType};
 use crate::metrics::{CostEstimate, ExchangeFootprint};
-use crate::operator::{MidOperator, OperatorRequirements, Precision};
+use crate::operator::Precision;
 use foldhash::fast::FixedState;
 use ipu_target::hardware::HardwareTarget;
 use std::collections::HashMap;
@@ -69,14 +69,11 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 
     fn operator_cycles(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
-        self.inner
-            .operator_cycles(operator, schedule, requirements, inputs, output)
+        self.inner.operator_cycles(schedule, inputs, output)
     }
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
@@ -98,26 +95,22 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 
     fn operator_exchange_cycles(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
         self.inner
-            .operator_exchange_cycles(operator, schedule, requirements, inputs, output)
+            .operator_exchange_cycles(schedule, inputs, output)
     }
 
     fn operator_exchange_footprint(
         &self,
-        operator: MidOperator,
         schedule: &OperatorSchedule,
-        requirements: &OperatorRequirements,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
         self.inner
-            .operator_exchange_footprint(operator, schedule, requirements, inputs, output)
+            .operator_exchange_footprint(schedule, inputs, output)
     }
 
     fn deferred_input_cycles(
