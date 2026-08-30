@@ -1,9 +1,9 @@
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
-use crate::ir::{MidGraph, MidOperationKind};
 use crate::low::LowProgram;
 use crate::memory::{MemoryLayoutError, MemoryRequest, TileMemoryMap};
 use crate::mid::lower_finalists;
+use crate::mid::{MidGraph, MidOperationKind};
 use crate::operator::Precision;
 use crate::{
     KernelBuildPlan, PipelineConfig, TileProgramLowering, lower_exchanges, lower_to_tiles, place,

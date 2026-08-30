@@ -1,11 +1,11 @@
 //! Address-independent layout-conversion routes and copy geometry.
 
 use crate::graph::TensorShape;
-use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidValue};
 use crate::layout::{
     AMP_COLUMN_MICRO, Layout, LayoutError, NativeKernelOrder, StorageOrder, TensorRegion,
     TensorType,
 };
+use crate::mid::{MidGraph, MidOperation, MidOperationKind, MidValue};
 use crate::operator::Precision;
 use crate::storage::{StorageError, amp_micro_dimension, physical_byte_offset};
 use std::collections::BTreeMap;

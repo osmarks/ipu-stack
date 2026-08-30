@@ -7,6 +7,20 @@
 //! prices them with a [`CostModel`], and inserts explicit precision casts and
 //! layout rearrangements at format boundaries.
 
+mod consumers;
+mod gemm;
+mod ir;
+
+use consumers::{direct_consumer_layouts, operator_accepts_input_layout};
+use gemm::{
+    AmpWeightPlacement, GroupedOutputLayout, amp_output_column_blocks, apply_grouped_output_layout,
+    balance_parallel_gemm_columns, blocked_gemm_dispatch, gemm_accumulation_precision,
+    grouped_output_layout, pad_axis_to_f16_exchange_word,
+};
+pub use ir::{
+    MidGraph, MidInput, MidOperation, MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId,
+};
+
 use crate::config::{
     AttentionStrategy, ConversionStreamingPolicy, OperatorClass, PipelineConfig,
     PlannerSearchDomain,
@@ -25,13 +39,9 @@ use crate::graph::{
     ComputeGraph, GemmOptions, GraphInputKind, Operation, OperationId, OperationKind, Repeat,
     TensorShape, ValueId,
 };
-use crate::ir::{
-    MidGraph, MidInput, MidOperation, MidOperationKind, MidRegion, MidRepeat, MidValue, MidValueId,
-};
 use crate::layout::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_NARROW_OUTPUT_COLUMN_BLOCK, AMP_OUTPUT_COLUMN_BLOCK,
-    AMP_WIDE_OUTPUT_COLUMN_BLOCK, Layout, MemoryClass, NativeKernelOrder, Padding, StorageOrder,
-    TensorAxis, TensorFormat, TensorType,
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, Layout, MemoryClass,
+    NativeKernelOrder, StorageOrder, TensorAxis, TensorFormat, TensorType,
 };
 pub use crate::metrics::{CostEstimate, ExchangeFootprint};
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage, OperationMetrics, RegionMetrics};
@@ -352,62 +362,6 @@ fn amp_grid_gemm_plan(
                 .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
         },
     )
-}
-
-fn blocked_gemm_dispatch(operator: MidOperator, geometry: GemmGeometry) -> OperatorDispatch {
-    let MidOperator::Gemm {
-        multiply,
-        accumulate,
-        ..
-    } = operator
-    else {
-        unreachable!("blocked GEMM dispatch requires a GEMM operator")
-    };
-    OperatorDispatch::BlockedGemm(BlockedGemmPlan {
-        kernel: GemmKernelFamily {
-            multiply,
-            accumulate,
-            weights: GemmWeightLoad::Standard,
-        },
-        geometry,
-    })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct AmpWeightPlacement {
-    inner_partitions: u16,
-    memory_class: MemoryClass,
-}
-
-impl AmpWeightPlacement {
-    const fn resident(memory_class: MemoryClass) -> Self {
-        Self::sharded(1, memory_class)
-    }
-
-    const fn sharded(inner_partitions: u16, memory_class: MemoryClass) -> Self {
-        Self {
-            inner_partitions,
-            memory_class,
-        }
-    }
-}
-
-fn amp_output_column_blocks(precision: Precision) -> &'static [u32] {
-    match precision {
-        Precision::F16 => &[
-            AMP_OUTPUT_COLUMN_BLOCK,
-            AMP_WIDE_OUTPUT_COLUMN_BLOCK,
-            AMP_NARROW_OUTPUT_COLUMN_BLOCK,
-        ],
-        Precision::F32 | Precision::F8F143 { .. } => &[AMP_OUTPUT_COLUMN_BLOCK],
-    }
-}
-
-const fn gemm_accumulation_precision(precision: Precision) -> AccumulationPrecision {
-    match precision {
-        Precision::F16 | Precision::F8F143 { .. } => AccumulationPrecision::F16,
-        Precision::F32 => AccumulationPrecision::F32,
-    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -1830,127 +1784,11 @@ fn plan_fits_operator_memory(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GroupedOutputLayout {
-    groups: u16,
-    physical_lane_multiple: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ParallelGridCandidate {
     metrics: RegionMetrics,
     grid: GemmGrid,
     physical_column_groups: u16,
     grouped: bool,
-}
-
-fn grouped_output_layout(
-    source: &[Operation],
-    operation_index: usize,
-    operation: &Operation,
-    output: &TensorShape,
-    value_uses: &BTreeMap<ValueId, usize>,
-) -> Option<GroupedOutputLayout> {
-    let result = *operation.results.first()?;
-    if value_uses.get(&result).copied() != Some(1) {
-        return None;
-    }
-    let consumer = source[operation_index + 1..]
-        .iter()
-        .find(|candidate| candidate.inputs.contains(&result))?;
-    let OperationKind::SplitHeads(options) = consumer.kind else {
-        return None;
-    };
-    let groups = u16::try_from(options.heads).ok()?;
-    let width = *output.0.last()?;
-    (groups != 0 && width.is_multiple_of(u32::from(groups))).then_some(GroupedOutputLayout {
-        groups,
-        physical_lane_multiple: AMP_COLUMN_MICRO,
-    })
-}
-
-fn direct_consumer_layouts(
-    source: &[Operation],
-    operation_index: usize,
-    result: ValueId,
-    output: &TensorShape,
-    config: &PipelineConfig,
-) -> Vec<Layout> {
-    if !config
-        .search_domain
-        .permits_precision(OperatorClass::Attention, Precision::F16)
-    {
-        return Vec::new();
-    }
-    let Ok(streams) = u16::try_from(output.0.first().copied().unwrap_or(0)) else {
-        return Vec::new();
-    };
-    if streams == 0 {
-        return Vec::new();
-    }
-    let Some(&rows) = output.0.get(1) else {
-        return Vec::new();
-    };
-    let query_partitions = u16::try_from(rows)
-        .unwrap_or(u16::MAX)
-        .min(config.tile_count / streams);
-    let key_partitions = u16::try_from(rows.div_ceil(AMP_INNER_BLOCK))
-        .unwrap_or(u16::MAX)
-        .min(config.tile_count / streams);
-    let mut layouts = Vec::new();
-    for consumer in &source[operation_index + 1..] {
-        for input_index in consumer
-            .inputs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &input)| (input == result).then_some(index))
-        {
-            let layout = match (&consumer.kind, input_index) {
-                (OperationKind::FlashAttention(_), 0) if query_partitions != 0 => {
-                    Some(Layout::attention_query(streams, query_partitions))
-                }
-                (OperationKind::FlashAttention(_), 1) if key_partitions != 0 => {
-                    Some(Layout::attention_key(streams, key_partitions))
-                }
-                (OperationKind::FlashAttention(_), 2) if key_partitions != 0 => Some(
-                    Layout::attention_block_major_key_value(streams, key_partitions),
-                ),
-                _ => None,
-            };
-            if let Some(layout) = layout
-                && !layouts.contains(&layout)
-            {
-                layouts.push(layout);
-            }
-        }
-    }
-    layouts
-}
-
-fn operator_accepts_input_layout(
-    operation: &OperationKind,
-    input_index: usize,
-    config: &PipelineConfig,
-) -> bool {
-    match operation {
-        OperationKind::Gelu => {
-            input_index == 0
-                && !config
-                    .search_domain
-                    .precisions(OperatorClass::Gelu)
-                    .is_empty()
-        }
-        OperationKind::Add(_) => {
-            input_index < 2
-                && !config
-                    .search_domain
-                    .precisions(OperatorClass::Add)
-                    .is_empty()
-        }
-        OperationKind::SplitHeads(_) => input_index == 0,
-        OperationKind::Gemm(_) | OperationKind::FlashAttention(_) | OperationKind::Repeat(_) => {
-            false
-        }
-    }
 }
 
 fn plans_for_operation(
@@ -3137,68 +2975,6 @@ fn retain_precise_gemm_plans(
         .collect()
 }
 
-fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxis) {
-    if let Some(columns) = layout
-        .tiling
-        .axes
-        .iter_mut()
-        .find(|tiling| tiling.axis == axis)
-    {
-        columns.block_size = AMP_COLUMN_MICRO;
-        columns.padding_multiple = AMP_COLUMN_MICRO;
-        columns.padding = Padding::Zero;
-    }
-}
-
-fn apply_grouped_output_layout(
-    candidate: &mut OperatorPlan,
-    grouping: GroupedOutputLayout,
-) -> bool {
-    if candidate.requirements.output.format.precision != Precision::F16
-        || grouping.groups == 0
-        || grouping.physical_lane_multiple == 0
-    {
-        return false;
-    }
-    let configure = |layout: &mut Layout| {
-        let Some(axis) = layout
-            .tiling
-            .axes
-            .iter_mut()
-            .find(|axis| axis.axis == TensorAxis::FromEnd(1))
-        else {
-            return false;
-        };
-        if !axis.partitions.is_multiple_of(grouping.groups) {
-            return false;
-        }
-        // Subdivide every semantic group independently. This permits several
-        // shards per group while keeping padding at the group boundary rather
-        // than inserting it at unrelated grid boundaries.
-        axis.block_size = grouping.physical_lane_multiple;
-        axis.padding_multiple = grouping.physical_lane_multiple;
-        axis.padding_groups = grouping.groups;
-        axis.shard_padding_multiple = 1;
-        axis.padding = Padding::Zero;
-        true
-    };
-    configure(&mut candidate.requirements.inputs[1].format.layout)
-        && configure(&mut candidate.requirements.output.format.layout)
-}
-
-fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxis) {
-    if let Some(tiling) = layout
-        .tiling
-        .axes
-        .iter_mut()
-        .find(|tiling| tiling.axis == axis)
-    {
-        tiling.block_size = tiling.block_size.div_ceil(2) * 2;
-        tiling.padding_multiple = tiling.padding_multiple.div_ceil(2) * 2;
-        tiling.padding = Padding::Zero;
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn lower_repeat(
     operation: &Operation,
@@ -3493,7 +3269,7 @@ fn lookup(values: &BTreeMap<ValueId, MidValueId>, value: ValueId) -> LoweringRes
 mod tests {
     use super::*;
     use crate::graph::{AddOptions, AttentionOptions};
-    use crate::{AxisTiling, LayoutError, TensorTiling};
+    use crate::{AxisTiling, LayoutError, Padding, TensorTiling};
     use ipu_target::hardware::HardwareTarget;
 
     const RANDOM_CASES: usize = 128;

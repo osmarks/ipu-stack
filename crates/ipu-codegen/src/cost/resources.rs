@@ -2,12 +2,12 @@
 
 use super::exchange::ExchangeEndpointTraffic;
 use crate::graph::TensorShape;
-use crate::ir::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, Layout, MemoryClass, StorageOrder, TensorAxis, TensorRegion,
     TensorType,
 };
 use crate::metrics::{MemoryEstimate, MemoryPeaks, MemoryUsage};
+use crate::mid::{MidOperation, MidOperationKind, MidValue, MidValueId};
 use crate::operator::{
     AllocationRequirements, GemmDistribution, MemoryElementRequirement, MemoryOperand,
     OperandMaterialization, OperatorDispatch, OperatorRequirements, Precision,

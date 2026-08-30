@@ -9,12 +9,12 @@
 use crate::PipelineConfig;
 use crate::conversion::{ConversionStrategy, DeferredTransform};
 use crate::graph::{GraphInputKind, OperationId};
-use crate::ir::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::kernel::TileKernelSpec;
 use crate::layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, BlockedOrder, Layout, LayoutError, MemoryClass,
     NativeKernelOrder, ShardExtent, StorageOrder, TensorRegion, TensorTiling, TensorType,
 };
+use crate::mid::{MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId};
 use crate::operator::{
     GemmDistribution, GemmKernelMode, MemoryOperand, MemorySpaceRequirements, OperandRequirement,
     OperatorDispatch, OperatorRequirements, OutputAliasing, PointwiseInputMapping, Precision,
