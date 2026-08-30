@@ -223,6 +223,29 @@ fn specialized_kernel_symbol(kernel: &TileKernelSpec) -> Result<String, KernelAb
     }
 }
 
+fn attention_kernel_symbol(kernel: &TileKernelSpec) -> Result<String, KernelAbiError> {
+    match kernel {
+        TileKernelSpec::AttentionSoftmax {
+            query_rows,
+            head_dimension,
+            key_columns,
+            padded_key_columns,
+        } => Ok(format!(
+            "ipu_stack_attention_softmax_f16_q{query_rows}_d{head_dimension}_k{key_columns}_p{padded_key_columns}"
+        )),
+        TileKernelSpec::AttentionMerge {
+            query_rows,
+            value_dimension,
+            padded_value_dimension,
+            key_block_columns,
+            ..
+        } => Ok(format!(
+            "ipu_stack_attention_merge_f16_q{query_rows}_v{value_dimension}_p{padded_value_dimension}_k{key_block_columns}"
+        )),
+        _ => Err(KernelAbiError::RequirementMismatch),
+    }
+}
+
 impl KernelBuildPlan {
     /// Derives device objects from the finalized schedule, so row variants are
     /// compiler specializations rather than a fixed collection of binaries.
@@ -542,26 +565,8 @@ impl KernelBuildPlan {
             let mut softmax_cpp_symbols = Vec::new();
             let mut softmax_assembly_symbols = Vec::new();
             let mut merge_symbols = Vec::new();
-            for (kernel, rows) in attention_stages {
-                let size = if rows == small_query {
-                    "small"
-                } else {
-                    "large"
-                };
-                let symbol = match &kernel {
-                    TileKernelSpec::AttentionSoftmax { key_columns, .. } => {
-                        let key_size = if *key_columns == small_key {
-                            "small"
-                        } else {
-                            "large"
-                        };
-                        format!("ipu_stack_attention_softmax_{size}_query_{key_size}_key_f16")
-                    }
-                    TileKernelSpec::AttentionMerge { .. } => {
-                        format!("ipu_stack_attention_merge_{size}_query_f16")
-                    }
-                    _ => return Err(KernelAbiError::RequirementMismatch),
-                };
+            for (kernel, _) in attention_stages {
+                let symbol = attention_kernel_symbol(&kernel)?;
                 let retained_symbols = match &kernel {
                     TileKernelSpec::AttentionSoftmax { key_columns, .. }
                         if assembly_softmax_keys.contains(key_columns) =>
@@ -577,6 +582,58 @@ impl KernelBuildPlan {
                 }
                 plan.symbols.insert(kernel, symbol);
             }
+            let softmax_symbol = |query_rows, key_columns| {
+                format!(
+                    "ipu_stack_attention_softmax_f16_q{query_rows}_d{head_dimension}_k{key_columns}_p{key_block_columns}"
+                )
+            };
+            let merge_symbol = |query_rows| {
+                format!(
+                    "ipu_stack_attention_merge_f16_q{query_rows}_v{value_dimension}_p{padded_value_dimension}_k{key_block_columns}"
+                )
+            };
+            let small_small = softmax_symbol(small_query, small_key);
+            let large_small = if large_query == small_query {
+                format!("{small_small}_alternate_query")
+            } else {
+                softmax_symbol(large_query, small_key)
+            };
+            let small_large = if large_key == small_key {
+                format!("{small_small}_alternate_key")
+            } else {
+                softmax_symbol(small_query, large_key)
+            };
+            let large_large = if large_query == small_query || large_key == small_key {
+                format!("{small_small}_alternate_query_key")
+            } else {
+                softmax_symbol(large_query, large_key)
+            };
+            let small_merge = merge_symbol(small_query);
+            let large_merge = if large_query == small_query {
+                format!("{small_merge}_alternate_query")
+            } else {
+                merge_symbol(large_query)
+            };
+            let entry_definitions = vec![
+                (
+                    "ATTENTION_SOFTMAX_SMALL_QUERY_SMALL_KEY_SYMBOL",
+                    small_small,
+                ),
+                (
+                    "ATTENTION_SOFTMAX_LARGE_QUERY_SMALL_KEY_SYMBOL",
+                    large_small,
+                ),
+                (
+                    "ATTENTION_SOFTMAX_SMALL_QUERY_LARGE_KEY_SYMBOL",
+                    small_large,
+                ),
+                (
+                    "ATTENTION_SOFTMAX_LARGE_QUERY_LARGE_KEY_SYMBOL",
+                    large_large,
+                ),
+                ("ATTENTION_MERGE_SMALL_QUERY_SYMBOL", small_merge),
+                ("ATTENTION_MERGE_LARGE_QUERY_SYMBOL", large_merge),
+            ];
             let scale_bits = (1.0_f32 / (head_dimension as f32).sqrt()).to_bits();
             let softmax_definitions = vec![
                 ("ATTENTION_HEAD_DIMENSION", head_dimension.to_string()),
@@ -597,16 +654,22 @@ impl KernelBuildPlan {
                 source: "attention_softmax_f16_wrapper.S",
                 name: "attention_softmax_wrapper".into(),
                 optimization: None,
-                definitions: [
-                    assembly_softmax_keys
-                        .contains(&small_key)
-                        .then(|| ("ATTENTION_USE_ASSEMBLY_SMALL_KEY", "1".into())),
-                    (large_key != small_key && assembly_softmax_keys.contains(&large_key))
-                        .then(|| ("ATTENTION_USE_ASSEMBLY_LARGE_KEY", "1".into())),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
+                definitions: entry_definitions
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .chain(
+                        [
+                            assembly_softmax_keys
+                                .contains(&small_key)
+                                .then(|| ("ATTENTION_USE_ASSEMBLY_SMALL_KEY", "1".into())),
+                            (large_key != small_key && assembly_softmax_keys.contains(&large_key))
+                                .then(|| ("ATTENTION_USE_ASSEMBLY_LARGE_KEY", "1".into())),
+                        ]
+                        .into_iter()
+                        .flatten(),
+                    )
+                    .collect(),
                 retained_symbols: softmax_cpp_symbols,
             });
             let mut attention_stage_definitions = vec![
@@ -623,6 +686,7 @@ impl KernelBuildPlan {
                 ("ATTENTION_LARGE_KEY_ROWS", large_key.to_string()),
                 ("ATTENTION_SCALE_BITS", format!("0x{scale_bits:08x}")),
             ];
+            attention_stage_definitions.extend(entry_definitions);
             if assembly_softmax_keys.contains(&small_key) {
                 attention_stage_definitions
                     .push(("ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY", "1".into()));
