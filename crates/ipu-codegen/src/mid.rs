@@ -12,8 +12,8 @@ use crate::config::{
     PlannerSearchDomain,
 };
 use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
-use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
+use crate::cost::{MemoizedCostModel, parallel_reduction_preselection_metrics};
 use crate::estimate::{
     conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity,
@@ -2462,9 +2462,6 @@ fn parallel_reduction_plans_for_orientation(
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<OperatorPlan> {
-    // Residual supervisor, weight-feed, and worker setup cost after retained
-    // state, measured on IPU21 independently of the four issue cycles per row.
-    const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 160;
     let OperatorDispatch::BlockedGemm(plan) = candidate.dispatch else {
         return Vec::new();
     };
@@ -2550,12 +2547,6 @@ fn parallel_reduction_plans_for_orientation(
     {
         return Vec::new();
     }
-    let outer_rows = left.shape.0[..left.shape.0.len() - 2]
-        .iter()
-        .copied()
-        .fold(1u64, |product, extent| {
-            product.saturating_mul(u64::from(extent))
-        });
     let mut grids = Vec::new();
     for inner_partitions in 2..=inner_groups.min(tile_count) {
         let maximum_columns = grouped_column_groups
@@ -2580,7 +2571,6 @@ fn parallel_reduction_plans_for_orientation(
                 if used_tiles < tile_count.div_ceil(2) || u32::from(row_partitions) > rows {
                     continue;
                 }
-                let local_rows = rows.div_ceil(u32::from(row_partitions));
                 let local_columns =
                     u32::from(physical_column_groups).div_ceil(u32::from(column_partitions));
                 let local_inner = u32::from(inner_groups).div_ceil(u32::from(inner_partitions));
@@ -2589,88 +2579,31 @@ fn parallel_reduction_plans_for_orientation(
                 {
                     continue;
                 }
-                // Retain grids by the generated kernel's actual K16 x C16
-                // invocation structure, including its fixed weight-feed and
-                // worker/supervisor cost. Pure arithmetic work is almost
-                // constant across grids and incorrectly favors tiny row runs.
-                let row_run_cycles = outer_rows
-                    .saturating_mul(u64::from(local_rows))
-                    .saturating_mul(4)
-                    .saturating_add(AMP_F16_MICROBLOCK_FIXED_CYCLES);
-                let compute = u64::from(local_columns)
-                    .saturating_mul(u64::from(local_inner))
-                    .saturating_mul(row_run_cycles);
-                let communication = u64::from(local_columns)
-                    .saturating_mul(u64::from(local_inner))
-                    .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
-                    .saturating_add(
-                        u64::from(local_rows)
-                            .saturating_mul(u64::from(local_columns))
-                            .saturating_mul(u64::from(inner_partitions - 1)),
-                    );
-                let left_bytes = outer_rows
-                    .saturating_mul(u64::from(local_rows))
-                    .saturating_mul(u64::from(local_inner))
-                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(
-                        candidate.requirements.inputs[match orientation {
-                            GemmOrientation::Normal => 0,
-                            GemmOrientation::Swapped => 1,
-                        }]
-                        .format
-                        .precision
-                        .bytes(),
-                    );
-                let right_bytes = u64::from(local_columns)
-                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(u64::from(local_inner))
-                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(
-                        candidate.requirements.inputs[match orientation {
-                            GemmOrientation::Normal => 1,
-                            GemmOrientation::Swapped => 0,
-                        }]
-                        .format
-                        .precision
-                        .bytes(),
-                    );
-                let partial_bytes = outer_rows
-                    .saturating_mul(u64::from(local_rows))
-                    .saturating_mul(u64::from(local_columns))
-                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(candidate.requirements.output.format.precision.bytes());
-                // Operand staging and the local partial coexist during
-                // convolution. Complete staging is evaluated later by the
-                // ordinary operator-memory model.
-                let convolution_bytes = left_bytes
-                    .saturating_add(right_bytes)
-                    .saturating_add(partial_bytes);
-                let reduction_bytes = partial_bytes.saturating_mul(4);
-                let temporary_bytes = convolution_bytes.max(reduction_bytes);
+                let grid = GemmGrid {
+                    rows: row_partitions,
+                    columns: column_partitions,
+                    inner: inner_partitions,
+                };
+                let Some(metrics) = parallel_reduction_preselection_metrics(
+                    config.target,
+                    GemmBlockShape {
+                        inner: local_inner.saturating_mul(AMP_COLUMN_MICRO),
+                        output_columns: local_columns.saturating_mul(AMP_COLUMN_MICRO),
+                    },
+                    grid,
+                    orientation,
+                    inputs,
+                    candidate.requirements.output.format.precision,
+                ) else {
+                    continue;
+                };
                 let constraints = config.target.memory_constraints();
-                if temporary_bytes > constraints.total_bytes
-                    || right_bytes.saturating_add(partial_bytes) > constraints.interleaved_bytes
-                {
+                if metrics.memory.total > constraints.total_bytes {
                     continue;
                 }
                 grids.push(ParallelGridCandidate {
-                    metrics: RegionMetrics {
-                        cost: CostEstimate {
-                            cycles: compute.saturating_add(communication),
-                            exchange_cycles: communication,
-                            ..CostEstimate::default()
-                        },
-                        memory: MemoryPeaks {
-                            standard: temporary_bytes,
-                            total: temporary_bytes,
-                            ..MemoryPeaks::default()
-                        },
-                    },
-                    grid: GemmGrid {
-                        rows: row_partitions,
-                        columns: column_partitions,
-                        inner: inner_partitions,
-                    },
+                    metrics,
+                    grid,
                     physical_column_groups,
                     grouped,
                 });

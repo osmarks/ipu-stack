@@ -12,6 +12,7 @@ pub struct HardwareCosts {
     pub kernel_launch_cycles: u64,
     pub logical_fragment_cycles: u64,
     pub amp_call_cycles: u64,
+    pub amp_grid_search_setup_cycles: u64,
     pub amp_column_group_width: u64,
     pub amp_interleaved_column_group_cycles: u64,
     pub amp_standard_column_group_cycles: u64,
@@ -46,6 +47,9 @@ pub(crate) const IPU21_TARGET_COSTS: HardwareCosts = HardwareCosts {
     // Generated AMP GEMM kernel: one 16-column group and one 64-element K
     // block, with the remaining group cost dominated by weight delivery.
     amp_call_cycles: 294,
+    // Coarse grid search excludes retained kernel state and separately models
+    // the residual supervisor, weight-feed, and worker setup per microblock.
+    amp_grid_search_setup_cycles: 160,
     amp_column_group_width: 16,
     amp_interleaved_column_group_cycles: 940,
     amp_standard_column_group_cycles: 1_063,

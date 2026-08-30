@@ -6,15 +6,14 @@ use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion
 use crate::estimate::{
     ExchangeEndpointTraffic, average_shard_bytes, gemm_exchange_endpoint_traffic,
     gemm_exchange_phase_count, gemm_partial_tensor, gemm_requires_panel_repacking,
-    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes,
-    operator_memory_estimate, physical_elements,
+    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
-use crate::metrics::{CostEstimate, ExchangeFootprint};
+use crate::metrics::{CostEstimate, ExchangeFootprint, MemoryPeaks, RegionMetrics};
 use crate::operator::{
-    GemmDistribution, LocalOperandStaging, MidOperator, OperatorDispatch, OperatorRequirements,
-    Precision,
+    GemmBlockShape, GemmDistribution, GemmGrid, GemmOrientation, LocalOperandStaging, MidOperator,
+    OperatorDispatch, OperatorRequirements, Precision,
 };
 use foldhash::fast::FixedState;
 use ipu_target::cost::HardwareCosts;
@@ -875,6 +874,85 @@ fn deferred_split_input_cycles(
     ))
 }
 
+/// Cheap ranking used before concrete blocked-GEMM layouts are expanded into
+/// the full operator candidate set.
+pub(crate) fn parallel_reduction_preselection_metrics(
+    target: HardwareTarget,
+    block: GemmBlockShape,
+    compute_grid: GemmGrid,
+    orientation: GemmOrientation,
+    inputs: &[TensorType],
+    output_precision: Precision,
+) -> Option<RegionMetrics> {
+    let [left, right] = inputs else { return None };
+    let costs = target.costs();
+    let outer_rows = left.shape.0[..left.shape.0.len().saturating_sub(2)]
+        .iter()
+        .fold(1u64, |product, &extent| {
+            product.saturating_mul(u64::from(extent))
+        });
+    let logical_rows = match orientation {
+        GemmOrientation::Normal => left.shape.0[left.shape.0.len() - 2],
+        GemmOrientation::Swapped => right.shape.0[right.shape.0.len() - 1],
+    };
+    let local_rows = logical_rows.div_ceil(u32::from(compute_grid.rows));
+    let local_columns = block.output_columns.div_ceil(crate::AMP_COLUMN_MICRO);
+    let local_inner = block.inner.div_ceil(crate::AMP_COLUMN_MICRO);
+    let row_run_cycles = outer_rows
+        .saturating_mul(u64::from(local_rows))
+        .saturating_mul(4)
+        .saturating_add(costs.amp_grid_search_setup_cycles);
+    let compute = u64::from(local_columns)
+        .saturating_mul(u64::from(local_inner))
+        .saturating_mul(row_run_cycles);
+    let communication = u64::from(local_columns)
+        .saturating_mul(u64::from(local_inner))
+        .saturating_add(u64::from(local_rows).saturating_mul(u64::from(local_inner)))
+        .saturating_add(
+            u64::from(local_rows)
+                .saturating_mul(u64::from(local_columns))
+                .saturating_mul(u64::from(compute_grid.inner.saturating_sub(1))),
+        );
+    let (left_precision, right_precision) = match orientation {
+        GemmOrientation::Normal => (left.format.precision, right.format.precision),
+        GemmOrientation::Swapped => (right.format.precision, left.format.precision),
+    };
+    let left_bytes = outer_rows
+        .saturating_mul(u64::from(local_rows))
+        .saturating_mul(u64::from(local_inner))
+        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
+        .saturating_mul(left_precision.bytes());
+    let right_bytes = u64::from(local_columns)
+        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
+        .saturating_mul(u64::from(local_inner))
+        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
+        .saturating_mul(right_precision.bytes());
+    let partial_bytes = outer_rows
+        .saturating_mul(u64::from(local_rows))
+        .saturating_mul(u64::from(local_columns))
+        .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
+        .saturating_mul(output_precision.bytes());
+    let temporary_bytes = left_bytes
+        .saturating_add(right_bytes)
+        .saturating_add(partial_bytes)
+        .max(partial_bytes.saturating_mul(4));
+    if right_bytes.saturating_add(partial_bytes) > target.memory_constraints().interleaved_bytes {
+        return None;
+    }
+    Some(RegionMetrics {
+        cost: CostEstimate {
+            cycles: compute.saturating_add(communication),
+            exchange_cycles: communication,
+            ..CostEstimate::default()
+        },
+        memory: MemoryPeaks {
+            standard: temporary_bytes,
+            total: temporary_bytes,
+            ..MemoryPeaks::default()
+        },
+    })
+}
+
 impl CostModel for Ipu21CostModel {
     fn target(&self) -> HardwareTarget {
         HardwareTarget::Ipu21
@@ -1136,15 +1214,6 @@ impl CostModel for Ipu21CostModel {
                 )
                 .map(|cycles| cycles.saturating_mul(matrices_per_tile))
                 .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
-                let memory = operator_memory_estimate(dispatch, requirements, inputs, output);
-                let capacity_penalty = if memory
-                    .peak
-                    .fits(ipu_target::hardware::HardwareTarget::Ipu21.memory_constraints())
-                {
-                    0
-                } else {
-                    u64::MAX / 8
-                };
                 let result_copy = (compute_output.format.layout != output.format.layout)
                     .then(|| standard_to_interleaved_copy_cycles(maximum_shard_bytes(output)))
                     .unwrap_or(0);
@@ -1155,7 +1224,6 @@ impl CostModel for Ipu21CostModel {
                     .saturating_add(exchange)
                     .saturating_add(reduction_work)
                     .saturating_add(result_copy)
-                    .saturating_add(capacity_penalty)
             }
             MidOperator::FlashAttention { .. } => {
                 let query = inputs.first().map(|input| &input.shape.0);
