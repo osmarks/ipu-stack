@@ -38,10 +38,6 @@ pub fn layout_conversion_strategy(
                 StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
             )
         || matches!(to.order, StorageOrder::Linear)
-            && matches!(
-                from.order,
-                StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::Output)
-            )
         || matches!(
             (from.order, to.order),
             (StorageOrder::Blocked(source), StorageOrder::Blocked(destination))
@@ -62,7 +58,6 @@ pub struct ConversionPlan {
     pub input: OperandRequirement,
     pub output: OperandRequirement,
     pub strategy: ConversionStrategy,
-    pub mappings: Vec<ConversionMapping>,
 }
 
 /// One arbitrary-rank affine copy nest within a conversion route.
@@ -1003,7 +998,9 @@ fn physical_block_dimensions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{BlockedOrder, ShardExtent, TensorAxis};
+    use crate::layout::{
+        AxisTiling, BlockedOrder, MemoryClass, Padding, ShardExtent, TensorAxis, TensorTiling,
+    };
     use std::collections::BTreeMap;
 
     #[test]
@@ -1155,6 +1152,54 @@ mod tests {
                     break;
                 }
             }
+        }
+    }
+
+    #[test]
+    fn randomized_native_results_can_be_linearized_directly() {
+        let mut random = fastrand::Rng::with_seed(0x7374_6167_6564_6c69);
+        for case in 0..64 {
+            let row_partitions = random.u16(1..=8);
+            let column_partitions = random.u16(1..=8);
+            let rows = 16 * u32::from(row_partitions) * random.u32(1..=4) - random.u32(0..16);
+            let columns = 2 * u32::from(column_partitions) * random.u32(1..=8) - random.u32(0..2);
+            let tile_count = row_partitions * column_partitions;
+            let source = Layout {
+                order: StorageOrder::Native(NativeKernelOrder::TransposedLeft),
+                tiling: TensorTiling {
+                    tile_count,
+                    replicas: 1,
+                    axes: vec![
+                        AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 16, Padding::Zero)
+                            .with_tile_stride(1),
+                        AxisTiling::new(
+                            TensorAxis::FromEnd(1),
+                            column_partitions,
+                            2,
+                            Padding::Zero,
+                        )
+                        .with_tile_stride(row_partitions),
+                    ],
+                },
+                memory_class: MemoryClass::Interleaved,
+            };
+            let destination = Layout::logical_linear(tile_count, 4);
+            let shape = if random.bool() {
+                TensorShape::new([rows, columns])
+            } else {
+                TensorShape::new([1, rows, columns])
+            };
+            if source.resolve(&shape).is_err() || destination.resolve(&shape).is_err() {
+                continue;
+            }
+            let strategy = layout_conversion_strategy(Precision::F16, &source, &destination);
+            assert_eq!(
+                strategy,
+                ConversionStrategy::DirectLogical,
+                "random case {case}"
+            );
+            plan_conversion(&shape, Precision::F16, &source, &destination, strategy)
+                .unwrap_or_else(|error| panic!("random case {case}: {error}"));
         }
     }
 }

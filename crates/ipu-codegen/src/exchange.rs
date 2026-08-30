@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::time::Instant;
 
 #[cfg(test)]
 use ipu_target::exchange::plan_event_cycles;
@@ -101,6 +102,7 @@ pub(crate) fn lower_exchanges(
         .exchange_phases
         .iter()
         .map(|phase| {
+            let started = Instant::now();
             let pending = phase
                 .transfers
                 .par_iter()
@@ -123,15 +125,31 @@ pub(crate) fn lower_exchanges(
                 .into_iter()
                 .flatten()
                 .collect();
+            let prepared = started.elapsed();
             let mut pending = coalesce_pending_transfers(pending, maximum_transfer_words);
+            let coalesced = started.elapsed();
             attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
             let incoming_bases = incoming_bases(&pending, program.tile_count)?;
+            tracing::info!(
+                phase = phase.id.index(),
+                logical_transfers = phase.transfers.len(),
+                physical_transfers = pending.len(),
+                prepare_ms = prepared.as_millis(),
+                coalesce_ms = coalesced.saturating_sub(prepared).as_millis(),
+                "prepared exchange phase"
+            );
             let schedule = materialize_greedy_schedule(
                 &topology,
                 &pending,
                 &incoming_bases,
                 program.tile_count,
             )?;
+            tracing::info!(
+                phase = phase.id.index(),
+                physical_transfers = pending.len(),
+                schedule_ms = started.elapsed().saturating_sub(coalesced).as_millis(),
+                "scheduled exchange phase"
+            );
             let MaterializedSchedule {
                 builder,
                 activities,
@@ -407,11 +425,6 @@ struct PendingTransfer {
 }
 
 impl PendingTransfer {
-    fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
-        std::iter::once(self.physical.source)
-            .chain(self.physical.destinations.iter().map(|entry| entry.0))
-    }
-
     fn refresh_source_elements(&mut self) {
         self.source_elements = self
             .physical
@@ -569,11 +582,16 @@ impl<'a> TransferScheduler<'a> {
                     .item_count()
                     .unwrap_or(transfer.physical.words),
             );
-            for tile in transfer.tiles() {
+            for tile in std::iter::once(transfer.physical.source).chain(
+                transfer
+                    .physical
+                    .destinations
+                    .iter()
+                    .map(|endpoint| endpoint.0),
+            ) {
                 word_pressure[usize::from(tile)] += items;
             }
         }
-
         let mut dependents = vec![Vec::new(); transfers.len()];
         let mut indegrees = vec![0usize; transfers.len()];
         for (before, after) in memory_dependencies(transfers, tile_count) {
@@ -583,9 +601,6 @@ impl<'a> TransferScheduler<'a> {
         let mut scheduler = Self {
             transfers,
             word_pressure,
-            // Multicast choices release several endpoint queues at once, so
-            // their useful priority is the pressure which remains. Stable
-            // pressure is a better matching tie-break for point-to-point work.
             dynamic_word_pressure: transfers
                 .iter()
                 .any(|transfer| transfer.physical.destinations.len() > 1),
@@ -605,12 +620,16 @@ impl<'a> TransferScheduler<'a> {
 
     fn push_ready(&mut self, index: usize, earliest_start: u32) {
         let transfer = &self.transfers[index];
-        let endpoint_pressure = transfer
-            .tiles()
-            // Bytes, rather than role count, approximate how long selecting
-            // this hyperedge frees work on the phase's congested endpoints.
+        let endpoint_pressure = std::iter::once(transfer.physical.source)
+            .chain(
+                transfer
+                    .physical
+                    .destinations
+                    .iter()
+                    .map(|endpoint| endpoint.0),
+            )
             .map(|tile| self.word_pressure[usize::from(tile)])
-            .sum::<u64>();
+            .sum();
         self.ready.push(ReadyTransfer {
             earliest_start: Reverse(earliest_start),
             endpoint_pressure,
@@ -656,7 +675,13 @@ impl<'a> TransferScheduler<'a> {
                     .item_count()
                     .unwrap_or(transfer.physical.words),
             );
-            for tile in transfer.tiles() {
+            for tile in std::iter::once(transfer.physical.source).chain(
+                transfer
+                    .physical
+                    .destinations
+                    .iter()
+                    .map(|endpoint| endpoint.0),
+            ) {
                 self.word_pressure[usize::from(tile)] =
                     self.word_pressure[usize::from(tile)].saturating_sub(items);
             }
@@ -1074,19 +1099,9 @@ mod tests {
             let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
             let mut occurrences = vec![0u8; transfers.len()];
             let mut intervals = vec![(0u32, 0u32); transfers.len()];
-            while let Some((index, dependency_ready)) = scheduler.next(&availability) {
+            while let Some((index, start)) = scheduler.next(&availability) {
                 occurrences[index] += 1;
                 let transfer = &transfers[index];
-                let start =
-                    std::iter::once(dependency_ready)
-                        .chain(std::iter::once(
-                            availability[usize::from(transfer.physical.source)].send,
-                        ))
-                        .chain(transfer.physical.destinations.iter().map(
-                            |&TransferEndpoint(tile, _)| availability[usize::from(tile)].receive,
-                        ))
-                        .max()
-                        .unwrap_or(0);
                 let end = start.saturating_add(transfers[index].physical.words);
                 intervals[index] = (start, end);
                 availability[usize::from(transfer.physical.source)].send = end;

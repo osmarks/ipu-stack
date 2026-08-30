@@ -1,16 +1,13 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
-use crate::ConversionMapping;
 #[cfg(test)]
 use crate::MemorySpaceRequirements;
-use crate::conversion::{
-    ConversionStrategy, DeferredTransform, layout_conversion_strategy, plan_conversion,
-};
+use crate::conversion::{ConversionStrategy, DeferredTransform, layout_conversion_strategy};
 use crate::estimate::{
-    ExchangeEndpointTraffic, average_shard_bytes, conversion_mapping_traffic,
-    gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
-    gemm_requires_panel_repacking, gemm_uses_panel_buffer, maximum_axis_shard_extent,
-    maximum_shard_bytes, operator_memory_estimate, physical_elements,
+    ExchangeEndpointTraffic, average_shard_bytes, gemm_exchange_endpoint_traffic,
+    gemm_exchange_phase_count, gemm_partial_tensor, gemm_requires_panel_repacking,
+    gemm_uses_panel_buffer, maximum_axis_shard_extent, maximum_shard_bytes,
+    operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::layout::{Layout, MemoryClass, NativeKernelOrder, StorageOrder, TensorAxis, TensorType};
@@ -150,12 +147,9 @@ pub trait CostModel: Sync {
     }
     fn rearrangement_cost(
         &self,
-        shape: &TensorShape,
-        _precision: Precision,
+        source: &TensorType,
+        destination: &TensorType,
         strategy: ConversionStrategy,
-        from: &Layout,
-        to: &Layout,
-        mappings: &[ConversionMapping],
     ) -> CostEstimate;
 
     fn layout_conversion_cost(
@@ -166,10 +160,11 @@ pub trait CostModel: Sync {
         to: &Layout,
     ) -> CostEstimate {
         let requested = layout_conversion_strategy(precision, from, to);
-        let Ok(mappings) = plan_conversion(shape, precision, from, to, requested) else {
-            return impossible_conversion_cost();
-        };
-        self.rearrangement_cost(shape, precision, requested, from, to, &mappings)
+        self.rearrangement_cost(
+            &TensorType::new(shape.0.clone(), precision, from.clone()),
+            &TensorType::new(shape.0.clone(), precision, to.clone()),
+            requested,
+        )
     }
 }
 
@@ -214,7 +209,7 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     rearrangements: Mutex<RearrangementCache>,
 }
 
-type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
+type RearrangementKey = (TensorType, TensorType, ConversionStrategy);
 type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<CostEstimate>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
@@ -256,13 +251,9 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         to: &Layout,
     ) -> CostEstimate {
         let requested = layout_conversion_strategy(precision, from, to);
-        let key = (
-            shape.clone(),
-            precision,
-            requested,
-            from.clone(),
-            to.clone(),
-        );
+        let source = TensorType::new(shape.0.clone(), precision, from.clone());
+        let destination = TensorType::new(shape.0.clone(), precision, to.clone());
+        let key = (source.clone(), destination.clone(), requested);
         let cached = self
             .rearrangements
             .lock()
@@ -271,12 +262,9 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
             .or_default()
             .clone();
         *cached.get_or_init(|| {
-            let Ok(mappings) = plan_conversion(shape, precision, from, to, requested) else {
-                return impossible_conversion_cost();
-            };
             let mut cost = self
                 .inner
-                .rearrangement_cost(shape, precision, requested, from, to, &mappings);
+                .rearrangement_cost(&source, &destination, requested);
             let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
             cost.cycles = cost
                 .cycles
@@ -350,14 +338,11 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 
     fn rearrangement_cost(
         &self,
-        shape: &TensorShape,
-        precision: Precision,
+        source: &TensorType,
+        destination: &TensorType,
         strategy: ConversionStrategy,
-        from: &Layout,
-        to: &Layout,
-        mappings: &[ConversionMapping],
     ) -> CostEstimate {
-        let key = (shape.clone(), precision, strategy, from.clone(), to.clone());
+        let key = (source.clone(), destination.clone(), strategy);
         let cached = self
             .rearrangements
             .lock()
@@ -366,10 +351,13 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
             .or_default()
             .clone();
         *cached.get_or_init(|| {
-            let mut cost = self
-                .inner
-                .rearrangement_cost(shape, precision, strategy, from, to, mappings);
-            let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
+            let mut cost = self.inner.rearrangement_cost(source, destination, strategy);
+            let active_tiles = source
+                .format
+                .layout
+                .tiling
+                .tile_count
+                .max(destination.format.layout.tiling.tile_count);
             // The inner model reports occupied work. Reduced-grid conversions
             // leave spatial issue slots idle, so convert that work into a phase
             // horizon using the occupancy of this particular planning target.
@@ -389,9 +377,14 @@ fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u
     if traffic.is_empty() || phases == 0 {
         return 0;
     }
-    traffic
+    let payload_cycles = traffic
         .maximum_payload_bytes()
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
+    let cutover_cycles = traffic
+        .maximum_fragments()
+        .saturating_mul(IPU21_TARGET_COSTS.logical_fragment_cycles);
+    payload_cycles
+        .max(cutover_cycles)
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
 }
 
@@ -1360,80 +1353,124 @@ impl CostModel for Ipu21CostModel {
 
     fn rearrangement_cost(
         &self,
-        _shape: &TensorShape,
-        _precision: Precision,
+        source: &TensorType,
+        destination: &TensorType,
         strategy: ConversionStrategy,
-        from: &Layout,
-        to: &Layout,
-        mappings: &[ConversionMapping],
     ) -> CostEstimate {
-        if mappings.is_empty() && strategy.uses_intersections() {
+        if source.format.layout.resolve(&source.shape).is_err()
+            || destination
+                .format
+                .layout
+                .resolve(&destination.shape)
+                .is_err()
+        {
             return impossible_conversion_cost();
         }
-        let traffic = conversion_mapping_traffic(mappings, self.target());
-        let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(&traffic);
-        let exchange_cycles = exchange_endpoint_cycles(&endpoint_traffic, 1);
-        let mut local_work = HashMap::<u16, (u64, u64)>::new();
-        let mut add_geometry = |tile, geometry: &crate::CopyGeometry| {
-            let work = local_work.entry(tile).or_default();
-            work.0 = work.0.saturating_add(geometry.bytes());
-            let retains_inner = geometry.dimensions.first().is_some_and(|dimension| {
-                geometry.contiguous_bytes.is_multiple_of(8)
-                    && u64::from(geometry.contiguous_bytes) * u64::from(dimension.count) <= 512
-            });
-            let calls = geometry
-                .dimensions
-                .iter()
-                .skip(usize::from(retains_inner))
-                .fold(1u64, |calls, dimension| {
-                    calls.saturating_mul(u64::from(dimension.count))
-                });
-            work.1 = work.1.saturating_add(calls);
+        let source_bytes = maximum_shard_bytes(source);
+        let destination_bytes = maximum_shard_bytes(destination);
+        let changes_ownership = source.format.layout.tiling != destination.format.layout.tiling
+            && source
+                .format
+                .layout
+                .tiling
+                .tile_count
+                .max(destination.format.layout.tiling.tile_count)
+                > 1;
+        let maximum_chunk_bytes = u64::from(self.target().exchange().maximum_transfer_words) * 4;
+        let replica_expansion = u64::from(destination.format.layout.tiling.replicas)
+            .div_ceil(u64::from(source.format.layout.tiling.replicas));
+        let endpoint_traffic = if changes_ownership {
+            let contiguous_bytes = if source.format.layout.order == destination.format.layout.order
+                && source.format.layout.order != StorageOrder::Linear
+                && (source.format.layout.tiling.linear_grain().is_some()
+                    || destination.format.layout.tiling.linear_grain().is_some())
+            {
+                source
+                    .shape
+                    .0
+                    .len()
+                    .checked_sub(1)
+                    .map(|axis| {
+                        maximum_axis_shard_extent(source, axis)
+                            .min(maximum_axis_shard_extent(destination, axis))
+                            .saturating_mul(source.format.precision.bytes())
+                            .min(maximum_chunk_bytes)
+                    })
+                    .unwrap_or(maximum_chunk_bytes)
+                    .max(4)
+            } else {
+                maximum_chunk_bytes
+            };
+            let outgoing_bytes = source_bytes.saturating_mul(replica_expansion);
+            ExchangeEndpointTraffic::from_maxima(
+                outgoing_bytes,
+                destination_bytes,
+                outgoing_bytes.div_ceil(contiguous_bytes),
+                destination_bytes.div_ceil(contiguous_bytes),
+            )
+        } else {
+            ExchangeEndpointTraffic::default()
         };
-        for mapping in mappings {
-            for geometry in &mapping.source_copies {
-                add_geometry(mapping.source_tile, geometry);
+        let exchange_cycles =
+            exchange_endpoint_cycles(&endpoint_traffic, u64::from(changes_ownership));
+        let changes_order = source.format.layout.order != destination.format.layout.order;
+        let block_elements = |tensor: &TensorType| match tensor.format.layout.order {
+            StorageOrder::Linear => maximum_shard_elements(tensor).max(1),
+            StorageOrder::Native(NativeKernelOrder::Left | NativeKernelOrder::TransposedLeft) => {
+                u64::from(crate::storage::amp_micro_dimension(tensor.format.precision))
             }
-            for geometry in &mapping.destination_copies {
-                add_geometry(mapping.destination_tile, geometry);
+            StorageOrder::Native(
+                NativeKernelOrder::Output | NativeKernelOrder::TransposedOutput,
+            ) => u64::from(crate::AMP_COLUMN_MICRO),
+            StorageOrder::Native(NativeKernelOrder::TransposedRight) => {
+                u64::from(crate::storage::amp_micro_dimension(tensor.format.precision))
+                    .saturating_mul(u64::from(crate::AMP_COLUMN_MICRO))
             }
-            if mapping.source_tile == mapping.destination_tile {
-                for geometry in &mapping.copies {
-                    add_geometry(mapping.source_tile, geometry);
-                }
+            StorageOrder::Blocked(order) => {
+                u64::from(crate::storage::amp_micro_dimension(tensor.format.precision))
+                    .saturating_mul(u64::from(order.block_shape[1]))
             }
-        }
-        let (mut local_bytes, mut local_calls) = local_work
-            .into_values()
-            .max_by_key(|&(bytes, calls)| {
-                bytes
-                    .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-                    .saturating_add(calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles))
-            })
-            .unwrap_or_default();
-        if strategy == ConversionStrategy::StageLogicalThenTransform {
-            local_bytes =
-                local_bytes.saturating_add(traffic.maximum_destination_bytes.saturating_mul(2));
-            local_calls = local_calls.saturating_add(1);
-        }
+        };
+        let transform_calls = if changes_order {
+            maximum_shard_elements(source)
+                .div_ceil(block_elements(source))
+                .saturating_add(
+                    maximum_shard_elements(destination).div_ceil(block_elements(destination)),
+                )
+        } else {
+            0
+        };
+        let (local_bytes, local_calls): (u64, u64) = match strategy {
+            ConversionStrategy::LocalKernel => (source_bytes.saturating_add(destination_bytes), 1),
+            ConversionStrategy::StageLogicalThenTransform => (
+                source_bytes.saturating_add(destination_bytes.saturating_mul(2)),
+                transform_calls.max(2),
+            ),
+            ConversionStrategy::DirectLogical | ConversionStrategy::DirectRetile
+                if changes_order =>
+            {
+                (
+                    source_bytes.saturating_add(destination_bytes),
+                    transform_calls.max(1),
+                )
+            }
+            ConversionStrategy::DirectLogical | ConversionStrategy::DirectRetile
+                if !changes_ownership =>
+            {
+                (source_bytes.saturating_add(destination_bytes), 1)
+            }
+            ConversionStrategy::DirectLogical | ConversionStrategy::DirectRetile => (0, 0),
+        };
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        let mut exchange_footprint = exchange_endpoint_footprint(
-            &endpoint_traffic,
-            u64::from(traffic.remote_fragments != 0),
-        );
-        exchange_footprint.maximum_transfer_chunks_per_tile = exchange_footprint
-            .maximum_transfer_chunks_per_tile
-            .max(traffic.maximum_routed_fragments);
         CostEstimate {
             cycles: exchange_cycles.saturating_add(local_cycles),
             exchange_cycles,
-            exchange_footprint: if from.tiling == to.tiling {
-                ExchangeFootprint::default()
-            } else {
-                exchange_footprint
-            },
+            exchange_footprint: exchange_endpoint_footprint(
+                &endpoint_traffic,
+                u64::from(changes_ownership),
+            ),
         }
     }
 }
@@ -1484,7 +1521,12 @@ mod tests {
                 cycles.saturating_sub(fixed),
                 outgoing
                     .max(incoming)
-                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle),
+                    .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+                    .max(
+                        traffic
+                            .maximum_fragments()
+                            .saturating_mul(IPU21_TARGET_COSTS.logical_fragment_cycles)
+                    ),
                 "case {case}"
             );
             let reversed_traffic = ExchangeEndpointTraffic::from_maxima(

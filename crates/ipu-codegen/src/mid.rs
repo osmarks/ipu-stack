@@ -13,7 +13,6 @@ use crate::config::{
 };
 use crate::conversion::{
     ConversionPlan, ConversionStrategy, DeferredTransform, layout_conversion_strategy,
-    plan_conversion, plan_view_conversion,
 };
 use crate::cost::MemoizedCostModel;
 pub use crate::cost::{CostModel, Ipu21CostModel};
@@ -1735,16 +1734,15 @@ fn apply_selected_view(
             layout: output_layout,
         },
     };
-    let (strategy, mappings) = plan_view_conversion(source_type, &output_type, transform).ok()?;
-    let cost = costs.rearrangement_cost(
-        &output_type.shape,
-        output_type.format.precision,
-        strategy,
+    source_type.format.layout.resolve(&source_type.shape).ok()?;
+    output_type.format.layout.resolve(&output_type.shape).ok()?;
+    let strategy = layout_conversion_strategy(
+        source_type.format.precision,
         &source_type.format.layout,
         &output_type.format.layout,
-        &mappings,
     );
-    let memory = conversion_memory_estimate(source_type, &output_type, strategy, &mappings);
+    let cost = costs.rearrangement_cost(source_type, &output_type, strategy);
+    let memory = conversion_memory_estimate(source_type, &output_type, strategy);
     let input = OperandRequirement::new(source_type.format.clone(), 8);
     let output = OperandRequirement::new(output_type.format.clone(), 8)
         .with_materialization(OperandMaterialization::DispatchSlices);
@@ -1765,7 +1763,6 @@ fn apply_selected_view(
             input,
             output,
             strategy,
-            mappings,
         }),
         metrics: OperationMetrics { cost, memory },
     });
@@ -3534,7 +3531,6 @@ fn ensure_format(
             &original.tensor_type,
             &tensor_type,
             ConversionStrategy::LocalKernel,
-            &[],
         );
         operations.push(MidOperation {
             source: Some(source),
@@ -3552,7 +3548,6 @@ fn ensure_format(
                 input: OperandRequirement::new(original.tensor_type.format.clone(), 8),
                 output: OperandRequirement::new(tensor_type.format.clone(), 8),
                 strategy: ConversionStrategy::LocalKernel,
-                mappings: Vec::new(),
             }),
             metrics: OperationMetrics {
                 cost: CostEstimate {
@@ -3572,29 +3567,8 @@ fn ensure_format(
         let result = state.derived_value(value, tensor_type.clone());
         let strategy =
             layout_conversion_strategy(tensor_type.format.precision, &from, &target.layout);
-        let mappings = plan_conversion(
-            &tensor_type.shape,
-            tensor_type.format.precision,
-            &from,
-            &target.layout,
-            strategy,
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "conversion {:?} {strategy:?} from {from:?} to {:?}: {error}",
-                tensor_type.shape, target.layout
-            )
-        });
-        let rearrangement = costs.rearrangement_cost(
-            &tensor_type.shape,
-            tensor_type.format.precision,
-            strategy,
-            &from,
-            &target.layout,
-            &mappings,
-        );
-        let memory =
-            conversion_memory_estimate(&current.tensor_type, &tensor_type, strategy, &mappings);
+        let rearrangement = costs.rearrangement_cost(&current.tensor_type, &tensor_type, strategy);
+        let memory = conversion_memory_estimate(&current.tensor_type, &tensor_type, strategy);
         operations.push(MidOperation {
             source: Some(source),
             inputs: vec![value],
@@ -3612,7 +3586,6 @@ fn ensure_format(
                 output: OperandRequirement::new(tensor_type.format.clone(), 8)
                     .with_materialization(materialization),
                 strategy,
-                mappings,
             }),
             metrics: OperationMetrics {
                 cost: rearrangement,
@@ -4197,12 +4170,9 @@ mod tests {
 
         fn rearrangement_cost(
             &self,
-            _shape: &TensorShape,
-            _precision: Precision,
+            _source: &TensorType,
+            _destination: &TensorType,
             _strategy: ConversionStrategy,
-            _from: &Layout,
-            _to: &Layout,
-            _mappings: &[crate::ConversionMapping],
         ) -> crate::CostEstimate {
             crate::CostEstimate::default()
         }
@@ -4723,7 +4693,7 @@ mod tests {
                     operation.metrics.cost.cycles == 0
                         && operation.conversion_plan.as_ref().is_some_and(|plan| {
                             plan.output.materialization == OperandMaterialization::DispatchSlices
-                                && !plan.mappings.is_empty()
+                                && plan.strategy.uses_intersections()
                         })
                 }),
                 "random case {case}"
@@ -4806,7 +4776,7 @@ mod tests {
                 operation
                     .conversion_plan
                     .as_ref()
-                    .is_some_and(|plan| !plan.mappings.is_empty()),
+                    .is_some_and(|plan| plan.strategy.uses_intersections()),
                 "random case {case}"
             );
             let tiled = crate::low::lower_to_tiles(&lowered, &config)

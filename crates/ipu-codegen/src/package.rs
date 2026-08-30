@@ -938,11 +938,14 @@ fn build_package_from_objects(
         .end
         .checked_sub(sizing_host_base)
         .ok_or_else(|| invalid("host program size underflow"))?;
+    let host_code_capacity = host_code_bytes
+        .checked_add(config.pipeline.target.exchange().host_page_bytes)
+        .ok_or_else(|| invalid("host program capacity overflow"))?;
     let host_code = (host_code_bytes != 0)
         .then(|| {
             memory.allocate(MemoryRequest {
                 name: "host programs",
-                bytes: host_code_bytes,
+                bytes: host_code_capacity,
                 alignment: 8,
                 bounds: AddressRegion::new(
                     linked_end,
@@ -980,7 +983,7 @@ fn build_package_from_objects(
         false,
     )?;
     let sizing_code_address = memory.next_free(
-        host_code_base + host_code_bytes,
+        host_code_base + host_code_capacity,
         AddressRegion::new(
             TILE_MEMORY_BASE,
             ipu_target::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
@@ -1032,16 +1035,23 @@ fn build_package_from_objects(
             .max()
             .ok_or_else(|| invalid("execution topology has no tiles"))
     })?;
-    let code_address = if generated_code_bytes == 0 {
+    let generated_code_capacity = if generated_code_bytes == 0 {
+        0
+    } else {
+        generated_code_bytes
+            .checked_add(config.pipeline.target.exchange().host_page_bytes)
+            .ok_or_else(|| invalid("generated tile-code capacity overflow"))?
+    };
+    let code_address = if generated_code_capacity == 0 {
         sizing_code_address
     } else {
         memory
             .allocate(MemoryRequest {
                 name: "generated tile programs",
-                bytes: generated_code_bytes,
+                bytes: generated_code_capacity,
                 alignment: 4,
                 bounds: AddressRegion::new(
-                    host_code_base + host_code_bytes,
+                    host_code_base + host_code_capacity,
                     ipu_target::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 ),
                 // Host programs and generated tile code form one contiguous
@@ -1064,7 +1074,9 @@ fn build_package_from_objects(
             .map_or(0, |allocation| allocation.range.size()),
         exchange_table_bytes,
         host_code_bytes,
+        host_code_capacity,
         generated_code_bytes,
+        generated_code_capacity,
         code_address,
         ?standard_ranges,
         "allocated package support memory"
@@ -1153,9 +1165,9 @@ fn build_package_from_objects(
         .end
         .checked_sub(host_code_base)
         .ok_or_else(|| invalid("host program end precedes its base"))?;
-    if final_host_code_bytes > host_code_bytes {
+    if final_host_code_bytes > host_code_capacity {
         return Err(invalid(format!(
-            "host program grew after tensor placement: reserved {host_code_bytes}, requires {final_host_code_bytes} bytes"
+            "host program grew after tensor placement: reserved {host_code_capacity}, requires {final_host_code_bytes} bytes"
         )));
     }
     let finalizer = TileProgramLowering::new(
@@ -1230,7 +1242,7 @@ fn build_package_from_objects(
     let actual_code_bytes = generated.iter().try_fold(0u32, |maximum, program| {
         Ok::<_, PackageBuildError>(maximum.max(u32::try_from(program.bytes.len())?))
     })?;
-    if actual_code_bytes > generated_code_bytes {
+    if actual_code_bytes > generated_code_capacity {
         return Err(invalid(
             "generated tile code exceeded its planned allocation",
         ));

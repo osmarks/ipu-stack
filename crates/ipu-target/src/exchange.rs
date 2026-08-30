@@ -431,36 +431,24 @@ impl PhaseProgramBuilder {
         schedule_offset: u32,
     ) -> Result<PhaseTransferTiming, ExchangeError> {
         let transfer_timing = self.transfer_timing_at(transfer, schedule_offset)?;
-        let mut updates = Vec::with_capacity(transfer.receivers.len() + 2);
-        let mut source_schedule = self
-            .tile_states
-            .get(usize::from(transfer.source))
+        self.tile_states
+            .get_mut(usize::from(transfer.source))
             .ok_or(ExchangeError::Tile(transfer.source))?
-            .clone();
-        source_schedule.append_sender_at(&transfer.plan.sender, schedule_offset)?;
-        updates.push((transfer.source, source_schedule));
+            .append_sender_at(&transfer.plan.sender, schedule_offset)?;
 
         if let Some(tile) = transfer.reserved_source {
-            let mut schedule = self
+            let schedule = self
                 .tile_states
-                .get(usize::from(tile))
-                .ok_or(ExchangeError::Tile(tile))?
-                .clone();
+                .get_mut(usize::from(tile))
+                .ok_or(ExchangeError::Tile(tile))?;
             schedule.event_cycles = schedule.event_cycles.max(transfer_timing.sender_horizon);
-            updates.push((tile, schedule));
         }
 
         for (&receiver, row) in transfer.receivers.iter().zip(&transfer.plan.receivers) {
-            let mut receiver_schedule = self
-                .tile_states
-                .get(usize::from(receiver))
+            self.tile_states
+                .get_mut(usize::from(receiver))
                 .ok_or(ExchangeError::Tile(receiver))?
-                .clone();
-            receiver_schedule.append_receiver_at(row, schedule_offset, transfer.words)?;
-            updates.push((receiver, receiver_schedule));
-        }
-        for (tile, schedule) in updates {
-            self.tile_states[usize::from(tile)] = schedule;
+                .append_receiver_at(row, schedule_offset, transfer.words)?;
         }
         Ok(transfer_timing)
     }
@@ -575,10 +563,13 @@ impl TileProgramSchedule {
                 .end_cycles
                 .checked_add(offset)
                 .ok_or(ExchangeError::Schedule("send offset overflow"))?;
+            let next = self
+                .senders
+                .partition_point(|sender| sender.end_cycles <= start);
             let conflicting_sender = self
                 .senders
-                .iter()
-                .find(|sender| start < sender.end_cycles && sender.start_cycles < end);
+                .get(next)
+                .filter(|sender| sender.start_cycles < end);
             if let Some(sender) = conflicting_sender {
                 offset = sender
                     .end_cycles
@@ -589,11 +580,11 @@ impl TileProgramSchedule {
             // A receive control cannot be encoded before the first outgoing
             // word. Leave at least one continuation word so SENDPIC can carry
             // a control at the following event.
-            if self
-                .receive_events
-                .iter()
-                .any(|event| event.cycles == start || event.cycles == start.saturating_add(1))
-            {
+            if [start, start.saturating_add(1)].into_iter().any(|cycles| {
+                self.receive_events
+                    .binary_search_by_key(&cycles, |event| event.cycles)
+                    .is_ok()
+            }) {
                 offset = offset
                     .checked_add(1)
                     .ok_or(ExchangeError::Schedule("send offset overflow"))?;
@@ -638,16 +629,25 @@ impl TileProgramSchedule {
                 .as_ref()
                 .is_some_and(|stream| timing.source_start == stream.source_end_cycles);
             let collision = timing.events.iter().any(|new| {
-                self.receive_events.iter().any(|existing| {
-                    new.cycles == existing.cycles
-                        && !(replaces_neutral
-                            && new.kind == ReceiveEventKind::OrdinarySource
-                            && existing.kind == ReceiveEventKind::OrdinaryNeutral)
-                        && !receive_events_can_share_instruction(*new, *existing)
-                })
+                let first = self
+                    .receive_events
+                    .partition_point(|existing| existing.cycles < new.cycles);
+                self.receive_events[first..]
+                    .iter()
+                    .take_while(|existing| existing.cycles == new.cycles)
+                    .any(|existing| {
+                        new.cycles == existing.cycles
+                            && !(replaces_neutral
+                                && new.kind == ReceiveEventKind::OrdinarySource
+                                && existing.kind == ReceiveEventKind::OrdinaryNeutral)
+                            && !receive_events_can_share_instruction(*new, *existing)
+                    })
             });
             let sender_boundary = timing.events.iter().any(|event| {
-                self.senders.iter().any(|sender| {
+                let first = self
+                    .senders
+                    .partition_point(|sender| sender.start_cycles < event.cycles.saturating_sub(1));
+                self.senders[first..].iter().take(2).any(|sender| {
                     event.cycles == sender.start_cycles
                         || event.cycles == sender.start_cycles.saturating_add(1)
                 })
@@ -669,23 +669,39 @@ impl TileProgramSchedule {
         schedule_offset: u32,
     ) -> Result<(), ExchangeError> {
         let timing = sender_row_timing(row, schedule_offset)?;
-        if self.senders.iter().any(|sender| {
-            timing.start_cycles < sender.end_cycles && sender.start_cycles < timing.end_cycles
-        }) {
+        let insertion = self
+            .senders
+            .partition_point(|sender| sender.start_cycles < timing.start_cycles);
+        if self
+            .senders
+            .get(insertion.wrapping_sub(1))
+            .is_some_and(|sender| sender.end_cycles > timing.start_cycles)
+            || self
+                .senders
+                .get(insertion)
+                .is_some_and(|sender| sender.start_cycles < timing.end_cycles)
+        {
             return Err(ExchangeError::Schedule("overlapping outgoing messages"));
         }
-        if self.receive_events.iter().any(|event| {
-            event.cycles == timing.start_cycles
-                || event.cycles == timing.start_cycles.saturating_add(1)
-        }) {
+        if [timing.start_cycles, timing.start_cycles.saturating_add(1)]
+            .into_iter()
+            .any(|cycles| {
+                self.receive_events
+                    .binary_search_by_key(&cycles, |event| event.cycles)
+                    .is_ok()
+            })
+        {
             return Err(ExchangeError::Schedule("unencodable initial send control"));
         }
         self.event_cycles = self.event_cycles.max(timing.horizon_cycles);
-        self.senders.push(ScheduledSenderRow {
-            row: *row,
-            start_cycles: timing.start_cycles,
-            end_cycles: timing.end_cycles,
-        });
+        self.senders.insert(
+            insertion,
+            ScheduledSenderRow {
+                row: *row,
+                start_cycles: timing.start_cycles,
+                end_cycles: timing.end_cycles,
+            },
+        );
         Ok(())
     }
 
@@ -725,13 +741,14 @@ impl TileProgramSchedule {
                 return Err(ExchangeError::Schedule("overlapping receive streams"));
             }
             if timing.source_start == stream.source_end_cycles {
-                let neutral = self
+                let first = self
                     .receive_events
+                    .partition_point(|event| event.cycles < stream.source_end_cycles);
+                let neutral = self.receive_events[first..]
                     .iter()
-                    .rposition(|event| {
-                        event.kind == ReceiveEventKind::OrdinaryNeutral
-                            && event.cycles == stream.source_end_cycles
-                    })
+                    .take_while(|event| event.cycles == stream.source_end_cycles)
+                    .position(|event| event.kind == ReceiveEventKind::OrdinaryNeutral)
+                    .map(|position| first + position)
                     .filter(|_| {
                         stream.mode == ReceiveMode::Ordinary && base.mode == ReceiveMode::Ordinary
                     });
@@ -740,12 +757,12 @@ impl TileProgramSchedule {
                 }
             }
         }
-        // `earliest_receiver_offset` checked the new events against the full
-        // existing stream, while `scheduled_receive_window` validated the new
-        // group internally. Source and pointer controls are independent and
-        // may be inserted on opposite sides of an older teardown event, so
-        // keep insertion order here and sort once when encoding the row.
-        self.receive_events.extend(timing.events.iter().copied());
+        for event in timing.events.iter().copied() {
+            let insertion = self
+                .receive_events
+                .partition_point(|existing| existing.cycles <= event.cycles);
+            self.receive_events.insert(insertion, event);
+        }
         self.event_cycles = self.event_cycles.max(timing.horizon);
         self.receive_stream = Some(ReceiveStream {
             mode: base.mode,
