@@ -131,10 +131,7 @@ pub enum GemmOrientation {
 /// and tile-kernel phases after concrete shards are known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperatorDispatch {
-    Pointwise {
-        kernel: TileKernelSpec,
-        input_mapping: PointwiseInputMapping,
-    },
+    Pointwise(PointwiseInputMapping),
     BlockedGemm(BlockedGemmPlan),
     Attention(AttentionPlan),
 }
@@ -335,7 +332,7 @@ enum EmptyOutputShardPolicy {
 impl OperatorDispatch {
     fn empty_output_shard_policy(&self) -> EmptyOutputShardPolicy {
         match self {
-            Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
+            Self::Pointwise(_) => EmptyOutputShardPolicy::Skip,
             Self::BlockedGemm(_) | Self::Attention(_) => EmptyOutputShardPolicy::Reject,
         }
     }
@@ -814,20 +811,7 @@ impl OperatorPlan {
                 }
                 Ok(())
             }
-            (
-                MidOperator::Gelu,
-                OperatorDispatch::Pointwise {
-                    kernel: TileKernelSpec::Gelu,
-                    ..
-                },
-            )
-            | (
-                MidOperator::Add(_),
-                OperatorDispatch::Pointwise {
-                    kernel: TileKernelSpec::Add,
-                    ..
-                },
-            ) => {
+            (MidOperator::Gelu | MidOperator::Add(_), OperatorDispatch::Pointwise(_)) => {
                 let output_tiles = output.format.layout.tiling.tile_count;
                 if inputs
                     .iter()
@@ -933,30 +917,6 @@ impl OperatorPlan {
                     || kernel.weights != GemmWeightLoad::Standard
                 {
                     Err(OperatorPlanError::InvalidBlocking)
-                } else {
-                    Ok(())
-                }
-            }
-            (
-                MidOperator::FlashAttention {
-                    options,
-                    accumulate,
-                },
-                OperatorDispatch::Pointwise {
-                    kernel:
-                        TileKernelSpec::FlashAttention {
-                            options: kernel_options,
-                            accumulate: kernel_accumulate,
-                        },
-                    ..
-                },
-            ) if options == kernel_options && accumulate == kernel_accumulate => {
-                let output_tiles = output.format.layout.tiling.tile_count;
-                if inputs
-                    .iter()
-                    .any(|input| input.format.layout.tiling.tile_count != output_tiles)
-                {
-                    Err(OperatorPlanError::IncompatibleTileGroups)
                 } else {
                     Ok(())
                 }

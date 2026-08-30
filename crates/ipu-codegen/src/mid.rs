@@ -2142,11 +2142,6 @@ fn pointwise_plans(
         MidOperator::Add(_) => PointwiseInputMapping::BroadcastToOutput,
         _ => return Vec::new(),
     };
-    let kernel = match operator {
-        MidOperator::Gelu => TileKernelSpec::Gelu,
-        MidOperator::Add(_) => TileKernelSpec::Add,
-        _ => unreachable!(),
-    };
     let mut plans = Vec::new();
     for (anchor, input) in inputs.iter().enumerate() {
         if input.shape != *output
@@ -2172,10 +2167,7 @@ fn pointwise_plans(
             );
             let plan = OperatorPlan {
                 operator,
-                dispatch: OperatorDispatch::Pointwise {
-                    kernel: kernel.clone(),
-                    input_mapping: mapping,
-                },
+                dispatch: OperatorDispatch::Pointwise(mapping),
                 requirements: OperatorRequirements {
                     inputs: (0..inputs.len())
                         .map(|_| OperandRequirement::new(format.clone(), 8))
@@ -2378,7 +2370,7 @@ fn independent_parameter_storage(
     let inner_blocks = inner.div_ceil(u32::from(inner_block));
     let output_column_block = match candidate.dispatch {
         OperatorDispatch::BlockedGemm(plan) => plan.geometry.block.output_columns,
-        OperatorDispatch::Pointwise { .. } | OperatorDispatch::Attention(_) => {
+        OperatorDispatch::Pointwise(_) | OperatorDispatch::Attention(_) => {
             return Vec::new();
         }
     };

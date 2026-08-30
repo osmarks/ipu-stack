@@ -755,7 +755,7 @@ fn estimated_operator_exchange_cycles(
         OperatorDispatch::Attention(_) => attention_endpoint_traffic(inputs, output, dispatch)
             .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
             .unwrap_or(u64::MAX / 8),
-        OperatorDispatch::Pointwise { .. } => 0,
+        OperatorDispatch::Pointwise(_) => 0,
     }
 }
 
@@ -1122,7 +1122,7 @@ impl CostModel for Ipu21CostModel {
                         .div_ceil(u64::from(plan.geometry.block.output_columns))
                         .saturating_mul(matrices_per_tile)
                         .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                    OperatorDispatch::Pointwise { .. } => 0,
+                    OperatorDispatch::Pointwise(_) => 0,
                     OperatorDispatch::Attention(_) => 0,
                 };
                 let kernel = amp_kernel_cycles(
@@ -1480,16 +1480,13 @@ mod tests {
     use super::*;
     use crate::{
         OperandRequirement, OperatorRequirements, OutputAliasing, PointwiseInputMapping,
-        TensorFormat, TileKernelSpec,
+        TensorFormat,
     };
 
     const CASES: usize = 32;
 
     fn pointwise_dispatch() -> OperatorDispatch {
-        OperatorDispatch::Pointwise {
-            kernel: TileKernelSpec::Gelu,
-            input_mapping: PointwiseInputMapping::TileLocal,
-        }
+        OperatorDispatch::Pointwise(PointwiseInputMapping::TileLocal)
     }
 
     fn pointwise_requirements(format: TensorFormat) -> OperatorRequirements {

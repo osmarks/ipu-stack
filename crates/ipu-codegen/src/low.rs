@@ -1688,16 +1688,14 @@ impl LoweringState {
             .operator_plan()
             .ok_or(LowLoweringError::MissingOperatorPlan)?;
         match &plan.dispatch {
-            OperatorDispatch::Pointwise {
-                kernel,
-                input_mapping,
-            } => self.lower_pointwise(
-                operation,
-                kernel.clone(),
-                *input_mapping,
-                &plan.requirements,
-                tiles,
-            ),
+            OperatorDispatch::Pointwise(input_mapping) => {
+                let kernel = match plan.operator {
+                    crate::MidOperator::Gelu => TileKernelSpec::Gelu,
+                    crate::MidOperator::Add(_) => TileKernelSpec::Add,
+                    _ => return Err(LowLoweringError::InvalidOperatorPlan),
+                };
+                self.lower_pointwise(operation, kernel, *input_mapping, &plan.requirements, tiles)
+            }
             OperatorDispatch::BlockedGemm(dispatch) => {
                 self.lower_blocked_gemm(operation, dispatch, &plan.requirements, tiles)
             }
