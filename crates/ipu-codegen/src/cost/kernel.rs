@@ -210,15 +210,10 @@ fn attention_endpoint_traffic(
     let OperatorDispatch::Attention(plan) = dispatch else {
         return Some((ExchangeEndpointTraffic::default(), 0));
     };
-    let (query_block_rows, key_block_rows, phases) = match plan.blocking {
-        crate::AttentionBlocking::Flash {
-            query_rows,
-            key_rows,
-        } => (query_rows, key_rows, None),
-        crate::AttentionBlocking::Materialized { query_rows, .. } => {
-            (query_rows, crate::layout::AMP_INNER_BLOCK, Some(3))
-        }
-    };
+    let query_block_rows = plan.blocking.query_rows();
+    let key_block_rows = plan.blocking.key_block_rows();
+    let phases =
+        matches!(plan.blocking, crate::AttentionBlocking::Materialized { .. }).then_some(3);
     let padded_query_dimension = plan.padding.query_dimension;
     let padded_value_dimension = plan.padding.value_dimension;
     let key = inputs.get(1)?;
@@ -605,16 +600,10 @@ fn deferred_split_input_cycles(
     }
 
     let (query_block_rows, key_block_rows) = match consumer_dispatch {
-        OperatorDispatch::Attention(plan) => match plan.blocking {
-            crate::AttentionBlocking::Flash {
-                query_rows,
-                key_rows,
-            } => (u64::from(query_rows), u64::from(key_rows)),
-            crate::AttentionBlocking::Materialized { query_rows, .. } => (
-                u64::from(query_rows),
-                u64::from(crate::layout::AMP_INNER_BLOCK),
-            ),
-        },
+        OperatorDispatch::Attention(plan) => (
+            u64::from(plan.blocking.query_rows()),
+            u64::from(plan.blocking.key_block_rows()),
+        ),
         _ => (rows, u64::from(crate::layout::AMP_INNER_BLOCK)),
     };
     let block_rows = key_block_rows.max(1);

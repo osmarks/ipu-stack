@@ -1529,78 +1529,59 @@ fn plans_for_operation(
                 precision: Precision::F32,
                 layout: Layout::attention_output(heads, query_partitions),
             };
-            if config.search_domain.attention_strategy != AttentionStrategy::Materialized {
-                plans.push(OperatorPlan {
-                    operator: MidOperator::FlashAttention {
-                        options,
-                        accumulate: AccumulationPrecision::F32,
-                    },
-                    dispatch: OperatorDispatch::Attention(AttentionPlan {
-                        kernel: GemmKernelFamily {
-                            multiply: Precision::F16,
-                            accumulate: AccumulationPrecision::F32,
-                            weights: GemmWeightLoad::Standard,
-                        },
-                        blocking: AttentionBlocking::Flash {
-                            query_rows: query_rows.div_ceil(u32::from(query_partitions)),
-                            key_rows: AMP_INNER_BLOCK,
-                        },
-                        padding: AttentionPadding {
-                            query_dimension: padded_query_dimension,
-                            value_dimension: padded_value_dimension,
-                        },
+            let operator = MidOperator::FlashAttention {
+                options,
+                accumulate: AccumulationPrecision::F32,
+            };
+            let kernel = GemmKernelFamily {
+                multiply: Precision::F16,
+                accumulate: AccumulationPrecision::F32,
+                weights: GemmWeightLoad::Standard,
+            };
+            let padding = AttentionPadding {
+                query_dimension: padded_query_dimension,
+                value_dimension: padded_value_dimension,
+            };
+            let requirements = OperatorRequirements {
+                inputs: [query_format, key_format, value_format]
+                    .into_iter()
+                    .map(|format| {
+                        OperandRequirement::new(format, 8)
+                            .with_materialization(OperandMaterialization::DispatchSlices)
+                    })
+                    .collect(),
+                output: OperandRequirement::new(output_format, 8),
+                output_aliasing: OutputAliasing::Fresh,
+                memory_space: MemorySpaceRequirements::default(),
+            };
+            let query_rows = query_rows.div_ceil(u32::from(query_partitions));
+            let blockings = [
+                (config.search_domain.attention_strategy != AttentionStrategy::Materialized)
+                    .then_some(AttentionBlocking::Flash {
+                        query_rows,
+                        key_rows: AMP_INNER_BLOCK,
                     }),
-                    requirements: OperatorRequirements {
-                        inputs: vec![
-                            OperandRequirement::new(query_format.clone(), 8)
-                                .with_materialization(OperandMaterialization::DispatchSlices),
-                            OperandRequirement::new(key_format.clone(), 8)
-                                .with_materialization(OperandMaterialization::DispatchSlices),
-                            OperandRequirement::new(value_format.clone(), 8)
-                                .with_materialization(OperandMaterialization::DispatchSlices),
-                        ],
-                        output: OperandRequirement::new(output_format.clone(), 8),
-                        output_aliasing: OutputAliasing::Fresh,
-                        memory_space: MemorySpaceRequirements::default(),
+                (config.search_domain.attention_strategy != AttentionStrategy::Flash).then_some(
+                    AttentionBlocking::Materialized {
+                        query_rows,
+                        padded_key_rows,
                     },
-                });
-            }
-            if config.search_domain.attention_strategy != AttentionStrategy::Flash {
-                plans.push(OperatorPlan {
-                    operator: MidOperator::FlashAttention {
-                        options,
-                        accumulate: AccumulationPrecision::F32,
-                    },
-                    dispatch: OperatorDispatch::Attention(AttentionPlan {
-                        kernel: GemmKernelFamily {
-                            multiply: Precision::F16,
-                            accumulate: AccumulationPrecision::F32,
-                            weights: GemmWeightLoad::Standard,
-                        },
-                        blocking: AttentionBlocking::Materialized {
-                            query_rows: query_rows.div_ceil(u32::from(query_partitions)),
-                            padded_key_rows,
-                        },
-                        padding: AttentionPadding {
-                            query_dimension: padded_query_dimension,
-                            value_dimension: padded_value_dimension,
-                        },
+                ),
+            ];
+            plans.extend(
+                blockings
+                    .into_iter()
+                    .flatten()
+                    .map(|blocking| OperatorPlan {
+                        operator,
+                        dispatch: OperatorDispatch::Attention(AttentionPlan {
+                            kernel,
+                            blocking,
+                            padding,
+                        }),
+                        requirements: requirements.clone(),
                     }),
-                    requirements: OperatorRequirements {
-                        inputs: vec![
-                            OperandRequirement::new(query_format, 8)
-                                .with_materialization(OperandMaterialization::DispatchSlices),
-                            OperandRequirement::new(key_format, 8)
-                                .with_materialization(OperandMaterialization::DispatchSlices),
-                            OperandRequirement::new(value_format, 8)
-                                .with_materialization(OperandMaterialization::DispatchSlices),
-                        ],
-                        output: OperandRequirement::new(output_format, 8),
-                        output_aliasing: OutputAliasing::Fresh,
-                        memory_space: MemorySpaceRequirements::default(),
-                    },
-                });
-            }
+            );
         }
     }
     match operation.kind {
@@ -2351,6 +2332,7 @@ mod tests {
                     order: GridOrder::ColumnsFast,
                     distribution: GemmDistribution::OutputStationary,
                 },
+                output_columns,
                 AmpWeightPlacement::resident(MemoryClass::Standard),
             );
             let inputs = [
@@ -2540,6 +2522,7 @@ mod tests {
                 Precision::F16,
                 16,
                 geometry,
+                geometry.block.output_columns,
                 AmpWeightPlacement::resident(MemoryClass::Interleaved),
             );
             let inputs = [

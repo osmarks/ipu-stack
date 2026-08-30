@@ -146,6 +146,21 @@ pub enum AttentionBlocking {
     },
 }
 
+impl AttentionBlocking {
+    pub const fn query_rows(self) -> u32 {
+        match self {
+            Self::Flash { query_rows, .. } | Self::Materialized { query_rows, .. } => query_rows,
+        }
+    }
+
+    pub const fn key_block_rows(self) -> u32 {
+        match self {
+            Self::Flash { key_rows, .. } => key_rows,
+            Self::Materialized { .. } => AMP_INNER_BLOCK,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionPlan {
     pub kernel: GemmKernelFamily,
@@ -156,10 +171,10 @@ pub struct AttentionPlan {
 impl AttentionPlan {
     pub fn gemm_blocks(&self) -> [GemmBlockShape; 2] {
         let key_columns = match self.blocking {
-            AttentionBlocking::Flash { key_rows, .. } => key_rows,
             AttentionBlocking::Materialized {
                 padded_key_rows, ..
             } => padded_key_rows,
+            blocking => blocking.key_block_rows(),
         };
         [
             GemmBlockShape {

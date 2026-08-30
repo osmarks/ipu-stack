@@ -7,7 +7,7 @@ use crate::layout::{
     AMP_WIDE_OUTPUT_COLUMN_BLOCK, Layout, MemoryClass, Padding, StorageOrder, TensorAxis,
     TensorFormat, TensorType,
 };
-use crate::metrics::{CostEstimate, RegionMetrics};
+use crate::metrics::{CostEstimate, RegionMetrics, pareto_frontier};
 use crate::operator::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,7 +30,7 @@ pub(super) fn gemm_seed_plans_for_tile_count(
     tile_count: u16,
     domain: &PlannerSearchDomain,
 ) -> Vec<OperatorPlan> {
-    let mut candidates = (1..=tile_count)
+    let candidates = (1..=tile_count)
         .rev()
         .filter(|columns| tile_count.is_multiple_of(*columns))
         .flat_map(|columns| {
@@ -98,9 +98,29 @@ pub(super) fn gemm_seed_plans_for_tile_count(
                     }
                     let mut geometry = geometry;
                     geometry.block.output_columns = output_columns;
-                    let candidate =
-                        amp_grid_gemm_plan(options, precision, left_tail, geometry, weights);
+                    let candidate = amp_grid_gemm_plan(
+                        options,
+                        precision,
+                        left_tail,
+                        geometry,
+                        output_columns,
+                        weights,
+                    );
                     grid.push(candidate.clone());
+                    if columns == 1
+                        && rows == tile_count
+                        && output_columns > AMP_OUTPUT_COLUMN_BLOCK
+                        && weights == AmpWeightPlacement::resident(MemoryClass::Standard)
+                    {
+                        grid.push(amp_grid_gemm_plan(
+                            options,
+                            precision,
+                            left_tail,
+                            geometry,
+                            AMP_OUTPUT_COLUMN_BLOCK,
+                            weights,
+                        ));
+                    }
                     if precision == Precision::F16 && weights.memory_class == MemoryClass::Standard
                     {
                         let mut staged = candidate;
@@ -113,26 +133,6 @@ pub(super) fn gemm_seed_plans_for_tile_count(
             grid
         })
         .collect::<Vec<_>>();
-    if domain.permits_weight_memory(MemoryClass::Standard) {
-        for &precision in domain.precisions(OperatorClass::Gemm) {
-            let Some(left_tail) = gemm_left_access_tail(precision) else {
-                continue;
-            };
-            for &output_columns in amp_output_column_blocks(precision)
-                .iter()
-                .filter(|&&columns| columns >= AMP_OUTPUT_COLUMN_BLOCK)
-            {
-                candidates.push(amp_gemm_plan(
-                    options,
-                    precision,
-                    64,
-                    left_tail,
-                    output_columns,
-                    tile_count,
-                ));
-            }
-        }
-    }
     let mut unique = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         if !unique.contains(&candidate) {
@@ -157,95 +157,20 @@ const fn gemm_supports_weight_memory(precision: Precision, memory_class: MemoryC
     )
 }
 
-fn amp_gemm_plan(
-    options: GemmOptions,
-    precision: Precision,
-    inner: u16,
-    left_tail: u32,
-    output_columns: u32,
-    tile_count: u16,
-) -> OperatorPlan {
-    let operator = MidOperator::Gemm {
-        options,
-        multiply: precision,
-        accumulate: gemm_accumulation_precision(precision),
-    };
-    OperatorPlan::candidate(
-        operator,
-        blocked_gemm_dispatch(
-            operator,
-            GemmGeometry {
-                block: GemmBlockShape {
-                    inner: u32::from(inner),
-                    output_columns,
-                },
-                orientation: GemmOrientation::Normal,
-                result: GemmResultGrid {
-                    rows: tile_count,
-                    columns: 1,
-                },
-                order: GridOrder::ColumnsFast,
-                distribution: GemmDistribution::OutputStationary,
-            },
-        ),
-        OperatorRequirements {
-            inputs: vec![
-                OperandRequirement::new(
-                    TensorFormat {
-                        precision,
-                        layout: Layout::amp_left(inner, tile_count),
-                    },
-                    32,
-                )
-                .with_access_tail(left_tail)
-                .with_materialization(OperandMaterialization::DispatchSlices),
-                OperandRequirement::new(
-                    TensorFormat {
-                        precision,
-                        layout: Layout::block_major_matrix_storage(
-                            inner,
-                            AMP_OUTPUT_COLUMN_BLOCK,
-                            tile_count,
-                            1,
-                            1,
-                            MemoryClass::Standard,
-                        ),
-                    },
-                    32,
-                ),
-            ],
-            output: OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: if precision == Precision::F16 {
-                        Layout::amp_left_result(tile_count)
-                    } else {
-                        Layout::amp_output(tile_count)
-                    },
-                },
-                32,
-            ),
-            output_aliasing: OutputAliasing::Fresh,
-            memory_space: MemorySpaceRequirements::default()
-                .with_distinct_elements([MemoryOperand::Output, MemoryOperand::Input(0)]),
-        },
-    )
-}
-
 pub(super) fn amp_grid_gemm_plan(
     options: GemmOptions,
     precision: Precision,
     left_tail: u32,
     geometry: GemmGeometry,
+    storage_column_block: u32,
     weights: AmpWeightPlacement,
 ) -> OperatorPlan {
     let inner = u16::try_from(geometry.block.inner).unwrap_or(0);
-    let output_columns = geometry.block.output_columns;
     let grid = geometry.result;
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
         (1, MemoryClass::Standard) => Layout::block_major_matrix_grid(
             inner,
-            output_columns,
+            storage_column_block,
             grid.tile_count(),
             grid.rows,
             grid.columns,
@@ -253,7 +178,7 @@ pub(super) fn amp_grid_gemm_plan(
         ),
         (inner_partitions, memory_class) => Layout::block_major_matrix_storage(
             inner,
-            output_columns,
+            storage_column_block,
             grid.columns,
             inner_partitions,
             grid.rows / inner_partitions,
@@ -305,7 +230,7 @@ pub(super) fn amp_grid_gemm_plan(
                     precision,
                     layout: if precision == Precision::F16 {
                         Layout::amp_left_result_grid(
-                            output_columns,
+                            storage_column_block,
                             grid.tile_count(),
                             grid.rows,
                             grid.columns,
@@ -313,7 +238,7 @@ pub(super) fn amp_grid_gemm_plan(
                         )
                     } else {
                         Layout::amp_output_grid(
-                            output_columns,
+                            storage_column_block,
                             grid.tile_count(),
                             grid.rows,
                             grid.columns,
@@ -844,19 +769,11 @@ fn parallel_reduction_plans_for_orientation(
         // Inner partitioning and grouped outputs select different lowering
         // families. Within each family the shared metrics vocabulary retains
         // cycle, exchange, and memory tradeoffs for precise evaluation below.
-        let dominates = |left: &ParallelGridCandidate, right: &ParallelGridCandidate| {
-            left.grid.inner == right.grid.inner
-                && left.grouped == right.grouped
-                && left.metrics.dominates(right.metrics)
-        };
-        let mut frontier = Vec::new();
-        for grid in grids {
-            if frontier.iter().any(|kept| dominates(kept, &grid)) {
-                continue;
-            }
-            frontier.retain(|kept| !dominates(&grid, kept));
-            frontier.push(grid);
-        }
+        let (mut frontier, _) = pareto_frontier(
+            grids,
+            |grid| (grid.grid.inner, grid.grouped),
+            |grid| grid.metrics,
+        );
         frontier.sort_by_key(|grid| {
             (
                 grid.metrics.cost.cycles,
@@ -1299,20 +1216,11 @@ fn retain_precise_gemm_plans(
             (candidate, objective, compatibility)
         })
         .collect::<Vec<_>>();
-    let mut frontier = Vec::<(OperatorPlan, RegionMetrics, GemmPlanCompatibility)>::new();
-    for entry in ranked {
-        if frontier
-            .iter()
-            .any(|(_, kept, compatibility)| *compatibility == entry.2 && kept.dominates(entry.1))
-        {
-            continue;
-        }
-        frontier.retain(|(_, kept, compatibility)| {
-            *compatibility != entry.2 || !entry.1.dominates(*kept)
-        });
-        frontier.push(entry);
-    }
-    let mut ranked = frontier;
+    let (mut ranked, _) = pareto_frontier(
+        ranked,
+        |(_, _, compatibility)| compatibility.clone(),
+        |(_, objective, _)| *objective,
+    );
     ranked.sort_by_key(|(_, objective, _)| {
         (
             objective.cost.cycles,

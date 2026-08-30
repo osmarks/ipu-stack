@@ -251,3 +251,29 @@ impl PlanMetrics<MemoryPeaks> {
             && left.iter().zip(right).any(|(left, right)| *left < right)
     }
 }
+
+pub(crate) fn pareto_frontier<T, K: PartialEq>(
+    candidates: impl IntoIterator<Item = T>,
+    class: impl Fn(&T) -> K,
+    objective: impl Fn(&T) -> RegionMetrics,
+) -> (Vec<T>, usize) {
+    let mut frontier = Vec::new();
+    let mut dominated = 0;
+    for candidate in candidates {
+        let candidate_class = class(&candidate);
+        let candidate_objective = objective(&candidate);
+        if frontier.iter().any(|kept| {
+            class(kept) == candidate_class && objective(kept).dominates(candidate_objective)
+        }) {
+            dominated += 1;
+            continue;
+        }
+        let before = frontier.len();
+        frontier.retain(|kept| {
+            class(kept) != candidate_class || !candidate_objective.dominates(objective(kept))
+        });
+        dominated += before - frontier.len();
+        frontier.push(candidate);
+    }
+    (frontier, dominated)
+}
