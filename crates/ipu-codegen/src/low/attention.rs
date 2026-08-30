@@ -422,7 +422,7 @@ impl LoweringState {
         else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let (query_key, probability_value) = attention_kernel_specs(plan);
+        let [query_key_block, probability_value_block] = plan.gemm_blocks();
         let padded_value_dimension = plan.padding.value_dimension;
         if key_block_rows != AMP_INNER_BLOCK || query_block_rows == 0 {
             return Err(LowLoweringError::InvalidOperatorPlan);
@@ -514,7 +514,12 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        query_key.clone(),
+                        gemm_kernel_spec(
+                            plan.kernel,
+                            GemmKernelMode::Initialize,
+                            query_key_block,
+                            task.query_rows,
+                        ),
                         vec![
                             KernelOperand {
                                 views: vec![self.full_view(task.query)],
@@ -533,6 +538,7 @@ impl LoweringState {
                     KernelRun::new(
                         kernel_provenance,
                         TileKernelSpec::AttentionSoftmax {
+                            query_rows: task.query_rows,
                             head_dimension: task.query_dimension,
                             key_columns: valid_key_rows,
                             padded_key_columns: key_block_rows,
@@ -552,7 +558,12 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        probability_value.clone(),
+                        gemm_kernel_spec(
+                            plan.kernel,
+                            GemmKernelMode::Initialize,
+                            probability_value_block,
+                            task.query_rows,
+                        ),
                         vec![
                             KernelOperand {
                                 views: vec![probability_view],
@@ -571,6 +582,7 @@ impl LoweringState {
                     KernelRun::new(
                         kernel_provenance,
                         TileKernelSpec::AttentionMerge {
+                            query_rows: task.query_rows,
                             value_dimension: task.value_dimension,
                             padded_value_dimension,
                             key_block_columns: key_block_rows,
@@ -676,7 +688,7 @@ impl LoweringState {
         else {
             return Err(LowLoweringError::InvalidOperatorPlan);
         };
-        let (query_key, probability_value) = attention_kernel_specs(plan);
+        let [query_key_block, probability_value_block] = plan.gemm_blocks();
         let padded_value_dimension = plan.padding.value_dimension;
         if query_block_rows == 0
             || padded_key_rows == 0
@@ -709,7 +721,12 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    query_key.clone(),
+                    gemm_kernel_spec(
+                        plan.kernel,
+                        GemmKernelMode::Initialize,
+                        query_key_block,
+                        task.query_rows,
+                    ),
                     vec![
                         KernelOperand {
                             views: vec![self.full_view(task.query)],
@@ -728,6 +745,7 @@ impl LoweringState {
                 KernelRun::new(
                     kernel_provenance,
                     TileKernelSpec::AttentionSoftmax {
+                        query_rows: task.query_rows,
                         head_dimension: task.query_dimension,
                         key_columns: key_rows,
                         padded_key_columns: padded_key_rows,
@@ -756,7 +774,12 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    probability_value.clone(),
+                    gemm_kernel_spec(
+                        plan.kernel,
+                        GemmKernelMode::Initialize,
+                        probability_value_block,
+                        task.query_rows,
+                    ),
                     vec![
                         KernelOperand {
                             views: vec![probabilities],
@@ -775,6 +798,7 @@ impl LoweringState {
                 KernelRun::new(
                     kernel_provenance,
                     TileKernelSpec::AttentionMerge {
+                        query_rows: task.query_rows,
                         value_dimension: task.value_dimension,
                         padded_value_dimension,
                         key_block_columns: padded_key_rows,
@@ -967,10 +991,12 @@ impl LoweringState {
             tile,
             KernelRun::new(
                 provenance,
-                TileKernelSpec::Rearrange {
-                    from: input.layout.clone(),
-                    to: output.layout.clone(),
-                },
+                rearrange_kernel_spec(
+                    input.layout.clone(),
+                    output.layout.clone(),
+                    &self.full_view(source),
+                    &self.full_view(destination),
+                )?,
                 vec![KernelOperand {
                     views: vec![self.full_view(source)],
                 }],

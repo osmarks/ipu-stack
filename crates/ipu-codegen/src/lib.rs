@@ -50,8 +50,8 @@ pub use ir::{
 };
 pub use kernel::{
     KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
-    KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument, TileKernelSpec,
-    materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
+    KernelMaterializationError, KernelOptimization, KernelSymbols, PlannedKernelCall,
+    ScalarArgument, TileKernelSpec, materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
 };
 pub use layout::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AxisTiling, BlockedOrder, Layout,

@@ -4,9 +4,9 @@
 use crate::MemorySpaceRequirements;
 use crate::layout::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AccumulationPrecision, AttentionOptions, GemmKernelMode, GemmWeightLoad, KernelRequirements,
-    KernelRun, Layout, LowProgram, LowShard, LowShardId, NativeKernelOrder, Precision,
-    StorageError, StorageOrder, TileWorkList, TileWorkRef, view_byte_spans,
+    AccumulationPrecision, GemmKernelMode, GemmWeightLoad, KernelRequirements, KernelRun, Layout,
+    LowProgram, LowShard, LowShardId, NativeKernelOrder, Precision, StorageError, StorageOrder,
+    TileWorkList, TileWorkRef, view_byte_spans,
 };
 use ipu_target::program::{ComputeStep, StepProfile, TileAddress};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,7 @@ pub const FIRST_INPUT_REGISTER: u8 = 3;
 pub const RETURN_REGISTER: u8 = 10;
 
 /// A concrete tile-local callable produced during low lowering.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TileKernelSpec {
     FillZero,
     Gemm {
@@ -26,22 +26,21 @@ pub enum TileKernelSpec {
         weights: GemmWeightLoad,
         inner_block: u32,
         output_columns: u32,
+        rows: u32,
     },
     Gelu,
     ReductionSum {
         partials: u16,
     },
     Add,
-    FlashAttention {
-        options: AttentionOptions,
-        accumulate: AccumulationPrecision,
-    },
     AttentionSoftmax {
+        query_rows: u32,
         head_dimension: u32,
         key_columns: u32,
         padded_key_columns: u32,
     },
     AttentionMerge {
+        query_rows: u32,
         value_dimension: u32,
         padded_value_dimension: u32,
         key_block_columns: u32,
@@ -55,6 +54,11 @@ pub enum TileKernelSpec {
     Rearrange {
         from: Layout,
         to: Layout,
+        matrices: u32,
+        logical_rows: u32,
+        physical_rows: u32,
+        logical_columns: u32,
+        physical_columns: u32,
     },
 }
 
@@ -62,7 +66,6 @@ pub enum TileKernelSpec {
 pub enum KernelSymbols {
     Exact(&'static str),
     RowSpecialized { small: String, large: String },
-    AttentionSpecialized,
     AttentionStageSpecialized,
     RearrangeSpecialized,
     UnpackSpecialized,
@@ -94,8 +97,32 @@ pub struct KernelAbi {
 pub struct KernelCompilation {
     pub source: &'static str,
     pub name: String,
-    pub flags: Vec<String>,
+    pub optimization: Option<KernelOptimization>,
+    pub definitions: Vec<(&'static str, String)>,
     pub retained_symbols: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelOptimization {
+    Size,
+    Speed,
+}
+
+impl KernelCompilation {
+    pub fn compiler_flags(&self) -> Vec<String> {
+        self.optimization
+            .map(|optimization| match optimization {
+                KernelOptimization::Size => "-Os".to_owned(),
+                KernelOptimization::Speed => "-O2".to_owned(),
+            })
+            .into_iter()
+            .chain(
+                self.definitions
+                    .iter()
+                    .map(|(name, value)| format!("-D{name}={value}")),
+            )
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -103,7 +130,6 @@ pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
     gemm_rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), Vec<u32>>,
     gemm_symbols: BTreeMap<(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32), String>,
-    attention_symbols: BTreeMap<AttentionKernelShape, String>,
     attention_stage_symbols: Vec<(TileKernelSpec, u32, String)>,
     rearrange_symbols: BTreeMap<(RearrangeTarget, u32, u32, u32, u32), String>,
     unpack_symbols: BTreeMap<(UnpackSource, u32, u32, u32, u32), String>,
@@ -163,16 +189,6 @@ impl RearrangeTarget {
             Self::BlockMajor { .. } => 2,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct AttentionKernelShape {
-    matrices: u32,
-    query_rows: u32,
-    key_rows: u32,
-    query_dimension: u32,
-    value_dimension: u32,
-    scale_bits: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -247,7 +263,6 @@ impl KernelBuildPlan {
         let mut reduction_add = false;
         let mut rearrangements = BTreeSet::new();
         let mut unpacks = BTreeSet::new();
-        let mut attention = BTreeSet::new();
         let mut attention_stages = Vec::new();
         for tile in &program.tiles {
             collect_kernels(
@@ -258,7 +273,6 @@ impl KernelBuildPlan {
                 &mut reduction_add,
                 &mut rearrangements,
                 &mut unpacks,
-                &mut attention,
                 &mut attention_stages,
             )?;
         }
@@ -312,21 +326,21 @@ impl KernelBuildPlan {
                     }
                 }
                 let single_rows = pair.len() == 1;
-                let mut flags = vec![
-                    format!("-DGEMM_SMALL_ROWS={small}"),
-                    format!("-DGEMM_LARGE_ROWS={large}"),
-                    format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
-                    format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block}"),
-                    format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
-                    format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
-                    format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
-                    format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
+                let mut definitions = vec![
+                    ("GEMM_SMALL_ROWS", small.to_string()),
+                    ("GEMM_LARGE_ROWS", large.to_string()),
+                    ("GEMM_OUTPUT_COLUMNS", output_columns.to_string()),
+                    ("GEMM_INNER_BLOCK_DIMENSION", inner_block.to_string()),
+                    ("GEMM_INIT_SMALL_SYMBOL", symbols[0].clone()),
+                    ("GEMM_INIT_LARGE_SYMBOL", symbols[1].clone()),
+                    ("GEMM_ACCUMULATE_SMALL_SYMBOL", symbols[2].clone()),
+                    ("GEMM_ACCUMULATE_LARGE_SYMBOL", symbols[3].clone()),
                 ];
                 if single_rows {
-                    flags.push("-DGEMM_SINGLE_ROWS=1".into());
+                    definitions.push(("GEMM_SINGLE_ROWS", "1".into()));
                 }
                 if weights == GemmWeightLoad::Interleaved {
-                    flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
+                    definitions.push(("GEMM_INTERLEAVED_WEIGHTS", "1".into()));
                 }
                 let retained_symbols = if single_rows {
                     vec![symbols[0].clone(), symbols[2].clone()]
@@ -338,7 +352,8 @@ impl KernelBuildPlan {
                     name: format!(
                         "gemm_{prefix}{weight_suffix}_k{inner_block}_c{output_columns}_r{small}_r{large}"
                     ),
-                    flags,
+                    optimization: None,
+                    definitions,
                     retained_symbols,
                 });
             }
@@ -349,7 +364,8 @@ impl KernelBuildPlan {
             plan.compilations.push(KernelCompilation {
                 source: "gelu_f16.S",
                 name: "gelu_f16".into(),
-                flags: Vec::new(),
+                optimization: None,
+                definitions: Vec::new(),
                 retained_symbols: vec!["ipu_stack_gelu_tanh_approx_f16".into()],
             });
         }
@@ -357,7 +373,8 @@ impl KernelBuildPlan {
             plan.compilations.push(KernelCompilation {
                 source: "reduce_add_f16.S",
                 name: "reduce_add_f16".into(),
-                flags: Vec::new(),
+                optimization: None,
+                definitions: Vec::new(),
                 retained_symbols: vec!["ipu_stack_reduce_sum_f16".into()],
             });
         }
@@ -373,23 +390,24 @@ impl KernelBuildPlan {
             plan.compilations.push(KernelCompilation {
                 source: "unpack_amp_f16.cpp",
                 name: format!("unpack_amp_f16_codelet_{suffix}"),
-                flags: vec![
-                    "-O2".into(),
-                    format!("-DUNPACK_SOURCE_ORDER={order_index}"),
-                    format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
-                    format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
-                    format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
-                    format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
-                    format!("-DUNPACK_VERTEX_NAME={vertex}"),
+                optimization: Some(KernelOptimization::Speed),
+                definitions: vec![
+                    ("UNPACK_SOURCE_ORDER", order_index.to_string()),
+                    ("UNPACK_LOGICAL_ROWS", logical_rows.to_string()),
+                    ("UNPACK_PHYSICAL_ROWS", physical_rows.to_string()),
+                    ("UNPACK_LOGICAL_COLUMNS", logical_columns.to_string()),
+                    ("UNPACK_PHYSICAL_COLUMNS", physical_columns.to_string()),
+                    ("UNPACK_VERTEX_NAME", vertex),
                 ],
                 retained_symbols: Vec::new(),
             });
             plan.compilations.push(KernelCompilation {
                 source: "rearrange_f16.S",
                 name: format!("unpack_amp_f16_wrapper_{suffix}"),
-                flags: vec![
-                    format!("-DREARRANGE_CALL_SYMBOL={call}"),
-                    format!("-DREARRANGE_CODELET_SYMBOL={codelet}"),
+                optimization: None,
+                definitions: vec![
+                    ("REARRANGE_CALL_SYMBOL", call.clone()),
+                    ("REARRANGE_CODELET_SYMBOL", codelet),
                 ],
                 retained_symbols: vec![call.clone()],
             });
@@ -428,12 +446,13 @@ impl KernelBuildPlan {
                 plan.compilations.push(KernelCompilation {
                     source: "rearrange_amp_left_f16.S",
                     name: format!("rearrange_amp_left_f16_{suffix}"),
-                    flags: vec![
-                        format!("-DREARRANGE_CALL_SYMBOL={call}"),
-                        format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
-                        format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
-                        format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
-                        format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+                    optimization: None,
+                    definitions: vec![
+                        ("REARRANGE_CALL_SYMBOL", call.clone()),
+                        ("REARRANGE_LOGICAL_ROWS", logical_rows.to_string()),
+                        ("REARRANGE_PHYSICAL_ROWS", physical_rows.to_string()),
+                        ("REARRANGE_LOGICAL_COLUMNS", logical_columns.to_string()),
+                        ("REARRANGE_PHYSICAL_COLUMNS", physical_columns.to_string()),
                     ],
                     retained_symbols: vec![call.clone()],
                 });
@@ -461,9 +480,10 @@ impl KernelBuildPlan {
                 plan.compilations.push(KernelCompilation {
                     source: "rearrange_block_major_f16.S",
                     name: format!("rearrange_block_major_f16_{suffix}"),
-                    flags: vec![
-                        format!("-DREARRANGE_CALL_SYMBOL={call}"),
-                        format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+                    optimization: None,
+                    definitions: vec![
+                        ("REARRANGE_CALL_SYMBOL", call.clone()),
+                        ("REARRANGE_PHYSICAL_COLUMNS", physical_columns.to_string()),
                     ],
                     retained_symbols: vec![call.clone()],
                 });
@@ -488,7 +508,8 @@ impl KernelBuildPlan {
                 plan.compilations.push(KernelCompilation {
                     source: "rearrange_transposed_right_f16.S",
                     name: format!("rearrange_transposed_right_f16_{suffix}"),
-                    flags: vec![format!("-DREARRANGE_CALL_SYMBOL={call}")],
+                    optimization: None,
+                    definitions: vec![("REARRANGE_CALL_SYMBOL", call.clone())],
                     retained_symbols: vec![call.clone()],
                 });
                 plan.rearrange_symbols.insert(
@@ -506,26 +527,27 @@ impl KernelBuildPlan {
             plan.compilations.push(KernelCompilation {
                 source: "rearrange_f16.cpp",
                 name: format!("rearrange_f16_codelet_{suffix}"),
-                flags: vec![
-                    "-O2".into(),
-                    format!("-DREARRANGE_TARGET_ORDER={order_index}"),
-                    format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
-                    format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
-                    format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
-                    format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
-                    format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"),
-                    format!("-DREARRANGE_ROW_BLOCK={row_block}"),
-                    format!("-DREARRANGE_COLUMN_BLOCK={column_block}"),
-                    format!("-DREARRANGE_VERTEX_NAME={vertex}"),
+                optimization: Some(KernelOptimization::Speed),
+                definitions: vec![
+                    ("REARRANGE_TARGET_ORDER", order_index.to_string()),
+                    ("REARRANGE_LOGICAL_ROWS", logical_rows.to_string()),
+                    ("REARRANGE_PHYSICAL_ROWS", physical_rows.to_string()),
+                    ("REARRANGE_LOGICAL_COLUMNS", logical_columns.to_string()),
+                    ("REARRANGE_PHYSICAL_COLUMNS", physical_columns.to_string()),
+                    ("REARRANGE_INNER_DIMENSION", AMP_COLUMN_MICRO.to_string()),
+                    ("REARRANGE_ROW_BLOCK", row_block.to_string()),
+                    ("REARRANGE_COLUMN_BLOCK", column_block.to_string()),
+                    ("REARRANGE_VERTEX_NAME", vertex),
                 ],
                 retained_symbols: Vec::new(),
             });
             plan.compilations.push(KernelCompilation {
                 source: "rearrange_f16.S",
                 name: format!("rearrange_f16_wrapper_{suffix}"),
-                flags: vec![
-                    format!("-DREARRANGE_CALL_SYMBOL={call}"),
-                    format!("-DREARRANGE_CODELET_SYMBOL={codelet}"),
+                optimization: None,
+                definitions: vec![
+                    ("REARRANGE_CALL_SYMBOL", call.clone()),
+                    ("REARRANGE_CODELET_SYMBOL", codelet),
                 ],
                 retained_symbols: vec![call.clone()],
             });
@@ -540,53 +562,14 @@ impl KernelBuildPlan {
                 call,
             );
         }
-        if has_worker_codelets || !attention.is_empty() || !attention_stages.is_empty() {
+        if has_worker_codelets || !attention_stages.is_empty() {
             plan.compilations.push(KernelCompilation {
                 source: "worker_support.S",
                 name: "worker_support".into(),
-                flags: Vec::new(),
+                optimization: None,
+                definitions: Vec::new(),
                 retained_symbols: Vec::new(),
             });
-        }
-        for shape in attention {
-            let suffix = format!(
-                "m{}_q{}_k{}_d{}_v{}_{:08x}",
-                shape.matrices,
-                shape.query_rows,
-                shape.key_rows,
-                shape.query_dimension,
-                shape.value_dimension,
-                shape.scale_bits,
-            );
-            let call_symbol = format!("ipu_stack_flash_attention_online_f16_{suffix}");
-            let vertex = format!("FlashAttentionOnlineF16_{suffix}");
-            let codelet = format!("__runCodelet_{vertex}");
-            let common_flags = vec![
-                format!("-DATTENTION_MATRICES={}", shape.matrices),
-                format!("-DATTENTION_QUERY_ROWS={}", shape.query_rows),
-                format!("-DATTENTION_KEY_ROWS={}", shape.key_rows),
-                format!("-DATTENTION_QUERY_DIMENSION={}", shape.query_dimension),
-                format!("-DATTENTION_VALUE_DIMENSION={}", shape.value_dimension),
-                format!("-DATTENTION_SCALE={}", f32::from_bits(shape.scale_bits)),
-            ];
-            let mut codelet_flags = common_flags;
-            codelet_flags.push(format!("-DATTENTION_VERTEX_NAME={vertex}"));
-            plan.compilations.push(KernelCompilation {
-                source: "flash_attention_online_f16.cpp",
-                name: format!("flash_attention_codelet_{suffix}"),
-                flags: codelet_flags,
-                retained_symbols: Vec::new(),
-            });
-            plan.compilations.push(KernelCompilation {
-                source: "flash_attention_online_f16.S",
-                name: format!("flash_attention_wrapper_{suffix}"),
-                flags: vec![
-                    format!("-DATTENTION_CALL_SYMBOL={call_symbol}"),
-                    format!("-DATTENTION_CODELET_SYMBOL={codelet}"),
-                ],
-                retained_symbols: vec![call_symbol.clone()],
-            });
-            plan.attention_symbols.insert(shape, call_symbol);
         }
         if !attention_stages.is_empty() {
             let mut query_rows = attention_stages
@@ -693,53 +676,58 @@ impl KernelBuildPlan {
                 plan.attention_stage_symbols.push((kernel, rows, symbol));
             }
             let scale_bits = (1.0_f32 / (head_dimension as f32).sqrt()).to_bits();
-            let softmax_flags = vec![
-                "-Os".into(),
-                format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
-                format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
-                format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
-                format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
-                format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
-                format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
+            let softmax_definitions = vec![
+                ("ATTENTION_HEAD_DIMENSION", head_dimension.to_string()),
+                ("ATTENTION_KEY_BLOCK_COLUMNS", key_block_columns.to_string()),
+                ("ATTENTION_SMALL_QUERY_ROWS", small_query.to_string()),
+                ("ATTENTION_LARGE_QUERY_ROWS", large_query.to_string()),
+                ("ATTENTION_SMALL_KEY_ROWS", small_key.to_string()),
+                ("ATTENTION_LARGE_KEY_ROWS", large_key.to_string()),
             ];
             plan.compilations.push(KernelCompilation {
                 source: "attention_softmax_f16.cpp",
                 name: format!("attention_softmax_q{small_query}_q{large_query}_d{head_dimension}"),
-                flags: softmax_flags,
+                optimization: Some(KernelOptimization::Size),
+                definitions: softmax_definitions,
                 retained_symbols: Vec::new(),
             });
             plan.compilations.push(KernelCompilation {
                 source: "attention_softmax_f16_wrapper.S",
                 name: "attention_softmax_wrapper".into(),
-                flags: [
+                optimization: None,
+                definitions: [
                     assembly_softmax_keys
                         .contains(&small_key)
-                        .then(|| "-DATTENTION_USE_ASSEMBLY_SMALL_KEY".into()),
+                        .then(|| ("ATTENTION_USE_ASSEMBLY_SMALL_KEY", "1".into())),
                     (large_key != small_key && assembly_softmax_keys.contains(&large_key))
-                        .then(|| "-DATTENTION_USE_ASSEMBLY_LARGE_KEY".into()),
+                        .then(|| ("ATTENTION_USE_ASSEMBLY_LARGE_KEY", "1".into())),
                 ]
                 .into_iter()
                 .flatten()
                 .collect(),
                 retained_symbols: softmax_cpp_symbols,
             });
-            let mut attention_stage_flags = vec![
-                "-O2".into(),
-                format!("-DATTENTION_HEAD_DIMENSION={head_dimension}"),
-                format!("-DATTENTION_VALUE_DIMENSION={value_dimension}"),
-                format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded_value_dimension}"),
-                format!("-DATTENTION_KEY_BLOCK_COLUMNS={key_block_columns}"),
-                format!("-DATTENTION_SMALL_QUERY_ROWS={small_query}"),
-                format!("-DATTENTION_LARGE_QUERY_ROWS={large_query}"),
-                format!("-DATTENTION_SMALL_KEY_ROWS={small_key}"),
-                format!("-DATTENTION_LARGE_KEY_ROWS={large_key}"),
-                format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
+            let mut attention_stage_definitions = vec![
+                ("ATTENTION_HEAD_DIMENSION", head_dimension.to_string()),
+                ("ATTENTION_VALUE_DIMENSION", value_dimension.to_string()),
+                (
+                    "ATTENTION_PADDED_VALUE_DIMENSION",
+                    padded_value_dimension.to_string(),
+                ),
+                ("ATTENTION_KEY_BLOCK_COLUMNS", key_block_columns.to_string()),
+                ("ATTENTION_SMALL_QUERY_ROWS", small_query.to_string()),
+                ("ATTENTION_LARGE_QUERY_ROWS", large_query.to_string()),
+                ("ATTENTION_SMALL_KEY_ROWS", small_key.to_string()),
+                ("ATTENTION_LARGE_KEY_ROWS", large_key.to_string()),
+                ("ATTENTION_SCALE_BITS", format!("0x{scale_bits:08x}")),
             ];
             if assembly_softmax_keys.contains(&small_key) {
-                attention_stage_flags.push("-DATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY".into());
+                attention_stage_definitions
+                    .push(("ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY", "1".into()));
             }
             if large_key != small_key && assembly_softmax_keys.contains(&large_key) {
-                attention_stage_flags.push("-DATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY".into());
+                attention_stage_definitions
+                    .push(("ATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY", "1".into()));
             }
             merge_symbols.extend(softmax_assembly_symbols);
             plan.compilations.push(KernelCompilation {
@@ -747,7 +735,8 @@ impl KernelBuildPlan {
                 name: format!(
                     "attention_stages_q{small_query}_q{large_query}_d{head_dimension}_v{value_dimension}"
                 ),
-                flags: attention_stage_flags,
+                optimization: Some(KernelOptimization::Speed),
+                definitions: attention_stage_definitions,
                 retained_symbols: merge_symbols,
             });
         }
@@ -770,16 +759,16 @@ impl KernelBuildPlan {
                     weights,
                     inner_block,
                     output_columns,
+                    rows,
                     ..
                 },
             ) => {
-                let rows = gemm_rows(run)?;
                 let planned = self
                     .gemm_rows
                     .get(&(*multiply, *weights, *inner_block, *output_columns))
-                    .ok_or(KernelAbiError::UnplannedGemmRows(rows))?;
-                if !planned.contains(&rows) {
-                    return Err(KernelAbiError::UnplannedGemmRows(rows));
+                    .ok_or(KernelAbiError::UnplannedGemmRows(*rows))?;
+                if !planned.contains(rows) {
+                    return Err(KernelAbiError::UnplannedGemmRows(*rows));
                 }
                 self.gemm_symbols
                     .get(&(
@@ -788,18 +777,17 @@ impl KernelBuildPlan {
                         *inner_block,
                         *output_columns,
                         *mode,
-                        rows,
+                        *rows,
                     ))
                     .cloned()
-                    .ok_or(KernelAbiError::UnplannedGemmRows(rows))?
+                    .ok_or(KernelAbiError::UnplannedGemmRows(*rows))?
             }
-            (KernelSymbols::AttentionSpecialized, TileKernelSpec::FlashAttention { .. }) => self
-                .attention_symbols
-                .get(&attention_shape(run)?)
-                .cloned()
-                .ok_or(KernelAbiError::RequirementMismatch)?,
             (KernelSymbols::AttentionStageSpecialized, _) => {
-                let rows = gemm_rows(run)?;
+                let rows = match kernel {
+                    TileKernelSpec::AttentionSoftmax { query_rows, .. }
+                    | TileKernelSpec::AttentionMerge { query_rows, .. } => *query_rows,
+                    _ => return Err(KernelAbiError::RequirementMismatch),
+                };
                 self.attention_stage_symbols
                     .iter()
                     .find(|(planned, planned_rows, _)| planned == kernel && *planned_rows == rows)
@@ -938,7 +926,6 @@ fn collect_kernels(
     reduction_add: &mut bool,
     rearrangements: &mut BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     unpacks: &mut BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
-    attention: &mut BTreeSet<AttentionKernelShape>,
     attention_stages: &mut Vec<(TileKernelSpec, u32)>,
 ) -> Result<(), KernelAbiError> {
     for work in program.work(tile) {
@@ -954,12 +941,13 @@ fn collect_kernels(
                     weights,
                     inner_block,
                     output_columns,
+                    rows: kernel_rows,
                     ..
                 } = kernel
                 {
                     rows.entry((*multiply, *weights, *inner_block, *output_columns))
                         .or_default()
-                        .insert(gemm_rows(run)?);
+                        .insert(*kernel_rows);
                 } else if matches!(kernel, TileKernelSpec::Gelu) {
                     *gelu = true;
                 } else if matches!(kernel, TileKernelSpec::ReductionSum { .. }) {
@@ -971,15 +959,20 @@ fn collect_kernels(
                             ..
                         },
                     to: crate::Layout { order, .. },
+                    logical_rows,
+                    physical_rows,
+                    logical_columns,
+                    physical_columns,
+                    ..
                 } = kernel
                     && let Some(target) = RearrangeTarget::from_order(*order)
                 {
                     rearrangements.insert(rearrangement_specialization(
                         target,
-                        matrix_extent(run, true, false)?,
-                        matrix_extent(run, false, false)?,
-                        matrix_extent(run, true, true)?,
-                        matrix_extent(run, false, true)?,
+                        *logical_rows,
+                        *physical_rows,
+                        *logical_columns,
+                        *physical_columns,
                     ));
                 } else if let TileKernelSpec::Rearrange {
                     from: crate::Layout { order, .. },
@@ -988,23 +981,31 @@ fn collect_kernels(
                             order: StorageOrder::Linear,
                             ..
                         },
+                    logical_rows,
+                    physical_rows,
+                    logical_columns,
+                    physical_columns,
+                    ..
                 } = kernel
                     && let Some(source) = UnpackSource::from_order(*order)
                 {
                     unpacks.insert((
                         source,
-                        input_matrix_extent(run, true, false)?,
-                        input_matrix_extent(run, false, false)?,
-                        input_matrix_extent(run, true, true)?,
-                        input_matrix_extent(run, false, true)?,
+                        *logical_rows,
+                        *physical_rows,
+                        *logical_columns,
+                        *physical_columns,
                     ));
-                } else if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
-                    attention.insert(attention_shape(run)?);
                 } else if matches!(
                     kernel,
                     TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. }
                 ) {
-                    let stage = (kernel.clone(), gemm_rows(run)?);
+                    let query_rows = match kernel {
+                        TileKernelSpec::AttentionSoftmax { query_rows, .. }
+                        | TileKernelSpec::AttentionMerge { query_rows, .. } => *query_rows,
+                        _ => unreachable!(),
+                    };
+                    let stage = (kernel.clone(), query_rows);
                     if !attention_stages.contains(&stage) {
                         attention_stages.push(stage);
                     }
@@ -1018,102 +1019,12 @@ fn collect_kernels(
                 reduction_add,
                 rearrangements,
                 unpacks,
-                attention,
                 attention_stages,
             )?,
             TileWorkRef::Exchange(_) | TileWorkRef::LocalCopy(_) | TileWorkRef::Checkpoint(..) => {}
         }
     }
     Ok(())
-}
-
-fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
-    let TileKernelSpec::FlashAttention {
-        options,
-        accumulate,
-    } = &run.kernel
-    else {
-        return Err(KernelAbiError::RequirementMismatch);
-    };
-    if options.causal || *accumulate != crate::AccumulationPrecision::F32 {
-        return Err(KernelAbiError::RequirementMismatch);
-    }
-    let [query, key, value] = run.inputs.as_slice() else {
-        return Err(KernelAbiError::RequirementMismatch);
-    };
-    let extents = |operand: &crate::KernelOperand| {
-        let [view] = operand.views.as_slice() else {
-            return None;
-        };
-        Some(
-            view.extents
-                .iter()
-                .map(|extent| extent.physical_end - extent.start)
-                .collect::<Vec<_>>(),
-        )
-    };
-    let query = extents(query).ok_or(KernelAbiError::RequirementMismatch)?;
-    let key = extents(key).ok_or(KernelAbiError::RequirementMismatch)?;
-    let value = extents(value).ok_or(KernelAbiError::RequirementMismatch)?;
-    if query.len() < 2 || query.len() != key.len() || query.len() != value.len() {
-        return Err(KernelAbiError::RequirementMismatch);
-    }
-    let rank = query.len();
-    if query[..rank - 2] != key[..rank - 2]
-        || query[..rank - 2] != value[..rank - 2]
-        || query[rank - 1] != key[rank - 1]
-        || key[rank - 2] != value[rank - 2]
-    {
-        return Err(KernelAbiError::RequirementMismatch);
-    }
-    let matrices = query[..rank - 2]
-        .iter()
-        .try_fold(1u32, |product, &extent| product.checked_mul(extent))
-        .ok_or(KernelAbiError::ElementCountOverflow)?;
-    let scale = options
-        .scale
-        .as_value()
-        .unwrap_or_else(|| 1.0 / (query[rank - 1] as f32).sqrt());
-    Ok(AttentionKernelShape {
-        matrices,
-        query_rows: query[rank - 2],
-        key_rows: key[rank - 2],
-        query_dimension: query[rank - 1],
-        value_dimension: value[rank - 1],
-        scale_bits: scale.to_bits(),
-    })
-}
-
-fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
-    let rank = run.output.extents.len();
-    let output_order = match &run.requirements {
-        KernelRequirements::Operator(requirements) => &requirements.output.format.layout.order,
-        KernelRequirements::Conversion { .. } => return Err(KernelAbiError::RequirementMismatch),
-    };
-    let matrix_column_axis = rank
-        .checked_sub(
-            if matches!(
-                output_order,
-                StorageOrder::Native(
-                    NativeKernelOrder::TransposedOutput | NativeKernelOrder::TransposedLeft
-                )
-            ) {
-                2
-            } else {
-                1
-            },
-        )
-        .ok_or(KernelAbiError::MissingGemmRows)?;
-    run.output
-        .extents
-        .iter()
-        .enumerate()
-        .filter(|(axis, _)| *axis != matrix_column_axis)
-        .try_fold(1u32, |rows, extent| {
-            rows.checked_mul(extent.1.physical_end - extent.1.start)
-        })
-        .filter(|&rows| rows != 0)
-        .ok_or(KernelAbiError::MissingGemmRows)
 }
 
 fn matrix_extent(run: &KernelRun, logical: bool, columns: bool) -> Result<u32, KernelAbiError> {
@@ -1331,19 +1242,6 @@ pub fn tile_kernel_abi(
                 ],
             ),
         ),
-        TileKernelSpec::FlashAttention { .. } => (
-            KernelSymbols::AttentionSpecialized,
-            if matches!(requirements, KernelRequirements::Operator(requirements)
-                if requirements.output.format.precision == Precision::F32
-                    && requirements.inputs.iter().all(|input| input.format.precision == Precision::F16))
-            {
-                KernelAvailability::Implemented
-            } else {
-                KernelAvailability::Required
-            },
-            3,
-            Vec::new(),
-        ),
         TileKernelSpec::AttentionSoftmax { .. } => (
             KernelSymbols::AttentionStageSpecialized,
             KernelAvailability::Implemented,
@@ -1362,7 +1260,7 @@ pub fn tile_kernel_abi(
             1,
             scalar_arguments(1, &["element_count"]),
         ),
-        TileKernelSpec::Rearrange { from, to }
+        TileKernelSpec::Rearrange { from, to, .. }
             if precision == Precision::F16
                 && UnpackSource::from_order(from.order).is_some()
                 && to.order == StorageOrder::Linear =>
@@ -1383,7 +1281,7 @@ pub fn tile_kernel_abi(
                 ),
             )
         }
-        TileKernelSpec::Rearrange { from, to }
+        TileKernelSpec::Rearrange { from, to, .. }
             if precision == Precision::F16
                 && from.order == StorageOrder::Linear
                 && (matches!(
@@ -1593,76 +1491,8 @@ mod tests {
     use crate::{
         AccumulationPrecision, ComputeGraph, Ipu21CostModel, Layout, MemoryClass,
         OperandRequirement, OperatorRequirements, OutputAliasing, PipelineConfig,
-        PlannerSearchDomain, ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance,
-        WorkReason, lower, lower_to_tiles,
+        PlannerSearchDomain, TensorFormat, TensorTiling, lower, lower_to_tiles,
     };
-
-    #[test]
-    fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
-        let mut random = fastrand::Rng::with_seed(0x726f_7773_6f72_6465);
-        for case in 0..256 {
-            let outer = random.u32(1..=4);
-            let semantic_rows = random.u32(1..=96);
-            let semantic_columns = random.u32(1..=96);
-            let transposed = random.bool();
-            let order = match (transposed, random.bool()) {
-                (false, false) => NativeKernelOrder::Output,
-                (false, true) => NativeKernelOrder::Left,
-                (true, false) => NativeKernelOrder::TransposedOutput,
-                (true, true) => NativeKernelOrder::TransposedLeft,
-            };
-            let format = TensorFormat {
-                precision: Precision::F16,
-                layout: Layout {
-                    order: StorageOrder::Native(order),
-                    tiling: TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Standard,
-                },
-            };
-            let run = KernelRun::new(
-                WorkProvenance {
-                    operation: None,
-                    value: None,
-                    reason: WorkReason::OperatorKernel,
-                },
-                TileKernelSpec::Gemm {
-                    multiply: Precision::F16,
-                    accumulate: AccumulationPrecision::F32,
-                    mode: GemmKernelMode::Initialize,
-                    weights: GemmWeightLoad::Standard,
-                    inner_block: 64,
-                    output_columns: 16,
-                },
-                Vec::new(),
-                ShardView {
-                    shard: LowShardId::from_index(0),
-                    extents: [outer, semantic_rows, semantic_columns]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(axis, physical_end)| ShardExtent {
-                            axis: axis as u16,
-                            start: 0,
-                            logical_end: physical_end,
-                            physical_end,
-                        })
-                        .collect(),
-                },
-                KernelRequirements::Operator(OperatorRequirements {
-                    inputs: Vec::new(),
-                    output: OperandRequirement::new(format, 8),
-                    output_aliasing: OutputAliasing::Fresh,
-                    memory_space: MemorySpaceRequirements::default(),
-                }),
-            );
-            let expected = outer
-                * if transposed {
-                    semantic_columns
-                } else {
-                    semantic_rows
-                };
-            assert_eq!(gemm_rows(&run).unwrap(), expected, "random case {case}");
-        }
-    }
 
     #[test]
     fn randomized_gemm_abis_resolve_to_retained_symbols() {
@@ -1706,6 +1536,7 @@ mod tests {
                     weights,
                     inner_block: 64,
                     output_columns: [32, 64, 128][random.usize(0..3)],
+                    rows: random.u32(1..=64),
                 },
                 &requirements,
             )
@@ -1759,15 +1590,16 @@ mod tests {
             let planned_rows = plan.gemm_rows.values().next().unwrap();
             assert!(
                 plan.compilations[0]
-                    .flags
+                    .definitions
                     .iter()
-                    .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={}", planned_rows[0]))
+                    .any(|(name, value)| name == &"GEMM_SMALL_ROWS"
+                        && value == &planned_rows[0].to_string())
             );
             assert!(
                 plan.compilations[0]
-                    .flags
+                    .definitions
                     .iter()
-                    .any(|flag| flag == "-DGEMM_SINGLE_ROWS=1")
+                    .any(|(name, value)| name == &"GEMM_SINGLE_ROWS" && value == "1")
             );
             assert_eq!(plan.compilations[0].retained_symbols.len(), 2);
             for run in low

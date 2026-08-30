@@ -679,10 +679,11 @@ fn build_package_artifacts(
     let objects = build_phase("compile_kernels", || {
         let mut objects = vec![fs::read(&runtime_artifact.object)?];
         for compilation in &kernel_plan.compilations {
+            let flags = compilation.compiler_flags();
             let artifact = config.toolchain.compile(
                 config.kernel_source_directory.join(compilation.source),
                 &compilation.name,
-                &compilation.flags,
+                &flags,
             )?;
             objects.push(fs::read(&artifact.object)?);
         }

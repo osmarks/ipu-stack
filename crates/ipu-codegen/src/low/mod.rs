@@ -574,6 +574,7 @@ fn gemm_kernel_spec(
     family: crate::GemmKernelFamily,
     mode: crate::GemmKernelMode,
     block: crate::GemmBlockShape,
+    rows: u32,
 ) -> TileKernelSpec {
     TileKernelSpec::Gemm {
         multiply: family.multiply,
@@ -582,15 +583,70 @@ fn gemm_kernel_spec(
         weights: family.weights,
         inner_block: block.inner,
         output_columns: block.output_columns,
+        rows,
     }
 }
 
-fn attention_kernel_specs(plan: &crate::AttentionPlan) -> (TileKernelSpec, TileKernelSpec) {
-    let [query_key, probability_value] = plan.gemm_blocks();
-    (
-        gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, query_key),
-        gemm_kernel_spec(plan.kernel, GemmKernelMode::Initialize, probability_value),
-    )
+fn gemm_kernel_rows(output: &ShardView, order: StorageOrder) -> LowLoweringResult<u32> {
+    let rank = output.extents.len();
+    let column_axis = rank
+        .checked_sub(
+            if matches!(
+                order,
+                StorageOrder::Native(
+                    NativeKernelOrder::TransposedOutput | NativeKernelOrder::TransposedLeft
+                )
+            ) {
+                2
+            } else {
+                1
+            },
+        )
+        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+    output
+        .extents
+        .iter()
+        .enumerate()
+        .filter(|(axis, _)| *axis != column_axis)
+        .try_fold(1u32, |rows, (_, extent)| {
+            rows.checked_mul(extent.physical_end - extent.start)
+        })
+        .filter(|rows| *rows != 0)
+        .ok_or(LowLoweringError::IdOverflow)
+}
+
+fn rearrange_kernel_spec(
+    from: Layout,
+    to: Layout,
+    input: &ShardView,
+    output: &ShardView,
+) -> LowLoweringResult<TileKernelSpec> {
+    let view = if from.order == StorageOrder::Linear {
+        output
+    } else {
+        input
+    };
+    let rank = view.extents.len();
+    if rank < 2 {
+        return Err(LowLoweringError::InvalidConversionPlan);
+    }
+    let rows = view.extents[rank - 2];
+    let columns = view.extents[rank - 1];
+    let matrices = view.extents[..rank - 2]
+        .iter()
+        .try_fold(1u32, |product, extent| {
+            product.checked_mul(extent.physical_end - extent.start)
+        })
+        .ok_or(LowLoweringError::IdOverflow)?;
+    Ok(TileKernelSpec::Rearrange {
+        from,
+        to,
+        matrices,
+        logical_rows: rows.logical_end - rows.start,
+        physical_rows: rows.physical_end - rows.start,
+        logical_columns: columns.logical_end - columns.start,
+        physical_columns: columns.physical_end - columns.start,
+    })
 }
 
 impl AttentionBufferShape {
@@ -1047,14 +1103,16 @@ impl LoweringState {
                 source.tile,
                 KernelRun::new(
                     provenance,
-                    TileKernelSpec::Rearrange {
-                        from: source.tensor_type.format.layout.clone(),
-                        to: self.shards[staging.index() as usize]
+                    rearrange_kernel_spec(
+                        source.tensor_type.format.layout.clone(),
+                        self.shards[staging.index() as usize]
                             .tensor_type
                             .format
                             .layout
                             .clone(),
-                    },
+                        &self.full_view(source_shard),
+                        &self.full_view(staging),
+                    )?,
                     vec![KernelOperand {
                         views: vec![self.full_view(source_shard)],
                     }],
@@ -1213,17 +1271,12 @@ impl LoweringState {
             .tensor_type
             .format
             .clone();
-        let kernel = match kind {
-            MidOperationKind::CastPrecision => TileKernelSpec::Cast {
+        let static_kernel = match kind {
+            MidOperationKind::CastPrecision => Some(TileKernelSpec::Cast {
                 from: input_format.precision,
                 to: output_format.precision,
-            },
-            MidOperationKind::View(..) | MidOperationKind::Rearrange(..) => {
-                TileKernelSpec::Rearrange {
-                    from: input_format.layout.clone(),
-                    to: output_format.layout.clone(),
-                }
-            }
+            }),
+            MidOperationKind::View(..) | MidOperationKind::Rearrange(..) => None,
             MidOperationKind::Operator(_) | MidOperationKind::Repeat(_) => {
                 return Err(LowLoweringError::InvalidConversionPlan);
             }
@@ -1231,16 +1284,31 @@ impl LoweringState {
         for output in self.value_shards(*result)?.to_vec() {
             let tile = self.shards[output.index() as usize].tile;
             let input = self.local_shard(*input, tile)?;
+            let input_view = self.full_view(input);
+            let output_view = self.full_view(output);
+            let kernel = match kind {
+                MidOperationKind::View(..) | MidOperationKind::Rearrange(..) => {
+                    rearrange_kernel_spec(
+                        input_format.layout.clone(),
+                        output_format.layout.clone(),
+                        &input_view,
+                        &output_view,
+                    )?
+                }
+                _ => static_kernel
+                    .clone()
+                    .ok_or(LowLoweringError::InvalidConversionPlan)?,
+            };
             self.append_kernel(
                 tiles,
                 tile,
                 KernelRun::new(
                     operation_provenance(operation, kind),
-                    kernel.clone(),
+                    kernel,
                     vec![KernelOperand {
-                        views: vec![self.full_view(input)],
+                        views: vec![input_view],
                     }],
-                    self.full_view(output),
+                    output_view,
                     KernelRequirements::Conversion {
                         input: OperandRequirement::new(input_format.clone(), 8),
                         output: OperandRequirement::new(output_format.clone(), 8),
@@ -1440,10 +1508,12 @@ impl LoweringState {
                     tile,
                     KernelRun::new(
                         operation_provenance(operation, kind),
-                        TileKernelSpec::Rearrange {
-                            from: source_format.layout.clone(),
-                            to: destination_format.layout.clone(),
-                        },
+                        rearrange_kernel_spec(
+                            source_format.layout.clone(),
+                            destination_format.layout.clone(),
+                            &self.full_view(staging),
+                            &self.full_view(destination),
+                        )?,
                         vec![KernelOperand {
                             views: vec![self.full_view(staging)],
                         }],

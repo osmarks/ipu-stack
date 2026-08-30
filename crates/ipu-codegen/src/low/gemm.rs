@@ -11,8 +11,7 @@ struct GemmLowering {
     right_rank: usize,
     output_rank: usize,
     block: crate::GemmBlockShape,
-    initialize: TileKernelSpec,
-    accumulate: TileKernelSpec,
+    kernel: crate::GemmKernelFamily,
 }
 
 impl GemmLowering {
@@ -54,16 +53,7 @@ impl GemmLowering {
             right_rank,
             output_rank,
             block: plan.geometry.block,
-            initialize: gemm_kernel_spec(
-                plan.kernel,
-                GemmKernelMode::Initialize,
-                plan.geometry.block,
-            ),
-            accumulate: gemm_kernel_spec(
-                plan.kernel,
-                GemmKernelMode::Accumulate,
-                plan.geometry.block,
-            ),
+            kernel: plan.kernel,
         })
     }
 }
@@ -127,8 +117,7 @@ impl LoweringState {
         };
         let (inner_block, output_column_block) = (gemm.block.inner, gemm.block.output_columns);
         let orientation = plan.geometry.orientation;
-        let initialize = gemm.initialize;
-        let accumulate = gemm.accumulate;
+        let kernel_family = gemm.kernel;
         let row_partitions = reduction.compute.rows;
         let column_partitions = reduction.compute.columns;
         let inner_partitions = reduction.compute.inner;
@@ -522,32 +511,35 @@ impl LoweringState {
                             let selected = direct
                                 .as_ref()
                                 .map_or_else(|| staged, |view| Ok(view.shard))?;
-                            let mut kernel = if block_index == 0 && panel == 0 {
-                                initialize.clone()
+                            let mode = if block_index == 0 && panel == 0 {
+                                GemmKernelMode::Initialize
                             } else {
-                                accumulate.clone()
+                                GemmKernelMode::Accumulate
                             };
-                            if let TileKernelSpec::Gemm {
-                                weights: load,
-                                inner_block: kernel_inner_block,
-                                output_columns: kernel_output_columns,
-                                ..
-                            } = &mut kernel
+                            let mut family = kernel_family;
+                            family.weights = if self.shards[selected.index() as usize]
+                                .tensor_type
+                                .format
+                                .layout
+                                .memory_class
+                                == crate::MemoryClass::Standard
                             {
-                                *kernel_inner_block = panel_end - panel_start;
-                                *kernel_output_columns = local_output_columns;
-                                *load = if self.shards[selected.index() as usize]
-                                    .tensor_type
-                                    .format
-                                    .layout
-                                    .memory_class
-                                    == crate::MemoryClass::Standard
-                                {
-                                    crate::GemmWeightLoad::Standard
-                                } else {
-                                    crate::GemmWeightLoad::Interleaved
-                                };
-                            }
+                                crate::GemmWeightLoad::Standard
+                            } else {
+                                crate::GemmWeightLoad::Interleaved
+                            };
+                            let kernel = gemm_kernel_spec(
+                                family,
+                                mode,
+                                crate::GemmBlockShape {
+                                    inner: panel_end - panel_start,
+                                    output_columns: local_output_columns,
+                                },
+                                gemm_kernel_rows(
+                                    &partial,
+                                    kernel_requirements.output.format.layout.order,
+                                )?,
+                            );
                             let weight_view = direct.map_or_else(
                                 || {
                                     self.narrow_view(
@@ -969,21 +961,27 @@ impl LoweringState {
                         };
                     let output_view = self
                         .narrow_view(output, &[(gemm.output_rank - 1, column_start, column_end)])?;
-                    let mut kernel = if inner_start == 0 {
-                        gemm.initialize.clone()
+                    let mode = if inner_start == 0 {
+                        GemmKernelMode::Initialize
                     } else {
-                        gemm.accumulate.clone()
+                        GemmKernelMode::Accumulate
                     };
+                    let mut family = gemm.kernel;
                     if self.shards[resident_view.shard.index() as usize]
                         .tensor_type
                         .format
                         .layout
                         .memory_class
                         == crate::MemoryClass::Interleaved
-                        && let TileKernelSpec::Gemm { weights, .. } = &mut kernel
                     {
-                        *weights = crate::GemmWeightLoad::Interleaved;
+                        family.weights = crate::GemmWeightLoad::Interleaved;
                     }
+                    let kernel = gemm_kernel_spec(
+                        family,
+                        mode,
+                        gemm.block,
+                        gemm_kernel_rows(&output_view, requirements.output.format.layout.order)?,
+                    );
                     runs.push((
                         tile,
                         KernelRun::new(
