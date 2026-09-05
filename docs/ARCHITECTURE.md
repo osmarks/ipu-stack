@@ -35,6 +35,9 @@ organized by responsibility:
 - `estimate/tensor` adapts resolved geometry to conservative estimates, `traffic`
   counts data movement, `memory` evaluates allocations and region liveness, and
   `cycles` applies target prices. Memory estimate types live here alongside their calculations.
+- `kernel/abi` defines call contracts and scalar arguments; `specialization`
+  derives keys shared by collection and lookup; `geometry` extracts call shapes;
+  `build` generates object recipes. The root materializes placed call addresses.
 - `low/conversion` realizes selected formats and deferred views; `gemm` and
   `attention` expand their dispatches. `copies` handles concrete byte-span copies.
   The root module owns the shared schedule state and generic dispatch.

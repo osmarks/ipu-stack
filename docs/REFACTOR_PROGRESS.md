@@ -23,8 +23,9 @@ interface's post-host-exchange visibility is not claimed to be fixed.
 
 ## Next work
 
-1. Separate kernel ABI, specialization geometry, build recipes, and address
-   materialization. Shared specialization key and typed scalar values are done.
+1. Kernel responsibilities are now split into ABI, specialization collection,
+   geometry, build recipes, and placed-call materialization. Four kernel tests
+   pass after extraction; duplicate rearrangement symbol insertion is removed.
 2. Decouple physical storage-span geometry from LowShard so mid planning can use
    actual relative spans. Low conversion currently calls the cycle estimator to
    reconsider direct word exchange versus staging; move this policy to a shared
