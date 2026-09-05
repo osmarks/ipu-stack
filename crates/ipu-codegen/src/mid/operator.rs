@@ -137,9 +137,8 @@ pub enum OperatorDispatch {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
     },
-    /// Redistribute packed projection columns into independent attention
-    /// streams. The byte mapping is performed directly by local copies and
-    /// exchanges, without a tile kernel.
+    /// Materialize a logical view with copies, exchanges, and any required
+    /// storage-order transforms. The operator owns the coordinate mapping.
     View,
 }
 

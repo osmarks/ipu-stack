@@ -26,8 +26,8 @@ pub use exchange::{
 };
 pub(crate) use graph::*;
 pub use graph::{
-    AttentionOptions, AttentionScale, ComputeGraph, GemmOptions, GraphError, GraphInputKind,
-    Operation, OperationKind, Region, Repeat, ValueId,
+    AttentionOptions, AttentionScale, AxisFactorView, ComputeGraph, GemmOptions, GraphError,
+    GraphInputKind, Operation, OperationKind, Region, Repeat, ValueId,
 };
 pub(crate) use kernel::*;
 pub(crate) use low::*;

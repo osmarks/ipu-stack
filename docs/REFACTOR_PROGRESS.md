@@ -37,9 +37,14 @@ interface's post-host-exchange visibility is not claimed to be fixed.
    A shared span zipper replaces duplicate copy/count walkers. 142 workspace
    release tests and Clippy pass. Five `/tmp/mid-copy-*` hardware workloads pass;
    tile images remain identical to `/tmp/views-kernels-*`.
-3. Extend views beyond the axis-factor primitive as useful. Graph SplitHeads is
-   still semantic syntax; attention candidate layouts and cost paths remain
-   specialized. Do not mistake renaming those paths for generalization.
+3. Graph and mid both have View(AxisFactorView); split_heads is now only a
+   rank-three graph helper. Shape and inverse-slice geometry live in graph/view;
+   mid/view adapts storage extents. A row-major fallback handles arbitrary axis
+   pairs. An end-to-end low-copy interpreter test checks ranks 2–4 and every
+   distinct axis pair against an independent forward mapping. Generic reshape/
+   permutation composition remains open; attention fast paths are still specific.
+   143 workspace release tests and Clippy pass. Both attention hardware cases
+   pass with identical tile images (`/tmp/general-view-*`).
 4. Kernel attention-stage compilation currently assumes one common configuration
    and at most two query/key sizes. This deserves correction before claiming the
    kernel design supports arbitrary additional operations/configurations.

@@ -1634,3 +1634,97 @@ fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhas
         TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) | TileWorkRef::Checkpoint(..) => false,
     })
 }
+
+#[test]
+fn general_graph_views_lower_to_correct_relative_copies() {
+    for rank in 2..=4 {
+        for split in 0..rank {
+            for merge in 0..rank {
+                if split == merge {
+                    continue;
+                }
+                let mut shape = vec![2; rank];
+                shape[split] = 6;
+                let mut graph = ComputeGraph::new();
+                let input = graph.host_input("input", shape.clone()).unwrap();
+                let output = graph
+                    .view(input, AxisFactorView::new(split, merge, 3))
+                    .unwrap();
+                graph.set_outputs([output]).unwrap();
+                let config = PipelineConfig::new(1).with_input(
+                    input,
+                    TensorFormat {
+                        precision: Precision::F32,
+                        layout: Layout::row_major(TensorTiling::replicated(1)),
+                    },
+                );
+                let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+                let low = lower_to_tiles(&mid, &config).unwrap();
+                let mut buffers = low
+                    .shards
+                    .iter()
+                    .map(|shard| {
+                        vec![u32::MAX; crate::shard_storage_bytes(shard).unwrap() as usize / 4]
+                    })
+                    .collect::<Vec<_>>();
+                let input_shard = low.inputs[0].shards[0].index() as usize;
+                buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
+                for work in low.work(&low.tiles[0]) {
+                    let copy = match work {
+                        TileWorkRef::LocalCopy(copy) => copy,
+                        TileWorkRef::Exchange(phase) => {
+                            assert!(
+                                low.exchange_phases[phase.index() as usize]
+                                    .transfers
+                                    .is_empty()
+                            );
+                            continue;
+                        }
+                        _ => panic!("row-major view should only require copies"),
+                    };
+                    let (rows, width, source_stride, destination_stride) = match copy.pattern {
+                        CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
+                        CopyPattern::Strided {
+                            rows,
+                            row_bytes,
+                            source_stride,
+                            destination_stride,
+                        } => (rows, row_bytes, source_stride, destination_stride),
+                    };
+                    for row in 0..rows {
+                        for byte in (0..width).step_by(4) {
+                            let value = buffers[copy.source.index() as usize]
+                                [((copy.source_offset + row * source_stride + byte) / 4) as usize];
+                            buffers[copy.destination.index() as usize][((copy.destination_offset
+                                + row * destination_stride
+                                + byte)
+                                / 4)
+                                as usize] = value;
+                        }
+                    }
+                }
+                let output_shape = &graph.value_shape(output).unwrap().0;
+                let actual = &buffers[low.outputs[0].shards[0].index() as usize];
+                for source in 0..shape.iter().product::<u32>() {
+                    let mut index = source;
+                    let mut coordinates = vec![0; rank];
+                    for axis in (0..rank).rev() {
+                        coordinates[axis] = index % shape[axis];
+                        index /= shape[axis];
+                    }
+                    let part = coordinates[split] / output_shape[split];
+                    coordinates[split] %= output_shape[split];
+                    coordinates[merge] = coordinates[merge] * 3 + part;
+                    let target = coordinates
+                        .iter()
+                        .zip(output_shape)
+                        .fold(0, |index, (&coordinate, &width)| index * width + coordinate);
+                    assert_eq!(
+                        actual[target as usize], source,
+                        "rank {rank}, split {split}, merge {merge}"
+                    );
+                }
+            }
+        }
+    }
+}

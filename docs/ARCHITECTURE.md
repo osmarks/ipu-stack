@@ -27,8 +27,8 @@ package-building interface, and types used by diagnostics. Internals are
 organized by responsibility:
 
 - `mid/layout` defines tensor formats; `mid/resolved` validates ownership and
-  resolves partition bounds and capacities. `mid/view` owns logical axis split/merge
-  mappings shared by materialized views and deferred consumer slices.
+  resolves partition bounds and capacities. `graph/view` owns logical axis split/merge mappings; `mid/view` adapts
+  them to storage extents shared by materialized and deferred consumers.
   `mid/operator` defines executable contracts. `catalogue` supplies implementation families,
   `candidates` specializes them for shapes, and `planner` selects complete plans
   and inserts conversions.
@@ -198,12 +198,15 @@ Application construction is intentionally not part of the runtime.
 
 ### View and kernel specialization contracts
 
-The semantic graph still provides `SplitHeads`, but mid-level execution uses
-`MidOperator::View(AxisFactorView)`. The mapping moves a factor between arbitrary
+The semantic graph and mid execution both represent axis split/merge views.
+`ComputeGraph::view` accepts `AxisFactorView`; `split_heads` is only a rank-three
+convenience constructor, with no separate graph or mid operator kind. The mapping moves a factor between arbitrary
 axes, validates the output shape, and maps rectangular slices back to their
 source. Materialized and deferred lowering share this geometry. This is a
 split/merge view primitive, not yet a general reshape/permutation composition.
-Attention-specific candidate layouts and cost fast paths remain.
+Attention-specific candidate layouts and cost fast paths remain, alongside a
+row-major fallback for other axis pairs. The host reference evaluator uses an
+independent forward mapping to check the compiler's inverse slice mapping.
 
 Kernel build planning and call emission use the same `KernelSpecialization`
 key. ABI scalar arguments are typed values rather than strings interpreted at

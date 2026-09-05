@@ -499,7 +499,7 @@ pub(super) fn lower_operation_candidates(
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
-        let format_sensitive_indices = if matches!(operation.kind, OperationKind::SplitHeads(_)) {
+        let format_sensitive_indices = if matches!(operation.kind, OperationKind::View(_)) {
             (0..operation.inputs.len()).collect::<BTreeSet<_>>()
         } else {
             config

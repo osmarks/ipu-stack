@@ -32,6 +32,9 @@
 //! # build().unwrap();
 //! ```
 
+mod view;
+pub use view::{AxisFactorView, ViewSlice};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Logical tensor dimensions. Shapes are semantic graph information; storage
@@ -117,7 +120,7 @@ pub enum OperationKind {
     /// Exact Gaussian error linear unit.
     Gelu,
     Add(AddOptions),
-    SplitHeads(SplitHeadsOptions),
+    View(AxisFactorView),
     FlashAttention(AttentionOptions),
     Repeat(Repeat),
 }
@@ -137,11 +140,6 @@ pub enum BroadcastMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AddOptions {
     pub broadcasting: BroadcastMode,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SplitHeadsOptions {
-    pub heads: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -333,13 +331,23 @@ impl ComputeGraph {
         self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
     }
 
-    /// Converts `[batch, rows, heads * channels]` projection output into
-    /// `[batch * heads, rows, channels]` attention streams.
+    /// Apply a logical axis split/merge; materialization is selected by planning.
+    pub fn view(&mut self, input: ValueId, view: AxisFactorView) -> GraphResult<ValueId> {
+        self.inferred_result(OperationKind::View(view), [input])
+    }
+
+    /// Convert `[batch, rows, heads * channels]` into attention streams.
     pub fn split_heads(&mut self, input: ValueId, heads: u32) -> GraphResult<ValueId> {
-        self.inferred_result(
-            OperationKind::SplitHeads(SplitHeadsOptions { heads }),
-            [input],
-        )
+        if self
+            .shapes
+            .get(&input)
+            .is_some_and(|shape| shape.0.len() != 3)
+        {
+            return Err(GraphError::InvalidShape(
+                "split_heads requires [batch, rows, channels] input".into(),
+            ));
+        }
+        self.view(input, AxisFactorView::new(2, 0, heads))
     }
 
     pub fn flash_attention(
@@ -561,11 +569,22 @@ impl<'a> RegionBuilder<'a> {
         self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
     }
 
+    pub fn view(&mut self, input: ValueId, view: AxisFactorView) -> GraphResult<ValueId> {
+        self.inferred_result(OperationKind::View(view), [input])
+    }
+
+    /// Convert `[batch, rows, heads * channels]` into attention streams.
     pub fn split_heads(&mut self, input: ValueId, heads: u32) -> GraphResult<ValueId> {
-        self.inferred_result(
-            OperationKind::SplitHeads(SplitHeadsOptions { heads }),
-            [input],
-        )
+        if self
+            .shapes
+            .get(&input)
+            .is_some_and(|shape| shape.0.len() != 3)
+        {
+            return Err(GraphError::InvalidShape(
+                "split_heads requires [batch, rows, channels] input".into(),
+            ));
+        }
+        self.view(input, AxisFactorView::new(2, 0, heads))
     }
 
     pub fn flash_attention(
@@ -696,28 +715,9 @@ fn infer_shape(
         OperationKind::Add(AddOptions {
             broadcasting: BroadcastMode::Numpy,
         }) => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
-        OperationKind::SplitHeads(options) => {
-            let input = input(0)?;
-            if input.0.len() != 3 || options.heads == 0 {
-                return Err(GraphError::InvalidShape(
-                    "split_heads requires nonzero heads and [batch, rows, channels] input".into(),
-                ));
-            }
-            let channels = input.0[2];
-            if !channels.is_multiple_of(options.heads) {
-                return Err(GraphError::InvalidShape(
-                    "split_heads channels must be divisible by heads".into(),
-                ));
-            }
-            let streams = input.0[0].checked_mul(options.heads).ok_or_else(|| {
-                GraphError::InvalidShape("split_heads stream count overflow".into())
-            })?;
-            Ok(TensorShape(vec![
-                streams,
-                input.0[1],
-                channels / options.heads,
-            ]))
-        }
+        OperationKind::View(view) => view.output_shape(input(0)?).ok_or_else(|| {
+            GraphError::InvalidShape("view axes, factor, or output dimensions are invalid".into())
+        }),
         OperationKind::FlashAttention(options) => {
             let (query, key, value) = (input(0)?, input(1)?, input(2)?);
             if query.0.len() < 2 || key.0.len() < 2 || value.0.len() < 2 {

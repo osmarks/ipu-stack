@@ -35,10 +35,13 @@ pub(super) fn grouped_output_layout(
     let consumer = source[operation_index + 1..]
         .iter()
         .find(|candidate| candidate.inputs.contains(&result))?;
-    let OperationKind::SplitHeads(options) = consumer.kind else {
+    let OperationKind::View(view) = consumer.kind else {
         return None;
     };
-    let groups = u16::try_from(options.heads).ok()?;
+    if view.split_axis != output.0.len().checked_sub(1)? || view.merge_axis != 0 {
+        return None;
+    }
+    let groups = u16::try_from(view.factor).ok()?;
     let width = *output.0.last()?;
     (groups != 0 && width.is_multiple_of(u32::from(groups))).then_some(GroupedOutputLayout {
         groups,
@@ -114,7 +117,9 @@ pub(super) fn plans(
         .gemm_plan_constraints
         .iter()
         .find(|constraint| constraint.source_operation == operation.id.index());
-    if let OperationKind::SplitHeads(options) = operation.kind
+    if let OperationKind::View(view) = operation.kind
+        && view.split_axis == 2
+        && view.merge_axis == 0
         && let [input] = inputs
         && output.0.len() == 3
         && let (Ok(streams), Ok(rows)) = (u16::try_from(output.0[0]), u16::try_from(output.0[1]))
@@ -139,7 +144,7 @@ pub(super) fn plans(
         };
         for layout in layouts {
             let plan = OperatorPlan {
-                operator: MidOperator::View(AxisFactorView::new(2, 0, options.heads)),
+                operator: MidOperator::View(view),
                 dispatch: OperatorDispatch::View,
                 requirements: OperatorRequirements {
                     inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
@@ -155,7 +160,7 @@ pub(super) fn plans(
                 },
                 deferred_output: Some(DeferredOutputPlan {
                     source_input: 0,
-                    transform: AxisFactorView::new(2, 0, options.heads),
+                    transform: view,
                     unfused_cycles: 0,
                     unfused_exchange_cycles: 0,
                 }),
@@ -164,6 +169,45 @@ pub(super) fn plans(
                 plans.push(plan);
             }
         }
+    }
+    if let OperationKind::View(view) = operation.kind
+        && plans.is_empty()
+        && let [input] = inputs
+    {
+        let row_major = |shape: &TensorShape| {
+            Layout::row_major(TensorTiling::sharded(
+                TensorAxis::FromStart(0),
+                u16::try_from(shape.0[0])
+                    .unwrap_or(u16::MAX)
+                    .min(config.tile_count)
+                    .max(1),
+            ))
+        };
+        let source = if input.format.layout.tiling.linear_grain().is_some() {
+            TensorFormat {
+                precision: input.format.precision,
+                layout: row_major(&input.shape),
+            }
+        } else {
+            input.format.clone()
+        };
+        plans.push(OperatorPlan {
+            operator: MidOperator::View(view),
+            dispatch: OperatorDispatch::View,
+            requirements: OperatorRequirements {
+                inputs: vec![OperandRequirement::new(source, 8)],
+                output: OperandRequirement::new(
+                    TensorFormat {
+                        precision: input.format.precision,
+                        layout: row_major(output),
+                    },
+                    8,
+                ),
+                output_aliasing: OutputAliasing::Fresh,
+                distinct_elements: Vec::new(),
+            },
+            deferred_output: None,
+        });
     }
     if let OperationKind::FlashAttention(options) = operation.kind
         && !options.causal
@@ -1424,9 +1468,7 @@ pub(super) fn operator_matches(operation: &OperationKind, operator: MidOperator)
         (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
         (OperationKind::Gelu, MidOperator::Gelu) => true,
         (OperationKind::Add(expected), MidOperator::Add(options)) => *expected == options,
-        (OperationKind::SplitHeads(expected), MidOperator::View(view)) => {
-            view == AxisFactorView::new(2, 0, expected.heads)
-        }
+        (OperationKind::View(expected), MidOperator::View(view)) => *expected == view,
         (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
             *expected == options
         }

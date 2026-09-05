@@ -16,8 +16,8 @@ mod operator;
 mod planner;
 mod resolved;
 mod view;
+pub use crate::graph::AxisFactorView;
 pub(crate) use resolved::{ResolvedAxis, ResolvedLayout};
-pub use view::*;
 
 use candidates::*;
 use catalogue::*;

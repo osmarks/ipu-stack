@@ -447,8 +447,8 @@ fn evaluate_operations(
                 &values[&operation.inputs[0]],
                 &values[&operation.inputs[1]],
             )?],
-            OperationKind::SplitHeads(options) => {
-                vec![split_heads(&values[&operation.inputs[0]], options.heads)?]
+            OperationKind::View(view) => {
+                vec![apply_view(&values[&operation.inputs[0]], *view)?]
             }
             OperationKind::FlashAttention(options) => vec![attention(
                 &values[&operation.inputs[0]],
@@ -691,28 +691,30 @@ fn add(left: &HostTensor, right: &HostTensor) -> Result<HostTensor> {
     Ok(HostTensor { shape, values })
 }
 
-fn split_heads(input: &HostTensor, heads: u32) -> Result<HostTensor> {
-    let [batch, rows, width] = input.shape.as_slice() else {
-        bail!("SplitHeads diagnostic input must have rank three");
-    };
-    if !width.is_multiple_of(heads) {
-        bail!("SplitHeads diagnostic width is not divisible by heads");
-    }
-    let channels = width / heads;
+fn apply_view(input: &HostTensor, view: ipu_codegen::AxisFactorView) -> Result<HostTensor> {
+    let source_shape = ipu_codegen::graph::TensorShape(input.shape.clone());
+    let output_shape = view
+        .output_shape(&source_shape)
+        .context("invalid diagnostic view")?;
     let mut values = vec![0.0; input.values.len()];
-    for b in 0..*batch {
-        for h in 0..heads {
-            for r in 0..*rows {
-                for c in 0..channels {
-                    let source = ((b * rows + r) * width + h * channels + c) as usize;
-                    let target = (((b * heads + h) * rows + r) * channels + c) as usize;
-                    values[target] = input.values[source];
-                }
-            }
-        }
+    for (index, &value) in input.values.iter().enumerate() {
+        // Forward reference mapping, independent of the compiler's inverse
+        // rectangular-slice mapping.
+        let mut coordinates = decode_index(index, &input.shape);
+        let width = output_shape.0[view.split_axis];
+        let part = coordinates[view.split_axis] / width;
+        coordinates[view.split_axis] %= width;
+        coordinates[view.merge_axis] = coordinates[view.merge_axis] * view.factor + part;
+        let target = coordinates
+            .iter()
+            .zip(&output_shape.0)
+            .fold(0usize, |index, (&coordinate, &width)| {
+                index * width as usize + coordinate as usize
+            });
+        values[target] = value;
     }
     Ok(HostTensor {
-        shape: vec![batch * heads, *rows, channels],
+        shape: output_shape.0,
         values,
     })
 }

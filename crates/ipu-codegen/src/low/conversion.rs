@@ -938,11 +938,10 @@ impl LoweringState {
         for (source_extents, source) in
             self.intersecting_shard_set(&deferred_shards, &target, destination_tile)
         {
-            let destination_extents = mapping
-                .destination_source_axes
-                .iter()
+            let destination_extents = (0..mapping.source_ranges.len())
+                .filter(|&axis| axis != deferred.transform.merge_axis)
                 .enumerate()
-                .map(|(destination_axis, &source_axis)| {
+                .map(|(destination_axis, source_axis)| {
                     let source = source_extents
                         .get(source_axis)
                         .ok_or(LowLoweringError::InvalidOperatorPlan)?;
