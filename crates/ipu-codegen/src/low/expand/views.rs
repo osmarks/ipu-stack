@@ -6,12 +6,9 @@ impl TileGraphBuilder {
     pub(super) fn build_view(
         &mut self,
         operation: &MidOperation,
-        operator: &crate::MidOperator,
+        view: AxisFactorView,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        let crate::MidOperator::View(view) = operator else {
-            return Err(ExpansionError::InvalidOperatorPlan);
-        };
         let [input] = operation.inputs.as_slice() else {
             return Err(ExpansionError::InvalidOperatorPlan);
         };
@@ -40,7 +37,7 @@ impl TileGraphBuilder {
             "selected view exchange strategy"
         );
         if direct_panel_exchange {
-            let mappings = self.view_mappings(&original_sources, &output_shards, *view)?;
+            let mappings = self.view_mappings(&original_sources, &output_shards, view)?;
             if let Some(mappings) = self.f16_micro_panel_mappings(mappings)? {
                 tracing::info!(
                     source = ?operation.source.map(OperationId::index),
@@ -79,7 +76,7 @@ impl TileGraphBuilder {
             self.value_shards(*input)?.to_vec()
         };
 
-        let mappings = self.view_mappings(&source_shards, &output_shards, *view)?;
+        let mappings = self.view_mappings(&source_shards, &output_shards, view)?;
         self.build_mapped_views(
             mappings,
             CopyOrder::Semantic,

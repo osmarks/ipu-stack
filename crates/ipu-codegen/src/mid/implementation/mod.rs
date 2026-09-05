@@ -162,6 +162,16 @@ impl Builder {
     }
 
     fn copy(&mut self, input: MidValueId, output: TensorType, offsets: Vec<u32>) -> MidValueId {
+        self.materialize(input, output, offsets, true)
+    }
+
+    fn materialize(
+        &mut self,
+        input: MidValueId,
+        output: TensorType,
+        offsets: Vec<u32>,
+        reuse_local: bool,
+    ) -> MidValueId {
         let source = self.tensor(input);
         if offsets.iter().all(|&offset| offset == 0)
             && (source == &output
@@ -177,7 +187,7 @@ impl Builder {
             output,
             Primitive::Copy {
                 offsets,
-                reuse_local: true,
+                reuse_local,
             },
         )
     }

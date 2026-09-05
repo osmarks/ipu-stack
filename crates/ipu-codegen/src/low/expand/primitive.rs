@@ -32,9 +32,7 @@ impl TileGraphBuilder {
                     body,
                 )
             }
-            Primitive::View(view) => {
-                self.build_view(operation, &crate::MidOperator::View(*view), body)
-            }
+            Primitive::View(view) => self.build_view(operation, *view, body),
             Primitive::Sum { axis, staging } => {
                 self.sum_tensor(operation, usize::from(*axis), *staging, body)
             }

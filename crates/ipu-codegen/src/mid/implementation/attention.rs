@@ -46,39 +46,50 @@ impl Builder {
             right_inner: TensorAxis::FromEnd(2),
             output_column: TensorAxis::FromEnd(1),
         };
+        let mut packed_key = key.clone();
+        let mut packed_value = value.clone();
+        for (tensor, width) in [
+            (&mut packed_key, query_width),
+            (&mut packed_value, value_width),
+        ] {
+            tensor.shape.0[1] = key_rows;
+            tensor.shape.0[2] = width;
+            tensor.format.layout.tiling = project_grid(output, tensor, 0, 0)?;
+            tensor.format.layout.tiling.axes.push(AxisTiling::new(
+                TensorAxis::FromStart(1),
+                1,
+                key_block,
+                Padding::Zero,
+            ));
+            tensor.format.layout.tiling.axes.push(AxisTiling::new(
+                TensorAxis::FromStart(2),
+                1,
+                AMP_COLUMN_MICRO,
+                Padding::Zero,
+            ));
+            tensor.format.layout.memory_class = MemoryClass::Ipu21Standard;
+        }
+        packed_key.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
+        packed_value.format.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block: u16::try_from(key_block).ok()?,
+            column_block: AMP_COLUMN_MICRO as u16,
+        });
+        let key_panels = self.prepare_attention_operand(MidValueId(1), &packed_key, key_block)?;
+        let value_panels =
+            self.prepare_attention_operand(MidValueId(2), &packed_value, key_block)?;
         let mut weights = None;
         let mut result = None;
         for start in (0..key_rows).step_by(key_block as usize) {
             let valid = key_block.min(key_rows - start);
-            let mut packed_key = key.clone();
-            let mut packed_value = value.clone();
-            for (tensor, width) in [
-                (&mut packed_key, query_width),
-                (&mut packed_value, value_width),
-            ] {
-                tensor.shape.0[1] = valid;
-                tensor.shape.0[2] = width;
-                tensor.format.layout.tiling = project_grid(output, tensor, 0, 0)?;
-                tensor.format.layout.tiling.axes.push(AxisTiling::new(
-                    TensorAxis::FromStart(1),
-                    1,
-                    key_block,
-                    Padding::Zero,
-                ));
-                tensor.format.layout.tiling.axes.push(AxisTiling::new(
-                    TensorAxis::FromStart(2),
-                    1,
-                    AMP_COLUMN_MICRO,
-                    Padding::Zero,
-                ));
-                tensor.format.layout.memory_class = MemoryClass::Ipu21Standard;
-            }
-            packed_key.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
-            packed_value.format.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block: u16::try_from(key_block).ok()?,
-                column_block: AMP_COLUMN_MICRO as u16,
-            });
-            let k = self.attention_operand(MidValueId(1), packed_key, start)?;
+            let mut key_block_type = packed_key.clone();
+            let mut value_block_type = packed_value.clone();
+            key_block_type.shape.0[1] = valid;
+            value_block_type.shape.0[1] = valid;
+            let k = self.copy(key_panels, key_block_type, vec![0, start, 0]);
+            // Flash broadcasts K/V together. Full materialization keeps their
+            // large resident matrices in disjoint lifetimes.
+            let v = (!materialized)
+                .then(|| self.copy(value_panels, value_block_type.clone(), vec![0, start, 0]));
             let scores = self.compute(
                 vec![query_buffer, k],
                 scores_type.clone(),
@@ -100,7 +111,8 @@ impl Builder {
                 vec![],
             ));
             let weights_id = weights?;
-            let v = self.attention_operand(MidValueId(2), packed_value, start)?;
+            let v =
+                v.unwrap_or_else(|| self.copy(value_panels, value_block_type, vec![0, start, 0]));
             let product = self.compute(
                 vec![weights_id, v],
                 product_type.clone(),
@@ -131,19 +143,23 @@ impl Builder {
     }
     /// Pack once on a small distributed owner grid, then broadcast native
     /// panels. Both materializations are ordinary mid values and copies.
-    fn attention_operand(
+    fn prepare_attention_operand(
         &mut self,
         input: MidValueId,
-        resident: TensorType,
-        start: u32,
+        resident: &TensorType,
+        key_block: u32,
     ) -> Option<MidValueId> {
         let heads = u16::try_from(resident.shape.0[0]).ok()?;
-        let columns = u16::try_from(resident.shape.0[2].div_ceil(AMP_COLUMN_MICRO))
+        let blocks = u16::try_from(resident.shape.0[1].div_ceil(key_block))
             .ok()?
             .min(resident.format.layout.tiling.tile_count / heads)
             .max(1);
+        let columns = u16::try_from(resident.shape.0[2].div_ceil(AMP_COLUMN_MICRO))
+            .ok()?
+            .min(resident.format.layout.tiling.tile_count / heads / blocks)
+            .max(1);
         let mut packed = resident.clone();
-        packed.format.layout.tiling.tile_count = heads.checked_mul(columns)?;
+        packed.format.layout.tiling.tile_count = heads.checked_mul(columns)?.checked_mul(blocks)?;
         packed.format.layout.tiling.replicas = 1;
         for axis in &mut packed.format.layout.tiling.axes {
             match axis.axis.resolve(3).ok()? {
@@ -151,16 +167,17 @@ impl Builder {
                     axis.partitions = heads;
                     axis.tile_stride = Some(1);
                 }
+                1 => {
+                    axis.partitions = blocks;
+                    axis.tile_stride = Some(heads.checked_mul(columns)?);
+                }
                 2 => {
                     axis.partitions = columns;
                     axis.tile_stride = Some(heads);
                 }
-                _ => {
-                    axis.tile_stride = None;
-                }
+                _ => unreachable!(),
             }
         }
-        let packed = self.copy(input, packed, vec![0, start, 0]);
-        Some(self.copy(packed, resident, vec![]))
+        Some(self.copy(input, packed, vec![]))
     }
 }

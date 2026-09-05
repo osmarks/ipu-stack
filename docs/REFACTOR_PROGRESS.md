@@ -428,3 +428,38 @@ Materialized attention layout correction (2026-09-05):
   key rows padded to a 128-row product.
 - All 153 release workspace tests and strict Clippy pass. Forced materialized
   hardware validation is running at this checkpoint.
+
+Completed whole-device mid rewrite (2026-09-05):
+
+- Final selection contains compact distributed primitives; low rejects unresolved
+  operator recipes and only expands selected primitives. Beam costing uses mid
+  geometry, approximate traffic and coarse liveness without constructing tile
+  graphs or running physical allocation analysis.
+- Attention packs complete distributed K/V tensors before its key-block sequence.
+  Flash broadcasts K/V together; materialized attention separates their resident
+  lifetimes. These are ordinary mid copies, with no attention strategy in low.
+  Parallel GEMM also preserves the selected MatchRemote materialization policy.
+- Final validation: all 153 workspace release tests and strict Clippy pass. Hardware
+  passes GEMM, batched GEMM, full MLP, automatic attention, attention smoke, forced
+  Flash, forced materialized attention, repeated MLP and scheduled-repeat MLP.
+  The scheduled-repeat run retained only one finalist, so it does not demonstrate
+  hardware reranking of multiple finalists; the pricing/multiplicity unit test
+  covers that logic. No driver or reset workaround changes were needed.
+- Final full MLP (729 tokens, width 1152, hidden 4304) measures 327,144 cycles at
+  1.5 GHz, versus 336,318 before this rewrite: about 2.7% faster. Maximum error
+  is 0.011719. Mid planning falls from 64.8 s to 7.181 s; total build/validation
+  falls from 298.6 s to 244.67 s. Peak RSS falls from about 8.94 GiB to 1.31 GiB.
+- Final projected attention (16 heads, 729 tokens, width 72) measures 782,088 cycles
+  versus 739,284 before this rewrite: a remaining 5.8% device regression.
+  Upfront packing removed most of the initial regression (1,226,070 cycles).
+  Automatic build/validation takes 49.62 s, with 2.495 s mid planning versus
+  32.673 s previously. Maximum error is 0.001230; forced materialized attention
+  also passes with maximum error 0.000930. Final attention has 21 exchange phases
+  versus 19 previously; further scheduling/transfer work remains possible.
+- Source size is 50,491 lines, down 1,054 from the 51,545-line baseline `3dc35a8`.
+  Counts include tracked Rust/C/C++/assembly sources and headers under `crates`
+  and `device`, excluding documentation and generated artifacts.
+- These final measurements supersede the intermediate validation checkpoints
+  above. Logs and packages are under `/tmp/whole-mid-*`; architecture and data-flow
+  documentation describe the completed boundary. General copy/view chain
+  composition (#4) remains deferred pending discussion of its planning overlap.

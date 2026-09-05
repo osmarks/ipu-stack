@@ -42,7 +42,10 @@ Parallel GEMM uses a leading partials dimension followed by a sum. Output-statio
 GEMM exposes its staged K panels and accumulating output versions. Attention
 exposes Q/K/V materialization, products, softmax and merge. Key/value panels
 are packed on a small distributed owner grid and then broadcast through ordinary
-mid copies; consumers do not each repeat the source transform. Key blocks are currently
+mid copies. Packing precedes the key-block sequence. Flash places each block's
+K/V broadcasts together so generic transfer consolidation can combine them;
+materialized attention delays the resident V copy until after softmax so the
+large resident K/V matrices have disjoint lifetimes. Key blocks are currently
 statically represented as whole-device operations; tile counts do not multiply
 this representation. Kernel blocking describes the local calls to enumerate later.
 

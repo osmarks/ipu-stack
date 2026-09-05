@@ -92,7 +92,13 @@ impl Builder {
                 if multiply == Precision::F16 {
                     right_staging.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
                 }
-                let weights = self.copy(right, right_staging, vec![]);
+                let weights = self.materialize(
+                    right,
+                    right_staging,
+                    vec![],
+                    plan.requirements.inputs[right.index() as usize].local_staging
+                        == LocalOperandStaging::Direct,
+                );
                 let mut partials = partial;
                 partials.shape.0.insert(0, u32::from(inner_partitions));
                 let rank = partials.shape.0.len();

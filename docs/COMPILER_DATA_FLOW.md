@@ -79,6 +79,24 @@ view slices are mapped copies whose output is an ordinary mid value. Tile
 expansion shares physical copy realization across all these uses, including
 padding, direct resident views and destination packing.
 
+```mermaid
+flowchart LR
+  K[Logical keys and values] --> PACK[Copy to distributed packed tensors]
+  PACK --> WINDOW[Copy each key-block window to the compute grid]
+  Q[Materialized queries] --> QK[QK product]
+  WINDOW --> QK
+  QK --> SOFTMAX[Softmax and row state]
+  SOFTMAX --> PV[Probability/value product]
+  WINDOW --> PV
+  PV --> MERGE[Merge output version]
+```
+
+Packing happens once before the key-block sequence. Flash key/value broadcasts
+for a block are adjacent independent copies; generic low transfer consolidation
+can combine them. Materialized attention delays the resident value copy until
+after softmax, keeping the large resident key/value matrices in disjoint
+lifetimes. This ordering is explicit in mid; low has no attention strategy builder.
+
 **General copy/view chain composition (#4) remains deferred at the user's
 request.** Discuss its overlap with planning before implementing it. Resolving
 already selected deferred views is part of the current boundary rewrite; it is
