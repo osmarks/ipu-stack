@@ -45,10 +45,6 @@ impl BlockBuilder {
             &requirements.inputs[left_index],
             &requirements.inputs[right_index],
         );
-        let mut kernel_requirements = requirements.clone();
-        if orientation == crate::GemmOrientation::Swapped {
-            kernel_requirements.inputs.swap(0, 1);
-        }
         let left_shards = self.value_shards(*left_value)?.to_vec();
         let right_shards = self.value_shards(*right_value)?.to_vec();
         let output_shards = self.value_shards(*output_value)?.to_vec();
@@ -453,7 +449,7 @@ impl BlockBuilder {
                                 };
                                 gemm_runs.push((
                                     left_shard.tile,
-                                    KernelRun::new(
+                                    self.kernel_run(
                                         WorkProvenance {
                                             operation: operation.source,
                                             value: Some(*output_value),
@@ -469,8 +465,7 @@ impl BlockBuilder {
                                             },
                                         ],
                                         partial.clone(),
-                                        kernel_requirements.clone(),
-                                    ),
+                                    )?,
                                 ));
                             }
                             continue;
@@ -522,7 +517,7 @@ impl BlockBuilder {
                                 ],
                             )?
                         };
-                        let run = KernelRun::new(
+                        let run = self.kernel_run(
                             WorkProvenance {
                                 operation: operation.source,
                                 value: Some(*output_value),
@@ -538,8 +533,7 @@ impl BlockBuilder {
                                 },
                             ],
                             partial.clone(),
-                            kernel_requirements.clone(),
-                        );
+                        )?;
                         gemm_runs.push((left_shard.tile, run));
                     }
                 }
@@ -576,7 +570,6 @@ impl BlockBuilder {
                     .map(|contributors| contributors.into_iter().map(|(_, view)| view).collect()),
                 &output_shards,
                 reduction_staging,
-                requirements,
                 WorkProvenance {
                     operation: operation.source,
                     value: Some(*output_value),

@@ -82,7 +82,6 @@ impl BlockBuilder {
         padded_key_rows: u32,
         padded_query_dimension: u32,
         padded_value_dimension: u32,
-        requirements: &StorageRequirements,
         tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
@@ -166,7 +165,7 @@ impl BlockBuilder {
             self.append_kernel(
                 tiles,
                 task.tile,
-                KernelRun::new(
+                self.kernel_run(
                     kernel_provenance,
                     query_key.clone(),
                     vec![
@@ -178,13 +177,12 @@ impl BlockBuilder {
                         },
                     ],
                     scores.clone(),
-                    requirements.clone(),
-                ),
+                )?,
             )?;
             self.append_kernel(
                 tiles,
                 task.tile,
-                KernelRun::new(
+                self.kernel_run(
                     kernel_provenance,
                     TileKernelSpec::AttentionSoftmax {
                         head_dimension: task.query_dimension,
@@ -195,8 +193,7 @@ impl BlockBuilder {
                         views: vec![scores],
                     }],
                     self.full_view(task.weights),
-                    requirements.clone(),
-                ),
+                )?,
             )?;
         }
         self.append_materialized_attention_input(
@@ -213,7 +210,7 @@ impl BlockBuilder {
             self.append_kernel(
                 tiles,
                 task.tile,
-                KernelRun::new(
+                self.kernel_run(
                     kernel_provenance,
                     probability_value.clone(),
                     vec![
@@ -225,13 +222,12 @@ impl BlockBuilder {
                         },
                     ],
                     block_value.clone(),
-                    requirements.clone(),
-                ),
+                )?,
             )?;
             self.append_kernel(
                 tiles,
                 task.tile,
-                KernelRun::new(
+                self.kernel_run(
                     kernel_provenance,
                     TileKernelSpec::AttentionMerge {
                         value_dimension: task.value_dimension,
@@ -249,8 +245,7 @@ impl BlockBuilder {
                         },
                     ],
                     self.full_view(task.output),
-                    requirements.clone(),
-                ),
+                )?,
             )?;
         }
         Ok(())

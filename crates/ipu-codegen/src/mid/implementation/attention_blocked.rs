@@ -117,7 +117,6 @@ impl BlockBuilder {
         key_block_rows: u32,
         padded_query_dimension: u32,
         padded_value_dimension: u32,
-        requirements: &StorageRequirements,
         tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
@@ -257,7 +256,7 @@ impl BlockBuilder {
                 self.append_kernel(
                     tiles,
                     task.tile,
-                    KernelRun::new(
+                    self.kernel_run(
                         kernel_provenance,
                         query_key.clone(),
                         vec![
@@ -269,13 +268,12 @@ impl BlockBuilder {
                             },
                         ],
                         score_view.clone(),
-                        requirements.clone(),
-                    ),
+                    )?,
                 )?;
                 self.append_kernel(
                     tiles,
                     task.tile,
-                    KernelRun::new(
+                    self.kernel_run(
                         kernel_provenance,
                         TileKernelSpec::AttentionSoftmax {
                             head_dimension: task.query_dimension,
@@ -286,8 +284,7 @@ impl BlockBuilder {
                             views: vec![score_view],
                         }],
                         self.full_view(task.weights),
-                        requirements.clone(),
-                    ),
+                    )?,
                 )?;
                 let probability_view = self.narrow_view(task.weights, &[(1, 0, key_block_rows)])?;
                 let block_value_view =
@@ -295,7 +292,7 @@ impl BlockBuilder {
                 self.append_kernel(
                     tiles,
                     task.tile,
-                    KernelRun::new(
+                    self.kernel_run(
                         kernel_provenance,
                         probability_value.clone(),
                         vec![
@@ -307,13 +304,12 @@ impl BlockBuilder {
                             },
                         ],
                         block_value_view.clone(),
-                        requirements.clone(),
-                    ),
+                    )?,
                 )?;
                 self.append_kernel(
                     tiles,
                     task.tile,
-                    KernelRun::new(
+                    self.kernel_run(
                         kernel_provenance,
                         TileKernelSpec::AttentionMerge {
                             value_dimension: task.value_dimension,
@@ -331,8 +327,7 @@ impl BlockBuilder {
                             },
                         ],
                         self.full_view(task.output),
-                        requirements.clone(),
-                    ),
+                    )?,
                 )?;
             }
         }

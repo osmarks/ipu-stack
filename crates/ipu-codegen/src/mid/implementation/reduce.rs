@@ -10,7 +10,6 @@ impl BlockBuilder {
         groups: impl IntoIterator<Item = Vec<ShardView>>,
         outputs: &[BlockValueId],
         staging: crate::ReductionStaging,
-        requirements: &StorageRequirements,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
@@ -197,7 +196,7 @@ impl BlockBuilder {
                     };
                     reduction_runs[stage].push((
                         owner.tile,
-                        KernelRun::new(
+                        self.kernel_run(
                             provenance,
                             TileKernelSpec::ReductionSum {
                                 partials: u16::try_from(chunk.len() + 1)
@@ -212,8 +211,7 @@ impl BlockBuilder {
                                 },
                             ],
                             self.full_view(stage_result),
-                            requirements.clone(),
-                        ),
+                        )?,
                     ));
                 }
                 let final_result = if reduction_stages.is_multiple_of(2) {
@@ -327,19 +325,12 @@ mod tests {
                         .collect(),
                 );
             }
-            let requirements = StorageRequirements {
-                inputs: vec![OperandRequirement::new(format.clone(), 8); 2],
-                output: OperandRequirement::new(format, 8),
-                output_aliasing: OutputAliasing::Fresh,
-                distinct_elements: Vec::new(),
-            };
             let mut region = BlockRegion::default();
             builder
                 .append_sum_partials(
                     groups,
                     &outputs,
                     staging,
-                    &requirements,
                     WorkProvenance {
                         operation: None,
                         value: None,

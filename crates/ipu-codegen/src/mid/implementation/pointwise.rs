@@ -8,7 +8,6 @@ impl BlockBuilder {
         operation: &MidOperation,
         kernel: TileKernelSpec,
         input_mapping: PointwiseInputMapping,
-        requirements: &StorageRequirements,
         tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
         let [result] = operation.results.as_slice() else {
@@ -90,7 +89,7 @@ impl BlockBuilder {
                     .collect::<BlockBuildResult<_>>()?;
                 wave_runs[wave].push((
                     tile,
-                    KernelRun::new(
+                    self.kernel_run(
                         WorkProvenance {
                             operation: operation.source,
                             value: operation.results.first().copied(),
@@ -102,8 +101,7 @@ impl BlockBuilder {
                             shard: output,
                             extents: output_extents,
                         },
-                        requirements.clone(),
-                    ),
+                    )?,
                 ));
             }
         }

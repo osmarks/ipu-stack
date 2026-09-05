@@ -3,7 +3,7 @@
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{BlockValueId, ShardDefinition};
-use crate::mid::{MemoryClass, MemoryOperand, OperandRequirement};
+use crate::mid::{MemoryClass, MemoryOperand};
 use crate::{StorageError, shard_storage_bytes};
 use ipu_package::{
     IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
@@ -437,7 +437,7 @@ fn collect_requirements(
     }
 }
 
-fn apply_requirement(target: &mut Requirement, requirement: &OperandRequirement) {
+fn apply_requirement(target: &mut Requirement, requirement: &crate::mid::KernelAccess) {
     target.alignment = target.alignment.max(requirement.alignment);
     target.access_tail = target.access_tail.max(requirement.access_tail_bytes);
 }

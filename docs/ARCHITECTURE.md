@@ -168,8 +168,10 @@ intermediate sizes to a "large" specialization. Full-block C++ softmax retains
 its query-row specialization; assembly tail softmax shares workers across both
 query and logical key sizes.
 
-Candidate recipes and mid compute blocks share `StorageRequirements`. The mid builder binds call
-formats to the actual operand buffers, truncates unused enclosing-operator
-operands, and retains access alignment/tail and applicable separation constraints
-before interning metadata. Backend validation no longer distinguishes a conversion
-from another kernel by a wrapper tag.
+Candidate recipes use `StorageRequirements` for format and materialization choices.
+Mid calls construct `KernelRequirements` from the actual buffers and primitive
+kernel kind. These contain only operand formats, alignment/access tails and SRAM
+separation constraints; they do not retain candidate aliasing, staging or
+materialization policy. GEMM calls, including those inside attention, require
+their actual left operand's read tail and output/left SRAM separation. Reductions
+and attention stages no longer inherit unrelated enclosing-operator constraints.

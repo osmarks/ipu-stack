@@ -251,7 +251,7 @@ impl BlockBuilder {
         self.append_kernel(
             tiles,
             tile,
-            KernelRun::new(
+            self.kernel_run(
                 provenance,
                 TileKernelSpec::Rearrange {
                     from: input.layout.clone(),
@@ -261,13 +261,7 @@ impl BlockBuilder {
                     views: vec![self.full_view(source)],
                 }],
                 self.full_view(destination),
-                StorageRequirements {
-                    inputs: vec![OperandRequirement::new(input, 2)],
-                    output_aliasing: OutputAliasing::Fresh,
-                    output: OperandRequirement::new(output, 2),
-                    distinct_elements: Vec::new(),
-                },
-            ),
+            )?,
         )
     }
 }

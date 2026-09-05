@@ -143,7 +143,7 @@ pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> 
 
 pub fn tile_kernel_abi(
     kernel: &TileKernelSpec,
-    requirements: &StorageRequirements,
+    requirements: &KernelRequirements,
 ) -> Result<KernelAbi, KernelAbiError> {
     let precision = requirements.output.format.precision;
     let (symbols, availability, inputs, scalars): (_, _, usize, &'static [ScalarValue]) =
@@ -362,7 +362,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     Ok(abi)
 }
 
-pub(super) fn gelu_symbol(requirements: &StorageRequirements) -> Option<&'static str> {
+pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
     let [input] = requirements.inputs.as_slice() else {
         return None;
     };

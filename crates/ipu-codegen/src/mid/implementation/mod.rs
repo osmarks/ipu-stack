@@ -24,10 +24,9 @@ use crate::graph::OperationId;
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
     ConversionStrategy, CopyOrder, CopyPattern, ElementOrder, GemmDistribution,
-    ImplementationCandidate, Layout, LayoutError, MemoryClass, MemoryOperand, MidOperation,
-    MidOperationKind, MidRepeat, MidValueId, OperandRequirement, OperatorDispatch, OutputAliasing,
-    PointwiseInputMapping, Precision, ShardExtent, StorageRequirements, TensorTiling, TensorType,
-    TileKernelSpec,
+    ImplementationCandidate, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
+    MidRepeat, MidValueId, OperatorDispatch, OutputAliasing, PointwiseInputMapping, Precision,
+    ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError};
 use attention::*;
@@ -330,13 +329,7 @@ impl BlockBuilder {
             OperatorDispatch::Pointwise {
                 kernel,
                 input_mapping,
-            } => self.build_pointwise(
-                operation,
-                kernel.clone(),
-                *input_mapping,
-                &plan.requirements,
-                tiles,
-            ),
+            } => self.build_pointwise(operation, kernel.clone(), *input_mapping, tiles),
             OperatorDispatch::BlockedGemm {
                 inner_block,
                 output_column_block,
@@ -386,7 +379,6 @@ impl BlockBuilder {
                 *key_block_rows,
                 *padded_query_dimension,
                 *padded_value_dimension,
-                &plan.requirements,
                 tiles,
             ),
             OperatorDispatch::MaterializedAttention {
@@ -404,7 +396,6 @@ impl BlockBuilder {
                 *padded_key_rows,
                 *padded_query_dimension,
                 *padded_value_dimension,
-                &plan.requirements,
                 tiles,
             ),
             OperatorDispatch::View => self.build_view(operation, &plan.operator, tiles),
@@ -426,22 +417,15 @@ impl BlockBuilder {
     ) -> BlockBuildResult<()> {
         let shard_data = &self.shards[shard.index() as usize];
         let tile = shard_data.tile;
-        let output = OperandRequirement::new(shard_data.tensor_type.format.clone(), 8);
         self.append_kernel(
             tiles,
             tile,
-            KernelRun::new(
+            self.kernel_run(
                 provenance,
                 TileKernelSpec::FillZero,
                 Vec::new(),
                 self.full_view(shard),
-                StorageRequirements {
-                    inputs: Vec::new(),
-                    output,
-                    output_aliasing: crate::OutputAliasing::Fresh,
-                    distinct_elements: Vec::new(),
-                },
-            ),
+            )?,
         )
     }
 

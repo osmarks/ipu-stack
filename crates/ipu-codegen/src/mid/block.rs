@@ -121,11 +121,67 @@ pub struct KernelOperand {
     pub views: Vec<ShardView>,
 }
 
+/// Access contract of an actual kernel buffer, without candidate planning policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelAccess {
+    pub format: TensorFormat,
+    pub alignment: u32,
+    pub access_tail_bytes: u32,
+}
+
+impl KernelAccess {
+    pub fn new(format: TensorFormat, alignment: u32) -> Self {
+        Self {
+            format,
+            alignment,
+            access_tail_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRequirements {
+    pub inputs: Vec<KernelAccess>,
+    pub output: KernelAccess,
+    pub distinct_elements: Vec<Vec<MemoryOperand>>,
+}
+
+impl KernelRequirements {
+    pub fn new(
+        kernel: &TileKernelSpec,
+        inputs: impl IntoIterator<Item = TensorFormat>,
+        output: TensorFormat,
+    ) -> Self {
+        let alignment = match kernel {
+            TileKernelSpec::Gemm { .. } => 32,
+            TileKernelSpec::Rearrange { .. } => 2,
+            _ => 8,
+        };
+        let mut requirements = Self {
+            inputs: inputs
+                .into_iter()
+                .map(|format| KernelAccess::new(format, alignment))
+                .collect(),
+            output: KernelAccess::new(output, alignment),
+            distinct_elements: Vec::new(),
+        };
+        if let TileKernelSpec::Gemm { multiply, .. } = kernel
+            && let Some(left) = requirements.inputs.first_mut()
+        {
+            left.access_tail_bytes = 8 * multiply.bytes() as u32;
+            requirements
+                .distinct_elements
+                .push(vec![MemoryOperand::Output, MemoryOperand::Input(0)]);
+        }
+        requirements
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
     pub kernel: TileKernelSpec,
-    pub requirements: StorageRequirements,
+    pub requirements: KernelRequirements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +197,7 @@ impl KernelRun {
         kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
         output: ShardView,
-        requirements: StorageRequirements,
+        requirements: KernelRequirements,
     ) -> Self {
         Self {
             metadata: Arc::new(KernelRunMetadata {

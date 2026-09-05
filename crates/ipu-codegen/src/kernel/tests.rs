@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    AccumulationPrecision, ComputeGraph, Ipu21CostModel, Layout, MemoryClass, OperandRequirement,
-    OutputAliasing, PipelineConfig, ShardExtent, ShardView, StorageRequirements, TensorFormat,
-    TensorTiling, WorkProvenance, WorkReason, lower, lower_to_tiles,
+    AccumulationPrecision, ComputeGraph, Ipu21CostModel, KernelAccess, KernelRequirements, Layout,
+    MemoryClass, PipelineConfig, ShardExtent, ShardView, TensorFormat, TensorTiling,
+    WorkProvenance, WorkReason, lower, lower_to_tiles,
 };
 
 #[test]
@@ -55,10 +55,9 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                     })
                     .collect(),
             },
-            StorageRequirements {
+            KernelRequirements {
                 inputs: Vec::new(),
-                output: OperandRequirement::new(format, 8),
-                output_aliasing: OutputAliasing::Fresh,
+                output: KernelAccess::new(format, 8),
                 distinct_elements: Vec::new(),
             },
         );
@@ -99,11 +98,10 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
                 memory_class: MemoryClass::Ipu21Standard,
             },
         };
-        let operand = OperandRequirement::new(format, 8);
-        let requirements = StorageRequirements {
+        let operand = KernelAccess::new(format, 8);
+        let requirements = KernelRequirements {
             inputs: vec![operand.clone(), operand.clone()],
             output: operand,
-            output_aliasing: OutputAliasing::Fresh,
             distinct_elements: Vec::new(),
         };
         let abi = tile_kernel_abi(
@@ -225,7 +223,7 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
         };
         let output_layout = input_layout.clone();
         let requirement = |layout| {
-            OperandRequirement::new(
+            KernelAccess::new(
                 TensorFormat {
                     precision: Precision::F16,
                     layout,
@@ -233,10 +231,9 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
                 8,
             )
         };
-        let requirements = StorageRequirements {
+        let requirements = KernelRequirements {
             inputs: vec![requirement(input_layout)],
             output: requirement(output_layout),
-            output_aliasing: OutputAliasing::Fresh,
             distinct_elements: Vec::new(),
         };
         let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
@@ -347,10 +344,9 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 })
                 .collect(),
             output,
-            StorageRequirements {
-                inputs: vec![OperandRequirement::new(format.clone(), 8); inputs],
-                output: OperandRequirement::new(format, 8),
-                output_aliasing: OutputAliasing::Fresh,
+            KernelRequirements {
+                inputs: vec![KernelAccess::new(format.clone(), 8); inputs],
+                output: KernelAccess::new(format, 8),
                 distinct_elements: Vec::new(),
             },
         );

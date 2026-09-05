@@ -220,7 +220,7 @@ impl BlockBuilder {
                         }
                         runs.push((
                             tile,
-                            KernelRun::new(
+                            self.kernel_run(
                                 WorkProvenance {
                                     operation: operation.source,
                                     value: Some(*output_value),
@@ -236,8 +236,7 @@ impl BlockBuilder {
                                     },
                                 ],
                                 output_view,
-                                requirements.clone(),
-                            ),
+                            )?,
                         ));
                     }
                 }

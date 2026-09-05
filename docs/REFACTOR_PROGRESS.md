@@ -191,3 +191,20 @@ passes with 262144 exact checks and an identical tile image
 The requested block-IR migration is complete: low has no GEMM/attention/conversion
 expansion path. Further work can price expanded blocks directly or compose more
 general layout-conversion chains; neither is claimed by the contiguous-copy pass.
+
+## Primitive call contracts (2026-09-05)
+
+- Kernel calls now derive their contracts from actual operand formats and kernel
+  kind. Removed inherited contract truncation, format rewriting, separation-group
+  pruning, and unused requirement arguments in attention, pointwise and sums.
+- Executable contracts omit candidate aliasing/materialization/staging policy.
+  GEMM read tails and output/left SRAM separation apply to GEMMs inside attention;
+  reduction and softmax calls no longer inherit enclosing GEMM constraints.
+- Release workspace tests: 146 passed. Strict Clippy passed. Hardware GEMM,
+  batched GEMM, SigLIP MLP, SigLIP attention and attention smoke all passed.
+  Logs: `/tmp/kernel-contract-*`.
+- Remaining authorized work: shared panel materialization and mid-derived cost /
+  allocation analysis used by detailed planning, removing obsolete estimates.
+- Deferred at the user's request: copy/view chain composition (#4). Remind the
+  user later to discuss its complexity and interaction with planning before
+  implementing it. Adjacent-copy behavior remains as before.

@@ -17,8 +17,8 @@ use specialization::*;
 use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
     AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, GemmKernelMode,
-    GemmWeightLoad, KernelRun, LowProgram, Precision, StepProfile, StorageError,
-    StorageRequirements, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
+    GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, Precision, StepProfile,
+    StorageError, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

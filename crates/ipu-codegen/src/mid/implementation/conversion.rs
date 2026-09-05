@@ -53,7 +53,7 @@ impl BlockBuilder {
             self.append_kernel(
                 tiles,
                 source.tile,
-                KernelRun::new(
+                self.kernel_run(
                     provenance,
                     TileKernelSpec::Rearrange {
                         from: source.tensor_type.format.layout.clone(),
@@ -67,19 +67,7 @@ impl BlockBuilder {
                         views: vec![self.full_view(source_shard)],
                     }],
                     self.full_view(staging),
-                    StorageRequirements {
-                        inputs: vec![OperandRequirement::new(source.tensor_type.format, 4)],
-                        output_aliasing: OutputAliasing::Fresh,
-                        output: OperandRequirement::new(
-                            self.shards[staging.index() as usize]
-                                .tensor_type
-                                .format
-                                .clone(),
-                            4,
-                        ),
-                        distinct_elements: Vec::new(),
-                    },
-                ),
+                )?,
             )?;
             staging_shards.push(staging);
         }
@@ -134,7 +122,7 @@ impl BlockBuilder {
             self.append_kernel(
                 tiles,
                 tile,
-                KernelRun::new(
+                self.kernel_run(
                     operation_provenance(operation),
                     if plan.input.format.precision != plan.output.format.precision {
                         TileKernelSpec::Cast {
@@ -151,13 +139,7 @@ impl BlockBuilder {
                         views: vec![self.full_view(input)],
                     }],
                     self.full_view(output),
-                    StorageRequirements {
-                        inputs: vec![plan.input.clone()],
-                        output_aliasing: OutputAliasing::Fresh,
-                        output: plan.output.clone(),
-                        distinct_elements: Vec::new(),
-                    },
-                ),
+                )?,
             )?;
         }
         Ok(())
@@ -278,14 +260,6 @@ impl BlockBuilder {
             if let Some(staging) = staging {
                 let destination = self.logical_view(destination_shard);
                 let staging = self.full_view(staging);
-                let source_format = self.shards[staging.shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .clone();
-                let destination_format = self.shards[destination_shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .clone();
                 let tile = self.shards[destination_shard.index() as usize].tile;
                 if let Some(kernel) = plan
                     .staging
@@ -294,23 +268,14 @@ impl BlockBuilder {
                 {
                     after_exchange_kernels.push((
                         tile,
-                        KernelRun::new(
+                        self.kernel_run(
                             provenance,
                             kernel.clone(),
                             vec![KernelOperand {
                                 views: vec![staging],
                             }],
                             self.full_view(destination_shard),
-                            StorageRequirements {
-                                inputs: vec![OperandRequirement::new(source_format, 2)],
-                                output_aliasing: OutputAliasing::Fresh,
-                                output: OperandRequirement::new(destination_format, 2),
-                                distinct_elements: vec![vec![
-                                    MemoryOperand::Input(0),
-                                    MemoryOperand::Output,
-                                ]],
-                            },
-                        ),
+                        )?,
                     ));
                 } else {
                     append_span_copies(

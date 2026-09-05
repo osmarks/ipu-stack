@@ -3,6 +3,43 @@
 use super::*;
 
 impl BlockBuilder {
+    pub(super) fn kernel_run(
+        &self,
+        provenance: WorkProvenance,
+        kernel: TileKernelSpec,
+        inputs: Vec<KernelOperand>,
+        output: ShardView,
+    ) -> BlockBuildResult<KernelRun> {
+        let formats = inputs
+            .iter()
+            .map(|operand| {
+                let view = operand
+                    .views
+                    .first()
+                    .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                Ok(self.shards[view.shard.index() as usize]
+                    .tensor_type
+                    .format
+                    .clone())
+            })
+            .collect::<BlockBuildResult<Vec<_>>>()?;
+        let requirements = KernelRequirements::new(
+            &kernel,
+            formats,
+            self.shards[output.shard.index() as usize]
+                .tensor_type
+                .format
+                .clone(),
+        );
+        Ok(KernelRun::new(
+            provenance,
+            kernel,
+            inputs,
+            output,
+            requirements,
+        ))
+    }
+
     pub(super) fn append_phase(
         &mut self,
         transfers: BTreeMap<ShardView, Vec<ShardView>>,
@@ -157,37 +194,10 @@ impl BlockBuilder {
         &mut self,
         tiles: &mut BlockRegion,
         tile: u16,
-        mut run: KernelRun,
+        run: KernelRun,
     ) -> BlockBuildResult<()> {
-        // Dispatch constraints describe a whole operator. Bind their access
-        // requirements to this call's actual buffers before interning metadata.
-        let requirements = &mut Arc::make_mut(&mut run.metadata).requirements;
-        if run.inputs.len() > requirements.inputs.len() {
-            return Err(BlockBuildError::InvalidOperatorPlan);
-        }
-        requirements.inputs.truncate(run.inputs.len());
-        for (operand, requirement) in run.inputs.iter().zip(&mut requirements.inputs) {
-            let view = operand
-                .views
-                .first()
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
-            requirement.format = self.shards[view.shard.index() as usize]
-                .tensor_type
-                .format
-                .clone();
-        }
-        requirements.output.format = self.shards[run.output.shard.index() as usize]
-            .tensor_type
-            .format
-            .clone();
-        for group in &mut requirements.distinct_elements {
-            group.retain(|operand| match operand {
-                MemoryOperand::Output => true,
-                MemoryOperand::Input(index) => usize::from(*index) < run.inputs.len(),
-            });
-        }
         let output_flattens_outer_rows = matches!(
-            requirements.output.format.layout.order,
+            run.requirements.output.format.layout.order,
             ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
         );
         if matches!(run.kernel, TileKernelSpec::Gemm { .. })
