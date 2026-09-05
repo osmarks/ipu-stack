@@ -20,6 +20,27 @@ Add broadcasting, and attention causality and scaling. GeLU currently denotes
 the exact function. Attention intentionally has no general mask input; the
 supported form is either causal or unmasked.
 
+## Compiler modules
+
+Compiler implementation modules are private; the crate root exposes the graph,
+package-building interface, and types used by diagnostics. Internals are
+organized by responsibility:
+
+- `mid/layout` defines tensor formats; `mid/resolved` validates ownership and
+  resolves partition bounds and capacities. `mid/view` owns logical axis split/merge
+  mappings shared by materialized views and deferred consumer slices.
+  `mid/operator` defines executable contracts. `catalogue` supplies implementation families,
+  `candidates` specializes them for shapes, and `planner` selects complete plans
+  and inserts conversions.
+- `estimate/tensor` adapts resolved geometry to conservative estimates, `traffic`
+  counts data movement, `memory` evaluates allocations and region liveness, and
+  `cycles` applies target prices. Memory estimate types live here alongside their calculations.
+- `low/conversion` realizes selected formats and deferred views; `gemm` and
+  `attention` expand their dispatches. `copies` handles concrete byte-span copies.
+  The root module owns the shared schedule state and generic dispatch.
+
+Tests live in separate test modules next to these implementations.
+
 ## Mid-level IR
 
 `ipu_codegen::mid` is the layout-aware boundary. Every value has a logical
@@ -43,15 +64,32 @@ Candidates record every input and output format, per-operand alignment and
 access tails, output aliasing permissions, memory-element relations, and
 operation-specific compute precision. They can therefore describe
 mixed-precision, alternative-layout, and in-place operator implementations.
-The initial toy model compares rough arithmetic throughput with bytes moved. When a chosen
-operator format differs from its producer, lowering inserts `CastPrecision` and
-`Rearrange` operations explicitly. Repeated regions stay structured; their
+Catalogue candidates wrap a shared `OperatorPlan` with a format policy. After
+resolving that policy, candidate expansion, validation, costing, and selection
+use the same plan record. Bound deferred inputs and exchange footprints belong
+to the selected operation. When a chosen operator format differs from its
+producer, lowering inserts explicit `Convert` operations, casting precision
+before changing layout. Each operation variant owns its selected plan; there are no optional
+sidecar plans or duplicate format fields. Repeated regions stay structured; their
 iterated value sequences are normalized once outside the body rather than
 causing the body to be unrolled.
 
+Mid planning also commits materialization decisions. A conversion whose output
+is `DispatchSlices` remains unmaterialized until its consumer requests slices,
+including when conversions for other operands intervene. Before emitting a
+selected region, the planner clears unclaimed deferred-output offers and restores
+their materialized costs. Low lowering follows the resulting contracts instead
+of scanning region uses to make those decisions again.
+
+Low lowering still chooses physical fragment emission and staging from concrete
+storage spans. Coalescing adjacent byte copies belongs to that physical step;
+it does not create or remove semantic format conversions.
+
 The selected `OperatorPlan` also contains an `OperatorDispatch`: a whole-device
-recipe for ordered data movement and tile-kernel calls. The retained GEMM plan
-uses 64-element inner and output-column blocks. Low lowering expands each
+recipe for ordered data movement and tile-kernel calls. A blocked GEMM stores
+its blocking, orientation, and distribution once. Low lowering derives the
+initializing and accumulating kernel specifications from that plan and the
+selected compute precision. Low lowering expands each
 output-column block into an initializing tile-kernel phase followed by zero or
 more accumulating phases, moving the applicable right-hand slice to every
 output-row tile before each call. Pointwise and head-sharded plans dispatch one
@@ -59,7 +97,7 @@ local kernel per output shard.
 
 Every candidate plan is validated against its concrete operand types before it
 can be selected. Validation checks dispatch/operator agreement, tile groups,
-block divisibility, tile-kernel modes and GEMM layout roles. The retained AMP
+block divisibility and GEMM layout roles. The retained AMP
 GEMM plan currently rejects transposed operands rather than silently applying
 the non-transposed schedule.
 
@@ -70,6 +108,19 @@ the IPU21 interleaved memory class, and the output and left stream occupy
 distinct effective memory elements. This is an inspectable scaffold for a
 measured cost model or autotuner, not a claim that those choices are globally
 optimal.
+
+`Layout::resolve` constructs a `ResolvedLayout` before physical placement. It
+stores partition bounds once per axis, sharing them across replicas and tile
+queries. Logical ranges exclude padding between groups; physical ranges include
+padding owned by each shard. Capacity queries use those same bounds, and
+`Layout::shard_extents` expands them for low lowering. Linear ownership remains
+compact until row fragments are needed. Resolution failures are infeasible
+estimates rather than approximate fallback capacities.
+
+Parallel GEMM partial-buffer formats are derived by `OperatorDispatch`, including
+the selected ownership grain and per-shard padding. Both cycle/memory estimation
+and low lowering consume that format; kernel column blocking does not define a
+second storage partitioning.
 
 `low::lower_to_tiles` turns these plans into logical per-tile work lists. It
 assigns rectangular shards to logical tiles, preserves repeats as reusable tile-local
@@ -136,3 +187,22 @@ loads an `Application`, applies package configuration writes, and creates a
 driver `HostSession`.
 
 Application construction is intentionally not part of the runtime.
+
+### View and kernel specialization contracts
+
+The semantic graph still provides `SplitHeads`, but mid-level execution uses
+`MidOperator::View(AxisFactorView)`. The mapping moves a factor between arbitrary
+axes, validates the output shape, and maps rectangular slices back to their
+source. Materialized and deferred lowering share this geometry. This is a
+split/merge view primitive, not yet a general reshape/permutation composition.
+Attention-specific candidate layouts and cost fast paths remain.
+
+Kernel build planning and call emission use the same `KernelSpecialization`
+key. ABI scalar arguments are typed values rather than strings interpreted at
+runtime. The build plan retains one specialization-to-symbol map; redundant
+GEMM row inventories and unused provisional ABI symbol names are removed.
+
+Packaging still uses provisional scheduling to size exchange tables and generated
+code. It may reuse transfer widths and ordering after final placement, but always
+rebuilds and validates physical rows. Changed normalized rows trigger optimization
+again. Removing this allocation/scheduling cycle is not a current refactoring goal.

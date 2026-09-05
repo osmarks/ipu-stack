@@ -1,0 +1,1286 @@
+use super::*;
+
+const RANDOM_CASES: usize = 128;
+
+#[test]
+fn randomized_memory_peaks_reserve_disjoint_class_arenas() {
+    let mut random = fastrand::Rng::with_seed(0x636c_6173_735f_7372);
+    let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
+    let interleaved_capacity = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
+    let element = u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
+    let mut rejected_noncoincident_peaks = 0;
+    for _ in 0..RANDOM_CASES * 16 {
+        let standard = random.u64(0..=capacity);
+        let interleaved = random.u64(0..=interleaved_capacity);
+        let reservation = random.u64(0..=capacity / 4);
+        let simultaneous =
+            random.u64(standard.max(interleaved)..=standard.saturating_add(interleaved));
+        let peaks = MemoryPeaks {
+            standard,
+            interleaved,
+            total: simultaneous,
+            maximum_standard_allocation: 0,
+            ..MemoryPeaks::default()
+        };
+        let aligned_interleaved = interleaved.div_ceil(element) * element;
+        let static_partition = standard
+            .saturating_add(aligned_interleaved)
+            .saturating_add(reservation);
+        let fits = peaks.fits_ipu21_with_budget(reservation, capacity);
+        assert_eq!(fits, static_partition <= capacity);
+        if simultaneous.saturating_add(reservation) <= capacity && static_partition > capacity {
+            rejected_noncoincident_peaks += 1;
+            assert!(!fits);
+        }
+    }
+    assert!(rejected_noncoincident_peaks > 0);
+}
+
+fn dimension(random: &mut fastrand::Rng) -> u32 {
+    random.u32(1..=128)
+}
+
+fn small_dimension(random: &mut fastrand::Rng) -> u32 {
+    random.u32(1..=4)
+}
+
+fn precision(random: &mut fastrand::Rng) -> Precision {
+    if random.bool() {
+        Precision::F16
+    } else {
+        Precision::F32
+    }
+}
+
+fn format(precision: Precision, layout: Layout) -> TensorFormat {
+    TensorFormat { precision, layout }
+}
+
+fn random_format(random: &mut fastrand::Rng, tiles: u16) -> TensorFormat {
+    let tiling = if random.bool() {
+        TensorTiling::replicated(tiles)
+    } else {
+        TensorTiling::sharded(TensorAxis::FromEnd(2), tiles)
+    };
+    let mut layout = Layout::row_major(tiling);
+    if random.bool() {
+        layout.memory_class = MemoryClass::Ipu21Interleaved;
+    }
+    format(precision(random), layout)
+}
+
+#[test]
+fn randomized_future_state_is_id_independent_but_preserves_aliasing() {
+    let mut random = fastrand::Rng::with_seed(0x616c_6961_7365_7321);
+    for _ in 0..RANDOM_CASES {
+        let mut graph = ComputeGraph::new();
+        let first = graph.host_input("first", [1]).unwrap();
+        let second = graph.host_input("second", [1]).unwrap();
+        let dummy = graph.host_input("dummy", [1]).unwrap();
+        let tiles = random.u16(1..=64);
+        let tensor_type = TensorType {
+            shape: TensorShape::new([random.u32(1..=128)]),
+            format: random_format(&mut random, tiles),
+        };
+        let aliases = random.bool();
+        let automatic = random.bool();
+        let parameter = random.bool();
+
+        let make_branch = |prepend_dummy: bool, aliases: bool| {
+            let mut state = LoweringState::default();
+            if prepend_dummy {
+                state.value(dummy, tensor_type.clone());
+            }
+            let first_id = state.value(first, tensor_type.clone());
+            let second_id = if aliases {
+                state.value_in_storage_group(second, tensor_type.clone(), first_id)
+            } else {
+                state.value(second, tensor_type.clone())
+            };
+            if automatic {
+                state.automatic_inputs.extend([first_id, second_id]);
+            }
+            if parameter {
+                state.parameter_values.extend([first_id, second_id]);
+            }
+            BeamBranch {
+                values: [(first, first_id), (second, second_id)]
+                    .into_iter()
+                    .collect(),
+                state,
+                operations: Vec::new(),
+                peak_memory: MemoryPeaks::default(),
+            }
+        };
+        let future = [first, second].into_iter().collect();
+        let constraints = RegionPlanningConstraints {
+            allocation_copies: [(first, random.u32(1..=8))].into_iter().collect(),
+            required_equal_formats: vec![(first, second)],
+        };
+        let baseline = future_beam_state(&make_branch(false, aliases), &future, &constraints);
+        let renumbered = future_beam_state(&make_branch(true, aliases), &future, &constraints);
+        let changed_aliasing =
+            future_beam_state(&make_branch(true, !aliases), &future, &constraints);
+        assert_eq!(baseline, renumbered);
+        assert_ne!(baseline, changed_aliasing);
+    }
+}
+
+#[test]
+fn randomized_active_tile_candidates_bound_idle_capacity() {
+    let mut random = fastrand::Rng::with_seed(0x7469_6c65);
+    for _ in 0..RANDOM_CASES {
+        let capacity = random.u16(1..=1472);
+        let counts = candidate_active_tile_counts(capacity);
+        assert_eq!(counts[0], capacity);
+        assert!(counts.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(counts.iter().all(|&count| count <= capacity));
+        assert!(counts[1..].iter().all(|count| count.is_power_of_two()));
+        assert_eq!(counts.last(), Some(&1));
+    }
+    for exponent in 1..=10 {
+        let capacity = 1_u16 << exponent;
+        assert_eq!(candidate_active_tile_counts(capacity).len(), exponent + 1);
+    }
+}
+
+#[test]
+fn randomized_shape_aware_tile_candidates_follow_graph_extents() {
+    let mut random = fastrand::Rng::with_seed(0x7368_6170_655f_6772);
+    for case in 0..RANDOM_CASES {
+        let capacity = random.u16(16..=1472);
+        let extent = random.u16(2..=capacity);
+        let shape = TensorShape(vec![u32::from(extent), random.u32(1..=4096)]);
+        let counts = shape_aware_active_tile_counts(capacity, [&shape]);
+        let expected = capacity / extent * extent;
+        if expected >= capacity.div_ceil(2) && expected < capacity {
+            assert!(counts.contains(&expected), "case {case}");
+        }
+        assert!(counts.iter().all(|&count| {
+            count < capacity
+                && count >= capacity.div_ceil(2)
+                && shape.0.iter().any(|&axis| u32::from(count) % axis == 0)
+        }));
+    }
+}
+
+fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
+    &lowered.values[id.index() as usize]
+}
+
+#[test]
+fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
+    let mut random = fastrand::Rng::with_seed(0x7061_7274_6961_6c73);
+    let mut distributed_result_cases = 0;
+    for _ in 0..RANDOM_CASES {
+        let output_columns = AMP_OUTPUT_COLUMN_BLOCK;
+        let inner_partitions = random.u16(2..=4);
+        let column_partitions = random.u16(1..=4);
+        let row_partitions = random.u16(1..=8);
+        let tiles = row_partitions * column_partitions * inner_partitions;
+        let k = u32::from(inner_partitions) * 64 + random.u32(0..64);
+        let n = u32::from(column_partitions) * output_columns + random.u32(0..output_columns);
+        let m = u32::from(row_partitions) + random.u32(0..=16);
+        let base = amp_grid_gemm_operator_candidate(
+            Precision::F16,
+            64,
+            16,
+            output_columns,
+            AmpGridShape {
+                tile_count: tiles,
+                row_partitions: 1,
+                column_partitions: tiles,
+                order: GridOrder::ColumnsFast,
+            },
+            AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
+        );
+        let inputs = [
+            TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
+            TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
+        ];
+        let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
+        let candidates = parallel_reduction_candidates(
+            &base.plan,
+            &inputs,
+            &TensorShape(vec![m, n]),
+            &config,
+            &Ipu21CostModel,
+            true,
+            None,
+            None,
+        );
+        assert!(
+            !candidates.is_empty(),
+            "shape={m}x{k}x{n} tiles={tiles} output_columns={output_columns}"
+        );
+        distributed_result_cases += usize::from(candidates.iter().any(|candidate| {
+            matches!(
+                candidate.dispatch,
+                OperatorDispatch::BlockedGemm {
+                    distribution: GemmDistribution::ParallelReduction {
+                        result_row_partitions,
+                        result_column_partitions,
+                        ..
+                    },
+                    ..
+                } if (result_row_partitions, result_column_partitions) != (1, 1)
+            )
+        }));
+        for candidate in candidates {
+            assert!(
+                candidate.supports(&inputs, &TensorShape(vec![m, n])),
+                "unsupported candidate: {candidate:?}; shape={m}x{k}x{n}"
+            );
+            assert!(matches!(
+                candidate.dispatch,
+                OperatorDispatch::BlockedGemm {
+                    inner_block,
+                    output_column_block,
+                    orientation,
+                    distribution: GemmDistribution::ParallelReduction {
+                        row_partitions: actual_rows,
+                        column_partitions: actual_columns,
+                        inner_partitions: actual,
+                        ..
+                    },
+                    ..
+                } if actual_rows * actual_columns * actual <= tiles
+                    && actual_rows * actual_columns * actual >= tiles.div_ceil(2)
+                    && u32::from(actual_rows) <= match orientation {
+                        GemmOrientation::Normal => m,
+                        GemmOrientation::Swapped => n,
+                    }
+                    && u32::from(actual_columns) * output_column_block >= match orientation {
+                        GemmOrientation::Normal => n,
+                        GemmOrientation::Swapped => m,
+                    }
+                    && u32::from(actual) * inner_block >= k
+            ));
+        }
+    }
+    assert!(distributed_result_cases > 0);
+}
+
+#[test]
+fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
+    let mut random = fastrand::Rng::with_seed(0x6379_636c);
+    for _ in 0..RANDOM_CASES {
+        let rows = 1_u16 << random.u32(0..=2);
+        let columns = 1_u16 << random.u32(0..=2);
+        let tiles = rows * columns;
+        let m = u32::from(rows) * random.u32(1..=4);
+        let k = 64 * random.u32(2..=4);
+        let n = u32::from(columns) * 64;
+        let left = TensorType::new(
+            [m, k],
+            Precision::F16,
+            Layout::amp_left_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
+        );
+        let mut standard_layout =
+            Layout::block_major_matrix_grid(64, 64, tiles, rows, columns, GridOrder::ColumnsFast);
+        let mut direct_layout = standard_layout.clone();
+        direct_layout.memory_class = MemoryClass::Ipu21Interleaved;
+        standard_layout.memory_class = MemoryClass::Ipu21Standard;
+        let standard = TensorType::new([k, n], Precision::F16, standard_layout);
+        let direct = TensorType::new([k, n], Precision::F16, direct_layout);
+        let output = TensorType::new(
+            [m, n],
+            Precision::F16,
+            Layout::amp_output_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
+        );
+        let operator = MidOperator::Gemm {
+            options: GemmOptions::default(),
+            multiply: Precision::F16,
+            accumulate: AccumulationPrecision::F32,
+        };
+        let dispatch = default_dispatch(operator);
+        let requirements = OperatorRequirements {
+            inputs: Vec::new(),
+            output: OperandRequirement::new(output.format.clone(), 8),
+            output_aliasing: OutputAliasing::Fresh,
+            distinct_elements: Vec::new(),
+        };
+        let plan = OperatorPlan {
+            operator,
+            dispatch,
+            requirements,
+            deferred_output: None,
+        };
+        let standard_cost =
+            Ipu21CostModel.operator_cycles(&plan, &[left.clone(), standard], &output);
+        let direct_cost = Ipu21CostModel.operator_cycles(&plan, &[left, direct], &output);
+        assert!(direct_cost < standard_cost);
+    }
+}
+
+#[test]
+fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids() {
+    let mut random = fastrand::Rng::with_seed(0x6f77_6e65_7273);
+    for case in 0..RANDOM_CASES {
+        let row_partitions = 1_u16 << random.u32(1..=4);
+        let column_partitions = 1_u16 << random.u32(0..=4);
+        let tiles = row_partitions * column_partitions;
+        let inner_blocks = u32::from(row_partitions) * random.u32(1..=4);
+        let inner = inner_blocks * AMP_INNER_BLOCK;
+        let columns = u32::from(column_partitions) * AMP_OUTPUT_COLUMN_BLOCK;
+        let grid = AmpGridShape {
+            tile_count: tiles,
+            row_partitions,
+            column_partitions,
+            order: GridOrder::ColumnsFast,
+        };
+        let candidate = amp_grid_gemm_operator_candidate(
+            Precision::F16,
+            64,
+            16,
+            AMP_OUTPUT_COLUMN_BLOCK,
+            grid,
+            AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
+        );
+        let inputs = [
+            TensorType::new(
+                [u32::from(row_partitions), inner],
+                Precision::F16,
+                candidate.plan.requirements.inputs[0].format.layout.clone(),
+            ),
+            TensorType::new(
+                [inner, columns],
+                Precision::F16,
+                candidate.plan.requirements.inputs[1].format.layout.clone(),
+            ),
+        ];
+        let variants =
+            independent_parameter_storage(&candidate.plan, &inputs, 1, &PipelineConfig::new(tiles));
+        assert!(!variants.is_empty(), "case {case}");
+        for variant in variants {
+            let tiling = &variant.requirements.inputs[1].format.layout.tiling;
+            assert_eq!(tiling.replicas, 1, "case {case}");
+            assert!(tiling.tile_count <= tiles, "case {case}");
+            assert_eq!(
+                tiling.tile_count,
+                tiling.replicas
+                    * tiling
+                        .axes
+                        .iter()
+                        .map(|axis| axis.partitions)
+                        .product::<u16>(),
+                "case {case}"
+            );
+            assert!(
+                variant.requirements.inputs[1]
+                    .format
+                    .layout
+                    .padded_shape(&inputs[1].shape)
+                    .is_ok(),
+                "case {case}"
+            );
+        }
+    }
+}
+
+fn assert_conversions_are_explicit(lowered: &MidGraph, operations: &[MidOperation]) {
+    for operation in operations {
+        let [input] = operation.inputs.as_slice() else {
+            continue;
+        };
+        let [result] = operation.results.as_slice() else {
+            continue;
+        };
+        let before = &value(lowered, *input).tensor_type;
+        let after = &value(lowered, *result).tensor_type;
+        if let MidOperationKind::Convert(plan) = &operation.kind {
+            assert_eq!(plan.input.format, before.format);
+            assert_eq!(plan.output.format, after.format);
+            assert_eq!(before.shape, after.shape);
+            if before.format.precision != after.format.precision {
+                assert_eq!(before.format.layout, after.format.layout);
+                assert_eq!(plan.strategy, ConversionStrategy::LocalKernel);
+            } else {
+                assert_ne!(before.format.layout, after.format.layout);
+            }
+        }
+    }
+}
+
+fn assert_operator_signature(
+    lowered: &MidGraph,
+    operation: &MidOperation,
+    inputs: &[TensorFormat],
+    output: TensorFormat,
+) {
+    assert_eq!(operation.inputs.len(), inputs.len());
+    for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
+        assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
+    }
+    assert_eq!(
+        value(lowered, operation.results[0]).tensor_type.format,
+        output
+    );
+}
+
+struct ColumnParityCost;
+
+impl CostModel for ColumnParityCost {
+    fn operator_cycles(
+        &self,
+        plan: &OperatorPlan,
+        _inputs: &[TensorType],
+        output: &TensorType,
+    ) -> u64 {
+        let preferred = if output.shape.0.last().unwrap().is_multiple_of(2) {
+            Precision::F16
+        } else {
+            Precision::F32
+        };
+        match plan.operator {
+            MidOperator::Gemm { multiply, .. } if multiply == preferred => 0,
+            MidOperator::Gemm { .. } => 1,
+            _ => 0,
+        }
+    }
+
+    fn cast_cycles(&self, _input: &TensorType, _to: Precision) -> u64 {
+        0
+    }
+
+    fn rearrangement_cost(
+        &self,
+        _shape: &TensorShape,
+        _precision: Precision,
+        _strategy: ConversionStrategy,
+        _from: &Layout,
+        _to: &Layout,
+    ) -> crate::estimate::RearrangementCost {
+        crate::estimate::RearrangementCost::default()
+    }
+}
+
+#[test]
+fn randomized_axis_tiling_applies_or_rejects_padding() {
+    let mut random = fastrand::Rng::with_seed(0x7469_6c65);
+    for case in 0..RANDOM_CASES {
+        let rank = random.usize(1..=6);
+        let axis = random.usize(0..rank);
+        let extent = dimension(&mut random);
+        let block_size = random.u32(1..=32);
+        let partitions = random.u16(1..=16);
+        let replicas = random.u16(1..=4);
+        let padding = if random.bool() {
+            Padding::Reject
+        } else {
+            Padding::Zero
+        };
+        let mut shape = (0..rank)
+            .map(|_| dimension(&mut random))
+            .collect::<Vec<_>>();
+        shape[axis] = extent;
+        let layout = Layout::row_major(TensorTiling {
+            tile_count: partitions * replicas,
+            replicas,
+            axes: vec![AxisTiling::new(
+                TensorAxis::FromStart(axis as u16),
+                partitions,
+                block_size,
+                padding,
+            )],
+        });
+
+        let result = layout.padded_shape(&TensorShape(shape.clone()));
+        if padding == Padding::Reject && !extent.is_multiple_of(block_size) {
+            assert!(
+                matches!(result, Err(LayoutError::IndivisibleAxis { .. })),
+                "random case {case}"
+            );
+        } else {
+            let padded = result.unwrap();
+            let expected = extent.div_ceil(block_size) * block_size;
+            assert_eq!(padded.0[axis], expected, "random case {case}");
+            for (other, original) in shape.iter().enumerate() {
+                if other != axis {
+                    assert_eq!(padded.0[other], *original, "random case {case}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
+    let mut random = fastrand::Rng::with_seed(0x6d69_6467);
+    for case in 0..RANDOM_CASES {
+        let tiles = random.u16(1..=64);
+        let (rows, inner, columns) = (
+            u32::from(tiles) * small_dimension(&mut random),
+            random.u32(1..=2) * 64,
+            small_dimension(&mut random) * 64,
+        );
+        let batches = (0..random.usize(0..=3))
+            .map(|_| random.u32(1..=2))
+            .collect::<Vec<_>>();
+        let multiply = precision(&mut random);
+        let left_format = format(
+            precision(&mut random),
+            Layout::amp_left([8, 16, 32][random.usize(0..3)], tiles),
+        );
+        let right_format = format(
+            if random.bool() {
+                precision(&mut random)
+            } else {
+                Precision::F8F143 {
+                    scale_exponent: random.i8(-16..=16),
+                }
+            },
+            Layout::block_major_matrix_storage(
+                [8, 16, 32][random.usize(0..3)],
+                AMP_OUTPUT_COLUMN_BLOCK,
+                tiles,
+                1,
+                1,
+                MemoryClass::Ipu21Standard,
+            ),
+        );
+        let output_format = format(
+            precision(&mut random),
+            if multiply == Precision::F16 {
+                Layout::amp_left_result(tiles)
+            } else {
+                Layout::amp_output(tiles)
+            },
+        );
+        let accumulate = if random.bool() {
+            AccumulationPrecision::F16
+        } else {
+            AccumulationPrecision::F32
+        };
+        let candidate = OperatorCandidate::new(
+            MidOperator::Gemm {
+                options: GemmOptions::default(),
+                multiply,
+                accumulate,
+            },
+            [
+                OperandRequirement::new(left_format.clone(), 32),
+                OperandRequirement::new(right_format.clone(), 32),
+            ],
+            OperandRequirement::new(output_format.clone(), 32),
+        );
+        let mut left_shape = batches.clone();
+        left_shape.extend([rows, inner]);
+        let mut right_shape = vec![1; batches.len()];
+        right_shape.extend([inner, columns]);
+
+        let mut graph = ComputeGraph::new();
+        let left = graph.host_input("left", left_shape).unwrap();
+        let right = graph.parameter("right", right_shape).unwrap();
+        let product = graph.gemm(left, right).unwrap();
+        graph.set_outputs([product]).unwrap();
+        let linear = Layout::row_sharded(tiles);
+        let mut config = PipelineConfig::new(tiles)
+            .with_input(left, format(precision(&mut random), linear.clone()))
+            .with_input(right, format(precision(&mut random), linear));
+        config.operator_candidates = vec![candidate.clone()];
+
+        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap_or_else(|error| {
+            panic!(
+                "random case {case}: tiles={tiles} rows={rows} inner={inner} columns={columns} batches={batches:?}: {error:?}"
+            )
+        });
+        let operator = lowered
+            .operations
+            .iter()
+            .find(|operation| matches!(operation.kind, MidOperationKind::Operator { .. }))
+            .unwrap();
+        let MidOperationKind::Operator {
+            plan:
+                OperatorPlan {
+                    operator:
+                        MidOperator::Gemm {
+                            multiply: selected_multiply,
+                            accumulate: selected_accumulate,
+                            ..
+                        },
+                    ..
+                },
+            ..
+        } = operator.kind
+        else {
+            panic!("random case {case}: expected GEMM");
+        };
+        assert_eq!(selected_multiply, multiply, "random case {case}");
+        assert_eq!(selected_accumulate, accumulate, "random case {case}");
+        assert_eq!(
+            &value(&lowered, operator.inputs[0]).tensor_type.format,
+            &candidate.plan.requirements.inputs[0].format,
+            "random case {case}"
+        );
+        let selected_right = &value(&lowered, operator.inputs[1]).tensor_type.format;
+        assert_eq!(
+            selected_right.precision, candidate.plan.requirements.inputs[1].format.precision,
+            "random case {case}"
+        );
+        assert_eq!(
+            selected_right.layout.order, candidate.plan.requirements.inputs[1].format.layout.order,
+            "random case {case}"
+        );
+        let output = value(&lowered, lowered.outputs[0]);
+        let expected_shape = graph.value_shape(product).unwrap().clone();
+        assert_eq!(
+            output.tensor_type.shape, expected_shape,
+            "random case {case}"
+        );
+        assert_eq!(
+            &output.tensor_type.format, &candidate.plan.requirements.output.format,
+            "random case {case}"
+        );
+        assert_conversions_are_explicit(&lowered, &lowered.operations);
+    }
+}
+
+#[test]
+fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
+    let mut random = fastrand::Rng::with_seed(0x6265_616d);
+    for case in 0..RANDOM_CASES {
+        let tiles = [1, 2, 4, 8][random.usize(0..4)];
+        let rows = u32::from(tiles) * random.u32(1..=8);
+        let inner = random.u32(1..=4) * 64;
+        let columns = random.u32(1..=4) * 64;
+        let row = format(Precision::F16, Layout::row_sharded(tiles));
+        let left = format(Precision::F16, Layout::amp_left(64, tiles));
+        let right = format(
+            Precision::F16,
+            Layout::block_major_matrix_storage(
+                64,
+                AMP_OUTPUT_COLUMN_BLOCK,
+                tiles,
+                1,
+                1,
+                MemoryClass::Ipu21Standard,
+            ),
+        );
+        let output = format(Precision::F16, Layout::amp_left_result(tiles));
+
+        let mut graph = ComputeGraph::new();
+        let activation = graph.host_input("activation", [rows, inner]).unwrap();
+        let weights = graph.parameter("weights", [inner, columns]).unwrap();
+        let activated = graph.gelu(activation).unwrap();
+        let product = graph.gemm(activated, weights).unwrap();
+        graph.set_outputs([product]).unwrap();
+
+        let candidates = vec![
+            OperatorCandidate::new(
+                MidOperator::Gelu,
+                [OperandRequirement::new(row.clone(), 8)],
+                OperandRequirement::new(row.clone(), 8),
+            ),
+            OperatorCandidate::new(
+                MidOperator::Gelu,
+                [OperandRequirement::new(row.clone(), 8)],
+                OperandRequirement::new(left.clone(), 8),
+            ),
+            OperatorCandidate::new(
+                MidOperator::Gemm {
+                    options: GemmOptions::default(),
+                    multiply: Precision::F16,
+                    accumulate: AccumulationPrecision::F32,
+                },
+                [
+                    OperandRequirement::new(left.clone(), 32),
+                    OperandRequirement::new(right.clone(), 32),
+                ],
+                OperandRequirement::new(output, 32),
+            ),
+        ];
+        let make_config = |beam_width| {
+            let mut config = PipelineConfig::new(tiles)
+                .with_input(activation, row.clone())
+                .with_input(weights, right.clone())
+                .with_planning_beam_width(beam_width);
+            config.operator_candidates = candidates.clone();
+            config
+        };
+        let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
+        let searched_config = make_config(2);
+        let finalists = lower_finalists(&graph, &searched_config, &Ipu21CostModel, 2).unwrap();
+        assert!(
+            !finalists.is_empty() && finalists.len() <= 2,
+            "random case {case}"
+        );
+        for finalist in &finalists {
+            assert_eq!(
+                finalist.estimated_cycles,
+                finalist
+                    .operations
+                    .iter()
+                    .map(|operation| operation.estimated_cycles)
+                    .sum::<u64>(),
+                "random case {case}"
+            );
+            assert_eq!(
+                finalist.estimated_exchange_cycles,
+                finalist
+                    .operations
+                    .iter()
+                    .map(|operation| operation.estimated_exchange_cycles)
+                    .sum::<u64>(),
+                "random case {case}"
+            );
+            assert!(
+                finalist.estimated_exchange_cycles <= finalist.estimated_cycles,
+                "random case {case}"
+            );
+        }
+        let searched = &finalists[0];
+
+        assert!(
+            searched.estimated_cycles < greedy.estimated_cycles,
+            "random case {case}"
+        );
+        let gelu = searched
+            .operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::Gelu,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            value(searched, gelu.results[0]).tensor_type.format,
+            left,
+            "random case {case}"
+        );
+        assert!(
+            searched.peak_memory.fits_ipu21_with_budget(
+                searched_config.standard_memory_reservation_bytes,
+                searched_config.tile_memory_budget_bytes,
+            ),
+            "random case {case}"
+        );
+    }
+}
+
+#[test]
+fn randomized_gemm_lowering_rejects_per_batch_weights() {
+    let mut random = fastrand::Rng::with_seed(0x6261_7463);
+    for _ in 0..RANDOM_CASES {
+        let batch = random.u32(2..=8);
+        let rows = random.u32(1..=8);
+        let mut graph = ComputeGraph::new();
+        let left = graph.host_input("left", [batch, rows, 64]).unwrap();
+        let right = graph.parameter("right", [batch, 64, 64]).unwrap();
+        let output = graph.gemm(left, right).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(1)
+            .with_automatic_input(left, Precision::F16)
+            .with_automatic_input(right, Precision::F16);
+        assert!(matches!(
+            lower(&graph, &config, &Ipu21CostModel),
+            Err(LoweringError::UnsupportedGemmBatching(_))
+        ));
+    }
+}
+
+#[test]
+fn randomized_gemms_choose_precision_independently_within_one_graph() {
+    let mut random = fastrand::Rng::with_seed(0x6d75_6c74);
+    for case in 0..RANDOM_CASES / 4 {
+        let tiles = random.u16(1..=64);
+        let rows = u32::from(tiles) * small_dimension(&mut random);
+        let inner = random.u32(1..=64);
+        let even_columns = random.u32(1..=16) * 2;
+        let odd_columns = random.u32(1..=16) * 2 - 1;
+        let layout = Layout::row_sharded(tiles);
+        let mut graph = ComputeGraph::new();
+        let left = graph.host_input("left", [rows, inner]).unwrap();
+        let even_right = graph.parameter("even", [inner, even_columns]).unwrap();
+        let odd_right = graph.parameter("odd", [inner, odd_columns]).unwrap();
+        let even = graph.gemm(left, even_right).unwrap();
+        let odd = graph.gemm(left, odd_right).unwrap();
+        graph.set_outputs([even, odd]).unwrap();
+        let input_format = format(precision(&mut random), layout);
+        let config = PipelineConfig::new(tiles)
+            .with_input(left, input_format.clone())
+            .with_input(even_right, input_format.clone())
+            .with_input(odd_right, input_format);
+
+        let lowered = lower(&graph, &config, &ColumnParityCost).unwrap();
+        let chosen = lowered
+            .operations
+            .iter()
+            .filter_map(|operation| match operation.kind {
+                MidOperationKind::Operator {
+                    plan:
+                        OperatorPlan {
+                            operator: MidOperator::Gemm { multiply, .. },
+                            ..
+                        },
+                    ..
+                } => Some(multiply),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chosen,
+            vec![Precision::F16, Precision::F32],
+            "random case {case}"
+        );
+        for operation in lowered.operations.iter().filter(|operation| {
+            matches!(
+                operation.kind,
+                MidOperationKind::Operator {
+                    plan: OperatorPlan {
+                        operator: MidOperator::Gemm { .. },
+                        ..
+                    },
+                    ..
+                }
+            )
+        }) {
+            let requirements = &operation.operator_plan().unwrap().requirements;
+            assert!(
+                requirements
+                    .inputs
+                    .iter()
+                    .chain([&requirements.output])
+                    .all(|requirement| requirement.alignment == 32)
+            );
+            assert_eq!(
+                requirements.output.format.layout.memory_class,
+                MemoryClass::Ipu21Interleaved
+            );
+            let orientation = match operation.operator_plan().map(|plan| &plan.dispatch) {
+                Some(OperatorDispatch::BlockedGemm { orientation, .. }) => *orientation,
+                _ => unreachable!(),
+            };
+            let physical_left = match orientation {
+                GemmOrientation::Normal => 0usize,
+                GemmOrientation::Swapped => 1usize,
+            };
+            assert_eq!(
+                requirements.distinct_elements,
+                [vec![
+                    MemoryOperand::Output,
+                    MemoryOperand::Input(physical_left as u16),
+                ]]
+            );
+            let expected_tail = match operation.kind {
+                MidOperationKind::Operator {
+                    plan:
+                        OperatorPlan {
+                            operator:
+                                MidOperator::Gemm {
+                                    multiply: Precision::F16,
+                                    ..
+                                },
+                            ..
+                        },
+                    ..
+                } => 16,
+                MidOperationKind::Operator {
+                    plan:
+                        OperatorPlan {
+                            operator:
+                                MidOperator::Gemm {
+                                    multiply: Precision::F32,
+                                    ..
+                                },
+                            ..
+                        },
+                    ..
+                } => 32,
+                _ => unreachable!(),
+            };
+            assert_eq!(requirements.inputs[0].access_tail_bytes, expected_tail);
+        }
+    }
+}
+
+#[test]
+fn randomized_non_gemm_lowering_honors_operator_plans() {
+    let mut random = fastrand::Rng::with_seed(0x6164_642b);
+    for case in 0..RANDOM_CASES {
+        let tiles = random.u16(1..=64);
+        let batch = random.u32(1..=2);
+        let query_rows = u32::from(tiles) * random.u32(1..=2);
+        let key_rows = random.u32(1..=8);
+        let channels = random.u32(1..=8);
+        let value_channels = random.u32(1..=8);
+        let mut graph = ComputeGraph::new();
+        let activation = graph
+            .host_input("activation", [batch, query_rows, channels])
+            .unwrap();
+        let residual = graph
+            .host_input("residual", [batch, query_rows, channels])
+            .unwrap();
+        let query = graph
+            .host_input("query", [batch, query_rows, channels])
+            .unwrap();
+        let key = graph
+            .host_input("key", [batch, key_rows, channels])
+            .unwrap();
+        let attention_value = graph
+            .host_input("value", [batch, key_rows, value_channels])
+            .unwrap();
+        let activated = graph.gelu(activation).unwrap();
+        let sum = graph.add(activated, residual).unwrap();
+        let attended = graph.flash_attention(query, key, attention_value).unwrap();
+        graph.set_outputs([sum, attended]).unwrap();
+
+        let gelu_input = random_format(&mut random, tiles);
+        let gelu_output = gelu_input.clone();
+        let add_left = random_format(&mut random, tiles);
+        let add_right = random_format(&mut random, tiles);
+        let add_output = add_left.clone();
+        let attention_query = random_format(&mut random, tiles);
+        let attention_key = random_format(&mut random, tiles);
+        let attention_value_format = random_format(&mut random, tiles);
+        let attention_output = random_format(&mut random, tiles);
+        let attention_accumulate = if random.bool() {
+            AccumulationPrecision::F16
+        } else {
+            AccumulationPrecision::F32
+        };
+        let mut config = PipelineConfig::new(tiles)
+            .with_input(activation, random_format(&mut random, tiles))
+            .with_input(residual, random_format(&mut random, tiles))
+            .with_input(query, random_format(&mut random, tiles))
+            .with_input(key, random_format(&mut random, tiles))
+            .with_input(attention_value, random_format(&mut random, tiles));
+        config.operator_candidates = vec![
+            OperatorCandidate::new(
+                MidOperator::Gelu,
+                [OperandRequirement::new(gelu_input.clone(), 8)],
+                OperandRequirement::new(gelu_output.clone(), 8),
+            )
+            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
+            OperatorCandidate::new(
+                MidOperator::Add(AddOptions::default()),
+                [
+                    OperandRequirement::new(add_left.clone(), 8),
+                    OperandRequirement::new(add_right.clone(), 8),
+                ],
+                OperandRequirement::new(add_output.clone(), 8),
+            )
+            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
+            OperatorCandidate::new(
+                MidOperator::FlashAttention {
+                    options: AttentionOptions::default(),
+                    accumulate: attention_accumulate,
+                },
+                [
+                    OperandRequirement::new(attention_query.clone(), 8),
+                    OperandRequirement::new(attention_key.clone(), 8),
+                    OperandRequirement::new(attention_value_format.clone(), 8),
+                ],
+                OperandRequirement::new(attention_output.clone(), 8),
+            ),
+        ];
+
+        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let operators = lowered
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, MidOperationKind::Operator { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(operators.len(), 3, "random case {case}");
+        let gelu = operators
+            .iter()
+            .copied()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::Gelu,
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .expect("random graph retains its GeLU");
+        let add = operators
+            .iter()
+            .copied()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::Add(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .expect("random graph retains its add");
+        let attention = operators
+            .iter()
+            .copied()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::FlashAttention { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .expect("random graph retains its attention");
+        assert_operator_signature(&lowered, gelu, &[gelu_input], gelu_output.clone());
+        assert_eq!(
+            gelu.operator_plan().unwrap().requirements.output_aliasing,
+            OutputAliasing::MayAliasInputs(vec![0])
+        );
+        assert_operator_signature(&lowered, add, &[add_left, add_right], add_output);
+        assert_eq!(
+            add.operator_plan().unwrap().requirements.output_aliasing,
+            OutputAliasing::MayAliasInputs(vec![0])
+        );
+        assert!(matches!(
+            attention.kind,
+            MidOperationKind::Operator { plan: OperatorPlan { operator: MidOperator::FlashAttention { options, .. }, .. }, .. }
+                if options == AttentionOptions::default()
+        ));
+        assert_eq!(
+            value(&lowered, attention.results[0]).tensor_type.shape.0,
+            vec![batch, query_rows, value_channels],
+            "random case {case}"
+        );
+        assert_conversions_are_explicit(&lowered, &lowered.operations);
+    }
+}
+
+#[test]
+fn randomized_repeat_lowering_retains_sequences_without_unrolling() {
+    let mut random = fastrand::Rng::with_seed(0x7265_7065);
+    for case in 0..RANDOM_CASES {
+        let tiles = random.u16(1..=64);
+        let size = u32::from(tiles);
+        let count = random.u32(1..=12);
+        let layout = Layout::row_sharded(tiles);
+        let carried_format = format(precision(&mut random), layout.clone());
+        let mut graph = ComputeGraph::new();
+        let carried = graph.host_input("state", [size, size]).unwrap();
+        let weights = (0..count)
+            .map(|index| graph.parameter(format!("weight.{index}"), [size, size]))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let sequence = graph.value_sequence("weights", weights.clone()).unwrap();
+        let output = graph
+            .repeat(count, [carried], [], [sequence], |body, arguments| {
+                Ok(vec![
+                    body.gemm(arguments.carried[0], arguments.iterated[0])?,
+                ])
+            })
+            .unwrap()[0];
+        graph.set_outputs([output]).unwrap();
+        let mut config = PipelineConfig::new(tiles).with_input(carried, carried_format.clone());
+        for weight in weights {
+            config
+                .inputs
+                .insert(weight, format(precision(&mut random), layout.clone()));
+        }
+
+        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let repeat = lowered
+            .operations
+            .iter()
+            .find_map(|operation| match &operation.kind {
+                MidOperationKind::Repeat(repeat) => Some(repeat),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(repeat.count, count, "random case {case}");
+        assert_eq!(repeat.iterated_inputs.len(), 1, "random case {case}");
+        assert_eq!(
+            repeat.iterated_inputs[0].len(),
+            count as usize,
+            "random case {case}"
+        );
+        let sequence_format = &value(&lowered, repeat.iterated_inputs[0][0])
+            .tensor_type
+            .format;
+        assert!(
+            repeat.iterated_inputs[0].iter().all(|value_id| {
+                &value(&lowered, *value_id).tensor_type.format == sequence_format
+            })
+        );
+        assert_eq!(
+            &value(&lowered, repeat.body.yields[0]).tensor_type.format,
+            &carried_format,
+            "random case {case}"
+        );
+        assert_eq!(
+            &value(&lowered, lowered.outputs[0]).tensor_type.format,
+            &carried_format,
+            "random case {case}"
+        );
+        assert_conversions_are_explicit(&lowered, &lowered.operations);
+        assert_conversions_are_explicit(&lowered, &repeat.body.operations);
+    }
+}
+
+#[test]
+fn randomized_single_use_views_are_claimed_by_slice_consumers() {
+    let mut random = fastrand::Rng::with_seed(0x6465_6665_7272_6564);
+    for case in 0..RANDOM_CASES / 32 {
+        let heads = random.u32(2..=6);
+        let head_width = random.u32(4..=40) * 2;
+        let tokens = random.u32(1..=3) * AMP_INNER_BLOCK;
+        let model_width = heads * head_width;
+        let tiles = u16::try_from(heads * tokens.div_ceil(AMP_INNER_BLOCK)).unwrap();
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [1, tokens, model_width]).unwrap();
+        let mut projected = Vec::new();
+        let mut parameters = Vec::new();
+        for index in 0..3 {
+            let weights = graph
+                .parameter(format!("projection.{index}"), [model_width, model_width])
+                .unwrap();
+            parameters.push(weights);
+            projected.push(graph.gemm(input, weights).unwrap());
+        }
+        let split = projected
+            .iter()
+            .map(|&value| graph.split_heads(value, heads).unwrap())
+            .collect::<Vec<_>>();
+        let output = graph.flash_attention(split[0], split[1], split[2]).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let mut config = PipelineConfig::new(tiles).with_automatic_input(input, Precision::F16);
+        for parameter in parameters {
+            config = config.with_automatic_input(parameter, Precision::F16);
+        }
+        config.conversion_streaming = ConversionStreamingPolicy::Always;
+
+        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let producers = lowered
+            .operations
+            .iter()
+            .filter(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::View(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(producers.len(), split.len(), "random case {case}");
+        assert!(
+            producers.iter().all(|operation| {
+                operation.estimated_cycles == 0
+                    && operation
+                        .operator_plan()
+                        .is_some_and(|plan| plan.deferred_output.is_some())
+            }),
+            "random case {case}"
+        );
+        let consumer = lowered
+            .operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::FlashAttention { .. },
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let claims = consumer.deferred_inputs();
+        assert_eq!(claims.len(), split.len(), "random case {case}");
+        assert!(claims.iter().all(Option::is_some), "random case {case}");
+        assert!(
+            matches!(&consumer.kind, MidOperationKind::Operator { exchange, .. } if exchange.phases >= 2),
+            "random case {case}"
+        );
+        assert!(
+            consumer.memory.exchange_row_bytes != 0,
+            "random case {case}"
+        );
+        assert_eq!(
+            lowered.estimated_cycles,
+            lowered
+                .operations
+                .iter()
+                .map(|operation| operation.estimated_cycles)
+                .sum::<u64>(),
+            "random case {case}"
+        );
+        let tiled = crate::low::lower_to_tiles(&lowered, &config).unwrap_or_else(|error| {
+            panic!(
+                "random case {case}, heads {heads}, width {head_width}, tokens {tokens}: {error}"
+            )
+        });
+        crate::KernelBuildPlan::from_program(&tiled)
+            .unwrap_or_else(|error| panic!("random case {case}: {error}"));
+        let attention_phases = tiled
+            .exchange_phases
+            .iter()
+            .filter(|phase| phase.provenance.operation == consumer.source)
+            .count();
+        assert!(
+            attention_phases <= tokens.div_ceil(AMP_INNER_BLOCK) as usize + 2,
+            "random case {case}: {attention_phases} attention exchange phases"
+        );
+    }
+}
+
+#[test]
+fn randomized_unclaimed_deferred_offers_restore_materialization_cost() {
+    let mut random = fastrand::Rng::with_seed(0x756e_636c_6169_6d65);
+    for case in 0..RANDOM_CASES / 8 {
+        let batch = random.u32(1..=4);
+        let heads = random.u32(1..=8);
+        let rows = random.u32(1..=4) * AMP_INNER_BLOCK;
+        let head_width = random.u32(1..=4) * AMP_COLUMN_MICRO;
+        let mut graph = ComputeGraph::new();
+        let input = graph
+            .host_input("input", [batch, rows, heads * head_width])
+            .unwrap();
+        let output = graph.split_heads(input, heads).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let tiles = u16::try_from(batch * heads).unwrap();
+        let config = PipelineConfig::new(tiles).with_automatic_input(input, Precision::F16);
+
+        let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let operation = lowered
+            .operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Operator {
+                        plan: OperatorPlan {
+                            operator: MidOperator::View(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(operation.operator_plan().unwrap().deferred_output.is_none());
+        assert!(operation.estimated_cycles != 0, "random case {case}");
+    }
+}

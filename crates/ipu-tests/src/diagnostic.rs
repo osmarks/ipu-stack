@@ -348,6 +348,15 @@ pub(crate) fn prepare_inputs(
             },
         );
     }
+    let (weights, inputs) = pack_inputs(application, metadata, &values)?;
+    Ok((values, weights, inputs))
+}
+
+pub(crate) fn pack_inputs(
+    application: &Application,
+    metadata: &[DiagnosticTensor],
+    values: &BTreeMap<ValueId, HostTensor>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let pack = |bindings: &[Binding]| -> Result<Vec<u8>> {
         let mut result = Vec::new();
         for binding in bindings {
@@ -370,7 +379,7 @@ pub(crate) fn prepare_inputs(
                         format!("binding slice for {} shard is missing", binding.name)
                     })?;
                 for (index, offset) in shard_elements(metadata, shard)? {
-                    if u64::from(offset) + u64::try_from(metadata.precision.bytes())? > slice.size {
+                    if u64::from(offset) + metadata.precision.bytes() > slice.size {
                         bail!("logical element exceeds binding {} shard", binding.name);
                     }
                     encode_value(
@@ -394,7 +403,7 @@ pub(crate) fn prepare_inputs(
     };
     let weights = pack(&application.weights)?;
     let inputs = pack(&application.inputs)?;
-    Ok((values, weights, inputs))
+    Ok((weights, inputs))
 }
 
 fn encode_value(bytes: &mut [u8], offset: usize, value: f32, precision: Precision) -> Result<()> {

@@ -6,75 +6,51 @@ use ipu_exchange::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-mod cost;
 mod estimate;
-pub mod exchange;
+mod exchange;
 pub mod graph;
 mod host;
-pub mod kernel;
-pub mod low;
-pub mod memory;
-pub mod mid;
+mod kernel;
+mod low;
+mod memory;
+mod mid;
 mod package;
-pub mod place;
-pub mod storage;
-pub mod tile;
+mod place;
+mod storage;
+mod tile;
+pub(crate) use exchange::*;
 pub use exchange::{
-    EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityDiagnostic,
-    ExchangeActivityKind, ExchangeItemWidth, ExchangeLoweringError, ExchangeLoweringOptions,
-    ExchangeMemoryElement, ExchangeScheduleDestination, ExchangeScheduleProblem,
-    ExchangeScheduleRun, ExchangeScheduleSnapshot, ExchangeScheduleTransfer,
-    ExchangeTileDiagnostic, LoweredExchanges, PhysicalExchangePhase, diagnose_exchange_tile,
-    inactive_exchange_program, lower_exchanges, schedule_exchange_problem,
-    validate_exchange_schedule,
+    EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityKind,
+    ExchangeScheduleSnapshot, PhysicalExchangePhase, inactive_exchange_program,
+    schedule_exchange_problem, validate_exchange_schedule,
 };
+pub(crate) use graph::*;
 pub use graph::{
-    AddOptions, AttentionOptions, AttentionScale, BroadcastMode, ComputeGraph, GemmOptions,
-    GraphError, GraphInput, GraphInputKind, GraphResult, Operation, OperationId, OperationKind,
-    Region, RegionBuilder, Repeat, RepeatArguments, SplitHeadsOptions, TensorShape, ValueId,
-    ValueSequence, ValueSequenceId,
+    AttentionOptions, AttentionScale, ComputeGraph, GemmOptions, GraphError, GraphInputKind,
+    Operation, OperationKind, Region, Repeat, ValueId,
 };
-pub use kernel::{
-    KernelAbi, KernelAbiError, KernelAvailability, KernelBuildPlan, KernelCompilation,
-    KernelMaterializationError, KernelSymbols, PlannedKernelCall, ScalarArgument,
-    materialize_kernel_run, tile_kernel_abi, validate_kernel_run,
-};
-pub use low::{
-    ExchangeOrder, ExchangePhase, ExchangePhaseId, KernelOperand, KernelRequirements, KernelRun,
-    KernelRunId, KernelRunMetadata, LocalCopy, LocalCopyId, LocalCopyPattern, LogicalExchange,
-    LowInput, LowLoweringError, LowLoweringResult, LowProgram, LowShard, LowShardId, LowValue,
-    RepeatCarried, RepeatInvariant, RepeatIterated, RepeatRun, RepeatRunId, ShardDefinition,
-    ShardExtent, ShardView, TileKernel, TileWork, TileWorkList, TileWorkRef, WorkProvenance,
-    WorkReason, lower_to_tiles,
-};
-pub use memory::{
-    IPU21_DATA_BASE, IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES,
-    IPU21_STANDARD_FIXED_BYTES,
-};
+pub(crate) use kernel::*;
+pub(crate) use low::*;
+pub use low::{LowShard, LowShardId, ShardDefinition, ShardView};
+pub(crate) use memory::*;
+pub(crate) use mid::*;
 pub use mid::{
-    AccumulationPrecision, AmpOrder, AttentionStrategy, AxisTiling, BlockMajorOrder,
-    ConversionPlan, ConversionStrategy, ConversionStreamingPolicy, CostModel, ElementOrder,
-    GemmDistribution, GemmKernelMode, GemmOrientation, GemmPlanConstraint, GemmWeightLoad,
-    GridOrder, HardwareTarget, IPU21_TARGET_COSTS, Ipu21CostModel, Ipu21TargetCosts, Layout,
-    LayoutError, LocalOperandStaging, LoweringError, LoweringResult, MemoryClass, MemoryEstimate,
-    MemoryOperand, MemoryPeaks, MemoryRelation, MemoryUsage, MidGraph, MidInput, MidOperation,
-    MidOperationKind, MidOperator, MidRegion, MidRepeat, MidValue, MidValueId,
-    OperandMaterialization, OperandRequirement, OperatorCandidate, OperatorDispatch,
-    OperatorFormatPolicy, OperatorPlan, OperatorPlanError, OperatorRequirements, OutputAliasing,
-    Padding, PipelineConfig, PointwiseInputMapping, Precision, ProfilingConfig, ReductionStaging,
-    SchedulingPolicy, TensorAxis, TensorFormat, TensorTiling, TensorType, TileKernelSpec, lower,
+    AMP_COLUMN_MICRO, AmpOrder, AttentionStrategy, BlockMajorOrder, ConversionStreamingPolicy,
+    GemmOrientation, GemmPlanConstraint, GridOrder, Layout, LocalOperandStaging, MemoryClass,
+    MidOperator, PipelineConfig, Precision, ReductionStaging, ShardExtent, TensorFormat,
+    TensorType,
 };
 pub use package::{
-    CompiledPackage, DiagnosticCheckpoint, DiagnosticPackage, DiagnosticShard, DiagnosticTensor,
-    PackageBuildError, PackageBuildResult, PackageConfig, TileProgramData,
-    build_diagnostic_package, build_package, build_tile_program_package,
+    CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageConfig,
+    TileProgramData, build_diagnostic_package, build_package, build_tile_program_package,
 };
-pub use place::{Placement, PlacementError, place};
+pub(crate) use place::*;
+pub(crate) use storage::*;
 pub use storage::{
-    ByteSpan, StorageError, StorageResult, amp_matrix_coordinates, block_major_matrix_coordinates,
-    logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
+    amp_matrix_coordinates, block_major_matrix_coordinates, logical_view_byte_spans,
+    shard_storage_bytes,
 };
-pub use tile::{TileLoweringError, TileProgramLowering, compact_exchange_row_address};
+pub(crate) use tile::*;
 
 const INCOMING_BASE: u8 = 0xa4;
 const INCOMING_DCOUNT: u8 = 0xa6;
@@ -91,6 +67,7 @@ const LAST_VALUE_REGISTER: u8 = 9;
 
 pub const WORKER_BARRIER_SYMBOL: &str = "ipu_stack_static_worker_barrier";
 pub const COMPLETE_SYMBOL: &str = "ipu_stack_static_complete";
+pub const COMPLETED_SYMBOL: &str = "ipu_stack_static_completed";
 pub const HOST_RUN_SYMBOL: &str = "ipu_stack_static_host_run";
 pub const REPEAT_CALL_SYMBOL: &str = "ipu_stack_static_repeat_call";
 pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";

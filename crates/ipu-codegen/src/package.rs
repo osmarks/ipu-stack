@@ -12,8 +12,8 @@ use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
     PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
     SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering, WORKER_BARRIER_SYMBOL,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower_exchanges, lower_to_tiles,
-    place, shard_storage_bytes,
+    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower_to_tiles, place,
+    shard_storage_bytes,
 };
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
@@ -572,7 +572,7 @@ pub fn build_diagnostic_package(
     for operation in &mid.operations {
         if !matches!(
             operation.kind,
-            MidOperationKind::Operator(_) | MidOperationKind::Repeat(_)
+            MidOperationKind::Operator { .. } | MidOperationKind::Repeat(_)
         ) {
             continue;
         }
@@ -657,7 +657,7 @@ fn build_package_artifacts(
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
     if diagnostic_checkpoints {
-        planning.profiling.enabled = false;
+        planning.profiling = false;
     }
     let finalists = build_phase("lower_mid", || {
         Ok(lower_finalists(
@@ -667,7 +667,7 @@ fn build_package_artifacts(
             planning.exchange_schedule_finalists,
         )?)
     })?;
-    let (mid, low) = build_phase("select_finalist", || {
+    let (mid, low, mut exchange_cache) = build_phase("select_finalist", || {
         select_scheduled_finalist(finalists, &planning)
     })?;
     tracing::info!(
@@ -695,14 +695,20 @@ fn build_package_artifacts(
     })?;
     let mut package_config = config.clone();
     package_config.pipeline = planning;
-    let built = build_package_from_objects(&low, &package_config, &objects, &kernel_plan)?;
+    let built = build_package_from_objects(
+        &low,
+        &package_config,
+        &objects,
+        &kernel_plan,
+        &mut exchange_cache,
+    )?;
     Ok((built, mid, low))
 }
 
 fn select_scheduled_finalist(
     finalists: Vec<MidGraph>,
     planning: &PipelineConfig,
-) -> PackageBuildResult<(MidGraph, LowProgram)> {
+) -> PackageBuildResult<(MidGraph, LowProgram, crate::exchange::ExchangeScheduleCache)> {
     if finalists.len() == 1 {
         let mid = finalists.into_iter().next().unwrap();
         tracing::info!(
@@ -715,12 +721,12 @@ fn select_scheduled_finalist(
                 source = ?operation.source,
                 kind = ?operation.kind,
                 memory = ?operation.memory,
-                plan = ?operation.operator_plan,
+                plan = ?operation.operator_plan(),
                 "selected mid-level operation"
             );
         }
         let low = lower_to_tiles(&mid, planning)?;
-        return Ok((mid, low));
+        return Ok((mid, low, crate::exchange::ExchangeScheduleCache::default()));
     }
 
     let topology = active_topology(planning.tile_count)?;
@@ -728,11 +734,13 @@ fn select_scheduled_finalist(
     for (index, mid) in finalists.into_iter().enumerate() {
         let low = lower_to_tiles(&mid, planning)?;
         let placement = place(&low)?;
-        let exchanges = lower_exchanges(
+        let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
+        let exchanges = crate::exchange::lower_exchanges_cached(
             &low,
             &placement,
             &topology,
             crate::ExchangeLoweringOptions::default(),
+            &mut exchange_cache,
         )?;
         let scheduled_exchange_cycles = exchanges
             .phases
@@ -756,15 +764,15 @@ fn select_scheduled_finalist(
             refined_cycles,
             "scheduled operator-plan finalist"
         );
-        ranked.push((refined_cycles, index, mid, low));
+        ranked.push((refined_cycles, index, mid, low, exchange_cache));
     }
-    ranked.sort_by_key(|(cycles, index, _, _)| (*cycles, *index));
-    let (_, selected, mid, low) = ranked.remove(0);
+    ranked.sort_by_key(|(cycles, index, _, _, _)| (*cycles, *index));
+    let (_, selected, mid, low, exchange_cache) = ranked.remove(0);
     tracing::info!(
         selected,
         "selected physically scheduled operator-plan finalist"
     );
-    Ok((mid, low))
+    Ok((mid, low, exchange_cache))
 }
 
 fn build_package_from_objects(
@@ -772,6 +780,7 @@ fn build_package_from_objects(
     config: &PackageConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
+    exchange_cache: &mut crate::exchange::ExchangeScheduleCache,
 ) -> PackageBuildResult<BuiltApplication> {
     let topology = active_topology(program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
@@ -798,11 +807,12 @@ fn build_package_from_objects(
 
     let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
     let provisional_exchanges = build_phase("lower_exchanges_provisional", || {
-        Ok(lower_exchanges(
+        Ok(crate::exchange::lower_exchanges_cached(
             program,
             &provisional_placement,
             &topology,
             crate::ExchangeLoweringOptions::default(),
+            exchange_cache,
         )?)
     })?
     .phases;
@@ -812,7 +822,7 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
-    let profile_samples = config.pipeline.profiling.enabled.then(|| {
+    let profile_samples = config.pipeline.profiling.then(|| {
         program
             .tiles
             .iter()
@@ -1006,12 +1016,10 @@ fn build_package_from_objects(
                         initial_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
                             .then_some(PROFILE_START_CYCLE),
                         final_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
                             .then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
@@ -1063,13 +1071,14 @@ fn build_package_from_objects(
         )?)
     })?;
     let lowered_exchanges = build_phase("lower_exchanges", || {
-        Ok(lower_exchanges(
+        Ok(crate::exchange::lower_exchanges_cached(
             program,
             &placement,
             &topology,
             crate::ExchangeLoweringOptions {
                 diagnostics: config.pipeline.exchange_diagnostics,
             },
+            exchange_cache,
         )?)
     })?;
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
@@ -1092,7 +1101,7 @@ fn build_package_from_objects(
         .enumerate()
         .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    if config.pipeline.profiling.enabled {
+    if config.pipeline.profiling {
         outputs.push(cycle_binding(
             "profile.start-cycle",
             PROFILE_START_CYCLE,
@@ -1199,12 +1208,10 @@ fn build_package_from_objects(
                         initial_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
                             .then_some(PROFILE_START_CYCLE),
                         final_profile_address: config
                             .pipeline
                             .profiling
-                            .enabled
                             .then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
@@ -1569,7 +1576,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
         }
     }
-    if config.pipeline.profiling.enabled {
+    if config.pipeline.profiling {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {

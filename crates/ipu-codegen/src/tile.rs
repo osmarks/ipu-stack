@@ -231,16 +231,18 @@ fn lower_work(
                     sync_in_program: false,
                     program: placed.program.clone(),
                     setup_patch: placed.setup_patch.clone(),
-                    repeat_patches: inside_repeat
-                        .then(|| placed.repeat_patches.clone())
-                        .unwrap_or_default(),
+                    repeat_patches: if inside_repeat {
+                        placed.repeat_patches.clone()
+                    } else {
+                        Default::default()
+                    },
                     profile: StepProfile::default(),
                 })
             }
             TileWorkRef::LocalCopy(copy) => {
                 let (source, destination) = placed_local_copy(program, placement, copy)?;
                 let (symbol, arguments) =
-                    local_copy_call(copy).ok_or_else(|| TileLoweringError::InvalidLocalCopy {
+                    local_copy_call(copy).ok_or(TileLoweringError::InvalidLocalCopy {
                         tile: tile.tile,
                         source_shard: copy.source,
                         source_offset: copy.source_offset,
@@ -453,21 +455,6 @@ pub fn compact_exchange_table_bytes(
         maximum = maximum.max(end);
     }
     Ok(maximum)
-}
-
-/// Returns the final row address for one tile and physical exchange phase in
-/// the same compact table layout used by package generation.
-pub fn compact_exchange_row_address(
-    exchanges: &[PhysicalExchangePhase],
-    tile: u16,
-    scheduled_tile_count: u16,
-    base: u32,
-    phase: ExchangePhaseId,
-) -> Result<u32, TileLoweringError> {
-    let (rows, _) = layout_exchange_rows(exchanges, tile, scheduled_tile_count, base, false)?;
-    rows.get(&phase)
-        .map(|row| row.program.address)
-        .ok_or(TileLoweringError::UnknownExchange)
 }
 
 fn layout_exchange_rows(

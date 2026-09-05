@@ -416,6 +416,11 @@ impl Device {
                 skipped_host_sync_writes += 1;
             } else {
                 self.write_config(offset, value)?;
+                // The capture contains writes, but not the SDK's intervening
+                // reads and waits. Drain each posted PCIe write before replaying
+                // the next configuration transition. CCSR is safe to read here;
+                // the destination register may have read side effects.
+                let _ = self.read_config(pci::CCSR)?;
             }
         }
         self.clear_host_sync_marks()?;
@@ -602,14 +607,10 @@ impl Device {
         self.with_tile_context(physical_tile, context, true, || {
             let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
             let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
-            let read = (|| {
-                addresses
-                    .iter()
-                    .map(|&address| {
-                        self.read_tile_word_without_save(physical_tile, context, address)
-                    })
-                    .collect()
-            })();
+            let read = addresses
+                .iter()
+                .map(|&address| self.read_tile_word_without_save(physical_tile, context, address))
+                .collect();
             let restore = self.restore_tile_m01(physical_tile, context, original_m0, original_m1);
             match (read, restore) {
                 (Err(error), _) | (Ok(_), Err(error)) => Err(error),

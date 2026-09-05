@@ -541,5 +541,9 @@ ipu_stack_static_complete:
 	setzi $m1, ipu_stack_static_completion
 	st32 $m0, $m1, $m15, 0
 	zero $m0
+	// The terminal branch may remain visible as INVALID_PC in TDI. The host
+	// accepts that state only here, after verifying the completion marker.
+	.globl ipu_stack_static_completed
+ipu_stack_static_completed:
 	br $m0
 	.size ipu_stack_static_complete, .-ipu_stack_static_complete

@@ -16,7 +16,6 @@ use rand_distr::{Distribution, StandardNormal};
 use rand_xoshiro::{SplitMix64, rand_core::SeedableRng};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -387,6 +386,16 @@ fn main() -> Result<()> {
     {
         bail!("--mlp-* shape options require --workload siglip-mlp-benchmark");
     }
+    if arguments.reuse_package
+        && matches!(
+            arguments.workload,
+            Workload::GemmSmoke | Workload::BatchedGemmSmoke | Workload::MlpSmoke
+        )
+    {
+        bail!(
+            "numerical smoke tests require compilation to retain logical storage metadata; omit --reuse-package"
+        );
+    }
     if !matches!(arguments.workload, Workload::GemmBenchmark)
         && (arguments.benchmark_rows != GEMM_BENCHMARK_ROWS
             || arguments.benchmark_inner != GEMM_BENCHMARK_INNER
@@ -474,7 +483,7 @@ fn main() -> Result<()> {
             .with_context(|| format!("read {}", arguments.configuration.display()))?;
         let bootloader_bytes =
             fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-        retry_after_reset(&arguments.sdk, || {
+        {
             let runtime = open_and_load_once(
                 &arguments.device,
                 &configuration,
@@ -513,8 +522,8 @@ fn main() -> Result<()> {
                     .map_err(|_| anyhow::anyhow!("exchange watchdog panicked"))?;
                 result
             })
-            .with_context(|| stress.failure_context(&runtime))
-        })?;
+            .with_context(|| stress.failure_context(&runtime))?;
+        }
         println!(
             "package={} seed={:#x} exchangeCases={} hardwareTest=PASS",
             arguments.package.display(),
@@ -653,11 +662,11 @@ fn main() -> Result<()> {
             // of allowing a different GEMM precision to confound the sweep.
             pipeline.operator_candidates.retain(|candidate| {
                 !matches!(
-                    candidate.operator,
+                    candidate.plan.operator,
                     MidOperator::Gemm { multiply, .. } if multiply != Precision::F16
                 )
             });
-            pipeline.profiling.enabled = !arguments.no_profile;
+            pipeline.profiling = !arguments.no_profile;
         } else {
             let (heads, query_rows, key_rows) = (4, 17, 19);
             let query_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
@@ -699,7 +708,7 @@ fn main() -> Result<()> {
             // conversions rather than the independent whole-head codelet.
             pipeline.operator_candidates.clear();
             pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
-            pipeline.profiling.enabled = !arguments.no_profile;
+            pipeline.profiling = !arguments.no_profile;
         }
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
@@ -747,7 +756,7 @@ fn main() -> Result<()> {
             )?[0]
         };
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = !arguments.no_profile;
+        pipeline.profiling = !arguments.no_profile;
         pipeline = pipeline.with_automatic_input(left, Precision::F16);
         for weight in right0.into_iter().chain(right1) {
             pipeline = pipeline.with_automatic_input(weight, Precision::F16);
@@ -765,7 +774,7 @@ fn main() -> Result<()> {
         )?;
         let output = graph.gemm(left, right)?;
         graph.set_outputs([output])?;
-        pipeline.profiling.enabled = !arguments.no_profile;
+        pipeline.profiling = !arguments.no_profile;
         pipeline = pipeline
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
@@ -849,7 +858,7 @@ fn main() -> Result<()> {
     } else {
         application.host_exchange.startup_mark
     };
-    retry_after_reset(&arguments.sdk, || {
+    {
         let runtime = open_and_load_once(
             &arguments.device,
             &configuration,
@@ -875,21 +884,26 @@ fn main() -> Result<()> {
                 run_gemm(
                     &runtime,
                     &application,
-                    active_tiles,
-                    if matches!(arguments.workload, Workload::BatchedGemmSmoke) {
-                        3
-                    } else {
-                        1
-                    },
+                    compiled_package.as_ref().context(
+                        "GEMM smoke requires a newly compiled package for logical storage metadata",
+                    )?,
                     arguments.timeout_seconds,
                 )?;
             } else if matches!(arguments.workload, Workload::MlpSmoke) {
-                run_mlp_chain(
+                let (_, maximum_error) = run_reference(
                     &runtime,
                     &application,
-                    active_tiles,
+                    &graph,
+                    compiled_package
+                        .as_ref()
+                        .context("MLP smoke requires a newly compiled package")?,
                     arguments.timeout_seconds,
+                    (0.02, 0.0),
                 )?;
+                println!(
+                    "mlpNumericalChecks={} maximumAbsoluteError={maximum_error:.6} numericalTest=PASS",
+                    u32::from(active_tiles) * 64
+                );
             } else if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
                 run_projected_attention_benchmark(
                     &runtime,
@@ -957,8 +971,7 @@ fn main() -> Result<()> {
                 Duration::from_secs(arguments.timeout_seconds),
             )?;
         }
-        Ok(())
-    })?;
+    }
     println!(
         "package={} tiles={} hardwareTest=PASS",
         arguments.package.display(),
@@ -979,29 +992,6 @@ fn open_and_load_once(
     Ok(runtime)
 }
 
-fn retry_after_reset<T>(sdk: &Path, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
-    match attempt() {
-        Ok(value) => Ok(value),
-        Err(error)
-            if error
-                .chain()
-                .any(|cause| matches!(cause.downcast_ref(), Some(DriverError::Timeout(_)))) =>
-        {
-            tracing::warn!(%error, "device timed out; resetting and retrying once");
-            let reset = sdk.join("bin/gc-reset");
-            let status = Command::new(&reset)
-                .arg("-m")
-                .status()
-                .with_context(|| format!("run {} -m", reset.display()))?;
-            if !status.success() {
-                bail!("{} -m exited with {status}", reset.display());
-            }
-            attempt().context("hardware execution failed after gc-reset -m")
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn execute_exchange_replay(
     arguments: &Arguments,
     replay: &exchange_stress::PhaseReplayPackage,
@@ -1012,7 +1002,7 @@ fn execute_exchange_replay(
         .with_context(|| format!("read {}", arguments.configuration.display()))?;
     let bootloader_bytes =
         fs::read(bootloader).with_context(|| format!("read {}", bootloader.display()))?;
-    retry_after_reset(&arguments.sdk, || {
+    {
         let runtime = open_and_load_once(
             &arguments.device,
             &configuration,
@@ -1044,8 +1034,8 @@ fn execute_exchange_replay(
             &runtime,
             &replay.application,
             Duration::from_secs(arguments.timeout_seconds),
-        )
-    })?;
+        )?;
+    }
     println!(
         "package={} exchangeReplayPhase={} hardwareTest=PASS",
         arguments.package.display(),
@@ -1057,140 +1047,86 @@ fn execute_exchange_replay(
 fn run_gemm(
     runtime: &Runtime,
     application: &Application,
-    active_tiles: u16,
-    batch: u32,
+    package: &CompiledPackage,
     timeout_seconds: u64,
 ) -> Result<()> {
-    let left = application
-        .inputs
-        .iter()
-        .find(|binding| binding.name == "left")
-        .cloned()
-        .context("GEMM package has no left input binding")?;
-    let right = application
-        .weights
-        .iter()
-        .find(|binding| binding.name == "right")
-        .cloned()
-        .context("GEMM package has no right weight binding")?;
-    let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
-        let (batch_index, inner) = amp_matrix_coordinates(
-            AmpOrder::Left,
-            Precision::F16,
-            batch,
-            elements / batch,
-            linear,
-        )?;
-        let selected_inner = (batch_index * 7 + u32::from(logical_tile)) % 64;
-        Ok(if selected_inner == inner { 0x3c00 } else { 0 })
-    })?;
-    let right_bytes = packed_binding(&right, |logical_tile, linear, elements| {
-        let (inner, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
+    // Generate logical tensors; placement, padding and element order come from
+    // the compiler's storage maps, never from the binding slice index.
+    let mut values = std::collections::BTreeMap::new();
+    for tensor in &package.inputs {
+        let data = (0..tensor.shape.elements())
+            .map(|index| {
+                let index = index as u32;
+                let bits = if tensor.name.as_deref() == Some("left") {
+                    let row = index / 64;
+                    let batch = row / tensor.shape.0[1];
+                    let row = row % tensor.shape.0[1];
+                    if index % 64 == (batch * 7 + row) % 64 {
+                        0x3c00
+                    } else {
+                        0
+                    }
+                } else {
+                    gemm_right_value(index / tensor.shape.0[2], index % tensor.shape.0[2])
+                };
+                half_to_f32(bits)
+            })
+            .collect();
+        values.insert(
+            tensor.value,
+            diagnostic::HostTensor {
+                shape: tensor.shape.0.clone(),
+                values: data,
             },
-            Precision::F16,
-            64,
-            elements / 64,
-            linear,
-        )?;
-        Ok(gemm_right_value(
-            inner,
-            u32::from(logical_tile) * 64 + column,
-        ))
-    })?;
-    if left.slices.len() != usize::from(active_tiles)
-        || right.slices.len() != usize::from(active_tiles)
-    {
-        bail!("GEMM bindings do not cover every active tile");
+        );
     }
-    let output = run_initialized_program(
-        runtime,
-        application,
-        &right_bytes,
-        &left_bytes,
-        timeout_seconds,
-    )?;
-    verify_gemm_output(application, active_tiles, batch, &output)
+    let (weights, inputs) = diagnostic::pack_inputs(application, &package.inputs, &values)?;
+    let bytes = run_initialized_program(runtime, application, &weights, &inputs, timeout_seconds)?;
+    let tensor = package
+        .outputs
+        .iter()
+        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
+        .context("GEMM package has no logical output storage map")?;
+    let rows = tensor.shape.0[1];
+    let columns = tensor.shape.0[2];
+    let expected = (0..tensor.shape.elements())
+        .map(|index| {
+            let index = index as u32;
+            let row = index / columns;
+            half_to_f32(gemm_right_value(
+                (row / rows * 7 + row % rows) % 64,
+                index % columns,
+            ))
+        })
+        .collect::<Vec<_>>();
+    verify_logical_f16_output(application, tensor, &bytes, &expected, (0.0, 0.0))?;
+    println!("gemmNumericalChecks={} numericalTest=PASS", expected.len());
+    Ok(())
 }
 
-fn run_mlp_chain(
+fn run_reference(
     runtime: &Runtime,
     application: &Application,
-    active_tiles: u16,
+    graph: &ComputeGraph,
+    package: &CompiledPackage,
     timeout_seconds: u64,
-) -> Result<()> {
-    let binding = |name: &str, bindings: &[Binding]| {
-        bindings
-            .iter()
-            .find(|binding| binding.name == name)
-            .cloned()
-            .with_context(|| format!("MLP package has no {name} binding"))
-    };
-    let left = binding("left", &application.inputs)?;
-    let right0 = binding("right.0", &application.weights)?;
-    let right1 = binding("right.1", &application.weights)?;
-    let left_bytes = packed_binding(&left, |logical_tile, linear, elements| {
-        let (_, inner) =
-            amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
-        Ok(mlp_smoke_value(
-            MLP_INPUT_SEED,
-            u64::from(logical_tile) * u64::from(MLP_SMOKE_WIDTH) + u64::from(inner),
-            MLP_INPUT_STANDARD_DEVIATION,
-        ))
-    })?;
-    let right0_bytes = packed_binding(&right0, |logical_tile, linear, elements| {
-        let (inner, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
-            },
-            Precision::F16,
-            64,
-            elements / 64,
-            linear,
-        )?;
-        let column = u32::from(logical_tile) * 64 + column;
-        Ok(if column < 64 {
-            mlp_smoke_value(
-                MLP_FIRST_WEIGHT_SEED,
-                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
-                MLP_WEIGHT_STANDARD_DEVIATION,
-            )
-        } else {
-            0
-        })
-    })?;
-    let right1_bytes = packed_binding(&right1, |logical_tile, linear, elements| {
-        let (inner, column) = block_major_matrix_coordinates(
-            BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: 16,
-            },
-            Precision::F16,
-            64,
-            elements / 64,
-            linear,
-        )?;
-        let column = u32::from(logical_tile) * 64 + column;
-        Ok(if column < 64 {
-            mlp_smoke_value(
-                MLP_SECOND_WEIGHT_SEED,
-                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
-                MLP_WEIGHT_STANDARD_DEVIATION,
-            )
-        } else {
-            0
-        })
-    })?;
-    let mut weights = Vec::with_capacity(right0_bytes.len() + right1_bytes.len());
-    weights.extend_from_slice(&right0_bytes);
-    weights.extend_from_slice(&right1_bytes);
-
-    let output =
-        run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
-    verify_mlp_output(application, active_tiles, &output)
+    tolerance: (f32, f32),
+) -> Result<(Vec<u8>, f32)> {
+    let (host_inputs, weights, inputs) =
+        diagnostic::prepare_inputs(graph, application, &package.inputs)?;
+    let references = diagnostic::evaluate(graph, host_inputs, &package.precisions)?;
+    let output = run_initialized_program(runtime, application, &weights, &inputs, timeout_seconds)?;
+    let tensor = package
+        .outputs
+        .iter()
+        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
+        .context("package has no logical output storage map")?;
+    let expected = references
+        .get(&tensor.value)
+        .context("host reference has no graph output")?;
+    let maximum_error =
+        verify_logical_f16_output(application, tensor, &output, &expected.values, tolerance)?;
+    Ok((output, maximum_error))
 }
 
 fn run_projected_attention_benchmark(
@@ -1343,7 +1279,7 @@ fn run_attention_smoke(
         let column = linear % padded_query_dimension;
         let (row_start, _) = balanced_range(query_rows, query_partitions, partition);
         Ok(if column < query_dimension {
-            mlp_smoke_value(
+            gaussian_f16(
                 QUERY_SEED,
                 u64::from(head * query_rows * query_dimension)
                     + u64::from((row_start + local_row) * query_dimension + column),
@@ -1374,7 +1310,7 @@ fn run_attention_smoke(
         let (row_start, _) = balanced_range(key_rows, key_rows.div_ceil(64), partition);
         let row = row_start + local_row;
         Ok(if row < key_rows && column < query_dimension {
-            mlp_smoke_value(
+            gaussian_f16(
                 KEY_SEED,
                 u64::from(head * key_rows * query_dimension + row * query_dimension + column),
                 STANDARD_DEVIATION,
@@ -1407,7 +1343,7 @@ fn run_attention_smoke(
         let (row_start, _) = balanced_range(key_rows, key_rows.div_ceil(64), partition);
         let row = row_start + local_row;
         Ok(if row < key_rows && column < value_dimension {
-            mlp_smoke_value(
+            gaussian_f16(
                 VALUE_SEED,
                 u64::from(head * key_rows * value_dimension + row * value_dimension + column),
                 STANDARD_DEVIATION,
@@ -1427,7 +1363,7 @@ fn run_attention_smoke(
         bail!("attention output has fewer shards than its query tiling");
     }
 
-    let sample = |seed, index, width| half_to_f32(mlp_smoke_value(seed, index, width));
+    let sample = |seed, index, width| half_to_f32(gaussian_f16(seed, index, width));
     let scale = 1.0 / (query_dimension as f32).sqrt();
     let mut maximum_error = 0.0f32;
     let mut squared_error = 0.0f64;
@@ -1633,23 +1569,14 @@ fn run_siglip_mlp_benchmark(
     if clock_hz == 0 {
         bail!("benchmark clock must be nonzero");
     }
-    let (host_inputs, weights, left_bytes) =
-        diagnostic::prepare_inputs(graph, application, &package.inputs)?;
-    let references = diagnostic::evaluate(graph, host_inputs, &package.precisions)?;
-
-    let output =
-        run_initialized_program(runtime, application, &weights, &left_bytes, timeout_seconds)?;
-
-    let output_metadata = package
-        .outputs
-        .iter()
-        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
-        .context("MLP benchmark package has no logical output storage map")?;
-    let expected = references
-        .get(&output_metadata.value)
-        .context("MLP host reference has no graph output")?;
-    let maximum_absolute_error =
-        verify_logical_f16_output(application, output_metadata, &output, &expected.values)?;
+    let (output, maximum_absolute_error) = run_reference(
+        runtime,
+        application,
+        graph,
+        package,
+        timeout_seconds,
+        (0.03, 0.05),
+    )?;
     if !profiling_enabled {
         println!(
             "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
@@ -1667,8 +1594,8 @@ fn run_siglip_mlp_benchmark(
     let peak_tflops = clock_hz as f64 * f64::from(execution_tiles) * 128.0 / 1.0e12;
     println!(
         "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
-        left_bytes.len(),
-        weights.len(),
+        application.inputs.iter().map(binding_size).sum::<u64>(),
+        application.weights.iter().map(binding_size).sum::<u64>(),
         seconds * 1.0e6,
         tflops / peak_tflops * 100.0,
     );
@@ -1730,7 +1657,7 @@ fn validate_benchmark_shape(rows: u32, inner: u32, columns: u32) -> Result<()> {
         || inner == 0
         || columns == 0
         || !inner.is_multiple_of(64)
-        || !columns.is_multiple_of(ipu_codegen::mid::AMP_COLUMN_MICRO)
+        || !columns.is_multiple_of(ipu_codegen::AMP_COLUMN_MICRO)
     {
         bail!(
             "benchmark rows must be nonzero, inner must be a multiple of 64, and columns must be a multiple of 16"
@@ -1791,12 +1718,13 @@ fn verify_logical_f16_output(
     tensor: &DiagnosticTensor,
     bytes: &[u8],
     expected: &[f32],
+    tolerance: (f32, f32),
 ) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
     if tensor.precision != Precision::F16
         || expected.len() != usize::try_from(tensor.shape.elements())?
     {
-        bail!("MLP benchmark output metadata is inconsistent with its reference");
+        bail!("logical output metadata is inconsistent with its reference");
     }
     let mut covered = vec![false; expected.len()];
     let mut maximum = 0.0f32;
@@ -1810,19 +1738,19 @@ fn verify_logical_f16_output(
             .find(|slice| {
                 slice.tile == u32::from(shard.physical_tile) && slice.tile_address == shard.address
             })
-            .context("MLP output binding slice is missing")?;
+            .context("output binding slice is missing")?;
         for (index, offset) in diagnostic::shard_elements(tensor, shard)? {
             let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
             let raw = bytes
                 .get(start..start + 2)
-                .context("MLP logical output exceeds host output")?;
+                .context("logical output exceeds host output")?;
             let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
             let reference = expected[index];
             let error = (actual - reference).abs();
             checked += 1;
             maximum = maximum.max(error);
             covered[index] = true;
-            if !actual.is_finite() || error > 0.03 + 0.05 * reference.abs() {
+            if !actual.is_finite() || error > tolerance.0 + tolerance.1 * reference.abs() {
                 mismatch_count += 1;
                 if mismatches.len() < 16 {
                     mismatches.push((index, reference, actual, error));
@@ -1831,11 +1759,11 @@ fn verify_logical_f16_output(
         }
     }
     if let Some(missing) = covered.iter().position(|covered| !covered) {
-        bail!("MLP output does not contain logical element {missing}");
+        bail!("output does not contain logical element {missing}");
     }
     if !mismatches.is_empty() {
         bail!(
-            "MLP benchmark numerical comparison failed for {mismatch_count}/{} logical shard values (maximum absolute error {maximum}): {mismatches:?}",
+            "numerical comparison failed for {mismatch_count}/{} logical shard values (maximum absolute error {maximum}): {mismatches:?}",
             checked
         );
     }
@@ -1913,110 +1841,12 @@ fn filled_f16_binding(binding: &Binding, bits: u16) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn verify_mlp_output(application: &Application, active_tiles: u16, bytes: &[u8]) -> Result<()> {
-    let output = application
-        .outputs
-        .iter()
-        .find(|binding| binding.name == "output.0")
-        .context("MLP package has no output binding")?;
-    let expected_bytes = output
-        .slices
-        .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .context("MLP output has no slices")?;
-    if bytes.len() != usize::try_from(expected_bytes)? {
-        bail!(
-            "MLP returned {} bytes, expected {expected_bytes}",
-            bytes.len()
-        );
-    }
-    let mut maximum_error = 0.0f32;
-    let mut mismatches = Vec::new();
-    let mut checked = 0usize;
-    if output.slices.len() != usize::from(active_tiles) {
-        bail!("MLP output does not cover every logical tile");
-    }
-    for (row, slice) in output.slices.iter().enumerate() {
-        let row = u16::try_from(row)?;
-        let expected_row = mlp_smoke_reference(row);
-        let elements = u32::try_from(slice.size / 2)?;
-        for linear in 0..elements {
-            let (_, column) =
-                amp_matrix_coordinates(AmpOrder::Left, Precision::F16, 1, elements, linear)?;
-            if column >= 64 {
-                continue;
-            }
-            let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
-            let actual = half_to_f32(u16::from_le_bytes(
-                bytes[offset..offset + 2].try_into().unwrap(),
-            ));
-            let expected = expected_row[column as usize];
-            let error = (actual - expected).abs();
-            maximum_error = maximum_error.max(error);
-            checked += 1;
-            if error > 0.02 && mismatches.len() < 16 {
-                mismatches.push((row, column, expected, actual, error));
-            }
-        }
-    }
-    if !mismatches.is_empty() {
-        bail!("MLP numerical verification failed after {checked} checks: {mismatches:?}");
-    }
-    println!(
-        "mlpNumericalChecks={checked} maximumAbsoluteError={maximum_error:.6} numericalTest=PASS"
-    );
-    Ok(())
-}
-
 fn gelu_reference(value: f32) -> f32 {
     0.5 * value * (1.0 + (0.797_884_6 * (value + 0.044_715 * value.powi(3))).tanh())
 }
 
-const MLP_SMOKE_WIDTH: u32 = 64;
-const MLP_INPUT_SEED: u64 = 0x6d6c_705f_696e_7075;
-const MLP_FIRST_WEIGHT_SEED: u64 = 0x6d6c_705f_7730_5f5f;
-const MLP_SECOND_WEIGHT_SEED: u64 = 0x6d6c_705f_7731_5f5f;
-const MLP_INPUT_STANDARD_DEVIATION: f32 = 0.5;
-const MLP_WEIGHT_STANDARD_DEVIATION: f32 = 0.125;
-
-fn mlp_smoke_value(seed: u64, index: u64, standard_deviation: f32) -> u16 {
+fn gaussian_f16(seed: u64, index: u64, standard_deviation: f32) -> u16 {
     f32_to_half(gaussian(seed, index) * standard_deviation)
-}
-
-fn mlp_smoke_reference(row: u16) -> [f32; MLP_SMOKE_WIDTH as usize] {
-    let mut hidden = [0.0; MLP_SMOKE_WIDTH as usize];
-    for column in 0..MLP_SMOKE_WIDTH {
-        let mut sum = 0.0;
-        for inner in 0..MLP_SMOKE_WIDTH {
-            let input = half_to_f32(mlp_smoke_value(
-                MLP_INPUT_SEED,
-                u64::from(row) * u64::from(MLP_SMOKE_WIDTH) + u64::from(inner),
-                MLP_INPUT_STANDARD_DEVIATION,
-            ));
-            let weight = half_to_f32(mlp_smoke_value(
-                MLP_FIRST_WEIGHT_SEED,
-                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
-                MLP_WEIGHT_STANDARD_DEVIATION,
-            ));
-            sum += input * weight;
-        }
-        hidden[column as usize] = gelu_reference(half_to_f32(f32_to_half(sum)));
-    }
-    let mut output = [0.0; MLP_SMOKE_WIDTH as usize];
-    for column in 0..MLP_SMOKE_WIDTH {
-        let mut sum = 0.0;
-        for inner in 0..MLP_SMOKE_WIDTH {
-            let weight = half_to_f32(mlp_smoke_value(
-                MLP_SECOND_WEIGHT_SEED,
-                u64::from(inner) * u64::from(MLP_SMOKE_WIDTH) + u64::from(column),
-                MLP_WEIGHT_STANDARD_DEVIATION,
-            ));
-            sum += half_to_f32(f32_to_half(hidden[inner as usize])) * weight;
-        }
-        output[column as usize] = gelu_reference(half_to_f32(f32_to_half(sum)));
-    }
-    output
 }
 
 fn gaussian(seed: u64, index: u64) -> f32 {
@@ -2059,62 +1889,6 @@ fn packed_binding(
         }
     }
     Ok(bytes)
-}
-
-fn verify_gemm_output(
-    application: &Application,
-    active_tiles: u16,
-    batch: u32,
-    bytes: &[u8],
-) -> Result<()> {
-    let output = application
-        .outputs
-        .iter()
-        .find(|binding| binding.name == "output.0")
-        .context("GEMM package has no output binding")?;
-    let expected_bytes = output
-        .slices
-        .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .context("GEMM output has no slices")?;
-    if bytes.len() != usize::try_from(expected_bytes)? {
-        bail!(
-            "GEMM returned {} bytes, expected {expected_bytes}",
-            bytes.len()
-        );
-    }
-    let mut mismatches = Vec::new();
-    let mut checked = 0usize;
-    if output.slices.len() != usize::from(active_tiles) {
-        bail!("GEMM output does not cover every logical tile");
-    }
-    for (row, slice) in output.slices.iter().enumerate() {
-        let row = u16::try_from(row)?;
-        let elements = u32::try_from(slice.size / 2)?;
-        for linear in 0..elements {
-            let (batch_index, column) = amp_matrix_coordinates(
-                AmpOrder::Output,
-                Precision::F16,
-                batch,
-                u32::from(active_tiles) * 64,
-                linear,
-            )?;
-            let offset = usize::try_from(slice.file_offset + u64::from(linear) * 2)?;
-            let actual = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap());
-            let selected_inner = (batch_index * 7 + u32::from(row)) % 64;
-            let expected = gemm_right_value(selected_inner, column);
-            checked += 1;
-            if actual != expected && mismatches.len() < 16 {
-                mismatches.push((row, batch_index, column, expected, actual));
-            }
-        }
-    }
-    if !mismatches.is_empty() {
-        bail!("GEMM numerical verification failed after {checked} checks: {mismatches:?}");
-    }
-    println!("gemmNumericalChecks={checked} numericalTest=PASS");
-    Ok(())
 }
 
 fn gemm_right_value(inner: u32, column: u32) -> u16 {
@@ -2215,14 +1989,46 @@ fn diagnose_completion(
     application: &Application,
     timeout: Duration,
 ) -> Result<()> {
+    let completion_pc = application
+        .debug_symbols
+        .iter()
+        .find(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
+        .map(|symbol| symbol.address);
     let deadline = Instant::now() + timeout;
+    let mut completed = std::collections::BTreeSet::new();
     loop {
-        let states = supervisor_states(runtime, application)?;
-        if states.iter().all(|&(_, state)| state == 0) {
+        for tile in &application.tiles {
+            let physical = u16::try_from(tile.physical_tile)?;
+            if completed.contains(&physical) {
+                continue;
+            }
+            let device = runtime.device();
+            let state = device.tile_context_state(physical, 0)?;
+            let terminal_fault = if state == 3 && completion_pc.is_some() {
+                // Branching to zero in the runtime's completion routine can
+                // remain visible as INVALID_PC after the final host exchange.
+                // Do not confuse a fault elsewhere with successful completion.
+                let exception = ipu_driver::TileException::from_status(
+                    device.read_tile_context_status(physical, 0)?,
+                );
+                exception == ipu_driver::TileException::InvalidProgramCounter
+                    && Some(device.read_tile_program_counter(physical, 0)?) == completion_pc
+                    && device.read_tile_word(physical, tile.diagnostic_address)? == 1
+            } else {
+                false
+            };
+            if state == 0 || terminal_fault {
+                completed.insert(physical);
+            }
+        }
+        if completed.len() == application.tiles.len() {
             break;
         }
         if Instant::now() >= deadline {
-            bail!("supervisors did not halt: {}", summarize_states(&states));
+            bail!(
+                "supervisors did not complete: {}",
+                summarize_states(&supervisor_states(runtime, application)?)
+            );
         }
         std::thread::sleep(Duration::from_micros(100));
     }
@@ -2441,6 +2247,127 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn randomized_logical_io_ignores_slice_order_and_rejects_corruption() -> Result<()> {
+        use ipu_codegen::{
+            DiagnosticShard, GridOrder, LowShard, LowShardId, ShardDefinition, TensorType,
+        };
+        let mut random = fastrand::Rng::with_seed(0x6765_6d6d_696f);
+        for _ in 0..64 {
+            let row_parts = random.u16(1..=4);
+            let column_parts = random.u16(1..=4);
+            let tiles = row_parts * column_parts;
+            let shape = [random.u32(1..=3), random.u32(1..=12), random.u32(1..=256)];
+            let order = if random.bool() {
+                GridOrder::ColumnsFast
+            } else {
+                GridOrder::RowsFast
+            };
+            let layout = if random.bool() {
+                Layout::amp_output_grid(64, tiles, row_parts, column_parts, order)
+            } else {
+                Layout::amp_left_result_grid(64, tiles, row_parts, column_parts, order)
+            };
+            let tensor_type = TensorType::new(shape, Precision::F16, layout);
+            let mut graph = ComputeGraph::new();
+            let value = graph.host_input("output.0", shape)?;
+            let mut tensor = DiagnosticTensor {
+                name: Some("output.0".into()),
+                value,
+                shape: tensor_type.shape.clone(),
+                precision: Precision::F16,
+                shards: Vec::new(),
+            };
+            let mut binding = Binding {
+                name: "output.0".into(),
+                dtype: "f16".into(),
+                shape: shape.to_vec(),
+                slices: Vec::new(),
+            };
+            let mut physical = (0..tiles).collect::<Vec<_>>();
+            random.shuffle(&mut physical);
+            let mut file_offset = 0;
+            for (tile, extents) in tensor_type
+                .format
+                .layout
+                .shard_extents(&tensor_type.shape)?
+            {
+                let storage = LowShard {
+                    id: LowShardId::from_index(u32::from(tile)),
+                    tile,
+                    tensor_type: tensor_type.clone(),
+                    extents,
+                    definition: ShardDefinition::Staging,
+                };
+                let size = u64::from(ipu_codegen::shard_storage_bytes(&storage)?);
+                let address = 0x10_0000;
+                binding.slices.push(ipu_package::RegionSlice {
+                    tile: u32::from(physical[tile as usize]),
+                    tile_address: address,
+                    file_offset,
+                    size,
+                });
+                tensor.shards.push(DiagnosticShard {
+                    physical_tile: physical[tile as usize],
+                    address,
+                    storage,
+                });
+                file_offset += size + random.u64(0..=4) * 2;
+            }
+            let expected = (0..tensor.shape.elements())
+                .map(|_| random.i32(-128..128) as f32 / 16.0)
+                .collect::<Vec<_>>();
+            let values = std::collections::BTreeMap::from([(
+                value,
+                diagnostic::HostTensor {
+                    shape: shape.to_vec(),
+                    values: expected.clone(),
+                },
+            )]);
+            let mut application = Application {
+                inputs: vec![binding.clone()],
+                outputs: vec![binding],
+                ..Default::default()
+            };
+            let (_, packed) = diagnostic::pack_inputs(&application, &[tensor.clone()], &values)?;
+            // Changing enumeration and physical tile numbers must not change logical I/O.
+            random.shuffle(&mut application.inputs[0].slices);
+            random.shuffle(&mut application.outputs[0].slices);
+            random.shuffle(&mut tensor.shards);
+            let (_, repacked) = diagnostic::pack_inputs(&application, &[tensor.clone()], &values)?;
+            assert_eq!(packed, repacked);
+            assert_eq!(
+                verify_logical_f16_output(&application, &tensor, &packed, &expected, (0.0, 0.0))?,
+                0.0
+            );
+            let shard = tensor
+                .shards
+                .iter()
+                .find(|shard| {
+                    shard
+                        .storage
+                        .extents
+                        .iter()
+                        .all(|extent| extent.logical_end > extent.start)
+                })
+                .unwrap();
+            let slice = application.outputs[0]
+                .slices
+                .iter()
+                .find(|slice| slice.tile == u32::from(shard.physical_tile))
+                .unwrap();
+            let (_, offset) = diagnostic::shard_elements(&tensor, shard)?[0];
+            let offset = (slice.file_offset + u64::from(offset)) as usize;
+            let mut corrupted = packed;
+            corrupted[offset..offset + 2].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());
+            assert!(
+                verify_logical_f16_output(&application, &tensor, &corrupted, &expected, (0.0, 0.0))
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn randomized_binding_values_follow_logical_slice_order() -> Result<()> {

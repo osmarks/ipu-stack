@@ -877,9 +877,11 @@ fn build_physical_phase_replay(
                 steps: vec![
                     TileStep::Exchange(ExchangeStep {
                         active: scheduled && phase.active[usize::from(tile)],
-                        incoming_base: scheduled
-                            .then(|| phase.incoming_bases[usize::from(tile)])
-                            .unwrap_or(0),
+                        incoming_base: if scheduled {
+                            phase.incoming_bases[usize::from(tile)]
+                        } else {
+                            0
+                        },
                         preserve_base_registers: false,
                         incoming_mux: None,
                         incoming_format: 0,

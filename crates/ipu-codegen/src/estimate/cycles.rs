@@ -1,16 +1,15 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
 use crate::estimate::{
-    ExchangeEndpointTraffic, average_shard_bytes, conversion_traffic,
-    gemm_exchange_endpoint_traffic, gemm_exchange_phase_count, gemm_partial_tensor,
-    gemm_requires_panel_repacking, gemm_uses_panel_buffer, maximum_axis_shard_extent,
-    maximum_shard_bytes, operator_memory_estimate, physical_elements,
+    ExchangeEndpointTraffic, conversion_traffic, gemm_exchange_endpoint_traffic,
+    gemm_exchange_phase_count, gemm_requires_panel_repacking, gemm_uses_panel_buffer,
+    maximum_axis_shard_extent, maximum_shard_bytes, operator_memory_estimate, physical_elements,
 };
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, BlockMajorOrder, ConversionStrategy, DeferredTransform, ElementOrder,
-    GemmDistribution, Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch,
-    OperatorRequirements, Precision, TensorAxis, TensorType, layout_conversion_strategy,
+    AmpOrder, AxisFactorView, BlockMajorOrder, ConversionStrategy, ElementOrder, GemmDistribution,
+    Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch, OperatorPlan,
+    Precision, TensorAxis, TensorType, layout_conversion_strategy,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
@@ -19,94 +18,53 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub trait CostModel: Sync {
     fn operator_cycles(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64;
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
     fn operator_exchange_cycles(
         &self,
-        _operator: MidOperator,
-        _dispatch: &OperatorDispatch,
-        _requirements: &OperatorRequirements,
+        _plan: &OperatorPlan,
         _inputs: &[TensorType],
         _output: &TensorType,
     ) -> u64 {
         0
     }
-    fn operator_transition_cycles(
+    /// Total cycles and their exchange component for the same transition.
+    fn operator_transition_cost(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         source_inputs: &[TensorType],
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> u64 {
-        source_inputs
+    ) -> (u64, u64) {
+        let mut cycles = self.operator_cycles(plan, inputs, output);
+        let mut exchange = self.operator_exchange_cycles(plan, inputs, output);
+        for ((source, input), requirement) in source_inputs
             .iter()
             .zip(inputs)
-            .zip(&requirements.inputs)
-            .filter(|((source, input), requirement)| {
-                requirement.materialization == crate::OperandMaterialization::DispatchSlices
-                    && source.format.layout != input.format.layout
-            })
-            .fold(
-                self.operator_cycles(operator, dispatch, requirements, inputs, output),
-                |cycles, ((source, input), _)| {
-                    cycles.saturating_add(
-                        self.rearrangement_cost(
-                            &input.shape,
-                            input.format.precision,
-                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
-                            &source.format.layout,
-                            &input.format.layout,
-                        )
-                        .cycles,
-                    )
-                },
-            )
-    }
-    fn operator_transition_exchange_cycles(
-        &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
-        source_inputs: &[TensorType],
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        source_inputs
-            .iter()
-            .zip(inputs)
-            .zip(&requirements.inputs)
-            .filter(|((source, input), requirement)| {
-                requirement.materialization == crate::OperandMaterialization::DispatchSlices
-                    && source.format.layout != input.format.layout
-            })
-            .fold(
-                self.operator_exchange_cycles(operator, dispatch, requirements, inputs, output),
-                |cycles, ((source, input), _)| {
-                    cycles.saturating_add(
-                        self.rearrangement_cost(
-                            &input.shape,
-                            input.format.precision,
-                            layout_conversion_strategy(&source.format.layout, &input.format.layout),
-                            &source.format.layout,
-                            &input.format.layout,
-                        )
-                        .exchange_cycles,
-                    )
-                },
-            )
+            .zip(&plan.requirements.inputs)
+        {
+            if requirement.materialization == crate::OperandMaterialization::DispatchSlices
+                && source.format.layout != input.format.layout
+            {
+                let cost = self.rearrangement_cost(
+                    &input.shape,
+                    input.format.precision,
+                    layout_conversion_strategy(&source.format.layout, &input.format.layout),
+                    &source.format.layout,
+                    &input.format.layout,
+                );
+                cycles = cycles.saturating_add(cost.cycles);
+                exchange = exchange.saturating_add(cost.exchange_cycles);
+            }
+        }
+        (cycles, exchange)
     }
     fn operator_exchange_footprint(
         &self,
-        _operator: MidOperator,
-        _dispatch: &OperatorDispatch,
-        _requirements: &OperatorRequirements,
+        _plan: &OperatorPlan,
         _inputs: &[TensorType],
         _output: &TensorType,
     ) -> ExchangeFootprint {
@@ -115,27 +73,16 @@ pub trait CostModel: Sync {
     /// Cost of producing dispatch-sized consumer slices through a deferred
     /// logical transform. The default preserves the unfused producer estimate;
     /// target models may price the actual fused staging and exchange path.
-    fn deferred_input_cycles(
+    fn deferred_input_cost(
         &self,
-        _transform: DeferredTransform,
+        _transform: AxisFactorView,
         _source: &TensorType,
         _logical_output: &TensorType,
         _consumer_input: &TensorType,
         _consumer_dispatch: &OperatorDispatch,
         producer_cycles: u64,
-    ) -> u64 {
-        producer_cycles
-    }
-    fn deferred_input_exchange_cycles(
-        &self,
-        _transform: DeferredTransform,
-        _source: &TensorType,
-        _logical_output: &TensorType,
-        _consumer_input: &TensorType,
-        _consumer_dispatch: &OperatorDispatch,
-        _producer_cycles: u64,
-    ) -> u64 {
-        0
+    ) -> (u64, u64) {
+        (producer_cycles, 0)
     }
     fn rearrangement_cost(
         &self,
@@ -158,30 +105,6 @@ pub struct RearrangementCost {
 pub struct ExchangeFootprint {
     pub phases: u64,
     pub maximum_transfer_chunks_per_tile: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SpatialOccupancy {
-    average_work: u64,
-    critical_work: u64,
-}
-
-impl SpatialOccupancy {
-    fn for_output(output: &TensorType) -> Self {
-        let bytes = output.format.precision.bytes();
-        Self {
-            average_work: average_shard_bytes(output).div_ceil(bytes),
-            critical_work: maximum_shard_bytes(output).div_ceil(bytes),
-        }
-    }
-
-    const fn latency_work(self) -> u64 {
-        // Device-wide dependencies make the longest spatial shard determine
-        // latency. Keeping the mean alongside it makes the imbalance explicit
-        // without incorrectly scoring latency as mean work.
-        debug_assert!(self.average_work <= self.critical_work);
-        self.critical_work
-    }
 }
 
 impl ExchangeFootprint {
@@ -227,14 +150,11 @@ impl<'a, C> MemoizedCostModel<'a, C> {
 impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
     fn operator_cycles(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
-        self.inner
-            .operator_cycles(operator, dispatch, requirements, inputs, output)
+        self.inner.operator_cycles(plan, inputs, output)
     }
 
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
@@ -243,57 +163,32 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
 
     fn operator_exchange_cycles(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
-        self.inner
-            .operator_exchange_cycles(operator, dispatch, requirements, inputs, output)
+        self.inner.operator_exchange_cycles(plan, inputs, output)
     }
 
     fn operator_exchange_footprint(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
-        self.inner
-            .operator_exchange_footprint(operator, dispatch, requirements, inputs, output)
+        self.inner.operator_exchange_footprint(plan, inputs, output)
     }
 
-    fn deferred_input_cycles(
+    fn deferred_input_cost(
         &self,
-        transform: DeferredTransform,
+        transform: AxisFactorView,
         source: &TensorType,
         logical_output: &TensorType,
         consumer_input: &TensorType,
         consumer_dispatch: &OperatorDispatch,
         producer_cycles: u64,
-    ) -> u64 {
-        self.inner.deferred_input_cycles(
-            transform,
-            source,
-            logical_output,
-            consumer_input,
-            consumer_dispatch,
-            producer_cycles,
-        )
-    }
-
-    fn deferred_input_exchange_cycles(
-        &self,
-        transform: DeferredTransform,
-        source: &TensorType,
-        logical_output: &TensorType,
-        consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
-        producer_cycles: u64,
-    ) -> u64 {
-        self.inner.deferred_input_exchange_cycles(
+    ) -> (u64, u64) {
+        self.inner.deferred_input_cost(
             transform,
             source,
             logical_output,
@@ -605,18 +500,19 @@ fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
     }
     let physical_elements = maximum_shard_elements(output);
     let fragments = physical_elements.div_ceil(u64::from(crate::mid::AMP_COLUMN_MICRO));
-    let clear_cycles = (output
+    let clear_cycles = if output
         .format
         .layout
         .padded_shape(&output.shape)
         .ok()
-        .is_some_and(|padded| padded != output.shape))
-    .then(|| {
+        .is_some_and(|padded| padded != output.shape)
+    {
         maximum_shard_bytes(output)
             .div_ceil(8 * 6)
             .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-    })
-    .unwrap_or(0);
+    } else {
+        0
+    };
     Some(
         fragments
             .saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES)
@@ -770,7 +666,7 @@ fn estimated_operator_exchange_cycles(
                 },
             ..
         } => {
-            let compute_output = gemm_partial_tensor(dispatch, output);
+            let compute_output = dispatch.gemm_partial_tensor(output);
             let endpoint = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
                 .unwrap_or_else(|| {
                     ExchangeEndpointTraffic::from_maxima(
@@ -806,7 +702,7 @@ fn estimated_operator_exchange_cycles(
             ))
         }
         OperatorDispatch::BlockedGemm { .. } => {
-            let compute_output = gemm_partial_tensor(dispatch, output);
+            let compute_output = dispatch.gemm_partial_tensor(output);
             let traffic = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
                 .unwrap_or_else(|| {
                     ExchangeEndpointTraffic::from_maxima(
@@ -827,7 +723,7 @@ fn estimated_operator_exchange_cycles(
                 .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
                 .unwrap_or(u64::MAX / 8)
         }
-        OperatorDispatch::SplitHeads => inputs.first().map_or(0, |input| {
+        OperatorDispatch::View => inputs.first().map_or(0, |input| {
             exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
         }),
         OperatorDispatch::Pointwise { .. } => 0,
@@ -953,15 +849,15 @@ fn deferred_split_input_cycles(
 impl CostModel for Ipu21CostModel {
     fn operator_cycles(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
+        let operator = plan.operator;
+        let dispatch = &plan.dispatch;
+        let requirements = &plan.requirements;
         let elements = physical_elements(&output.shape, &output.format.layout);
-        let spatial_occupancy = SpatialOccupancy::for_output(output);
-        let spatial_occupancy_adjusted_elements = spatial_occupancy.latency_work();
+        let spatial_occupancy_adjusted_elements = maximum_shard_elements(output);
         match operator {
             MidOperator::Gemm { multiply, .. } => {
                 let orientation = match dispatch {
@@ -973,9 +869,8 @@ impl CostModel for Ipu21CostModel {
                         crate::GemmOrientation::Normal => (0, 1, 1, 1),
                         crate::GemmOrientation::Swapped => (1, 0, 2, 2),
                     };
-                let compute_output = gemm_partial_tensor(dispatch, output);
-                let output_elements_per_tile =
-                    SpatialOccupancy::for_output(&compute_output).latency_work();
+                let compute_output = dispatch.gemm_partial_tensor(output);
+                let output_elements_per_tile = maximum_shard_elements(&compute_output);
                 let left_shape = inputs[left_index]
                     .format
                     .layout
@@ -1205,7 +1100,7 @@ impl CostModel for Ipu21CostModel {
                     OperatorDispatch::Pointwise { .. } => 0,
                     OperatorDispatch::BlockedAttention { .. } => 0,
                     OperatorDispatch::MaterializedAttention { .. } => 0,
-                    OperatorDispatch::SplitHeads => 0,
+                    OperatorDispatch::View => 0,
                 };
                 let kernel = amp_kernel_cycles(
                     multiply,
@@ -1224,9 +1119,11 @@ impl CostModel for Ipu21CostModel {
                 } else {
                     u64::MAX / 8
                 };
-                let result_copy = (compute_output.format.layout != output.format.layout)
-                    .then(|| standard_to_interleaved_copy_cycles(maximum_shard_bytes(output)))
-                    .unwrap_or(0);
+                let result_copy = if compute_output.format.layout != output.format.layout {
+                    standard_to_interleaved_copy_cycles(maximum_shard_bytes(output))
+                } else {
+                    0
+                };
                 kernel
                     .saturating_add(standard_source_owner_penalty)
                     .saturating_add(packing)
@@ -1301,7 +1198,7 @@ impl CostModel for Ipu21CostModel {
             MidOperator::Add(_) => spatial_occupancy_adjusted_elements
                 .div_ceil(16)
                 .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::SplitHeads(_) => {
+            MidOperator::View(_) => {
                 let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
                 if let Some(input) = inputs.first()
                     && split_heads_uses_micro_panel_exchange(input, output)
@@ -1324,14 +1221,14 @@ impl CostModel for Ipu21CostModel {
 
     fn operator_exchange_cycles(
         &self,
-        operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        _requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> u64 {
+        let operator = plan.operator;
+        let dispatch = &plan.dispatch;
         let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-        if matches!(operator, MidOperator::SplitHeads(_))
+        if matches!(operator, MidOperator::View(_))
             && let Some(input) = inputs.first()
             && split_heads_uses_micro_panel_exchange(input, output)
         {
@@ -1343,50 +1240,31 @@ impl CostModel for Ipu21CostModel {
         }
     }
 
-    fn deferred_input_cycles(
+    fn deferred_input_cost(
         &self,
-        transform: DeferredTransform,
+        transform: AxisFactorView,
         source: &TensorType,
         logical_output: &TensorType,
         consumer_input: &TensorType,
         consumer_dispatch: &OperatorDispatch,
         producer_cycles: u64,
-    ) -> u64 {
-        let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
-        if parts == 0 {
-            return producer_cycles;
+    ) -> (u64, u64) {
+        if transform.output_shape(&source.shape).as_ref() != Some(&logical_output.shape) {
+            return (producer_cycles, 0);
         }
         deferred_split_input_cycles(source, logical_output, consumer_input, consumer_dispatch)
-            .map_or(producer_cycles, |cost| cost.0)
-    }
-
-    fn deferred_input_exchange_cycles(
-        &self,
-        transform: DeferredTransform,
-        source: &TensorType,
-        logical_output: &TensorType,
-        consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
-        _producer_cycles: u64,
-    ) -> u64 {
-        let DeferredTransform::SplitLastAxisIntoLeading { parts } = transform;
-        if parts == 0 {
-            return 0;
-        }
-        deferred_split_input_cycles(source, logical_output, consumer_input, consumer_dispatch)
-            .map_or(0, |cost| cost.1)
+            .unwrap_or((producer_cycles, 0))
     }
 
     fn operator_exchange_footprint(
         &self,
-        _operator: MidOperator,
-        dispatch: &OperatorDispatch,
-        _requirements: &OperatorRequirements,
+        plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
     ) -> ExchangeFootprint {
+        let dispatch = &plan.dispatch;
         let phases = match dispatch {
-            OperatorDispatch::SplitHeads => 1,
+            OperatorDispatch::View => 1,
             OperatorDispatch::BlockedAttention { key_block_rows, .. } => inputs
                 .get(1)
                 .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
@@ -1423,7 +1301,7 @@ impl CostModel for Ipu21CostModel {
         if phases == 0 {
             return ExchangeFootprint::default();
         }
-        if matches!(dispatch, OperatorDispatch::SplitHeads) {
+        if matches!(dispatch, OperatorDispatch::View) {
             let Some(input) = inputs.first() else {
                 return ExchangeFootprint::default();
             };
@@ -1546,7 +1424,7 @@ mod tests {
             inputs: vec![OperandRequirement::new(format.clone(), 8)],
             output: OperandRequirement::new(format, 8),
             output_aliasing: OutputAliasing::Fresh,
-            memory_relations: Vec::new(),
+            distinct_elements: Vec::new(),
         }
     }
 
@@ -1612,16 +1490,22 @@ mod tests {
                 MidOperator::Add(crate::AddOptions::default()),
             ] {
                 let sharded_cycles = Ipu21CostModel.operator_cycles(
-                    operator,
-                    &pointwise_dispatch(),
-                    &pointwise_requirements(sharded.format.clone()),
+                    &OperatorPlan {
+                        operator,
+                        dispatch: pointwise_dispatch(),
+                        requirements: pointwise_requirements(sharded.format.clone()),
+                        deferred_output: None,
+                    },
                     std::slice::from_ref(&sharded),
                     &sharded,
                 );
                 let unsharded_cycles = Ipu21CostModel.operator_cycles(
-                    operator,
-                    &pointwise_dispatch(),
-                    &pointwise_requirements(unsharded.format.clone()),
+                    &OperatorPlan {
+                        operator,
+                        dispatch: pointwise_dispatch(),
+                        requirements: pointwise_requirements(unsharded.format.clone()),
+                        deferred_output: None,
+                    },
                     std::slice::from_ref(&unsharded),
                     &unsharded,
                 );

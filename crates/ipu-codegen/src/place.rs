@@ -4,7 +4,7 @@ use crate::low::{
     KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
 };
 use crate::memory::IPU21_DATA_BASE;
-use crate::mid::{MemoryClass, MemoryOperand, MemoryRelation, OperandRequirement};
+use crate::mid::{MemoryClass, MemoryOperand, OperandRequirement};
 use crate::storage::{StorageError, shard_storage_bytes};
 use ipu_package::{
     IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
@@ -391,20 +391,19 @@ fn collect_requirements(
     for work in program.work(tile) {
         match work {
             TileWorkRef::Kernel(run) => {
-                let (inputs, output, memory_relations) = match &run.requirements {
+                let (inputs, output, distinct_elements) = match &run.requirements {
                     KernelRequirements::Operator(operator_requirements) => (
                         &operator_requirements.inputs[..],
                         &operator_requirements.output,
-                        &operator_requirements.memory_relations,
+                        &operator_requirements.distinct_elements,
                     ),
                     KernelRequirements::Conversion {
                         input,
                         output,
-                        memory_relations,
-                    } => (std::slice::from_ref(input), output, memory_relations),
+                        distinct_elements,
+                    } => (std::slice::from_ref(input), output, distinct_elements),
                 };
-                for relation in memory_relations {
-                    let MemoryRelation::DistinctElements(operands) = relation;
+                for operands in distinct_elements {
                     for operand in operands {
                         match operand {
                             MemoryOperand::Output => {
@@ -878,8 +877,13 @@ mod tests {
             let low = lower_to_tiles(&mid, &config).unwrap();
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
-            assert_eq!(placement.shard_addresses.len(), low.shards.len());
-            for shard in &low.shards {
+            let resident = low
+                .shards
+                .iter()
+                .filter(|shard| !matches!(shard.definition, crate::ShardDefinition::Unmaterialized))
+                .collect::<Vec<_>>();
+            assert_eq!(placement.shard_addresses.len(), resident.len());
+            for shard in resident {
                 let address = placement.shard_addresses[&shard.id];
                 match shard.tensor_type.format.layout.memory_class {
                     MemoryClass::Ipu21Interleaved => {
@@ -903,8 +907,7 @@ mod tests {
                         )
                         .unwrap();
                         if let KernelRequirements::Operator(requirements) = &run.requirements {
-                            for relation in &requirements.memory_relations {
-                                let MemoryRelation::DistinctElements(operands) = relation;
+                            for operands in &requirements.distinct_elements {
                                 let mut ranges = Vec::new();
                                 for operand in operands {
                                     let shards = match operand {

@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn randomized_queries_crop_one_common_initial_entry_span() {
-        let mut random = fastrand::Rng::with_seed(0x7072_6f67_7261_6d);
+        let mut random = fastrand::Rng::with_seed(0x0070_726f_6772_616d);
         for case in 0..64 {
             let tile_count = random.usize(2..=32);
             let starts = (0..tile_count)

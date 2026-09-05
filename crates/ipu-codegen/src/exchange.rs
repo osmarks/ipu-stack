@@ -1,5 +1,8 @@
 //! Physical exchange programs generated from logical shard transfers.
 
+mod reuse;
+pub(crate) use reuse::ExchangeScheduleCache;
+
 use crate::{
     ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
     logical_view_byte_spans, view_byte_spans,
@@ -87,40 +90,6 @@ pub struct ExchangeTileDiagnostic {
     pub row_elements: Vec<ExchangeMemoryElement>,
     pub program: ipu_exchange::diagnostic::PlanProgramDiagnostic,
     pub activities: Vec<ExchangeActivityDiagnostic>,
-}
-
-impl ExchangeTileDiagnostic {
-    pub fn has_row_data_conflict(&self) -> bool {
-        self.activities
-            .iter()
-            .any(|activity| activity.conflicts_with_row)
-    }
-
-    pub fn render(&self) -> String {
-        let mut output = format!(
-            "phase={} tile={} row=0x{:x} rowElements={:?}\n",
-            self.phase.index(),
-            self.tile,
-            self.row_address,
-            self.row_elements
-        );
-        for activity in &self.activities {
-            output.push_str(&format!(
-                "transfer={} {:?} cycles={}..{} memoryEnd={} address=0x{:x} words={} elements={:?} rowConflict={}\n",
-                activity.activity.transfer,
-                activity.activity.kind,
-                activity.activity.start_cycle,
-                activity.activity.end_cycle,
-                activity.activity.memory_end_cycle,
-                activity.activity.address,
-                activity.activity.words,
-                activity.memory_elements,
-                activity.conflicts_with_row,
-            ));
-        }
-        output.push_str(&self.program.render());
-        output
-    }
 }
 
 pub fn diagnose_exchange_tile(
@@ -213,7 +182,7 @@ impl ExchangeItemWidth {
 
     fn item_count(self, words: u32) -> Result<u32, ExchangeLoweringError> {
         let item_words = self.item_words();
-        if words == 0 || words % item_words != 0 {
+        if words == 0 || !words.is_multiple_of(item_words) {
             return Err(ExchangeLoweringError::UnalignedPayload);
         }
         Ok(words / item_words)
@@ -297,20 +266,28 @@ pub enum ExchangeLoweringError {
     Invariant(String),
 }
 
-pub fn lower_exchanges(
+#[cfg(test)]
+pub(crate) fn lower_exchanges(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
     options: ExchangeLoweringOptions,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
-    lower_static_exchanges(program, placement, topology, options)
+    lower_exchanges_cached(
+        program,
+        placement,
+        topology,
+        options,
+        &mut ExchangeScheduleCache::default(),
+    )
 }
 
-fn lower_static_exchanges(
+pub(crate) fn lower_exchanges_cached(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
     options: ExchangeLoweringOptions,
+    cache: &mut ExchangeScheduleCache,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<LowShardId, Vec<LowShardId>>::new();
     for repeat in &program.repeat_runs {
@@ -360,7 +337,7 @@ fn lower_static_exchanges(
                 receive_counts,
                 incoming_bases,
                 optimized,
-            } = select_transfer_widths(phase.id.index(), topology, pending, program.tile_count)?;
+            } = cache.select(phase.id, topology, pending, program.tile_count)?;
             let schedule_problem = schedule_problem(phase.id.index(), &pending);
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
@@ -892,11 +869,9 @@ impl PhaseDiagnostics {
             scheduled_horizon_cycles = horizon,
             scheduler_excess_cycles = u64::from(horizon).saturating_sub(role_word_lower_bound),
             maximum_scheduled_wait_cycles = maximum_scheduled_wait,
-            mean_final_padding_cycles = if active_builders == 0 {
-                0
-            } else {
-                total_final_padding / active_builders
-            },
+            mean_final_padding_cycles = total_final_padding
+                .checked_div(active_builders)
+                .unwrap_or(0),
             maximum_final_padding_cycles = maximum_final_padding,
             critical_chain_length,
             ?critical_chain_tail,
@@ -1196,10 +1171,10 @@ fn receive_configuration(
     }
     let mut incoming_bases = vec![None::<u32>; usize::from(tile_count)];
     for transfer in pending {
-        if let [(tile, address)] = transfer.destinations.as_slice() {
-            if receive_counts[usize::from(*tile)] == 1 {
-                incoming_bases[usize::from(*tile)] = Some(*address);
-            }
+        if let [(tile, address)] = transfer.destinations.as_slice()
+            && receive_counts[usize::from(*tile)] == 1
+        {
+            incoming_bases[usize::from(*tile)] = Some(*address);
         }
     }
     Ok((
@@ -2467,14 +2442,24 @@ fn materialize_schedule_order(
     for (before, after) in dependencies {
         predecessors[after].push(before);
     }
-    let mut completion = vec![0u32; pending.len()];
+    let mut completion = vec![None; pending.len()];
     for &index in order {
+        if index >= pending.len()
+            || completion[index].is_some()
+            || predecessors[index]
+                .iter()
+                .any(|&before| completion[before].is_none())
+        {
+            return Err(ExchangeLoweringError::Invariant(
+                "exchange order is not a topological permutation".into(),
+            ));
+        }
         let dependency_ready = predecessors[index]
             .iter()
-            .map(|predecessor| completion[*predecessor])
+            .filter_map(|predecessor| completion[*predecessor])
             .max()
             .unwrap_or(0);
-        completion[index] = schedule.append(
+        completion[index] = Some(schedule.append(
             topology,
             pending,
             incoming_bases,
@@ -2483,7 +2468,7 @@ fn materialize_schedule_order(
             dependency_ready,
             false,
             &mut last_transfer,
-        )?;
+        )?);
     }
     schedule.finish_horizon();
     if schedule_encoding_is_valid(&schedule)? {
@@ -2875,8 +2860,8 @@ fn critical_neighborhood_order(
     let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
     let mut next_receive_address = vec![None; usize::from(tile_count)];
     let mut ready = BinaryHeap::new();
-    for index in 0..pending.len() {
-        if indegrees[index] == 0 {
+    for (index, &indegree) in indegrees.iter().enumerate() {
+        if indegree == 0 {
             ready.push(repair_ready(
                 index,
                 pending,

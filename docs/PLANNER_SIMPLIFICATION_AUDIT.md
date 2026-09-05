@@ -1,7 +1,13 @@
+> This document records historical findings and possible directions, not a task
+> checklist. Current priorities are shared mid-level copy/view semantics, clear
+> kernel contracts, and fewer representations. The two-pass exchange scheduler
+> can remain while those boundaries are improved.
+
 # Planner simplification audit
 
-`ipu-codegen` currently contains about 32,500 lines of Rust. The production
-parts of `mid.rs` and `low.rs` account for about 12,500 lines. Most of the
+At the original audit baseline, `ipu-codegen` contained about 32,500 lines of
+Rust. The production parts of the former `mid.rs` and `low.rs` accounted for
+about 12,500 lines. Most of the
 avoidable complexity does not come from supporting several algorithms; it
 comes from representing the same decisions independently during candidate
 generation, beam search, costing, conversion planning, tile lowering, and
@@ -21,6 +27,133 @@ commit `43c947e` measured the current search shape:
 These measurements are a useful baseline for judging simplifications. They
 also show that reducing the number of independently expanded choices is more
 important than micro-optimizing the beam container.
+
+## September 4 checkpoint
+
+The complete compiler is retained. The graph-only replacement is saved at
+`archive/graph-only-restructure-2026-09-04` (`5f60b5a`). The audit below records
+the original priorities, not a claim that all remain unimplemented.
+
+Completed: shared logical shard geometry; operation variants owning their plans;
+a single conversion construction path and format authority; removal of duplicate
+GEMM kernel specifications; paired transition/deferred cost queries; common exact
+Pareto metrics; removal of unused target/scheduling/aliasing options and the
+profiling/memory-relation wrappers. GEMM and MLP smoke verification now follows
+compiler storage metadata instead of assuming slice order defines tensor order.
+
+The follow-up pass normalizes catalogue candidates and selected operations onto
+one `OperatorPlan`, removes the intermediate private plan representation, and
+passes that plan directly to costing. GEMM candidate expansion constructs final
+dispatches once without intermediate result-layout lists. Physical GEMM operand
+indices and matrix axes are shared by planning, estimation, and lowering.
+
+Remaining structural work: canonical resolved layout caching and capacity queries, generic semantic views, shared
+address-independent compute/exchange stages, and avoiding the second physical
+exchange scheduling pass. These need separate measured changes; this checkpoint
+does not introduce an adapter around the existing scheduling algorithms.
+
+Validation of this checkpoint:
+
+- `cargo test --release --workspace`: 132 tests pass, including randomized
+  logical-I/O permutation and corruption checks. Existing compiler tests remain.
+- Full-device GEMM: 138,674,176 exact checks pass on 1,472 tiles.
+- 64-tile GEMM and batched GEMM: 262,144 and 786,432 exact checks pass.
+- Canonical batch-one SigLIP MLP: maximum absolute error 0.011719.
+- Random-input attention smoke: 4,896 checks, maximum error 0.000113.
+- Projected SigLIP attention: 839,808 checks, maximum error 0.000930.
+- Clippy passes with `-D warnings -A clippy::too_many_arguments -A
+  clippy::type_complexity`. The unqualified README command still flags existing
+  long signatures and composite types; this change does not hide those lints
+  or add parameter objects solely to satisfy them.
+
+The numerical GEMM fault was in the harness: it decoded output using AMP
+`Output` order while the F16 planner selected AMP `Left` result order. It also
+inferred logical ownership from binding-slice position. Input packing and
+verification now use the compiler's shard maps, retaining exact one-hot checks.
+Device initialization occasionally needed a reset/retry independently of that
+numerical fault; this checkpoint does not claim to repair that startup issue.
+
+Follow-up validation: all 132 release tests and the same Clippy command pass.
+The pass removes 142 production Rust lines (92 net including test adaptations).
+Generated 64-tile GEMM, canonical batch-one MLP, and projected attention packages
+are byte-for-byte identical to the preceding checkpoint. MLP and attention pass
+again on hardware with the same numerical errors; GEMM passes all 262,144 exact
+checks after startup retries. Startup code remains unchanged.
+
+## Modularization and materialization follow-up
+
+The former `mid.rs` and `low.rs` are split by responsibility, retaining their
+public interfaces. Cost and memory estimation now share the `estimate` module,
+with separate geometry, traffic, liveness, and cycle-pricing implementations.
+See [Architecture](ARCHITECTURE.md) for the module map.
+
+Mid planning now commits deferred-output offers and conversion materialization.
+Previously, low lowering reconsidered streaming using the next operation; two
+operand conversions could prevent the first from streaming despite the selected
+plan and its memory estimate. Lowering now follows `DispatchSlices` directly.
+A regression test forces this nonadjacent-consumer case and checks that canonical
+result shards stay unmaterialized. Unclaimed deferred offers are cleared during
+planning instead of being rediscovered during lowering.
+
+The pass also consolidates matrix-layout constructors and the region-liveness
+peak calculation, and removes the temporary startup reset/retry implementation.
+The posted-write readback fix remains in the driver. Startup/run validation and
+its limits are recorded in [Bring-up](BRINGUP.md).
+
+Validation: all 133 release workspace tests pass, as does Clippy with the two
+existing allowances documented above. GEMM, batched GEMM, canonical batch-one
+MLP, projected attention, and attention smoke pass on hardware without automatic
+recovery. All five generated packages are byte-for-byte identical to the prior
+checkpoint packages. This pass removes 113 Rust lines overall, including test
+changes; the largest newly split module is 1,706 lines.
+
+The remaining structural work listed above is still open. In particular, physical
+fragment/staging choices still use concrete spans in low lowering; this pass does
+not introduce a shared execution-stage representation or resolved-layout cache.
+
+## September 5: shared resolved geometry
+
+`mid/resolved` now owns layout validation, axis partition resolution, logical
+bounds, and physical capacities. `Layout::shard_extents`, GEMM traffic, memory
+estimates, and operator capacity checks use that representation. Independent
+`TileAxisPlan` arithmetic and the operator validator's average-shard formulas
+are removed. Traffic retains a resolved operand/output across its tile loop;
+source capacity is also calculated once outside the outgoing-bus loop.
+
+This fixes two discrepancies:
+
+- GEMM traffic's simplified bounds included padding from the next logical group
+  and omitted per-shard padding in maximum-extent queries. Logical ownership and
+  allocation capacity now have distinct queries over the same partitions.
+- Estimates independently rebuilt parallel-GEMM partial storage using the kernel
+  column block. Only low lowering preserved the selected ownership grain and
+  per-shard padding. `OperatorDispatch::gemm_partial_tensor` now supplies both.
+
+New tests cover exact grouped-padding traffic, partial capacities in both GEMM
+orientations, and randomized agreement with physical storage for grouped,
+replicated, and linear layouts.
+
+Hardware validation also exposed an existing completion-check mismatch: the
+runtime's terminal branch to zero can leave an explicit invalid-PC exception.
+The checker now recognizes only that named terminal instruction with its
+completion flag set. Runtime instruction bytes are unchanged; see
+[Bring-up](BRINGUP.md#completion-state-checking) for the evidence and limits.
+
+Validation: 136 release workspace tests and Clippy with the existing two
+allowances pass. Fresh GEMM, batched GEMM, canonical MLP, projected attention,
+and attention-smoke workloads pass numerically; 20 additional attention-smoke
+loads/runs also pass consecutively. Every tile image is byte-for-byte
+identical to the preceding checkpoint; packages add one completion symbol.
+Final-run MLP planning took 25.5 seconds versus the preceding recorded 30.2;
+attention took 15.0 versus 15.5 seconds. These single-run timings are observations,
+not a controlled performance benchmark. Production Rust is 44 lines smaller;
+155 lines of regression tests bring the overall Rust total up by 111 lines.
+
+Resolution is reused within each consumer; there is no compilation-wide layout
+cache yet. Generic semantic views, shared execution stages, and eliminating the
+second physical exchange-scheduling pass remain separate follow-ups. Low GEMM
+still constructs dispatch slices when its compute grid differs from final result
+ownership; this is not yet a shared stage representation.
 
 ## Intended architecture
 
@@ -182,3 +315,25 @@ tradeoffs and should be unified rather than removed:
 Each step should preserve numerical hardware tests and compare canonical MLP
 and attention planning/runtime results against the profiles recorded before the
 change.
+
+## View and kernel checkpoint (2026-09-05)
+
+- Compiler implementation modules are private, with explicit external exports.
+- Mid-level SplitHeads and the one-off deferred transform are replaced by one
+  rank-independent axis-factor view. Both materialized and deferred mapping use
+  its shape validation and coordinate transform. General permutation and view
+  composition remain open; existing graph SplitHeads is semantic syntax.
+- Kernel specialization keys are derived once by shared code for collection and
+  call lookup. One symbol map replaces the per-family maps and redundant GEMM row
+  map. ABI scalar values are typed rather than string-dispatched.
+- Exchange optimization choices can be replayed with final addresses, checked
+  against hazards and normalized rows; this retains the existing two-pass model.
+
+Remaining concrete boundary problem: low/conversion still decides between direct
+word-fragment exchange and staging plus a local transform, calling the estimator
+from low-level lowering. That policy belongs with the selected mid-level copy
+plan. It needs actual relative span geometry, not another independent heuristic.
+
+Validation for this checkpoint: 140 workspace release tests (including doctests),
+strict Clippy, and all five canonical hardware workloads pass. Every tile image
+is identical to its preceding completion-final package, including linked code.
