@@ -21,7 +21,7 @@ accepts only the known terminal InvalidProgramCounter at the named completed
 symbol with the completion word set; it still rejects other faults. The debug
 interface's post-host-exchange visibility is not claimed to be fixed.
 
-## Next work
+## Completed work
 
 1. Kernel responsibilities are now split into ABI, specialization collection,
    geometry, build recipes, and placed-call materialization. Four kernel tests
@@ -57,7 +57,7 @@ interface's post-host-exchange visibility is not claimed to be fixed.
    Linked code ends 152/120 bytes earlier; generated call code grows 12 bytes;
    SRAM reservations are unchanged for projected/smoke attention respectively.
 
-## Immediate next simplifications
+## Subsequent simplifications
 
 - ABI now stores an input count and static typed scalar slice; fixed register
   constants are shared with emit_compute. TileKernel's single Planned wrapper
@@ -95,8 +95,25 @@ interface's post-host-exchange visibility is not claimed to be fixed.
   avoiding kernel clones and repeated linear duplicate scans. ABI needs only one
   generic specialized marker. 144 release workspace tests and Clippy pass; both
   attention cases pass again after the inventory change (`/tmp/kernel-final-*`).
+- Local and inter-tile copies now share mid's CopyOrder. One local-copy binder
+  replaces the separate logical/physical helpers and duplicate call-site branches,
+  removing 48 Rust lines. All 144 workspace release tests and Clippy pass. Five
+  final hardware workloads pass (`/tmp/copy-order-*`) and have byte-identical tile
+  images to `/tmp/ownership-*`. This also validates the final kernel recipe split.
 - CopyPlan is still expanded with shard geometry during lowering. Do not claim
   full materialization recipes are retained in MidOperation yet.
 
 
 No subagents were used. Work is on `refactor/compiler-views-kernels`.
+
+## Remaining design boundaries
+
+The inexpensive consolidation opportunities found in this pass are implemented.
+General permutation/view composition still needs a traversal representation that
+preserves reordered coordinates; simply zipping canonical source/destination
+spans would be incorrect. Retaining concrete copy recipes before low expansion
+also needs a common representation for operator-created staging buffers. Avoid
+adding a second parallel schedule only to move policy calls earlier. Flexible
+kernel output layouts and shared GEMM execution/cost stages remain substantial
+extensions, rather than mechanical cleanup. These are useful starting points for
+a subsequent design pass, not claims that the compiler is fully generalized.

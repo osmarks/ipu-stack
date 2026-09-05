@@ -510,9 +510,9 @@ impl LoweringState {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
-        let logical_order = match plan.strategy {
-            ConversionStrategy::DirectRetile => false,
-            ConversionStrategy::StageLogicalThenTransform => true,
+        let copy_order = match plan.strategy {
+            ConversionStrategy::DirectRetile => CopyOrder::Physical,
+            ConversionStrategy::StageLogicalThenTransform => CopyOrder::Semantic,
             ConversionStrategy::LocalKernel => {
                 return Err(LowLoweringError::InvalidConversionPlan);
             }
@@ -539,8 +539,8 @@ impl LoweringState {
         }
         self.lower_mapped_views(
             mappings,
-            logical_order,
-            ExchangeOrder::Semantic,
+            copy_order,
+            CopyOrder::Semantic,
             operation_provenance(operation),
             tiles,
         )
@@ -549,8 +549,8 @@ impl LoweringState {
     pub(super) fn lower_mapped_views(
         &mut self,
         mappings: Vec<(ShardView, ShardView)>,
-        logical_order: bool,
-        exchange_order: ExchangeOrder,
+        copy_order: CopyOrder,
+        exchange_order: CopyOrder,
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
@@ -563,7 +563,7 @@ impl LoweringState {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
         for (destination_shard, mut mappings) in grouped {
-            let plan = self.copy_plan(&mappings, destination_shard, logical_order)?;
+            let plan = self.copy_plan(&mappings, destination_shard, copy_order)?;
             if plan.clear_padding {
                 self.append_fill_zero(tiles, destination_shard, provenance)?;
             }
@@ -596,23 +596,14 @@ impl LoweringState {
                     } else {
                         &mut after_exchange
                     };
-                    if logical_order {
-                        append_logical_span_copies(
-                            &self.shards,
-                            &source,
-                            &destination,
-                            destination_tile,
-                            copies,
-                        )?;
-                    } else {
-                        append_span_copies(
-                            &self.shards,
-                            &source,
-                            &destination,
-                            destination_tile,
-                            copies,
-                        )?;
-                    }
+                    append_span_copies(
+                        &self.shards,
+                        &source,
+                        &destination,
+                        destination_tile,
+                        copies,
+                        copy_order,
+                    )?;
                 } else {
                     transfers.entry(source).or_default().push(destination);
                 }
@@ -655,12 +646,13 @@ impl LoweringState {
                         ),
                     ));
                 } else {
-                    append_logical_span_copies(
+                    append_span_copies(
                         &self.shards,
                         &staging,
                         &destination,
                         tile,
                         &mut after_exchange,
+                        CopyOrder::Semantic,
                     )?;
                 }
             }
@@ -732,8 +724,8 @@ impl LoweringState {
                 );
                 return self.lower_mapped_views(
                     mappings,
-                    false,
-                    ExchangeOrder::Physical,
+                    CopyOrder::Physical,
+                    CopyOrder::Physical,
                     WorkProvenance {
                         operation: operation.source,
                         value: Some(*result),
@@ -765,8 +757,8 @@ impl LoweringState {
         let mappings = self.view_mappings(&source_shards, &output_shards, *view)?;
         self.lower_mapped_views(
             mappings,
-            true,
-            ExchangeOrder::Semantic,
+            CopyOrder::Semantic,
+            CopyOrder::Semantic,
             WorkProvenance {
                 operation: operation.source,
                 value: Some(*result),
@@ -973,7 +965,7 @@ impl LoweringState {
         &self,
         mappings: &[(ShardView, ShardView)],
         destination: LowShardId,
-        logical_order: bool,
+        copy_order: CopyOrder,
     ) -> LowLoweringResult<crate::mid::CopyPlan> {
         let shard = &self.shards[destination.index() as usize];
         let mappings = mappings
@@ -988,7 +980,7 @@ impl LoweringState {
             &shard.tensor_type,
             &shard.extents,
             &mappings,
-            logical_order,
+            copy_order,
         )?)
     }
 
@@ -1013,7 +1005,7 @@ impl LoweringState {
             destination,
         )?;
         Ok(self
-            .copy_plan(&mappings, destination, true)?
+            .copy_plan(&mappings, destination, CopyOrder::Semantic)?
             .direct_word_exchange)
     }
 
@@ -1027,7 +1019,7 @@ impl LoweringState {
         column_start: u32,
         columns: u32,
         destination: LowShardId,
-        order: ExchangeOrder,
+        order: CopyOrder,
         transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         local_copies: &mut Vec<(u16, LocalCopy)>,
     ) -> LowLoweringResult<()> {
@@ -1042,7 +1034,7 @@ impl LoweringState {
             destination,
         )?;
         for (source_view, destination_view) in mappings {
-            let mappings = if order == ExchangeOrder::Physical {
+            let mappings = if order == CopyOrder::Physical {
                 self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
                     .ok_or(LowLoweringError::InvalidOperatorPlan)?
             } else {
@@ -1050,23 +1042,14 @@ impl LoweringState {
             };
             for (source_view, destination_view) in mappings {
                 if self.shards[source_view.shard.index() as usize].tile == destination_tile {
-                    if order == ExchangeOrder::Physical {
-                        append_span_copies(
-                            &self.shards,
-                            &source_view,
-                            &destination_view,
-                            destination_tile,
-                            local_copies,
-                        )?;
-                    } else {
-                        append_logical_span_copies(
-                            &self.shards,
-                            &source_view,
-                            &destination_view,
-                            destination_tile,
-                            local_copies,
-                        )?;
-                    }
+                    append_span_copies(
+                        &self.shards,
+                        &source_view,
+                        &destination_view,
+                        destination_tile,
+                        local_copies,
+                        order,
+                    )?;
                 } else {
                     transfers
                         .entry(source_view)

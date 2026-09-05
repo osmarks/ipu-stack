@@ -559,7 +559,7 @@ fn prepare_transfer(
     transfer: &LogicalExchange,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
     let source = &program.shards[transfer.source.shard.index() as usize];
-    let logical_order = transfer.order == crate::low::ExchangeOrder::Semantic
+    let logical_order = transfer.order == crate::mid::CopyOrder::Semantic
         && transfer.destinations.iter().any(|view| {
             program.shards[view.shard.index() as usize]
                 .tensor_type

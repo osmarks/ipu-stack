@@ -225,9 +225,9 @@ impl LoweringState {
                 task.query_dimension,
                 task.query_receive.unwrap_or(task.query),
                 if physical {
-                    ExchangeOrder::Physical
+                    CopyOrder::Physical
                 } else {
-                    ExchangeOrder::Semantic
+                    CopyOrder::Semantic
                 },
                 &mut transfers,
                 &mut local_copies,
@@ -240,9 +240,9 @@ impl LoweringState {
             transfers,
             provenance,
             if physical {
-                ExchangeOrder::Physical
+                CopyOrder::Physical
             } else {
-                ExchangeOrder::Semantic
+                CopyOrder::Semantic
             },
             tiles,
         )?;
@@ -640,6 +640,7 @@ impl LoweringState {
                             &destination_view,
                             task.tile,
                             &mut copies,
+                            CopyOrder::Physical,
                         )?;
                         for (tile, copy) in copies {
                             self.append_local_copy(tiles, tile, copy)?;
@@ -933,9 +934,9 @@ impl LoweringState {
                     panel_columns,
                     gather_destination,
                     if physical {
-                        ExchangeOrder::Physical
+                        CopyOrder::Physical
                     } else {
-                        ExchangeOrder::Semantic
+                        CopyOrder::Semantic
                     },
                     if physical {
                         physical_gathers
@@ -991,6 +992,7 @@ impl LoweringState {
                         &destination_view,
                         panel.tile,
                         &mut copies,
+                        CopyOrder::Physical,
                     )?;
                     for (tile, copy) in copies {
                         self.append_local_copy(tiles, tile, copy)?;

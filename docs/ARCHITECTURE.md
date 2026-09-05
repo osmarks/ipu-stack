@@ -27,22 +27,26 @@ package-building interface, and types used by diagnostics. Internals are
 organized by responsibility:
 
 - `mid/layout` defines tensor formats; `mid/resolved` validates ownership and
-  resolves partition bounds and capacities. `graph/view` owns logical axis split/merge mappings; `mid/view` adapts
-  them to storage extents shared by materialized and deferred consumers.
-  `mid/operator` defines executable contracts. `catalogue` supplies implementation families,
-  `candidates` specializes them for shapes, and `planner` selects complete plans
-  and inserts conversions.
+  resolves partition bounds and capacities. `graph/view` owns axis split/merge
+  mappings; `mid/view` adapts them to storage extents. `mid/operator` defines
+  executable contracts. `catalogue` supplies implementation families, `candidates`
+  specializes them for shapes, and `planner` selects plans and inserts conversions.
+  `ownership` selects parameter tile rotations for the finalized mid graph.
 - `estimate/tensor` adapts resolved geometry to conservative estimates, `traffic`
   counts data movement, `memory` evaluates allocations and region liveness, and
   `cycles` applies target prices. Memory estimate types live here alongside their calculations.
 - `kernel/abi` defines call contracts and scalar arguments; `specialization`
   derives keys shared by collection and lookup; `geometry` extracts call shapes;
-  `build` generates object recipes. The root materializes placed call addresses.
+  `build` coordinates the GEMM, rearrangement, and attention object recipes.
+  `device/worker_call.S` marshals declared supervisor registers into C++ vertex
+  fields. The root materializes placed call addresses.
 - `storage` computes relative byte spans from borrowed format/extents without
   depending on the low IR; low-level adapters add shard identity checks.
 - `mid/copy` defines relative copy operations and per-destination materialization
   recipes, including staging geometry and optional transform kernels. It owns
-  word-exchange pricing and strided-copy formation; `low` binds these to shards.
+  word-exchange pricing and strided-copy formation. Its `CopyOrder` specifies
+  semantic or physical traversal for both local copies and exchanges. `low`
+  binds the recipes to shards.
 - `low/conversion` realizes selected formats and deferred views; `gemm` and
   `attention` expand their dispatches. `copies` handles concrete byte-span copies.
   The root module owns the shared schedule state and generic dispatch.
@@ -62,10 +66,10 @@ shape plus a `TensorFormat` containing:
 - replication and logical tile-group size;
 - a hardware memory class such as IPU21 standard or interleaved memory.
 
-This is deliberately less specific than placement: it records decisions that
-change an operator plan, but not physical tile IDs, SRAM addresses,
-lifetimes, or exchange rows. AMP order selects the packing family; axis tiling
-contains its block dimensions.
+The selected mid graph records the target tile count and ownership rotations
+alongside each value's format. SRAM addresses, lifetimes, and exchange rows are
+resolved later. AMP order selects the packing family; axis tiling contains its
+block dimensions.
 
 `mid::lower` considers complete operator candidates for each semantic operation.
 Candidates record every input and output format, per-operand alignment and
@@ -89,9 +93,10 @@ selected region, the planner clears unclaimed deferred-output offers and restore
 their materialized costs. Low lowering follows the resulting contracts instead
 of scanning region uses to make those decisions again.
 
-Low lowering still chooses physical fragment emission and staging from concrete
-storage spans. Coalescing adjacent byte copies belongs to that physical step;
-it does not create or remove semantic format conversions.
+Copy recipes are still expanded using concrete shard geometry during low
+lowering, rather than stored per destination in `MidOperation`. The shared mid
+copy code selects staging and forms contiguous/strided runs. This expansion does
+not create or remove semantic format conversions.
 
 The selected `OperatorPlan` also contains an `OperatorDispatch`: a whole-device
 recipe for ordered data movement and tile-kernel calls. A blocked GEMM stores
@@ -147,11 +152,11 @@ sources. Missing general GeLU, Add, attention, cast, and rearrangement kernels
 are marked `Required`; they are not confused with diagnostic assembly helpers.
 The corresponding retained assembly entry points carry matching ABI comments.
 
-`PipelineConfig` is shared by mid lowering, low scheduling, and package
-construction. It contains the hardware target, one tile count, graph-input
-formats, the operator catalog, scheduling policy, and profiling policy.
-`PackageConfig` adds only build-environment details such as the toolchain and
-runtime source.
+`PipelineConfig` supplies mid planning and package construction with the target,
+input formats, operator catalogue, scheduling policy, and profiling policy. Low
+lowering consumes the selected `MidGraph` and a diagnostic-checkpoint flag.
+`PackageConfig` adds build-environment details such as the toolchain and runtime
+source.
 
 Kernel runs, exchange phases, and structured repeats retain `WorkProvenance`:
 the originating graph operation, affected mid-level value, and the reason for

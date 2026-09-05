@@ -38,57 +38,21 @@ pub(super) fn append_span_copies(
     destination: &ShardView,
     tile: u16,
     copies: &mut Vec<(u16, LocalCopy)>,
+    order: CopyOrder,
 ) -> LowLoweringResult<()> {
-    let source_spans = view_byte_spans(&shards[source.shard.index() as usize], source)?;
-    let destination_spans =
-        view_byte_spans(&shards[destination.shard.index() as usize], destination)?;
-    append_byte_span_copies(
-        source,
-        destination,
-        tile,
-        &source_spans,
-        &destination_spans,
-        copies,
-    )
-}
-
-pub(super) fn append_byte_span_copies(
-    source: &ShardView,
-    destination: &ShardView,
-    tile: u16,
-    source_spans: &[ByteSpan],
-    destination_spans: &[ByteSpan],
-    copies: &mut Vec<(u16, LocalCopy)>,
-) -> LowLoweringResult<()> {
+    let spans = match order {
+        CopyOrder::Semantic => logical_view_byte_spans,
+        CopyOrder::Physical => view_byte_spans,
+    };
     copies.extend(
-        crate::mid::CopyOperation::from_spans(
+        LocalCopy::from_spans(
             source.shard,
             destination.shard,
-            source_spans,
-            destination_spans,
+            &spans(&shards[source.shard.index() as usize], source)?,
+            &spans(&shards[destination.shard.index() as usize], destination)?,
         )?
         .into_iter()
         .map(|copy| (tile, copy)),
     );
     Ok(())
-}
-
-pub(super) fn append_logical_span_copies(
-    shards: &[LowShard],
-    source: &ShardView,
-    destination: &ShardView,
-    tile: u16,
-    copies: &mut Vec<(u16, LocalCopy)>,
-) -> LowLoweringResult<()> {
-    let source_spans = logical_view_byte_spans(&shards[source.shard.index() as usize], source)?;
-    let destination_spans =
-        logical_view_byte_spans(&shards[destination.shard.index() as usize], destination)?;
-    append_byte_span_copies(
-        source,
-        destination,
-        tile,
-        &source_spans,
-        &destination_spans,
-        copies,
-    )
 }

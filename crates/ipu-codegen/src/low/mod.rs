@@ -13,10 +13,10 @@ mod gemm;
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
-    ConversionStrategy, CopyPattern, ElementOrder, GemmDistribution, Layout, LayoutError,
-    MemoryClass, MemoryOperand, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperandRequirement, OperatorDispatch, OutputAliasing, PointwiseInputMapping, Precision,
-    ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
+    ConversionStrategy, CopyOrder, CopyPattern, ElementOrder, GemmDistribution, Layout,
+    LayoutError, MemoryClass, MemoryOperand, MidGraph, MidOperation, MidOperationKind, MidRepeat,
+    MidValueId, OperandRequirement, OperatorDispatch, OutputAliasing, PointwiseInputMapping,
+    Precision, ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError};
 use conversion::*;
@@ -114,16 +114,7 @@ pub struct LowValue {
 pub struct LogicalExchange {
     pub source: ShardView,
     pub destinations: Vec<ShardView>,
-    pub order: ExchangeOrder,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ExchangeOrder {
-    /// Preserve tensor coordinates, converting between physical layouts.
-    #[default]
-    Semantic,
-    /// Preserve allocation order, treating both views as packed byte spans.
-    Physical,
+    pub order: CopyOrder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -981,12 +972,13 @@ impl LoweringState {
                 extents,
             };
             if self.shards[source.index() as usize].tile == tile {
-                append_logical_span_copies(
+                append_span_copies(
                     &self.shards,
                     &source_view,
                     &destination_view,
                     tile,
                     local_copies,
+                    CopyOrder::Semantic,
                 )?;
             } else {
                 transfers
@@ -1004,7 +996,7 @@ impl LoweringState {
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        self.append_ordered_phase(transfers, provenance, ExchangeOrder::Semantic, tiles)
+        self.append_ordered_phase(transfers, provenance, CopyOrder::Semantic, tiles)
     }
 
     fn append_physical_phase(
@@ -1013,14 +1005,14 @@ impl LoweringState {
         provenance: WorkProvenance,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
-        self.append_ordered_phase(transfers, provenance, ExchangeOrder::Physical, tiles)
+        self.append_ordered_phase(transfers, provenance, CopyOrder::Physical, tiles)
     }
 
     fn append_ordered_phase(
         &mut self,
         transfers: BTreeMap<ShardView, Vec<ShardView>>,
         provenance: WorkProvenance,
-        order: ExchangeOrder,
+        order: CopyOrder,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let transfers = transfers
@@ -1047,8 +1039,8 @@ impl LoweringState {
     ) -> LowLoweringResult<()> {
         let mut transfers = Vec::with_capacity(semantic.len().saturating_add(physical.len()));
         for (order, mappings) in [
-            (ExchangeOrder::Semantic, semantic),
-            (ExchangeOrder::Physical, physical),
+            (CopyOrder::Semantic, semantic),
+            (CopyOrder::Physical, physical),
         ] {
             transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
                 destinations.sort_unstable();

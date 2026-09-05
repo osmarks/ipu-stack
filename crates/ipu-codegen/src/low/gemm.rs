@@ -876,12 +876,13 @@ impl LoweringState {
                                     ],
                                 )?;
                                 if source_is_local {
-                                    append_logical_span_copies(
+                                    append_span_copies(
                                         &self.shards,
                                         &target_view,
                                         &destination_view,
                                         left_shard.tile,
                                         &mut local_copies,
+                                        CopyOrder::Semantic,
                                     )?;
                                 } else {
                                     transfers
@@ -1152,6 +1153,7 @@ impl LoweringState {
                             &self.full_view(initial),
                             owner.tile,
                             &mut seed_copies,
+                            CopyOrder::Physical,
                         )?;
                     } else {
                         reduction_transfers[0]
@@ -1235,6 +1237,7 @@ impl LoweringState {
                         },
                         owner.tile,
                         &mut result_copies,
+                        CopyOrder::Physical,
                     )?;
                     reduction_roots += 1;
                 }

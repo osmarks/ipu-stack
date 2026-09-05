@@ -2,6 +2,15 @@
 
 use crate::storage::{ByteSpan, StorageError, StorageResult};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CopyOrder {
+    /// Preserve tensor coordinates, converting between physical layouts.
+    #[default]
+    Semantic,
+    /// Preserve allocation order, treating both views as packed byte spans.
+    Physical,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyOperation<Buffer> {
     pub source: Buffer,
@@ -189,9 +198,9 @@ impl CopyPlan {
         destination: &TensorType,
         extents: &[ShardExtent],
         mappings: &[CopyMapping<'_>],
-        logical_order: bool,
+        order: CopyOrder,
     ) -> StorageResult<Self> {
-        if !logical_order {
+        if order == CopyOrder::Physical {
             return Ok(Self {
                 direct_word_exchange: false,
                 clear_padding: false,
@@ -241,11 +250,10 @@ impl CopyPlan {
             bytes.div_ceil(destination.format.precision.bytes().max(1)),
         );
         let direct_word_exchange = word_aligned && fragment_cycles < pack_cycles;
-        let transform = logical_order
-            && (destination_unaligned
-                || mappings.iter().any(|mapping| {
-                    mapping.source.format.layout.order != destination.format.layout.order
-                }));
+        let transform = destination_unaligned
+            || mappings.iter().any(|mapping| {
+                mapping.source.format.layout.order != destination.format.layout.order
+            });
         let staging = (transform && !direct_word_exchange).then(|| {
             let mut extents = extents.to_vec();
             for extent in &mut extents {
