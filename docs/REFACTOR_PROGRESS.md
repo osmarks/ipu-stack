@@ -26,8 +26,10 @@ interface's post-host-exchange visibility is not claimed to be fixed.
 1. Kernel responsibilities are now split into ABI, specialization collection,
    geometry, build recipes, and placed-call materialization. Four kernel tests
    pass after extraction; duplicate rearrangement symbol insertion is removed.
-2. Decouple physical storage-span geometry from LowShard so mid planning can use
-   actual relative spans. Low conversion currently calls the cycle estimator to
+2. Physical storage-span geometry now accepts borrowed format/extents, independent
+   of LowShard; the low-level adapter checks shard identity. Physical and logical
+   spans share one index traversal. All 80 codegen tests and its doctest pass.
+   Low conversion still calls the cycle estimator to
    reconsider direct word exchange versus staging; move this policy to a shared
    mid-level copy plan, rather than duplicating its heuristic again.
 3. Extend views beyond the axis-factor primitive as useful. Graph SplitHeads is

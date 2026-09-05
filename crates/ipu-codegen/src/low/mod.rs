@@ -18,9 +18,10 @@ use crate::mid::{
     OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing, PipelineConfig,
     PointwiseInputMapping, Precision, ShardExtent, TensorTiling, TensorType, TileKernelSpec,
 };
-use crate::storage::{ByteSpan, StorageError, logical_view_byte_spans, view_byte_spans};
+use crate::storage::{ByteSpan, StorageError};
 use conversion::*;
 use copies::*;
+pub use copies::{logical_view_byte_spans, shard_storage_bytes, view_byte_spans};
 use gemm::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -520,12 +521,9 @@ impl LoweringState {
                 extents
                     .iter()
                     .map(|(_, extents)| {
-                        crate::shard_storage_bytes(&LowShard {
-                            id: LowShardId(0),
-                            tile: 0,
-                            tensor_type: value.tensor_type.clone(),
-                            extents: extents.clone(),
-                            definition: ShardDefinition::Value(value.id),
+                        crate::storage::storage_bytes(crate::storage::TensorStorage {
+                            format: &value.tensor_type.format,
+                            extents,
                         })
                         .map(u64::from)
                         .map_err(LowLoweringError::from)

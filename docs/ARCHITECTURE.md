@@ -38,6 +38,8 @@ organized by responsibility:
 - `kernel/abi` defines call contracts and scalar arguments; `specialization`
   derives keys shared by collection and lookup; `geometry` extracts call shapes;
   `build` generates object recipes. The root materializes placed call addresses.
+- `storage` computes relative byte spans from borrowed format/extents without
+  depending on the low IR; low-level adapters add shard identity checks.
 - `low/conversion` realizes selected formats and deferred views; `gemm` and
   `attention` expand their dispatches. `copies` handles concrete byte-span copies.
   The root module owns the shared schedule state and generic dispatch.

@@ -1,7 +1,15 @@
 //! Conversion from logical shard views to physical byte ranges.
 
-use crate::low::{LowShard, ShardView};
-use crate::mid::{AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision};
+use crate::mid::{
+    AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision, ShardExtent, TensorFormat,
+};
+
+/// Relative storage geometry, independent of low IR identities and placement.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TensorStorage<'a> {
+    pub format: &'a TensorFormat,
+    pub extents: &'a [ShardExtent],
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -29,7 +37,7 @@ pub enum StorageError {
 pub type StorageResult<T> = Result<T, StorageError>;
 
 /// Returns the physical allocation size of a shard.
-pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
+pub(crate) fn storage_bytes(shard: TensorStorage<'_>) -> StorageResult<u32> {
     let elements = shard.extents.iter().try_fold(1u64, |product, extent| {
         product
             .checked_mul(u64::from(extent.physical_end - extent.start))
@@ -37,7 +45,7 @@ pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
     })?;
     u32::try_from(
         elements
-            .checked_mul(shard.tensor_type.format.precision.bytes())
+            .checked_mul(shard.format.precision.bytes())
             .ok_or(StorageError::Overflow)?,
     )
     .map_err(|_| StorageError::Overflow)
@@ -49,67 +57,32 @@ pub fn shard_storage_bytes(shard: &LowShard) -> StorageResult<u32> {
 /// for each outer matrix. AMP left and output operands flatten their outer
 /// axes into the row dimension, which lets one tile-kernel invocation process
 /// activation batches with shared weights.
-pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<ByteSpan>> {
+pub(crate) fn physical_byte_spans(
+    shard: TensorStorage<'_>,
+    view: &[ShardExtent],
+) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
-    if shard.extents == view.extents {
+    if shard.extents == view {
         return Ok(vec![ByteSpan {
             offset: 0,
-            bytes: shard_storage_bytes(shard)?,
+            bytes: storage_bytes(shard)?,
         }]);
     }
     if let Some(spans) = block_major_panel_spans(shard, view)? {
         return Ok(spans);
     }
-    let shard_widths = shard
-        .extents
-        .iter()
-        .map(|extent| extent.physical_end - extent.start)
-        .collect::<Vec<_>>();
-    let view_widths = view
-        .extents
-        .iter()
-        .map(|extent| extent.physical_end - extent.start)
-        .collect::<Vec<_>>();
-    let elements = view_widths.iter().try_fold(1u64, |product, &width| {
-        product
-            .checked_mul(u64::from(width))
-            .ok_or(StorageError::Overflow)
-    })?;
-    let element_bytes = u32::try_from(shard.tensor_type.format.precision.bytes())
-        .map_err(|_| StorageError::Overflow)?;
-    let mut view_coordinates = vec![0; view_widths.len()];
-    let mut shard_coordinates = vec![0; shard_widths.len()];
-    let mut offsets = Vec::with_capacity(usize::try_from(elements).unwrap_or(0));
-    for logical in 0..elements {
-        decode_row_major(&view_widths, logical, &mut view_coordinates);
-        for ((shard_coordinate, view_coordinate), (shard_extent, view_extent)) in shard_coordinates
-            .iter_mut()
-            .zip(&view_coordinates)
-            .zip(shard.extents.iter().zip(&view.extents))
-        {
-            *shard_coordinate = view_extent.start - shard_extent.start + view_coordinate;
-        }
-        let physical = physical_index(shard, &shard_widths, &shard_coordinates)?;
-        let offset = u32::try_from(physical)
-            .ok()
-            .and_then(|index| index.checked_mul(element_bytes))
-            .ok_or(StorageError::Overflow)?;
-        offsets.push(offset);
-    }
-    offsets.sort_unstable();
+    let mut logical = logical_byte_spans(shard, view)?;
+    logical.sort_unstable_by_key(|span| span.offset);
     let mut spans = Vec::<ByteSpan>::new();
-    for offset in offsets {
+    for span in logical {
         match spans.last_mut() {
-            Some(last) if last.offset.checked_add(last.bytes) == Some(offset) => {
-                last.bytes = last
+            Some(previous) if previous.offset.checked_add(previous.bytes) == Some(span.offset) => {
+                previous.bytes = previous
                     .bytes
-                    .checked_add(element_bytes)
+                    .checked_add(span.bytes)
                     .ok_or(StorageError::Overflow)?;
             }
-            _ => spans.push(ByteSpan {
-                offset,
-                bytes: element_bytes,
-            }),
+            _ => spans.push(span),
         }
     }
     Ok(spans)
@@ -118,7 +91,10 @@ pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<
 /// Converts a semantic view into physical spans ordered by canonical logical
 /// coordinates. Zipping spans from two layouts therefore describes a layout
 /// conversion without materializing an intermediate packed buffer.
-pub fn logical_view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageResult<Vec<ByteSpan>> {
+pub(crate) fn logical_byte_spans(
+    shard: TensorStorage<'_>,
+    view: &[ShardExtent],
+) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
     let shard_widths = shard
         .extents
@@ -126,7 +102,6 @@ pub fn logical_view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageRes
         .map(|extent| extent.physical_end - extent.start)
         .collect::<Vec<_>>();
     let view_widths = view
-        .extents
         .iter()
         .map(|extent| extent.physical_end - extent.start)
         .collect::<Vec<_>>();
@@ -135,8 +110,8 @@ pub fn logical_view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageRes
             .checked_mul(u64::from(width))
             .ok_or(StorageError::Overflow)
     })?;
-    let element_bytes = u32::try_from(shard.tensor_type.format.precision.bytes())
-        .map_err(|_| StorageError::Overflow)?;
+    let element_bytes =
+        u32::try_from(shard.format.precision.bytes()).map_err(|_| StorageError::Overflow)?;
     let mut view_coordinates = vec![0; view_widths.len()];
     let mut shard_coordinates = vec![0; shard_widths.len()];
     let mut spans = Vec::<ByteSpan>::new();
@@ -145,7 +120,7 @@ pub fn logical_view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageRes
         for ((shard_coordinate, view_coordinate), (shard_extent, view_extent)) in shard_coordinates
             .iter_mut()
             .zip(&view_coordinates)
-            .zip(shard.extents.iter().zip(&view.extents))
+            .zip(shard.extents.iter().zip(view))
         {
             *shard_coordinate = view_extent.start - shard_extent.start + view_coordinate;
         }
@@ -170,9 +145,13 @@ pub fn logical_view_byte_spans(shard: &LowShard, view: &ShardView) -> StorageRes
     Ok(spans)
 }
 
-fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> StorageResult<u64> {
+fn physical_index(
+    shard: TensorStorage<'_>,
+    widths: &[u32],
+    coordinates: &[u32],
+) -> StorageResult<u64> {
     let rank = widths.len();
-    match shard.tensor_type.format.layout.order {
+    match shard.format.layout.order {
         ElementOrder::RowMajor => encode_row_major(widths, coordinates),
         ElementOrder::BlockMajor(order) => {
             if rank < 2 {
@@ -186,7 +165,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
             let matrix_elements = u64::from(rows) * u64::from(columns);
             let within = block_major_matrix_index(
                 order,
-                shard.tensor_type.format.precision,
+                shard.format.precision,
                 rows,
                 columns,
                 row,
@@ -208,13 +187,8 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
             let column = coordinates[rank - 1];
             if role == AmpOrder::TransposedRight {
                 let matrix_elements = u64::from(rows) * u64::from(columns);
-                let within = right_matrix_index(
-                    shard.tensor_type.format.precision,
-                    columns,
-                    rows,
-                    column,
-                    row,
-                )?;
+                let within =
+                    right_matrix_index(shard.format.precision, columns, rows, column, row)?;
                 outer
                     .checked_mul(matrix_elements)
                     .and_then(|base| base.checked_add(u64::from(within)))
@@ -225,7 +199,7 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
                 })?;
                 amp_matrix_index(
                     role,
-                    shard.tensor_type.format.precision,
+                    shard.format.precision,
                     flat_rows,
                     columns,
                     u32::try_from(outer)
@@ -238,14 +212,8 @@ fn physical_index(shard: &LowShard, widths: &[u32], coordinates: &[u32]) -> Stor
                 .map(u64::from)
             } else {
                 let matrix_elements = u64::from(rows) * u64::from(columns);
-                let within = amp_matrix_index(
-                    role,
-                    shard.tensor_type.format.precision,
-                    rows,
-                    columns,
-                    row,
-                    column,
-                )?;
+                let within =
+                    amp_matrix_index(role, shard.format.precision, rows, columns, row, column)?;
                 outer
                     .checked_mul(matrix_elements)
                     .and_then(|base| base.checked_add(u64::from(within)))
@@ -398,40 +366,39 @@ fn block_major_matrix_index(
 }
 
 fn block_major_panel_spans(
-    shard: &LowShard,
-    view: &ShardView,
+    shard: TensorStorage<'_>,
+    view: &[ShardExtent],
 ) -> StorageResult<Option<Vec<ByteSpan>>> {
     if shard.extents.len() < 2 {
         return Ok(None);
     }
     let rank = shard.extents.len();
-    let (inner_block, inner_axis, column_axis, column_tensor_axis) =
-        match shard.tensor_type.format.layout.order {
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
-                u32::from(row_block),
-                rank - 2,
-                rank - 1,
-                crate::TensorAxis::FromEnd(1),
-            ),
-            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { row_block, .. }) => (
-                u32::from(row_block),
-                rank - 1,
-                rank - 2,
-                crate::TensorAxis::FromEnd(2),
-            ),
-            _ => return Ok(None),
-        };
-    if shard.extents[..rank - 2] != view.extents[..rank - 2] {
+    let (inner_block, inner_axis, column_axis, column_tensor_axis) = match shard.format.layout.order
+    {
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
+            u32::from(row_block),
+            rank - 2,
+            rank - 1,
+            crate::TensorAxis::FromEnd(1),
+        ),
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { row_block, .. }) => (
+            u32::from(row_block),
+            rank - 1,
+            rank - 2,
+            crate::TensorAxis::FromEnd(2),
+        ),
+        _ => return Ok(None),
+    };
+    if shard.extents[..rank - 2] != view[..rank - 2] {
         return Ok(None);
     }
     let rows = shard.extents[inner_axis].physical_end - shard.extents[inner_axis].start;
     let columns = shard.extents[column_axis].physical_end - shard.extents[column_axis].start;
-    let inner_start = view.extents[inner_axis].start - shard.extents[inner_axis].start;
-    let column_start = view.extents[column_axis].start - shard.extents[column_axis].start;
-    let inner_width = view.extents[inner_axis].physical_end - view.extents[inner_axis].start;
-    let column_width = view.extents[column_axis].physical_end - view.extents[column_axis].start;
+    let inner_start = view[inner_axis].start - shard.extents[inner_axis].start;
+    let column_start = view[column_axis].start - shard.extents[column_axis].start;
+    let inner_width = view[inner_axis].physical_end - view[inner_axis].start;
+    let column_width = view[column_axis].physical_end - view[column_axis].start;
     let Some(output_column_block) = shard
-        .tensor_type
         .format
         .layout
         .tiling
@@ -457,21 +424,15 @@ fn block_major_panel_spans(
             .ok_or(StorageError::Overflow)?;
         let panel_bytes = inner_block
             .checked_mul(output_column_block)
-            .and_then(|elements| {
-                elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
-            })
+            .and_then(|elements| elements.checked_mul(shard.format.precision.bytes() as u32))
             .ok_or(StorageError::Overflow)?;
         let bytes = inner_block
             .checked_mul(column_width)
-            .and_then(|elements| {
-                elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
-            })
+            .and_then(|elements| elements.checked_mul(shard.format.precision.bytes() as u32))
             .ok_or(StorageError::Overflow)?;
         let matrix_bytes = rows
             .checked_mul(columns)
-            .and_then(|elements| {
-                elements.checked_mul(shard.tensor_type.format.precision.bytes() as u32)
-            })
+            .and_then(|elements| elements.checked_mul(shard.format.precision.bytes() as u32))
             .ok_or(StorageError::Overflow)?;
         let outer = shard.extents[..rank - 2]
             .iter()
@@ -504,30 +465,20 @@ fn block_major_panel_spans(
     Ok(None)
 }
 
-fn validate_view(shard: &LowShard, view: &ShardView) -> StorageResult<()> {
-    if view.shard != shard.id {
-        return Err(StorageError::WrongShard);
-    }
-    if view.extents.len() != shard.extents.len()
-        || view
-            .extents
-            .iter()
-            .zip(&shard.extents)
-            .any(|(view, shard)| {
-                view.axis != shard.axis
-                    || view.start < shard.start
-                    || view.start > view.logical_end
-                    || view.logical_end > view.physical_end
-                    || view.physical_end > shard.physical_end
-            })
+fn validate_view(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<()> {
+    if view.len() != shard.extents.len()
+        || view.iter().zip(shard.extents).any(|(view, shard)| {
+            view.axis != shard.axis
+                || view.start < shard.start
+                || view.start > view.logical_end
+                || view.logical_end > view.physical_end
+                || view.physical_end > shard.physical_end
+        })
     {
         tracing::error!(
-            shard = ?shard.id,
-            tile = shard.tile,
-            shape = ?shard.tensor_type.shape,
-            layout = ?shard.tensor_type.format.layout,
+            layout = ?shard.format.layout,
             shard_extents = ?shard.extents,
-            view_extents = ?view.extents,
+            view_extents = ?view,
             "tensor view falls outside its storage shard"
         );
         return Err(StorageError::InvalidView);
@@ -537,13 +488,13 @@ fn validate_view(shard: &LowShard, view: &ShardView) -> StorageResult<()> {
 
 #[cfg(test)]
 fn physical_coordinates(
-    shard: &LowShard,
+    shard: TensorStorage<'_>,
     widths: &[u32],
     physical: u64,
 ) -> StorageResult<Vec<u32>> {
     let rank = widths.len();
     let mut coordinates = vec![0; rank];
-    match shard.tensor_type.format.layout.order {
+    match shard.format.layout.order {
         ElementOrder::RowMajor => decode_row_major(widths, physical, &mut coordinates),
         ElementOrder::BlockMajor(order) => {
             if rank < 2 {
@@ -558,7 +509,7 @@ fn physical_coordinates(
                 u32::try_from(physical % matrix_elements).map_err(|_| StorageError::Overflow)?;
             let (row, column) = block_major_matrix_coordinates(
                 order,
-                shard.tensor_type.format.precision,
+                shard.format.precision,
                 rows,
                 columns,
                 linear,
@@ -581,7 +532,7 @@ fn physical_coordinates(
                 let linear = u32::try_from(physical).map_err(|_| StorageError::Overflow)?;
                 let (flat_row, column) = amp_matrix_coordinates(
                     role,
-                    shard.tensor_type.format.precision,
+                    shard.format.precision,
                     outer_rows,
                     columns,
                     linear,
@@ -600,13 +551,8 @@ fn physical_coordinates(
                 decode_row_major(&widths[..rank - 2], outer, &mut coordinates[..rank - 2]);
                 let linear = u32::try_from(physical % matrix_elements)
                     .map_err(|_| StorageError::Overflow)?;
-                let (row, column) = amp_matrix_coordinates(
-                    role,
-                    shard.tensor_type.format.precision,
-                    rows,
-                    columns,
-                    linear,
-                )?;
+                let (row, column) =
+                    amp_matrix_coordinates(role, shard.format.precision, rows, columns, linear)?;
                 coordinates[rank - 2] = row;
                 coordinates[rank - 1] = column;
             }
@@ -763,7 +709,10 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::low::{LowShardId, ShardDefinition};
+    use crate::low::{
+        LowShard, LowShardId, ShardDefinition, ShardView, logical_view_byte_spans,
+        shard_storage_bytes, view_byte_spans,
+    };
     use crate::mid::ShardExtent;
     use crate::mid::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
@@ -838,7 +787,8 @@ mod tests {
                     for offset in (span.offset..span.offset + span.bytes).step_by(2) {
                         decode_row_major(&widths, logical, &mut expected);
                         assert_eq!(
-                            physical_coordinates(&shard, &widths, u64::from(offset / 2)).unwrap(),
+                            physical_coordinates(shard.storage(), &widths, u64::from(offset / 2))
+                                .unwrap(),
                             expected
                         );
                         logical += 1;
@@ -1073,13 +1023,13 @@ mod tests {
                     .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
                 for (source_offset, destination_offset) in source_offsets.zip(destination_offsets) {
                     let source_coordinates = physical_coordinates(
-                        &source,
+                        source.storage(),
                         &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
                         u64::from(source_offset / 2),
                     )
                     .unwrap();
                     let destination_coordinates = physical_coordinates(
-                        &destination,
+                        destination.storage(),
                         &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
                         u64::from(destination_offset / 2),
                     )
@@ -1158,13 +1108,13 @@ mod tests {
                 );
                 for (source_offset, destination_offset) in pairs {
                     let source_coordinates = physical_coordinates(
-                        &source,
+                        source.storage(),
                         &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
                         u64::from(source_offset / 2),
                     )
                     .unwrap();
                     let destination_coordinates = physical_coordinates(
-                        &destination,
+                        destination.storage(),
                         &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
                         u64::from(destination_offset / 2),
                     )

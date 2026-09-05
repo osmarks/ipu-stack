@@ -31,7 +31,9 @@ pub use graph::{
 };
 pub(crate) use kernel::*;
 pub(crate) use low::*;
-pub use low::{LowShard, LowShardId, ShardDefinition, ShardView};
+pub use low::{
+    LowShard, LowShardId, ShardDefinition, ShardView, logical_view_byte_spans, shard_storage_bytes,
+};
 pub(crate) use memory::*;
 pub(crate) use mid::*;
 pub use mid::{
@@ -46,10 +48,7 @@ pub use package::{
 };
 pub(crate) use place::*;
 pub(crate) use storage::*;
-pub use storage::{
-    amp_matrix_coordinates, block_major_matrix_coordinates, logical_view_byte_spans,
-    shard_storage_bytes,
-};
+pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
 pub(crate) use tile::*;
 
 const INCOMING_BASE: u8 = 0xa4;
