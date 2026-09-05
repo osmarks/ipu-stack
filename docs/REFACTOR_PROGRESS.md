@@ -74,11 +74,15 @@ interface's post-host-exchange visibility is not claimed to be fixed.
   passed with checks against each actual buffer. All 142 workspace release tests
   pass (`/tmp/storage-requirements-workspace.log`); hardware recheck follows the
   common graph-builder cleanup.
-- ComputeGraph and RegionBuilder duplicate every operation builder. Define the
-  common inherent API once so adding an operation cannot omit repeat bodies.
-- CopyPlan is still expanded with shard geometry during lowering; retaining
-  complete copy recipes earlier needs the parameter tile rotation decision to
-  move out of low initialization. Avoid just introducing another plan copy.
+- ComputeGraph and RegionBuilder now expand one inherent operation-building
+  API from graph/builder.rs. No trait imports or call-site API changes are needed.
+  142 workspace release tests and Clippy pass for this extraction.
+- Next: record parameter tile rotations on selected MidValue records, moving
+  the balancing choice out of low initialization. Optimize rotation scoring by
+  starting with the existing peak and evaluating only affected tiles; preserve
+  exact old tie-breaking and compare hardware images.
+- CopyPlan is still expanded with shard geometry during lowering. Do not claim
+  full materialization recipes are retained in MidOperation yet.
 
 
 No subagents were used. Work is on `refactor/compiler-views-kernels`.
