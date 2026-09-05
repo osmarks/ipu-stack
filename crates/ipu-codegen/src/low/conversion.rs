@@ -572,39 +572,18 @@ impl LoweringState {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
         for (destination_shard, mut mappings) in grouped {
-            let destination_format = &self.shards[destination_shard.index() as usize]
-                .tensor_type
-                .format;
-            let destination_unaligned = mappings.iter().try_fold(
-                false,
-                |unaligned, (_, destination)| -> LowLoweringResult<bool> {
-                    let spans = logical_view_byte_spans(
-                        &self.shards[destination.shard.index() as usize],
-                        destination,
-                    )?;
-                    Ok(unaligned
-                        || spans
-                            .iter()
-                            .any(|span| span.offset & 0b11 != 0 || span.bytes & 0b11 != 0))
-                },
-            )?;
-            let requires_materialization = logical_order
-                && (mappings.iter().any(|(source, _)| {
-                    self.shards[source.shard.index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .order
-                        != destination_format.layout.order
-                }) || destination_unaligned);
-            let direct_logical = requires_materialization
-                && self.mappings_benefit_from_word_exchange(&mappings, destination_shard)?;
-            let stage_destination = requires_materialization && !direct_logical;
-            if direct_logical && self.shard_has_padding(destination_shard) {
+            let plan = self.copy_plan(&mappings, destination_shard, logical_order)?;
+            if plan.clear_padding {
                 self.append_fill_zero(tiles, destination_shard, provenance)?;
             }
-            let staging = if stage_destination {
-                Some(self.push_conversion_staging(destination_shard)?)
+            let staging = if let Some(staging) = &plan.staging {
+                Some(self.push_shard(LowShard {
+                    id: LowShardId(0),
+                    tile: self.shards[destination_shard.index() as usize].tile,
+                    tensor_type: staging.tensor_type.clone(),
+                    extents: staging.extents.clone(),
+                    definition: ShardDefinition::Staging,
+                })?)
             } else {
                 None
             };
@@ -659,22 +638,16 @@ impl LoweringState {
                     .format
                     .clone();
                 let tile = self.shards[destination_shard.index() as usize].tile;
-                if source_format.precision == crate::Precision::F16
-                    && source_format.layout.order == ElementOrder::RowMajor
-                    && matches!(
-                        destination_format.layout.order,
-                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                    )
+                if let Some(kernel) = plan
+                    .staging
+                    .as_ref()
+                    .and_then(|staging| staging.kernel.as_ref())
                 {
                     after_exchange_kernels.push((
                         tile,
                         KernelRun::new(
                             provenance,
-                            TileKernel::Planned(TileKernelSpec::Rearrange {
-                                from: source_format.layout.clone(),
-                                to: destination_format.layout.clone(),
-                            }),
+                            TileKernel::Planned(kernel.clone()),
                             vec![KernelOperand {
                                 views: vec![staging],
                             }],
@@ -711,37 +684,6 @@ impl LoweringState {
             self.append_kernel(tiles, tile, run)?;
         }
         Ok(())
-    }
-
-    pub(super) fn push_conversion_staging(
-        &mut self,
-        destination: LowShardId,
-    ) -> LowLoweringResult<LowShardId> {
-        let destination = &self.shards[destination.index() as usize];
-        let mut extents = destination.extents.clone();
-        let tile = destination.tile;
-        let shape = destination.tensor_type.shape.clone();
-        let precision = destination.tensor_type.format.precision;
-        for extent in &mut extents {
-            extent.physical_end = extent.logical_end;
-        }
-        self.push_shard(LowShard {
-            id: LowShardId(0),
-            tile,
-            tensor_type: TensorType {
-                shape,
-                format: crate::TensorFormat {
-                    precision,
-                    layout: Layout {
-                        order: ElementOrder::RowMajor,
-                        tiling: TensorTiling::replicated(1),
-                        memory_class: MemoryClass::Ipu21Standard,
-                    },
-                },
-            },
-            extents,
-            definition: ShardDefinition::Staging,
-        })
     }
 
     pub(super) fn logical_view(&self, shard: LowShardId) -> ShardView {
@@ -1037,113 +979,27 @@ impl LoweringState {
         Ok(mappings)
     }
 
-    pub(super) fn mapping_word_exchange_fragments(
-        &self,
-        mappings: &[(ShardView, ShardView)],
-    ) -> LowLoweringResult<Option<u64>> {
-        let maximum_bytes = ipu_exchange::MAX_TRANSFER_WORDS
-            .checked_mul(4)
-            .ok_or(LowLoweringError::IdOverflow)?;
-        let mut fragments = 0u64;
-        for (source, destination) in mappings {
-            let source_spans =
-                logical_view_byte_spans(&self.shards[source.shard.index() as usize], source)?;
-            let destination_spans = logical_view_byte_spans(
-                &self.shards[destination.shard.index() as usize],
-                destination,
-            )?;
-            let aligned = source_spans
-                .iter()
-                .chain(&destination_spans)
-                .all(|span| span.offset & 0b11 == 0 && span.bytes & 0b11 == 0);
-            let source_bytes = source_spans.iter().map(|span| span.bytes).sum::<u32>();
-            let destination_bytes = destination_spans.iter().map(|span| span.bytes).sum::<u32>();
-            if !aligned || source_bytes != destination_bytes {
-                tracing::trace!(
-                    source = ?source,
-                    destination = ?destination,
-                    source_order = ?self.shards[source.shard.index() as usize]
-                        .tensor_type.format.layout.order,
-                    destination_order = ?self.shards[destination.shard.index() as usize]
-                        .tensor_type.format.layout.order,
-                    source_spans = ?source_spans,
-                    destination_spans = ?destination_spans,
-                    aligned,
-                    source_bytes,
-                    destination_bytes,
-                    "deferred logical fragment cannot be exchanged directly"
-                );
-                return Ok(None);
-            }
-            let mut source_index = 0usize;
-            let mut destination_index = 0usize;
-            let mut source_offset = 0u32;
-            let mut destination_offset = 0u32;
-            while source_index < source_spans.len() && destination_index < destination_spans.len() {
-                let source_remaining = source_spans[source_index].bytes - source_offset;
-                let destination_remaining =
-                    destination_spans[destination_index].bytes - destination_offset;
-                let bytes = source_remaining
-                    .min(destination_remaining)
-                    .min(maximum_bytes);
-                if bytes == 0 || bytes & 0b11 != 0 {
-                    return Ok(None);
-                }
-                fragments = fragments.saturating_add(1);
-                source_offset += bytes;
-                destination_offset += bytes;
-                if source_offset == source_spans[source_index].bytes {
-                    source_index += 1;
-                    source_offset = 0;
-                }
-                if destination_offset == destination_spans[destination_index].bytes {
-                    destination_index += 1;
-                    destination_offset = 0;
-                }
-            }
-            if source_index != source_spans.len()
-                || destination_index != destination_spans.len()
-                || source_offset != 0
-                || destination_offset != 0
-            {
-                return Ok(None);
-            }
-        }
-        Ok(Some(fragments))
-    }
-
-    pub(super) fn mappings_benefit_from_word_exchange(
+    fn copy_plan(
         &self,
         mappings: &[(ShardView, ShardView)],
         destination: LowShardId,
-    ) -> LowLoweringResult<bool> {
-        let Some(fragments) = self.mapping_word_exchange_fragments(mappings)? else {
-            return Ok(false);
-        };
+        logical_order: bool,
+    ) -> LowLoweringResult<crate::mid::CopyPlan> {
         let shard = &self.shards[destination.index() as usize];
-        let bytes = u64::from(crate::shard_storage_bytes(shard)?);
-        let elements = bytes.div_ceil(shard.tensor_type.format.precision.bytes().max(1));
-        let packed_cycles = crate::estimate::row_major_pack_cycles(&shard.tensor_type, elements);
-        let clear_cycles = if self.shard_has_padding(destination) {
-            crate::estimate::IPU21_TARGET_COSTS
-                .kernel_launch_cycles
-                .saturating_add(bytes.div_ceil(8 * 6))
-        } else {
-            0
-        };
-        let fragment_cycles = fragments
-            .saturating_mul(crate::estimate::IPU21_LOGICAL_FRAGMENT_CYCLES)
-            .saturating_add(clear_cycles);
-        let direct = fragment_cycles < packed_cycles;
-        tracing::trace!(
-            destination = destination.index(),
-            fragments,
-            fragment_cycles,
-            packed_cycles,
-            direct,
-            "selected logical conversion materialization"
-        );
-        Ok(direct)
+        let mappings = mappings
+            .iter()
+            .map(|(source, destination)| crate::mid::CopyMapping {
+                source: self.shards[source.shard.index() as usize].storage(),
+                source_extents: &source.extents,
+                destination_extents: &destination.extents,
+            })
+            .collect::<Vec<_>>();
+        Ok(crate::mid::CopyPlan::for_destination(
+            &shard.tensor_type,
+            &shard.extents,
+            &mappings,
+            logical_order,
+        )?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1166,7 +1022,9 @@ impl LoweringState {
             columns,
             destination,
         )?;
-        self.mappings_benefit_from_word_exchange(&mappings, destination)
+        Ok(self
+            .copy_plan(&mappings, destination, true)?
+            .direct_word_exchange)
     }
 
     #[allow(clippy::too_many_arguments)]

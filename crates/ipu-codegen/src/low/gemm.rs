@@ -404,7 +404,7 @@ impl LoweringState {
                                             destination: copy,
                                             destination_offset,
                                             bytes: span.bytes,
-                                            pattern: LocalCopyPattern::Contiguous,
+                                            pattern: CopyPattern::Contiguous,
                                         },
                                     ));
                                     destination_offset = destination_offset
@@ -1456,7 +1456,7 @@ impl LoweringState {
                                                 destination: resident,
                                                 destination_offset,
                                                 bytes: span.bytes,
-                                                pattern: LocalCopyPattern::Contiguous,
+                                                pattern: CopyPattern::Contiguous,
                                             },
                                         ));
                                         destination_offset = destination_offset

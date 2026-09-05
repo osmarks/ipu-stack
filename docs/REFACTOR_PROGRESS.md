@@ -29,9 +29,14 @@ interface's post-host-exchange visibility is not claimed to be fixed.
 2. Physical storage-span geometry now accepts borrowed format/extents, independent
    of LowShard; the low-level adapter checks shard identity. Physical and logical
    spans share one index traversal. All 80 codegen tests and its doctest pass.
-   Low conversion still calls the cycle estimator to
-   reconsider direct word exchange versus staging; move this policy to a shared
-   mid-level copy plan, rather than duplicating its heuristic again.
+   Mid CopyPlan now owns per-destination direct-word/staging decisions, staging
+   tensor geometry, and optional transform kernels. CopyOperation<Buffer> owns
+   relative contiguous/strided regions; low binds it to LowShardId. Low no longer
+   imports the estimator in production. CopyPlan is expanded with concrete shard
+   extents during lowering, not yet retained in the selected MidOperation.
+   A shared span zipper replaces duplicate copy/count walkers. 142 workspace
+   release tests and Clippy pass. Five `/tmp/mid-copy-*` hardware workloads pass;
+   tile images remain identical to `/tmp/views-kernels-*`.
 3. Extend views beyond the axis-factor primitive as useful. Graph SplitHeads is
    still semantic syntax; attention candidate layouts and cost paths remain
    specialized. Do not mistake renaming those paths for generalization.

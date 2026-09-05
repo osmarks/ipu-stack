@@ -8,6 +8,8 @@
 //! layout rearrangements at format boundaries.
 
 mod candidates;
+mod copy;
+pub use copy::*;
 mod catalogue;
 mod layout;
 mod operator;

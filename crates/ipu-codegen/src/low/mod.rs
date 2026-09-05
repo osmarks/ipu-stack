@@ -13,8 +13,8 @@ mod gemm;
 use crate::graph::{GraphInputKind, OperationId};
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
-    ConversionStrategy, ElementOrder, GemmDistribution, Layout, LayoutError, MemoryClass,
-    MemoryOperand, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
+    ConversionStrategy, CopyPattern, ElementOrder, GemmDistribution, Layout, LayoutError,
+    MemoryClass, MemoryOperand, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
     OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing, PipelineConfig,
     PointwiseInputMapping, Precision, ShardExtent, TensorTiling, TensorType, TileKernelSpec,
 };
@@ -213,27 +213,7 @@ impl std::ops::Deref for KernelRun {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LocalCopy {
-    pub source: LowShardId,
-    pub source_offset: u32,
-    pub destination: LowShardId,
-    pub destination_offset: u32,
-    pub bytes: u32,
-    pub pattern: LocalCopyPattern,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LocalCopyPattern {
-    #[default]
-    Contiguous,
-    Strided {
-        rows: u32,
-        row_bytes: u32,
-        source_stride: u32,
-        destination_stride: u32,
-    },
-}
+pub type LocalCopy = crate::mid::CopyOperation<LowShardId>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatCarried {
