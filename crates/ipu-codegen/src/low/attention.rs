@@ -379,7 +379,7 @@ impl LoweringState {
         key_block_rows: u32,
         padded_query_dimension: u32,
         padded_value_dimension: u32,
-        requirements: &OperatorRequirements,
+        requirements: &StorageRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
@@ -531,7 +531,7 @@ impl LoweringState {
                             },
                         ],
                         score_view.clone(),
-                        KernelRequirements::Operator(requirements.clone()),
+                        requirements.clone(),
                     ),
                 )?;
                 self.append_kernel(
@@ -548,7 +548,7 @@ impl LoweringState {
                             views: vec![score_view],
                         }],
                         self.full_view(task.weights),
-                        KernelRequirements::Operator(requirements.clone()),
+                        requirements.clone(),
                     ),
                 )?;
                 let probability_view = self.narrow_view(task.weights, &[(1, 0, key_block_rows)])?;
@@ -569,7 +569,7 @@ impl LoweringState {
                             },
                         ],
                         block_value_view.clone(),
-                        KernelRequirements::Operator(requirements.clone()),
+                        requirements.clone(),
                     ),
                 )?;
                 self.append_kernel(
@@ -593,7 +593,7 @@ impl LoweringState {
                             },
                         ],
                         self.full_view(task.output),
-                        KernelRequirements::Operator(requirements.clone()),
+                        requirements.clone(),
                     ),
                 )?;
             }
@@ -679,7 +679,7 @@ impl LoweringState {
         padded_key_rows: u32,
         padded_query_dimension: u32,
         padded_value_dimension: u32,
-        requirements: &OperatorRequirements,
+        requirements: &StorageRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
@@ -775,7 +775,7 @@ impl LoweringState {
                         },
                     ],
                     scores.clone(),
-                    KernelRequirements::Operator(requirements.clone()),
+                    requirements.clone(),
                 ),
             )?;
             self.append_kernel(
@@ -792,7 +792,7 @@ impl LoweringState {
                         views: vec![scores],
                     }],
                     self.full_view(task.weights),
-                    KernelRequirements::Operator(requirements.clone()),
+                    requirements.clone(),
                 ),
             )?;
         }
@@ -822,7 +822,7 @@ impl LoweringState {
                         },
                     ],
                     block_value.clone(),
-                    KernelRequirements::Operator(requirements.clone()),
+                    requirements.clone(),
                 ),
             )?;
             self.append_kernel(
@@ -846,7 +846,7 @@ impl LoweringState {
                         },
                     ],
                     self.full_view(task.output),
-                    KernelRequirements::Operator(requirements.clone()),
+                    requirements.clone(),
                 ),
             )?;
         }
@@ -1035,8 +1035,9 @@ impl LoweringState {
                     views: vec![self.full_view(source)],
                 }],
                 self.full_view(destination),
-                KernelRequirements::Conversion {
-                    input: OperandRequirement::new(input, 2),
+                StorageRequirements {
+                    inputs: vec![OperandRequirement::new(input, 2)],
+                    output_aliasing: OutputAliasing::Fresh,
                     output: OperandRequirement::new(output, 2),
                     distinct_elements: Vec::new(),
                 },

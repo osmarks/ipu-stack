@@ -1406,7 +1406,7 @@ impl CostModel for Ipu21CostModel {
 mod tests {
     use super::*;
     use crate::{
-        OperandRequirement, OperatorRequirements, OutputAliasing, PointwiseInputMapping,
+        OperandRequirement, OutputAliasing, PointwiseInputMapping, StorageRequirements,
         TensorFormat, TileKernelSpec,
     };
 
@@ -1419,8 +1419,8 @@ mod tests {
         }
     }
 
-    fn pointwise_requirements(format: TensorFormat) -> OperatorRequirements {
-        OperatorRequirements {
+    fn pointwise_requirements(format: TensorFormat) -> StorageRequirements {
+        StorageRequirements {
             inputs: vec![OperandRequirement::new(format.clone(), 8)],
             output: OperandRequirement::new(format, 8),
             output_aliasing: OutputAliasing::Fresh,

@@ -225,3 +225,9 @@ configurations and more than two block sizes in one package without mapping
 intermediate sizes to a "large" specialization. Full-block C++ softmax retains
 its query-row specialization; assembly tail softmax shares workers across both
 query and logical key sizes.
+
+Operator plans and kernel calls share `StorageRequirements`. Low binds call
+formats to the actual operand buffers, truncates unused enclosing-operator
+operands, and retains access alignment/tail and applicable separation constraints
+before interning metadata. Backend validation no longer distinguishes a conversion
+from another kernel by a wrapper tag.

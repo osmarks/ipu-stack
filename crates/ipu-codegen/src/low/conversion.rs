@@ -329,8 +329,9 @@ impl LoweringState {
                         views: vec![self.full_view(source_shard)],
                     }],
                     self.full_view(staging),
-                    KernelRequirements::Conversion {
-                        input: OperandRequirement::new(source.tensor_type.format, 4),
+                    StorageRequirements {
+                        inputs: vec![OperandRequirement::new(source.tensor_type.format, 4)],
+                        output_aliasing: OutputAliasing::Fresh,
                         output: OperandRequirement::new(
                             self.shards[staging.index() as usize]
                                 .tensor_type
@@ -483,8 +484,9 @@ impl LoweringState {
                         views: vec![self.full_view(input)],
                     }],
                     self.full_view(output),
-                    KernelRequirements::Conversion {
-                        input: plan.input.clone(),
+                    StorageRequirements {
+                        inputs: vec![plan.input.clone()],
+                        output_aliasing: OutputAliasing::Fresh,
                         output: plan.output.clone(),
                         distinct_elements: Vec::new(),
                     },
@@ -641,8 +643,9 @@ impl LoweringState {
                                 views: vec![staging],
                             }],
                             self.full_view(destination_shard),
-                            KernelRequirements::Conversion {
-                                input: OperandRequirement::new(source_format, 2),
+                            StorageRequirements {
+                                inputs: vec![OperandRequirement::new(source_format, 2)],
+                                output_aliasing: OutputAliasing::Fresh,
                                 output: OperandRequirement::new(destination_format, 2),
                                 distinct_elements: vec![vec![
                                     MemoryOperand::Input(0),

@@ -1,8 +1,6 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
-use crate::low::{
-    KernelRequirements, LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef,
-};
+use crate::low::{LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::mid::{MemoryClass, MemoryOperand, OperandRequirement};
 use crate::{StorageError, shard_storage_bytes};
@@ -391,18 +389,9 @@ fn collect_requirements(
     for work in program.work(tile) {
         match work {
             TileWorkRef::Kernel(run) => {
-                let (inputs, output, distinct_elements) = match &run.requirements {
-                    KernelRequirements::Operator(operator_requirements) => (
-                        &operator_requirements.inputs[..],
-                        &operator_requirements.output,
-                        &operator_requirements.distinct_elements,
-                    ),
-                    KernelRequirements::Conversion {
-                        input,
-                        output,
-                        distinct_elements,
-                    } => (std::slice::from_ref(input), output, distinct_elements),
-                };
+                let inputs = &run.requirements.inputs;
+                let output = &run.requirements.output;
+                let distinct_elements = &run.requirements.distinct_elements;
                 for operands in distinct_elements {
                     for operand in operands {
                         match operand {
@@ -906,7 +895,8 @@ mod tests {
                             &BTreeMap::new(),
                         )
                         .unwrap();
-                        if let KernelRequirements::Operator(requirements) = &run.requirements {
+                        {
+                            let requirements = &run.requirements;
                             for operands in &requirements.distinct_elements {
                                 let mut ranges = Vec::new();
                                 for operand in operands {

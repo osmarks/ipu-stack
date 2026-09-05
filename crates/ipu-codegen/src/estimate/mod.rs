@@ -10,7 +10,7 @@ use crate::graph::TensorShape;
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, GemmDistribution, Layout, MemoryClass,
     MemoryOperand, MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization,
-    OperatorDispatch, OperatorRequirements, Precision, TensorAxis, TensorType,
+    OperatorDispatch, Precision, StorageRequirements, TensorAxis, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 

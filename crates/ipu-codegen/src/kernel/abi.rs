@@ -137,10 +137,7 @@ pub(super) fn element_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
 }
 
 pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
-    let precision = match &run.requirements {
-        KernelRequirements::Operator(requirements) => requirements.output.format.precision,
-        KernelRequirements::Conversion { output, .. } => output.format.precision,
-    };
+    let precision = run.requirements.output.format.precision;
     element_count(run)?
         .checked_mul(
             u32::try_from(precision.bytes()).map_err(|_| KernelAbiError::ElementCountOverflow)?,
@@ -150,12 +147,9 @@ pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> 
 
 pub fn tile_kernel_abi(
     kernel: &TileKernelSpec,
-    requirements: &KernelRequirements,
+    requirements: &StorageRequirements,
 ) -> Result<KernelAbi, KernelAbiError> {
-    let precision = match requirements {
-        KernelRequirements::Operator(requirements) => requirements.output.format.precision,
-        KernelRequirements::Conversion { output, .. } => output.format.precision,
-    };
+    let precision = requirements.output.format.precision;
     let (symbols, availability, inputs, scalars): (_, _, usize, &'static [ScalarValue]) =
         match kernel {
             TileKernelSpec::FillZero => (
@@ -170,7 +164,7 @@ pub fn tile_kernel_abi(
                 weights,
                 ..
             } => {
-                if !matches!(requirements, KernelRequirements::Operator(_)) {
+                if requirements.inputs.len() != 2 {
                     return Err(KernelAbiError::RequirementMismatch);
                 }
                 if *weights == GemmWeightLoad::Interleaved && *multiply != Precision::F16 {
@@ -221,9 +215,11 @@ pub fn tile_kernel_abi(
             ),
             TileKernelSpec::FlashAttention { .. } => (
                 KernelSymbols::AttentionSpecialized,
-                if matches!(requirements, KernelRequirements::Operator(requirements)
                 if requirements.output.format.precision == Precision::F32
-                    && requirements.inputs.iter().all(|input| input.format.precision == Precision::F16))
+                    && requirements
+                        .inputs
+                        .iter()
+                        .all(|input| input.format.precision == Precision::F16)
                 {
                     KernelAvailability::Implemented
                 } else {
@@ -370,10 +366,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     Ok(abi)
 }
 
-pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static str> {
-    let KernelRequirements::Operator(requirements) = requirements else {
-        return None;
-    };
+pub(super) fn gelu_symbol(requirements: &StorageRequirements) -> Option<&'static str> {
     let [input] = requirements.inputs.as_slice() else {
         return None;
     };

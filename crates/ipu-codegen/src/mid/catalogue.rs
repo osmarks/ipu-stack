@@ -31,7 +31,7 @@ impl OperatorCandidate {
             plan: OperatorPlan {
                 operator,
                 dispatch: default_dispatch(operator),
-                requirements: OperatorRequirements {
+                requirements: StorageRequirements {
                     inputs: inputs.into_iter().collect(),
                     output,
                     output_aliasing: OutputAliasing::Fresh,

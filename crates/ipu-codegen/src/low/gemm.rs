@@ -195,7 +195,7 @@ impl LoweringState {
         output_column_block: u32,
         orientation: crate::GemmOrientation,
         distribution: GemmDistribution,
-        requirements: &OperatorRequirements,
+        requirements: &StorageRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         if let GemmDistribution::ParallelReduction {
@@ -471,7 +471,7 @@ impl LoweringState {
                                     },
                                 ],
                                 output_view,
-                                KernelRequirements::Operator(requirements.clone()),
+                                requirements.clone(),
                             ),
                         ));
                     }
@@ -516,7 +516,7 @@ impl LoweringState {
         result_row_partitions: u16,
         result_column_partitions: u16,
         reduction_staging: crate::ReductionStaging,
-        requirements: &OperatorRequirements,
+        requirements: &StorageRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
@@ -966,7 +966,7 @@ impl LoweringState {
                                             },
                                         ],
                                         partial.clone(),
-                                        KernelRequirements::Operator(kernel_requirements.clone()),
+                                        kernel_requirements.clone(),
                                     ),
                                 ));
                             }
@@ -1035,7 +1035,7 @@ impl LoweringState {
                                 },
                             ],
                             partial.clone(),
-                            KernelRequirements::Operator(kernel_requirements.clone()),
+                            kernel_requirements.clone(),
                         );
                         gemm_runs.push((left_shard.tile, run));
                     }
@@ -1217,7 +1217,7 @@ impl LoweringState {
                                     },
                                 ],
                                 self.full_view(stage_result),
-                                KernelRequirements::Operator(requirements.clone()),
+                                requirements.clone(),
                             ),
                         ));
                     }
@@ -1281,7 +1281,7 @@ impl LoweringState {
         accumulate: TileKernelSpec,
         inner_block: u32,
         output_column_block: u32,
-        requirements: &OperatorRequirements,
+        requirements: &StorageRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [left_value, right_value] = operation.inputs.as_slice() else {
@@ -1506,7 +1506,7 @@ impl LoweringState {
                                     },
                                 ],
                                 output_view,
-                                KernelRequirements::Operator(requirements.clone()),
+                                requirements.clone(),
                             ),
                         ));
                     }

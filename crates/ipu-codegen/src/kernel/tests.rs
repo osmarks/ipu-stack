@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     AccumulationPrecision, ComputeGraph, Ipu21CostModel, Layout, MemoryClass, OperandRequirement,
-    OperatorRequirements, OutputAliasing, PipelineConfig, ShardExtent, ShardView, TensorFormat,
+    OutputAliasing, PipelineConfig, ShardExtent, ShardView, StorageRequirements, TensorFormat,
     TensorTiling, WorkProvenance, WorkReason, lower, lower_to_tiles,
 };
 
@@ -55,12 +55,12 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                     })
                     .collect(),
             },
-            KernelRequirements::Operator(OperatorRequirements {
+            StorageRequirements {
                 inputs: Vec::new(),
                 output: OperandRequirement::new(format, 8),
                 output_aliasing: OutputAliasing::Fresh,
                 distinct_elements: Vec::new(),
-            }),
+            },
         );
         let expected = outer
             * if transposed {
@@ -100,12 +100,12 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
             },
         };
         let operand = OperandRequirement::new(format, 8);
-        let requirements = KernelRequirements::Operator(OperatorRequirements {
+        let requirements = StorageRequirements {
             inputs: vec![operand.clone(), operand.clone()],
             output: operand,
             output_aliasing: OutputAliasing::Fresh,
             distinct_elements: Vec::new(),
-        });
+        };
         let abi = tile_kernel_abi(
             &TileKernelSpec::Gemm {
                 multiply: precision,
@@ -230,12 +230,12 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
                 8,
             )
         };
-        let requirements = KernelRequirements::Operator(OperatorRequirements {
+        let requirements = StorageRequirements {
             inputs: vec![requirement(input_layout)],
             output: requirement(output_layout),
             output_aliasing: OutputAliasing::Fresh,
             distinct_elements: Vec::new(),
-        });
+        };
         let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
         assert_eq!(abi.availability, KernelAvailability::Implemented);
         assert_eq!(abi.inputs, 1);
@@ -338,12 +338,12 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 })
                 .collect(),
             output,
-            KernelRequirements::Operator(OperatorRequirements {
+            StorageRequirements {
                 inputs: vec![OperandRequirement::new(format.clone(), 8); inputs],
                 output: OperandRequirement::new(format, 8),
                 output_aliasing: OutputAliasing::Fresh,
                 distinct_elements: Vec::new(),
-            }),
+            },
         );
         let call = plan.call(&run).unwrap();
         assert_eq!(call.arguments, expected);

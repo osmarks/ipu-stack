@@ -61,10 +61,7 @@ pub(super) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, K
 
 pub(super) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let rank = run.output.extents.len();
-    let output_order = match &run.requirements {
-        KernelRequirements::Operator(requirements) => &requirements.output.format.layout.order,
-        KernelRequirements::Conversion { .. } => return Err(KernelAbiError::RequirementMismatch),
-    };
+    let output_order = &run.requirements.output.format.layout.order;
     let matrix_column_axis = rank
         .checked_sub(
             if matches!(

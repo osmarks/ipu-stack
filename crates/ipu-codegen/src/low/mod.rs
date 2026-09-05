@@ -15,8 +15,8 @@ use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
     ConversionStrategy, CopyPattern, ElementOrder, GemmDistribution, Layout, LayoutError,
     MemoryClass, MemoryOperand, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperandRequirement, OperatorDispatch, OperatorRequirements, OutputAliasing, PipelineConfig,
-    PointwiseInputMapping, Precision, ShardExtent, TensorTiling, TensorType, TileKernelSpec,
+    OperandRequirement, OperatorDispatch, OutputAliasing, PipelineConfig, PointwiseInputMapping,
+    Precision, ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError};
 use conversion::*;
@@ -151,16 +151,6 @@ pub struct WorkProvenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KernelRequirements {
-    Operator(OperatorRequirements),
-    Conversion {
-        input: OperandRequirement,
-        output: OperandRequirement,
-        distinct_elements: Vec<Vec<MemoryOperand>>,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelOperand {
     /// Views resident on the execution tile which form this ABI operand.
     pub views: Vec<ShardView>,
@@ -170,7 +160,7 @@ pub struct KernelOperand {
 pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
     pub kernel: TileKernelSpec,
-    pub requirements: KernelRequirements,
+    pub requirements: StorageRequirements,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,7 +176,7 @@ impl KernelRun {
         kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
         output: ShardView,
-        requirements: KernelRequirements,
+        requirements: StorageRequirements,
     ) -> Self {
         Self {
             metadata: Arc::new(KernelRunMetadata {
@@ -864,12 +854,12 @@ impl LoweringState {
                 TileKernelSpec::FillZero,
                 Vec::new(),
                 self.full_view(shard),
-                KernelRequirements::Operator(OperatorRequirements {
+                StorageRequirements {
                     inputs: Vec::new(),
                     output,
                     output_aliasing: crate::OutputAliasing::Fresh,
                     distinct_elements: Vec::new(),
-                }),
+                },
             ),
         )
     }
@@ -879,7 +869,7 @@ impl LoweringState {
         operation: &MidOperation,
         kernel: TileKernelSpec,
         input_mapping: PointwiseInputMapping,
-        requirements: &OperatorRequirements,
+        requirements: &StorageRequirements,
         tiles: &mut [TileWorkList],
     ) -> LowLoweringResult<()> {
         let [result] = operation.results.as_slice() else {
@@ -973,7 +963,7 @@ impl LoweringState {
                             shard: output,
                             extents: output_extents,
                         },
-                        KernelRequirements::Operator(requirements.clone()),
+                        requirements.clone(),
                     ),
                 ));
             }
@@ -1254,17 +1244,39 @@ impl LoweringState {
         &mut self,
         tiles: &mut [TileWorkList],
         tile: u16,
-        run: KernelRun,
+        mut run: KernelRun,
     ) -> LowLoweringResult<()> {
-        let output_flattens_outer_rows = self
-            .shards
-            .get(run.output.shard.index() as usize)
-            .is_some_and(|shard| {
-                matches!(
-                    shard.tensor_type.format.layout.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-                )
+        // Dispatch constraints describe a whole operator. Bind their access
+        // requirements to this call's actual buffers before interning metadata.
+        let requirements = &mut Arc::make_mut(&mut run.metadata).requirements;
+        if run.inputs.len() > requirements.inputs.len() {
+            return Err(LowLoweringError::InvalidOperatorPlan);
+        }
+        requirements.inputs.truncate(run.inputs.len());
+        for (operand, requirement) in run.inputs.iter().zip(&mut requirements.inputs) {
+            let view = operand
+                .views
+                .first()
+                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            requirement.format = self.shards[view.shard.index() as usize]
+                .tensor_type
+                .format
+                .clone();
+        }
+        requirements.output.format = self.shards[run.output.shard.index() as usize]
+            .tensor_type
+            .format
+            .clone();
+        for group in &mut requirements.distinct_elements {
+            group.retain(|operand| match operand {
+                MemoryOperand::Output => true,
+                MemoryOperand::Input(index) => usize::from(*index) < run.inputs.len(),
             });
+        }
+        let output_flattens_outer_rows = matches!(
+            requirements.output.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
+        );
         if matches!(run.kernel, TileKernelSpec::Gemm { .. })
             && run.output.extents.len() > 2
             && !output_flattens_outer_rows

@@ -230,7 +230,7 @@ fn maximum_standard_allocation(
 
 pub(crate) fn operator_memory_estimate(
     dispatch: &OperatorDispatch,
-    requirements: &OperatorRequirements,
+    requirements: &StorageRequirements,
     inputs: &[TensorType],
     output: &TensorType,
 ) -> MemoryEstimate {

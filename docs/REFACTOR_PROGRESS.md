@@ -65,9 +65,15 @@ interface's post-host-exchange visibility is not claimed to be fixed.
   and selection are shared between cached/uncached gathering and conversions.
   142 workspace release tests and strict Clippy pass for this chunk. This removes
   83 Rust lines without adding tests; existing numerical paths are unchanged.
-- KernelRequirements still duplicates OperatorRequirements for conversions.
-  Unify their storage constraints, retaining fresh-output aliasing for conversions
-  and checking actual operand constraints rather than a semantic origin tag.
+- Operator and conversion kernels now share StorageRequirements. Low binds its
+  formats/arity to actual kernel buffers before metadata interning, preserving
+  access requirements and applicable separation constraints. The prior attention
+  metadata incorrectly carried the enclosing operator's three input formats into
+  one/two-input kernels. Existing randomized deferred-view coverage failed under
+  the new arity check before the fix (`/tmp/operand-constraints-before.log`), then
+  passed with checks against each actual buffer. All 142 workspace release tests
+  pass (`/tmp/storage-requirements-workspace.log`); hardware recheck follows the
+  common graph-builder cleanup.
 - ComputeGraph and RegionBuilder duplicate every operation builder. Define the
   common inherent API once so adding an operation cannot omit repeat bodies.
 - CopyPlan is still expanded with shard geometry during lowering; retaining

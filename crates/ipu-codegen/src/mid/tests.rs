@@ -294,7 +294,7 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
             accumulate: AccumulationPrecision::F32,
         };
         let dispatch = default_dispatch(operator);
-        let requirements = OperatorRequirements {
+        let requirements = StorageRequirements {
             inputs: Vec::new(),
             output: OperandRequirement::new(output.format.clone(), 8),
             output_aliasing: OutputAliasing::Fresh,
@@ -1234,6 +1234,23 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         });
         crate::KernelBuildPlan::from_program(&tiled)
             .unwrap_or_else(|error| panic!("random case {case}: {error}"));
+        for run in &tiled.kernel_runs {
+            assert_eq!(run.inputs.len(), run.requirements.inputs.len());
+            for (operand, requirement) in run.inputs.iter().zip(&run.requirements.inputs) {
+                assert_eq!(
+                    requirement.format,
+                    tiled.shards[operand.views[0].shard.index() as usize]
+                        .tensor_type
+                        .format
+                );
+            }
+            assert_eq!(
+                run.requirements.output.format,
+                tiled.shards[run.output.shard.index() as usize]
+                    .tensor_type
+                    .format
+            );
+        }
         let attention_phases = tiled
             .exchange_phases
             .iter()

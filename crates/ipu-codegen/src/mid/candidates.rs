@@ -146,7 +146,7 @@ pub(super) fn plans(
             let plan = OperatorPlan {
                 operator: MidOperator::View(view),
                 dispatch: OperatorDispatch::View,
-                requirements: OperatorRequirements {
+                requirements: StorageRequirements {
                     inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
                     output: OperandRequirement::new(
                         TensorFormat {
@@ -194,7 +194,7 @@ pub(super) fn plans(
         plans.push(OperatorPlan {
             operator: MidOperator::View(view),
             dispatch: OperatorDispatch::View,
-            requirements: OperatorRequirements {
+            requirements: StorageRequirements {
                 inputs: vec![OperandRequirement::new(source, 8)],
                 output: OperandRequirement::new(
                     TensorFormat {
@@ -278,7 +278,7 @@ pub(super) fn plans(
                     padded_query_dimension,
                     padded_value_dimension,
                 },
-                requirements: OperatorRequirements {
+                requirements: StorageRequirements {
                     inputs: vec![
                         OperandRequirement::new(query_format.clone(), 8)
                             .with_materialization(OperandMaterialization::DispatchSlices),
@@ -320,7 +320,7 @@ pub(super) fn plans(
                     padded_query_dimension,
                     padded_value_dimension,
                 },
-                requirements: OperatorRequirements {
+                requirements: StorageRequirements {
                     inputs: vec![
                         OperandRequirement::new(query_format, 8)
                             .with_materialization(OperandMaterialization::DispatchSlices),
@@ -454,7 +454,7 @@ pub(super) fn plans(
                 let plan = OperatorPlan {
                     operator: candidate.operator,
                     dispatch: candidate.dispatch.clone(),
-                    requirements: OperatorRequirements {
+                    requirements: StorageRequirements {
                         inputs: vec![OperandRequirement::new(format.clone(), 8)],
                         output: OperandRequirement::new(format, 8),
                         output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),

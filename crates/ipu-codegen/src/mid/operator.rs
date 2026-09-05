@@ -406,8 +406,10 @@ pub(super) fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -
     }
 }
 
+/// Operand storage and access constraints, shared by operator plans and
+/// concrete kernel calls. A call binds formats to its actual operand buffers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OperatorRequirements {
+pub struct StorageRequirements {
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
@@ -418,7 +420,7 @@ pub struct OperatorRequirements {
 pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
-    pub requirements: OperatorRequirements,
+    pub requirements: StorageRequirements,
     /// A view transformation offered by this plan. It is materialized normally
     /// unless a later plan records a matching entry in `deferred_inputs`.
     pub deferred_output: Option<DeferredOutputPlan>,
