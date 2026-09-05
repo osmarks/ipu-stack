@@ -1,9 +1,24 @@
 //! Build executable mid blocks from an implementation candidate.
 
+mod emit;
+
+mod attention_blocked;
+mod attention_materialized;
+mod attention_panels;
+mod deferred;
+mod views;
+
 mod attention;
+mod buffers;
 mod conversion;
 mod copies;
 mod gemm;
+mod gemm_parallel;
+mod gemm_streamed;
+mod mapping;
+mod pointwise;
+mod reduce;
+mod repeat;
 use super::block::*;
 use crate::graph::OperationId;
 use crate::mid::{
@@ -15,10 +30,12 @@ use crate::mid::{
     TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError};
-use conversion::*;
+use attention::*;
 use copies::*;
 pub use copies::{logical_view_byte_spans, shard_storage_bytes, view_byte_spans};
+use deferred::*;
 use gemm::*;
+use mapping::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
@@ -56,8 +73,8 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
     if graph.tile_count == 0 {
         return Err(BlockBuildError::EmptyTileGroup);
     }
-    let mut state = LoweringState::new(graph)?;
-    let body = state.lower_region(&graph.operations, true)?;
+    let mut state = BlockBuilder::new(graph)?;
+    let body = state.build_region(&graph.operations, true)?;
     let inputs = graph
         .inputs
         .iter()
@@ -96,7 +113,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
         exchange_phases = state.phases.len(),
         "built logical tile schedule"
     );
-    Ok(Arc::new(MidProgram {
+    let mut program = MidProgram {
         tile_count: graph.tile_count,
         shards: state.shards,
         exchange_phases: state.phases,
@@ -125,12 +142,14 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
             .collect(),
         estimated_cycles: graph.estimated_cycles,
         estimated_exchange_cycles: graph.estimated_exchange_cycles,
-    }))
+    };
+    super::passes::simplify(&mut program);
+    Ok(Arc::new(program))
 }
 
 type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<BlockValueId>)>;
 
-struct LoweringState {
+struct BlockBuilder {
     tile_count: u16,
     shards: Vec<BlockValue>,
     canonical: Vec<Vec<BlockValueId>>,
@@ -143,19 +162,7 @@ struct LoweringState {
     intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
-impl LoweringState {
-    fn storage_root(&self, mut shard: BlockValueId) -> BlockValueId {
-        let mut remaining = self.shards.len().saturating_add(1);
-        while remaining != 0 {
-            remaining -= 1;
-            shard = match self.shards[shard.index() as usize].definition {
-                ShardDefinition::Alias(source) | ShardDefinition::WritableAlias(source) => source,
-                _ => return shard,
-            };
-        }
-        shard
-    }
-
+impl BlockBuilder {
     fn new(graph: &ImplementationCandidate) -> BlockBuildResult<Self> {
         let tile_count = graph.tile_count;
         let mut state = Self {
@@ -189,69 +196,6 @@ impl LoweringState {
             state.canonical[value.id.index() as usize] = value_shards;
         }
         Ok(state)
-    }
-
-    fn push_shard(&mut self, mut shard: BlockValue) -> BlockBuildResult<BlockValueId> {
-        let id = BlockValueId(
-            u32::try_from(self.shards.len()).map_err(|_| BlockBuildError::IdOverflow)?,
-        );
-        shard.id = id;
-        self.shards.push(shard);
-        Ok(id)
-    }
-
-    fn interleaved_capacity_available(
-        &self,
-        tile: u16,
-        bytes: u32,
-        access_tail: u32,
-    ) -> BlockBuildResult<bool> {
-        let used = self
-            .shards
-            .iter()
-            .filter(|shard| {
-                shard.tile == tile
-                    && shard.tensor_type.format.layout.memory_class
-                        == crate::MemoryClass::Ipu21Interleaved
-                    && !matches!(
-                        shard.definition,
-                        ShardDefinition::Alias(_)
-                            | ShardDefinition::WritableAlias(_)
-                            | ShardDefinition::ExchangeStaging
-                    )
-            })
-            .try_fold(0u32, |total, shard| {
-                total
-                    .checked_add(crate::shard_storage_bytes(shard)?)
-                    .and_then(|total| total.checked_add(access_tail))
-                    .ok_or(BlockBuildError::IdOverflow)
-            })?;
-        Ok(used
-            .checked_add(bytes)
-            .and_then(|total| total.checked_add(access_tail))
-            .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_REGION_BYTES))
-    }
-
-    fn value_shards(&self, value: MidValueId) -> BlockBuildResult<&[BlockValueId]> {
-        self.canonical
-            .get(value.index() as usize)
-            .filter(|shards| !shards.is_empty())
-            .map(Vec::as_slice)
-            .ok_or(BlockBuildError::UnknownValue(value))
-    }
-
-    fn local_shard(&self, value: MidValueId, tile: u16) -> BlockBuildResult<BlockValueId> {
-        let shards = self.value_shards(value)?;
-        if let Some(&shard) = shards.get(usize::from(tile))
-            && self.shards[shard.index() as usize].tile == tile
-        {
-            return Ok(shard);
-        }
-        shards
-            .iter()
-            .copied()
-            .find(|shard| self.shards[shard.index() as usize].tile == tile)
-            .ok_or(BlockBuildError::UnknownValue(value))
     }
 
     fn intersecting_shards(
@@ -311,7 +255,7 @@ impl LoweringState {
         self.select_intersections(&self.shard_intersection_groups(sources, target), local_tile)
     }
 
-    fn lower_region(
+    fn build_region(
         &mut self,
         operations: &[MidOperation],
         checkpoints: bool,
@@ -320,7 +264,7 @@ impl LoweringState {
         let mut checkpoint = 0u8;
         for (index, operation) in operations.iter().enumerate() {
             let started = Instant::now();
-            if self.lower_deferred_output(operation, &mut tiles)? {
+            if self.build_deferred_output(operation, &mut tiles)? {
                 tracing::info!(
                     operation = index,
                     source = ?operation.source.map(OperationId::index),
@@ -331,13 +275,13 @@ impl LoweringState {
             }
             let lowered = match &operation.kind {
                 MidOperationKind::Repeat(repeat) => {
-                    self.lower_repeat(operation, repeat, &mut tiles)
+                    self.build_repeat(operation, repeat, &mut tiles)
                 }
                 MidOperationKind::Operator { plan, .. } => {
-                    self.lower_operator(operation, plan, &mut tiles)
+                    self.build_operator(operation, plan, &mut tiles)
                 }
                 MidOperationKind::Convert(plan) => {
-                    self.lower_conversion(operation, plan, &mut tiles)
+                    self.build_conversion(operation, plan, &mut tiles)
                 }
             };
             if let Err(error) = lowered {
@@ -376,7 +320,7 @@ impl LoweringState {
         Ok(tiles)
     }
 
-    fn lower_operator(
+    fn build_operator(
         &mut self,
         operation: &MidOperation,
         plan: &crate::OperatorPlan,
@@ -386,7 +330,7 @@ impl LoweringState {
             OperatorDispatch::Pointwise {
                 kernel,
                 input_mapping,
-            } => self.lower_pointwise(
+            } => self.build_pointwise(
                 operation,
                 kernel.clone(),
                 *input_mapping,
@@ -415,7 +359,7 @@ impl LoweringState {
                     inner_block: *inner_block,
                     output_columns: *output_column_block,
                 };
-                self.lower_blocked_gemm(
+                self.build_blocked_gemm(
                     operation,
                     kernel(crate::GemmKernelMode::Initialize),
                     kernel(crate::GemmKernelMode::Accumulate),
@@ -434,7 +378,7 @@ impl LoweringState {
                 key_block_rows,
                 padded_query_dimension,
                 padded_value_dimension,
-            } => self.lower_blocked_attention(
+            } => self.build_blocked_attention(
                 operation,
                 query_key.clone(),
                 probability_value.clone(),
@@ -452,7 +396,7 @@ impl LoweringState {
                 padded_key_rows,
                 padded_query_dimension,
                 padded_value_dimension,
-            } => self.lower_materialized_attention(
+            } => self.build_materialized_attention(
                 operation,
                 query_key.clone(),
                 probability_value.clone(),
@@ -463,7 +407,7 @@ impl LoweringState {
                 &plan.requirements,
                 tiles,
             ),
-            OperatorDispatch::View => self.lower_view(operation, &plan.operator, tiles),
+            OperatorDispatch::View => self.build_view(operation, &plan.operator, tiles),
         }
     }
 
@@ -499,175 +443,6 @@ impl LoweringState {
                 },
             ),
         )
-    }
-
-    fn lower_pointwise(
-        &mut self,
-        operation: &MidOperation,
-        kernel: TileKernelSpec,
-        input_mapping: PointwiseInputMapping,
-        requirements: &StorageRequirements,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
-        };
-        let outputs = self.value_shards(*result)?.to_vec();
-        let mut wave_transfers = Vec::<BTreeMap<ShardView, Vec<ShardView>>>::new();
-        let mut wave_runs = Vec::<Vec<(u16, KernelRun)>>::new();
-        for output in outputs {
-            if self.shards[output.index() as usize]
-                .extents
-                .iter()
-                .any(|extent| extent.start == extent.physical_end)
-            {
-                continue;
-            }
-            let tile = self.shards[output.index() as usize].tile;
-            let sources = operation
-                .inputs
-                .iter()
-                .map(|input| {
-                    Ok(match input_mapping {
-                        PointwiseInputMapping::BroadcastToOutput => self
-                            .value_shards(*input)?
-                            .iter()
-                            .find_map(|source| self.broadcast_view(*source, output))
-                            .ok_or(BlockBuildError::InvalidOperatorPlan)?,
-                        PointwiseInputMapping::TileLocal => {
-                            let output_extents = &self.shards[output.index() as usize].extents;
-                            let source = self
-                                .value_shards(*input)?
-                                .iter()
-                                .copied()
-                                .find(|source| {
-                                    let source = &self.shards[source.index() as usize];
-                                    source.tile == tile && source.extents == *output_extents
-                                })
-                                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
-                            self.full_view(source)
-                        }
-                    })
-                })
-                .collect::<BlockBuildResult<Vec<_>>>()?;
-            let chunks = vec![self.shards[output.index() as usize].extents.clone()];
-            for (wave, output_extents) in chunks.into_iter().enumerate() {
-                if wave_transfers.len() <= wave {
-                    wave_transfers.push(BTreeMap::new());
-                    wave_runs.push(Vec::new());
-                }
-                let inputs = sources
-                    .iter()
-                    .map(|source| {
-                        let source_view = match input_mapping {
-                            PointwiseInputMapping::BroadcastToOutput => self
-                                .broadcast_view_for_extents(source.shard, output, &output_extents)
-                                .ok_or(BlockBuildError::InvalidOperatorPlan)?,
-                            PointwiseInputMapping::TileLocal => source.clone(),
-                        };
-                        let view = if self.shards[source_view.shard.index() as usize].tile == tile {
-                            source_view
-                        } else {
-                            let copy = self.push_shard(BlockValue {
-                                id: BlockValueId(0),
-                                tile,
-                                tensor_type: self.shards[source_view.shard.index() as usize]
-                                    .tensor_type
-                                    .clone(),
-                                extents: source_view.extents.clone(),
-                                definition: ShardDefinition::ExchangeStaging,
-                            })?;
-                            wave_transfers[wave]
-                                .entry(source_view)
-                                .or_default()
-                                .push(self.full_view(copy));
-                            self.full_view(copy)
-                        };
-                        Ok(KernelOperand { views: vec![view] })
-                    })
-                    .collect::<BlockBuildResult<_>>()?;
-                wave_runs[wave].push((
-                    tile,
-                    KernelRun::new(
-                        WorkProvenance {
-                            operation: operation.source,
-                            value: operation.results.first().copied(),
-                            reason: WorkReason::OperatorKernel,
-                        },
-                        kernel.clone(),
-                        inputs,
-                        ShardView {
-                            shard: output,
-                            extents: output_extents,
-                        },
-                        requirements.clone(),
-                    ),
-                ));
-            }
-        }
-        for (transfers, runs) in wave_transfers.into_iter().zip(wave_runs) {
-            self.append_phase(
-                transfers,
-                WorkProvenance {
-                    operation: operation.source,
-                    value: None,
-                    reason: WorkReason::OperatorInputs,
-                },
-                tiles,
-            )?;
-            for (tile, run) in runs {
-                self.append_kernel(tiles, tile, run)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn broadcast_view(&self, source: BlockValueId, output: BlockValueId) -> Option<ShardView> {
-        self.broadcast_view_for_extents(
-            source,
-            output,
-            &self.shards[output.index() as usize].extents,
-        )
-    }
-
-    fn broadcast_view_for_extents(
-        &self,
-        source: BlockValueId,
-        output: BlockValueId,
-        output_extents: &[ShardExtent],
-    ) -> Option<ShardView> {
-        let source_shard = &self.shards[source.index() as usize];
-        let output_shard = &self.shards[output.index() as usize];
-        let source_rank = source_shard.extents.len();
-        let output_rank = output_shard.extents.len();
-        if source_rank > output_rank {
-            return None;
-        }
-        let offset = output_rank - source_rank;
-        let mut extents = source_shard.extents.clone();
-        for (axis, extent) in extents.iter_mut().enumerate() {
-            let dimension = source_shard.tensor_type.shape.0[axis];
-            if dimension == 1 {
-                if extent.start != 0 || extent.logical_end == 0 {
-                    return None;
-                }
-                extent.start = 0;
-                extent.logical_end = 1;
-                extent.physical_end = 1;
-            } else {
-                let required = output_extents[offset + axis];
-                if extent.start > required.start || extent.logical_end < required.logical_end {
-                    return None;
-                }
-                extent.start = required.start;
-                extent.logical_end = required.logical_end;
-                extent.physical_end = required.logical_end;
-            }
-        }
-        Some(ShardView {
-            shard: source,
-            extents,
-        })
     }
 
     fn dispatch_input_view(
@@ -722,546 +497,6 @@ impl LoweringState {
         }
         Ok(self.full_view(staging))
     }
-
-    fn append_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        self.append_ordered_phase(transfers, provenance, CopyOrder::Semantic, tiles)
-    }
-
-    fn append_physical_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        self.append_ordered_phase(transfers, provenance, CopyOrder::Physical, tiles)
-    }
-
-    fn append_ordered_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        order: CopyOrder,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        let transfers = transfers
-            .into_iter()
-            .map(|(source, mut destinations)| {
-                destinations.sort_unstable();
-                destinations.dedup();
-                LogicalExchange {
-                    source,
-                    destinations,
-                    order,
-                }
-            })
-            .collect::<Vec<_>>();
-        self.append_exchange_phase(transfers, provenance, tiles)
-    }
-
-    fn append_mixed_phase(
-        &mut self,
-        semantic: BTreeMap<ShardView, Vec<ShardView>>,
-        physical: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        let mut transfers = Vec::with_capacity(semantic.len().saturating_add(physical.len()));
-        for (order, mappings) in [
-            (CopyOrder::Semantic, semantic),
-            (CopyOrder::Physical, physical),
-        ] {
-            transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
-                destinations.sort_unstable();
-                destinations.dedup();
-                LogicalExchange {
-                    source,
-                    destinations,
-                    order,
-                }
-            }));
-        }
-        self.append_exchange_phase(transfers, provenance, tiles)
-    }
-
-    fn append_exchange_phase(
-        &mut self,
-        mut transfers: Vec<LogicalExchange>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        if transfers.is_empty() {
-            return Ok(());
-        }
-        if let Some(previous) = self.phases.last().map(|phase| phase.id)
-            && self.phases[previous.index() as usize]
-                .provenance
-                .operation
-                .is_some()
-            && self.phases[previous.index() as usize].provenance.operation == provenance.operation
-        {
-            let touched = transfers
-                .iter()
-                .flat_map(|transfer| {
-                    std::iter::once(transfer.source.shard)
-                        .chain(transfer.destinations.iter().map(|view| view.shard))
-                })
-                .map(|shard| self.storage_root(shard))
-                .collect::<BTreeSet<_>>();
-            let previous_touched = self.phases[previous.index() as usize]
-                .transfers
-                .iter()
-                .flat_map(|transfer| {
-                    std::iter::once(transfer.source.shard)
-                        .chain(transfer.destinations.iter().map(|view| view.shard))
-                })
-                .map(|shard| self.storage_root(shard))
-                .collect::<BTreeSet<_>>();
-            let disjoint_transfers = touched.is_disjoint(&previous_touched);
-            let only_independent_copies_between = tiles
-                .operations
-                .iter()
-                .rposition(|operation| *operation == BlockOperation::Exchange(previous))
-                .is_some_and(|boundary| {
-                    tiles.operations[boundary + 1..].iter().all(|operation| {
-                        let BlockOperation::Copy { copy, .. } = operation else {
-                            return false;
-                        };
-                        let copy = &self.local_copies[copy.0 as usize];
-                        !touched.contains(&self.storage_root(copy.source))
-                            && !touched.contains(&self.storage_root(copy.destination))
-                    })
-                });
-            if disjoint_transfers && only_independent_copies_between {
-                let phase = &mut self.phases[previous.index() as usize];
-                phase.transfers.append(&mut transfers);
-                if phase.provenance != provenance {
-                    phase.provenance = WorkProvenance {
-                        operation: provenance.operation,
-                        value: None,
-                        reason: WorkReason::OperatorInputs,
-                    };
-                }
-                tracing::debug!(
-                    phase = previous.index(),
-                    operation = ?provenance.operation.map(OperationId::index),
-                    "consolidated independent exchange transfers"
-                );
-                return Ok(());
-            }
-        }
-        let id = ExchangePhaseId(
-            u32::try_from(self.phases.len()).map_err(|_| BlockBuildError::IdOverflow)?,
-        );
-        self.phases.push(ExchangePhase {
-            id,
-            provenance,
-            transfers,
-        });
-        tracing::debug!(
-            phase = id.index(),
-            operation = ?provenance.operation.map(OperationId::index),
-            value = ?provenance.value.map(MidValueId::index),
-            reason = ?provenance.reason,
-            "scheduled exchange phase"
-        );
-        tiles.operations.push(BlockOperation::Exchange(id));
-        Ok(())
-    }
-
-    fn append_kernel(
-        &mut self,
-        tiles: &mut BlockRegion,
-        tile: u16,
-        mut run: KernelRun,
-    ) -> BlockBuildResult<()> {
-        // Dispatch constraints describe a whole operator. Bind their access
-        // requirements to this call's actual buffers before interning metadata.
-        let requirements = &mut Arc::make_mut(&mut run.metadata).requirements;
-        if run.inputs.len() > requirements.inputs.len() {
-            return Err(BlockBuildError::InvalidOperatorPlan);
-        }
-        requirements.inputs.truncate(run.inputs.len());
-        for (operand, requirement) in run.inputs.iter().zip(&mut requirements.inputs) {
-            let view = operand
-                .views
-                .first()
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
-            requirement.format = self.shards[view.shard.index() as usize]
-                .tensor_type
-                .format
-                .clone();
-        }
-        requirements.output.format = self.shards[run.output.shard.index() as usize]
-            .tensor_type
-            .format
-            .clone();
-        for group in &mut requirements.distinct_elements {
-            group.retain(|operand| match operand {
-                MemoryOperand::Output => true,
-                MemoryOperand::Input(index) => usize::from(*index) < run.inputs.len(),
-            });
-        }
-        let output_flattens_outer_rows = matches!(
-            requirements.output.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-        );
-        if matches!(run.kernel, TileKernelSpec::Gemm { .. })
-            && run.output.extents.len() > 2
-            && !output_flattens_outer_rows
-        {
-            let matrix_axes = run.output.extents.len() - 2;
-            let mut coordinates = vec![0; matrix_axes];
-            let mut matrix_runs = Vec::new();
-            split_gemm_matrices(&run, 0, &mut coordinates, &mut matrix_runs)?;
-            if matrix_runs.len() > 1 {
-                for matrix_run in matrix_runs {
-                    self.append_single_kernel(tiles, tile, matrix_run)?;
-                }
-                return Ok(());
-            }
-        }
-        self.append_single_kernel(tiles, tile, run)
-    }
-
-    fn append_single_kernel(
-        &mut self,
-        tiles: &mut BlockRegion,
-        tile: u16,
-        mut run: KernelRun,
-    ) -> BlockBuildResult<()> {
-        if let Some(metadata) = self
-            .kernel_metadata
-            .iter()
-            .find(|metadata| metadata.as_ref() == run.metadata.as_ref())
-        {
-            run.metadata = Arc::clone(metadata);
-        } else {
-            self.kernel_metadata.push(Arc::clone(&run.metadata));
-        }
-        let id = KernelRunId(
-            u32::try_from(self.kernel_runs.len()).map_err(|_| BlockBuildError::IdOverflow)?,
-        );
-        self.kernel_runs.push(run);
-        tiles
-            .operations
-            .push(BlockOperation::Compute { tile, run: id });
-        Ok(())
-    }
-
-    fn append_local_copy(
-        &mut self,
-        tiles: &mut BlockRegion,
-        tile: u16,
-        copy: LocalCopy,
-    ) -> BlockBuildResult<()> {
-        let id = LocalCopyId(
-            u32::try_from(self.local_copies.len()).map_err(|_| BlockBuildError::IdOverflow)?,
-        );
-        self.local_copies.push(copy);
-        tiles
-            .operations
-            .push(BlockOperation::Copy { tile, copy: id });
-        Ok(())
-    }
-
-    fn full_view(&self, shard: BlockValueId) -> ShardView {
-        ShardView {
-            shard,
-            extents: self.shards[shard.index() as usize].extents.clone(),
-        }
-    }
-
-    fn narrow_view(
-        &self,
-        shard: BlockValueId,
-        ranges: &[(usize, u32, u32)],
-    ) -> BlockBuildResult<ShardView> {
-        let mut view = self.full_view(shard);
-        for &(axis, start, end) in ranges {
-            let extent = view
-                .extents
-                .get_mut(axis)
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
-            if start < extent.start || end > extent.physical_end || start >= end {
-                return Err(BlockBuildError::InvalidOperatorPlan);
-            }
-            extent.start = start;
-            extent.physical_end = end;
-            extent.logical_end = end.min(extent.logical_end).max(start);
-        }
-        Ok(view)
-    }
-
-    fn lower_repeat(
-        &mut self,
-        operation: &MidOperation,
-        repeat: &MidRepeat,
-        tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
-        let expected_inputs = repeat.carried_inputs + repeat.invariant_inputs;
-        let expected_arguments = expected_inputs + repeat.iterated_inputs.len();
-        if operation.inputs.len() != expected_inputs
-            || operation.results.len() != repeat.carried_inputs
-            || repeat.body.arguments.len() != expected_arguments
-            || repeat.body.yields.len() != repeat.carried_inputs
-            || repeat
-                .iterated_inputs
-                .iter()
-                .any(|values| values.len() != repeat.count as usize)
-        {
-            return Err(BlockBuildError::InvalidRepeat);
-        }
-        for index in 0..repeat.carried_inputs {
-            if !repeat_yield_can_alias(
-                repeat.body.yields[index],
-                repeat.body.arguments[index],
-                &repeat.body.operations,
-            ) {
-                return Err(BlockBuildError::RepeatRequiresInPlace(index));
-            }
-        }
-        let iterated_requirements = repeat
-            .iterated_inputs
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                body_storage_requirement(
-                    repeat.body.arguments[expected_inputs + index],
-                    &repeat.body.operations,
-                )
-            })
-            .collect::<Vec<_>>();
-        let body = self.lower_region(&repeat.body.operations, false)?;
-        let mut bindings = Vec::new();
-        for tile in 0..self.tile_count {
-            let mut carried = Vec::with_capacity(repeat.carried_inputs);
-            for index in 0..repeat.carried_inputs {
-                let Some(argument) = self.find_local_shard(repeat.body.arguments[index], tile)?
-                else {
-                    continue;
-                };
-                let initial = self.corresponding_shard(operation.inputs[index], argument)?;
-                let yielded = self.corresponding_shard(repeat.body.yields[index], argument)?;
-                let result = self.corresponding_shard(operation.results[index], argument)?;
-                self.alias_shard(argument, initial);
-                if yielded != argument {
-                    self.shards[yielded.index() as usize].definition =
-                        ShardDefinition::WritableAlias(argument);
-                }
-                self.alias_shard(result, initial);
-                carried.push(RepeatCarried {
-                    initial,
-                    argument,
-                    yielded,
-                    result,
-                });
-            }
-            let invariants = (0..repeat.invariant_inputs)
-                .filter_map(|index| {
-                    let input_index = repeat.carried_inputs + index;
-                    let argument =
-                        match self.find_local_shard(repeat.body.arguments[input_index], tile) {
-                            Ok(Some(argument)) => argument,
-                            Ok(None) => return None,
-                            Err(error) => return Some(Err(error)),
-                        };
-                    Some(
-                        self.corresponding_shard(operation.inputs[input_index], argument)
-                            .map(|input| RepeatInvariant { input, argument }),
-                    )
-                })
-                .collect::<BlockBuildResult<_>>()?;
-            let iterated = repeat
-                .iterated_inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, values)| {
-                    let argument = match self
-                        .find_local_shard(repeat.body.arguments[expected_inputs + index], tile)
-                    {
-                        Ok(Some(argument)) => argument,
-                        Ok(None) => return None,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let inputs = values
-                        .iter()
-                        .map(|value| self.corresponding_shard(*value, argument))
-                        .collect::<BlockBuildResult<Vec<_>>>();
-                    let inputs = match inputs {
-                        Ok(inputs) => inputs,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let (alignment, access_tail) = iterated_requirements[index];
-                    let strides = inputs
-                        .iter()
-                        .map(|shard| self.shard_stride(*shard, alignment, access_tail))
-                        .collect::<BlockBuildResult<Vec<_>>>();
-                    let strides = match strides {
-                        Ok(strides) => strides,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let Some(&stride_bytes) = strides.first() else {
-                        return Some(Err(BlockBuildError::InvalidIteratedBlocks(index)));
-                    };
-                    if strides.iter().any(|stride| *stride != stride_bytes) {
-                        return Some(Err(BlockBuildError::InvalidIteratedBlocks(index)));
-                    }
-                    Some(Ok(RepeatIterated {
-                        inputs,
-                        argument,
-                        stride_bytes,
-                        alignment,
-                    }))
-                })
-                .collect::<BlockBuildResult<_>>()?;
-            bindings.push(BlockRepeatBinding {
-                tile,
-                carried,
-                invariants,
-                iterated,
-            });
-        }
-        tiles.operations.push(BlockOperation::Repeat(BlockRepeat {
-            provenance: WorkProvenance {
-                operation: operation.source,
-                value: operation.results.first().copied(),
-                reason: WorkReason::Repeat,
-            },
-            count: repeat.count,
-            bindings,
-            body,
-        }));
-        Ok(())
-    }
-
-    fn alias_shard(&mut self, shard: BlockValueId, target: BlockValueId) {
-        self.shards[shard.index() as usize].definition = ShardDefinition::Alias(target);
-    }
-
-    fn find_local_shard(
-        &self,
-        value: MidValueId,
-        tile: u16,
-    ) -> BlockBuildResult<Option<BlockValueId>> {
-        Ok(self
-            .value_shards(value)?
-            .iter()
-            .copied()
-            .find(|shard| self.shards[shard.index() as usize].tile == tile))
-    }
-
-    fn corresponding_shard(
-        &self,
-        value: MidValueId,
-        target: BlockValueId,
-    ) -> BlockBuildResult<BlockValueId> {
-        let target = &self.shards[target.index() as usize];
-        self.value_shards(value)?
-            .iter()
-            .copied()
-            .filter(|shard| self.shards[shard.index() as usize].extents == target.extents)
-            .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != target.tile))
-            .ok_or(BlockBuildError::UnknownValue(value))
-    }
-
-    fn shard_stride(
-        &self,
-        shard: BlockValueId,
-        alignment: u32,
-        access_tail: u32,
-    ) -> BlockBuildResult<u32> {
-        let shard = &self.shards[shard.index() as usize];
-        let elements = shard
-            .extents
-            .iter()
-            .try_fold(1_u64, |elements, extent| {
-                elements.checked_mul(u64::from(extent.physical_end - extent.start))
-            })
-            .ok_or(BlockBuildError::IdOverflow)?;
-        let bytes = elements
-            .checked_mul(shard.tensor_type.format.precision.bytes())
-            .and_then(|bytes| bytes.checked_add(u64::from(access_tail)))
-            .ok_or(BlockBuildError::IdOverflow)?;
-        let alignment = u64::from(alignment.max(1));
-        let stride = bytes
-            .checked_add(alignment - 1)
-            .map(|bytes| bytes / alignment * alignment)
-            .ok_or(BlockBuildError::IdOverflow)?;
-        u32::try_from(stride).map_err(|_| BlockBuildError::IdOverflow)
-    }
-}
-
-fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOperation]) -> bool {
-    if value == target {
-        return true;
-    }
-    let Some(operation) = operations
-        .iter()
-        .find(|operation| operation.results.contains(&value))
-    else {
-        return false;
-    };
-    let Some(plan) = operation.operator_plan() else {
-        return false;
-    };
-    let indices = match &plan.requirements.output_aliasing {
-        OutputAliasing::Fresh => return false,
-        OutputAliasing::MayAliasInputs(indices) => indices.as_slice(),
-    };
-    indices.iter().any(|index| {
-        operation
-            .inputs
-            .get(usize::from(*index))
-            .is_some_and(|input| value_can_alias(*input, target, operations))
-    })
-}
-
-fn repeat_yield_can_alias(
-    value: MidValueId,
-    carried: MidValueId,
-    operations: &[MidOperation],
-) -> bool {
-    if value_can_alias(value, carried, operations) {
-        return true;
-    }
-    let Some(definition) = operations
-        .iter()
-        .position(|operation| operation.results.contains(&value))
-    else {
-        return false;
-    };
-    // A repeat reuses the carried allocation on its next iteration. A fresh
-    // yield may overwrite it when every read of the previous iteration's
-    // value has completed before the yielding operation begins.
-    !operations[definition..]
-        .iter()
-        .any(|operation| operation.inputs.contains(&carried))
-}
-
-fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (u32, u32) {
-    let mut alignment = 8;
-    let mut access_tail = 0;
-    for operation in operations {
-        for (index, input) in operation.inputs.iter().enumerate() {
-            if *input != value {
-                continue;
-            }
-            let requirement = operation
-                .operator_plan()
-                .and_then(|plan| plan.requirements.inputs.get(index))
-                .or_else(|| operation.conversion_plan().map(|plan| &plan.input));
-            if let Some(requirement) = requirement {
-                alignment = alignment.max(requirement.alignment);
-                access_tail = access_tail.max(requirement.access_tail_bytes);
-            }
-        }
-    }
-    (alignment, access_tail)
 }
 
 fn operation_provenance(operation: &MidOperation) -> WorkProvenance {

@@ -21,6 +21,7 @@ mod catalogue;
 mod layout;
 mod operator;
 mod ownership;
+mod passes;
 mod planner;
 mod resolved;
 mod view;

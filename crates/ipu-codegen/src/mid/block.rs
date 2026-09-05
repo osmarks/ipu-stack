@@ -237,3 +237,15 @@ pub struct MidProgram {
     pub estimated_cycles: u64,
     pub estimated_exchange_cycles: u64,
 }
+
+pub(crate) fn storage_root(shards: &[BlockValue], mut shard: BlockValueId) -> BlockValueId {
+    let mut remaining = shards.len().saturating_add(1);
+    while remaining != 0 {
+        remaining -= 1;
+        shard = match shards[shard.index() as usize].definition {
+            ShardDefinition::Alias(source) | ShardDefinition::WritableAlias(source) => source,
+            _ => return shard,
+        };
+    }
+    shard
+}

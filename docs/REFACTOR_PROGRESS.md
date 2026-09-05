@@ -146,3 +146,25 @@ Next bounded step: extract the parallel-reduction builder from GEMM into a
 reusable mid sum builder over ordinary block views, deriving staging from the
 number of contributors rather than GEMM grid metadata. Add direct mid-region
 validation/coverage and repeat hardware checks after substantive changes.
+
+Reusable sum construction and mid copy cleanup are implemented. The sum builder
+accepts groups of ordinary block views, derives its complete/streamed stages
+from each group's contributor count, and handles one-contributor groups as
+copies. Its interpreter regression checks independent groups of one, two, and
+four contributors without invoking GEMM or low projection. Contributors must
+have matching coordinates and storage order; callers use explicit rearranges
+for other formats. Existing GEMM access requirements are retained for now.
+
+mid/passes merges adjacent contiguous copies on each tile, respecting compute,
+exchange, repeat, and checkpoint boundaries and avoiding aliasing allocations.
+It compacts the copy arena afterward. This is contiguous-run merging, not yet
+arbitrary composition/elimination of multi-operation layout conversions.
+
+Builder methods and files now use construction terminology. Buffer/view helpers,
+repeat handling, pointwise operations, block emission, three GEMM strategies,
+attention panel/blocked/materialized paths, deferred views, and mapping geometry
+are separated. Production implementation files are at most 590 lines (tests
+remain consolidated). 146 workspace release tests and Clippy pass in
+`/tmp/mid-modular-*`. Five `/tmp/mid-optimized-*` hardware runs pass and remain
+byte-identical to `/tmp/mid-blocks-*`; the subsequent method/file extraction
+changes no emitted work and passes the same unit checks.
