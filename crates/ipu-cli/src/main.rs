@@ -5,7 +5,7 @@ use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
 use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::{
     GroupBy, Query, SortBy, StepKind, calibrate_profiles, cycle_origin, exchange_activity_summary,
-    query,
+    exchange_boundaries, query,
 };
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
@@ -57,6 +57,12 @@ enum Command {
         bindings: bool,
         #[arg(long)]
         tile: Option<u32>,
+    },
+    /// Separate exchange arrival imbalance from scheduled transfer duration.
+    ProfileBarriers {
+        profile: PathBuf,
+        #[arg(long)]
+        json: bool,
     },
     ProfileInspect {
         profile: PathBuf,
@@ -315,6 +321,33 @@ fn main() -> Result<()> {
                 database.measurements.len(),
                 output.display()
             );
+        }
+        Command::ProfileBarriers { profile, json } => {
+            let report = ProfileReport::read(fs::File::open(profile)?)?;
+            let boundaries = exchange_boundaries(&report);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&boundaries)?);
+            } else {
+                println!(
+                    "Shared-clock cycle offsets; arrival spreads can overlap and must not be summed."
+                );
+                for phase in boundaries {
+                    println!(
+                        "epoch={} phase={} entry={}..{} exit={} lateTile={} arrivalSpread={} afterLastArrival={} scheduled={}",
+                        phase.epoch,
+                        phase.phase,
+                        phase.first_entry,
+                        phase.last_entry,
+                        phase.last_exit,
+                        phase.last_arriving_tile,
+                        phase.arrival_spread_cycles,
+                        phase.after_last_arrival_cycles,
+                        phase
+                            .scheduled_event_cycles
+                            .map_or_else(|| "unknown".into(), |n| n.to_string()),
+                    );
+                }
+            }
         }
         Command::ProfileQuery {
             profile,
@@ -729,12 +762,14 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if std::env::var("IPU_LOG_FORMAT").as_deref() == Ok("json") {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .json()
             .with_env_filter(filter)
             .with_target(false)
             .init();
     } else {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .with_target(false)
             .init();

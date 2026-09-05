@@ -253,12 +253,74 @@ pub fn cycle_origin(report: &ProfileReport) -> u32 {
     reference.wrapping_add_signed(minimum_delta)
 }
 
+/// One exchange boundary on the shared device clock. Arrival spread is work
+/// imbalance before the exchange, not transfer execution time. Different
+/// boundaries can overlap on tiles that have no work between them; do not sum
+/// their arrival spreads as elapsed program time.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExchangeBoundary {
+    pub epoch: u32,
+    pub phase: u32,
+    pub first_entry: u64,
+    pub last_entry: u64,
+    pub last_exit: u64,
+    pub last_arriving_tile: u32,
+    pub arrival_spread_cycles: u64,
+    pub after_last_arrival_cycles: u64,
+    /// Absent in older profiles without static schedule metadata.
+    pub scheduled_event_cycles: Option<u64>,
+}
+
+pub fn exchange_boundaries(report: &ProfileReport) -> Vec<ExchangeBoundary> {
+    let base = cycle_origin(report);
+    let mut phases = BTreeMap::<(u32, u32), ExchangeBoundary>::new();
+    for tile in &report.tiles {
+        for sample in &tile.samples {
+            if sample.step.kind != ProfileStepKind::Exchange {
+                continue;
+            }
+            let start = u64::from(sample.start_cycle.wrapping_sub(base));
+            let end = start + u64::from(duration(sample));
+            let events = u64::from(sample.step.exchange_event_cycles);
+            let phase = phases
+                .entry((sample.step.epoch, sample.step.phase))
+                .or_insert(ExchangeBoundary {
+                    epoch: sample.step.epoch,
+                    phase: sample.step.phase,
+                    first_entry: start,
+                    last_entry: start,
+                    last_exit: end,
+                    last_arriving_tile: tile.physical_tile,
+                    arrival_spread_cycles: 0,
+                    after_last_arrival_cycles: 0,
+                    scheduled_event_cycles: None,
+                });
+            phase.first_entry = phase.first_entry.min(start);
+            if start > phase.last_entry {
+                phase.last_entry = start;
+                phase.last_arriving_tile = tile.physical_tile;
+            }
+            phase.last_exit = phase.last_exit.max(end);
+            if events != 0 {
+                phase.scheduled_event_cycles =
+                    Some(phase.scheduled_event_cycles.unwrap_or(0).max(events));
+            }
+        }
+    }
+    let mut phases = phases.into_values().collect::<Vec<_>>();
+    for phase in &mut phases {
+        phase.arrival_spread_cycles = phase.last_entry - phase.first_entry;
+        phase.after_last_arrival_cycles = phase.last_exit - phase.last_entry;
+    }
+    phases.sort_by_key(|phase| (phase.last_exit, phase.epoch, phase.phase));
+    phases
+}
+
 /// Summarizes statically scheduled exchange roles, counting a device-wide
 /// exchange phase from the last participating tile's entry.
 pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySummary {
     let mut summary = ExchangeActivitySummary::default();
-    let base = cycle_origin(report);
-    let mut phases = BTreeMap::<(u32, u32), (u64, u64, u64, u64)>::new();
     for tile in &report.tiles {
         for sample in tile
             .samples
@@ -270,15 +332,6 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
             if event_cycles == 0 {
                 continue;
             }
-            let start = u64::from(sample.start_cycle.wrapping_sub(base));
-            let end = start + u64::from(duration(sample));
-            let phase = phases
-                .entry((sample.step.epoch, sample.step.phase))
-                .or_insert((start, start, end, event_cycles));
-            phase.0 = phase.0.min(start);
-            phase.1 = phase.1.max(start);
-            phase.2 = phase.2.max(end);
-            phase.3 = phase.3.max(event_cycles);
             if sample.step.exchange_activities.is_empty() {
                 continue;
             }
@@ -304,12 +357,14 @@ pub fn exchange_activity_summary(report: &ProfileReport) -> ExchangeActivitySumm
             summary.estimated_idle_work_cycles += roles.idle;
         }
     }
-    for (minimum_start, maximum_start, maximum_end, scheduled) in phases.into_values() {
-        let measured = maximum_end.saturating_sub(maximum_start);
-        summary.measured_phase_cycles += measured;
+    for phase in exchange_boundaries(report) {
+        let Some(scheduled) = phase.scheduled_event_cycles else {
+            continue;
+        };
+        summary.measured_phase_cycles += phase.after_last_arrival_cycles;
         summary.scheduled_event_cycles += scheduled;
-        summary.arrival_wait_cycles += maximum_start.saturating_sub(minimum_start);
-        summary.phase_boundary_cycles += measured.saturating_sub(scheduled);
+        summary.arrival_wait_cycles += phase.arrival_spread_cycles;
+        summary.phase_boundary_cycles += phase.after_last_arrival_cycles.saturating_sub(scheduled);
     }
     summary
 }
@@ -745,6 +800,41 @@ mod tests {
             start_cycle: start,
             end_cycle: end,
         }
+    }
+
+    #[test]
+    fn boundaries_separate_arrival_skew_and_preserve_epochs_across_clock_wrap() {
+        let mut early = sample(7, ProfileStepKind::Exchange, "exchange", u32::MAX - 19, 50);
+        early.step.exchange_event_cycles = 40;
+        let mut late = sample(7, ProfileStepKind::Exchange, "exchange", 5, 55);
+        late.step.exchange_event_cycles = 40;
+        let mut repeated = sample(7, ProfileStepKind::Exchange, "exchange", 80, 100);
+        repeated.step.epoch = 1;
+        let report = ProfileReport {
+            clock_hz: 1_000_000_000,
+            tiles: vec![
+                TileProfile {
+                    physical_tile: 2,
+                    samples: vec![early, repeated],
+                },
+                TileProfile {
+                    physical_tile: 3,
+                    samples: vec![late],
+                },
+            ],
+        };
+        let phases = exchange_boundaries(&report);
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].arrival_spread_cycles, 25);
+        assert_eq!(phases[0].after_last_arrival_cycles, 50);
+        assert_eq!(phases[0].scheduled_event_cycles, Some(40));
+        assert_eq!(phases[0].last_arriving_tile, 3);
+        assert_eq!(phases[1].epoch, 1);
+        assert_eq!(phases[1].scheduled_event_cycles, None);
+        let summary = exchange_activity_summary(&report);
+        assert_eq!(summary.arrival_wait_cycles, 25);
+        assert_eq!(summary.measured_phase_cycles, 50);
+        assert_eq!(summary.phase_boundary_cycles, 10);
     }
 
     #[test]
