@@ -4,7 +4,7 @@ use super::*;
 
 pub(super) struct DeferredValue {
     pub(super) transform: AxisFactorView,
-    pub(super) shards: Vec<LowShardId>,
+    pub(super) shards: Vec<BlockValueId>,
 }
 
 pub(super) fn intersect_extents(
@@ -62,11 +62,11 @@ pub(super) fn intersect_extents_with_shared_padding(
 }
 
 pub(super) fn split_mapping_at_panel_boundaries(
-    source_shard: &LowShard,
+    source_shard: &BlockValue,
     mut source: ShardView,
-    destination_shard: &LowShard,
+    destination_shard: &BlockValue,
     mut destination: ShardView,
-) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
+) -> BlockBuildResult<Vec<(ShardView, ShardView)>> {
     let source_rank = source.extents.len();
     let destination_rank = destination.extents.len();
     let outer_elements = |extents: &[ShardExtent]| {
@@ -83,21 +83,21 @@ pub(super) fn split_mapping_at_panel_boundaries(
         || outer_elements(&source.extents) != Some(1)
         || outer_elements(&destination.extents) != Some(1)
     {
-        return Err(LowLoweringError::InvalidOperatorPlan);
+        return Err(BlockBuildError::InvalidOperatorPlan);
     }
 
     let aligned_ranges = |source: ShardExtent,
                           source_shard: ShardExtent,
                           destination: ShardExtent,
                           destination_shard: ShardExtent|
-     -> LowLoweringResult<Vec<(ShardExtent, ShardExtent)>> {
+     -> BlockBuildResult<Vec<(ShardExtent, ShardExtent)>> {
         let logical_width = source.logical_end - source.start;
         if logical_width != destination.logical_end - destination.start {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let width = source.physical_end - source.start;
         if width != destination.physical_end - destination.start {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let mut ranges = Vec::new();
         let mut offset = 0;
@@ -106,12 +106,12 @@ pub(super) fn split_mapping_at_panel_boundaries(
                 .start
                 .checked_sub(source_shard.start)
                 .and_then(|start| start.checked_add(offset))
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
             let destination_position = destination
                 .start
                 .checked_sub(destination_shard.start)
                 .and_then(|start| start.checked_add(offset))
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
             let source_remaining = AMP_COLUMN_MICRO - source_position % AMP_COLUMN_MICRO;
             let destination_remaining = AMP_COLUMN_MICRO - destination_position % AMP_COLUMN_MICRO;
             let length = (width - offset)
@@ -234,7 +234,7 @@ impl LoweringState {
     pub(super) fn deferred_supports_physical_exchange(
         &self,
         value: MidValueId,
-        destination: LowShardId,
+        destination: BlockValueId,
     ) -> bool {
         let Some(root) = self.deferred_root(value) else {
             return false;
@@ -269,8 +269,8 @@ impl LoweringState {
         &mut self,
         source: MidValueId,
         provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<Option<Vec<LowShardId>>> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<Option<Vec<BlockValueId>>> {
         let sources = self.value_shards(source)?.to_vec();
         for &source_shard in &sources {
             let source = &self.shards[source_shard.index() as usize];
@@ -305,8 +305,8 @@ impl LoweringState {
             let source = self.shards[source_shard.index() as usize].clone();
             let mut staging_type = source.tensor_type.clone();
             staging_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
-            let staging = self.push_shard(LowShard {
-                id: LowShardId(0),
+            let staging = self.push_shard(BlockValue {
+                id: BlockValueId(0),
                 tile: source.tile,
                 tensor_type: staging_type,
                 extents: source.extents.clone(),
@@ -351,8 +351,8 @@ impl LoweringState {
     pub(super) fn lower_deferred_output(
         &mut self,
         operation: &MidOperation,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<bool> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<bool> {
         let Some(offered) = operation
             .operator_plan()
             .and_then(|plan| plan.deferred_output)
@@ -368,7 +368,7 @@ impl LoweringState {
         let source_type = &self.shards[self.value_shards(*source)?[0].index() as usize].tensor_type;
         let result_type = &self.shards[self.value_shards(*result)?[0].index() as usize].tensor_type;
         if offered.transform.output_shape(&source_type.shape).as_ref() != Some(&result_type.shape) {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let source_shards = self.value_shards(*source)?.to_vec();
         let source_format = &self.shards[source_shards[0].index() as usize]
@@ -423,15 +423,15 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         plan: &crate::ConversionPlan,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         if plan.output.materialization == crate::OperandMaterialization::DispatchSlices {
             let ([source], [result]) = (operation.inputs.as_slice(), operation.results.as_slice())
             else {
-                return Err(LowLoweringError::InvalidConversionPlan);
+                return Err(BlockBuildError::InvalidConversionPlan);
             };
             if !plan.strategy.uses_intersections() {
-                return Err(LowLoweringError::InvalidConversionPlan);
+                return Err(BlockBuildError::InvalidConversionPlan);
             }
             // Mid lowering selected consumer-sized materialization. It is not
             // contingent on where other operand conversions appear in the list.
@@ -453,13 +453,13 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         plan: &crate::ConversionPlan,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let [input] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidConversionPlan);
+            return Err(BlockBuildError::InvalidConversionPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         for output in self.value_shards(*result)?.to_vec() {
             let tile = self.shards[output.index() as usize].tile;
@@ -500,13 +500,13 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         plan: &crate::ConversionPlan,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let [input] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidConversionPlan);
+            return Err(BlockBuildError::InvalidConversionPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
@@ -514,7 +514,7 @@ impl LoweringState {
             ConversionStrategy::DirectRetile => CopyOrder::Physical,
             ConversionStrategy::StageLogicalThenTransform => CopyOrder::Semantic,
             ConversionStrategy::LocalKernel => {
-                return Err(LowLoweringError::InvalidConversionPlan);
+                return Err(BlockBuildError::InvalidConversionPlan);
             }
         };
         let mut mappings = Vec::new();
@@ -552,13 +552,13 @@ impl LoweringState {
         copy_order: CopyOrder,
         exchange_order: CopyOrder,
         provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
         let mut before_exchange = Vec::new();
         let mut after_exchange = Vec::new();
         let mut after_exchange_kernels = Vec::new();
-        let mut grouped = BTreeMap::<LowShardId, Vec<(ShardView, ShardView)>>::new();
+        let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
         for mapping in mappings {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
@@ -568,8 +568,8 @@ impl LoweringState {
                 self.append_fill_zero(tiles, destination_shard, provenance)?;
             }
             let staging = if let Some(staging) = &plan.staging {
-                Some(self.push_shard(LowShard {
-                    id: LowShardId(0),
+                Some(self.push_shard(BlockValue {
+                    id: BlockValueId(0),
                     tile: self.shards[destination_shard.index() as usize].tile,
                     tensor_type: staging.tensor_type.clone(),
                     extents: staging.extents.clone(),
@@ -670,7 +670,7 @@ impl LoweringState {
         Ok(())
     }
 
-    pub(super) fn logical_view(&self, shard: LowShardId) -> ShardView {
+    pub(super) fn logical_view(&self, shard: BlockValueId) -> ShardView {
         let mut view = self.full_view(shard);
         for extent in &mut view.extents {
             extent.physical_end = extent.logical_end;
@@ -682,27 +682,27 @@ impl LoweringState {
         &mut self,
         operation: &MidOperation,
         operator: &crate::MidOperator,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let crate::MidOperator::View(view) = operator else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [input] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         let input_type = self
             .value_shards(*input)?
             .first()
             .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let output_shards = self.value_shards(*result)?.to_vec();
         let output_type = output_shards
             .first()
             .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let original_sources = self.value_shards(*input)?.to_vec();
         let direct_panel_exchange = input_type
             .format
@@ -749,7 +749,7 @@ impl LoweringState {
                 },
                 tiles,
             )?
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?
         } else {
             self.value_shards(*input)?.to_vec()
         };
@@ -770,10 +770,10 @@ impl LoweringState {
 
     pub(super) fn view_mappings(
         &self,
-        source_shards: &[LowShardId],
-        output_shards: &[LowShardId],
+        source_shards: &[BlockValueId],
+        output_shards: &[BlockValueId],
         view: AxisFactorView,
-    ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
+    ) -> BlockBuildResult<Vec<(ShardView, ShardView)>> {
         let mut mappings = Vec::new();
         for &output in output_shards {
             let output_extents = self.shards[output.index() as usize].extents.clone();
@@ -783,7 +783,7 @@ impl LoweringState {
                 .shape;
             let output_shape = &self.shards[output.index() as usize].tensor_type.shape;
             if view.output_shape(source_shape).as_ref() != Some(output_shape) {
-                return Err(LowLoweringError::InvalidOperatorPlan);
+                return Err(BlockBuildError::InvalidOperatorPlan);
             }
             let split = view.split_axis;
             let merge = view.merge_axis;
@@ -795,7 +795,7 @@ impl LoweringState {
                 stream_extents[merge].physical_end = stream + 1;
                 let (target, column_base) = view
                     .source_extents(source_shape, output_shape, &stream_extents)
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                 for (mut source_extents, source) in
                     self.intersecting_shard_set(source_shards, &target, tile)
                 {
@@ -842,7 +842,7 @@ impl LoweringState {
     pub(super) fn f16_micro_panel_mappings(
         &self,
         mappings: Vec<(ShardView, ShardView)>,
-    ) -> LowLoweringResult<Option<Vec<(ShardView, ShardView)>>> {
+    ) -> BlockBuildResult<Option<Vec<(ShardView, ShardView)>>> {
         let mut split = Vec::new();
         for (source, destination) in mappings {
             let source_shard = &self.shards[source.shard.index() as usize];
@@ -881,15 +881,15 @@ impl LoweringState {
         rows: u32,
         column_start: u32,
         columns: u32,
-        destination: LowShardId,
-    ) -> LowLoweringResult<Vec<(ShardView, ShardView)>> {
+        destination: BlockValueId,
+    ) -> BlockBuildResult<Vec<(ShardView, ShardView)>> {
         let deferred_root = self
             .deferred_root(value)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let deferred = self
             .deferred_values
             .get(&deferred_root)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let deferred_shards = deferred.shards.clone();
         let logical_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
         let source_type = &self.shards[deferred.shards[0].index() as usize].tensor_type;
@@ -901,20 +901,20 @@ impl LoweringState {
         let mapping = deferred
             .transform
             .map_slice(&source_type.shape, &logical_type.shape, &logical_target)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let target = mapping
             .iter()
             .copied()
             .enumerate()
             .map(|(axis, (start, end))| {
                 Ok(ShardExtent {
-                    axis: u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?,
+                    axis: u16::try_from(axis).map_err(|_| BlockBuildError::IdOverflow)?,
                     start,
                     logical_end: end,
                     physical_end: end,
                 })
             })
-            .collect::<LowLoweringResult<Vec<_>>>()?;
+            .collect::<BlockBuildResult<Vec<_>>>()?;
         let destination_tile = self.shards[destination.index() as usize].tile;
         let mut covered = 0u64;
         let mut mappings = Vec::new();
@@ -927,20 +927,20 @@ impl LoweringState {
                 .map(|(destination_axis, source_axis)| {
                     let source = source_extents
                         .get(source_axis)
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                     let base = target
                         .get(source_axis)
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?
+                        .ok_or(BlockBuildError::InvalidOperatorPlan)?
                         .start;
                     Ok(ShardExtent {
                         axis: u16::try_from(destination_axis)
-                            .map_err(|_| LowLoweringError::IdOverflow)?,
+                            .map_err(|_| BlockBuildError::IdOverflow)?,
                         start: source.start - base,
                         logical_end: source.logical_end - base,
                         physical_end: source.logical_end - base,
                     })
                 })
-                .collect::<LowLoweringResult<Vec<_>>>()?;
+                .collect::<BlockBuildResult<Vec<_>>>()?;
             covered = covered.saturating_add(
                 u64::from(source_extents[1].logical_end - source_extents[1].start)
                     * u64::from(source_extents[2].logical_end - source_extents[2].start),
@@ -956,7 +956,7 @@ impl LoweringState {
             mappings.push((source_view, destination_view));
         }
         if covered != u64::from(rows) * u64::from(columns) {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         Ok(mappings)
     }
@@ -964,9 +964,9 @@ impl LoweringState {
     fn copy_plan(
         &self,
         mappings: &[(ShardView, ShardView)],
-        destination: LowShardId,
+        destination: BlockValueId,
         copy_order: CopyOrder,
-    ) -> LowLoweringResult<crate::mid::CopyPlan> {
+    ) -> BlockBuildResult<crate::mid::CopyPlan> {
         let shard = &self.shards[destination.index() as usize];
         let mappings = mappings
             .iter()
@@ -993,8 +993,8 @@ impl LoweringState {
         rows: u32,
         column_start: u32,
         columns: u32,
-        destination: LowShardId,
-    ) -> LowLoweringResult<bool> {
+        destination: BlockValueId,
+    ) -> BlockBuildResult<bool> {
         let mappings = self.deferred_panel_mappings(
             value,
             stream,
@@ -1018,11 +1018,11 @@ impl LoweringState {
         rows: u32,
         column_start: u32,
         columns: u32,
-        destination: LowShardId,
+        destination: BlockValueId,
         order: CopyOrder,
         transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         local_copies: &mut Vec<(u16, LocalCopy)>,
-    ) -> LowLoweringResult<()> {
+    ) -> BlockBuildResult<()> {
         let destination_tile = self.shards[destination.index() as usize].tile;
         let mappings = self.deferred_panel_mappings(
             value,
@@ -1036,7 +1036,7 @@ impl LoweringState {
         for (source_view, destination_view) in mappings {
             let mappings = if order == CopyOrder::Physical {
                 self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?
+                    .ok_or(BlockBuildError::InvalidOperatorPlan)?
             } else {
                 vec![(source_view, destination_view)]
             };

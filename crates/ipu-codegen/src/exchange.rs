@@ -4,7 +4,7 @@ mod reuse;
 pub(crate) use reuse::ExchangeScheduleCache;
 
 use crate::{
-    ExchangePhaseId, LogicalExchange, LowProgram, LowShardId, Placement, ShardDefinition,
+    BlockValueId, ExchangePhaseId, LogicalExchange, LowProgram, Placement, ShardDefinition,
     logical_view_byte_spans, view_byte_spans,
 };
 use ipu_exchange::{
@@ -289,7 +289,7 @@ pub(crate) fn lower_exchanges_cached(
     options: ExchangeLoweringOptions,
     cache: &mut ExchangeScheduleCache,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
-    let mut repeat_inputs = BTreeMap::<LowShardId, Vec<LowShardId>>::new();
+    let mut repeat_inputs = BTreeMap::<BlockValueId, Vec<BlockValueId>>::new();
     for repeat in &program.repeat_runs {
         for iterated in &repeat.iterated {
             match repeat_inputs.entry(iterated.argument) {
@@ -884,7 +884,7 @@ impl PhaseDiagnostics {
 #[derive(Clone)]
 struct PendingTransfer {
     source: u16,
-    source_shard: LowShardId,
+    source_shard: BlockValueId,
     source_offset: u32,
     destinations: Vec<(u16, u32)>,
     source_addresses: Vec<u32>,
@@ -922,7 +922,7 @@ impl PendingTransfer {
 
 fn attach_repeat_source_addresses(
     pending: &mut [PendingTransfer],
-    repeat_inputs: &BTreeMap<LowShardId, Vec<LowShardId>>,
+    repeat_inputs: &BTreeMap<BlockValueId, Vec<BlockValueId>>,
     placement: &Placement,
 ) -> Result<(), ExchangeLoweringError> {
     for transfer in pending {
@@ -1134,7 +1134,7 @@ fn pending_from_problem(
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             let mut pending = PendingTransfer {
                 source: transfer.source,
-                source_shard: LowShardId::from_index(
+                source_shard: BlockValueId::from_index(
                     u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 ),
                 source_offset: 0,
@@ -2188,7 +2188,7 @@ struct MaterializedSchedule {
     tile_availability: Vec<TileAvailability>,
     memory_accesses: Vec<TileMemorySchedule>,
     activities: Vec<Vec<ExchangeActivity>>,
-    scheduled_sends: Vec<Vec<(LowShardId, u32)>>,
+    scheduled_sends: Vec<Vec<(BlockValueId, u32)>>,
     order: Vec<usize>,
     timings: Vec<Option<MaterializedTiming>>,
 }
@@ -3367,7 +3367,7 @@ mod tests {
             let source_address = if random.bool() { 0x1_0000 } else { 0x4_2000 };
             let original = PendingTransfer {
                 source,
-                source_shard: LowShardId::from_index(u32::from(source)),
+                source_shard: BlockValueId::from_index(u32::from(source)),
                 source_offset: random.u32(0..16) * 8,
                 destinations: destinations.clone(),
                 source_addresses: vec![source_address],
@@ -3440,7 +3440,7 @@ mod tests {
                     let words = random.u32(1..=MAX_TRANSFER_WORDS);
                     PendingTransfer {
                         source,
-                        source_shard: LowShardId::from_index(u32::from(source)),
+                        source_shard: BlockValueId::from_index(u32::from(source)),
                         source_offset: 0,
                         destinations: receivers.into_iter().map(|tile| (tile, 0)).collect(),
                         source_addresses: vec![0],
@@ -3575,7 +3575,11 @@ mod tests {
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
+            let low = lower_to_tiles(
+                &crate::mid::build_blocks(&mid).unwrap(),
+                config.diagnostic_checkpoints,
+            )
+            .unwrap();
             let placement = place(&low).unwrap();
             let phases = lower_exchanges(
                 &low,

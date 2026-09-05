@@ -1,13 +1,12 @@
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
-use crate::low::{LowProgram, LowValue};
+use crate::low::LowProgram;
 use crate::memory::{
     MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
     RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
-use crate::mid::{
-    Ipu21CostModel, MidGraph, MidOperationKind, PipelineConfig, Precision, lower_finalists,
-};
+use crate::mid::ValueBlocks;
+use crate::mid::{Ipu21CostModel, MidProgram, PipelineConfig, Precision, lower_finalists};
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
     PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
@@ -57,7 +56,7 @@ pub enum PackageBuildError {
     #[error("mid-level lowering failed: {0}")]
     Mid(#[from] crate::LoweringError),
     #[error("tile scheduling failed: {0}")]
-    Low(#[from] crate::LowLoweringError),
+    Low(#[from] crate::BlockBuildError),
     #[error("kernel planning failed: {0}")]
     Kernel(#[from] crate::KernelAbiError),
     #[error("placement failed: {0}")]
@@ -149,7 +148,7 @@ pub struct DiagnosticTensor {
 pub struct DiagnosticShard {
     pub physical_tile: u16,
     pub address: u32,
-    pub storage: crate::LowShard,
+    pub storage: crate::BlockValue,
 }
 
 struct BuiltApplication {
@@ -569,18 +568,9 @@ pub fn build_diagnostic_package(
     let topology = active_topology(low.tile_count)?;
     let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
     let mut checkpoints = Vec::new();
-    for operation in &mid.operations {
-        if !matches!(
-            operation.kind,
-            MidOperationKind::Operator { .. } | MidOperationKind::Repeat(_)
-        ) {
-            continue;
-        }
-        let Some(source) = operation.source else {
-            continue;
-        };
-        let tensors = operation
-            .results
+    for (source, results) in &mid.checkpoints {
+        let source = *source;
+        let tensors = results
             .iter()
             .map(|&value| diagnostic_tensor(&mid, &low, &built.placement, &topology, value, None))
             .collect::<PackageBuildResult<Vec<_>>>()?;
@@ -620,15 +610,15 @@ pub fn build_diagnostic_package(
     })
 }
 
-fn package_precisions(mid: &MidGraph) -> BTreeMap<ValueId, Precision> {
-    mid.values
+fn package_precisions(mid: &MidProgram) -> BTreeMap<ValueId, Precision> {
+    mid.logical_values
         .iter()
         .map(|value| (value.origin, value.tensor_type.format.precision))
         .collect()
 }
 
 fn package_inputs(
-    mid: &MidGraph,
+    mid: &MidProgram,
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
@@ -652,7 +642,7 @@ fn build_package_artifacts(
     graph: &ComputeGraph,
     config: &PackageConfig,
     diagnostic_checkpoints: bool,
-) -> PackageBuildResult<(BuiltApplication, MidGraph, LowProgram)> {
+) -> PackageBuildResult<(BuiltApplication, std::sync::Arc<MidProgram>, LowProgram)> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
@@ -706,9 +696,13 @@ fn build_package_artifacts(
 }
 
 fn select_scheduled_finalist(
-    finalists: Vec<MidGraph>,
+    finalists: Vec<std::sync::Arc<MidProgram>>,
     planning: &PipelineConfig,
-) -> PackageBuildResult<(MidGraph, LowProgram, crate::exchange::ExchangeScheduleCache)> {
+) -> PackageBuildResult<(
+    std::sync::Arc<MidProgram>,
+    LowProgram,
+    crate::exchange::ExchangeScheduleCache,
+)> {
     if finalists.len() == 1 {
         let mid = finalists.into_iter().next().unwrap();
         tracing::info!(
@@ -716,15 +710,6 @@ fn select_scheduled_finalist(
             estimated_exchange_cycles = mid.estimated_exchange_cycles,
             "selected analytical operator plan"
         );
-        for operation in &mid.operations {
-            tracing::debug!(
-                source = ?operation.source,
-                kind = ?operation.kind,
-                memory = ?operation.memory,
-                plan = ?operation.operator_plan(),
-                "selected mid-level operation"
-            );
-        }
         let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints)?;
         return Ok((mid, low, crate::exchange::ExchangeScheduleCache::default()));
     }
@@ -1312,7 +1297,7 @@ fn build_package_from_objects(
 }
 
 fn diagnostic_tensor(
-    mid: &MidGraph,
+    mid: &MidProgram,
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
@@ -1320,7 +1305,7 @@ fn diagnostic_tensor(
     name: Option<String>,
 ) -> PackageBuildResult<DiagnosticTensor> {
     let mid_value = mid
-        .values
+        .logical_values
         .get(value.index() as usize)
         .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
     let low_value = low.values.iter().find(|candidate| candidate.value == value);
@@ -1648,7 +1633,7 @@ fn input_binding(
     program: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
-    input: &crate::LowInput,
+    input: &crate::ProgramInput,
 ) -> PackageBuildResult<Binding> {
     binding(
         program,
@@ -1663,7 +1648,7 @@ fn output_binding(
     program: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
-    output: &LowValue,
+    output: &ValueBlocks,
     index: usize,
 ) -> PackageBuildResult<Binding> {
     binding(
@@ -2133,7 +2118,7 @@ fn binding(
     placement: &crate::Placement,
     topology: &Topology,
     name: String,
-    shards: &[crate::LowShardId],
+    shards: &[crate::BlockValueId],
 ) -> PackageBuildResult<Binding> {
     let first = shards
         .first()

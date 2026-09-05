@@ -1,7 +1,8 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
-use crate::low::{LowProgram, LowShardId, ShardDefinition, TileWorkList, TileWorkRef};
+use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
+use crate::mid::{BlockValueId, ShardDefinition};
 use crate::mid::{MemoryClass, MemoryOperand, OperandRequirement};
 use crate::{StorageError, shard_storage_bytes};
 use ipu_package::{
@@ -13,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
-    pub shard_addresses: BTreeMap<LowShardId, u32>,
+    pub shard_addresses: BTreeMap<BlockValueId, u32>,
     pub tile_auxiliary_ranges: Vec<Vec<(u32, u32)>>,
 }
 
@@ -174,7 +175,7 @@ fn place_tile(
     root_of_member: &[usize],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
-) -> Result<(u16, BTreeMap<LowShardId, u32>, Vec<(u32, u32)>), PlacementError> {
+) -> Result<(u16, BTreeMap<BlockValueId, u32>, Vec<(u32, u32)>), PlacementError> {
     let mut grouped = BTreeSet::<usize>::new();
     for group in iterated.iter().filter(|group| group.tile == tile) {
         let roots = group
@@ -278,7 +279,7 @@ fn touch_work(
     lifetimes: &mut [Lifetime],
 ) {
     let current = *event;
-    let mut touch = |shard: LowShardId| lifetimes[shard.index() as usize].touch(current);
+    let mut touch = |shard: BlockValueId| lifetimes[shard.index() as usize].touch(current);
     match work {
         TileWorkRef::Kernel(run) => {
             for view in run.inputs.iter().flat_map(|operand| &operand.views) {
@@ -444,8 +445,8 @@ fn apply_requirement(target: &mut Requirement, requirement: &OperandRequirement)
 fn checked_union(
     program: &LowProgram,
     sets: &mut DisjointSets,
-    left: LowShardId,
-    right: LowShardId,
+    left: BlockValueId,
+    right: BlockValueId,
 ) -> Result<(), PlacementError> {
     let Some(left_shard) = program.shards.get(left.index() as usize) else {
         return Err(PlacementError::InvalidAlias(left.index()));
@@ -524,13 +525,13 @@ fn allocation_alignment(program: &LowProgram, members: &[usize], requirement: Re
 }
 
 fn assign_members(
-    addresses: &mut BTreeMap<LowShardId, u32>,
+    addresses: &mut BTreeMap<BlockValueId, u32>,
     members: &[usize],
     address: u32,
 ) -> Result<(), PlacementError> {
     for &member in members {
         addresses.insert(
-            LowShardId::from_index(u32::try_from(member).map_err(|_| PlacementError::Overflow)?),
+            BlockValueId::from_index(u32::try_from(member).map_err(|_| PlacementError::Overflow)?),
             address,
         );
     }
@@ -549,7 +550,7 @@ fn allocate_tile_class(
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
     arena: &mut Arena,
-    addresses: &mut BTreeMap<LowShardId, u32>,
+    addresses: &mut BTreeMap<BlockValueId, u32>,
 ) -> Result<(), PlacementError> {
     let mut requests = Vec::<AllocationRequest>::new();
     for group in iterated.iter().filter(|group| group.tile == tile) {
@@ -666,7 +667,7 @@ struct AllocationRequest {
 #[derive(Clone, Debug)]
 struct IteratedGroup {
     tile: u16,
-    shards: Vec<LowShardId>,
+    shards: Vec<BlockValueId>,
     stride: u32,
     alignment: u32,
 }
@@ -863,7 +864,11 @@ mod tests {
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
+            let low = lower_to_tiles(
+                &crate::mid::build_blocks(&mid).unwrap(),
+                config.diagnostic_checkpoints,
+            )
+            .unwrap();
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let resident = low
@@ -960,7 +965,11 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let sum = mid.operations[0].results[0];
             let output = mid.operations[1].results[0];
-            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
+            let low = lower_to_tiles(
+                &crate::mid::build_blocks(&mid).unwrap(),
+                config.diagnostic_checkpoints,
+            )
+            .unwrap();
             let placement = place(&low).unwrap();
             for tile in 0..tiles {
                 let shard = |value| {

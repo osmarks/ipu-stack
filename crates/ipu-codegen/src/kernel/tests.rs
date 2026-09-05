@@ -43,7 +43,7 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
             },
             Vec::new(),
             ShardView {
-                shard: LowShardId::from_index(0),
+                shard: BlockValueId::from_index(0),
                 extents: [outer, semantic_rows, semantic_columns]
                     .into_iter()
                     .enumerate()
@@ -155,7 +155,11 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 },
             );
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
+        let low = lower_to_tiles(
+            &crate::mid::build_blocks(&mid).unwrap(),
+            config.diagnostic_checkpoints,
+        )
+        .unwrap();
         let plan = KernelBuildPlan::from_program(&low).unwrap();
         let addresses = low
             .shards
@@ -319,7 +323,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             layout: Layout::row_major(TensorTiling::replicated(1)),
         };
         let output = ShardView {
-            shard: LowShardId::from_index(0),
+            shard: BlockValueId::from_index(0),
             extents: [rows, 16]
                 .into_iter()
                 .enumerate()

@@ -1,10 +1,10 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
 use crate::{
-    ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep, KernelBuildPlan, LowProgram,
-    LowShardId, PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun,
-    RepeatStep, StepProfile, TileAddress, TileProgram, TileStep, TileWorkList, TileWorkRef,
-    materialize_kernel_run,
+    BlockValueId, ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep,
+    KernelBuildPlan, LowProgram, PhysicalExchangePhase, PlacedExchangeRow, Placement,
+    RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress, TileProgram, TileStep,
+    TileWorkList, TileWorkRef, materialize_kernel_run,
 };
 use std::collections::BTreeMap;
 
@@ -62,9 +62,9 @@ pub enum TileLoweringError {
     )]
     InvalidLocalCopy {
         tile: u16,
-        source_shard: LowShardId,
+        source_shard: BlockValueId,
         source_offset: u32,
-        destination_shard: LowShardId,
+        destination_shard: BlockValueId,
         destination_offset: u32,
         bytes: u32,
     },
@@ -209,7 +209,7 @@ fn lower_work(
     kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
-    overrides: &BTreeMap<LowShardId, TileAddress>,
+    overrides: &BTreeMap<BlockValueId, TileAddress>,
     inside_repeat: bool,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
@@ -701,7 +701,11 @@ mod tests {
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
+            let low = lower_to_tiles(
+                &crate::mid::build_blocks(&mid).unwrap(),
+                config.diagnostic_checkpoints,
+            )
+            .unwrap();
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = lower_exchanges(
@@ -757,9 +761,9 @@ mod tests {
             let words = random.u32(1..=4_096);
             let bytes = words * 4;
             let copy = crate::LocalCopy {
-                source: crate::LowShardId::from_index(0),
+                source: crate::BlockValueId::from_index(0),
                 source_offset: 0,
-                destination: crate::LowShardId::from_index(1),
+                destination: crate::BlockValueId::from_index(1),
                 destination_offset: 0,
                 bytes,
                 pattern: crate::CopyPattern::Contiguous,

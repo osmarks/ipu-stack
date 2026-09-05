@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl LowShard {
+impl BlockValue {
     pub(crate) fn storage(&self) -> crate::storage::TensorStorage<'_> {
         crate::storage::TensorStorage {
             format: &self.tensor_type.format,
@@ -11,11 +11,14 @@ impl LowShard {
     }
 }
 
-pub fn shard_storage_bytes(shard: &LowShard) -> Result<u32, StorageError> {
+pub fn shard_storage_bytes(shard: &BlockValue) -> Result<u32, StorageError> {
     crate::storage::storage_bytes(shard.storage())
 }
 
-pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> Result<Vec<ByteSpan>, StorageError> {
+pub fn view_byte_spans(
+    shard: &BlockValue,
+    view: &ShardView,
+) -> Result<Vec<ByteSpan>, StorageError> {
     if view.shard != shard.id {
         return Err(StorageError::WrongShard);
     }
@@ -23,7 +26,7 @@ pub fn view_byte_spans(shard: &LowShard, view: &ShardView) -> Result<Vec<ByteSpa
 }
 
 pub fn logical_view_byte_spans(
-    shard: &LowShard,
+    shard: &BlockValue,
     view: &ShardView,
 ) -> Result<Vec<ByteSpan>, StorageError> {
     if view.shard != shard.id {
@@ -33,13 +36,13 @@ pub fn logical_view_byte_spans(
 }
 
 pub(super) fn append_span_copies(
-    shards: &[LowShard],
+    shards: &[BlockValue],
     source: &ShardView,
     destination: &ShardView,
     tile: u16,
     copies: &mut Vec<(u16, LocalCopy)>,
     order: CopyOrder,
-) -> LowLoweringResult<()> {
+) -> BlockBuildResult<()> {
     let spans = match order {
         CopyOrder::Semantic => logical_view_byte_spans,
         CopyOrder::Physical => view_byte_spans,

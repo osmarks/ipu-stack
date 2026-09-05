@@ -462,8 +462,8 @@ fn randomized_resolved_capacity_matches_physical_storage() {
             let resolved = tensor.format.layout.resolve(&tensor.shape).unwrap();
             let mut tile_bytes = vec![0_u64; usize::from(tensor.format.layout.tiling.tile_count)];
             for (tile, extents) in resolved.shard_extents().unwrap() {
-                let bytes = crate::shard_storage_bytes(&crate::LowShard {
-                    id: crate::LowShardId::from_index(0),
+                let bytes = crate::shard_storage_bytes(&crate::BlockValue {
+                    id: crate::BlockValueId::from_index(0),
                     tile,
                     tensor_type: tensor.clone(),
                     extents,

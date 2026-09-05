@@ -7,15 +7,15 @@ pub(super) fn split_gemm_matrices(
     axis: usize,
     coordinates: &mut [u32],
     runs: &mut Vec<KernelRun>,
-) -> LowLoweringResult<()> {
+) -> BlockBuildResult<()> {
     if axis < coordinates.len() {
         let extent = run
             .output
             .extents
             .get(axis)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         if extent.logical_end != extent.physical_end {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         for coordinate in extent.start..extent.physical_end {
             coordinates[axis] = coordinate;
@@ -38,10 +38,10 @@ pub(super) fn split_gemm_matrices(
 pub(super) fn narrow_gemm_matrix_view(
     view: &mut ShardView,
     output_coordinates: &[u32],
-) -> LowLoweringResult<()> {
+) -> BlockBuildResult<()> {
     let input_axes = view.extents.len().saturating_sub(2);
     if input_axes > output_coordinates.len() {
-        return Err(LowLoweringError::InvalidOperatorPlan);
+        return Err(BlockBuildError::InvalidOperatorPlan);
     }
     let output_axis_offset = output_coordinates.len() - input_axes;
     for (axis, extent) in view.extents[..input_axes].iter_mut().enumerate() {
@@ -50,7 +50,7 @@ pub(super) fn narrow_gemm_matrix_view(
         }
         let coordinate = output_coordinates[output_axis_offset + axis];
         if coordinate < extent.start || coordinate >= extent.physical_end {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         extent.start = coordinate;
         extent.logical_end = coordinate + 1;
@@ -62,13 +62,13 @@ pub(super) fn narrow_gemm_matrix_view(
 impl LoweringState {
     pub(super) fn right_shard_for_block(
         &self,
-        right_shards: &[LowShardId],
+        right_shards: &[BlockValueId],
         tile: u16,
         column_start: u32,
         column_end: u32,
         inner_start: u32,
         inner_end: u32,
-    ) -> Option<LowShardId> {
+    ) -> Option<BlockValueId> {
         self.right_shards_for_block(
             right_shards,
             column_start,
@@ -81,12 +81,12 @@ impl LoweringState {
 
     pub(super) fn right_shards_for_block<'a>(
         &'a self,
-        right_shards: &'a [LowShardId],
+        right_shards: &'a [BlockValueId],
         column_start: u32,
         column_end: u32,
         inner_start: u32,
         inner_end: u32,
-    ) -> impl Iterator<Item = LowShardId> + 'a {
+    ) -> impl Iterator<Item = BlockValueId> + 'a {
         right_shards.iter().copied().filter(move |shard| {
             let extents = &self.shards[shard.index() as usize].extents;
             let columns = extents[extents.len() - 1];
@@ -100,14 +100,14 @@ impl LoweringState {
 
     pub(super) fn matrix_shards_for_block<'a>(
         &'a self,
-        shards: &'a [LowShardId],
+        shards: &'a [BlockValueId],
         column_axis: usize,
         inner_axis: usize,
         column_start: u32,
         column_end: u32,
         inner_start: u32,
         inner_end: u32,
-    ) -> impl Iterator<Item = LowShardId> + 'a {
+    ) -> impl Iterator<Item = BlockValueId> + 'a {
         shards.iter().copied().filter(move |shard| {
             let extents = &self.shards[shard.index() as usize].extents;
             let columns = extents[column_axis];
@@ -121,9 +121,9 @@ impl LoweringState {
 
     pub(super) fn prefer_local_shard(
         &self,
-        shards: &[LowShardId],
+        shards: &[BlockValueId],
         tile: u16,
-    ) -> Option<LowShardId> {
+    ) -> Option<BlockValueId> {
         shards
             .iter()
             .copied()
@@ -132,12 +132,12 @@ impl LoweringState {
 
     pub(super) fn use_uniform_interleaved_gemm_staging(
         &self,
-        output_shards: &[LowShardId],
-        right_shards: &[LowShardId],
+        output_shards: &[BlockValueId],
+        right_shards: &[BlockValueId],
         columns: Range<u32>,
         inner: Range<u32>,
         access_tail: u32,
-    ) -> LowLoweringResult<bool> {
+    ) -> BlockBuildResult<bool> {
         let mut candidates = Vec::with_capacity(output_shards.len());
         for output in output_shards {
             let tile = self.shards[output.index() as usize].tile;
@@ -173,7 +173,7 @@ impl LoweringState {
             let bytes = spans.iter().try_fold(0u32, |total, span| {
                 total
                     .checked_add(span.bytes)
-                    .ok_or(LowLoweringError::IdOverflow)
+                    .ok_or(BlockBuildError::IdOverflow)
             })?;
             candidates.push((tile, bytes));
         }
@@ -196,8 +196,8 @@ impl LoweringState {
         orientation: crate::GemmOrientation,
         distribution: GemmDistribution,
         requirements: &StorageRequirements,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         if let GemmDistribution::ParallelReduction {
             row_partitions,
             column_partitions,
@@ -225,13 +225,13 @@ impl LoweringState {
             );
         }
         if orientation != crate::GemmOrientation::Normal {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let [left_value, right_value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         if requirements.inputs[1]
             .format
@@ -252,7 +252,7 @@ impl LoweringState {
             );
         }
         if inner_block == 0 || output_column_block == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let left_shards = self.value_shards(*left_value)?.to_vec();
         let right_shards = self.value_shards(*right_value)?.to_vec();
@@ -262,7 +262,7 @@ impl LoweringState {
         let left_rank = left_type.shape.0.len();
         let output_rank = output_type.shape.0.len();
         if left_rank < 2 || output_rank < 2 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let inner_extent = left_type.format.layout.padded_shape(&left_type.shape)?.0[left_rank - 1];
         let column_extent = output_type
@@ -273,19 +273,19 @@ impl LoweringState {
         if !inner_extent.is_multiple_of(inner_block)
             || !column_extent.is_multiple_of(output_column_block)
         {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
 
         let panels_per_phase = column_extent / output_column_block;
         let phase_column_width = output_column_block
             .checked_mul(panels_per_phase)
-            .ok_or(LowLoweringError::IdOverflow)?;
-        let mut local_right_staging = BTreeMap::<(u16, u32), LowShardId>::new();
+            .ok_or(BlockBuildError::IdOverflow)?;
+        let mut local_right_staging = BTreeMap::<(u16, u32), BlockValueId>::new();
         let mut remote_right_staging = vec![
             vec![
                 None;
                 usize::try_from(panels_per_phase)
-                    .map_err(|_| LowLoweringError::IdOverflow)?
+                    .map_err(|_| BlockBuildError::IdOverflow)?
             ];
             usize::from(self.tile_count)
         ];
@@ -313,7 +313,7 @@ impl LoweringState {
                         )
                         .collect::<Vec<_>>();
                     if right_candidates.is_empty() {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
+                        return Err(BlockBuildError::InvalidOperatorPlan);
                     }
                     let column_outputs = output_shards
                         .iter()
@@ -325,7 +325,7 @@ impl LoweringState {
                         })
                         .collect::<Vec<_>>();
                     if column_outputs.is_empty() {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
+                        return Err(BlockBuildError::InvalidOperatorPlan);
                     }
                     let use_interleaved_staging = self.use_uniform_interleaved_gemm_staging(
                         &column_outputs,
@@ -336,7 +336,7 @@ impl LoweringState {
                     )?;
                     let staging_slot =
                         usize::try_from((column_start - phase_column_start) / output_column_block)
-                            .map_err(|_| LowLoweringError::IdOverflow)?;
+                            .map_err(|_| BlockBuildError::IdOverflow)?;
                     for output in &column_outputs {
                         let tile = self.shards[output.index() as usize].tile;
                         let left_view = if let Some(view) = left_views.get(&tile) {
@@ -354,7 +354,7 @@ impl LoweringState {
                         };
                         let right = self
                             .prefer_local_shard(&right_candidates, tile)
-                            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                         let right_rank = self.shards[right.index() as usize].extents.len();
                         let right_view = self.narrow_view(
                             right,
@@ -384,8 +384,8 @@ impl LoweringState {
                                     tensor_type.format.layout.memory_class =
                                         crate::MemoryClass::Ipu21Interleaved;
                                 }
-                                let copy = self.push_shard(LowShard {
-                                    id: LowShardId(0),
+                                let copy = self.push_shard(BlockValue {
+                                    id: BlockValueId(0),
                                     tile,
                                     tensor_type,
                                     extents: right_view.extents.clone(),
@@ -409,7 +409,7 @@ impl LoweringState {
                                     ));
                                     destination_offset = destination_offset
                                         .checked_add(span.bytes)
-                                        .ok_or(LowLoweringError::IdOverflow)?;
+                                        .ok_or(BlockBuildError::IdOverflow)?;
                                 }
                                 self.full_view(copy)
                             }
@@ -418,8 +418,8 @@ impl LoweringState {
                             let copy = if let Some(copy) = *slot {
                                 copy
                             } else {
-                                let copy = self.push_shard(LowShard {
-                                    id: LowShardId(0),
+                                let copy = self.push_shard(BlockValue {
+                                    id: BlockValueId(0),
                                     tile,
                                     tensor_type: self.shards[right.index() as usize]
                                         .tensor_type
@@ -517,13 +517,13 @@ impl LoweringState {
         result_column_partitions: u16,
         reduction_staging: crate::ReductionStaging,
         requirements: &StorageRequirements,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         if inner_block == 0
             || output_column_block == 0
@@ -534,7 +534,7 @@ impl LoweringState {
             || result_column_partitions == 0
             || result_row_partitions.saturating_mul(result_column_partitions) > inner_partitions
         {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let (left_index, right_index) = orientation.operand_indices();
         let values = [semantic_left_value, semantic_right_value];
@@ -554,7 +554,7 @@ impl LoweringState {
         let right_rank = self.shards[right_shards[0].index() as usize].extents.len();
         let output_rank = self.shards[output_shards[0].index() as usize].extents.len();
         if left_rank < 2 || output_rank < 2 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let (left_row_axis, left_inner_axis) = orientation.matrix_axes(left_rank);
         let (right_inner_axis, right_column_axis) = orientation.matrix_axes(right_rank);
@@ -574,7 +574,7 @@ impl LoweringState {
             .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
             .map(|axis| axis.block_size)
             .filter(|grain| *grain != 0)
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let column_tiling = output_type
             .format
             .layout
@@ -582,12 +582,12 @@ impl LoweringState {
             .axes
             .iter()
             .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
         let column_blocks = physical_columns / column_grain;
         if !physical_columns.is_multiple_of(column_grain)
             || column_blocks < u32::from(column_partitions)
         {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let short_blocks = column_blocks / u32::from(column_partitions);
         let long_partitions = column_blocks % u32::from(column_partitions);
@@ -596,7 +596,7 @@ impl LoweringState {
                 if column_tiling.partitions == column_partitions {
                     return column_tiling
                         .shard_bounds(physical_columns, logical_columns, partition)
-                        .map_err(LowLoweringError::from);
+                        .map_err(BlockBuildError::from);
                 }
                 let start_blocks = partition
                     .saturating_mul(short_blocks)
@@ -612,14 +612,14 @@ impl LoweringState {
                     physical_end,
                 ))
             })
-            .collect::<LowLoweringResult<Vec<_>>>()?;
+            .collect::<BlockBuildResult<Vec<_>>>()?;
         let partial_type = operation
             .operator_plan()
-            .ok_or(LowLoweringError::InvalidOperatorPlan)?
+            .ok_or(BlockBuildError::InvalidOperatorPlan)?
             .dispatch
             .gemm_partial_tensor(&output_type);
 
-        let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<LowShardId>>::new();
+        let mut replica_groups = BTreeMap::<Vec<(u32, u32)>, Vec<BlockValueId>>::new();
         for left in left_shards.iter().copied() {
             let key = self.shards[left.index() as usize]
                 .extents
@@ -628,16 +628,16 @@ impl LoweringState {
                 .collect::<Vec<_>>();
             replica_groups.entry(key).or_default().push(left);
         }
-        let mut replica_columns = BTreeMap::<LowShardId, u16>::new();
+        let mut replica_columns = BTreeMap::<BlockValueId, u16>::new();
         for replicas in replica_groups.values_mut() {
             replicas.sort_unstable_by_key(|shard| self.shards[shard.index() as usize].tile);
             if replicas.len() != usize::from(column_partitions) {
-                return Err(LowLoweringError::InvalidOperatorPlan);
+                return Err(BlockBuildError::InvalidOperatorPlan);
             }
             for (column, shard) in replicas.iter().copied().enumerate() {
                 replica_columns.insert(
                     shard,
-                    u16::try_from(column).map_err(|_| LowLoweringError::IdOverflow)?,
+                    u16::try_from(column).map_err(|_| BlockBuildError::IdOverflow)?,
                 );
             }
         }
@@ -646,19 +646,19 @@ impl LoweringState {
             let mut local_copies = Vec::<(u16, LocalCopy)>::new();
             let mut gemm_runs = Vec::<(u16, KernelRun)>::new();
             let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
-            let mut resident_lefts = BTreeMap::<LowShardId, ShardView>::new();
-            let mut weight_staging = BTreeMap::<(u16, LowShardId), LowShardId>::new();
+            let mut resident_lefts = BTreeMap::<BlockValueId, ShardView>::new();
+            let mut weight_staging = BTreeMap::<(u16, BlockValueId), BlockValueId>::new();
             for (output_column, &(column_start, logical_column_end, column_end)) in
                 columns.iter().enumerate()
             {
                 let output_column =
-                    u32::try_from(output_column).map_err(|_| LowLoweringError::IdOverflow)?;
+                    u32::try_from(output_column).map_err(|_| BlockBuildError::IdOverflow)?;
                 let local_output_columns = column_end - column_start;
                 if local_output_columns == 0
                     || local_output_columns > output_column_block
                     || !local_output_columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO)
                 {
-                    return Err(LowLoweringError::InvalidOperatorPlan);
+                    return Err(BlockBuildError::InvalidOperatorPlan);
                 }
                 for left in left_shards.iter().copied() {
                     let left_shard = self.shards[left.index() as usize].clone();
@@ -682,14 +682,14 @@ impl LoweringState {
                             != crate::OperandMaterialization::DispatchSlices
                             && view.shard != left
                         {
-                            return Err(LowLoweringError::InvalidOperatorPlan);
+                            return Err(BlockBuildError::InvalidOperatorPlan);
                         }
                         resident_lefts.insert(left, view.clone());
                         view
                     };
                     let inner = left_shard.extents[left_inner_axis];
                     if !(inner.physical_end - inner.start).is_multiple_of(inner_block) {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
+                        return Err(BlockBuildError::InvalidOperatorPlan);
                     }
                     if replica_columns.get(&left).copied().map(u32::from) != Some(output_column) {
                         continue;
@@ -719,15 +719,15 @@ impl LoweringState {
                         {
                             *extent = left_shard.extents[axis];
                             extent.axis =
-                                u16::try_from(axis).map_err(|_| LowLoweringError::IdOverflow)?;
+                                u16::try_from(axis).map_err(|_| BlockBuildError::IdOverflow)?;
                         }
                     }
                     extents[output_row_axis] = left_shard.extents[left_row_axis];
                     extents[output_row_axis].axis =
-                        u16::try_from(output_row_axis).map_err(|_| LowLoweringError::IdOverflow)?;
+                        u16::try_from(output_row_axis).map_err(|_| BlockBuildError::IdOverflow)?;
                     extents[output_column_axis] = ShardExtent {
                         axis: u16::try_from(output_column_axis)
-                            .map_err(|_| LowLoweringError::IdOverflow)?,
+                            .map_err(|_| BlockBuildError::IdOverflow)?,
                         start: column_start,
                         logical_end: logical_column_end,
                         physical_end: column_end,
@@ -755,8 +755,8 @@ impl LoweringState {
                             extents: extents.clone(),
                         }
                     } else {
-                        let partial = self.push_shard(LowShard {
-                            id: LowShardId(0),
+                        let partial = self.push_shard(BlockValue {
+                            id: BlockValueId(0),
                             tile: left_shard.tile,
                             tensor_type: partial_type.clone(),
                             extents,
@@ -796,7 +796,7 @@ impl LoweringState {
                             first_panel_end,
                         )
                         .next()
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                     let mut weight_type = self.shards[first_source.index() as usize]
                         .tensor_type
                         .clone();
@@ -823,8 +823,8 @@ impl LoweringState {
                         if let Some(staging) = weight_staging.get(&key).copied() {
                             Some(staging)
                         } else {
-                            let staging = self.push_shard(LowShard {
-                                id: LowShardId(0),
+                            let staging = self.push_shard(BlockValue {
+                                id: BlockValueId(0),
                                 tile: left_shard.tile,
                                 tensor_type: weight_type,
                                 extents: weight_extents,
@@ -856,7 +856,7 @@ impl LoweringState {
                                     panel_end,
                                 )
                                 .next()
-                                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                             let target_view = self.narrow_view(
                                 source,
                                 &[
@@ -869,7 +869,7 @@ impl LoweringState {
                             let consume_direct = source_is_local && !stage_local_sources;
                             if !consume_direct {
                                 let destination_view = self.narrow_view(
-                                    weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                                    weights.ok_or(BlockBuildError::InvalidOperatorPlan)?,
                                     &[
                                         (right_inner_axis, panel_start, panel_end),
                                         (right_column_axis, column_start, column_end),
@@ -900,7 +900,7 @@ impl LoweringState {
                             {
                                 let panel_start = inner_start
                                     + u32::try_from(panel_index)
-                                        .map_err(|_| LowLoweringError::IdOverflow)?
+                                        .map_err(|_| BlockBuildError::IdOverflow)?
                                         * source_panel_block;
                                 let panel_end = panel_start + source_panel_block;
                                 let left_view = self.narrow_view(
@@ -924,7 +924,7 @@ impl LoweringState {
                                     let selected = if local {
                                         source_view.shard
                                     } else {
-                                        weights.ok_or(LowLoweringError::InvalidOperatorPlan)?
+                                        weights.ok_or(BlockBuildError::InvalidOperatorPlan)?
                                     };
                                     *load = if self.shards[selected.index() as usize]
                                         .tensor_type
@@ -942,7 +942,7 @@ impl LoweringState {
                                     source_view
                                 } else {
                                     self.narrow_view(
-                                        weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                                        weights.ok_or(BlockBuildError::InvalidOperatorPlan)?,
                                         &[
                                             (right_inner_axis, panel_start, panel_end),
                                             (right_column_axis, column_start, column_end),
@@ -995,7 +995,7 @@ impl LoweringState {
                             let selected = if sources.len() == 1 && sources[0].1 {
                                 sources[0].0.shard
                             } else {
-                                weights.ok_or(LowLoweringError::InvalidOperatorPlan)?
+                                weights.ok_or(BlockBuildError::InvalidOperatorPlan)?
                             };
                             *load = if self.shards[selected.index() as usize]
                                 .tensor_type
@@ -1013,7 +1013,7 @@ impl LoweringState {
                             sources.pop().expect("one source").0
                         } else {
                             self.narrow_view(
-                                weights.ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                                weights.ok_or(BlockBuildError::InvalidOperatorPlan)?,
                                 &[
                                     (right_inner_axis, inner_start, inner_end),
                                     (right_column_axis, column_start, column_end),
@@ -1086,7 +1086,7 @@ impl LoweringState {
             let mut reduction_roots = 0usize;
             for contributors in partials.into_values() {
                 let Some((_, complete)) = contributors.first() else {
-                    return Err(LowLoweringError::InvalidOperatorPlan);
+                    return Err(BlockBuildError::InvalidOperatorPlan);
                 };
                 let expected = complete
                     .extents
@@ -1094,7 +1094,7 @@ impl LoweringState {
                     .try_fold(1u64, |elements, extent| {
                         elements.checked_mul(u64::from(extent.physical_end - extent.start))
                     })
-                    .ok_or(LowLoweringError::IdOverflow)?;
+                    .ok_or(BlockBuildError::IdOverflow)?;
                 let mut covered = 0u64;
                 for output in output_shards.iter().copied() {
                     let owner = self.shards[output.index() as usize].clone();
@@ -1108,13 +1108,13 @@ impl LoweringState {
                         .try_fold(1u32, |elements, extent| {
                             elements.checked_mul(extent.physical_end - extent.start)
                         })
-                        .ok_or(LowLoweringError::IdOverflow)?;
+                        .ok_or(BlockBuildError::IdOverflow)?;
                     if elements == 0 || !elements.is_multiple_of(8) {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
+                        return Err(BlockBuildError::InvalidOperatorPlan);
                     }
                     covered = covered
                         .checked_add(u64::from(elements))
-                        .ok_or(LowLoweringError::IdOverflow)?;
+                        .ok_or(BlockBuildError::IdOverflow)?;
 
                     let initial = self.push_packed_buffer(
                         owner.tile,
@@ -1124,7 +1124,7 @@ impl LoweringState {
                     )?;
                     let remote_elements = elements
                         .checked_mul(u32::from(remote_partials_per_stage))
-                        .ok_or(LowLoweringError::IdOverflow)?;
+                        .ok_or(BlockBuildError::IdOverflow)?;
                     let remote = self.push_packed_buffer(
                         owner.tile,
                         remote_elements,
@@ -1174,12 +1174,12 @@ impl LoweringState {
                     {
                         for (slot, partial) in chunk.iter().enumerate() {
                             let start = u32::try_from(slot)
-                                .map_err(|_| LowLoweringError::IdOverflow)?
+                                .map_err(|_| BlockBuildError::IdOverflow)?
                                 .checked_mul(elements)
-                                .ok_or(LowLoweringError::IdOverflow)?;
+                                .ok_or(BlockBuildError::IdOverflow)?;
                             let end = start
                                 .checked_add(elements)
-                                .ok_or(LowLoweringError::IdOverflow)?;
+                                .ok_or(BlockBuildError::IdOverflow)?;
                             reduction_transfers[stage]
                                 .entry(source_view(partial))
                                 .or_default()
@@ -1208,7 +1208,7 @@ impl LoweringState {
                                 },
                                 TileKernelSpec::ReductionSum {
                                     partials: u16::try_from(chunk.len() + 1)
-                                        .map_err(|_| LowLoweringError::IdOverflow)?,
+                                        .map_err(|_| BlockBuildError::IdOverflow)?,
                                 },
                                 vec![
                                     KernelOperand {
@@ -1242,7 +1242,7 @@ impl LoweringState {
                     reduction_roots += 1;
                 }
                 if covered != expected {
-                    return Err(LowLoweringError::InvalidOperatorPlan);
+                    return Err(BlockBuildError::InvalidOperatorPlan);
                 }
             }
             for (stage, (transfers, runs)) in reduction_transfers
@@ -1285,16 +1285,16 @@ impl LoweringState {
         inner_block: u32,
         output_column_block: u32,
         requirements: &StorageRequirements,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let [left_value, right_value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         if inner_block == 0 || output_column_block == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let left_shards = self.value_shards(*left_value)?.to_vec();
         let right_shards = self.value_shards(*right_value)?.to_vec();
@@ -1304,7 +1304,7 @@ impl LoweringState {
         let left_rank = left_type.shape.0.len();
         let output_rank = output_type.shape.0.len();
         if left_rank < 2 || output_rank < 2 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let inner_extent = left_type.format.layout.padded_shape(&left_type.shape)?.0[left_rank - 1];
         let column_extent = output_type
@@ -1315,19 +1315,19 @@ impl LoweringState {
         if !inner_extent.is_multiple_of(inner_block)
             || !column_extent.is_multiple_of(output_column_block)
         {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let staging_bytes = inner_block
             .checked_mul(output_column_block)
             .and_then(|elements| {
                 elements.checked_mul(requirements.inputs[1].format.precision.bytes() as u32)
             })
-            .ok_or(LowLoweringError::IdOverflow)?;
+            .ok_or(BlockBuildError::IdOverflow)?;
         let use_interleaved_staging = requirements.inputs[1].format.precision
             == crate::Precision::F16
             && output_shards.iter().try_fold(true, |available, output| {
                 let tile = self.shards[output.index() as usize].tile;
-                Ok::<_, LowLoweringError>(
+                Ok::<_, BlockBuildError>(
                     available
                         && self.interleaved_capacity_available(
                             tile,
@@ -1336,12 +1336,12 @@ impl LoweringState {
                         )?,
                 )
             })?;
-        let mut staging = BTreeMap::<(u16, u32), LowShardId>::new();
-        let mut local_staging = BTreeMap::<(u16, u32), LowShardId>::new();
+        let mut staging = BTreeMap::<(u16, u32), BlockValueId>::new();
+        let mut local_staging = BTreeMap::<(u16, u32), BlockValueId>::new();
         let columns_per_phase = column_extent / output_column_block;
         let column_phase_width = output_column_block
             .checked_mul(columns_per_phase)
-            .ok_or(LowLoweringError::IdOverflow)?;
+            .ok_or(BlockBuildError::IdOverflow)?;
 
         for inner_start in (0..inner_extent).step_by(inner_block as usize) {
             let inner_end = inner_start + inner_block;
@@ -1367,7 +1367,7 @@ impl LoweringState {
                         )
                         .collect::<Vec<_>>();
                     if right_candidates.is_empty() {
-                        return Err(LowLoweringError::InvalidOperatorPlan);
+                        return Err(BlockBuildError::InvalidOperatorPlan);
                     }
                     let column_outputs = output_shards
                         .iter()
@@ -1395,7 +1395,7 @@ impl LoweringState {
                         };
                         let right = self
                             .prefer_local_shard(&right_candidates, tile)
-                            .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                         let right_rank = self.shards[right.index() as usize].extents.len();
                         let right_view = self.narrow_view(
                             right,
@@ -1434,8 +1434,8 @@ impl LoweringState {
                                         tensor_type.format.layout.memory_class =
                                             crate::MemoryClass::Ipu21Interleaved;
                                     }
-                                    let resident = self.push_shard(LowShard {
-                                        id: LowShardId(0),
+                                    let resident = self.push_shard(BlockValue {
+                                        id: BlockValueId(0),
                                         tile,
                                         tensor_type,
                                         extents: right_view.extents.clone(),
@@ -1464,7 +1464,7 @@ impl LoweringState {
                                         ));
                                         destination_offset = destination_offset
                                             .checked_add(span.bytes)
-                                            .ok_or(LowLoweringError::IdOverflow)?;
+                                            .ok_or(BlockBuildError::IdOverflow)?;
                                     }
                                 } else {
                                     transfers

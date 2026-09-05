@@ -1,3 +1,10 @@
+use crate::low::*;
+fn lower_to_tiles(
+    graph: &crate::ImplementationCandidate,
+    checkpoints: bool,
+) -> super::BlockBuildResult<crate::LowProgram> {
+    crate::low::lower_to_tiles(&super::build_blocks(graph)?, checkpoints)
+}
 use super::*;
 use crate::{
     AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution, GridOrder,
@@ -787,8 +794,8 @@ fn randomized_partition_padding_preserves_logical_groups() {
                 cursor = extents[1].logical_end;
                 allocated += extents[1].physical_end - extents[1].start;
                 assert_eq!(
-                    crate::shard_storage_bytes(&LowShard {
-                        id: LowShardId(0),
+                    crate::shard_storage_bytes(&BlockValue {
+                        id: BlockValueId(0),
                         tile: 0,
                         tensor_type: tensor.clone(),
                         extents: extents.clone(),
@@ -927,8 +934,8 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
         } else {
             AMP_INNER_BLOCK
         };
-        let source = LowShard {
-            id: LowShardId(0),
+        let source = BlockValue {
+            id: BlockValueId(0),
             tile: 0,
             tensor_type: TensorType::new(
                 [rows, AMP_COLUMN_MICRO],
@@ -955,8 +962,8 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             ],
             definition: ShardDefinition::ExchangeStaging,
         };
-        let destination = LowShard {
-            id: LowShardId(1),
+        let destination = BlockValue {
+            id: BlockValueId(1),
             tile: 1,
             tensor_type: TensorType::new(
                 [rows, AMP_COLUMN_MICRO],
@@ -986,7 +993,7 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             ],
             definition: ShardDefinition::ExchangeStaging,
         };
-        let logical_view = |shard: &LowShard| ShardView {
+        let logical_view = |shard: &BlockValue| ShardView {
             shard: shard.id,
             extents: shard
                 .extents

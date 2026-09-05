@@ -16,8 +16,8 @@ use specialization::*;
 
 use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AmpOrder, BlockMajorOrder, ComputeStep, ElementOrder, GemmKernelMode, GemmWeightLoad,
-    KernelRun, LowProgram, LowShard, LowShardId, Precision, StepProfile, StorageError,
+    AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, GemmKernelMode,
+    GemmWeightLoad, KernelRun, LowProgram, Precision, StepProfile, StorageError,
     StorageRequirements, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,10 +47,10 @@ pub enum KernelMaterializationError {
 /// linked specialization and ABI scalar values.
 pub fn materialize_kernel_run(
     run: &KernelRun,
-    shards: &[LowShard],
-    shard_addresses: &BTreeMap<LowShardId, u32>,
+    shards: &[BlockValue],
+    shard_addresses: &BTreeMap<BlockValueId, u32>,
     plan: &KernelBuildPlan,
-    overrides: &BTreeMap<LowShardId, TileAddress>,
+    overrides: &BTreeMap<BlockValueId, TileAddress>,
 ) -> Result<ComputeStep, KernelMaterializationError> {
     let call = plan.call(run)?;
     let resolve = |view: &crate::ShardView| {

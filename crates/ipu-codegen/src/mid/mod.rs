@@ -7,6 +7,13 @@
 //! prices them with a [`CostModel`], and inserts explicit precision casts and
 //! layout rearrangements at format boundaries.
 
+mod block;
+mod implementation;
+pub use block::*;
+pub use implementation::{
+    BlockBuildError, logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
+};
+
 mod candidates;
 mod copy;
 pub use copy::*;
@@ -27,7 +34,19 @@ pub use layout::*;
 pub use operator::*;
 #[cfg(test)]
 pub(crate) use planner::lower;
-pub(crate) use planner::lower_finalists;
+pub(crate) fn lower_finalists(
+    graph: &ComputeGraph,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    count: usize,
+) -> LoweringResult<Vec<std::sync::Arc<MidProgram>>> {
+    planner::plan_finalists(graph, config, costs, count)?
+        .iter()
+        .map(|candidate| implementation::build_blocks(candidate).map_err(LoweringError::from))
+        .collect()
+}
+#[cfg(test)]
+pub(crate) use implementation::build_blocks;
 use planner::*;
 
 use crate::estimate::MemoizedCostModel;
@@ -321,7 +340,7 @@ pub struct MidInput {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MidGraph {
+pub struct ImplementationCandidate {
     pub tile_count: u16,
     pub inputs: Vec<MidInput>,
     pub values: Vec<MidValue>,
@@ -336,6 +355,8 @@ pub struct MidGraph {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LoweringError {
+    #[error(transparent)]
+    Blocks(#[from] BlockBuildError),
     #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error(transparent)]

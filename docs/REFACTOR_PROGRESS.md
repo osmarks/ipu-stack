@@ -117,3 +117,32 @@ adding a second parallel schedule only to move policy calls earlier. Flexible
 kernel output layouts and shared GEMM execution/cost stages remain substantial
 extensions, rather than mechanical cleanup. These are useful starting points for
 a subsequent design pass, not claims that the compiler is fully generalized.
+
+## Executable mid blocks (2026-09-05, subsequent request)
+
+User explicitly requested GEMM block/reduction/copy expansion in mid, removal of
+old pathways, and ideally the same migration for attention. Implemented the
+boundary change: mid/implementation builds a whole-device BlockRegion containing
+explicit Compute, Copy, Exchange, Repeat, and Checkpoint operations. BlockValue
+is shared by canonical tensor shards, partials, and staging outputs; no separate
+temporary-value representation. GEMM/attention/conversion expansion files moved
+out of low and now populate that region directly. Low is only a per-tile
+projection, shares the immutable MidProgram through Arc, and has no whole-GEMM or
+attention dispatch. Repeats retain one shared mid body, projected recursively.
+
+The analytical beam still uses implementation recipes as candidate-builder
+inputs (ImplementationCandidate, formerly MidGraph). Production lower_finalists
+constructs executable MidPrograms before scheduled finalist selection; those
+programs do not retain the opaque operation plans. Logical-value metadata and
+checkpoint boundaries remain for diagnostics. Planner unit tests inspect the
+builder inputs; execution tests explicitly build the mid program before low.
+
+144 workspace release tests and Clippy pass (`/tmp/mid-program-*`). Five hardware
+cases pass (`/tmp/mid-blocks-*`), with byte-identical tile images to the preceding
+`/tmp/copy-order-*` packages. The subsequent Arc-sharing cleanup passes the same
+unit checks and changes ownership only. No device code changed.
+
+Next bounded step: extract the parallel-reduction builder from GEMM into a
+reusable mid sum builder over ordinary block views, deriving staging from the
+number of contributors rather than GEMM grid metadata. Add direct mid-region
+validation/coverage and repeat hardware checks after substantive changes.

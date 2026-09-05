@@ -709,19 +709,19 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::low::{
-        LowShard, LowShardId, ShardDefinition, ShardView, logical_view_byte_spans,
-        shard_storage_bytes, view_byte_spans,
-    };
     use crate::mid::ShardExtent;
     use crate::mid::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
         MemoryClass, Precision, TensorTiling, TensorType,
     };
+    use crate::mid::{
+        BlockValue, BlockValueId, ShardDefinition, ShardView, logical_view_byte_spans,
+        shard_storage_bytes, view_byte_spans,
+    };
 
-    fn shard(layout: Layout, dimensions: &[u32]) -> LowShard {
-        LowShard {
-            id: LowShardId::from_index(0),
+    fn shard(layout: Layout, dimensions: &[u32]) -> BlockValue {
+        BlockValue {
+            id: BlockValueId::from_index(0),
             tile: 0,
             tensor_type: TensorType::new(dimensions.iter().copied(), Precision::F16, layout),
             extents: dimensions

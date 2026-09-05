@@ -12,16 +12,16 @@ pub fn lower(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
-) -> LoweringResult<MidGraph> {
-    Ok(lower_finalists(graph, config, costs, 1)?.remove(0))
+) -> LoweringResult<ImplementationCandidate> {
+    Ok(plan_finalists(graph, config, costs, 1)?.remove(0))
 }
 
-pub(crate) fn lower_finalists(
+pub(crate) fn plan_finalists(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
     finalist_count: usize,
-) -> LoweringResult<Vec<MidGraph>> {
+) -> LoweringResult<Vec<ImplementationCandidate>> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -182,7 +182,7 @@ pub(crate) fn lower_finalists(
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
             );
-            let mut graph = MidGraph {
+            let mut graph = ImplementationCandidate {
                 tile_count: config.tile_count,
                 inputs: inputs.clone(),
                 values: branch.state.values,

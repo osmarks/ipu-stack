@@ -1,3 +1,4 @@
+use super::planner::plan_finalists as lower_finalists;
 use super::*;
 
 const RANDOM_CASES: usize = 128;
@@ -164,7 +165,7 @@ fn randomized_shape_aware_tile_candidates_follow_graph_extents() {
     }
 }
 
-fn value(lowered: &MidGraph, id: MidValueId) -> &MidValue {
+fn value(lowered: &ImplementationCandidate, id: MidValueId) -> &MidValue {
     &lowered.values[id.index() as usize]
 }
 
@@ -378,7 +379,7 @@ fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids
     }
 }
 
-fn assert_conversions_are_explicit(lowered: &MidGraph, operations: &[MidOperation]) {
+fn assert_conversions_are_explicit(lowered: &ImplementationCandidate, operations: &[MidOperation]) {
     for operation in operations {
         let [input] = operation.inputs.as_slice() else {
             continue;
@@ -403,7 +404,7 @@ fn assert_conversions_are_explicit(lowered: &MidGraph, operations: &[MidOperatio
 }
 
 fn assert_operator_signature(
-    lowered: &MidGraph,
+    lowered: &ImplementationCandidate,
     operation: &MidOperation,
     inputs: &[TensorFormat],
     output: TensorFormat,
@@ -1227,7 +1228,11 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
                 .sum::<u64>(),
             "random case {case}"
         );
-        let tiled = crate::low::lower_to_tiles(&lowered, config.diagnostic_checkpoints).unwrap_or_else(|error| {
+        let tiled = crate::low::lower_to_tiles(
+            &build_blocks(&lowered).unwrap(),
+            config.diagnostic_checkpoints,
+        )
+        .unwrap_or_else(|error| {
             panic!(
                 "random case {case}, heads {heads}, width {head_width}, tokens {tokens}: {error}"
             )

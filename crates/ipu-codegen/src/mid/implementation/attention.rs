@@ -4,10 +4,10 @@ use super::*;
 
 pub(super) struct PreparedDistributedPanel {
     pub(super) panel: u32,
-    pub(super) row_major: Option<LowShardId>,
-    pub(super) packed: LowShardId,
+    pub(super) row_major: Option<BlockValueId>,
+    pub(super) packed: BlockValueId,
     pub(super) tile: u16,
-    pub(super) destinations: Vec<LowShardId>,
+    pub(super) destinations: Vec<BlockValueId>,
 }
 
 pub(super) struct PreparedAttentionBlock {
@@ -24,13 +24,13 @@ pub(super) struct AttentionTask {
     pub(super) query_rows: u32,
     pub(super) query_dimension: u32,
     pub(super) value_dimension: u32,
-    pub(super) query: LowShardId,
-    pub(super) query_receive: Option<LowShardId>,
-    pub(super) output: LowShardId,
-    pub(super) scratch: LowShardId,
-    pub(super) weights: LowShardId,
-    pub(super) key_staging: LowShardId,
-    pub(super) value_staging: LowShardId,
+    pub(super) query: BlockValueId,
+    pub(super) query_receive: Option<BlockValueId>,
+    pub(super) output: BlockValueId,
+    pub(super) scratch: BlockValueId,
+    pub(super) weights: BlockValueId,
+    pub(super) key_staging: BlockValueId,
+    pub(super) value_staging: BlockValueId,
 }
 
 #[derive(Clone, Copy)]
@@ -57,16 +57,16 @@ impl LoweringState {
         query: MidValueId,
         result: MidValueId,
         shape: AttentionBufferShape,
-    ) -> LowLoweringResult<Vec<AttentionTask>> {
+    ) -> BlockBuildResult<Vec<AttentionTask>> {
         let value_row_block = u16::try_from(shape.physical_staging_rows)
-            .map_err(|_| LowLoweringError::InvalidOperatorPlan)?;
+            .map_err(|_| BlockBuildError::InvalidOperatorPlan)?;
         let outputs = self.value_shards(result)?.to_vec();
         let mut tasks = Vec::with_capacity(outputs.len());
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
             let rank = self.shards[output.index() as usize].extents.len();
             if rank != 3 {
-                return Err(LowLoweringError::InvalidOperatorPlan);
+                return Err(BlockBuildError::InvalidOperatorPlan);
             }
             let rows = self.shards[output.index() as usize].extents[rank - 2].physical_end
                 - self.shards[output.index() as usize].extents[rank - 2].start;
@@ -75,9 +75,9 @@ impl LoweringState {
                 .shape
                 .0
                 .last()
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
             if rows == 0 || rows > shape.query_block_rows {
-                return Err(LowLoweringError::InvalidOperatorPlan);
+                return Err(BlockBuildError::InvalidOperatorPlan);
             }
             let canonical_query = self.local_shard(query, tile)?;
             let query_dimension = *self.shards[canonical_query.index() as usize]
@@ -85,7 +85,7 @@ impl LoweringState {
                 .shape
                 .0
                 .last()
-                .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
             let deferred_query = self.has_deferred_value(query);
             let query_shard = if deferred_query {
                 self.push_attention_buffer(
@@ -195,8 +195,8 @@ impl LoweringState {
         query: MidValueId,
         tasks: &[AttentionTask],
         provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         if !self.has_deferred_value(query) {
             return Ok(());
         }
@@ -252,7 +252,7 @@ impl LoweringState {
                     tiles,
                     task.tile,
                     task.query_receive
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?,
+                        .ok_or(BlockBuildError::InvalidOperatorPlan)?,
                     task.query,
                     WorkProvenance {
                         operation: provenance.operation,
@@ -276,11 +276,11 @@ impl LoweringState {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
         provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<Vec<PreparedAttentionBlock>> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<Vec<PreparedAttentionBlock>> {
         let blocks = key_rows.div_ceil(block_rows);
         let key_destinations = tasks.iter().fold(
-            BTreeMap::<u32, Vec<LowShardId>>::new(),
+            BTreeMap::<u32, Vec<BlockValueId>>::new(),
             |mut destinations, task| {
                 destinations
                     .entry(task.head)
@@ -290,7 +290,7 @@ impl LoweringState {
             },
         );
         let value_destinations = tasks.iter().fold(
-            BTreeMap::<u32, Vec<LowShardId>>::new(),
+            BTreeMap::<u32, Vec<BlockValueId>>::new(),
             |mut destinations, task| {
                 destinations
                     .entry(task.head)
@@ -323,7 +323,7 @@ impl LoweringState {
                 tiles,
             )?;
             let row_block =
-                u16::try_from(block_rows).map_err(|_| LowLoweringError::InvalidOperatorPlan)?;
+                u16::try_from(block_rows).map_err(|_| BlockBuildError::InvalidOperatorPlan)?;
             let value_panels = self.prepare_distributed_attention_panels(
                 value,
                 &value_destinations,
@@ -380,24 +380,24 @@ impl LoweringState {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
         requirements: &StorageRequirements,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         if key_block_rows != AMP_INNER_BLOCK || query_block_rows == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let key_shards = self.value_shards(*key)?.to_vec();
         let value_shards = self.value_shards(*value)?.to_vec();
         if key_shards.len() != value_shards.len() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         if self.has_deferred_value(*key) != self.has_deferred_value(*value) {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let tasks = self.build_attention_tasks(
             *query,
@@ -418,9 +418,9 @@ impl LoweringState {
             .shape
             .0[1];
         let blocks = usize::try_from(key_rows.div_ceil(key_block_rows))
-            .map_err(|_| LowLoweringError::IdOverflow)?;
+            .map_err(|_| BlockBuildError::IdOverflow)?;
         if blocks == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let exchange_provenance = WorkProvenance {
             operation: operation.source,
@@ -451,13 +451,13 @@ impl LoweringState {
         };
         for block in 0..blocks {
             let block_start =
-                u32::try_from(block).map_err(|_| LowLoweringError::IdOverflow)? * key_block_rows;
+                u32::try_from(block).map_err(|_| BlockBuildError::IdOverflow)? * key_block_rows;
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut task_sources = Vec::with_capacity(tasks.len());
             if deferred_key_value {
                 let prepared = prepared_blocks
                     .get(block)
-                    .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                    .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                 self.append_prepared_panel_broadcasts(
                     &prepared.key_panels,
                     0,
@@ -478,18 +478,18 @@ impl LoweringState {
                 );
             } else {
                 for task in &tasks {
-                    let source_matches = |candidate: &&LowShardId| {
+                    let source_matches = |candidate: &&BlockValueId| {
                         let shard = &self.shards[candidate.index() as usize];
                         shard.extents[0].start == task.head && shard.extents[1].start == block_start
                     };
                     let key_source = *key_shards
                         .iter()
                         .find(source_matches)
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                     let value_source = *value_shards
                         .iter()
                         .find(source_matches)
-                        .ok_or(LowLoweringError::InvalidOperatorPlan)?;
+                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                     let valid_key_rows = self.shards[key_source.index() as usize].extents[1]
                         .logical_end
                         .saturating_sub(block_start);
@@ -604,12 +604,12 @@ impl LoweringState {
     pub(super) fn append_materialized_attention_input(
         &mut self,
         operand: AttentionOperand,
-        sources: &[LowShardId],
+        sources: &[BlockValueId],
         prepared: &[PreparedAttentionBlock],
         tasks: &[AttentionTask],
         provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
         if prepared.is_empty() {
             for task in tasks {
@@ -681,32 +681,32 @@ impl LoweringState {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
         requirements: &StorageRequirements,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(LowLoweringError::ResultArity);
+            return Err(BlockBuildError::ResultArity);
         };
         if query_block_rows == 0
             || padded_key_rows == 0
             || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
             || self.has_deferred_value(*key) != self.has_deferred_value(*value)
         {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let key_shards = self.value_shards(*key)?.to_vec();
         let value_shards = self.value_shards(*value)?.to_vec();
         if key_shards.len() != value_shards.len() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let key_rows = self.shards[key_shards[0].index() as usize]
             .tensor_type
             .shape
             .0[1];
         if key_rows == 0 || key_rows > padded_key_rows {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let tasks = self.build_attention_tasks(
             *query,
@@ -723,7 +723,7 @@ impl LoweringState {
             },
         )?;
         if tasks.is_empty() {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let exchange_provenance = WorkProvenance {
             operation: operation.source,
@@ -858,7 +858,7 @@ impl LoweringState {
     pub(super) fn prepare_distributed_attention_panels(
         &mut self,
         value: MidValueId,
-        destinations: &BTreeMap<u32, Vec<LowShardId>>,
+        destinations: &BTreeMap<u32, Vec<BlockValueId>>,
         block_start: u32,
         valid_rows: u32,
         logical_columns: u32,
@@ -868,11 +868,11 @@ impl LoweringState {
         semantic_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         physical_gathers: &mut BTreeMap<ShardView, Vec<ShardView>>,
         provenance: WorkProvenance,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<Vec<PreparedDistributedPanel>> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<Vec<PreparedDistributedPanel>> {
         let panels = physical_columns.div_ceil(AMP_COLUMN_MICRO);
         if panels == 0 || valid_rows == 0 {
-            return Err(LowLoweringError::InvalidOperatorPlan);
+            return Err(BlockBuildError::InvalidOperatorPlan);
         }
         let mut packed_panels = Vec::new();
         for (&stream, stream_destinations) in destinations {
@@ -885,7 +885,7 @@ impl LoweringState {
                     continue;
                 }
                 let owner = usize::try_from(owner_offset.saturating_add(panel))
-                    .map_err(|_| LowLoweringError::IdOverflow)?
+                    .map_err(|_| BlockBuildError::IdOverflow)?
                     % stream_destinations.len();
                 let tile = stream_destinations[owner];
                 let tile = self.shards[tile.index() as usize].tile;
@@ -965,8 +965,8 @@ impl LoweringState {
         panels: &[PreparedDistributedPanel],
         destination_row_start: u32,
         broadcasts: &mut BTreeMap<ShardView, Vec<ShardView>>,
-        tiles: &mut [TileWorkList],
-    ) -> LowLoweringResult<()> {
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
         for panel in panels {
             let source = self.full_view(panel.packed);
             let source_rows = source.extents[0].physical_end - source.extents[0].start;
@@ -1010,12 +1010,12 @@ impl LoweringState {
 
     pub(super) fn append_attention_rearrange(
         &mut self,
-        tiles: &mut [TileWorkList],
+        tiles: &mut BlockRegion,
         tile: u16,
-        source: LowShardId,
-        destination: LowShardId,
+        source: BlockValueId,
+        destination: BlockValueId,
         provenance: WorkProvenance,
-    ) -> LowLoweringResult<()> {
+    ) -> BlockBuildResult<()> {
         let input = self.shards[source.index() as usize]
             .tensor_type
             .format
@@ -1055,9 +1055,9 @@ impl LoweringState {
         precision: Precision,
         order: ElementOrder,
         memory_class: MemoryClass,
-    ) -> LowLoweringResult<LowShardId> {
-        self.push_shard(LowShard {
-            id: LowShardId(0),
+    ) -> BlockBuildResult<BlockValueId> {
+        self.push_shard(BlockValue {
+            id: BlockValueId(0),
             tile,
             tensor_type: TensorType::new(
                 [rows, columns],
@@ -1092,9 +1092,9 @@ impl LoweringState {
         elements: u32,
         precision: Precision,
         definition: ShardDefinition,
-    ) -> LowLoweringResult<LowShardId> {
-        self.push_shard(LowShard {
-            id: LowShardId(0),
+    ) -> BlockBuildResult<BlockValueId> {
+        self.push_shard(BlockValue {
+            id: BlockValueId(0),
             tile,
             tensor_type: TensorType::new(
                 [elements],
@@ -1123,9 +1123,9 @@ impl LoweringState {
         logical_columns: u32,
         physical_columns: u32,
         order: ElementOrder,
-    ) -> LowLoweringResult<LowShardId> {
-        self.push_shard(LowShard {
-            id: LowShardId(0),
+    ) -> BlockBuildResult<BlockValueId> {
+        self.push_shard(BlockValue {
+            id: BlockValueId(0),
             tile,
             tensor_type: TensorType::new(
                 [logical_rows, logical_columns],

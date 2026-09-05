@@ -2251,7 +2251,7 @@ mod tests {
     #[test]
     fn randomized_logical_io_ignores_slice_order_and_rejects_corruption() -> Result<()> {
         use ipu_codegen::{
-            DiagnosticShard, GridOrder, LowShard, LowShardId, ShardDefinition, TensorType,
+            BlockValue, BlockValueId, DiagnosticShard, GridOrder, ShardDefinition, TensorType,
         };
         let mut random = fastrand::Rng::with_seed(0x6765_6d6d_696f);
         for _ in 0..64 {
@@ -2293,8 +2293,8 @@ mod tests {
                 .layout
                 .shard_extents(&tensor_type.shape)?
             {
-                let storage = LowShard {
-                    id: LowShardId::from_index(u32::from(tile)),
+                let storage = BlockValue {
+                    id: BlockValueId::from_index(u32::from(tile)),
                     tile,
                     tensor_type: tensor_type.clone(),
                     extents,
