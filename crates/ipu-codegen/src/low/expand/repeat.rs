@@ -2,13 +2,13 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn build_repeat(
         &mut self,
         operation: &MidOperation,
         repeat: &MidRepeat,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let expected_inputs = repeat.carried_inputs + repeat.invariant_inputs;
         let expected_arguments = expected_inputs + repeat.iterated_inputs.len();
         if operation.inputs.len() != expected_inputs
@@ -20,7 +20,7 @@ impl BlockBuilder {
                 .iter()
                 .any(|values| values.len() != repeat.count as usize)
         {
-            return Err(BlockBuildError::InvalidRepeat);
+            return Err(ExpansionError::InvalidRepeat);
         }
         for index in 0..repeat.carried_inputs {
             if !repeat_yield_can_alias(
@@ -28,7 +28,7 @@ impl BlockBuilder {
                 repeat.body.arguments[index],
                 &repeat.body.operations,
             ) {
-                return Err(BlockBuildError::RepeatRequiresInPlace(index));
+                return Err(ExpansionError::RepeatRequiresInPlace(index));
             }
         }
         let iterated_requirements = repeat
@@ -81,7 +81,7 @@ impl BlockBuilder {
                             .map(|input| RepeatInvariant { input, argument }),
                     )
                 })
-                .collect::<BlockBuildResult<_>>()?;
+                .collect::<ExpansionResult<_>>()?;
             let iterated = repeat
                 .iterated_inputs
                 .iter()
@@ -97,7 +97,7 @@ impl BlockBuilder {
                     let inputs = values
                         .iter()
                         .map(|value| self.corresponding_shard(*value, argument))
-                        .collect::<BlockBuildResult<Vec<_>>>();
+                        .collect::<ExpansionResult<Vec<_>>>();
                     let inputs = match inputs {
                         Ok(inputs) => inputs,
                         Err(error) => return Some(Err(error)),
@@ -106,16 +106,16 @@ impl BlockBuilder {
                     let strides = inputs
                         .iter()
                         .map(|shard| self.shard_stride(*shard, alignment, access_tail))
-                        .collect::<BlockBuildResult<Vec<_>>>();
+                        .collect::<ExpansionResult<Vec<_>>>();
                     let strides = match strides {
                         Ok(strides) => strides,
                         Err(error) => return Some(Err(error)),
                     };
                     let Some(&stride_bytes) = strides.first() else {
-                        return Some(Err(BlockBuildError::InvalidIteratedBlocks(index)));
+                        return Some(Err(ExpansionError::InvalidIteratedBlocks(index)));
                     };
                     if strides.iter().any(|stride| *stride != stride_bytes) {
-                        return Some(Err(BlockBuildError::InvalidIteratedBlocks(index)));
+                        return Some(Err(ExpansionError::InvalidIteratedBlocks(index)));
                     }
                     Some(Ok(RepeatIterated {
                         inputs,
@@ -124,7 +124,7 @@ impl BlockBuilder {
                         alignment,
                     }))
                 })
-                .collect::<BlockBuildResult<_>>()?;
+                .collect::<ExpansionResult<_>>()?;
             bindings.push(BlockRepeatBinding {
                 tile,
                 carried,

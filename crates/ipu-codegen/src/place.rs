@@ -2,8 +2,8 @@
 
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
-use crate::mid::{BlockValueId, ShardDefinition};
-use crate::mid::{MemoryClass, MemoryOperand};
+use crate::{BlockValueId, ShardDefinition};
+use crate::{MemoryClass, MemoryOperand};
 use crate::{StorageError, shard_storage_bytes};
 use ipu_package::{
     IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
@@ -560,7 +560,7 @@ fn collect_requirements(
     }
 }
 
-fn apply_requirement(target: &mut Requirement, requirement: &crate::mid::KernelAccess) {
+fn apply_requirement(target: &mut Requirement, requirement: &crate::KernelAccess) {
     target.alignment = target.alignment.max(requirement.alignment);
     target.access_tail = target.access_tail.max(requirement.access_tail_bytes);
 }
@@ -976,7 +976,7 @@ mod tests {
             crate::OperandRequirement::new(format, 8),
         )];
         let candidate = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let mut program = (*crate::mid::implementation::build_blocks(&candidate).unwrap()).clone();
+        let mut program = (*crate::low::expand::expand_tiles(&candidate).unwrap()).clone();
         let work = program
             .body
             .operations
@@ -1028,7 +1028,7 @@ mod tests {
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(
-                &crate::mid::build_blocks(&mid).unwrap(),
+                &crate::expand_tiles(&mid).unwrap(),
                 config.diagnostic_checkpoints,
             );
             let placement = place(&low).unwrap();
@@ -1128,7 +1128,7 @@ mod tests {
             let sum = mid.operations[0].results[0];
             let output = mid.operations[1].results[0];
             let low = lower_to_tiles(
-                &crate::mid::build_blocks(&mid).unwrap(),
+                &crate::expand_tiles(&mid).unwrap(),
                 config.diagnostic_checkpoints,
             );
             let placement = place(&low).unwrap();

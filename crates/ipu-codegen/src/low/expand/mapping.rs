@@ -61,7 +61,7 @@ pub(super) fn split_mapping_at_panel_boundaries(
     mut source: ShardView,
     destination_shard: &BlockValue,
     mut destination: ShardView,
-) -> BlockBuildResult<Vec<(ShardView, ShardView)>> {
+) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
     let source_rank = source.extents.len();
     let destination_rank = destination.extents.len();
     let outer_elements = |extents: &[ShardExtent]| {
@@ -78,21 +78,21 @@ pub(super) fn split_mapping_at_panel_boundaries(
         || outer_elements(&source.extents) != Some(1)
         || outer_elements(&destination.extents) != Some(1)
     {
-        return Err(BlockBuildError::InvalidOperatorPlan);
+        return Err(ExpansionError::InvalidOperatorPlan);
     }
 
     let aligned_ranges = |source: ShardExtent,
                           source_shard: ShardExtent,
                           destination: ShardExtent,
                           destination_shard: ShardExtent|
-     -> BlockBuildResult<Vec<(ShardExtent, ShardExtent)>> {
+     -> ExpansionResult<Vec<(ShardExtent, ShardExtent)>> {
         let logical_width = source.logical_end - source.start;
         if logical_width != destination.logical_end - destination.start {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let width = source.physical_end - source.start;
         if width != destination.physical_end - destination.start {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let mut ranges = Vec::new();
         let mut offset = 0;
@@ -101,12 +101,12 @@ pub(super) fn split_mapping_at_panel_boundaries(
                 .start
                 .checked_sub(source_shard.start)
                 .and_then(|start| start.checked_add(offset))
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
             let destination_position = destination
                 .start
                 .checked_sub(destination_shard.start)
                 .and_then(|start| start.checked_add(offset))
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
             let source_remaining = AMP_COLUMN_MICRO - source_position % AMP_COLUMN_MICRO;
             let destination_remaining = AMP_COLUMN_MICRO - destination_position % AMP_COLUMN_MICRO;
             let length = (width - offset)

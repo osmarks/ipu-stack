@@ -7,7 +7,7 @@ pub(super) struct DeferredValue {
     pub(super) shards: Vec<BlockValueId>,
 }
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn deferred_root(&self, mut value: MidValueId) -> Option<MidValueId> {
         let mut remaining = self.deferred_conversions.len().saturating_add(1);
         while !self.deferred_values.contains_key(&value) {
@@ -59,7 +59,7 @@ impl BlockBuilder {
         &mut self,
         operation: &MidOperation,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<bool> {
+    ) -> ExpansionResult<bool> {
         let Some(offered) = operation
             .operator_plan()
             .and_then(|plan| plan.deferred_output)
@@ -75,7 +75,7 @@ impl BlockBuilder {
         let source_type = &self.shards[self.value_shards(*source)?[0].index() as usize].tensor_type;
         let result_type = &self.shards[self.value_shards(*result)?[0].index() as usize].tensor_type;
         if offered.transform.output_shape(&source_type.shape).as_ref() != Some(&result_type.shape) {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let source_shards = self.value_shards(*source)?.to_vec();
         let source_format = &self.shards[source_shards[0].index() as usize]
@@ -136,14 +136,14 @@ impl BlockBuilder {
         column_start: u32,
         columns: u32,
         destination: BlockValueId,
-    ) -> BlockBuildResult<Vec<(ShardView, ShardView)>> {
+    ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
         let deferred_root = self
             .deferred_root(value)
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let deferred = self
             .deferred_values
             .get(&deferred_root)
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let deferred_shards = deferred.shards.clone();
         let logical_type = &self.shards[self.value_shards(value)?[0].index() as usize].tensor_type;
         let source_type = &self.shards[deferred.shards[0].index() as usize].tensor_type;
@@ -155,20 +155,20 @@ impl BlockBuilder {
         let mapping = deferred
             .transform
             .map_slice(&source_type.shape, &logical_type.shape, &logical_target)
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let target = mapping
             .iter()
             .copied()
             .enumerate()
             .map(|(axis, (start, end))| {
                 Ok(ShardExtent {
-                    axis: u16::try_from(axis).map_err(|_| BlockBuildError::IdOverflow)?,
+                    axis: u16::try_from(axis).map_err(|_| ExpansionError::IdOverflow)?,
                     start,
                     logical_end: end,
                     physical_end: end,
                 })
             })
-            .collect::<BlockBuildResult<Vec<_>>>()?;
+            .collect::<ExpansionResult<Vec<_>>>()?;
         let destination_tile = self.shards[destination.index() as usize].tile;
         let mut covered = 0u64;
         let mut mappings = Vec::new();
@@ -181,20 +181,20 @@ impl BlockBuilder {
                 .map(|(destination_axis, source_axis)| {
                     let source = source_extents
                         .get(source_axis)
-                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                        .ok_or(ExpansionError::InvalidOperatorPlan)?;
                     let base = target
                         .get(source_axis)
-                        .ok_or(BlockBuildError::InvalidOperatorPlan)?
+                        .ok_or(ExpansionError::InvalidOperatorPlan)?
                         .start;
                     Ok(ShardExtent {
                         axis: u16::try_from(destination_axis)
-                            .map_err(|_| BlockBuildError::IdOverflow)?,
+                            .map_err(|_| ExpansionError::IdOverflow)?,
                         start: source.start - base,
                         logical_end: source.logical_end - base,
                         physical_end: source.logical_end - base,
                     })
                 })
-                .collect::<BlockBuildResult<Vec<_>>>()?;
+                .collect::<ExpansionResult<Vec<_>>>()?;
             covered = covered.saturating_add(
                 u64::from(source_extents[1].logical_end - source_extents[1].start)
                     * u64::from(source_extents[2].logical_end - source_extents[2].start),
@@ -210,7 +210,7 @@ impl BlockBuilder {
             mappings.push((source_view, destination_view));
         }
         if covered != u64::from(rows) * u64::from(columns) {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         Ok(mappings)
     }
@@ -227,7 +227,7 @@ impl BlockBuilder {
         provenance: WorkProvenance,
         batch: &mut MaterializationBatch,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let mut mappings = self.deferred_panel_mappings(
             value,
             stream,
@@ -240,7 +240,7 @@ impl BlockBuilder {
         let order = if self.deferred_supports_physical_exchange(value, destination) {
             mappings = self
                 .f16_micro_panel_mappings(mappings)?
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
             CopyOrder::Physical
         } else {
             CopyOrder::Semantic

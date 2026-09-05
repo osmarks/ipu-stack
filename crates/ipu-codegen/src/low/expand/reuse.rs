@@ -2,12 +2,12 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn reuse_implementation(
         &mut self,
         operation: &MidOperation,
         body: &mut BlockRegion,
-    ) -> BlockBuildResult<bool> {
+    ) -> ExpansionResult<bool> {
         if operation.inputs.iter().any(|input| {
             self.has_deferred_value(*input) || self.deferred_conversions.contains_key(input)
         }) {
@@ -73,7 +73,7 @@ impl BlockBuilder {
                 let bytes = additional.entry(block.tile).or_default();
                 *bytes = bytes
                     .checked_add(shard_storage_bytes(block)?)
-                    .ok_or(BlockBuildError::IdOverflow)?;
+                    .ok_or(ExpansionError::IdOverflow)?;
             }
         }
         let used = self.interleaved_usage(0)?;
@@ -145,7 +145,7 @@ impl BlockBuilder {
                     self.append_exchange_phase(transfers, provenance(phase.provenance), body)?;
                 }
                 BlockOperation::Checkpoint(..) => {}
-                BlockOperation::Repeat(_) => return Err(BlockBuildError::InvalidOperatorPlan),
+                BlockOperation::Repeat(_) => return Err(ExpansionError::InvalidOperatorPlan),
             }
         }
         Ok(true)
@@ -167,10 +167,9 @@ mod tests {
         let config = crate::PipelineConfig::new(4)
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
-        let mut candidate =
-            crate::mid::planner::lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
-        let retained = build_blocks(&candidate).unwrap();
-        let mut builder = BlockBuilder::new(&candidate).unwrap();
+        let mut candidate = crate::mid::lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let retained = expand_tiles(&candidate).unwrap();
+        let mut builder = TileGraphBuilder::new(&candidate).unwrap();
         let first = candidate
             .operations
             .iter()
@@ -186,7 +185,7 @@ mod tests {
                 assert!(implementation.take().is_some());
             }
         }
-        let rebuilt = build_blocks(&candidate).unwrap();
+        let rebuilt = expand_tiles(&candidate).unwrap();
         assert_eq!(retained, rebuilt);
     }
 }

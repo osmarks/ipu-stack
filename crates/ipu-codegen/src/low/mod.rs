@@ -1,11 +1,19 @@
-//! Project executable mid blocks into per-tile work lists.
-//! All operation expansion and copy materialization belongs to mid builders.
+//! Tile expansion and per-tile work, followed by placement and code generation.
+
+mod call;
+mod copy;
+pub(crate) mod expand;
+mod graph;
+mod passes;
+pub(crate) use call::*;
+pub use copy::*;
+pub use expand::{
+    ExpansionError, ExpansionResult, logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
+};
+pub use graph::*;
 
 use crate::graph::OperationId;
-use crate::mid::{
-    BlockOperation, BlockRegion, ExchangePhaseId, KernelRun, KernelRunId, LocalCopy, LocalCopyId,
-    MidProgram, RepeatCarried, RepeatInvariant, RepeatIterated, WorkProvenance,
-};
+use crate::mid::*;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,13 +56,13 @@ pub struct TileWorkList {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LowProgram {
-    pub program: Arc<MidProgram>,
+    pub program: Arc<TileGraph>,
     pub tiles: Vec<TileWorkList>,
     pub repeat_runs: Vec<RepeatRun>,
 }
 
 impl std::ops::Deref for LowProgram {
-    type Target = MidProgram;
+    type Target = TileGraph;
     fn deref(&self) -> &Self::Target {
         &self.program
     }
@@ -80,10 +88,10 @@ impl LowProgram {
 }
 
 /// Projection only: no GEMM, attention, conversion, or layout decisions.
-pub fn lower_to_tiles(program: &Arc<MidProgram>, diagnostic_checkpoints: bool) -> LowProgram {
+pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) -> LowProgram {
     fn project(
         region: &BlockRegion,
-        program: &MidProgram,
+        program: &TileGraph,
         repeats: &mut Vec<RepeatRun>,
         checkpoints: bool,
     ) -> Vec<TileWorkList> {

@@ -345,3 +345,14 @@ Profiled hardware measurement (2026-09-05):
   `BinaryHeap<ReadyTransfer>::pop`, 3.4% to its push, and 4.6% to
   `earliest_transfer_offset_impl`. This is a short sample, not an attribution
   across the whole build. `/tmp/final-mlp-scheduler-{perf.data,report.txt}`.
+
+Whole-device mid rewrite, representation checkpoint (in progress):
+
+- Renamed the selected whole-device recipe `MidProgram` and the expanded
+  per-tile buffers/calls `TileGraph`. Moved expanded IR, access contracts, copy
+  realization and tile builders under `low`.
+- This checkpoint preserves behavior; it is not the completed boundary rewrite.
+  Beam costing still expands tile graphs and will be replaced by compact mid
+  primitives and geometry-based estimates. Operator decomposition must become
+  explicit before generic tile expansion, not merely move behind another name.
+- All 148 release workspace tests pass after the mechanical separation.

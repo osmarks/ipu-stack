@@ -49,22 +49,22 @@ pub(super) enum AttentionOperand {
     Value,
 }
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn build_attention_tasks(
         &mut self,
         query: MidValueId,
         result: MidValueId,
         shape: AttentionBufferShape,
-    ) -> BlockBuildResult<Vec<AttentionTask>> {
+    ) -> ExpansionResult<Vec<AttentionTask>> {
         let value_row_block = u16::try_from(shape.physical_staging_rows)
-            .map_err(|_| BlockBuildError::InvalidOperatorPlan)?;
+            .map_err(|_| ExpansionError::InvalidOperatorPlan)?;
         let outputs = self.value_shards(result)?.to_vec();
         let mut tasks = Vec::with_capacity(outputs.len());
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
             let rank = self.shards[output.index() as usize].extents.len();
             if rank != 3 {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
             let rows = self.shards[output.index() as usize].extents[rank - 2].physical_end
                 - self.shards[output.index() as usize].extents[rank - 2].start;
@@ -73,9 +73,9 @@ impl BlockBuilder {
                 .shape
                 .0
                 .last()
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
             if rows == 0 || rows > shape.query_block_rows {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
             let canonical_query = self.local_shard(query, tile)?;
             let query_dimension = *self.shards[canonical_query.index() as usize]
@@ -83,7 +83,7 @@ impl BlockBuilder {
                 .shape
                 .0
                 .last()
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
             let deferred_query = self.has_deferred_value(query);
             let query_shard = if deferred_query {
                 self.push_attention_buffer(
@@ -172,7 +172,7 @@ impl BlockBuilder {
         precision: Precision,
         order: ElementOrder,
         memory_class: MemoryClass,
-    ) -> BlockBuildResult<BlockValueId> {
+    ) -> ExpansionResult<BlockValueId> {
         self.push_shard(BlockValue {
             id: BlockValueId(0),
             tile,
@@ -211,7 +211,7 @@ impl BlockBuilder {
         logical_columns: u32,
         physical_columns: u32,
         order: ElementOrder,
-    ) -> BlockBuildResult<BlockValueId> {
+    ) -> ExpansionResult<BlockValueId> {
         self.push_shard(BlockValue {
             id: BlockValueId(0),
             tile,

@@ -12,7 +12,7 @@ pub fn lower(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
-) -> LoweringResult<ImplementationCandidate> {
+) -> LoweringResult<MidProgram> {
     Ok(plan_finalists(graph, config, costs, 1)?.remove(0))
 }
 
@@ -21,7 +21,7 @@ pub(crate) fn plan_finalists(
     config: &PipelineConfig,
     costs: &impl CostModel,
     finalist_count: usize,
-) -> LoweringResult<Vec<ImplementationCandidate>> {
+) -> LoweringResult<Vec<MidProgram>> {
     // Fragment construction allocates substantially more than scalar costing.
     // Use a fixed small pool instead of spreading allocator arenas over every
     // logical CPU on large build hosts. Concurrent planners share this bound.
@@ -49,7 +49,7 @@ fn plan_in_pool(
     config: &PipelineConfig,
     costs: &impl CostModel,
     finalist_count: usize,
-) -> LoweringResult<Vec<ImplementationCandidate>> {
+) -> LoweringResult<Vec<MidProgram>> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -208,7 +208,7 @@ fn plan_in_pool(
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
             );
-            let mut graph = ImplementationCandidate {
+            let mut graph = MidProgram {
                 tile_count: config.tile_count,
                 inputs: inputs.clone(),
                 values: branch.state.values,

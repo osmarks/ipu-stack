@@ -1,27 +1,16 @@
 //! Candidate selection and executable, layout-aware block IR.
 //!
 //! The analytical beam screens coupled implementation choices. Candidate builders
-//! produce a [`MidProgram`] with explicit blocks and movement before per-tile
+//! produce a [`TileGraph`] with explicit blocks and movement before per-tile
 //! projection. Neither low lowering nor placement expands whole operators.
 
-mod block;
-mod call;
-pub(crate) use call::*;
-pub(crate) mod implementation;
-pub use block::*;
-pub use implementation::{
-    BlockBuildError, BlockBuildResult, logical_view_byte_spans, shard_storage_bytes,
-    view_byte_spans,
-};
+use crate::low::*;
 
 mod candidates;
-mod copy;
-pub use copy::*;
 mod catalogue;
 mod layout;
 mod operator;
 mod ownership;
-mod passes;
 mod planner;
 mod resolved;
 mod view;
@@ -39,14 +28,14 @@ pub(crate) fn lower_finalists(
     config: &PipelineConfig,
     costs: &impl CostModel,
     count: usize,
-) -> LoweringResult<Vec<std::sync::Arc<MidProgram>>> {
+) -> LoweringResult<Vec<std::sync::Arc<TileGraph>>> {
     planner::plan_finalists(graph, config, costs, count)?
         .iter()
-        .map(|candidate| implementation::build_blocks(candidate).map_err(LoweringError::from))
+        .map(|candidate| crate::low::expand::expand_tiles(candidate).map_err(LoweringError::from))
         .collect()
 }
 #[cfg(test)]
-pub(crate) use implementation::build_blocks;
+pub(crate) use crate::low::expand::expand_tiles;
 use planner::*;
 
 use crate::estimate::MemoizedCostModel;
@@ -266,7 +255,7 @@ pub enum MidOperationKind {
     Operator {
         plan: OperatorPlan,
         deferred_inputs: Vec<Option<DeferredInputPlan>>,
-        implementation: Option<std::sync::Arc<MidProgram>>,
+        implementation: Option<std::sync::Arc<TileGraph>>,
     },
     Convert(ConversionPlan),
     Repeat(MidRepeat),
@@ -335,9 +324,9 @@ pub struct MidInput {
 }
 
 /// Transient beam recipe consumed by the executable-block builder.
-/// This is never passed to low or retained in a selected MidProgram.
+/// This is never passed to low or retained in a selected TileGraph.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ImplementationCandidate {
+pub struct MidProgram {
     pub tile_count: u16,
     pub inputs: Vec<MidInput>,
     pub values: Vec<MidValue>,
@@ -355,7 +344,7 @@ pub enum LoweringError {
     #[error("cannot create planning worker pool: {0}")]
     PlanningThreads(String),
     #[error(transparent)]
-    Blocks(#[from] BlockBuildError),
+    Blocks(#[from] ExpansionError),
     #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error(transparent)]

@@ -154,7 +154,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             );
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(
-            &crate::mid::build_blocks(&mid).unwrap(),
+            &crate::expand_tiles(&mid).unwrap(),
             config.diagnostic_checkpoints,
         );
         let plan = KernelBuildPlan::from_program(&low).unwrap();

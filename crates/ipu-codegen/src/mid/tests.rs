@@ -166,7 +166,7 @@ fn randomized_shape_aware_tile_candidates_follow_graph_extents() {
     }
 }
 
-fn value(lowered: &ImplementationCandidate, id: MidValueId) -> &MidValue {
+fn value(lowered: &MidProgram, id: MidValueId) -> &MidValue {
     &lowered.values[id.index() as usize]
 }
 
@@ -383,7 +383,7 @@ fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids
     }
 }
 
-fn assert_conversions_are_explicit(lowered: &ImplementationCandidate, operations: &[MidOperation]) {
+fn assert_conversions_are_explicit(lowered: &MidProgram, operations: &[MidOperation]) {
     for operation in operations {
         let [input] = operation.inputs.as_slice() else {
             continue;
@@ -408,7 +408,7 @@ fn assert_conversions_are_explicit(lowered: &ImplementationCandidate, operations
 }
 
 fn assert_operator_signature(
-    lowered: &ImplementationCandidate,
+    lowered: &MidProgram,
     operation: &MidOperation,
     inputs: &[TensorFormat],
     output: TensorFormat,
@@ -698,7 +698,7 @@ fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
             "random case {case}"
         );
         for finalist in &finalists {
-            let program = build_blocks(finalist).unwrap();
+            let program = expand_tiles(finalist).unwrap();
             let cycles = crate::estimate::program_cycles(&program, None).unwrap();
             assert_eq!(program.estimated_cycles, cycles.total, "random case {case}");
             assert_eq!(
@@ -1190,7 +1190,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         let claims = consumer.deferred_inputs();
         assert_eq!(claims.len(), split.len(), "random case {case}");
         assert!(claims.iter().all(Option::is_some), "random case {case}");
-        let program = build_blocks(&lowered).unwrap();
+        let program = expand_tiles(&lowered).unwrap();
         let cycles = crate::estimate::program_cycles(&program, None).unwrap();
         assert_eq!(program.estimated_cycles, cycles.total);
         assert_eq!(program.estimated_exchange_cycles, cycles.exchange);

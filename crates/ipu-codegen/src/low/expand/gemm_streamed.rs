@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_streamed_blocked_gemm(
         &mut self,
@@ -13,15 +13,15 @@ impl BlockBuilder {
         output_column_block: u32,
         requirements: &StorageRequirements,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [left_value, right_value] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         if inner_block == 0 || output_column_block == 0 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let left_shards = self.value_shards(*left_value)?.to_vec();
         let right_shards = self.value_shards(*right_value)?.to_vec();
@@ -31,7 +31,7 @@ impl BlockBuilder {
         let left_rank = left_type.shape.0.len();
         let output_rank = output_type.shape.0.len();
         if left_rank < 2 || output_rank < 2 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let inner_extent = left_type.format.layout.padded_shape(&left_type.shape)?.0[left_rank - 1];
         let column_extent = output_type
@@ -42,19 +42,19 @@ impl BlockBuilder {
         if !inner_extent.is_multiple_of(inner_block)
             || !column_extent.is_multiple_of(output_column_block)
         {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let staging_bytes = inner_block
             .checked_mul(output_column_block)
             .and_then(|elements| {
                 elements.checked_mul(requirements.inputs[1].format.precision.bytes() as u32)
             })
-            .ok_or(BlockBuildError::IdOverflow)?;
+            .ok_or(ExpansionError::IdOverflow)?;
         let use_interleaved_staging = requirements.inputs[1].format.precision
             == crate::Precision::F16
             && output_shards.iter().try_fold(true, |available, output| {
                 let tile = self.shards[output.index() as usize].tile;
-                Ok::<_, BlockBuildError>(
+                Ok::<_, ExpansionError>(
                     available
                         && self.interleaved_capacity_available(
                             tile,
@@ -68,7 +68,7 @@ impl BlockBuilder {
         let columns_per_phase = column_extent / output_column_block;
         let column_phase_width = output_column_block
             .checked_mul(columns_per_phase)
-            .ok_or(BlockBuildError::IdOverflow)?;
+            .ok_or(ExpansionError::IdOverflow)?;
 
         for inner_start in (0..inner_extent).step_by(inner_block as usize) {
             let inner_end = inner_start + inner_block;
@@ -93,7 +93,7 @@ impl BlockBuilder {
                         )
                         .collect::<Vec<_>>();
                     if right_candidates.is_empty() {
-                        return Err(BlockBuildError::InvalidOperatorPlan);
+                        return Err(ExpansionError::InvalidOperatorPlan);
                     }
                     let column_outputs = output_shards
                         .iter()
@@ -122,7 +122,7 @@ impl BlockBuilder {
                         };
                         let right = self
                             .prefer_local_shard(&right_candidates, tile)
-                            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                            .ok_or(ExpansionError::InvalidOperatorPlan)?;
                         let right_rank = self.shards[right.index() as usize].extents.len();
                         let right_view = self.narrow_view(
                             right,
@@ -191,7 +191,7 @@ impl BlockBuilder {
                                         ));
                                         destination_offset = destination_offset
                                             .checked_add(span.bytes)
-                                            .ok_or(BlockBuildError::IdOverflow)?;
+                                            .ok_or(ExpansionError::IdOverflow)?;
                                     }
                                 } else {
                                     batch

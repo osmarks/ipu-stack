@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn append_materialized_attention_input(
         &mut self,
         operand: AttentionOperand,
@@ -11,7 +11,7 @@ impl BlockBuilder {
         tasks: &[AttentionTask],
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
         if prepared.is_empty() {
             for task in tasks {
@@ -83,31 +83,31 @@ impl BlockBuilder {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         if query_block_rows == 0
             || padded_key_rows == 0
             || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
             || self.has_deferred_value(*key) != self.has_deferred_value(*value)
         {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let key_shards = self.value_shards(*key)?.to_vec();
         let value_shards = self.value_shards(*value)?.to_vec();
         if key_shards.len() != value_shards.len() {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let key_rows = self.shards[key_shards[0].index() as usize]
             .tensor_type
             .shape
             .0[1];
         if key_rows == 0 || key_rows > padded_key_rows {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let tasks = self.build_attention_tasks(
             *query,
@@ -124,7 +124,7 @@ impl BlockBuilder {
             },
         )?;
         if tasks.is_empty() {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let exchange_provenance = WorkProvenance {
             operation: operation.source,

@@ -2,16 +2,16 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn build_pointwise(
         &mut self,
         operation: &MidOperation,
         kernel: TileKernelSpec,
         input_mapping: PointwiseInputMapping,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         let outputs = self.value_shards(*result)?.to_vec();
         let mut wave_transfers = Vec::<BTreeMap<ShardView, Vec<ShardView>>>::new();
@@ -34,7 +34,7 @@ impl BlockBuilder {
                             .value_shards(*input)?
                             .iter()
                             .find_map(|source| self.broadcast_view(*source, output))
-                            .ok_or(BlockBuildError::InvalidOperatorPlan)?,
+                            .ok_or(ExpansionError::InvalidOperatorPlan)?,
                         PointwiseInputMapping::TileLocal => {
                             let output_extents = &self.shards[output.index() as usize].extents;
                             let source = self
@@ -47,12 +47,12 @@ impl BlockBuilder {
                                         && (matches!(kernel, TileKernelSpec::FlashAttention { .. })
                                             || source.extents == *output_extents)
                                 })
-                                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                                .ok_or(ExpansionError::InvalidOperatorPlan)?;
                             self.full_view(source)
                         }
                     })
                 })
-                .collect::<BlockBuildResult<Vec<_>>>()?;
+                .collect::<ExpansionResult<Vec<_>>>()?;
             let chunks = vec![self.shards[output.index() as usize].extents.clone()];
             for (wave, output_extents) in chunks.into_iter().enumerate() {
                 if wave_transfers.len() <= wave {
@@ -65,7 +65,7 @@ impl BlockBuilder {
                         let source_view = match input_mapping {
                             PointwiseInputMapping::BroadcastToOutput => self
                                 .broadcast_view_for_extents(source.shard, output, &output_extents)
-                                .ok_or(BlockBuildError::InvalidOperatorPlan)?,
+                                .ok_or(ExpansionError::InvalidOperatorPlan)?,
                             PointwiseInputMapping::TileLocal => source.clone(),
                         };
                         let view = if self.shards[source_view.shard.index() as usize].tile == tile {
@@ -88,7 +88,7 @@ impl BlockBuilder {
                         };
                         Ok(KernelOperand { views: vec![view] })
                     })
-                    .collect::<BlockBuildResult<_>>()?;
+                    .collect::<ExpansionResult<_>>()?;
                 wave_runs[wave].push((
                     tile,
                     self.kernel_run(

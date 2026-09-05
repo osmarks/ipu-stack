@@ -1,6 +1,6 @@
 //! Conversion from logical shard views to physical byte ranges.
 
-use crate::mid::{
+use crate::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision, ShardExtent, TensorFormat,
 };
 
@@ -757,11 +757,11 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 mod tests {
     use super::*;
     use crate::mid::ShardExtent;
-    use crate::mid::{
+    use crate::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
         MemoryClass, Precision, TensorTiling, TensorType,
     };
-    use crate::mid::{
+    use crate::{
         BlockValue, BlockValueId, ShardDefinition, ShardView, logical_view_byte_spans,
         shard_storage_bytes, view_byte_spans,
     };

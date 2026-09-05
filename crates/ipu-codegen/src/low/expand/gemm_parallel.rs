@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_parallel_gemm(
         &mut self,
@@ -20,12 +20,12 @@ impl BlockBuilder {
         reduction_staging: crate::ReductionStaging,
         requirements: &StorageRequirements,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [semantic_left_value, semantic_right_value] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         if inner_block == 0
             || output_column_block == 0
@@ -36,7 +36,7 @@ impl BlockBuilder {
             || result_column_partitions == 0
             || result_row_partitions.saturating_mul(result_column_partitions) > inner_partitions
         {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let (left_index, right_index) = orientation.operand_indices();
         let values = [semantic_left_value, semantic_right_value];
@@ -52,7 +52,7 @@ impl BlockBuilder {
         let right_rank = self.shards[right_shards[0].index() as usize].extents.len();
         let output_rank = self.shards[output_shards[0].index() as usize].extents.len();
         if left_rank < 2 || output_rank < 2 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let (left_row_axis, left_inner_axis) = orientation.matrix_axes(left_rank);
         let (right_inner_axis, right_column_axis) = orientation.matrix_axes(right_rank);
@@ -72,7 +72,7 @@ impl BlockBuilder {
             .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
             .map(|axis| axis.block_size)
             .filter(|grain| *grain != 0)
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let column_tiling = output_type
             .format
             .layout
@@ -80,12 +80,12 @@ impl BlockBuilder {
             .axes
             .iter()
             .find(|axis| axis.axis.resolve(output_rank).ok() == Some(output_column_axis))
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let column_blocks = physical_columns / column_grain;
         if !physical_columns.is_multiple_of(column_grain)
             || column_blocks < u32::from(column_partitions)
         {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let short_blocks = column_blocks / u32::from(column_partitions);
         let long_partitions = column_blocks % u32::from(column_partitions);
@@ -94,7 +94,7 @@ impl BlockBuilder {
                 if column_tiling.partitions == column_partitions {
                     return column_tiling
                         .shard_bounds(physical_columns, logical_columns, partition)
-                        .map_err(BlockBuildError::from);
+                        .map_err(ExpansionError::from);
                 }
                 let start_blocks = partition
                     .saturating_mul(short_blocks)
@@ -110,10 +110,10 @@ impl BlockBuilder {
                     physical_end,
                 ))
             })
-            .collect::<BlockBuildResult<Vec<_>>>()?;
+            .collect::<ExpansionResult<Vec<_>>>()?;
         let partial_type = operation
             .operator_plan()
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?
+            .ok_or(ExpansionError::InvalidOperatorPlan)?
             .dispatch
             .gemm_partial_tensor(&output_type);
 
@@ -130,12 +130,12 @@ impl BlockBuilder {
         for replicas in replica_groups.values_mut() {
             replicas.sort_unstable_by_key(|shard| self.shards[shard.index() as usize].tile);
             if replicas.len() != usize::from(column_partitions) {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
             for (column, shard) in replicas.iter().copied().enumerate() {
                 replica_columns.insert(
                     shard,
-                    u16::try_from(column).map_err(|_| BlockBuildError::IdOverflow)?,
+                    u16::try_from(column).map_err(|_| ExpansionError::IdOverflow)?,
                 );
             }
         }
@@ -149,13 +149,13 @@ impl BlockBuilder {
                 columns.iter().enumerate()
             {
                 let output_column =
-                    u32::try_from(output_column).map_err(|_| BlockBuildError::IdOverflow)?;
+                    u32::try_from(output_column).map_err(|_| ExpansionError::IdOverflow)?;
                 let local_output_columns = column_end - column_start;
                 if local_output_columns == 0
                     || local_output_columns > output_column_block
                     || !local_output_columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO)
                 {
-                    return Err(BlockBuildError::InvalidOperatorPlan);
+                    return Err(ExpansionError::InvalidOperatorPlan);
                 }
                 for left in left_shards.iter().copied() {
                     let left_shard = self.shards[left.index() as usize].clone();
@@ -180,14 +180,14 @@ impl BlockBuilder {
                             != crate::OperandMaterialization::DispatchSlices
                             && view.shard != left
                         {
-                            return Err(BlockBuildError::InvalidOperatorPlan);
+                            return Err(ExpansionError::InvalidOperatorPlan);
                         }
                         resident_lefts.insert(left, view.clone());
                         view
                     };
                     let inner = left_shard.extents[left_inner_axis];
                     if !(inner.physical_end - inner.start).is_multiple_of(inner_block) {
-                        return Err(BlockBuildError::InvalidOperatorPlan);
+                        return Err(ExpansionError::InvalidOperatorPlan);
                     }
                     if replica_columns.get(&left).copied().map(u32::from) != Some(output_column) {
                         continue;
@@ -217,15 +217,15 @@ impl BlockBuilder {
                         {
                             *extent = left_shard.extents[axis];
                             extent.axis =
-                                u16::try_from(axis).map_err(|_| BlockBuildError::IdOverflow)?;
+                                u16::try_from(axis).map_err(|_| ExpansionError::IdOverflow)?;
                         }
                     }
                     extents[output_row_axis] = left_shard.extents[left_row_axis];
                     extents[output_row_axis].axis =
-                        u16::try_from(output_row_axis).map_err(|_| BlockBuildError::IdOverflow)?;
+                        u16::try_from(output_row_axis).map_err(|_| ExpansionError::IdOverflow)?;
                     extents[output_column_axis] = ShardExtent {
                         axis: u16::try_from(output_column_axis)
-                            .map_err(|_| BlockBuildError::IdOverflow)?,
+                            .map_err(|_| ExpansionError::IdOverflow)?,
                         start: column_start,
                         logical_end: logical_column_end,
                         physical_end: column_end,
@@ -294,7 +294,7 @@ impl BlockBuilder {
                             first_panel_end,
                         )
                         .next()
-                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                        .ok_or(ExpansionError::InvalidOperatorPlan)?;
                     let mut weight_type = self.shards[first_source.index() as usize]
                         .tensor_type
                         .clone();
@@ -354,7 +354,7 @@ impl BlockBuilder {
                                     panel_end,
                                 )
                                 .next()
-                                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                                .ok_or(ExpansionError::InvalidOperatorPlan)?;
                             let target_view = self.narrow_view(
                                 source,
                                 &[
@@ -367,7 +367,7 @@ impl BlockBuilder {
                             let consume_direct = source_is_local && !stage_local_sources;
                             if !consume_direct {
                                 let destination_view = self.narrow_view(
-                                    weights.ok_or(BlockBuildError::InvalidOperatorPlan)?,
+                                    weights.ok_or(ExpansionError::InvalidOperatorPlan)?,
                                     &[
                                         (right_inner_axis, panel_start, panel_end),
                                         (right_column_axis, column_start, column_end),
@@ -399,7 +399,7 @@ impl BlockBuilder {
                             {
                                 let panel_start = inner_start
                                     + u32::try_from(panel_index)
-                                        .map_err(|_| BlockBuildError::IdOverflow)?
+                                        .map_err(|_| ExpansionError::IdOverflow)?
                                         * source_panel_block;
                                 let panel_end = panel_start + source_panel_block;
                                 let left_view = self.narrow_view(
@@ -423,7 +423,7 @@ impl BlockBuilder {
                                     let selected = if local {
                                         source_view.shard
                                     } else {
-                                        weights.ok_or(BlockBuildError::InvalidOperatorPlan)?
+                                        weights.ok_or(ExpansionError::InvalidOperatorPlan)?
                                     };
                                     *load = if self.shards[selected.index() as usize]
                                         .tensor_type
@@ -441,7 +441,7 @@ impl BlockBuilder {
                                     source_view
                                 } else {
                                     self.narrow_view(
-                                        weights.ok_or(BlockBuildError::InvalidOperatorPlan)?,
+                                        weights.ok_or(ExpansionError::InvalidOperatorPlan)?,
                                         &[
                                             (right_inner_axis, panel_start, panel_end),
                                             (right_column_axis, column_start, column_end),
@@ -493,7 +493,7 @@ impl BlockBuilder {
                             let selected = if sources.len() == 1 && sources[0].1 {
                                 sources[0].0.shard
                             } else {
-                                weights.ok_or(BlockBuildError::InvalidOperatorPlan)?
+                                weights.ok_or(ExpansionError::InvalidOperatorPlan)?
                             };
                             *load = if self.shards[selected.index() as usize]
                                 .tensor_type
@@ -511,7 +511,7 @@ impl BlockBuilder {
                             sources.pop().expect("one source").0
                         } else {
                             self.narrow_view(
-                                weights.ok_or(BlockBuildError::InvalidOperatorPlan)?,
+                                weights.ok_or(ExpansionError::InvalidOperatorPlan)?,
                                 &[
                                     (right_inner_axis, inner_start, inner_end),
                                     (right_column_axis, column_start, column_end),

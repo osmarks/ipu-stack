@@ -1,10 +1,10 @@
 use crate::low::*;
 fn lower_to_tiles(
-    graph: &crate::ImplementationCandidate,
+    graph: &crate::MidProgram,
     checkpoints: bool,
-) -> super::BlockBuildResult<crate::LowProgram> {
+) -> super::ExpansionResult<crate::LowProgram> {
     Ok(crate::low::lower_to_tiles(
-        &super::build_blocks(graph)?,
+        &super::expand_tiles(graph)?,
         checkpoints,
     ))
 }

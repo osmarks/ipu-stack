@@ -2,15 +2,14 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn storage_root(&self, shard: BlockValueId) -> BlockValueId {
-        crate::mid::storage_root(&self.shards, shard)
+        crate::storage_root(&self.shards, shard)
     }
 
-    pub(super) fn push_shard(&mut self, mut shard: BlockValue) -> BlockBuildResult<BlockValueId> {
-        let id = BlockValueId(
-            u32::try_from(self.shards.len()).map_err(|_| BlockBuildError::IdOverflow)?,
-        );
+    pub(super) fn push_shard(&mut self, mut shard: BlockValue) -> ExpansionResult<BlockValueId> {
+        let id =
+            BlockValueId(u32::try_from(self.shards.len()).map_err(|_| ExpansionError::IdOverflow)?);
         shard.id = id;
         self.shards.push(shard);
         Ok(id)
@@ -21,7 +20,7 @@ impl BlockBuilder {
         tile: u16,
         bytes: u32,
         access_tail: u32,
-    ) -> BlockBuildResult<bool> {
+    ) -> ExpansionResult<bool> {
         let used = self
             .shards
             .iter()
@@ -40,7 +39,7 @@ impl BlockBuilder {
                 total
                     .checked_add(crate::shard_storage_bytes(shard)?)
                     .and_then(|total| total.checked_add(access_tail))
-                    .ok_or(BlockBuildError::IdOverflow)
+                    .ok_or(ExpansionError::IdOverflow)
             })?;
         Ok(used
             .checked_add(bytes)
@@ -48,7 +47,7 @@ impl BlockBuilder {
             .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_REGION_BYTES))
     }
 
-    pub(super) fn interleaved_usage(&self, access_tail: u32) -> BlockBuildResult<Vec<u32>> {
+    pub(super) fn interleaved_usage(&self, access_tail: u32) -> ExpansionResult<Vec<u32>> {
         let mut used = vec![0u32; usize::from(self.tile_count)];
         for shard in &self.shards {
             if shard.tensor_type.format.layout.memory_class == MemoryClass::Ipu21Interleaved
@@ -63,25 +62,25 @@ impl BlockBuilder {
                 *total = total
                     .checked_add(shard_storage_bytes(shard)?)
                     .and_then(|total| total.checked_add(access_tail))
-                    .ok_or(BlockBuildError::IdOverflow)?;
+                    .ok_or(ExpansionError::IdOverflow)?;
             }
         }
         Ok(used)
     }
 
-    pub(super) fn value_shards(&self, value: MidValueId) -> BlockBuildResult<&[BlockValueId]> {
+    pub(super) fn value_shards(&self, value: MidValueId) -> ExpansionResult<&[BlockValueId]> {
         self.canonical
             .get(value.index() as usize)
             .filter(|shards| !shards.is_empty())
             .map(Vec::as_slice)
-            .ok_or(BlockBuildError::UnknownValue(value))
+            .ok_or(ExpansionError::UnknownValue(value))
     }
 
     pub(super) fn local_shard(
         &self,
         value: MidValueId,
         tile: u16,
-    ) -> BlockBuildResult<BlockValueId> {
+    ) -> ExpansionResult<BlockValueId> {
         let shards = self.value_shards(value)?;
         if let Some(&shard) = shards.get(usize::from(tile))
             && self.shards[shard.index() as usize].tile == tile
@@ -92,7 +91,7 @@ impl BlockBuilder {
             .iter()
             .copied()
             .find(|shard| self.shards[shard.index() as usize].tile == tile)
-            .ok_or(BlockBuildError::UnknownValue(value))
+            .ok_or(ExpansionError::UnknownValue(value))
     }
 
     pub(super) fn full_view(&self, shard: BlockValueId) -> ShardView {
@@ -106,15 +105,15 @@ impl BlockBuilder {
         &self,
         shard: BlockValueId,
         ranges: &[(usize, u32, u32)],
-    ) -> BlockBuildResult<ShardView> {
+    ) -> ExpansionResult<ShardView> {
         let mut view = self.full_view(shard);
         for &(axis, start, end) in ranges {
             let extent = view
                 .extents
                 .get_mut(axis)
-                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
             if start < extent.start || end > extent.physical_end || start >= end {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
             extent.start = start;
             extent.physical_end = end;
@@ -131,7 +130,7 @@ impl BlockBuilder {
         &self,
         value: MidValueId,
         tile: u16,
-    ) -> BlockBuildResult<Option<BlockValueId>> {
+    ) -> ExpansionResult<Option<BlockValueId>> {
         Ok(self
             .value_shards(value)?
             .iter()
@@ -143,14 +142,14 @@ impl BlockBuilder {
         &self,
         value: MidValueId,
         target: BlockValueId,
-    ) -> BlockBuildResult<BlockValueId> {
+    ) -> ExpansionResult<BlockValueId> {
         let target = &self.shards[target.index() as usize];
         self.value_shards(value)?
             .iter()
             .copied()
             .filter(|shard| self.shards[shard.index() as usize].extents == target.extents)
             .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != target.tile))
-            .ok_or(BlockBuildError::UnknownValue(value))
+            .ok_or(ExpansionError::UnknownValue(value))
     }
 
     pub(super) fn shard_stride(
@@ -158,7 +157,7 @@ impl BlockBuilder {
         shard: BlockValueId,
         alignment: u32,
         access_tail: u32,
-    ) -> BlockBuildResult<u32> {
+    ) -> ExpansionResult<u32> {
         let shard = &self.shards[shard.index() as usize];
         let elements = shard
             .extents
@@ -166,17 +165,17 @@ impl BlockBuilder {
             .try_fold(1_u64, |elements, extent| {
                 elements.checked_mul(u64::from(extent.physical_end - extent.start))
             })
-            .ok_or(BlockBuildError::IdOverflow)?;
+            .ok_or(ExpansionError::IdOverflow)?;
         let bytes = elements
             .checked_mul(shard.tensor_type.format.precision.bytes())
             .and_then(|bytes| bytes.checked_add(u64::from(access_tail)))
-            .ok_or(BlockBuildError::IdOverflow)?;
+            .ok_or(ExpansionError::IdOverflow)?;
         let alignment = u64::from(alignment.max(1));
         let stride = bytes
             .checked_add(alignment - 1)
             .map(|bytes| bytes / alignment * alignment)
-            .ok_or(BlockBuildError::IdOverflow)?;
-        u32::try_from(stride).map_err(|_| BlockBuildError::IdOverflow)
+            .ok_or(ExpansionError::IdOverflow)?;
+        u32::try_from(stride).map_err(|_| ExpansionError::IdOverflow)
     }
 
     pub(super) fn push_packed_buffer(
@@ -185,7 +184,7 @@ impl BlockBuilder {
         elements: u32,
         precision: Precision,
         definition: ShardDefinition,
-    ) -> BlockBuildResult<BlockValueId> {
+    ) -> ExpansionResult<BlockValueId> {
         self.push_shard(BlockValue {
             id: BlockValueId(0),
             tile,

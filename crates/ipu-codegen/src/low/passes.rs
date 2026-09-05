@@ -65,7 +65,7 @@ fn compact_copies(region: &mut BlockRegion, old: &[LocalCopy], copies: &mut Vec<
     }
 }
 
-pub(super) fn simplify(program: &mut MidProgram) {
+pub(super) fn simplify(program: &mut TileGraph) {
     let roots = program
         .shards
         .iter()

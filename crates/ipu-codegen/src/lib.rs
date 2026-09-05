@@ -31,6 +31,10 @@ pub use graph::{
 };
 pub(crate) use kernel::*;
 pub(crate) use low::*;
+pub use low::{
+    BlockValue, BlockValueId, ShardDefinition, ShardView, logical_view_byte_spans,
+    shard_storage_bytes,
+};
 pub(crate) use memory::*;
 pub(crate) use mid::*;
 pub use mid::{
@@ -38,10 +42,6 @@ pub use mid::{
     GemmOrientation, GemmPlanConstraint, GridOrder, Layout, LocalOperandStaging, MemoryClass,
     MidOperator, PipelineConfig, Precision, ReductionStaging, ShardExtent, TensorFormat,
     TensorType,
-};
-pub use mid::{
-    BlockValue, BlockValueId, ShardDefinition, ShardView, logical_view_byte_spans,
-    shard_storage_bytes,
 };
 pub use package::{
     CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageConfig,

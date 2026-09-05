@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_attention_blocks(
         &mut self,
@@ -15,7 +15,7 @@ impl BlockBuilder {
         padded_value_dimension: u32,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<Vec<PreparedAttentionBlock>> {
+    ) -> ExpansionResult<Vec<PreparedAttentionBlock>> {
         let blocks = key_rows.div_ceil(block_rows);
         let key_destinations = tasks.iter().fold(
             BTreeMap::<u32, Vec<BlockValueId>>::new(),
@@ -59,7 +59,7 @@ impl BlockBuilder {
                 tiles,
             )?;
             let row_block =
-                u16::try_from(block_rows).map_err(|_| BlockBuildError::InvalidOperatorPlan)?;
+                u16::try_from(block_rows).map_err(|_| ExpansionError::InvalidOperatorPlan)?;
             let value_panels = self.prepare_distributed_attention_panels(
                 value,
                 &value_destinations,
@@ -98,23 +98,23 @@ impl BlockBuilder {
         padded_query_dimension: u32,
         padded_value_dimension: u32,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [query, key, value] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         if key_block_rows != AMP_INNER_BLOCK || query_block_rows == 0 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let key_shards = self.value_shards(*key)?.to_vec();
         let value_shards = self.value_shards(*value)?.to_vec();
         if key_shards.len() != value_shards.len() {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         if self.has_deferred_value(*key) != self.has_deferred_value(*value) {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let tasks = self.build_attention_tasks(
             *query,
@@ -135,9 +135,9 @@ impl BlockBuilder {
             .shape
             .0[1];
         let blocks = usize::try_from(key_rows.div_ceil(key_block_rows))
-            .map_err(|_| BlockBuildError::IdOverflow)?;
+            .map_err(|_| ExpansionError::IdOverflow)?;
         if blocks == 0 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let exchange_provenance = WorkProvenance {
             operation: operation.source,
@@ -168,13 +168,13 @@ impl BlockBuilder {
         };
         for block in 0..blocks {
             let block_start =
-                u32::try_from(block).map_err(|_| BlockBuildError::IdOverflow)? * key_block_rows;
+                u32::try_from(block).map_err(|_| ExpansionError::IdOverflow)? * key_block_rows;
             let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
             let mut task_sources = Vec::with_capacity(tasks.len());
             if deferred_key_value {
                 let prepared = prepared_blocks
                     .get(block)
-                    .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
                 self.append_prepared_panel_broadcasts(
                     &prepared.key_panels,
                     0,
@@ -202,11 +202,11 @@ impl BlockBuilder {
                     let key_source = *key_shards
                         .iter()
                         .find(source_matches)
-                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                        .ok_or(ExpansionError::InvalidOperatorPlan)?;
                     let value_source = *value_shards
                         .iter()
                         .find(source_matches)
-                        .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                        .ok_or(ExpansionError::InvalidOperatorPlan)?;
                     let valid_key_rows = self.shards[key_source.index() as usize].extents[1]
                         .logical_end
                         .saturating_sub(block_start);

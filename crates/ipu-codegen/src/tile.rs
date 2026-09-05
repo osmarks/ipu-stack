@@ -702,7 +702,7 @@ mod tests {
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(
-                &crate::mid::build_blocks(&mid).unwrap(),
+                &crate::expand_tiles(&mid).unwrap(),
                 config.diagnostic_checkpoints,
             );
             let placement = place(&low).unwrap();

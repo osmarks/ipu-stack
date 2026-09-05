@@ -42,7 +42,7 @@ pub(super) fn append_span_copies(
     tile: u16,
     copies: &mut Vec<(u16, LocalCopy)>,
     order: CopyOrder,
-) -> BlockBuildResult<()> {
+) -> ExpansionResult<()> {
     let spans = match order {
         CopyOrder::Semantic => logical_view_byte_spans,
         CopyOrder::Physical => view_byte_spans,

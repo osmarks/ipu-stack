@@ -7,15 +7,15 @@ pub(super) fn split_gemm_matrices(
     axis: usize,
     coordinates: &mut [u32],
     runs: &mut Vec<KernelRun>,
-) -> BlockBuildResult<()> {
+) -> ExpansionResult<()> {
     if axis < coordinates.len() {
         let extent = run
             .output
             .extents
             .get(axis)
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         if extent.logical_end != extent.physical_end {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         for coordinate in extent.start..extent.physical_end {
             coordinates[axis] = coordinate;
@@ -38,10 +38,10 @@ pub(super) fn split_gemm_matrices(
 pub(super) fn narrow_gemm_matrix_view(
     view: &mut ShardView,
     output_coordinates: &[u32],
-) -> BlockBuildResult<()> {
+) -> ExpansionResult<()> {
     let input_axes = view.extents.len().saturating_sub(2);
     if input_axes > output_coordinates.len() {
-        return Err(BlockBuildError::InvalidOperatorPlan);
+        return Err(ExpansionError::InvalidOperatorPlan);
     }
     let output_axis_offset = output_coordinates.len() - input_axes;
     for (axis, extent) in view.extents[..input_axes].iter_mut().enumerate() {
@@ -50,7 +50,7 @@ pub(super) fn narrow_gemm_matrix_view(
         }
         let coordinate = output_coordinates[output_axis_offset + axis];
         if coordinate < extent.start || coordinate >= extent.physical_end {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         extent.start = coordinate;
         extent.logical_end = coordinate + 1;
@@ -59,7 +59,7 @@ pub(super) fn narrow_gemm_matrix_view(
     Ok(())
 }
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn right_shard_for_block(
         &self,
         right_shards: &[BlockValueId],
@@ -137,7 +137,7 @@ impl BlockBuilder {
         columns: Range<u32>,
         inner: Range<u32>,
         access_tail: u32,
-    ) -> BlockBuildResult<bool> {
+    ) -> ExpansionResult<bool> {
         let mut candidates = Vec::with_capacity(output_shards.len());
         for output in output_shards {
             let tile = self.shards[output.index() as usize].tile;
@@ -173,7 +173,7 @@ impl BlockBuilder {
             let bytes = spans.iter().try_fold(0u32, |total, span| {
                 total
                     .checked_add(span.bytes)
-                    .ok_or(BlockBuildError::IdOverflow)
+                    .ok_or(ExpansionError::IdOverflow)
             })?;
             candidates.push((tile, bytes));
         }
@@ -197,7 +197,7 @@ impl BlockBuilder {
         distribution: GemmDistribution,
         requirements: &StorageRequirements,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         if let GemmDistribution::ParallelReduction {
             row_partitions,
             column_partitions,
@@ -225,13 +225,13 @@ impl BlockBuilder {
             );
         }
         if orientation != crate::GemmOrientation::Normal {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let [left_value, right_value] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [output_value] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         if requirements.inputs[1]
             .format
@@ -252,7 +252,7 @@ impl BlockBuilder {
             );
         }
         if inner_block == 0 || output_column_block == 0 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let left_shards = self.value_shards(*left_value)?.to_vec();
         let right_shards = self.value_shards(*right_value)?.to_vec();
@@ -262,7 +262,7 @@ impl BlockBuilder {
         let left_rank = left_type.shape.0.len();
         let output_rank = output_type.shape.0.len();
         if left_rank < 2 || output_rank < 2 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let inner_extent = left_type.format.layout.padded_shape(&left_type.shape)?.0[left_rank - 1];
         let column_extent = output_type
@@ -273,19 +273,19 @@ impl BlockBuilder {
         if !inner_extent.is_multiple_of(inner_block)
             || !column_extent.is_multiple_of(output_column_block)
         {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
 
         let panels_per_phase = column_extent / output_column_block;
         let phase_column_width = output_column_block
             .checked_mul(panels_per_phase)
-            .ok_or(BlockBuildError::IdOverflow)?;
+            .ok_or(ExpansionError::IdOverflow)?;
         let mut local_right_staging = BTreeMap::<(u16, u32), BlockValueId>::new();
         let mut remote_right_staging = vec![
             vec![
                 None;
                 usize::try_from(panels_per_phase)
-                    .map_err(|_| BlockBuildError::IdOverflow)?
+                    .map_err(|_| ExpansionError::IdOverflow)?
             ];
             usize::from(self.tile_count)
         ];
@@ -312,7 +312,7 @@ impl BlockBuilder {
                         )
                         .collect::<Vec<_>>();
                     if right_candidates.is_empty() {
-                        return Err(BlockBuildError::InvalidOperatorPlan);
+                        return Err(ExpansionError::InvalidOperatorPlan);
                     }
                     let column_outputs = output_shards
                         .iter()
@@ -324,7 +324,7 @@ impl BlockBuilder {
                         })
                         .collect::<Vec<_>>();
                     if column_outputs.is_empty() {
-                        return Err(BlockBuildError::InvalidOperatorPlan);
+                        return Err(ExpansionError::InvalidOperatorPlan);
                     }
                     let use_interleaved_staging = self.use_uniform_interleaved_gemm_staging(
                         &column_outputs,
@@ -335,7 +335,7 @@ impl BlockBuilder {
                     )?;
                     let staging_slot =
                         usize::try_from((column_start - phase_column_start) / output_column_block)
-                            .map_err(|_| BlockBuildError::IdOverflow)?;
+                            .map_err(|_| ExpansionError::IdOverflow)?;
                     for output in &column_outputs {
                         let tile = self.shards[output.index() as usize].tile;
                         let left_view = if let Some(view) = left_views.get(&tile) {
@@ -354,7 +354,7 @@ impl BlockBuilder {
                         };
                         let right = self
                             .prefer_local_shard(&right_candidates, tile)
-                            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                            .ok_or(ExpansionError::InvalidOperatorPlan)?;
                         let right_rank = self.shards[right.index() as usize].extents.len();
                         let right_view = self.narrow_view(
                             right,
@@ -409,7 +409,7 @@ impl BlockBuilder {
                                     ));
                                     destination_offset = destination_offset
                                         .checked_add(span.bytes)
-                                        .ok_or(BlockBuildError::IdOverflow)?;
+                                        .ok_or(ExpansionError::IdOverflow)?;
                                 }
                                 self.full_view(copy)
                             }

@@ -11,7 +11,7 @@ mod tensor;
 mod traffic;
 
 use crate::graph::TensorShape;
-use crate::mid::{
+use crate::{
     ElementOrder, Layout, MemoryClass, MidOperation, MidValue, MidValueId, Precision, TensorType,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};

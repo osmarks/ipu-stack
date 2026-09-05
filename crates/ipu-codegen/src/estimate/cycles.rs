@@ -2,7 +2,7 @@
 
 use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic, maximum_shard_bytes};
 use crate::graph::TensorShape;
-use crate::mid::{
+use crate::{
     AmpOrder, BlockMajorOrder, ConversionStrategy, ElementOrder, Layout, OperatorPlan, Precision,
     TensorType,
 };
@@ -16,7 +16,7 @@ pub trait CostModel: Sync {
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> Option<Arc<crate::MidProgram>> {
+    ) -> Option<Arc<crate::TileGraph>> {
         super::implementation_estimate(plan, inputs, output)
     }
     fn operator_cycle_override(
@@ -105,7 +105,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> Option<Arc<crate::MidProgram>> {
+    ) -> Option<Arc<crate::TileGraph>> {
         let mut plan = plan.clone();
         plan.deferred_output = None;
         let key = (plan, inputs.to_vec(), output.clone());

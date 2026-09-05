@@ -12,7 +12,7 @@ pub(crate) use abi::*;
 pub(crate) use build::*;
 use specialization::*;
 
-use crate::mid::{
+use crate::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AttentionKernelShape, KernelAbiError, attention_shape,
     gemm_rows, input_matrix_extent, matrix_count, matrix_extent,
 };

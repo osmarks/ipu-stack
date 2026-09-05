@@ -2,32 +2,32 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn build_view(
         &mut self,
         operation: &MidOperation,
         operator: &crate::MidOperator,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let crate::MidOperator::View(view) = operator else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [input] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         let input_type = self
             .value_shards(*input)?
             .first()
             .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let output_shards = self.value_shards(*result)?.to_vec();
         let output_type = output_shards
             .first()
             .map(|shard| self.shards[shard.index() as usize].tensor_type.clone())
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
         let original_sources = self.value_shards(*input)?.to_vec();
         let direct_panel_exchange = input_type
             .format
@@ -74,7 +74,7 @@ impl BlockBuilder {
                 },
                 tiles,
             )?
-            .ok_or(BlockBuildError::InvalidOperatorPlan)?
+            .ok_or(ExpansionError::InvalidOperatorPlan)?
         } else {
             self.value_shards(*input)?.to_vec()
         };
@@ -98,7 +98,7 @@ impl BlockBuilder {
         source_shards: &[BlockValueId],
         output_shards: &[BlockValueId],
         view: AxisFactorView,
-    ) -> BlockBuildResult<Vec<(ShardView, ShardView)>> {
+    ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
         let mut mappings = Vec::new();
         for &output in output_shards {
             let output_extents = self.shards[output.index() as usize].extents.clone();
@@ -108,7 +108,7 @@ impl BlockBuilder {
                 .shape;
             let output_shape = &self.shards[output.index() as usize].tensor_type.shape;
             if view.output_shape(source_shape).as_ref() != Some(output_shape) {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
             let split = view.split_axis;
             let merge = view.merge_axis;
@@ -120,7 +120,7 @@ impl BlockBuilder {
                 stream_extents[merge].physical_end = stream + 1;
                 let (target, column_base) = view
                     .source_extents(source_shape, output_shape, &stream_extents)
-                    .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
                 for (mut source_extents, source) in
                     self.intersecting_shard_set(source_shards, &target, tile)
                 {
@@ -167,7 +167,7 @@ impl BlockBuilder {
     pub(super) fn f16_micro_panel_mappings(
         &self,
         mappings: Vec<(ShardView, ShardView)>,
-    ) -> BlockBuildResult<Option<Vec<(ShardView, ShardView)>>> {
+    ) -> ExpansionResult<Option<Vec<(ShardView, ShardView)>>> {
         let mut split = Vec::new();
         for (source, destination) in mappings {
             let source_shard = &self.shards[source.shard.index() as usize];

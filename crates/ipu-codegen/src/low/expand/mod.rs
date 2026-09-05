@@ -20,17 +20,16 @@ mod pointwise;
 mod reduce;
 mod repeat;
 mod reuse;
-use super::block::*;
 use crate::graph::OperationId;
-use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
-    ConversionStrategy, CopyOrder, CopyPattern, ElementOrder, GemmDistribution,
-    ImplementationCandidate, KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation,
-    MidOperationKind, MidRepeat, MidValueId, OperatorDispatch, OutputAliasing,
-    PointwiseInputMapping, Precision, ShardExtent, StorageRequirements, TensorTiling, TensorType,
-    TileKernelSpec,
-};
+use crate::low::*;
 use crate::storage::{ByteSpan, StorageError};
+use crate::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
+    ConversionStrategy, CopyOrder, CopyPattern, ElementOrder, GemmDistribution, KernelRequirements,
+    Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind, MidProgram, MidRepeat,
+    MidValueId, OperatorDispatch, OutputAliasing, PointwiseInputMapping, Precision, ShardExtent,
+    StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
+};
 use attention::*;
 use conversion::MaterializationBatch;
 use copies::*;
@@ -44,7 +43,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum BlockBuildError {
+pub enum ExpansionError {
     #[error("mid block construction requires a nonzero tile count")]
     EmptyTileGroup,
     #[error("value {0:?} does not exist")]
@@ -69,13 +68,13 @@ pub enum BlockBuildError {
     Storage(#[from] StorageError),
 }
 
-pub type BlockBuildResult<T> = Result<T, BlockBuildError>;
+pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
-pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<Arc<MidProgram>> {
+pub(crate) fn expand_tiles(graph: &MidProgram) -> ExpansionResult<Arc<TileGraph>> {
     if graph.tile_count == 0 {
-        return Err(BlockBuildError::EmptyTileGroup);
+        return Err(ExpansionError::EmptyTileGroup);
     }
-    let mut state = BlockBuilder::new(graph)?;
+    let mut state = TileGraphBuilder::new(graph)?;
     let body = state.build_region(&graph.operations, true)?;
     let inputs = graph
         .inputs
@@ -88,7 +87,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
                 shards: state.value_shards(input.value)?.to_vec(),
             })
         })
-        .collect::<BlockBuildResult<_>>()?;
+        .collect::<ExpansionResult<_>>()?;
     let outputs = graph
         .outputs
         .iter()
@@ -98,7 +97,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
                 shards: state.value_shards(*value)?.to_vec(),
             })
         })
-        .collect::<BlockBuildResult<_>>()?;
+        .collect::<ExpansionResult<_>>()?;
     let values = graph
         .values
         .iter()
@@ -115,7 +114,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
         exchange_phases = state.phases.len(),
         "built logical tile schedule"
     );
-    let mut program = MidProgram {
+    let mut program = TileGraph {
         tile_count: graph.tile_count,
         shards: state.shards,
         exchange_phases: state.phases,
@@ -145,7 +144,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
         estimated_cycles: graph.estimated_cycles,
         estimated_exchange_cycles: graph.estimated_exchange_cycles,
     };
-    super::passes::simplify(&mut program);
+    crate::low::passes::simplify(&mut program);
     let cycles = crate::estimate::program_cycles(&program, None)?;
     program.estimated_cycles = cycles.total;
     program.estimated_exchange_cycles = cycles.exchange;
@@ -154,7 +153,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
 
 type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<BlockValueId>)>;
 
-struct BlockBuilder {
+struct TileGraphBuilder {
     tile_count: u16,
     shards: Vec<BlockValue>,
     canonical: Vec<Vec<BlockValueId>>,
@@ -167,8 +166,8 @@ struct BlockBuilder {
     intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
 }
 
-impl BlockBuilder {
-    fn new(graph: &ImplementationCandidate) -> BlockBuildResult<Self> {
+impl TileGraphBuilder {
+    fn new(graph: &MidProgram) -> ExpansionResult<Self> {
         let tile_count = graph.tile_count;
         let mut state = Self {
             tile_count,
@@ -238,7 +237,7 @@ impl BlockBuilder {
         source: MidValueId,
         target: &[ShardExtent],
         local_tile: u16,
-    ) -> BlockBuildResult<Vec<(Vec<ShardExtent>, BlockValueId)>> {
+    ) -> ExpansionResult<Vec<(Vec<ShardExtent>, BlockValueId)>> {
         let key = (source, target.to_vec());
         if !self.intersection_cache.contains_key(&key) {
             let groups = self.shard_intersection_groups(self.value_shards(source)?, target);
@@ -294,7 +293,7 @@ impl BlockBuilder {
         &mut self,
         operations: &[MidOperation],
         checkpoints: bool,
-    ) -> BlockBuildResult<BlockRegion> {
+    ) -> ExpansionResult<BlockRegion> {
         let mut tiles = BlockRegion::default();
         let mut checkpoint = 0u8;
         for (index, operation) in operations.iter().enumerate() {
@@ -361,9 +360,9 @@ impl BlockBuilder {
         operation: &MidOperation,
         plan: &crate::OperatorPlan,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         if plan.requirements.inputs.len() != operation.inputs.len() {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         if self.reuse_implementation(operation, tiles)? {
             return Ok(());
@@ -385,7 +384,7 @@ impl BlockBuilder {
                     ..
                 } = plan.operator
                 else {
-                    return Err(BlockBuildError::InvalidOperatorPlan);
+                    return Err(ExpansionError::InvalidOperatorPlan);
                 };
                 let kernel = |mode| TileKernelSpec::Gemm {
                     multiply,
@@ -450,7 +449,7 @@ impl BlockBuilder {
         tiles: &mut BlockRegion,
         shard: BlockValueId,
         provenance: WorkProvenance,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let shard_data = &self.shards[shard.index() as usize];
         let tile = shard_data.tile;
         self.append_kernel(
@@ -473,7 +472,7 @@ impl BlockBuilder {
         provenance: WorkProvenance,
         batch: &mut MaterializationBatch,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<ShardView> {
+    ) -> ExpansionResult<ShardView> {
         let target = self.local_shard(value, tile)?;
         let target_view = self.narrow_view(target, ranges)?;
         let Some(source_value) = self.deferred_conversions.get(&value).copied() else {
@@ -489,7 +488,7 @@ impl BlockBuilder {
         })?;
         let intersections = self.intersecting_shards(source_value, &target_view.extents, tile)?;
         if intersections.is_empty() {
-            return Err(BlockBuildError::InvalidConversionPlan);
+            return Err(ExpansionError::InvalidConversionPlan);
         }
         let mappings = intersections
             .into_iter()

@@ -2,27 +2,27 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn kernel_run(
         &self,
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
         output: ShardView,
-    ) -> BlockBuildResult<KernelRun> {
+    ) -> ExpansionResult<KernelRun> {
         let formats = inputs
             .iter()
             .map(|operand| {
                 let view = operand
                     .views
                     .first()
-                    .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
                 Ok(self.shards[view.shard.index() as usize]
                     .tensor_type
                     .format
                     .clone())
             })
-            .collect::<BlockBuildResult<Vec<_>>>()?;
+            .collect::<ExpansionResult<Vec<_>>>()?;
         let requirements = KernelRequirements::new(
             &kernel,
             formats,
@@ -45,7 +45,7 @@ impl BlockBuilder {
         transfers: BTreeMap<ShardView, Vec<ShardView>>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         self.append_ordered_phase(transfers, provenance, CopyOrder::Semantic, tiles)
     }
 
@@ -54,7 +54,7 @@ impl BlockBuilder {
         transfers: BTreeMap<ShardView, Vec<ShardView>>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         self.append_ordered_phase(transfers, provenance, CopyOrder::Physical, tiles)
     }
 
@@ -64,7 +64,7 @@ impl BlockBuilder {
         provenance: WorkProvenance,
         order: CopyOrder,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let transfers = transfers
             .into_iter()
             .map(|(source, mut destinations)| {
@@ -86,7 +86,7 @@ impl BlockBuilder {
         physical: BTreeMap<ShardView, Vec<ShardView>>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let mut transfers = Vec::with_capacity(semantic.len().saturating_add(physical.len()));
         for (order, mappings) in [
             (CopyOrder::Semantic, semantic),
@@ -110,7 +110,7 @@ impl BlockBuilder {
         mut transfers: Vec<LogicalExchange>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         if transfers.is_empty() {
             return Ok(());
         }
@@ -172,7 +172,7 @@ impl BlockBuilder {
             }
         }
         let id = ExchangePhaseId(
-            u32::try_from(self.phases.len()).map_err(|_| BlockBuildError::IdOverflow)?,
+            u32::try_from(self.phases.len()).map_err(|_| ExpansionError::IdOverflow)?,
         );
         self.phases.push(ExchangePhase {
             id,
@@ -195,7 +195,7 @@ impl BlockBuilder {
         tiles: &mut BlockRegion,
         tile: u16,
         run: KernelRun,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let output_flattens_outer_rows = matches!(
             run.requirements.output.format.layout.order,
             ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
@@ -223,7 +223,7 @@ impl BlockBuilder {
         tiles: &mut BlockRegion,
         tile: u16,
         mut run: KernelRun,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         if let Some(metadata) = self
             .kernel_metadata
             .iter()
@@ -234,7 +234,7 @@ impl BlockBuilder {
             self.kernel_metadata.push(Arc::clone(&run.metadata));
         }
         let id = KernelRunId(
-            u32::try_from(self.kernel_runs.len()).map_err(|_| BlockBuildError::IdOverflow)?,
+            u32::try_from(self.kernel_runs.len()).map_err(|_| ExpansionError::IdOverflow)?,
         );
         self.kernel_runs.push(run);
         tiles
@@ -248,9 +248,9 @@ impl BlockBuilder {
         tiles: &mut BlockRegion,
         tile: u16,
         copy: LocalCopy,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let id = LocalCopyId(
-            u32::try_from(self.local_copies.len()).map_err(|_| BlockBuildError::IdOverflow)?,
+            u32::try_from(self.local_copies.len()).map_err(|_| ExpansionError::IdOverflow)?,
         );
         self.local_copies.push(copy);
         tiles

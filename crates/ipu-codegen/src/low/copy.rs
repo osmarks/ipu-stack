@@ -167,11 +167,11 @@ fn coalesce_copies<Buffer: Clone>(
     coalesced
 }
 
-use super::{
+use crate::storage::{TensorStorage, logical_byte_spans, storage_bytes};
+use crate::{
     AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, ShardExtent, TensorFormat,
     TensorTiling, TensorType, TileKernelSpec,
 };
-use crate::storage::{TensorStorage, logical_byte_spans, storage_bytes};
 
 pub(crate) struct CopyMapping<'a> {
     pub source: TensorStorage<'a>,

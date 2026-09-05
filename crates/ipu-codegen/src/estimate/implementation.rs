@@ -1,17 +1,17 @@
 //! Cost concrete implementations once; share their executable fragments.
 
 use super::*;
-use crate::mid::*;
+use crate::*;
 use std::sync::{Arc, Weak};
 
 pub(super) type ImplementationKey = (OperatorPlan, Vec<TensorType>, TensorType);
-pub(super) type ImplementationCache = HashMap<ImplementationKey, Weak<MidProgram>>;
+pub(super) type ImplementationCache = HashMap<ImplementationKey, Weak<TileGraph>>;
 
 pub(crate) fn implementation_estimate(
     plan: &OperatorPlan,
     inputs: &[TensorType],
     output: &TensorType,
-) -> Option<Arc<MidProgram>> {
+) -> Option<Arc<TileGraph>> {
     let values = inputs
         .iter()
         .chain(std::iter::once(output))
@@ -28,7 +28,7 @@ pub(crate) fn implementation_estimate(
         })
         .collect::<Vec<_>>();
     let result = values.last()?.id;
-    let candidate = ImplementationCandidate {
+    let candidate = MidProgram {
         tile_count: values
             .iter()
             .map(|value| value.tensor_type.format.layout.tiling.tile_count)
@@ -58,7 +58,7 @@ pub(crate) fn implementation_estimate(
         }],
         outputs: vec![result],
         values,
-        ..ImplementationCandidate::default()
+        ..MidProgram::default()
     };
-    crate::mid::implementation::build_blocks(&candidate).ok()
+    crate::low::expand::expand_tiles(&candidate).ok()
 }

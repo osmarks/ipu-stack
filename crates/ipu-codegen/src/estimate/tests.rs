@@ -1,5 +1,5 @@
 use super::*;
-use crate::mid::{AMP_INNER_BLOCK, GemmDistribution, OperatorDispatch, TensorAxis};
+use crate::{AMP_INNER_BLOCK, GemmDistribution, OperatorDispatch, TensorAxis};
 use std::collections::BTreeSet;
 
 fn output_stationary_dispatch() -> OperatorDispatch {
@@ -216,7 +216,7 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
 
 #[test]
 fn randomized_resolved_capacity_matches_physical_storage() {
-    use crate::mid::{AxisTiling, Padding, TensorTiling};
+    use crate::{AxisTiling, Padding, TensorTiling};
     let mut random = fastrand::Rng::with_seed(0x7265_736f_6c76_6564);
     for _ in 0..128 {
         let groups = random.u16(1..=4);
@@ -262,7 +262,7 @@ fn randomized_resolved_capacity_matches_physical_storage() {
 
 #[test]
 fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
-    use crate::mid::{GemmOrientation, GridOrder};
+    use crate::{GemmOrientation, GridOrder};
     for orientation in [GemmOrientation::Normal, GemmOrientation::Swapped] {
         let (shape, layout) = match orientation {
             GemmOrientation::Normal => (

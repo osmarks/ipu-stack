@@ -4,7 +4,7 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn append_sum_partials(
         &mut self,
         groups: impl IntoIterator<Item = Vec<ShardView>>,
@@ -12,7 +12,7 @@ impl BlockBuilder {
         staging: crate::ReductionStaging,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let mut reduction_transfers = Vec::<BTreeMap<ShardView, Vec<ShardView>>>::new();
         let mut seed_copies = Vec::<(u16, LocalCopy)>::new();
         let mut reduction_runs = Vec::<Vec<(u16, KernelRun)>>::new();
@@ -20,7 +20,7 @@ impl BlockBuilder {
         let mut reduction_roots = 0usize;
         for contributors in groups {
             let Some(complete) = contributors.first() else {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             };
             let remote_count = contributors.len() - 1;
             let remote_partials_per_stage = match staging {
@@ -44,7 +44,7 @@ impl BlockBuilder {
                     || format.precision != Precision::F16
                     || format.layout.order != source_order
             }) {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
             let expected = complete
                 .extents
@@ -52,14 +52,14 @@ impl BlockBuilder {
                 .try_fold(1u64, |elements, extent| {
                     elements.checked_mul(u64::from(extent.physical_end - extent.start))
                 })
-                .ok_or(BlockBuildError::IdOverflow)?;
+                .ok_or(ExpansionError::IdOverflow)?;
             let mut covered = 0u64;
             for output in outputs.iter().copied() {
                 let owner = self.shards[output.index() as usize].clone();
                 if owner.tensor_type.format.precision != Precision::F16
                     || owner.tensor_type.format.layout.order != source_order
                 {
-                    return Err(BlockBuildError::InvalidOperatorPlan);
+                    return Err(ExpansionError::InvalidOperatorPlan);
                 }
                 let intersection =
                     intersect_extents_with_shared_padding(&owner.extents, &complete.extents);
@@ -71,13 +71,13 @@ impl BlockBuilder {
                     .try_fold(1u32, |elements, extent| {
                         elements.checked_mul(extent.physical_end - extent.start)
                     })
-                    .ok_or(BlockBuildError::IdOverflow)?;
+                    .ok_or(ExpansionError::IdOverflow)?;
                 if elements == 0 || !elements.is_multiple_of(8) {
-                    return Err(BlockBuildError::InvalidOperatorPlan);
+                    return Err(ExpansionError::InvalidOperatorPlan);
                 }
                 covered = covered
                     .checked_add(u64::from(elements))
-                    .ok_or(BlockBuildError::IdOverflow)?;
+                    .ok_or(ExpansionError::IdOverflow)?;
 
                 if remote_count == 0 {
                     let source = ShardView {
@@ -118,9 +118,9 @@ impl BlockBuilder {
                 let remote_elements = elements
                     .checked_mul(
                         u32::try_from(remote_partials_per_stage)
-                            .map_err(|_| BlockBuildError::IdOverflow)?,
+                            .map_err(|_| ExpansionError::IdOverflow)?,
                     )
-                    .ok_or(BlockBuildError::IdOverflow)?;
+                    .ok_or(ExpansionError::IdOverflow)?;
                 let remote = self.push_packed_buffer(
                     owner.tile,
                     remote_elements,
@@ -170,12 +170,12 @@ impl BlockBuilder {
                 {
                     for (slot, partial) in chunk.iter().enumerate() {
                         let start = u32::try_from(slot)
-                            .map_err(|_| BlockBuildError::IdOverflow)?
+                            .map_err(|_| ExpansionError::IdOverflow)?
                             .checked_mul(elements)
-                            .ok_or(BlockBuildError::IdOverflow)?;
+                            .ok_or(ExpansionError::IdOverflow)?;
                         let end = start
                             .checked_add(elements)
-                            .ok_or(BlockBuildError::IdOverflow)?;
+                            .ok_or(ExpansionError::IdOverflow)?;
                         reduction_transfers[stage]
                             .entry(source_view(partial))
                             .or_default()
@@ -200,7 +200,7 @@ impl BlockBuilder {
                             provenance,
                             TileKernelSpec::ReductionSum {
                                 partials: u16::try_from(chunk.len() + 1)
-                                    .map_err(|_| BlockBuildError::IdOverflow)?,
+                                    .map_err(|_| ExpansionError::IdOverflow)?,
                             },
                             vec![
                                 KernelOperand {
@@ -233,7 +233,7 @@ impl BlockBuilder {
                 reduction_roots += 1;
             }
             if covered != expected {
-                return Err(BlockBuildError::InvalidOperatorPlan);
+                return Err(ExpansionError::InvalidOperatorPlan);
             }
         }
         for (stage, (transfers, runs)) in reduction_transfers
@@ -276,7 +276,7 @@ mod tests {
             crate::ReductionStaging::Complete,
             crate::ReductionStaging::Streamed,
         ] {
-            let mut builder = BlockBuilder::new(&ImplementationCandidate {
+            let mut builder = TileGraphBuilder::new(&MidProgram {
                 tile_count: 4,
                 ..Default::default()
             })

@@ -1,9 +1,7 @@
 //! Price executable work and compose per-tile timelines across barriers/repeats.
 
 use super::{IPU21_TARGET_COSTS as TARGET, *};
-use crate::mid::{
-    BlockBuildResult, BlockOperation, BlockRegion, KernelRun, MidProgram, TileKernelSpec,
-};
+use crate::{BlockOperation, BlockRegion, ExpansionResult, KernelRun, TileGraph, TileKernelSpec};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramCycles {
@@ -97,9 +95,9 @@ fn maximum(values: &[u64]) -> u64 {
 }
 
 pub(crate) fn program_cycles(
-    program: &MidProgram,
+    program: &TileGraph,
     exchange: Option<&[u64]>,
-) -> BlockBuildResult<ProgramCycles> {
+) -> ExpansionResult<ProgramCycles> {
     let phases = if let Some(costs) = exchange {
         costs.to_vec()
     } else {
@@ -117,9 +115,9 @@ pub(crate) fn program_cycles(
                         .saturating_mul(super::IPU21_LOGICAL_FRAGMENT_CYCLES),
                 ))
             })
-            .collect::<BlockBuildResult<Vec<_>>>()?
+            .collect::<ExpansionResult<Vec<_>>>()?
     };
-    fn region(program: &MidProgram, body: &BlockRegion, phases: &[u64]) -> Timeline {
+    fn region(program: &TileGraph, body: &BlockRegion, phases: &[u64]) -> Timeline {
         let mut timeline = Timeline::new(usize::from(program.tile_count));
         for operation in &body.operations {
             match operation {
@@ -168,9 +166,9 @@ pub(crate) fn program_cycles(
 }
 
 pub(super) fn phase_traffic(
-    program: &MidProgram,
+    program: &TileGraph,
     phase: &crate::ExchangePhase,
-) -> BlockBuildResult<ExchangeEndpointTraffic> {
+) -> ExpansionResult<ExchangeEndpointTraffic> {
     let mut traffic = ExchangeEndpointTraffic::default();
     for transfer in &phase.transfers {
         let source = &program.shards[transfer.source.shard.index() as usize];
@@ -184,7 +182,7 @@ pub(super) fn phase_traffic(
         for destination in &transfer.destinations {
             let target = &program.shards[destination.shard.index() as usize];
             let mut fragments = 0u64;
-            crate::mid::for_each_copy_span(
+            crate::for_each_copy_span(
                 &source_spans,
                 &spans(target, destination)?,
                 |_, _, bytes| {
@@ -219,7 +217,7 @@ fn kernel_cycles(run: &KernelRun) -> u64 {
             output_columns,
             ..
         } => {
-            let rows = crate::mid::gemm_rows(run).map_or(u64::MAX, u64::from);
+            let rows = crate::gemm_rows(run).map_or(u64::MAX, u64::from);
             let columns = u64::from(*output_columns);
             let inner = u64::from(*inner_block);
             let right = run.requirements.inputs.get(1);
@@ -281,7 +279,7 @@ fn kernel_cycles(run: &KernelRun) -> u64 {
         TileKernelSpec::AttentionSoftmax { .. } => elements.saturating_mul(10),
         TileKernelSpec::AttentionMerge { .. } => elements.saturating_mul(4),
         TileKernelSpec::FlashAttention { .. } => {
-            let shape = crate::mid::attention_shape(run);
+            let shape = crate::attention_shape(run);
             return shape.map_or(u64::MAX, |shape| {
                 u64::from(shape.matrices)
                     .saturating_mul(u64::from(shape.query_rows))
@@ -298,7 +296,7 @@ fn kernel_cycles(run: &KernelRun) -> u64 {
     work.saturating_add(TARGET.kernel_launch_cycles)
 }
 
-pub(crate) fn program_footprint(program: &MidProgram) -> BlockBuildResult<ExchangeFootprint> {
+pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
     let mut chunks = 0u64;
     for phase in &program.exchange_phases {
         chunks = chunks.saturating_add(phase_traffic(program, phase)?.maximum_fragments());
@@ -315,7 +313,7 @@ mod tests {
 
     #[test]
     fn scheduled_phase_prices_follow_repeat_execution_counts() {
-        use crate::mid::*;
+        use crate::*;
         let provenance = WorkProvenance {
             operation: None,
             value: None,
@@ -325,7 +323,7 @@ mod tests {
         let body = BlockRegion {
             operations: vec![BlockOperation::Exchange(phase)],
         };
-        let mut program = MidProgram {
+        let mut program = TileGraph {
             tile_count: 2,
             shards: vec![],
             kernel_runs: vec![],

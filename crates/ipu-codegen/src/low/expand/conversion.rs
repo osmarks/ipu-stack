@@ -12,13 +12,13 @@ pub(super) struct MaterializationBatch {
     kernels: Vec<(u16, KernelRun)>,
 }
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn unpack_amp_to_row_major(
         &mut self,
         source: MidValueId,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<Option<Vec<BlockValueId>>> {
+    ) -> ExpansionResult<Option<Vec<BlockValueId>>> {
         let sources = self.value_shards(source)?.to_vec();
         for &source_shard in &sources {
             let source = &self.shards[source_shard.index() as usize];
@@ -89,14 +89,14 @@ impl BlockBuilder {
         operation: &MidOperation,
         plan: &crate::ConversionPlan,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         if plan.output.materialization == crate::OperandMaterialization::DispatchSlices {
             let ([source], [result]) = (operation.inputs.as_slice(), operation.results.as_slice())
             else {
-                return Err(BlockBuildError::InvalidConversionPlan);
+                return Err(ExpansionError::InvalidConversionPlan);
             };
             if !plan.strategy.uses_intersections() {
-                return Err(BlockBuildError::InvalidConversionPlan);
+                return Err(ExpansionError::InvalidConversionPlan);
             }
             // Mid lowering selected consumer-sized materialization. It is not
             // contingent on where other operand conversions appear in the list.
@@ -119,12 +119,12 @@ impl BlockBuilder {
         operation: &MidOperation,
         plan: &crate::ConversionPlan,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [input] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidConversionPlan);
+            return Err(ExpansionError::InvalidConversionPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         for output in self.value_shards(*result)?.to_vec() {
             let tile = self.shards[output.index() as usize].tile;
@@ -160,12 +160,12 @@ impl BlockBuilder {
         operation: &MidOperation,
         plan: &crate::ConversionPlan,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let [input] = operation.inputs.as_slice() else {
-            return Err(BlockBuildError::InvalidConversionPlan);
+            return Err(ExpansionError::InvalidConversionPlan);
         };
         let [result] = operation.results.as_slice() else {
-            return Err(BlockBuildError::ResultArity);
+            return Err(ExpansionError::ResultArity);
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*result)?.to_vec();
@@ -173,7 +173,7 @@ impl BlockBuilder {
             ConversionStrategy::DirectRetile => CopyOrder::Physical,
             ConversionStrategy::StageLogicalThenTransform => CopyOrder::Semantic,
             ConversionStrategy::LocalKernel => {
-                return Err(BlockBuildError::InvalidConversionPlan);
+                return Err(ExpansionError::InvalidConversionPlan);
             }
         };
         let mut mappings = Vec::new();
@@ -212,7 +212,7 @@ impl BlockBuilder {
         exchange_order: CopyOrder,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let mut batch = MaterializationBatch::default();
         self.prepare_mapped_views(
             mappings,
@@ -233,7 +233,7 @@ impl BlockBuilder {
         provenance: WorkProvenance,
         batch: &mut MaterializationBatch,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         let transfers = match exchange_order {
             CopyOrder::Semantic => &mut batch.semantic,
             CopyOrder::Physical => &mut batch.physical,
@@ -328,7 +328,7 @@ impl BlockBuilder {
         batch: MaterializationBatch,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         for (tile, copy) in batch.before {
             self.append_local_copy(tiles, tile, copy)?;
         }
@@ -355,17 +355,17 @@ impl BlockBuilder {
         mappings: &[(ShardView, ShardView)],
         destination: BlockValueId,
         copy_order: CopyOrder,
-    ) -> BlockBuildResult<crate::mid::CopyPlan> {
+    ) -> ExpansionResult<crate::CopyPlan> {
         let shard = &self.shards[destination.index() as usize];
         let mappings = mappings
             .iter()
-            .map(|(source, destination)| crate::mid::CopyMapping {
+            .map(|(source, destination)| crate::CopyMapping {
                 source: self.shards[source.shard.index() as usize].storage(),
                 source_extents: &source.extents,
                 destination_extents: &destination.extents,
             })
             .collect::<Vec<_>>();
-        Ok(crate::mid::CopyPlan::for_destination(
+        Ok(crate::CopyPlan::for_destination(
             &shard.tensor_type,
             &shard.extents,
             &mappings,

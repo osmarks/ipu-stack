@@ -2,14 +2,14 @@
 
 use super::*;
 
-impl BlockBuilder {
+impl TileGraphBuilder {
     pub(super) fn materialize_attention_queries(
         &mut self,
         query: MidValueId,
         tasks: &[AttentionTask],
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         if !self.has_deferred_value(query) {
             return Ok(());
         }
@@ -45,10 +45,10 @@ impl BlockBuilder {
         batch: &mut MaterializationBatch,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<Vec<PreparedDistributedPanel>> {
+    ) -> ExpansionResult<Vec<PreparedDistributedPanel>> {
         let panels = physical_columns.div_ceil(AMP_COLUMN_MICRO);
         if panels == 0 || valid_rows == 0 {
-            return Err(BlockBuildError::InvalidOperatorPlan);
+            return Err(ExpansionError::InvalidOperatorPlan);
         }
         let mut packed_panels = Vec::new();
         for (&stream, stream_destinations) in destinations {
@@ -61,7 +61,7 @@ impl BlockBuilder {
                     continue;
                 }
                 let owner = usize::try_from(owner_offset.saturating_add(panel))
-                    .map_err(|_| BlockBuildError::IdOverflow)?
+                    .map_err(|_| ExpansionError::IdOverflow)?
                     % stream_destinations.len();
                 let tile = stream_destinations[owner];
                 let tile = self.shards[tile.index() as usize].tile;
@@ -102,7 +102,7 @@ impl BlockBuilder {
         destination_row_start: u32,
         broadcasts: &mut BTreeMap<ShardView, Vec<ShardView>>,
         tiles: &mut BlockRegion,
-    ) -> BlockBuildResult<()> {
+    ) -> ExpansionResult<()> {
         for panel in panels {
             let source = self.full_view(panel.packed);
             let source_rows = source.extents[0].physical_end - source.extents[0].start;

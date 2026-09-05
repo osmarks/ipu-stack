@@ -3,6 +3,7 @@
 //! explicit here. Tile-list projection and placement do not expand operators.
 
 use super::*;
+use crate::GraphInputKind;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,7 +186,7 @@ impl std::ops::Deref for KernelRun {
     }
 }
 
-pub type LocalCopy = crate::mid::CopyOperation<BlockValueId>;
+pub type LocalCopy = crate::CopyOperation<BlockValueId>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatCarried {
@@ -243,7 +244,7 @@ pub struct BlockRepeatBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MidProgram {
+pub struct TileGraph {
     pub tile_count: u16,
     pub shards: Vec<BlockValue>,
     pub exchange_phases: Vec<ExchangePhase>,

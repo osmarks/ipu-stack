@@ -3,7 +3,7 @@
 use super::*;
 use crate::storage::{StorageError, TensorStorage, storage_bytes};
 
-impl ImplementationCandidate {
+impl MidProgram {
     pub(super) fn assign_parameter_tiles(&mut self) -> LoweringResult<()> {
         let parameter_origins = self
             .inputs
