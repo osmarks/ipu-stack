@@ -61,7 +61,6 @@ const INCOMING_MUXPAIR: u8 = 0xa1;
 // Consolidated phases currently preserve that primitive-plan setting.
 const INTERNAL_EXCHANGE_DCOUNT: u32 = 1;
 const OUTGOING_BASE: u8 = 0xa7;
-const FIRST_INPUT_REGISTER: u8 = 3;
 const LAST_VALUE_REGISTER: u8 = 9;
 
 pub const WORKER_BARRIER_SYMBOL: &str = "ipu_stack_static_worker_barrier";
@@ -712,7 +711,12 @@ fn emit_compute(
                 .map_err(|_| invalid("kernel input count exceeds u8"))?,
         )
         .ok_or_else(|| invalid("kernel input register overflow"))?;
-    emit_address(code, 2, compute.output_address, repeat_pointer_count)?;
+    emit_address(
+        code,
+        OUTPUT_REGISTER,
+        compute.output_address,
+        repeat_pointer_count,
+    )?;
     for (index, &address) in compute.input_addresses.iter().enumerate() {
         emit_address(
             code,
@@ -735,7 +739,7 @@ fn emit_compute(
             compute.symbol
         ))
     })?;
-    code.call(kernel, 10)
+    code.call(kernel, RETURN_REGISTER)
 }
 
 fn emit_address(

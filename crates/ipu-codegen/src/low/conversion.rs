@@ -317,14 +317,14 @@ impl LoweringState {
                 source.tile,
                 KernelRun::new(
                     provenance,
-                    TileKernel::Planned(TileKernelSpec::Rearrange {
+                    TileKernelSpec::Rearrange {
                         from: source.tensor_type.format.layout.clone(),
                         to: self.shards[staging.index() as usize]
                             .tensor_type
                             .format
                             .layout
                             .clone(),
-                    }),
+                    },
                     vec![KernelOperand {
                         views: vec![self.full_view(source_shard)],
                     }],
@@ -468,19 +468,17 @@ impl LoweringState {
                 tile,
                 KernelRun::new(
                     operation_provenance(operation),
-                    TileKernel::Planned(
-                        if plan.input.format.precision != plan.output.format.precision {
-                            TileKernelSpec::Cast {
-                                from: plan.input.format.precision,
-                                to: plan.output.format.precision,
-                            }
-                        } else {
-                            TileKernelSpec::Rearrange {
-                                from: plan.input.format.layout.clone(),
-                                to: plan.output.format.layout.clone(),
-                            }
-                        },
-                    ),
+                    if plan.input.format.precision != plan.output.format.precision {
+                        TileKernelSpec::Cast {
+                            from: plan.input.format.precision,
+                            to: plan.output.format.precision,
+                        }
+                    } else {
+                        TileKernelSpec::Rearrange {
+                            from: plan.input.format.layout.clone(),
+                            to: plan.output.format.layout.clone(),
+                        }
+                    },
                     vec![KernelOperand {
                         views: vec![self.full_view(input)],
                     }],
@@ -520,20 +518,11 @@ impl LoweringState {
         let mut mappings = Vec::new();
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
-            let mut unique_intersections = BTreeMap::<Vec<ShardExtent>, LowShardId>::new();
-            for source in &inputs {
-                let Some(extents) = intersect_extents(
-                    &self.shards[source.index() as usize].extents,
-                    &self.shards[output.index() as usize].extents,
-                ) else {
-                    continue;
-                };
-                let selected = unique_intersections.entry(extents).or_insert(*source);
-                if self.shards[source.index() as usize].tile == tile {
-                    *selected = *source;
-                }
-            }
-            for (extents, source) in unique_intersections {
+            for (extents, source) in self.intersecting_shard_set(
+                &inputs,
+                &self.shards[output.index() as usize].extents,
+                tile,
+            ) {
                 mappings.push((
                     ShardView {
                         shard: source,
@@ -647,7 +636,7 @@ impl LoweringState {
                         tile,
                         KernelRun::new(
                             provenance,
-                            TileKernel::Planned(kernel.clone()),
+                            kernel.clone(),
                             vec![KernelOperand {
                                 views: vec![staging],
                             }],
@@ -919,7 +908,6 @@ impl LoweringState {
             .map_slice(&source_type.shape, &logical_type.shape, &logical_target)
             .ok_or(LowLoweringError::InvalidOperatorPlan)?;
         let target = mapping
-            .source_ranges
             .iter()
             .copied()
             .enumerate()
@@ -938,7 +926,7 @@ impl LoweringState {
         for (source_extents, source) in
             self.intersecting_shard_set(&deferred_shards, &target, destination_tile)
         {
-            let destination_extents = (0..mapping.source_ranges.len())
+            let destination_extents = (0..mapping.len())
                 .filter(|&axis| axis != deferred.transform.merge_axis)
                 .enumerate()
                 .map(|(destination_axis, source_axis)| {

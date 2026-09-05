@@ -33,14 +33,14 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                 value: None,
                 reason: WorkReason::OperatorKernel,
             },
-            TileKernel::Planned(TileKernelSpec::Gemm {
+            TileKernelSpec::Gemm {
                 multiply: Precision::F16,
                 accumulate: AccumulationPrecision::F32,
                 mode: GemmKernelMode::Initialize,
                 weights: GemmWeightLoad::Standard,
                 inner_block: 64,
                 output_columns: 16,
-            }),
+            },
             Vec::new(),
             ShardView {
                 shard: LowShardId::from_index(0),
@@ -120,8 +120,7 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
         .unwrap();
         assert_eq!(abi.availability, KernelAvailability::Implemented);
         assert!(matches!(abi.symbols, KernelSymbols::GemmSpecialized));
-        assert_eq!(abi.input_registers, [3, 4]);
-        assert_eq!(abi.return_register, 10);
+        assert_eq!(abi.inputs, 2);
     }
 }
 
@@ -239,8 +238,8 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
         });
         let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
         assert_eq!(abi.availability, KernelAvailability::Implemented);
-        assert_eq!(abi.input_registers, [3]);
-        assert_eq!(abi.scalar_arguments[0].register, 4);
+        assert_eq!(abi.inputs, 1);
+        assert_eq!(abi.scalar_arguments, &[ScalarValue::ElementCount]);
         assert_eq!(
             abi.symbols,
             KernelSymbols::Exact("ipu_stack_gelu_tanh_approx_f16")
@@ -332,7 +331,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 value: None,
                 reason: WorkReason::OperatorKernel,
             },
-            TileKernel::Planned(kernel),
+            kernel,
             (0..inputs)
                 .map(|_| crate::KernelOperand {
                     views: vec![output.clone()],

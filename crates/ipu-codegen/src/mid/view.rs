@@ -14,9 +14,8 @@ impl AxisFactorView {
             .map(|extent| (extent.start, extent.logical_end))
             .collect::<Vec<_>>();
         let mapping = self.map_slice(source_shape, output_shape, &ranges)?;
-        let base = mapping.source_ranges[self.split_axis].0 - output[self.split_axis].start;
+        let base = mapping[self.split_axis].0 - output[self.split_axis].start;
         let extents = mapping
-            .source_ranges
             .into_iter()
             .enumerate()
             .map(|(axis, (start, end))| {

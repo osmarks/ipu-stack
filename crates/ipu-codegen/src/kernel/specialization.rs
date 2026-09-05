@@ -102,7 +102,7 @@ impl KernelSpecialization {
     }
 
     pub(super) fn from_run(run: &KernelRun) -> Result<Self, KernelAbiError> {
-        let TileKernel::Planned(kernel) = &run.kernel;
+        let kernel = &run.kernel;
         Ok(match kernel {
             TileKernelSpec::Gemm {
                 multiply,
@@ -169,7 +169,7 @@ impl KernelInventory {
             match work {
                 TileWorkRef::Kernel(run) => {
                     let abi = validate_kernel_run(run)?;
-                    let TileKernel::Planned(kernel) = &run.kernel;
+                    let kernel = &run.kernel;
                     if abi.availability != KernelAvailability::Implemented {
                         return Err(KernelAbiError::Unavailable(kernel.clone()));
                     }

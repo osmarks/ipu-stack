@@ -42,7 +42,7 @@ impl AxisFactorView {
         source_shape: &TensorShape,
         output_shape: &TensorShape,
         output: &[(u32, u32)],
-    ) -> Option<ViewSlice> {
+    ) -> Option<Vec<(u32, u32)>> {
         if self.output_shape(source_shape).as_ref() != Some(output_shape)
             || output.len() != output_shape.0.len()
             || output
@@ -63,13 +63,8 @@ impl AxisFactorView {
             base.checked_add(output[self.split_axis].0)?,
             base.checked_add(output[self.split_axis].1)?,
         );
-        Some(ViewSlice { source_ranges })
+        Some(source_ranges)
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ViewSlice {
-    pub source_ranges: Vec<(u32, u32)>,
 }
 
 #[cfg(test)]

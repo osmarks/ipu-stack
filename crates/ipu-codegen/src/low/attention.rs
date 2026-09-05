@@ -521,7 +521,7 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(query_key.clone()),
+                        query_key.clone(),
                         vec![
                             KernelOperand {
                                 views: vec![self.full_view(task.query)],
@@ -539,11 +539,11 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
+                        TileKernelSpec::AttentionSoftmax {
                             head_dimension: task.query_dimension,
                             key_columns: valid_key_rows,
                             padded_key_columns: key_block_rows,
-                        }),
+                        },
                         vec![KernelOperand {
                             views: vec![score_view],
                         }],
@@ -559,7 +559,7 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(probability_value.clone()),
+                        probability_value.clone(),
                         vec![
                             KernelOperand {
                                 views: vec![probability_view],
@@ -577,13 +577,13 @@ impl LoweringState {
                     task.tile,
                     KernelRun::new(
                         kernel_provenance,
-                        TileKernel::Planned(TileKernelSpec::AttentionMerge {
+                        TileKernelSpec::AttentionMerge {
                             value_dimension: task.value_dimension,
                             padded_value_dimension,
                             key_block_columns: key_block_rows,
                             initial: block == 0,
                             final_block: block + 1 == blocks,
-                        }),
+                        },
                         vec![
                             KernelOperand {
                                 views: vec![block_value_view],
@@ -765,7 +765,7 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(query_key.clone()),
+                    query_key.clone(),
                     vec![
                         KernelOperand {
                             views: vec![self.full_view(task.query)],
@@ -783,11 +783,11 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(TileKernelSpec::AttentionSoftmax {
+                    TileKernelSpec::AttentionSoftmax {
                         head_dimension: task.query_dimension,
                         key_columns: key_rows,
                         padded_key_columns: padded_key_rows,
-                    }),
+                    },
                     vec![KernelOperand {
                         views: vec![scores],
                     }],
@@ -812,7 +812,7 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(probability_value.clone()),
+                    probability_value.clone(),
                     vec![
                         KernelOperand {
                             views: vec![probabilities],
@@ -830,13 +830,13 @@ impl LoweringState {
                 task.tile,
                 KernelRun::new(
                     kernel_provenance,
-                    TileKernel::Planned(TileKernelSpec::AttentionMerge {
+                    TileKernelSpec::AttentionMerge {
                         value_dimension: task.value_dimension,
                         padded_value_dimension,
                         key_block_columns: padded_key_rows,
                         initial: true,
                         final_block: true,
-                    }),
+                    },
                     vec![
                         KernelOperand {
                             views: vec![block_value],
@@ -1027,10 +1027,10 @@ impl LoweringState {
             tile,
             KernelRun::new(
                 provenance,
-                TileKernel::Planned(TileKernelSpec::Rearrange {
+                TileKernelSpec::Rearrange {
                     from: input.layout.clone(),
                     to: output.layout.clone(),
-                }),
+                },
                 vec![KernelOperand {
                     views: vec![self.full_view(source)],
                 }],

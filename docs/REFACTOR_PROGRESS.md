@@ -59,13 +59,17 @@ interface's post-host-exchange visibility is not claimed to be fixed.
 
 ## Immediate next simplifications
 
-- ABI still allocates pointer/scalar register lists whose register numbers are
-  ignored by emission. Replace those with an input count and a static typed
-  scalar slice; make fixed ABI register constants shared with emit_compute.
-- low/intersection conversion duplicates preferred-replica intersection logic
-  already available in intersecting_shard_set.
-- ViewSlice wraps only source_ranges; remove that wrapper now that deferred
-  consumer axis selection is kept out of semantic graph geometry.
+- ABI now stores an input count and static typed scalar slice; fixed register
+  constants are shared with emit_compute. TileKernel's single Planned wrapper
+  and ViewSlice's single-field wrapper are removed. Replica intersection grouping
+  and selection are shared between cached/uncached gathering and conversions.
+  142 workspace release tests and strict Clippy pass for this chunk. This removes
+  83 Rust lines without adding tests; existing numerical paths are unchanged.
+- KernelRequirements still duplicates OperatorRequirements for conversions.
+  Unify their storage constraints, retaining fresh-output aliasing for conversions
+  and checking actual operand constraints rather than a semantic origin tag.
+- ComputeGraph and RegionBuilder duplicate every operation builder. Define the
+  common inherent API once so adding an operation cannot omit repeat bodies.
 - CopyPlan is still expanded with shard geometry during lowering; retaining
   complete copy recipes earlier needs the parameter tile rotation decision to
   move out of low initialization. Avoid just introducing another plan copy.

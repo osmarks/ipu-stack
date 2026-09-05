@@ -209,8 +209,9 @@ row-major fallback for other axis pairs. The host reference evaluator uses an
 independent forward mapping to check the compiler's inverse slice mapping.
 
 Kernel build planning and call emission use the same `KernelSpecialization`
-key. ABI scalar arguments are typed values rather than strings interpreted at
-runtime. The build plan retains one specialization-to-symbol map; redundant
+key. ABI scalar arguments are static typed slices rather than strings interpreted at
+runtime. The ABI records pointer arity; fixed register constants are shared with
+call emission. Low kernel calls carry TileKernelSpec directly. The build plan retains one specialization-to-symbol map; redundant
 GEMM row inventories and unused provisional ABI symbol names are removed.
 
 Packaging still uses provisional scheduling to size exchange tables and generated

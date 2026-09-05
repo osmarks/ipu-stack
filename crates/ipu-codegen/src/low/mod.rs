@@ -151,11 +151,6 @@ pub struct WorkProvenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileKernel {
-    Planned(TileKernelSpec),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelRequirements {
     Operator(OperatorRequirements),
     Conversion {
@@ -174,7 +169,7 @@ pub struct KernelOperand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
-    pub kernel: TileKernel,
+    pub kernel: TileKernelSpec,
     pub requirements: KernelRequirements,
 }
 
@@ -188,7 +183,7 @@ pub struct KernelRun {
 impl KernelRun {
     pub fn new(
         provenance: WorkProvenance,
-        kernel: TileKernel,
+        kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
         output: ShardView,
         requirements: KernelRequirements,
@@ -637,36 +632,17 @@ impl LoweringState {
     ) -> LowLoweringResult<Vec<(Vec<ShardExtent>, LowShardId)>> {
         let key = (source, target.to_vec());
         if !self.intersection_cache.contains_key(&key) {
-            let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<LowShardId>>::new();
-            for shard in self.value_shards(source)?.to_vec() {
-                if let Some(extents) =
-                    intersect_extents(&self.shards[shard.index() as usize].extents, target)
-                {
-                    groups.entry(extents).or_default().push(shard);
-                }
-            }
-            self.intersection_cache
-                .insert(key.clone(), groups.into_iter().collect());
+            let groups = self.shard_intersection_groups(self.value_shards(source)?, target);
+            self.intersection_cache.insert(key.clone(), groups);
         }
-        Ok(self.intersection_cache[&key]
-            .iter()
-            .map(|(extents, candidates)| {
-                let selected = candidates
-                    .iter()
-                    .copied()
-                    .find(|shard| self.shards[shard.index() as usize].tile == local_tile)
-                    .unwrap_or(candidates[0]);
-                (extents.clone(), selected)
-            })
-            .collect())
+        Ok(self.select_intersections(&self.intersection_cache[&key], local_tile))
     }
 
-    fn intersecting_shard_set(
+    fn shard_intersection_groups(
         &self,
         sources: &[LowShardId],
         target: &[ShardExtent],
-        local_tile: u16,
-    ) -> Vec<(Vec<ShardExtent>, LowShardId)> {
+    ) -> ShardIntersections {
         let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<LowShardId>>::new();
         for &source in sources {
             if let Some(extents) =
@@ -675,17 +651,34 @@ impl LoweringState {
                 groups.entry(extents).or_default().push(source);
             }
         }
+        groups.into_iter().collect()
+    }
+
+    fn select_intersections(
+        &self,
+        groups: &ShardIntersections,
+        local_tile: u16,
+    ) -> Vec<(Vec<ShardExtent>, LowShardId)> {
         groups
-            .into_iter()
+            .iter()
             .map(|(extents, candidates)| {
                 let selected = candidates
                     .iter()
                     .copied()
                     .find(|source| self.shards[source.index() as usize].tile == local_tile)
                     .unwrap_or(candidates[0]);
-                (extents, selected)
+                (extents.clone(), selected)
             })
             .collect()
+    }
+
+    fn intersecting_shard_set(
+        &self,
+        sources: &[LowShardId],
+        target: &[ShardExtent],
+        local_tile: u16,
+    ) -> Vec<(Vec<ShardExtent>, LowShardId)> {
+        self.select_intersections(&self.shard_intersection_groups(sources, target), local_tile)
     }
 
     fn lower_region(
@@ -868,7 +861,7 @@ impl LoweringState {
             tile,
             KernelRun::new(
                 provenance,
-                TileKernel::Planned(TileKernelSpec::FillZero),
+                TileKernelSpec::FillZero,
                 Vec::new(),
                 self.full_view(shard),
                 KernelRequirements::Operator(OperatorRequirements {
@@ -974,7 +967,7 @@ impl LoweringState {
                             value: operation.results.first().copied(),
                             reason: WorkReason::OperatorKernel,
                         },
-                        TileKernel::Planned(kernel.clone()),
+                        kernel.clone(),
                         inputs,
                         ShardView {
                             shard: output,
@@ -1272,7 +1265,7 @@ impl LoweringState {
                     ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
                 )
             });
-        if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
+        if matches!(run.kernel, TileKernelSpec::Gemm { .. })
             && run.output.extents.len() > 2
             && !output_flattens_outer_rows
         {

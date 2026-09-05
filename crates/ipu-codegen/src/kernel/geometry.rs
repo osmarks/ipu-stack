@@ -3,10 +3,10 @@
 use super::*;
 
 pub(super) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
-    let TileKernel::Planned(TileKernelSpec::FlashAttention {
+    let TileKernelSpec::FlashAttention {
         options,
         accumulate,
-    }) = &run.kernel
+    } = &run.kernel
     else {
         return Err(KernelAbiError::RequirementMismatch);
     };

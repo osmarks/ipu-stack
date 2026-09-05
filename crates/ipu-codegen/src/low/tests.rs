@@ -237,19 +237,14 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let reduction_runs = low
             .kernel_runs
             .iter()
-            .filter(|run| {
-                matches!(
-                    run.kernel,
-                    TileKernel::Planned(TileKernelSpec::ReductionSum { .. })
-                )
-            })
+            .filter(|run| matches!(run.kernel, TileKernelSpec::ReductionSum { .. }))
             .collect::<Vec<_>>();
         assert!(!reduction_runs.is_empty(), "case {case}");
         assert!(
             reduction_runs.iter().all(|run| {
                 matches!(
                     run.kernel,
-                    TileKernel::Planned(TileKernelSpec::ReductionSum { partials })
+                    TileKernelSpec::ReductionSum { partials }
                         if partials == match reduction_staging {
                             crate::ReductionStaging::Complete => inner_partitions,
                             crate::ReductionStaging::Streamed => 2,
@@ -275,7 +270,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .kernel_runs
             .iter()
             .filter(|run| {
-                matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. }))
+                matches!(run.kernel, TileKernelSpec::Gemm { .. })
                     && run.inputs[1]
                         .views
                         .iter()
@@ -476,9 +471,7 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
             .iter()
             .flat_map(|tile| low.work(tile))
             .filter_map(|work| match work {
-                TileWorkRef::Kernel(run)
-                    if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm { .. })) =>
-                {
+                TileWorkRef::Kernel(run) if matches!(run.kernel, TileKernelSpec::Gemm { .. }) => {
                     Some(run)
                 }
                 _ => None,
@@ -530,8 +523,7 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
                     "case {case}"
                 );
                 let inner = input.extents.last().unwrap();
-                let TileKernel::Planned(TileKernelSpec::Gemm { inner_block, .. }) = &run.kernel
-                else {
+                let TileKernelSpec::Gemm { inner_block, .. } = &run.kernel else {
                     continue;
                 };
                 assert!(
@@ -1118,9 +1110,7 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
             let add = low
                 .work(tile)
                 .find_map(|work| match work {
-                    TileWorkRef::Kernel(run)
-                        if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Add)) =>
-                    {
+                    TileWorkRef::Kernel(run) if matches!(run.kernel, TileKernelSpec::Add) => {
                         Some(run)
                     }
                     _ => None,
@@ -1199,10 +1189,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                 .work(tile)
                 .filter_map(|work| match work {
                     TileWorkRef::Kernel(run)
-                        if matches!(
-                            run.kernel,
-                            TileKernel::Planned(TileKernelSpec::Gemm { .. })
-                        ) =>
+                        if matches!(run.kernel, TileKernelSpec::Gemm { .. }) =>
                     {
                         Some(run)
                     }
@@ -1214,12 +1201,12 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                 assert_eq!(run.provenance.reason, WorkReason::OperatorKernel);
                 assert!(run.provenance.operation.is_some());
                 assert!(run.provenance.value.is_some());
-                let TileKernel::Planned(TileKernelSpec::Gemm {
+                let TileKernelSpec::Gemm {
                     mode,
                     inner_block: kernel_inner,
                     output_columns: kernel_columns,
                     ..
-                }) = run.kernel
+                } = run.kernel
                 else {
                     unreachable!()
                 };
@@ -1365,10 +1352,10 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                     matches!(
                         work,
                         TileWorkRef::Kernel(run)
-                            if matches!(run.kernel, TileKernel::Planned(TileKernelSpec::Gemm {
+                            if matches!(run.kernel, TileKernelSpec::Gemm {
                                 weights: crate::GemmWeightLoad::Interleaved,
                                 ..
-                            }))
+                            })
                     )
                 })
         );

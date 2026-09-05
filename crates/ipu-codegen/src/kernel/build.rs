@@ -367,7 +367,7 @@ impl KernelBuildPlan {
 
     pub fn call(&self, run: &KernelRun) -> Result<PlannedKernelCall, KernelAbiError> {
         let abi = validate_kernel_run(run)?;
-        let TileKernel::Planned(kernel) = &run.kernel;
+        let kernel = &run.kernel;
         if abi.availability != KernelAvailability::Implemented {
             return Err(KernelAbiError::Unavailable(kernel.clone()));
         }

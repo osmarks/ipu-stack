@@ -46,19 +46,11 @@ pub enum ScalarValue {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScalarArgument {
-    pub register: u8,
-    pub value: ScalarValue,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelAbi {
     pub symbols: KernelSymbols,
     pub availability: KernelAvailability,
-    pub output_register: u8,
-    pub input_registers: Vec<u8>,
-    pub scalar_arguments: Vec<ScalarArgument>,
-    pub return_register: u8,
+    pub inputs: usize,
+    pub scalar_arguments: &'static [ScalarValue],
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -87,38 +79,30 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
     let count = element_count(run)?;
     abi.scalar_arguments
         .iter()
-        .map(|argument| match argument.value {
+        .map(|argument| match argument {
             ScalarValue::ElementCount => Ok(count),
             ScalarValue::QueryRows => gemm_rows(run),
             ScalarValue::KeyRows => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::AttentionSoftmax { key_columns, .. }) => {
-                    Ok(*key_columns)
-                }
+                TileKernelSpec::AttentionSoftmax { key_columns, .. } => Ok(*key_columns),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::NumPartials => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::ReductionSum { partials }) => {
-                    Ok(u32::from(*partials - 1))
-                }
+                TileKernelSpec::ReductionSum { partials } => Ok(u32::from(*partials - 1)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::ScaleExponent => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::Gemm {
+                TileKernelSpec::Gemm {
                     multiply: Precision::F8F143 { scale_exponent },
                     ..
-                }) => Ok(u32::from_ne_bytes(i32::from(*scale_exponent).to_ne_bytes())),
+                } => Ok(u32::from_ne_bytes(i32::from(*scale_exponent).to_ne_bytes())),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::InitialBlock => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::AttentionMerge { initial, .. }) => {
-                    Ok(u32::from(*initial))
-                }
+                TileKernelSpec::AttentionMerge { initial, .. } => Ok(u32::from(*initial)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::FinalBlock => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::AttentionMerge { final_block, .. }) => {
-                    Ok(u32::from(*final_block))
-                }
+                TileKernelSpec::AttentionMerge { final_block, .. } => Ok(u32::from(*final_block)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::WordsPerWorker => output_byte_count(run).map(|bytes| bytes / 8 / 6),
@@ -129,10 +113,10 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
             ScalarValue::LogicalColumns => matrix_extent(run, true, true),
             ScalarValue::PhysicalColumns => matrix_extent(run, false, true),
             ScalarValue::TargetOrder => match &run.kernel {
-                TileKernel::Planned(TileKernelSpec::Rearrange {
+                TileKernelSpec::Rearrange {
                     to: crate::Layout { order, .. },
                     ..
-                }) => RearrangeTarget::from_order(*order)
+                } => RearrangeTarget::from_order(*order)
                     .map(RearrangeTarget::codelet_index)
                     .ok_or(KernelAbiError::RequirementMismatch),
                 _ => Err(KernelAbiError::RequirementMismatch),
@@ -172,65 +156,62 @@ pub fn tile_kernel_abi(
         KernelRequirements::Operator(requirements) => requirements.output.format.precision,
         KernelRequirements::Conversion { output, .. } => output.format.precision,
     };
-    let (symbols, availability, inputs, scalars) = match kernel {
-        TileKernelSpec::FillZero => (
-            KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
-            KernelAvailability::Implemented,
-            0,
-            scalar_arguments(
+    let (symbols, availability, inputs, scalars): (_, _, usize, &'static [ScalarValue]) =
+        match kernel {
+            TileKernelSpec::FillZero => (
+                KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
+                KernelAvailability::Implemented,
                 0,
                 &[ScalarValue::WordsPerWorker, ScalarValue::RemainderWorkers],
             ),
-        ),
-        TileKernelSpec::Gemm {
-            multiply,
-            mode,
-            weights,
-            ..
-        } => {
-            if !matches!(requirements, KernelRequirements::Operator(_)) {
-                return Err(KernelAbiError::RequirementMismatch);
+            TileKernelSpec::Gemm {
+                multiply,
+                mode,
+                weights,
+                ..
+            } => {
+                if !matches!(requirements, KernelRequirements::Operator(_)) {
+                    return Err(KernelAbiError::RequirementMismatch);
+                }
+                if *weights == GemmWeightLoad::Interleaved && *multiply != Precision::F16 {
+                    return Err(KernelAbiError::RequirementMismatch);
+                }
+                let symbols = gemm_symbols(*multiply, *mode);
+                let scalars: &'static [ScalarValue] =
+                    if matches!(multiply, Precision::F8F143 { .. }) {
+                        &[ScalarValue::ScaleExponent]
+                    } else {
+                        &[]
+                    };
+                (symbols.0, symbols.1, 2, scalars)
             }
-            if *weights == GemmWeightLoad::Interleaved && *multiply != Precision::F16 {
-                return Err(KernelAbiError::RequirementMismatch);
+            TileKernelSpec::Gelu => {
+                let symbol = gelu_symbol(requirements).unwrap_or("ipu_stack_unsupported_gelu");
+                (
+                    KernelSymbols::Exact(symbol),
+                    if symbol == "ipu_stack_unsupported_gelu" {
+                        KernelAvailability::Required
+                    } else {
+                        KernelAvailability::Implemented
+                    },
+                    1,
+                    &[ScalarValue::ElementCount],
+                )
             }
-            let symbols = gemm_symbols(*multiply, *mode);
-            let scalars = if matches!(multiply, Precision::F8F143 { .. }) {
-                scalar_arguments(2, &[ScalarValue::ScaleExponent])
-            } else {
-                Vec::new()
-            };
-            (symbols.0, symbols.1, 2, scalars)
-        }
-        TileKernelSpec::Gelu => {
-            let symbol = gelu_symbol(requirements).unwrap_or("ipu_stack_unsupported_gelu");
-            (
-                KernelSymbols::Exact(symbol),
-                if symbol == "ipu_stack_unsupported_gelu" {
-                    KernelAvailability::Required
-                } else {
-                    KernelAvailability::Implemented
-                },
-                1,
-                scalar_arguments(1, &[ScalarValue::ElementCount]),
-            )
-        }
-        TileKernelSpec::ReductionSum { .. } => {
-            if precision != Precision::F16 {
-                return Err(KernelAbiError::RequirementMismatch);
+            TileKernelSpec::ReductionSum { .. } => {
+                if precision != Precision::F16 {
+                    return Err(KernelAbiError::RequirementMismatch);
+                }
+                (
+                    KernelSymbols::Exact("ipu_stack_reduce_sum_f16"),
+                    KernelAvailability::Implemented,
+                    2,
+                    &[ScalarValue::NumPartials, ScalarValue::ElementCount],
+                )
             }
-            (
-                KernelSymbols::Exact("ipu_stack_reduce_sum_f16"),
-                KernelAvailability::Implemented,
-                2,
-                scalar_arguments(2, &[ScalarValue::NumPartials, ScalarValue::ElementCount]),
-            )
-        }
-        TileKernelSpec::Add => (
-            exact_symbol(precision, "ipu_stack_add_f16", "ipu_stack_add_f32"),
-            KernelAvailability::Required,
-            2,
-            scalar_arguments(
+            TileKernelSpec::Add => (
+                exact_symbol(precision, "ipu_stack_add_f16", "ipu_stack_add_f32"),
+                KernelAvailability::Required,
                 2,
                 &[
                     ScalarValue::ElementCount,
@@ -238,39 +219,36 @@ pub fn tile_kernel_abi(
                     ScalarValue::RightBroadcastStride,
                 ],
             ),
-        ),
-        TileKernelSpec::FlashAttention { .. } => (
-            KernelSymbols::AttentionSpecialized,
-            if matches!(requirements, KernelRequirements::Operator(requirements)
+            TileKernelSpec::FlashAttention { .. } => (
+                KernelSymbols::AttentionSpecialized,
+                if matches!(requirements, KernelRequirements::Operator(requirements)
                 if requirements.output.format.precision == Precision::F32
                     && requirements.inputs.iter().all(|input| input.format.precision == Precision::F16))
-            {
-                KernelAvailability::Implemented
-            } else {
-                KernelAvailability::Required
-            },
-            3,
-            Vec::new(),
-        ),
-        TileKernelSpec::AttentionSoftmax {
-            key_columns,
-            padded_key_columns,
-            ..
-        } => (
-            KernelSymbols::AttentionStageSpecialized,
-            KernelAvailability::Implemented,
-            1,
-            if key_columns != padded_key_columns {
-                scalar_arguments(1, &[ScalarValue::QueryRows, ScalarValue::KeyRows])
-            } else {
-                Vec::new()
-            },
-        ),
-        TileKernelSpec::AttentionMerge { .. } => (
-            KernelSymbols::AttentionStageSpecialized,
-            KernelAvailability::Implemented,
-            2,
-            scalar_arguments(
+                {
+                    KernelAvailability::Implemented
+                } else {
+                    KernelAvailability::Required
+                },
+                3,
+                &[],
+            ),
+            TileKernelSpec::AttentionSoftmax {
+                key_columns,
+                padded_key_columns,
+                ..
+            } => (
+                KernelSymbols::AttentionStageSpecialized,
+                KernelAvailability::Implemented,
+                1,
+                if key_columns != padded_key_columns {
+                    &[ScalarValue::QueryRows, ScalarValue::KeyRows]
+                } else {
+                    &[]
+                },
+            ),
+            TileKernelSpec::AttentionMerge { .. } => (
+                KernelSymbols::AttentionStageSpecialized,
+                KernelAvailability::Implemented,
                 2,
                 &[
                     ScalarValue::InitialBlock,
@@ -278,23 +256,20 @@ pub fn tile_kernel_abi(
                     ScalarValue::QueryRows,
                 ],
             ),
-        ),
-        TileKernelSpec::Cast { from, to } => (
-            KernelSymbols::Exact(cast_symbol(*from, *to)),
-            KernelAvailability::Required,
-            1,
-            scalar_arguments(1, &[ScalarValue::ElementCount]),
-        ),
-        TileKernelSpec::Rearrange { from, to }
-            if precision == Precision::F16
-                && UnpackSource::from_order(from.order).is_some()
-                && to.order == ElementOrder::RowMajor =>
-        {
-            (
-                KernelSymbols::UnpackSpecialized,
-                KernelAvailability::Implemented,
+            TileKernelSpec::Cast { from, to } => (
+                KernelSymbols::Exact(cast_symbol(*from, *to)),
+                KernelAvailability::Required,
                 1,
-                scalar_arguments(
+                &[ScalarValue::ElementCount],
+            ),
+            TileKernelSpec::Rearrange { from, to }
+                if precision == Precision::F16
+                    && UnpackSource::from_order(from.order).is_some()
+                    && to.order == ElementOrder::RowMajor =>
+            {
+                (
+                    KernelSymbols::UnpackSpecialized,
+                    KernelAvailability::Implemented,
                     1,
                     &[
                         ScalarValue::Matrices,
@@ -303,23 +278,20 @@ pub fn tile_kernel_abi(
                         ScalarValue::LogicalColumns,
                         ScalarValue::PhysicalColumns,
                     ],
-                ),
-            )
-        }
-        TileKernelSpec::Rearrange { from, to }
-            if precision == Precision::F16
-                && from.order == ElementOrder::RowMajor
-                && matches!(
-                    to.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-                        | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                ) =>
-        {
-            (
-                KernelSymbols::RearrangeSpecialized,
-                KernelAvailability::Implemented,
-                1,
-                scalar_arguments(
+                )
+            }
+            TileKernelSpec::Rearrange { from, to }
+                if precision == Precision::F16
+                    && from.order == ElementOrder::RowMajor
+                    && matches!(
+                        to.order,
+                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+                    ) =>
+            {
+                (
+                    KernelSymbols::RearrangeSpecialized,
+                    KernelAvailability::Implemented,
                     1,
                     &[
                         ScalarValue::LogicalRows,
@@ -328,34 +300,29 @@ pub fn tile_kernel_abi(
                         ScalarValue::LogicalColumns,
                         ScalarValue::PhysicalColumns,
                     ],
-                ),
-            )
-        }
-        TileKernelSpec::Rearrange { .. } => (
-            KernelSymbols::Exact("ipu_stack_rearrange"),
-            KernelAvailability::Required,
-            1,
-            Vec::new(),
-        ),
-    };
+                )
+            }
+            TileKernelSpec::Rearrange { .. } => (
+                KernelSymbols::Exact("ipu_stack_rearrange"),
+                KernelAvailability::Required,
+                1,
+                &[],
+            ),
+        };
     Ok(KernelAbi {
         symbols,
         availability,
-        output_register: OUTPUT_REGISTER,
-        input_registers: (0..inputs)
-            .map(|index| FIRST_INPUT_REGISTER + index as u8)
-            .collect(),
+        inputs,
         scalar_arguments: scalars,
-        return_register: RETURN_REGISTER,
     })
 }
 
 pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError> {
-    let TileKernel::Planned(kernel) = &run.kernel;
+    let kernel = &run.kernel;
     let abi = tile_kernel_abi(kernel, &run.requirements)?;
-    if run.inputs.len() != abi.input_registers.len() {
+    if run.inputs.len() != abi.inputs {
         return Err(KernelAbiError::PointerArity {
-            expected: abi.input_registers.len(),
+            expected: abi.inputs,
             actual: run.inputs.len(),
         });
     }
@@ -462,15 +429,4 @@ pub(super) fn cast_symbol(from: Precision, to: Precision) -> &'static str {
         (Precision::F32, Precision::F8F143 { .. }) => "ipu_stack_cast_f32_f8",
         _ => "ipu_stack_cast_identity",
     }
-}
-
-pub(super) fn scalar_arguments(input_count: u8, values: &[ScalarValue]) -> Vec<ScalarArgument> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, &value)| ScalarArgument {
-            register: FIRST_INPUT_REGISTER + input_count + index as u8,
-            value,
-        })
-        .collect()
 }

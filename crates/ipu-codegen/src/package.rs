@@ -1612,10 +1612,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
 fn tile_has_fill_zero(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
     program.work(tile).any(|work| match work {
         crate::TileWorkRef::Kernel(run) => {
-            matches!(
-                run.kernel,
-                crate::TileKernel::Planned(crate::TileKernelSpec::FillZero)
-            )
+            matches!(run.kernel, crate::TileKernelSpec::FillZero)
         }
         crate::TileWorkRef::Repeat(repeat) => tile_has_fill_zero(program, &repeat.body),
         crate::TileWorkRef::Exchange(_)

@@ -33,7 +33,7 @@
 //! ```
 
 mod view;
-pub use view::{AxisFactorView, ViewSlice};
+pub use view::AxisFactorView;
 
 use std::collections::{BTreeMap, BTreeSet};
 

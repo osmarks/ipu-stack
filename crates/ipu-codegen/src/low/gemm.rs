@@ -461,7 +461,7 @@ impl LoweringState {
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                TileKernel::Planned(selected_kernel),
+                                selected_kernel,
                                 vec![
                                     KernelOperand {
                                         views: vec![left_view],
@@ -956,7 +956,7 @@ impl LoweringState {
                                             value: Some(*output_value),
                                             reason: WorkReason::OperatorKernel,
                                         },
-                                        TileKernel::Planned(kernel),
+                                        kernel,
                                         vec![
                                             KernelOperand {
                                                 views: vec![left_view],
@@ -1025,7 +1025,7 @@ impl LoweringState {
                                 value: Some(*output_value),
                                 reason: WorkReason::OperatorKernel,
                             },
-                            TileKernel::Planned(kernel),
+                            kernel,
                             vec![
                                 KernelOperand {
                                     views: vec![left_view],
@@ -1204,10 +1204,10 @@ impl LoweringState {
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                TileKernel::Planned(TileKernelSpec::ReductionSum {
+                                TileKernelSpec::ReductionSum {
                                     partials: u16::try_from(chunk.len() + 1)
                                         .map_err(|_| LowLoweringError::IdOverflow)?,
-                                }),
+                                },
                                 vec![
                                     KernelOperand {
                                         views: vec![self.full_view(accumulator)],
@@ -1496,7 +1496,7 @@ impl LoweringState {
                                     value: Some(*output_value),
                                     reason: WorkReason::OperatorKernel,
                                 },
-                                TileKernel::Planned(kernel),
+                                kernel,
                                 vec![
                                     KernelOperand {
                                         views: vec![left_view],
