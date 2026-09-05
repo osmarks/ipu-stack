@@ -3,7 +3,9 @@
 mod abi;
 mod attention;
 mod build;
+mod gemm;
 mod geometry;
+mod rearrange;
 mod specialization;
 #[cfg(test)]
 mod tests;

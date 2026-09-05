@@ -11,11 +11,7 @@ pub const RETURN_REGISTER: u8 = 10;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelSymbols {
     Exact(&'static str),
-    GemmSpecialized,
-    AttentionSpecialized,
-    AttentionStageSpecialized,
-    RearrangeSpecialized,
-    UnpackSpecialized,
+    Specialized,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,7 +210,7 @@ pub fn tile_kernel_abi(
                 ],
             ),
             TileKernelSpec::FlashAttention { .. } => (
-                KernelSymbols::AttentionSpecialized,
+                KernelSymbols::Specialized,
                 if requirements.output.format.precision == Precision::F32
                     && requirements
                         .inputs
@@ -233,7 +229,7 @@ pub fn tile_kernel_abi(
                 padded_key_columns,
                 ..
             } => (
-                KernelSymbols::AttentionStageSpecialized,
+                KernelSymbols::Specialized,
                 KernelAvailability::Implemented,
                 1,
                 if key_columns != padded_key_columns {
@@ -243,7 +239,7 @@ pub fn tile_kernel_abi(
                 },
             ),
             TileKernelSpec::AttentionMerge { .. } => (
-                KernelSymbols::AttentionStageSpecialized,
+                KernelSymbols::Specialized,
                 KernelAvailability::Implemented,
                 2,
                 &[
@@ -264,7 +260,7 @@ pub fn tile_kernel_abi(
                     && to.order == ElementOrder::RowMajor =>
             {
                 (
-                    KernelSymbols::UnpackSpecialized,
+                    KernelSymbols::Specialized,
                     KernelAvailability::Implemented,
                     1,
                     &[
@@ -286,7 +282,7 @@ pub fn tile_kernel_abi(
                     ) =>
             {
                 (
-                    KernelSymbols::RearrangeSpecialized,
+                    KernelSymbols::Specialized,
                     KernelAvailability::Implemented,
                     1,
                     &[
@@ -393,10 +389,7 @@ pub(super) fn gemm_symbols(
             KernelAvailability::Required,
         )
     } else {
-        (
-            KernelSymbols::GemmSpecialized,
-            KernelAvailability::Implemented,
-        )
+        (KernelSymbols::Specialized, KernelAvailability::Implemented)
     }
 }
 

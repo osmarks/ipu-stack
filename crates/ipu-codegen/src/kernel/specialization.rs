@@ -156,7 +156,7 @@ pub(super) struct KernelInventory {
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     pub(super) unpacks: BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
     pub(super) attention: BTreeSet<AttentionKernelShape>,
-    pub(super) attention_stages: Vec<(TileKernelSpec, u32)>,
+    pub(super) attention_stages: BTreeSet<KernelSpecialization>,
 }
 
 impl KernelInventory {
@@ -194,12 +194,9 @@ impl KernelInventory {
                         KernelSpecialization::Unpack(shape) => {
                             self.unpacks.insert(shape);
                         }
-                        KernelSpecialization::Softmax(_, _, _, rows)
-                        | KernelSpecialization::Merge(_, _, _, rows) => {
-                            let stage = (kernel.clone(), rows);
-                            if !self.attention_stages.contains(&stage) {
-                                self.attention_stages.push(stage);
-                            }
+                        stage @ (KernelSpecialization::Softmax(..)
+                        | KernelSpecialization::Merge(..)) => {
+                            self.attention_stages.insert(stage);
                         }
                     }
                 }

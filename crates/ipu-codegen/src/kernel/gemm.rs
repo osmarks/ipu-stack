@@ -1,0 +1,123 @@
+//! GEMM assembly specializations, paired by physical row count.
+
+use super::*;
+
+pub(super) fn specialized_gemm_symbol(
+    prefix: &str,
+    mode: GemmKernelMode,
+    weight_suffix: &str,
+    inner_block: u32,
+    output_columns: u32,
+    size: &str,
+    small_rows: u32,
+    large_rows: u32,
+) -> String {
+    let operation = match mode {
+        GemmKernelMode::Initialize => "init",
+        GemmKernelMode::Accumulate => "accumulate",
+    };
+    format!(
+        "ipu_stack_gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_k{inner_block}_c{output_columns}_r{small_rows}_r{large_rows}"
+    )
+}
+
+impl KernelBuildPlan {
+    pub(super) fn add_gemm(
+        &mut self,
+        (precision, weights, inner_block, output_columns): (Precision, GemmWeightLoad, u32, u32),
+        values: BTreeSet<u32>,
+    ) {
+        let values = values.into_iter().collect::<Vec<_>>();
+        let (source, prefix) = match precision {
+            Precision::F16 => ("gemm_f16_amp.S", "f16"),
+            Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
+            Precision::F8F143 { .. } => return,
+        };
+        let weight_suffix = if weights == GemmWeightLoad::Interleaved {
+            "_interleaved"
+        } else {
+            ""
+        };
+        for pair in values.chunks(2) {
+            let small = pair[0];
+            let large = *pair.last().expect("nonempty GEMM row pair");
+            let symbols = [
+                (GemmKernelMode::Initialize, "small", small),
+                (GemmKernelMode::Initialize, "large", large),
+                (GemmKernelMode::Accumulate, "small", small),
+                (GemmKernelMode::Accumulate, "large", large),
+            ]
+            .map(|(mode, size, _)| {
+                specialized_gemm_symbol(
+                    prefix,
+                    mode,
+                    weight_suffix,
+                    inner_block,
+                    output_columns,
+                    size,
+                    small,
+                    large,
+                )
+            });
+            for (mode, row_index) in [
+                (GemmKernelMode::Initialize, 0usize),
+                (GemmKernelMode::Accumulate, 2usize),
+            ] {
+                self.symbols.insert(
+                    KernelSpecialization::Gemm(
+                        precision,
+                        weights,
+                        inner_block,
+                        output_columns,
+                        mode,
+                        small,
+                    ),
+                    symbols[row_index].clone(),
+                );
+                if pair.len() == 2 {
+                    self.symbols.insert(
+                        KernelSpecialization::Gemm(
+                            precision,
+                            weights,
+                            inner_block,
+                            output_columns,
+                            mode,
+                            large,
+                        ),
+                        symbols[row_index + 1].clone(),
+                    );
+                }
+            }
+            let single_rows = pair.len() == 1;
+            let mut flags = vec![
+                format!("-DGEMM_SMALL_ROWS={small}"),
+                format!("-DGEMM_LARGE_ROWS={large}"),
+                format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
+                format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block}"),
+                format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
+                format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
+                format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
+                format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
+            ];
+            if single_rows {
+                flags.push("-DGEMM_SINGLE_ROWS=1".into());
+            }
+            if weights == GemmWeightLoad::Interleaved {
+                flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
+            }
+            let retained_symbols = if single_rows {
+                vec![symbols[0].clone(), symbols[2].clone()]
+            } else {
+                symbols.into_iter().collect()
+            };
+            self.compilations.push(KernelCompilation {
+                source,
+                name: format!(
+                    "gemm_{prefix}{weight_suffix}_k{inner_block}_c{output_columns}_r{small}_r{large}"
+                ),
+                flags,
+                retained_symbols,
+            });
+        }
+    }
+}

@@ -119,7 +119,7 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
         )
         .unwrap();
         assert_eq!(abi.availability, KernelAvailability::Implemented);
-        assert!(matches!(abi.symbols, KernelSymbols::GemmSpecialized));
+        assert!(matches!(abi.symbols, KernelSymbols::Specialized));
         assert_eq!(abi.inputs, 2);
     }
 }
@@ -281,7 +281,13 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
         }
     }
     let mut plan = KernelBuildPlan::default();
-    plan.add_attention_stages(stages.clone()).unwrap();
+    plan.add_attention_stages(
+        stages
+            .iter()
+            .map(|(kernel, rows)| KernelSpecialization::stage(kernel, *rows).unwrap())
+            .collect(),
+    )
+    .unwrap();
     // Four softmax dimension pairs and two merge dimension sets; query/key
     // block sizes share their assembly workers rather than selecting extrema.
     assert_eq!(
@@ -348,5 +354,67 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
         let call = plan.call(&run).unwrap();
         assert_eq!(call.arguments, expected);
         assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
+    }
+}
+
+#[test]
+fn block_rearrangements_have_distinct_objects_and_symbols() {
+    // These layouts have identical matrix sizes and C++ order indices, but
+    // require different worker code. They must coexist in one linked package.
+    let targets = [(8, 16), (16, 8), (64, 16)];
+    let mut inventory = KernelInventory::default();
+    for (row_block, column_block) in targets {
+        inventory.rearrangements.insert((
+            RearrangeTarget::BlockMajor {
+                row_block,
+                column_block,
+            },
+            128,
+            128,
+            128,
+            128,
+        ));
+    }
+    let plan = KernelBuildPlan::from_inventory(inventory).unwrap();
+    let objects = plan
+        .compilations
+        .iter()
+        .map(|object| &object.name)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(objects.len(), plan.compilations.len());
+    let symbols = plan.retained_symbols().collect::<BTreeSet<_>>();
+    assert_eq!(symbols.len(), targets.len());
+    for (row_block, column_block) in targets {
+        let symbol = &plan.symbols[&KernelSpecialization::Rearrange((
+            RearrangeTarget::BlockMajor {
+                row_block,
+                column_block,
+            },
+            128,
+            128,
+            128,
+            128,
+        ))];
+        assert!(symbols.contains(symbol.as_str()));
+        let object = plan
+            .compilations
+            .iter()
+            .find(|object| {
+                object.source == "rearrange_f16.cpp"
+                    && object
+                        .name
+                        .ends_with(&format!("_b{row_block}x{column_block}"))
+            })
+            .unwrap();
+        assert!(
+            object
+                .flags
+                .contains(&format!("-DREARRANGE_ROW_BLOCK={row_block}"))
+        );
+        assert!(
+            object
+                .flags
+                .contains(&format!("-DREARRANGE_COLUMN_BLOCK={column_block}"))
+        );
     }
 }

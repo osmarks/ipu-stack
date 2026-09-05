@@ -85,6 +85,16 @@ interface's post-host-exchange visibility is not claimed to be fixed.
   pass. All five hardware workloads pass (`/tmp/ownership-*`); tile images are
   byte-identical to their preceding checkpoints, including the operand-constraint
   and common graph-builder changes.
+- Kernel object recipes are now separated by GEMM, rearrangement, and attention
+  families. The shared build orchestrator is 135 lines. Three supervisor wrapper
+  files are replaced by worker_call.S, with argument-register order declared in
+  each recipe. Five hardware cases pass (`/tmp/worker-recipes-*`), with identical
+  tile image bytes. Block-major worker symbols now include both block dimensions;
+  regression coverage checks that multiple layouts coexist without object/symbol
+  collisions. Attention inventories keep normalized specialization keys in a set,
+  avoiding kernel clones and repeated linear duplicate scans. ABI needs only one
+  generic specialized marker. 144 release workspace tests and Clippy pass; both
+  attention cases pass again after the inventory change (`/tmp/kernel-final-*`).
 - CopyPlan is still expanded with shard geometry during lowering. Do not claim
   full materialization recipes are retained in MidOperation yet.
 
