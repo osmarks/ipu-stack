@@ -1,4 +1,4 @@
-//! Append explicit mid movement and compute operations with bound contracts.
+//! Append tile movement and compute operations with bound contracts.
 
 use super::*;
 

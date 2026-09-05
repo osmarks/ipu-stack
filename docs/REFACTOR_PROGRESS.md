@@ -390,3 +390,15 @@ Boundary enforcement and uneven-grid correction (2026-09-05):
 - Added offline physical-exchange coverage for the 64-tile GEMM smoke shape and
   a retile coordinate regression. All 151 release workspace tests and strict
   Clippy pass. Hardware revalidation, including profiled MLP, remains in progress.
+
+Physical-copy padding correction (2026-09-05):
+
+- The row correction reduced the MLP mismatch substantially but exposed an
+  independent unwritten-tail bug: physical materialization could leave newly
+  padded K storage uninitialized. Copy realization now zeroes destination
+  storage not covered by mappings, including any destination staging buffer.
+- The regression covers both declared padding and a mapped view whose logical
+  allocation is wider than its source. Workspace tests passed before adding
+  this focused regression; the added regression and strict Clippy also pass
+  (152 tests combined). Full profiled MLP and attention hardware validation
+  are still pending at this checkpoint.

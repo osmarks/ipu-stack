@@ -344,3 +344,11 @@ now happen in mid candidate builders; low only projects the resulting program.
 See ARCHITECTURE.md and the latest section of REFACTOR_PROGRESS.md for the current
 representation and validation. Analytical screening still uses recipe-level
 estimates, and general conversion-chain composition remains future work.
+
+2026-09-05 boundary revision: the executable-tile-in-mid migration above has
+itself been superseded. Mid now holds compact distributed tensor primitives;
+low enumerates their tiles and realizes physical movement. Beam estimates use
+coarse geometry rather than relative spans. Physical direct-copy/packing choices
+remain in low as realization of an already selected mid copy. See
+[the current data-flow diagrams](COMPILER_DATA_FLOW.md), not this historical audit,
+for the implemented boundary.

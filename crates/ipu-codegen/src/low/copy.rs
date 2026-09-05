@@ -185,8 +185,8 @@ pub(crate) struct CopyStaging {
     pub kernel: Option<TileKernelSpec>,
 }
 
-/// A selected destination recipe. Lowering binds buffers and emits these steps;
-/// it does not price alternative materializations.
+/// Physical realization of a selected mid copy: direct movement or destination
+/// packing, plus initialization of storage the source does not populate.
 pub(crate) struct CopyPlan {
     pub clear_padding: bool,
     pub staging: Option<CopyStaging>,
@@ -199,9 +199,27 @@ impl CopyPlan {
         mappings: &[CopyMapping<'_>],
         order: CopyOrder,
     ) -> StorageResult<Self> {
+        let elements = |extents: &[ShardExtent], physical: bool| {
+            extents.iter().fold(1u64, |n, e| {
+                n.saturating_mul(u64::from(
+                    if physical {
+                        e.physical_end
+                    } else {
+                        e.logical_end
+                    } - e.start,
+                ))
+            })
+        };
+        let copied = mappings.iter().fold(0u64, |n, m| {
+            n.saturating_add(elements(
+                m.destination_extents,
+                order == CopyOrder::Physical,
+            ))
+        });
+        let uncovered = copied < elements(extents, true);
         if order == CopyOrder::Physical {
             return Ok(Self {
-                clear_padding: false,
+                clear_padding: uncovered,
                 staging: None,
             });
         }
@@ -285,7 +303,7 @@ impl CopyPlan {
             }
         });
         Ok(Self {
-            clear_padding: transform && direct_word_exchange && padding,
+            clear_padding: uncovered || (transform && direct_word_exchange && padding),
             staging,
         })
     }
@@ -294,6 +312,55 @@ impl CopyPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copies_initialize_uncovered_padding_and_view_tails() {
+        let source = TensorType::new(
+            [2, 50],
+            super::super::Precision::F16,
+            Layout::row_major(TensorTiling::replicated(1)),
+        );
+        let copied = [
+            ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: 2,
+                physical_end: 2,
+            },
+            ShardExtent {
+                axis: 1,
+                start: 0,
+                logical_end: 50,
+                physical_end: 50,
+            },
+        ];
+        for logical_end in [50, 64] {
+            let mut extents = copied;
+            extents[1].logical_end = logical_end;
+            extents[1].physical_end = 64;
+            let mapping = CopyMapping {
+                source: TensorStorage {
+                    format: &source.format,
+                    extents: &copied,
+                },
+                source_extents: &copied,
+                destination_extents: &copied,
+            };
+            for order in [CopyOrder::Physical, CopyOrder::Semantic] {
+                let plan = CopyPlan::for_destination(
+                    &source,
+                    &extents,
+                    std::slice::from_ref(&mapping),
+                    order,
+                )
+                .unwrap();
+                assert!(
+                    plan.clear_padding,
+                    "unwritten storage must start at zero, including a mapped view's undeclared tail"
+                );
+            }
+        }
+    }
 
     #[test]
     fn copy_runs_preserve_byte_mapping_across_span_boundaries() {

@@ -32,7 +32,7 @@ use std::time::Instant;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExpansionError {
-    #[error("mid block construction requires a nonzero tile count")]
+    #[error("tile expansion requires a nonzero tile count")]
     EmptyTileGroup,
     #[error("value {0:?} does not exist")]
     UnknownValue(MidValueId),

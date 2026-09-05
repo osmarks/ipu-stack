@@ -251,6 +251,11 @@ impl TileGraphBuilder {
             } else {
                 None
             };
+            if plan.clear_padding
+                && let Some(staging) = staging
+            {
+                self.append_fill_zero(tiles, staging, provenance)?;
+            }
             for (mut source, mut destination) in mappings.drain(..) {
                 if let Some(staging) = staging {
                     destination.shard = staging;

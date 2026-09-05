@@ -1,4 +1,4 @@
-//! Local transformations of executable mid regions, before tile projection.
+//! Local transformations of expanded tile regions, before tile projection.
 
 use super::*;
 use std::collections::BTreeMap;

@@ -1,6 +1,5 @@
-//! Executable whole-device mid operations and their ordinary tensor blocks.
-//! Layout choices, copies, GEMM blocks, reductions, and attention stages are
-//! explicit here. Tile-list projection and placement do not expand operators.
+//! Expanded tile storage, calls and movement, before physical placement.
+//! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
 use super::*;
 use crate::GraphInputKind;

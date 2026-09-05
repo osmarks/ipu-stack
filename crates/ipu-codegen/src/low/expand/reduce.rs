@@ -339,7 +339,7 @@ mod tests {
                     &mut region,
                 )
                 .unwrap();
-            // Interpret the explicit mid movement and sums, without tile lowering
+            // Interpret the expanded movement and sums, without tile lowering
             // or GEMM. Small integer values are exactly representable in FP16.
             let mut memory = builder
                 .shards
