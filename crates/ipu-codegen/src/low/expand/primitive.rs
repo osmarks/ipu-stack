@@ -59,13 +59,14 @@ impl TileGraphBuilder {
                     let tile = block.tile;
                     if let Some(index) = reuse_input {
                         let previous = self
-                            .find_local_shard(operation.inputs[*index], tile)?
+                            .value_shards(operation.inputs[*index])?
+                            .iter()
+                            .copied()
+                            .find(|&candidate| {
+                                let candidate = &self.shards[candidate.index() as usize];
+                                candidate.tile == tile && candidate.extents == block.extents
+                            })
                             .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                        if self.shards[previous.index() as usize].extents
-                            != self.shards[output.index() as usize].extents
-                        {
-                            return Err(ExpansionError::InvalidOperatorPlan);
-                        }
                         self.shards[output.index() as usize].definition =
                             ShardDefinition::WritableAlias(previous);
                     }

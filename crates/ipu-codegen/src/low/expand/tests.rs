@@ -533,11 +533,12 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
             "case {case}"
         );
         assert!(
-            low.shards
+            low.values
                 .iter()
-                .filter(|shard| shard.definition == ShardDefinition::Unmaterialized)
-                .count()
-                >= 16 * deferred.len(),
+                .filter(|value| deferred.contains(&value.value))
+                .flat_map(|value| &value.shards)
+                .all(|shard| low.shards[shard.index() as usize].definition
+                    == ShardDefinition::Unmaterialized),
             "case {case}"
         );
         for run in &low.kernel_runs {
@@ -1740,5 +1741,35 @@ fn physical_micro_panels_preserve_retile_coordinates() {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
+    let format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::amp_left(16, 4).with_retained_order_linear_ownership(4, 16),
+    };
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [3, 17, 32]).unwrap();
+    let output = graph.gelu(input).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let mut candidate = OperatorCandidate::new(
+        MidOperator::Gelu,
+        [OperandRequirement::new(format.clone(), 8)],
+        OperandRequirement::new(format.clone(), 8),
+    );
+    candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
+    let mut config = PipelineConfig::new(4).with_input(input, format);
+    config.operator_candidates = vec![candidate];
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let low = lower_to_tiles(&mid, false).unwrap();
+    assert!(low.kernel_runs.len() > 4);
+    for run in &low.kernel_runs {
+        let result = &low.shards[run.output.shard.index() as usize];
+        let ShardDefinition::WritableAlias(source) = result.definition else {
+            panic!("expected in-place GeLU: {result:?}");
+        };
+        assert_eq!(low.shards[source.index() as usize].extents, result.extents);
     }
 }
