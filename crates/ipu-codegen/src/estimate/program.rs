@@ -1,0 +1,402 @@
+//! Price executable work and compose per-tile timelines across barriers/repeats.
+
+use super::{IPU21_TARGET_COSTS as TARGET, *};
+use crate::mid::{
+    BlockBuildResult, BlockOperation, BlockRegion, KernelRun, MidProgram, TileKernelSpec,
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProgramCycles {
+    pub total: u64,
+    pub exchange: u64,
+}
+
+/// Prefix and tail are tile-local. The middle starts at the first barrier and
+/// ends at the last one. This permits exact repeat composition without unrolling
+/// and without introducing a barrier at an operation or repeat boundary.
+struct Timeline {
+    prefix: Vec<u64>,
+    middle: Option<u64>,
+    tail: Vec<u64>,
+    exchange: u64,
+}
+
+impl Timeline {
+    fn new(tiles: usize) -> Self {
+        Self {
+            prefix: vec![0; tiles],
+            middle: None,
+            tail: vec![0; tiles],
+            exchange: 0,
+        }
+    }
+
+    fn local(&mut self, tile: usize, cycles: u64) {
+        let times = if self.middle.is_some() {
+            &mut self.tail
+        } else {
+            &mut self.prefix
+        };
+        times[tile] = times[tile].saturating_add(cycles);
+    }
+
+    fn barrier(&mut self, cycles: u64) {
+        self.middle = Some(self.middle.map_or(cycles, |middle| {
+            middle
+                .saturating_add(maximum(&self.tail))
+                .saturating_add(cycles)
+        }));
+        self.tail.fill(0);
+        self.exchange = self.exchange.saturating_add(cycles);
+    }
+
+    fn repeat(&mut self, body: Self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        if let Some(middle) = body.middle {
+            for (tile, &cycles) in body.prefix.iter().enumerate() {
+                self.local(tile, cycles);
+            }
+            let between = body
+                .tail
+                .iter()
+                .zip(&body.prefix)
+                .map(|(tail, prefix)| tail.saturating_add(*prefix))
+                .max()
+                .unwrap_or(0);
+            // barrier() accounts this as exchange; replace that bookkeeping with
+            // the body's actual exchange contribution after composing latency.
+            let exchange = self.exchange;
+            self.barrier(
+                middle.saturating_add(between.saturating_add(middle).saturating_mul(count - 1)),
+            );
+            self.exchange = exchange.saturating_add(body.exchange.saturating_mul(count));
+            for (tile, &cycles) in body.tail.iter().enumerate() {
+                self.local(tile, cycles);
+            }
+        } else {
+            for (tile, &cycles) in body.prefix.iter().enumerate() {
+                self.local(tile, cycles.saturating_mul(count));
+            }
+        }
+    }
+
+    fn cycles(self) -> ProgramCycles {
+        ProgramCycles {
+            total: maximum(&self.prefix)
+                .saturating_add(self.middle.unwrap_or(0))
+                .saturating_add(maximum(&self.tail)),
+            exchange: self.exchange,
+        }
+    }
+}
+
+fn maximum(values: &[u64]) -> u64 {
+    values.iter().copied().max().unwrap_or(0)
+}
+
+pub(crate) fn program_cycles(
+    program: &MidProgram,
+    exchange: Option<&[u64]>,
+) -> BlockBuildResult<ProgramCycles> {
+    let phases = if let Some(costs) = exchange {
+        costs.to_vec()
+    } else {
+        program
+            .exchange_phases
+            .iter()
+            .map(|phase| {
+                let traffic = phase_traffic(program, phase)?;
+                Ok(super::cycles::exchange_endpoint_cycles(&traffic, 1))
+            })
+            .collect::<BlockBuildResult<Vec<_>>>()?
+    };
+    fn region(program: &MidProgram, body: &BlockRegion, phases: &[u64]) -> Timeline {
+        let mut timeline = Timeline::new(usize::from(program.tile_count));
+        for operation in &body.operations {
+            match operation {
+                BlockOperation::Compute { tile, run } => timeline.local(
+                    usize::from(*tile),
+                    kernel_cycles(&program.kernel_runs[run.0 as usize]),
+                ),
+                BlockOperation::Copy { tile, copy } => {
+                    let copy = &program.local_copies[copy.0 as usize];
+                    // The strided helper assigns complete rows to six workers.
+                    // Its inner loop has six instructions per 64-bit word and
+                    // five instructions between rows; short rows cannot attain
+                    // the contiguous-copy bandwidth.
+                    let work = match copy.pattern {
+                        crate::CopyPattern::Contiguous => {
+                            u64::from(copy.bytes).div_ceil(TARGET.local_copy_bytes_per_cycle)
+                        }
+                        crate::CopyPattern::Strided {
+                            rows, row_bytes, ..
+                        } => u64::from(rows)
+                            .div_ceil(6)
+                            .saturating_mul(6)
+                            .saturating_mul(
+                                u64::from(row_bytes)
+                                    .div_ceil(8)
+                                    .saturating_mul(6)
+                                    .saturating_add(5),
+                            ),
+                    };
+                    timeline.local(
+                        usize::from(*tile),
+                        work.saturating_add(TARGET.local_copy_call_cycles),
+                    );
+                }
+                BlockOperation::Exchange(phase) => timeline.barrier(phases[phase.index() as usize]),
+                BlockOperation::Repeat(repeat) => timeline.repeat(
+                    region(program, &repeat.body, phases),
+                    u64::from(repeat.count),
+                ),
+                BlockOperation::Checkpoint(..) => {}
+            }
+        }
+        timeline
+    }
+    Ok(region(program, &program.body, &phases).cycles())
+}
+
+pub(super) fn phase_traffic(
+    program: &MidProgram,
+    phase: &crate::ExchangePhase,
+) -> BlockBuildResult<ExchangeEndpointTraffic> {
+    let mut traffic = ExchangeEndpointTraffic::default();
+    for transfer in &phase.transfers {
+        let source = &program.shards[transfer.source.shard.index() as usize];
+        let spans = match transfer.span_order(&program.shards) {
+            crate::CopyOrder::Physical => crate::view_byte_spans,
+            crate::CopyOrder::Semantic => crate::logical_view_byte_spans,
+        };
+        let source_spans = spans(source, &transfer.source)?;
+        let bytes = source_spans.iter().map(|span| u64::from(span.bytes)).sum();
+        let mut outgoing_fragments = 0;
+        for destination in &transfer.destinations {
+            let target = &program.shards[destination.shard.index() as usize];
+            let mut fragments = 0u64;
+            crate::mid::for_each_copy_span(
+                &source_spans,
+                &spans(target, destination)?,
+                |_, _, bytes| {
+                    fragments = fragments.saturating_add(
+                        u64::from(bytes).div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
+                    );
+                    Ok(())
+                },
+            )?;
+            outgoing_fragments = outgoing_fragments.max(fragments);
+            traffic.add_incoming(target.tile, bytes, fragments);
+        }
+        // A multicast source is sent once, rather than once per receiver.
+        traffic.add_outgoing(source.tile / 2, bytes, outgoing_fragments);
+    }
+
+    Ok(traffic)
+}
+
+fn kernel_cycles(run: &KernelRun) -> u64 {
+    let elements = run
+        .output
+        .extents
+        .iter()
+        .map(|extent| u64::from(extent.physical_end - extent.start))
+        .fold(1, u64::saturating_mul);
+    let bytes = elements.saturating_mul(run.requirements.output.format.precision.bytes());
+    let work = match &run.kernel {
+        TileKernelSpec::Gemm {
+            multiply,
+            inner_block,
+            output_columns,
+            ..
+        } => {
+            let rows = crate::mid::gemm_rows(run).map_or(u64::MAX, u64::from);
+            let columns = u64::from(*output_columns);
+            let inner = u64::from(*inner_block);
+            let right = run.requirements.inputs.get(1);
+            let interleaved = right.is_some_and(|input| {
+                input.format.layout.memory_class == MemoryClass::Ipu21Interleaved
+            });
+            let (row_cycles, group_cycles) = match multiply {
+                Precision::F16 => (rows, if interleaved { 940 } else { 1063 }),
+                Precision::F32 => (rows.saturating_mul(4), 2126),
+                Precision::F8F143 { .. } => {
+                    return rows
+                        .saturating_mul(columns)
+                        .saturating_mul(inner)
+                        .saturating_mul(2)
+                        .div_ceil(256)
+                        .saturating_add(TARGET.kernel_launch_cycles);
+                }
+            };
+            return 294u64.saturating_add(
+                inner.div_ceil(16).saturating_mul(
+                    columns
+                        .saturating_mul(row_cycles)
+                        .div_ceil(4)
+                        .saturating_add(
+                            columns
+                                .div_ceil(16)
+                                .saturating_mul(group_cycles)
+                                .div_ceil(4),
+                        ),
+                ),
+            );
+        }
+        TileKernelSpec::FillZero => bytes.div_ceil(48),
+        TileKernelSpec::Gelu => elements.saturating_mul(10),
+        TileKernelSpec::Add => elements.div_ceil(16),
+        TileKernelSpec::ReductionSum { partials } => bytes
+            .saturating_mul(u64::from(*partials).saturating_add(1))
+            .div_ceil(TARGET.reduction_output_bytes_per_cycle),
+        TileKernelSpec::Cast { .. } => elements.div_ceil(8),
+        TileKernelSpec::Rearrange { .. } => {
+            let tensor = TensorType {
+                shape: TensorShape(
+                    run.output
+                        .extents
+                        .iter()
+                        .map(|extent| extent.physical_end - extent.start)
+                        .collect(),
+                ),
+                format: run.requirements.output.format.clone(),
+            };
+            return if tensor.format.layout.order == ElementOrder::RowMajor {
+                elements
+                    .saturating_mul(10)
+                    .saturating_add(TARGET.kernel_launch_cycles)
+            } else {
+                row_major_pack_cycles(&tensor, elements)
+            };
+        }
+        TileKernelSpec::AttentionSoftmax { .. } => elements.saturating_mul(10),
+        TileKernelSpec::AttentionMerge { .. } => elements.saturating_mul(4),
+        TileKernelSpec::FlashAttention { .. } => {
+            let shape = crate::mid::attention_shape(run);
+            return shape.map_or(u64::MAX, |shape| {
+                u64::from(shape.matrices)
+                    .saturating_mul(u64::from(shape.query_rows))
+                    .saturating_mul(u64::from(shape.key_rows))
+                    .saturating_mul(
+                        u64::from(shape.query_dimension) + u64::from(shape.value_dimension),
+                    )
+                    .saturating_mul(4)
+                    .div_ceil(6)
+                    .saturating_add(TARGET.kernel_launch_cycles)
+            });
+        }
+    };
+    work.saturating_add(TARGET.kernel_launch_cycles)
+}
+
+pub(crate) fn program_footprint(program: &MidProgram) -> BlockBuildResult<ExchangeFootprint> {
+    let mut chunks = 0u64;
+    for phase in &program.exchange_phases {
+        chunks = chunks.saturating_add(phase_traffic(program, phase)?.maximum_fragments());
+    }
+    Ok(ExchangeFootprint {
+        phases: program.exchange_phases.len() as u64,
+        maximum_transfer_chunks_per_tile: chunks,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_phase_prices_follow_repeat_execution_counts() {
+        use crate::mid::*;
+        let provenance = WorkProvenance {
+            operation: None,
+            value: None,
+            reason: WorkReason::OperatorKernel,
+        };
+        let phase = ExchangePhaseId(0);
+        let body = BlockRegion {
+            operations: vec![BlockOperation::Exchange(phase)],
+        };
+        let program = MidProgram {
+            tile_count: 2,
+            shards: vec![],
+            kernel_runs: vec![],
+            local_copies: vec![],
+            exchange_phases: vec![ExchangePhase {
+                id: phase,
+                provenance,
+                transfers: vec![],
+            }],
+            body: BlockRegion {
+                operations: vec![BlockOperation::Repeat(Box::new(BlockRepeat {
+                    provenance,
+                    count: 7,
+                    bindings: vec![],
+                    body,
+                }))],
+            },
+            inputs: vec![],
+            outputs: vec![],
+            values: vec![],
+            logical_values: vec![],
+            checkpoints: vec![],
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        };
+        assert_eq!(
+            program_cycles(&program, Some(&[123])).unwrap(),
+            ProgramCycles {
+                total: 861,
+                exchange: 861
+            }
+        );
+        assert_eq!(program_footprint(&program).unwrap().phases, 1);
+    }
+
+    #[test]
+    fn repeated_timelines_match_unrolled_execution() {
+        let mut random = fastrand::Rng::with_seed(0x74696d656c696e65);
+        for _ in 0..1000 {
+            let tiles = random.usize(1..8);
+            let count = random.u64(0..8);
+            let prefix = (0..tiles).map(|_| random.u64(0..100)).collect::<Vec<_>>();
+            let events = (0..random.usize(0..30))
+                .map(|_| (random.usize(0..=tiles), random.u64(0..100)))
+                .collect::<Vec<_>>();
+            let mut compact = Timeline::new(tiles);
+            for (tile, &cycles) in prefix.iter().enumerate() {
+                compact.local(tile, cycles);
+            }
+            let mut body = Timeline::new(tiles);
+            for &(tile, cycles) in &events {
+                if tile == tiles {
+                    body.barrier(cycles);
+                } else {
+                    body.local(tile, cycles);
+                }
+            }
+            compact.repeat(body, count);
+            let mut clocks = prefix;
+            let mut exchange = 0;
+            for _ in 0..count {
+                for &(tile, cycles) in &events {
+                    if tile == tiles {
+                        let end = maximum(&clocks) + cycles;
+                        clocks.fill(end);
+                        exchange += cycles;
+                    } else {
+                        clocks[tile] += cycles;
+                    }
+                }
+            }
+            assert_eq!(
+                compact.cycles(),
+                ProgramCycles {
+                    total: maximum(&clocks),
+                    exchange
+                }
+            );
+        }
+    }
+}

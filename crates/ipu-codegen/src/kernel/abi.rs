@@ -49,28 +49,6 @@ pub struct KernelAbi {
     pub scalar_arguments: &'static [ScalarValue],
 }
 
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum KernelAbiError {
-    #[error("kernel requirements do not match the tile-kernel family")]
-    RequirementMismatch,
-    #[error("kernel run has {actual} pointer operands, ABI requires {expected}")]
-    PointerArity { expected: usize, actual: usize },
-    #[error("kernel operand {0} is fragmented into multiple views")]
-    FragmentedOperand(usize),
-    #[error("kernel {0:?} has no device implementation")]
-    Unavailable(TileKernelSpec),
-    #[error("GEMM output view does not have a matrix row axis")]
-    MissingGemmRows,
-    #[error("kernel element count overflowed")]
-    ElementCountOverflow,
-    #[error("kernel {symbol} requires an element count divisible by {divisor}, got {count}")]
-    UnsupportedElementCount {
-        symbol: &'static str,
-        count: u32,
-        divisor: u32,
-    },
-}
-
 pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbiError> {
     let count = element_count(run)?;
     abi.scalar_arguments

@@ -4,17 +4,18 @@ mod abi;
 mod attention;
 mod build;
 mod gemm;
-mod geometry;
 mod rearrange;
 mod specialization;
 #[cfg(test)]
 mod tests;
 pub(crate) use abi::*;
 pub(crate) use build::*;
-use geometry::*;
 use specialization::*;
 
-use crate::mid::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
+use crate::mid::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AttentionKernelShape, KernelAbiError, attention_shape,
+    gemm_rows, input_matrix_extent, matrix_count, matrix_extent,
+};
 use crate::{
     AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, GemmKernelMode,
     GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, Precision, StepProfile,

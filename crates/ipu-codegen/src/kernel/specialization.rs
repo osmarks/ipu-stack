@@ -57,16 +57,6 @@ impl RearrangeTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct AttentionKernelShape {
-    pub(super) matrices: u32,
-    pub(super) query_rows: u32,
-    pub(super) key_rows: u32,
-    pub(super) query_dimension: u32,
-    pub(super) value_dimension: u32,
-    pub(super) scale_bits: u32,
-}
-
 /// The same key selects a build recipe and resolves its eventual call.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum KernelSpecialization {

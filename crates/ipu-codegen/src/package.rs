@@ -720,20 +720,15 @@ fn select_scheduled_finalist(
             crate::ExchangeLoweringOptions::default(),
             &mut exchange_cache,
         )?;
-        let scheduled_exchange_cycles = exchanges
-            .phases
-            .iter()
-            .map(|phase| u64::from(phase.event_cycles))
-            .sum::<u64>()
-            .saturating_add(
-                (exchanges.phases.len() as u64)
-                    .saturating_mul(crate::IPU21_TARGET_COSTS.exchange_phase_cycles),
-            );
-        let estimated_non_exchange_cycles = mid
-            .estimated_cycles
-            .saturating_sub(mid.estimated_exchange_cycles);
-        let refined_cycles =
-            estimated_non_exchange_cycles.saturating_add(scheduled_exchange_cycles);
+        let mut phase_cycles = vec![0; mid.exchange_phases.len()];
+        for phase in &exchanges.phases {
+            phase_cycles[phase.id.index() as usize] = u64::from(phase.event_cycles)
+                .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles);
+        }
+        let refined = crate::estimate::program_cycles(&mid, Some(&phase_cycles))
+            .map_err(crate::LoweringError::Blocks)?;
+        let scheduled_exchange_cycles = refined.exchange;
+        let refined_cycles = refined.total;
         tracing::info!(
             finalist = index,
             analytical_cycles = mid.estimated_cycles,

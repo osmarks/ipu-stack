@@ -1,89 +1,46 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
-use crate::estimate::{
-    ExchangeEndpointTraffic, conversion_traffic, gemm_exchange_endpoint_traffic,
-    gemm_exchange_phase_count, gemm_requires_panel_repacking, gemm_uses_panel_buffer,
-    maximum_axis_shard_extent, maximum_shard_bytes, operator_memory_estimate, physical_elements,
-};
+use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic, maximum_shard_bytes};
 use crate::graph::TensorShape;
 use crate::mid::{
-    AmpOrder, AxisFactorView, BlockMajorOrder, ConversionStrategy, ElementOrder, GemmDistribution,
-    Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorDispatch, OperatorPlan,
-    Precision, TensorAxis, TensorType, layout_conversion_strategy,
+    AmpOrder, BlockMajorOrder, ConversionStrategy, ElementOrder, Layout, OperatorPlan, Precision,
+    TensorType,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub trait CostModel: Sync {
+    fn implementation(
+        &self,
+        plan: &OperatorPlan,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> Option<Arc<super::implementation::ImplementationEstimate>> {
+        super::implementation_estimate(plan, inputs, output)
+    }
+    fn operator_cycle_override(
+        &self,
+        _plan: &OperatorPlan,
+        _inputs: &[TensorType],
+        _output: &TensorType,
+    ) -> Option<u64> {
+        None
+    }
+    #[cfg(test)]
     fn operator_cycles(
         &self,
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> u64;
-    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
-    fn operator_exchange_cycles(
-        &self,
-        _plan: &OperatorPlan,
-        _inputs: &[TensorType],
-        _output: &TensorType,
     ) -> u64 {
-        0
+        self.operator_cycle_override(plan, inputs, output)
+            .unwrap_or_else(|| {
+                self.implementation(plan, inputs, output)
+                    .map_or(u64::MAX, |estimate| estimate.program.estimated_cycles)
+            })
     }
-    /// Total cycles and their exchange component for the same transition.
-    fn operator_transition_cost(
-        &self,
-        plan: &OperatorPlan,
-        source_inputs: &[TensorType],
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> (u64, u64) {
-        let mut cycles = self.operator_cycles(plan, inputs, output);
-        let mut exchange = self.operator_exchange_cycles(plan, inputs, output);
-        for ((source, input), requirement) in source_inputs
-            .iter()
-            .zip(inputs)
-            .zip(&plan.requirements.inputs)
-        {
-            if requirement.materialization == crate::OperandMaterialization::DispatchSlices
-                && source.format.layout != input.format.layout
-            {
-                let cost = self.rearrangement_cost(
-                    &input.shape,
-                    input.format.precision,
-                    layout_conversion_strategy(&source.format.layout, &input.format.layout),
-                    &source.format.layout,
-                    &input.format.layout,
-                );
-                cycles = cycles.saturating_add(cost.cycles);
-                exchange = exchange.saturating_add(cost.exchange_cycles);
-            }
-        }
-        (cycles, exchange)
-    }
-    fn operator_exchange_footprint(
-        &self,
-        _plan: &OperatorPlan,
-        _inputs: &[TensorType],
-        _output: &TensorType,
-    ) -> ExchangeFootprint {
-        ExchangeFootprint::default()
-    }
-    /// Cost of producing dispatch-sized consumer slices through a deferred
-    /// logical transform. The default preserves the unfused producer estimate;
-    /// target models may price the actual fused staging and exchange path.
-    fn deferred_input_cost(
-        &self,
-        _transform: AxisFactorView,
-        _source: &TensorType,
-        _logical_output: &TensorType,
-        _consumer_input: &TensorType,
-        _consumer_dispatch: &OperatorDispatch,
-        producer_cycles: u64,
-    ) -> (u64, u64) {
-        (producer_cycles, 0)
-    }
+    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
     fn rearrangement_cost(
         &self,
         shape: &TensorShape,
@@ -109,20 +66,13 @@ pub struct ExchangeFootprint {
 
 impl ExchangeFootprint {
     pub const fn estimated_row_bytes(self) -> u64 {
-        // A primitive plan contributes its synchronization-free body to the
-        // consolidated per-phase row. The entry sync and terminal return are
-        // shared by the caller and consolidated row respectively. Mid-level
-        // byte volume cannot see where independently tiled source and
-        // destination spans meet, or the address tables needed by shared
-        // executable rows. Six encoded chunks per logical chunk tracks the
-        // combined executable, offset, and per-use value storage on IPU21.
-        let words_per_chunk = (ipu_exchange::PLAN_WORDS - 2) as u64;
-        let encoded_chunks_per_logical_chunk = 6;
+        // Concrete span chunks already include fragmentation. Reserve each
+        // primitive row plus its address-table entries, without the old 6x
+        // multiplier used to guess fragmentation from whole tensor geometry.
         self.phases
             .saturating_add(
                 self.maximum_transfer_chunks_per_tile
-                    .saturating_mul(words_per_chunk)
-                    .saturating_mul(encoded_chunks_per_logical_chunk),
+                    .saturating_mul(ipu_exchange::PLAN_WORDS as u64),
             )
             .saturating_mul(4)
     }
@@ -132,6 +82,7 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
     spatial_capacity: u16,
     rearrangements: Mutex<RearrangementCache>,
+    implementations: Mutex<super::implementation::ImplementationCache>,
 }
 
 type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
@@ -143,59 +94,47 @@ impl<'a, C> MemoizedCostModel<'a, C> {
             inner,
             spatial_capacity,
             rearrangements: Mutex::new(HashMap::default()),
+            implementations: Mutex::new(HashMap::default()),
         }
     }
 }
 
 impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
-    fn operator_cycles(
+    fn implementation(
         &self,
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> u64 {
-        self.inner.operator_cycles(plan, inputs, output)
+    ) -> Option<Arc<super::implementation::ImplementationEstimate>> {
+        let mut plan = plan.clone();
+        plan.deferred_output = None;
+        let key = (plan, inputs.to_vec(), output.clone());
+        let entry = {
+            let mut cache = self.implementations.lock().unwrap();
+            if !cache.contains_key(&key)
+                && cache.len() >= if self.spatial_capacity > 256 { 16 } else { 256 }
+            {
+                // Retained operations own their fragments independently. Bound
+                // speculative entries so large searches do not retain every
+                // rejected implementation for the lifetime of planning.
+                cache.clear();
+            }
+            cache.entry(key.clone()).or_default().clone()
+        };
+        entry
+            .get_or_init(|| self.inner.implementation(&key.0, &key.1, &key.2))
+            .clone()
     }
-
+    fn operator_cycle_override(
+        &self,
+        plan: &OperatorPlan,
+        inputs: &[TensorType],
+        output: &TensorType,
+    ) -> Option<u64> {
+        self.inner.operator_cycle_override(plan, inputs, output)
+    }
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
         self.inner.cast_cycles(input, to)
-    }
-
-    fn operator_exchange_cycles(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        self.inner.operator_exchange_cycles(plan, inputs, output)
-    }
-
-    fn operator_exchange_footprint(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> ExchangeFootprint {
-        self.inner.operator_exchange_footprint(plan, inputs, output)
-    }
-
-    fn deferred_input_cost(
-        &self,
-        transform: AxisFactorView,
-        source: &TensorType,
-        logical_output: &TensorType,
-        consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
-        producer_cycles: u64,
-    ) -> (u64, u64) {
-        self.inner.deferred_input_cost(
-            transform,
-            source,
-            logical_output,
-            consumer_input,
-            consumer_dispatch,
-            producer_cycles,
-        )
     }
 
     fn rearrangement_cost(
@@ -274,7 +213,7 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
 // direct word-fragment exchange and one local packed staging pass.
 pub(crate) const IPU21_LOGICAL_FRAGMENT_CYCLES: u64 = 160;
 
-fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
+pub(super) fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
     if traffic.is_empty() || phases == 0 {
         return 0;
     }
@@ -282,24 +221,6 @@ fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u
         .maximum_payload_bytes()
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
-}
-
-/// Conservative endpoint proxy for an operator-internal redistribution which
-/// has not yet been expanded into an explicit conversion plan.
-fn tensor_transition_endpoint_traffic(
-    source: &TensorType,
-    destination: &TensorType,
-) -> ExchangeEndpointTraffic {
-    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
-    let outgoing = maximum_shard_bytes(source)
-        .saturating_mul(u64::from(source.format.layout.tiling.tile_count.min(2)));
-    let incoming = maximum_shard_bytes(destination);
-    ExchangeEndpointTraffic::from_maxima(
-        outgoing,
-        incoming,
-        outgoing.div_ceil(transfer_bytes),
-        incoming.div_ceil(transfer_bytes),
-    )
 }
 
 fn exchange_endpoint_footprint(
@@ -320,99 +241,6 @@ fn exchange_endpoint_footprint(
     }
 }
 
-fn attention_endpoint_traffic(
-    inputs: &[TensorType],
-    output: &TensorType,
-    dispatch: &OperatorDispatch,
-) -> Option<(ExchangeEndpointTraffic, u64)> {
-    let (query_block_rows, key_block_rows, padded_query_dimension, padded_value_dimension, phases) =
-        match dispatch {
-            OperatorDispatch::BlockedAttention {
-                query_block_rows,
-                key_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-                ..
-            } => (
-                *query_block_rows,
-                *key_block_rows,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                None,
-            ),
-            OperatorDispatch::MaterializedAttention {
-                query_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-                ..
-            } => (
-                *query_block_rows,
-                crate::mid::AMP_INNER_BLOCK,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                Some(3),
-            ),
-            _ => return Some((ExchangeEndpointTraffic::default(), 0)),
-        };
-    let key = inputs.get(1)?;
-    let key_rows = key
-        .shape
-        .0
-        .get(key.shape.0.len().checked_sub(2)?)
-        .copied()
-        .map(u64::from)?;
-    let block_rows = u64::from(key_block_rows).max(1);
-    let blocks = key_rows.div_ceil(block_rows);
-    let panel_columns = u64::from(crate::mid::AMP_COLUMN_MICRO);
-    let panels_per_block = u64::from(padded_query_dimension)
-        .div_ceil(panel_columns)
-        .saturating_add(u64::from(padded_value_dimension).div_ceil(panel_columns));
-    let element_bytes = key.format.precision.bytes();
-    let panel_bytes = block_rows
-        .saturating_mul(panel_columns)
-        .saturating_mul(element_bytes);
-    let incoming = blocks
-        .saturating_mul(panels_per_block)
-        .saturating_mul(panel_bytes);
-    let query_rows = output
-        .shape
-        .0
-        .get(output.shape.0.len().checked_sub(2)?)
-        .copied()
-        .map(u64::from)?;
-    let query_block_rows = u64::from(query_block_rows).max(1);
-    let owners = query_rows.div_ceil(query_block_rows).max(1);
-    let owner_panels = blocks.saturating_mul(panels_per_block).div_ceil(owners);
-    let outgoing_bus = owner_panels.saturating_mul(panel_bytes).saturating_mul(2);
-    Some((
-        ExchangeEndpointTraffic::from_maxima(
-            outgoing_bus,
-            incoming,
-            owner_panels.saturating_mul(2),
-            blocks.saturating_mul(panels_per_block),
-        ),
-        phases.unwrap_or_else(|| blocks.saturating_add(2)),
-    ))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AmpKernelCosts {
-    call_cycles: u64,
-    column_group_width: u64,
-    interleaved_column_group_cycles: u64,
-    standard_column_group_cycles: u64,
-}
-
-// Cycle counts of the generated IPU21 AMP kernel. A column group processes
-// sixteen output columns and one 64-element K block. The row term represents
-// AMP work; the remaining group cost is dominated by feeding its weights.
-const IPU21_AMP_KERNEL_COSTS: AmpKernelCosts = AmpKernelCosts {
-    call_cycles: 294,
-    column_group_width: 16,
-    interleaved_column_group_cycles: 940,
-    standard_column_group_cycles: 1_063,
-};
-
 // Indexed F16 layout transforms execute scalar address arithmetic as well as
 // their loads and stores. The transposed-right panel is a contiguous copy:
 // its final coefficient permutation is performed by the GEMM's ld*putcs
@@ -427,10 +255,6 @@ const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
 // 64x80 destinations.
 const IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES: u64 = 4_096;
 const IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT: u64 = 4;
-
-fn maximum_shard_elements(tensor: &TensorType) -> u64 {
-    maximum_shard_bytes(tensor).div_ceil(tensor.format.precision.bytes().max(1))
-}
 
 pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
     let cycles_per_element = match tensor.format.layout.order {
@@ -461,871 +285,7 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
         .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
 }
 
-fn amp_unpack_cycles(tensor: &TensorType) -> u64 {
-    if !matches!(
-        tensor.format.layout.order,
-        ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
-    ) {
-        return 0;
-    }
-    maximum_shard_elements(tensor)
-        .saturating_mul(IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT)
-        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-}
-
-fn split_heads_uses_micro_panel_exchange(source: &TensorType, output: &TensorType) -> bool {
-    source
-        .format
-        .supports_f16_micro_panel_exchange(&output.format)
-        && output
-            .shape
-            .0
-            .last()
-            .is_some_and(|width| width.is_multiple_of(2))
-}
-
-fn split_heads_word_fragment_cycles(output: &TensorType) -> Option<u64> {
-    if output.format.precision != Precision::F16
-        || !output
-            .shape
-            .0
-            .last()
-            .is_some_and(|width| width.is_multiple_of(2))
-        || !matches!(
-            output.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-        )
-    {
-        return None;
-    }
-    let physical_elements = maximum_shard_elements(output);
-    let fragments = physical_elements.div_ceil(u64::from(crate::mid::AMP_COLUMN_MICRO));
-    let clear_cycles = if output
-        .format
-        .layout
-        .padded_shape(&output.shape)
-        .ok()
-        .is_some_and(|padded| padded != output.shape)
-    {
-        maximum_shard_bytes(output)
-            .div_ceil(8 * 6)
-            .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-    } else {
-        0
-    };
-    Some(
-        fragments
-            .saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES)
-            .saturating_add(clear_cycles),
-    )
-}
-
-fn split_head_panel_exchange_cycles(
-    source: &TensorType,
-    logical_output: &TensorType,
-    destination: &TensorType,
-) -> Option<u64> {
-    let (&source_columns, &head_columns) = (source.shape.0.last()?, logical_output.shape.0.last()?);
-    if head_columns == 0 || !source_columns.is_multiple_of(head_columns) {
-        return None;
-    }
-    let groups = source_columns / head_columns;
-    let source_grouped = source
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis.resolve(source.shape.0.len()).ok() == Some(source.shape.0.len() - 1))
-        .is_some_and(|axis| u32::from(axis.padding_groups) == groups);
-    let panel = crate::mid::AMP_COLUMN_MICRO;
-    let panels_per_group = head_columns.div_ceil(panel);
-    let segments = if source_grouped {
-        u64::from(groups).saturating_mul(u64::from(panels_per_group))
-    } else {
-        (0..groups).fold(0_u64, |total, group| {
-            let base = group.saturating_mul(head_columns);
-            let destination_boundaries = head_columns.saturating_sub(1) / panel;
-            let first_source_boundary = (panel - base % panel) % panel;
-            let source_boundaries = if first_source_boundary == 0 {
-                destination_boundaries
-            } else if first_source_boundary >= head_columns {
-                0
-            } else {
-                1 + (head_columns - 1 - first_source_boundary) / panel
-            };
-            let shared_boundaries = if base.is_multiple_of(panel) {
-                destination_boundaries
-            } else {
-                0
-            };
-            total.saturating_add(u64::from(
-                1 + destination_boundaries + source_boundaries - shared_boundaries,
-            ))
-        })
-    };
-    let baseline_segments = u64::from(groups).saturating_mul(u64::from(panels_per_group));
-    let baseline_cycles = split_heads_word_fragment_cycles(destination)?;
-    Some(
-        baseline_cycles
-            .saturating_mul(segments)
-            .div_ceil(baseline_segments.max(1)),
-    )
-}
-
-fn amp_kernel_cycles(
-    multiply: Precision,
-    dispatch: &OperatorDispatch,
-    right: Option<&TensorType>,
-    staged_local_weights: bool,
-    output_elements_per_tile: u64,
-    output_columns_per_tile: u64,
-    k: u64,
-) -> Option<u64> {
-    let OperatorDispatch::BlockedGemm {
-        inner_block,
-        output_column_block,
-        ..
-    } = dispatch
-    else {
-        return None;
-    };
-    let inner_block = u64::from(*inner_block);
-    let output_column_block = u64::from(*output_column_block);
-    if inner_block == 0
-        || output_column_block == 0
-        || output_columns_per_tile == 0
-        || !inner_block.is_multiple_of(u64::from(crate::mid::AMP_COLUMN_MICRO))
-        || !output_column_block.is_multiple_of(IPU21_AMP_KERNEL_COSTS.column_group_width)
-    {
-        return None;
-    }
-    let rows = output_elements_per_tile.div_ceil(output_columns_per_tile);
-    let column_groups = output_column_block.div_ceil(IPU21_AMP_KERNEL_COSTS.column_group_width);
-    let interleaved = staged_local_weights
-        || right
-            .is_some_and(|right| right.format.layout.memory_class == MemoryClass::Ipu21Interleaved);
-    let (row_cycles, group_cycles) = match multiply {
-        Precision::F16 => (
-            rows,
-            if interleaved {
-                IPU21_AMP_KERNEL_COSTS.interleaved_column_group_cycles
-            } else {
-                IPU21_AMP_KERNEL_COSTS.standard_column_group_cycles
-            },
-        ),
-        // F32 AMP issues one quarter as many operations per cycle and feeds
-        // twice as many weight bytes as F16 for the same matrix block.
-        Precision::F32 => (
-            rows.saturating_mul(4),
-            IPU21_AMP_KERNEL_COSTS
-                .standard_column_group_cycles
-                .saturating_mul(2),
-        ),
-        Precision::F8F143 { .. } => return None,
-    };
-    let inner_micro_groups_per_call = inner_block / u64::from(crate::mid::AMP_COLUMN_MICRO);
-    let call_cycles = IPU21_AMP_KERNEL_COSTS.call_cycles.saturating_add(
-        inner_micro_groups_per_call.saturating_mul(
-            output_column_block
-                .saturating_mul(row_cycles)
-                .div_ceil(4)
-                .saturating_add(column_groups.saturating_mul(group_cycles).div_ceil(4)),
-        ),
-    );
-    Some(
-        k.div_ceil(inner_block)
-            .saturating_mul(output_columns_per_tile.div_ceil(output_column_block))
-            .saturating_mul(call_cycles),
-    )
-}
-
-fn standard_to_interleaved_copy_cycles(bytes: u64) -> u64 {
-    // The paced parallel helper sustains about six bytes per cycle including
-    // worker scheduling (1,308 measured cycles for an 8 KiB panel). Keep this
-    // separate from the target's ideal memcpy bandwidth.
-    bytes
-        .div_ceil(6)
-        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-}
-
-fn estimated_operator_exchange_cycles(
-    dispatch: &OperatorDispatch,
-    inputs: &[TensorType],
-    output: &TensorType,
-) -> u64 {
-    match dispatch {
-        OperatorDispatch::BlockedGemm {
-            distribution:
-                GemmDistribution::ParallelReduction {
-                    inner_partitions,
-                    result_row_partitions,
-                    result_column_partitions,
-                    reduction_staging,
-                    ..
-                },
-            ..
-        } => {
-            let compute_output = dispatch.gemm_partial_tensor(output);
-            let endpoint = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
-                .unwrap_or_else(|| {
-                    ExchangeEndpointTraffic::from_maxima(
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                    )
-                });
-            let remote_partials_per_stage = match reduction_staging {
-                crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
-                crate::ReductionStaging::Streamed => 1,
-            };
-            let reduction_epochs = inner_partitions
-                .saturating_sub(1)
-                .div_ceil(remote_partials_per_stage.max(1));
-            let reduction_partial_bytes =
-                if (*result_row_partitions, *result_column_partitions) != (1, 1) {
-                    maximum_shard_bytes(output)
-                } else {
-                    maximum_shard_bytes(&compute_output)
-                };
-            let reduction = ExchangeEndpointTraffic::from_maxima(
-                reduction_partial_bytes.saturating_mul(2),
-                u64::from(inner_partitions.saturating_sub(1))
-                    .saturating_mul(reduction_partial_bytes),
-                2,
-                u64::from(inner_partitions.saturating_sub(1)),
-            );
-            exchange_endpoint_cycles(&endpoint, 1).saturating_add(exchange_endpoint_cycles(
-                &reduction,
-                u64::from(reduction_epochs),
-            ))
-        }
-        OperatorDispatch::BlockedGemm { .. } => {
-            let compute_output = dispatch.gemm_partial_tensor(output);
-            let traffic = gemm_exchange_endpoint_traffic(dispatch, inputs, &compute_output)
-                .unwrap_or_else(|| {
-                    ExchangeEndpointTraffic::from_maxima(
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                        u64::MAX / 16,
-                    )
-                });
-            exchange_endpoint_cycles(
-                &traffic,
-                gemm_exchange_phase_count(dispatch, inputs, &compute_output),
-            )
-        }
-        OperatorDispatch::BlockedAttention { .. }
-        | OperatorDispatch::MaterializedAttention { .. } => {
-            attention_endpoint_traffic(inputs, output, dispatch)
-                .map(|(traffic, phases)| exchange_endpoint_cycles(&traffic, phases))
-                .unwrap_or(u64::MAX / 8)
-        }
-        OperatorDispatch::View => inputs.first().map_or(0, |input| {
-            exchange_endpoint_cycles(&tensor_transition_endpoint_traffic(input, output), 1)
-        }),
-        OperatorDispatch::Pointwise { .. } => 0,
-    }
-}
-
-fn deferred_split_input_cycles(
-    source: &TensorType,
-    logical_output: &TensorType,
-    consumer_input: &TensorType,
-    consumer_dispatch: &OperatorDispatch,
-) -> Option<(u64, u64)> {
-    if source.shape.0.len() != 3 || logical_output.shape.0.len() != 3 {
-        return None;
-    }
-    let bytes = consumer_input.format.precision.bytes().max(1);
-    let direct_panel_exchange = source
-        .format
-        .supports_f16_micro_panel_exchange(&consumer_input.format)
-        && logical_output
-            .shape
-            .0
-            .last()
-            .is_some_and(|width| width.is_multiple_of(2));
-    let source_unpack = if direct_panel_exchange {
-        0
-    } else {
-        amp_unpack_cycles(source)
-    };
-    let rank = consumer_input.shape.0.len();
-    let rows = consumer_input
-        .shape
-        .0
-        .get(rank.saturating_sub(2))
-        .copied()
-        .map_or(1, u64::from);
-    if matches!(
-        consumer_input.format.layout.order,
-        ElementOrder::Amp(AmpOrder::Left)
-    ) {
-        if direct_panel_exchange {
-            let exchange =
-                split_head_panel_exchange_cycles(source, logical_output, consumer_input)?;
-            return Some((exchange, exchange));
-        }
-        let local_elements = maximum_shard_elements(consumer_input);
-        let gather = local_elements
-            .saturating_mul(bytes)
-            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle);
-        return Some((
-            source_unpack
-                .saturating_add(gather)
-                .saturating_add(row_major_pack_cycles(consumer_input, local_elements)),
-            0,
-        ));
-    }
-
-    let (query_block_rows, key_block_rows) = match consumer_dispatch {
-        OperatorDispatch::BlockedAttention {
-            query_block_rows,
-            key_block_rows,
-            ..
-        } => (u64::from(*query_block_rows), u64::from(*key_block_rows)),
-        OperatorDispatch::MaterializedAttention {
-            query_block_rows, ..
-        } => (
-            u64::from(*query_block_rows),
-            u64::from(crate::mid::AMP_INNER_BLOCK),
-        ),
-        _ => (rows, u64::from(crate::mid::AMP_INNER_BLOCK)),
-    };
-    let block_rows = key_block_rows.max(1);
-    let blocks = rows.div_ceil(block_rows);
-    let physical_columns = consumer_input
-        .format
-        .layout
-        .padded_shape(&consumer_input.shape)
-        .ok()?
-        .0
-        .last()
-        .copied()
-        .map(u64::from)?;
-    let panel_columns = u64::from(crate::mid::AMP_COLUMN_MICRO);
-    let panels_per_block = physical_columns.div_ceil(panel_columns);
-    let owners = rows.div_ceil(query_block_rows.max(1)).max(1);
-    let panels_per_owner = blocks.saturating_mul(panels_per_block).div_ceil(owners);
-    let panel_elements = block_rows.saturating_mul(panel_columns);
-    let gather = if direct_panel_exchange {
-        0
-    } else {
-        panel_elements
-            .saturating_mul(bytes)
-            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-    };
-    let pack = if direct_panel_exchange {
-        0
-    } else {
-        row_major_pack_cycles(consumer_input, panel_elements)
-    };
-    // A materialized block is one contiguous source span. Deferral assigns its
-    // micro-panels to independent owners, so every source change after the
-    // first adds another panel-serialization horizon on the shared exchange
-    // paths even though the destination byte volume is unchanged.
-    let fragmented_exchange = blocks
-        .saturating_mul(panels_per_block.saturating_sub(1))
-        .saturating_mul(panel_elements)
-        .saturating_mul(bytes)
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle);
-    let panel_exchange = direct_panel_exchange
-        .then(|| split_head_panel_exchange_cycles(source, logical_output, consumer_input))
-        .flatten()
-        .unwrap_or(0);
-    let fragmented_exchange = fragmented_exchange.saturating_add(panel_exchange);
-
-    Some((
-        source_unpack
-            .saturating_add(panels_per_owner.saturating_mul(gather.saturating_add(pack)))
-            .saturating_add(fragmented_exchange),
-        fragmented_exchange,
-    ))
-}
-
 impl CostModel for Ipu21CostModel {
-    fn operator_cycles(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        let operator = plan.operator;
-        let dispatch = &plan.dispatch;
-        let requirements = &plan.requirements;
-        let elements = physical_elements(&output.shape, &output.format.layout);
-        let spatial_occupancy_adjusted_elements = maximum_shard_elements(output);
-        match operator {
-            MidOperator::Gemm { multiply, .. } => {
-                let orientation = match dispatch {
-                    OperatorDispatch::BlockedGemm { orientation, .. } => *orientation,
-                    _ => crate::GemmOrientation::Normal,
-                };
-                let (left_index, right_index, left_inner_from_end, output_column_from_end) =
-                    match orientation {
-                        crate::GemmOrientation::Normal => (0, 1, 1, 1),
-                        crate::GemmOrientation::Swapped => (1, 0, 2, 2),
-                    };
-                let compute_output = dispatch.gemm_partial_tensor(output);
-                let output_elements_per_tile = maximum_shard_elements(&compute_output);
-                let left_shape = inputs[left_index]
-                    .format
-                    .layout
-                    .padded_shape(&inputs[left_index].shape)
-                    .unwrap_or_else(|_| inputs[left_index].shape.clone());
-                let k = left_shape
-                    .0
-                    .get(left_shape.0.len().saturating_sub(left_inner_from_end))
-                    .copied()
-                    .unwrap_or(1) as u64;
-                let compute_k = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                inner_partitions, ..
-                            },
-                        ..
-                    } => k.div_ceil(u64::from(*inner_partitions)),
-                    _ => k,
-                };
-                let flops_per_cycle: u64 = match multiply {
-                    Precision::F8F143 { .. } => 256,
-                    Precision::F16 => 128,
-                    Precision::F32 => 32,
-                };
-                let output_columns_per_tile = maximum_axis_shard_extent(
-                    &compute_output,
-                    output.shape.0.len().saturating_sub(output_column_from_end),
-                );
-                // AMP left/output storage deliberately flattens outer axes
-                // into its row dimension. Transposed and matrix-major orders
-                // instead require one invocation sequence per physical
-                // matrix; preserve that distinction in the call estimate.
-                let matrices_per_tile = if matches!(
-                    compute_output.format.layout.order,
-                    ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-                ) {
-                    1
-                } else {
-                    (0..compute_output.shape.0.len().saturating_sub(2))
-                        .map(|axis| maximum_axis_shard_extent(&compute_output, axis))
-                        .fold(1u64, u64::saturating_mul)
-                        .max(1)
-                };
-                let kernel_output_elements = output_elements_per_tile.div_ceil(matrices_per_tile);
-                let kernel_output_columns = output_columns_per_tile;
-                let arithmetic = kernel_output_elements
-                    .saturating_mul(2)
-                    .saturating_mul(compute_k)
-                    .div_ceil(flops_per_cycle);
-                let right = inputs.get(right_index);
-                let right_bytes_consumed = right.map_or(u64::MAX, |right| {
-                    kernel_output_columns
-                        .saturating_mul(compute_k)
-                        .saturating_mul(right.format.precision.bytes())
-                });
-                let resident_interleaved_weights = right.is_some_and(|right| {
-                    right.format.layout.memory_class == MemoryClass::Ipu21Interleaved
-                });
-                let staged_weights = right.is_some_and(|right| {
-                    gemm_uses_panel_buffer(dispatch, right, &compute_output)
-                        && right.format.precision == Precision::F16
-                });
-                let staged_local_weights = staged_weights
-                    && requirements
-                        .inputs
-                        .get(right_index)
-                        .is_some_and(|requirement| {
-                            requirement.local_staging == LocalOperandStaging::MatchRemote
-                        });
-                let streamed_blocked_standard = right.filter(|right| {
-                    staged_weights
-                        && right.format.layout.memory_class == MemoryClass::Ipu21Standard
-                        && matches!(right.format.layout.order, ElementOrder::BlockMajor(_))
-                });
-                let weight_feed = streamed_blocked_standard.map_or_else(
-                    || {
-                        right_bytes_consumed.div_ceil(
-                            if resident_interleaved_weights || staged_weights {
-                                IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle
-                            } else {
-                                IPU21_TARGET_COSTS.standard_load_bytes_per_cycle
-                            },
-                        )
-                    },
-                    |right| {
-                        let owners = right
-                            .format
-                            .layout
-                            .tiling
-                            .axes
-                            .iter()
-                            .find(|axis| {
-                                axis.axis
-                                    == if matches!(
-                                        right.format.layout.order,
-                                        ElementOrder::BlockMajor(
-                                            BlockMajorOrder::TransposedMatrix { .. }
-                                        )
-                                    ) {
-                                        TensorAxis::FromEnd(1)
-                                    } else {
-                                        TensorAxis::FromEnd(2)
-                                    }
-                            })
-                            .map_or(1, |axis| u64::from(axis.partitions));
-                        let local = right_bytes_consumed.div_ceil(owners);
-                        let remote = right_bytes_consumed.saturating_sub(local);
-                        local
-                            .div_ceil(IPU21_TARGET_COSTS.standard_load_bytes_per_cycle)
-                            .saturating_add(
-                                remote
-                                    .div_ceil(IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle),
-                            )
-                    },
-                );
-                let standard_source_owner_penalty = streamed_blocked_standard.map_or(0, |right| {
-                    let owners = right
-                        .format
-                        .layout
-                        .tiling
-                        .axes
-                        .iter()
-                        .find(|axis| {
-                            axis.axis
-                                == if matches!(
-                                    right.format.layout.order,
-                                    ElementOrder::BlockMajor(
-                                        BlockMajorOrder::TransposedMatrix { .. }
-                                    )
-                                ) {
-                                    TensorAxis::FromEnd(1)
-                                } else {
-                                    TensorAxis::FromEnd(2)
-                                }
-                        })
-                        .map_or(1, |axis| u64::from(axis.partitions));
-                    let local_panel_bytes = right_bytes_consumed.div_ceil(owners);
-                    let per_phase_penalty = local_panel_bytes
-                        .div_ceil(IPU21_TARGET_COSTS.standard_load_bytes_per_cycle)
-                        .saturating_sub(
-                            local_panel_bytes
-                                .div_ceil(IPU21_TARGET_COSTS.interleaved_load_bytes_per_cycle),
-                        );
-                    // The source owner changes between phases. Device latency
-                    // follows that phase-local critical role rather than the
-                    // accumulated work of any one physical tile.
-                    per_phase_penalty.saturating_mul(gemm_exchange_phase_count(
-                        dispatch,
-                        inputs,
-                        &compute_output,
-                    ))
-                });
-                let packing = if right.is_some_and(|right| {
-                    right.format.precision == Precision::F16
-                        && gemm_requires_panel_repacking(dispatch, right, &compute_output)
-                }) {
-                    right_bytes_consumed
-                        .saturating_mul(2)
-                        .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-                } else {
-                    0
-                };
-                let local_staging = if staged_local_weights {
-                    // The source-owner role rotates with the streamed block,
-                    // but the critical-path tile performs one local population
-                    // for every block it computes rather than one divided share
-                    // of the operator's K traffic.
-                    standard_to_interleaved_copy_cycles(right_bytes_consumed)
-                } else {
-                    0
-                };
-                let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-                let reduction_work = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        output_column_block: _,
-                        distribution:
-                            GemmDistribution::ParallelReduction {
-                                column_partitions: _,
-                                inner_partitions,
-                                result_row_partitions,
-                                result_column_partitions,
-                                reduction_staging,
-                                ..
-                            },
-                        ..
-                    } => {
-                        let remote_partials_per_stage = match reduction_staging {
-                            crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
-                            crate::ReductionStaging::Streamed => 1,
-                        };
-                        let reduction_epochs = inner_partitions
-                            .saturating_sub(1)
-                            .div_ceil(remote_partials_per_stage.max(1));
-                        let partial_bytes = maximum_shard_bytes(&compute_output);
-                        let reduction_partial_bytes =
-                            if (*result_row_partitions, *result_column_partitions) != (1, 1) {
-                                maximum_shard_bytes(output)
-                            } else {
-                                partial_bytes
-                            };
-                        u64::from(
-                            inner_partitions
-                                .saturating_sub(1)
-                                .saturating_add(reduction_epochs),
-                        )
-                        .saturating_mul(reduction_partial_bytes)
-                        .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle)
-                        .saturating_add(
-                            u64::from(reduction_epochs)
-                                .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                        )
-                    }
-                    _ => 0,
-                };
-                let calls = match dispatch {
-                    OperatorDispatch::BlockedGemm {
-                        inner_block,
-                        output_column_block,
-                        ..
-                    } => compute_k
-                        .div_ceil(u64::from(*inner_block))
-                        .saturating_mul(kernel_output_columns)
-                        .div_ceil(u64::from(*output_column_block))
-                        .saturating_mul(matrices_per_tile)
-                        .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                    OperatorDispatch::Pointwise { .. } => 0,
-                    OperatorDispatch::BlockedAttention { .. } => 0,
-                    OperatorDispatch::MaterializedAttention { .. } => 0,
-                    OperatorDispatch::View => 0,
-                };
-                let kernel = amp_kernel_cycles(
-                    multiply,
-                    dispatch,
-                    right,
-                    staged_local_weights,
-                    kernel_output_elements,
-                    kernel_output_columns,
-                    compute_k,
-                )
-                .map(|cycles| cycles.saturating_mul(matrices_per_tile))
-                .unwrap_or_else(|| arithmetic.max(weight_feed).saturating_add(calls));
-                let memory = operator_memory_estimate(dispatch, requirements, inputs, output);
-                let capacity_penalty = if memory.peak.fits_ipu21() {
-                    0
-                } else {
-                    u64::MAX / 8
-                };
-                let result_copy = if compute_output.format.layout != output.format.layout {
-                    standard_to_interleaved_copy_cycles(maximum_shard_bytes(output))
-                } else {
-                    0
-                };
-                kernel
-                    .saturating_add(standard_source_owner_penalty)
-                    .saturating_add(packing)
-                    .saturating_add(local_staging)
-                    .saturating_add(exchange)
-                    .saturating_add(reduction_work)
-                    .saturating_add(result_copy)
-                    .saturating_add(capacity_penalty)
-            }
-            MidOperator::FlashAttention { .. } => {
-                let query = inputs.first().map(|input| &input.shape.0);
-                let key = inputs.get(1).map(|input| &input.shape.0);
-                let value = inputs.get(2).map(|input| &input.shape.0);
-                let key_rows = key
-                    .and_then(|shape| shape.get(shape.len().saturating_sub(2)))
-                    .copied()
-                    .map_or(1, u64::from);
-                let query_dimension = query
-                    .and_then(|shape| shape.last())
-                    .copied()
-                    .map_or(1, u64::from);
-                let value_dimension = value
-                    .and_then(|shape| shape.last())
-                    .copied()
-                    .map_or(1, u64::from);
-                let output_values_per_query = value_dimension.max(1);
-                let query_rows = elements.div_ceil(output_values_per_query);
-                match dispatch {
-                    OperatorDispatch::BlockedAttention { key_block_rows, .. } => {
-                        let arithmetic = query_rows
-                            .saturating_mul(key_rows)
-                            .saturating_mul(query_dimension.saturating_add(value_dimension))
-                            .saturating_mul(2)
-                            .div_ceil(128);
-                        let blocks = key_rows.div_ceil(u64::from(*key_block_rows));
-                        let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-                        arithmetic
-                            .saturating_add(
-                                blocks
-                                    .saturating_mul(4)
-                                    .saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                            )
-                            .saturating_add(exchange)
-                    }
-                    OperatorDispatch::MaterializedAttention { .. } => {
-                        let arithmetic = query_rows
-                            .saturating_mul(key_rows)
-                            .saturating_mul(query_dimension.saturating_add(value_dimension))
-                            .saturating_mul(2)
-                            .div_ceil(128);
-                        arithmetic
-                            .saturating_add(
-                                4u64.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                            )
-                            .saturating_add(estimated_operator_exchange_cycles(
-                                dispatch, inputs, output,
-                            ))
-                    }
-                    _ => query_rows
-                        .saturating_mul(key_rows)
-                        .saturating_mul(query_dimension.saturating_add(value_dimension))
-                        .saturating_mul(4)
-                        .div_ceil(6)
-                        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-                }
-            }
-            // The exact scalar implementation is compute-bound at roughly
-            // ten tile cycles per element across the six workers.
-            MidOperator::Gelu => spatial_occupancy_adjusted_elements
-                .saturating_mul(10)
-                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::Add(_) => spatial_occupancy_adjusted_elements
-                .div_ceil(16)
-                .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles),
-            MidOperator::View(_) => {
-                let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-                if let Some(input) = inputs.first()
-                    && split_heads_uses_micro_panel_exchange(input, output)
-                {
-                    return exchange.saturating_add(
-                        split_head_panel_exchange_cycles(input, output, output).unwrap_or(0),
-                    );
-                }
-                let source_unpack = inputs.first().map_or(0, amp_unpack_cycles);
-                let destination_pack =
-                    row_major_pack_cycles(output, maximum_shard_elements(output));
-                let materialization = split_heads_word_fragment_cycles(output)
-                    .map_or(destination_pack, |direct| direct.min(destination_pack));
-                source_unpack
-                    .saturating_add(materialization)
-                    .saturating_add(exchange)
-            }
-        }
-    }
-
-    fn operator_exchange_cycles(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        let operator = plan.operator;
-        let dispatch = &plan.dispatch;
-        let exchange = estimated_operator_exchange_cycles(dispatch, inputs, output);
-        if matches!(operator, MidOperator::View(_))
-            && let Some(input) = inputs.first()
-            && split_heads_uses_micro_panel_exchange(input, output)
-        {
-            exchange.saturating_add(
-                split_head_panel_exchange_cycles(input, output, output).unwrap_or(0),
-            )
-        } else {
-            exchange
-        }
-    }
-
-    fn deferred_input_cost(
-        &self,
-        transform: AxisFactorView,
-        source: &TensorType,
-        logical_output: &TensorType,
-        consumer_input: &TensorType,
-        consumer_dispatch: &OperatorDispatch,
-        producer_cycles: u64,
-    ) -> (u64, u64) {
-        if transform.output_shape(&source.shape).as_ref() != Some(&logical_output.shape) {
-            return (producer_cycles, 0);
-        }
-        deferred_split_input_cycles(source, logical_output, consumer_input, consumer_dispatch)
-            .unwrap_or((producer_cycles, 0))
-    }
-
-    fn operator_exchange_footprint(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> ExchangeFootprint {
-        let dispatch = &plan.dispatch;
-        let phases = match dispatch {
-            OperatorDispatch::View => 1,
-            OperatorDispatch::BlockedAttention { key_block_rows, .. } => inputs
-                .get(1)
-                .and_then(|key| key.shape.0.get(key.shape.0.len().saturating_sub(2)))
-                .copied()
-                .map_or(0, u64::from)
-                .div_ceil(u64::from(*key_block_rows).max(1))
-                .saturating_add(2),
-            OperatorDispatch::MaterializedAttention { .. } => 3,
-            _ => gemm_exchange_phase_count(dispatch, inputs, output),
-        };
-        let phases = match dispatch {
-            OperatorDispatch::BlockedGemm {
-                output_column_block: _,
-                distribution:
-                    GemmDistribution::ParallelReduction {
-                        inner_partitions,
-                        reduction_staging,
-                        ..
-                    },
-                ..
-            } => {
-                let remote_partials_per_stage = match reduction_staging {
-                    crate::ReductionStaging::Complete => inner_partitions.saturating_sub(1),
-                    crate::ReductionStaging::Streamed => 1,
-                };
-                1u64.saturating_add(u64::from(
-                    inner_partitions
-                        .saturating_sub(1)
-                        .div_ceil(remote_partials_per_stage.max(1)),
-                ))
-            }
-            _ => phases,
-        };
-        if phases == 0 {
-            return ExchangeFootprint::default();
-        }
-        if matches!(dispatch, OperatorDispatch::View) {
-            let Some(input) = inputs.first() else {
-                return ExchangeFootprint::default();
-            };
-            return exchange_endpoint_footprint(
-                &tensor_transition_endpoint_traffic(input, output),
-                phases,
-            );
-        }
-        if matches!(
-            dispatch,
-            OperatorDispatch::BlockedAttention { .. }
-                | OperatorDispatch::MaterializedAttention { .. }
-        ) {
-            let Some((traffic, _)) = attention_endpoint_traffic(inputs, output, dispatch) else {
-                return ExchangeFootprint::default();
-            };
-            return exchange_endpoint_footprint(&traffic, phases);
-        }
-        let Some(traffic) = gemm_exchange_endpoint_traffic(dispatch, inputs, output) else {
-            return ExchangeFootprint::default();
-        };
-        exchange_endpoint_footprint(&traffic, phases)
-    }
-
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
         let input_bytes = maximum_shard_bytes(input);
         let output_bytes = input_bytes
@@ -1405,6 +365,7 @@ impl CostModel for Ipu21CostModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MidOperator, OperatorDispatch};
     use crate::{
         OperandRequirement, OutputAliasing, PointwiseInputMapping, StorageRequirements,
         TensorFormat, TileKernelSpec,
@@ -1512,57 +473,5 @@ mod tests {
                 assert!(sharded_cycles <= unsharded_cycles, "case {case}");
             }
         }
-    }
-
-    #[test]
-    fn randomized_group_padding_never_adds_split_panel_boundaries() {
-        let mut random = fastrand::Rng::with_seed(0x6865_6164_5f67_7264);
-        let mut improvements = 0;
-        for case in 0..CASES * 8 {
-            let groups = random.u16(2..=16);
-            let head_columns = loop {
-                let columns = random.u32(1..=64) * 2;
-                if !columns.is_multiple_of(crate::mid::AMP_COLUMN_MICRO) {
-                    break columns;
-                }
-            };
-            let panels = head_columns.div_ceil(crate::mid::AMP_COLUMN_MICRO);
-            let partitions_per_group = random.u16(1..=u16::try_from(panels).unwrap());
-            let column_partitions = groups * partitions_per_group;
-            let rows = random.u32(1..=128);
-            let batch = random.u32(1..=4);
-            let source_shape =
-                TensorShape::new([batch, rows, u32::from(groups).saturating_mul(head_columns)]);
-            let logical_output_shape =
-                TensorShape::new([batch * u32::from(groups), rows, head_columns]);
-            let ordinary_layout = Layout::amp_left_result_grid(
-                crate::mid::AMP_COLUMN_MICRO,
-                column_partitions,
-                1,
-                column_partitions,
-                crate::GridOrder::ColumnsFast,
-            );
-            let mut grouped_layout = ordinary_layout.clone();
-            grouped_layout.tiling.axes[0].padding_groups = groups;
-            let ordinary = TensorType::new(source_shape.0.clone(), Precision::F16, ordinary_layout);
-            let grouped = TensorType::new(source_shape.0.clone(), Precision::F16, grouped_layout);
-            let logical_output = TensorType::new(
-                logical_output_shape.0.clone(),
-                Precision::F16,
-                Layout::attention_query(u16::try_from(logical_output_shape.0[0]).unwrap(), 1),
-            );
-            let ordinary_cycles =
-                split_head_panel_exchange_cycles(&ordinary, &logical_output, &logical_output)
-                    .unwrap();
-            let grouped_cycles =
-                split_head_panel_exchange_cycles(&grouped, &logical_output, &logical_output)
-                    .unwrap();
-            improvements += usize::from(grouped_cycles < ordinary_cycles);
-            assert!(
-                grouped_cycles <= ordinary_cycles,
-                "random case {case}: groups={groups} columns={head_columns} ordinary={ordinary_cycles} grouped={grouped_cycles}"
-            );
-        }
-        assert!(improvements > 0);
     }
 }

@@ -227,3 +227,25 @@ general layout-conversion chains; neither is claimed by the contiguous-copy pass
 - Next: replace operator-shaped cost reconstruction with executable-mid pricing
   and shared allocation analysis in detailed planning. Copy/view chain composition
   remains deferred for later discussion with the user.
+
+## Executable-mid costing and allocation analysis (2026-09-05, in validation)
+
+- Deleted operator-shaped GEMM/attention/deferred-view cycle, scratch and traffic
+  reconstruction. Primitive prices consume actual calls/copies/exchanges. Shared
+  call geometry lives in `mid/call`; shared allocation analysis includes alias
+  groups, access tails, element rounding, repeats and lifetimes.
+- Detailed branch scores use executable region timelines, including deferred
+  consumer movement. Operator fragments are retained and rebound with explicit
+  ownership/format/capacity checks. Cache retention is bounded; expanded branches
+  are pruned between parents as well as at the end of an operation.
+- Exchange pricing and encoding share semantic/physical span selection. Scheduled
+  phase prices use repeat execution counts, while row storage stays static.
+- Updated curated data-flow graphs and architecture. Copy/view chain composition
+  (#4) remains deferred for discussion with the user.
+- Validation so far: 144 release workspace tests and strict Clippy passed before
+  the final retention tuning; retained-vs-fresh program equality and scheduled
+  repeat pricing regressions pass. GEMM and batched GEMM pass on hardware. The
+  first full-size MLP attempts exposed excessive planning time/host memory and
+  were stopped during planning. Further performance and hardware validation is
+  required before considering #1 complete. Logs: `/tmp/concrete-mid-*`,
+  `/tmp/bounded-mid-*`, `/tmp/scheduled-repeat-test.log`.

@@ -48,6 +48,27 @@ impl BlockBuilder {
             .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_REGION_BYTES))
     }
 
+    pub(super) fn interleaved_usage(&self, access_tail: u32) -> BlockBuildResult<Vec<u32>> {
+        let mut used = vec![0u32; usize::from(self.tile_count)];
+        for shard in &self.shards {
+            if shard.tensor_type.format.layout.memory_class == MemoryClass::Ipu21Interleaved
+                && !matches!(
+                    shard.definition,
+                    ShardDefinition::Alias(_)
+                        | ShardDefinition::WritableAlias(_)
+                        | ShardDefinition::ExchangeStaging
+                )
+            {
+                let total = &mut used[usize::from(shard.tile)];
+                *total = total
+                    .checked_add(shard_storage_bytes(shard)?)
+                    .and_then(|total| total.checked_add(access_tail))
+                    .ok_or(BlockBuildError::IdOverflow)?;
+            }
+        }
+        Ok(used)
+    }
+
     pub(super) fn value_shards(&self, value: MidValueId) -> BlockBuildResult<&[BlockValueId]> {
         self.canonical
             .get(value.index() as usize)

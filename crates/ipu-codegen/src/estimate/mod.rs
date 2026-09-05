@@ -2,17 +2,19 @@
 //! memory evaluates allocations/liveness, and cycles applies IPU21 prices.
 
 mod cycles;
+mod implementation;
+pub(crate) use implementation::implementation_estimate;
 mod memory;
+mod program;
+pub(crate) use program::{ProgramCycles, program_cycles};
 mod tensor;
 mod traffic;
 
 use crate::graph::TensorShape;
 use crate::mid::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, ElementOrder, GemmDistribution, Layout, MemoryClass,
-    MemoryOperand, MidOperation, MidOperationKind, MidValue, MidValueId, OperandMaterialization,
-    OperatorDispatch, Precision, StorageRequirements, TensorAxis, TensorType,
+    ElementOrder, Layout, MemoryClass, MidOperation, MidValue, MidValueId, Precision, TensorType,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub use cycles::{
     CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel, RearrangementCost,

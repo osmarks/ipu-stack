@@ -5,10 +5,13 @@
 //! projection. Neither low lowering nor placement expands whole operators.
 
 mod block;
-mod implementation;
+mod call;
+pub(crate) use call::*;
+pub(crate) mod implementation;
 pub use block::*;
 pub use implementation::{
-    BlockBuildError, logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
+    BlockBuildError, BlockBuildResult, logical_view_byte_spans, shard_storage_bytes,
+    view_byte_spans,
 };
 
 mod candidates;
@@ -23,7 +26,6 @@ mod planner;
 mod resolved;
 mod view;
 pub use crate::graph::AxisFactorView;
-pub(crate) use resolved::{ResolvedAxis, ResolvedLayout};
 
 use candidates::*;
 use catalogue::*;
@@ -53,8 +55,7 @@ pub use crate::estimate::{
     MemoryUsage,
 };
 use crate::estimate::{
-    conversion_memory_estimate, operator_memory_estimate, region_peak_memory,
-    region_peak_memory_with_multiplicity,
+    conversion_memory_estimate, region_peak_memory, region_peak_memory_with_multiplicity,
 };
 use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
@@ -269,6 +270,7 @@ pub enum MidOperationKind {
         plan: OperatorPlan,
         exchange: ExchangeFootprint,
         deferred_inputs: Vec<Option<DeferredInputPlan>>,
+        implementation: Option<std::sync::Arc<MidProgram>>,
     },
     Convert(ConversionPlan),
     Repeat(MidRepeat),

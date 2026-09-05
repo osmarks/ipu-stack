@@ -5,7 +5,7 @@ use super::TensorShape;
 /// Move a factor from one axis into another, preserving the other axes.
 /// For example `(split_axis=2, merge_axis=0, factor=H)` maps
 /// `[B, R, H*C]` to `[B*H, R, C]`. Axis positions and rank are unrestricted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AxisFactorView {
     pub split_axis: usize,
     pub merge_axis: usize,

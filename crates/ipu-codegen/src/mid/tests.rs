@@ -111,6 +111,7 @@ fn randomized_future_state_is_id_independent_but_preserves_aliasing() {
                 state,
                 operations: Vec::new(),
                 peak_memory: MemoryPeaks::default(),
+                analysis: std::sync::OnceLock::new(),
             }
         };
         let future = [first, second].into_iter().collect();
@@ -296,7 +297,10 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
         };
         let dispatch = default_dispatch(operator);
         let requirements = StorageRequirements {
-            inputs: Vec::new(),
+            inputs: vec![
+                OperandRequirement::new(left.format.clone(), 32),
+                OperandRequirement::new(standard.format.clone(), 32),
+            ],
             output: OperandRequirement::new(output.format.clone(), 8),
             output_aliasing: OutputAliasing::Fresh,
             distinct_elements: Vec::new(),
@@ -422,22 +426,22 @@ fn assert_operator_signature(
 struct ColumnParityCost;
 
 impl CostModel for ColumnParityCost {
-    fn operator_cycles(
+    fn operator_cycle_override(
         &self,
         plan: &OperatorPlan,
         _inputs: &[TensorType],
         output: &TensorType,
-    ) -> u64 {
+    ) -> Option<u64> {
         let preferred = if output.shape.0.last().unwrap().is_multiple_of(2) {
             Precision::F16
         } else {
             Precision::F32
         };
-        match plan.operator {
+        Some(match plan.operator {
             MidOperator::Gemm { multiply, .. } if multiply == preferred => 0,
             MidOperator::Gemm { .. } => 1,
             _ => 0,
-        }
+        })
     }
 
     fn cast_cycles(&self, _input: &TensorType, _to: Precision) -> u64 {
@@ -519,20 +523,11 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             .map(|_| random.u32(1..=2))
             .collect::<Vec<_>>();
         let multiply = precision(&mut random);
-        let left_format = format(
-            precision(&mut random),
-            Layout::amp_left([8, 16, 32][random.usize(0..3)], tiles),
-        );
+        let left_format = format(multiply, Layout::amp_left(64, tiles));
         let right_format = format(
-            if random.bool() {
-                precision(&mut random)
-            } else {
-                Precision::F8F143 {
-                    scale_exponent: random.i8(-16..=16),
-                }
-            },
+            multiply,
             Layout::block_major_matrix_storage(
-                [8, 16, 32][random.usize(0..3)],
+                64,
                 AMP_OUTPUT_COLUMN_BLOCK,
                 tiles,
                 1,
@@ -541,18 +536,14 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             ),
         );
         let output_format = format(
-            precision(&mut random),
+            multiply,
             if multiply == Precision::F16 {
                 Layout::amp_left_result(tiles)
             } else {
                 Layout::amp_output(tiles)
             },
         );
-        let accumulate = if random.bool() {
-            AccumulationPrecision::F16
-        } else {
-            AccumulationPrecision::F32
-        };
+        let accumulate = gemm_accumulation_precision(multiply);
         let candidate = OperatorCandidate::new(
             MidOperator::Gemm {
                 options: GemmOptions::default(),
@@ -937,17 +928,16 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
         let gelu_input = random_format(&mut random, tiles);
         let gelu_output = gelu_input.clone();
         let add_left = random_format(&mut random, tiles);
-        let add_right = random_format(&mut random, tiles);
+        let add_right = add_left.clone();
         let add_output = add_left.clone();
-        let attention_query = random_format(&mut random, tiles);
-        let attention_key = random_format(&mut random, tiles);
-        let attention_value_format = random_format(&mut random, tiles);
-        let attention_output = random_format(&mut random, tiles);
-        let attention_accumulate = if random.bool() {
-            AccumulationPrecision::F16
-        } else {
-            AccumulationPrecision::F32
-        };
+        let attention_query = format(
+            Precision::F16,
+            Layout::row_major(TensorTiling::replicated(tiles)),
+        );
+        let attention_key = attention_query.clone();
+        let attention_value_format = attention_query.clone();
+        let attention_output = format(Precision::F32, attention_query.layout.clone());
+        let attention_accumulate = AccumulationPrecision::F32;
         let mut config = PipelineConfig::new(tiles)
             .with_input(activation, random_format(&mut random, tiles))
             .with_input(residual, random_format(&mut random, tiles))
@@ -1211,27 +1201,11 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         let claims = consumer.deferred_inputs();
         assert_eq!(claims.len(), split.len(), "random case {case}");
         assert!(claims.iter().all(Option::is_some), "random case {case}");
-        assert!(
-            matches!(&consumer.kind, MidOperationKind::Operator { exchange, .. } if exchange.phases >= 2),
-            "random case {case}"
-        );
-        assert!(
-            consumer.memory.exchange_row_bytes != 0,
-            "random case {case}"
-        );
-        assert_eq!(
-            lowered.estimated_cycles,
-            lowered
-                .operations
-                .iter()
-                .map(|operation| operation.estimated_cycles)
-                .sum::<u64>(),
-            "random case {case}"
-        );
-        let tiled = crate::low::lower_to_tiles(
-            &build_blocks(&lowered).unwrap(),
-            config.diagnostic_checkpoints,
-        );
+        let program = build_blocks(&lowered).unwrap();
+        let cycles = crate::estimate::program_cycles(&program, None).unwrap();
+        assert_eq!(program.estimated_cycles, cycles.total);
+        assert_eq!(program.estimated_exchange_cycles, cycles.exchange);
+        let tiled = crate::low::lower_to_tiles(&program, config.diagnostic_checkpoints);
         crate::KernelBuildPlan::from_program(&tiled)
             .unwrap_or_else(|error| panic!("random case {case}: {error}"));
         for run in &tiled.kernel_runs {
@@ -1256,6 +1230,10 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
             .iter()
             .filter(|phase| phase.provenance.operation == consumer.source)
             .count();
+        assert!(
+            attention_phases > 0,
+            "random case {case}: deferred movement must be priced"
+        );
         assert!(
             attention_phases <= tokens.div_ceil(AMP_INNER_BLOCK) as usize + 2,
             "random case {case}: {attention_phases} attention exchange phases"

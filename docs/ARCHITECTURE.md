@@ -29,14 +29,15 @@ supported form is either causal or unmasked.
 Implementation modules are private; the crate root exposes graph construction,
 package building, and the types used by diagnostics.
 
-The analytical planner screens whole-operation implementation choices together:
-formats, GEMM blocking/distribution, attention strategy, and reduction staging.
-Its `ImplementationCandidate` is input to a builder, not the executable IR.
-For each shortlisted candidate, `mid/implementation` constructs a `MidProgram`
-before physical exchange scheduling selects a finalist. The executable program
-does not retain opaque GEMM/attention plans or invoke their builders during low
-lowering. Cheap estimates still operate on implementation recipes; they have not
-all been replaced with costs derived from the expanded blocks.
+The planner screens whole-operation choices: formats, GEMM distribution,
+attention strategy and reduction staging. Cheap geometry and boundary-storage
+heuristics precede detailed evaluation. Detailed branches use executable mid
+fragments, shared allocation analysis, and primitive cycle prices. Selected
+`ImplementationCandidate` recipes retain their fragments; binding reuses them
+when boundary ownership, formats and capacity permit. Deferred movement is
+constructed by the same implementation builder in its actual consumer context.
+Final construction applies parameter ownership and reprices the executable
+`MidProgram` before physical scheduling. Low never expands opaque operators.
 
 `MidProgram` owns ordinary `BlockValue`s for input/output shards, GEMM partials,
 packed panels, reduction accumulators, and other intermediate results. Each has
@@ -86,12 +87,16 @@ ranges include padding owned by each shard. Ownership rotations balance paramete
 storage before block construction. `storage` computes byte spans from borrowed
 format/extents without depending on low. Block adapters add identity checks.
 
-`mid/operator` and `catalogue` define legal implementation choices; `candidates`
-specializes them and `planner` screens combinations. `estimate/tensor` adapts
-resolved geometry, `traffic` counts movement, `memory` evaluates allocations and
-region liveness, and `cycles` applies target prices. Deferred view/materialization
-claims are settled by candidate construction, which emits explicit consumer-sized
-buffers and movement. They are not rediscovered by low.
+`mid/operator` and `catalogue` define legal choices; `candidates` specializes
+and cheaply screens them. `estimate/implementation` builds and caches concrete
+fragments. `estimate/program` prices actual kernel calls, copy patterns and
+logical exchange spans, composing per-tile timelines across barriers and repeats.
+`estimate/memory` uses the same alias, access-tail and lifetime analysis as
+placement. `estimate/tensor`, `traffic` and `cycles` retain shared geometry,
+coarse conversion screening and target prices. Deferred view/materialization
+claims emit explicit consumer-sized buffers and movement; low does not rediscover
+them. Shared materialization batches handle destination staging, padding,
+local/remote population and final transforms for GEMM, attention and conversions.
 
 `low::lower_to_tiles` only projects the executable mid region into per-tile work
 lists. It shares the immutable `MidProgram` through `Arc`, including its block,
@@ -105,8 +110,8 @@ aligned per-tile strides including required access tails. Repeated execution
 advances base pointers rather than unrolling the body or building pointer tables.
 
 `kernel/abi` defines supported calls and scalar arguments; `specialization`
-provides keys shared by object construction and call lookup; `geometry` extracts
-call shapes. GEMM, rearrangement, and attention recipes are separate modules.
+provides keys shared by object construction and call lookup; `mid/call` supplies
+address-independent call shapes and primitive access contracts. GEMM, rearrangement, and attention recipes are separate modules.
 `device/worker_call.S` marshals declared registers into C++ vertex fields. Backend
 call materialization resolves block views after placement.
 
@@ -146,8 +151,8 @@ convenience constructor, with no separate graph or mid operator kind. The mappin
 axes, validates the output shape, and maps rectangular slices back to their
 source. Materialized and deferred lowering share this geometry. This is a
 split/merge view primitive, not yet a general reshape/permutation composition.
-Attention-specific candidate layouts and cost fast paths remain, alongside a
-row-major fallback for other axis pairs. The host reference evaluator uses an
+Attention-specific candidate layouts remain, alongside a row-major fallback for
+other axis pairs. Their emitted movement is priced directly. The host reference evaluator uses an
 independent forward mapping to check the compiler's inverse slice mapping.
 
 Kernel build planning and call emission use the same `KernelSpecialization`

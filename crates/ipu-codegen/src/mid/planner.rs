@@ -104,18 +104,16 @@ pub(crate) fn plan_finalists(
                 .iter()
                 .map(|value| lookup(&branch.values, *value))
                 .collect::<LoweringResult<Vec<_>>>()?;
-            let estimated_cycles = branch
-                .operations
-                .iter()
-                .map(|operation| operation.estimated_cycles)
-                .sum();
-            let estimated_exchange_cycles = branch
-                .operations
-                .iter()
-                .map(|operation| operation.estimated_exchange_cycles)
-                .sum();
-            let peak_memory =
-                region_peak_memory(&initial, &branch.operations, &outputs, &branch.state.values);
+            let (estimated_cycles, estimated_exchange_cycles, peak_memory) =
+                if let Some(Some((program, peak, true))) = branch.analysis.get() {
+                    (program.total, program.exchange, *peak)
+                } else {
+                    (
+                        branch.operations.iter().map(|operation| operation.estimated_cycles).sum(),
+                        branch.operations.iter().map(|operation| operation.estimated_exchange_cycles).sum(),
+                        region_peak_memory(&initial, &branch.operations, &outputs, &branch.state.values),
+                    )
+                };
             tracing::info!(
                 finalist,
                 values = branch.state.values.len(),
@@ -256,12 +254,15 @@ impl LoweringState {
     }
 }
 
+type BranchAnalysis = Option<(crate::estimate::ProgramCycles, MemoryPeaks, bool)>;
+
 #[derive(Clone)]
 pub(super) struct BeamBranch {
     pub(super) values: BTreeMap<ValueId, MidValueId>,
     pub(super) state: LoweringState,
     pub(super) operations: Vec<MidOperation>,
     pub(super) peak_memory: MemoryPeaks,
+    pub(super) analysis: std::sync::OnceLock<BranchAnalysis>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -445,6 +446,7 @@ pub(super) fn lower_operation_candidates(
             state: state.clone(),
             operations: Vec::new(),
             peak_memory: MemoryPeaks::default(),
+            analysis: std::sync::OnceLock::new(),
         }]);
     }
     let relevant_origins = source
@@ -476,6 +478,7 @@ pub(super) fn lower_operation_candidates(
         state: state.clone(),
         operations: Vec::new(),
         peak_memory: MemoryPeaks::default(),
+        analysis: std::sync::OnceLock::new(),
     }];
     for (operation_index, operation) in source.iter().enumerate() {
         let distributed_result_is_useful = operation.results.first().is_some_and(|result| {
@@ -500,6 +503,18 @@ pub(super) fn lower_operation_candidates(
                                 })
                         }))
         });
+        let future_origins = source[operation_index + 1..]
+            .iter()
+            .flat_map(|operation| operation_graph_inputs(operation, graph))
+            .chain(required_outputs.iter().copied())
+            .chain(
+                constraints
+                    .required_equal_formats
+                    .iter()
+                    .flat_map(|pair| [pair.0, pair.1]),
+            )
+            .chain(constraints.allocation_copies.keys().copied())
+            .collect::<BTreeSet<_>>();
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
@@ -524,6 +539,7 @@ pub(super) fn lower_operation_candidates(
             if let OperationKind::Repeat(repeat) = &operation.kind {
                 saw_candidate = true;
                 let mut next = branch.clone();
+                next.analysis.take();
                 lower_repeat(
                     operation,
                     repeat,
@@ -535,6 +551,7 @@ pub(super) fn lower_operation_candidates(
                     &mut next.operations,
                 )?;
                 let peak = beam_memory_peak(
+                    costs,
                     &next,
                     &initial,
                     source,
@@ -681,6 +698,7 @@ pub(super) fn lower_operation_candidates(
                 .into_par_iter()
                 .map(|plan| {
                     let mut next = branch.clone();
+                    next.analysis.take();
                     apply_selected_plan(
                         operation,
                         output_shape.clone(),
@@ -696,6 +714,7 @@ pub(super) fn lower_operation_candidates(
                         &mut next.operations,
                     );
                     let peak = beam_memory_peak(
+                        costs,
                         &next,
                         &initial,
                         source,
@@ -739,6 +758,19 @@ pub(super) fn lower_operation_candidates(
                     rejected_memory.push(peak);
                 }
             }
+            // Prune between parent branches as well as at the end of the
+            // operation. Executable fragments can be large; retaining every
+            // rejected Cartesian-product branch defeats the planning beam.
+            if expanded.len() > config.planning_beam_width.max(1).saturating_mul(2) {
+                expanded = retain_pareto_beam(
+                    expanded,
+                    &future_origins,
+                    constraints,
+                    costs,
+                    config.planning_beam_width.max(1),
+                )
+                .0;
+            }
         }
         if expanded.is_empty() {
             if saw_candidate
@@ -760,18 +792,6 @@ pub(super) fn lower_operation_candidates(
             }
             return Err(LoweringError::NoCandidate(operation.id));
         }
-        let future_origins = source[operation_index + 1..]
-            .iter()
-            .flat_map(|operation| operation_graph_inputs(operation, graph))
-            .chain(required_outputs.iter().copied())
-            .chain(
-                constraints
-                    .required_equal_formats
-                    .iter()
-                    .flat_map(|pair| [pair.0, pair.1]),
-            )
-            .chain(constraints.allocation_copies.keys().copied())
-            .collect::<BTreeSet<_>>();
         let expanded_count = expanded.len();
         let (expanded, dominated, equivalent, diversity) = retain_pareto_beam(
             expanded,
@@ -798,7 +818,10 @@ pub(super) fn lower_operation_candidates(
     let beam = beam
         .into_iter()
         .filter_map(|mut branch| {
+            restore_unclaimed_deferred_costs(&mut branch.operations);
+            branch.analysis.take();
             let peak = beam_memory_peak(
+                costs,
                 &branch,
                 &initial,
                 source,
@@ -827,9 +850,6 @@ pub(super) fn lower_operation_candidates(
     });
     if beam.is_empty() {
         return Err(LoweringError::NoCandidate(source[0].id));
-    }
-    for branch in &mut beam {
-        restore_unclaimed_deferred_costs(&mut branch.operations);
     }
     Ok(beam)
 }
@@ -1099,6 +1119,10 @@ pub(super) fn deferred_aware_branch_score(
     branch: &BeamBranch,
     possible_future_consumers: &BTreeSet<ValueId>,
 ) -> u64 {
+    if let Some(Some((program, _, true))) = branch.analysis.get() {
+        return program.total;
+    }
+
     let claims = deferred_claims(&branch.operations);
     branch.operations.iter().fold(0u64, |cycles, operation| {
         let pending = operation
@@ -1242,12 +1266,40 @@ pub(super) fn apply_selected_plan(
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
-    let (mut operator_cycles, mut operator_exchange_cycles) = costs.operator_transition_cost(
-        &plan,
-        &source_types,
-        &converted_types,
-        &state.get(result).tensor_type,
-    );
+    let implementation =
+        costs.implementation(&plan, &converted_types, &state.get(result).tensor_type);
+    let mut operator_cycles = costs
+        .operator_cycle_override(&plan, &converted_types, &state.get(result).tensor_type)
+        .unwrap_or_else(|| {
+            implementation
+                .as_ref()
+                .map_or(u64::MAX, |built| built.program.estimated_cycles)
+        });
+    let mut operator_exchange_cycles = implementation
+        .as_ref()
+        .map_or(u64::MAX, |built| built.program.estimated_exchange_cycles);
+    // Preliminary transition prices remain useful for custom planning models.
+    // Normal detailed ranking evaluates the emitted region, including movement.
+    for ((source, input), requirement) in source_types
+        .iter()
+        .zip(&converted_types)
+        .zip(&plan.requirements.inputs)
+    {
+        if requirement.materialization == OperandMaterialization::DispatchSlices
+            && source.format.layout != input.format.layout
+        {
+            let cost = costs.rearrangement_cost(
+                &input.shape,
+                input.format.precision,
+                layout_conversion_strategy(&source.format.layout, &input.format.layout),
+                &source.format.layout,
+                &input.format.layout,
+            );
+            operator_cycles = operator_cycles.saturating_add(cost.cycles);
+            operator_exchange_cycles =
+                operator_exchange_cycles.saturating_add(cost.exchange_cycles);
+        }
+    }
     let mut deferred_inputs = vec![None; converted.len()];
     for (input_index, ((&original, &converted), requirement)) in original_input_ids
         .iter()
@@ -1284,17 +1336,6 @@ pub(super) fn apply_selected_plan(
         let Some(&source) = operations[producer_index].inputs.get(offered.source_input) else {
             continue;
         };
-        let producer_cycles = offered.unfused_cycles;
-        let (fused_cycles, fused_exchange) = costs.deferred_input_cost(
-            offered.transform,
-            &state.get(source).tensor_type,
-            &state.get(original).tensor_type,
-            &converted_types[input_index],
-            &plan.dispatch,
-            producer_cycles,
-        );
-        operator_cycles = operator_cycles.saturating_add(fused_cycles);
-        operator_exchange_cycles = operator_exchange_cycles.saturating_add(fused_exchange);
         deferred_inputs[input_index] = Some(DeferredInputPlan {
             producer: original,
             source,
@@ -1312,15 +1353,14 @@ pub(super) fn apply_selected_plan(
         output_layout = ?state.get(result).tensor_type.format.layout,
         "costed operator plan"
     );
-    let exchange =
-        costs.operator_exchange_footprint(&plan, &converted_types, &state.get(result).tensor_type);
-    let mut memory = operator_memory_estimate(
-        &plan.dispatch,
-        &plan.requirements,
-        &converted_types,
-        &state.get(result).tensor_type,
-    );
-    memory.exchange_row_bytes = exchange.estimated_row_bytes();
+    let exchange = implementation
+        .as_ref()
+        .map_or(ExchangeFootprint::default(), |built| built.exchange);
+    let memory = implementation
+        .as_ref()
+        .map_or_else(crate::estimate::unavailable_operator_memory, |built| {
+            built.memory
+        });
     if let Some(offer) = &mut plan.deferred_output {
         offer.unfused_cycles = operator_cycles;
         offer.unfused_exchange_cycles = operator_exchange_cycles;
@@ -1335,6 +1375,7 @@ pub(super) fn apply_selected_plan(
             plan,
             exchange,
             deferred_inputs,
+            implementation: implementation.map(|built| std::sync::Arc::clone(&built.program)),
         },
         estimated_cycles: operator_cycles,
         estimated_exchange_cycles: operator_exchange_cycles,
@@ -1344,6 +1385,7 @@ pub(super) fn apply_selected_plan(
 }
 
 pub(super) fn beam_memory_peak(
+    costs: &impl CostModel,
     branch: &BeamBranch,
     initial: &[MidValueId],
     source: &[Operation],
@@ -1371,13 +1413,43 @@ pub(super) fn beam_memory_peak(
                 .map(|copies| (value.id, *copies))
         })
         .collect::<BTreeMap<_, _>>();
-    region_peak_memory_with_multiplicity(
-        initial,
-        &branch.operations,
-        &live,
-        &branch.state.values,
-        &multiplicity,
-    )
+    branch
+        .analysis
+        .get_or_init(|| {
+            let (program, peak) = crate::estimate::region_estimate(
+                initial,
+                &branch.operations,
+                &live,
+                &branch.state.values,
+                &multiplicity,
+            )?;
+            let primitive = !branch.operations.iter().any(|operation| {
+                operation.operator_plan().is_some_and(|plan| {
+                    let inputs = operation
+                        .inputs
+                        .iter()
+                        .map(|id| branch.state.get(*id).tensor_type.clone())
+                        .collect::<Vec<_>>();
+                    costs
+                        .operator_cycle_override(
+                            plan,
+                            &inputs,
+                            &branch.state.get(operation.results[0]).tensor_type,
+                        )
+                        .is_some()
+                })
+            });
+            Some((
+                crate::estimate::ProgramCycles {
+                    total: program.estimated_cycles,
+                    exchange: program.estimated_exchange_cycles,
+                },
+                peak,
+                primitive,
+            ))
+        })
+        .as_ref()
+        .map_or_else(crate::estimate::unavailable_memory, |(_, peak, _)| *peak)
 }
 
 pub(super) fn plan_fits_operator_memory(
@@ -1387,13 +1459,14 @@ pub(super) fn plan_fits_operator_memory(
     config: &PipelineConfig,
 ) -> bool {
     let (planned_inputs, planned_output) = plan.tensor_types(inputs, output);
-    let peak = operator_memory_estimate(
-        &plan.dispatch,
-        &plan.requirements,
-        &planned_inputs,
-        &planned_output,
-    )
-    .peak;
+    let peak = planned_inputs
+        .iter()
+        .chain(std::iter::once(&planned_output))
+        .map(crate::estimate::tensor_memory)
+        .fold(MemoryUsage::default(), |peak, tensor| MemoryUsage {
+            standard: peak.standard.max(tensor.standard),
+            interleaved: peak.interleaved.max(tensor.interleaved),
+        });
     peak.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
         && peak
             .total()

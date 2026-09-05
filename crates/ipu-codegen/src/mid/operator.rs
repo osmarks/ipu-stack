@@ -8,7 +8,7 @@ pub enum AccumulationPrecision {
     F32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MidOperator {
     Gemm {
         options: GemmOptions,
@@ -25,7 +25,7 @@ pub enum MidOperator {
 }
 
 /// A tile-local callable selected by a whole-device operator plan.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileKernelSpec {
     FillZero,
     Gemm {
@@ -67,7 +67,7 @@ pub enum TileKernelSpec {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GemmKernelMode {
     Initialize,
     Accumulate,
@@ -109,7 +109,7 @@ impl GemmOrientation {
 
 /// Shape-independent recipe which expands into ordered device-wide exchange
 /// and tile-kernel phases after concrete shards are known.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OperatorDispatch {
     Pointwise {
         kernel: TileKernelSpec,
@@ -142,7 +142,7 @@ pub enum OperatorDispatch {
     View,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeferredOutputPlan {
     pub source_input: usize,
     pub transform: AxisFactorView,
@@ -152,7 +152,7 @@ pub struct DeferredOutputPlan {
     pub unfused_exchange_cycles: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeferredInputPlan {
     pub producer: MidValueId,
     pub source: MidValueId,
@@ -160,7 +160,7 @@ pub struct DeferredInputPlan {
 }
 
 /// Which operand remains resident while a blocked whole-device GEMM is run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GemmDistribution {
     #[default]
     OutputStationary,
@@ -182,7 +182,7 @@ pub enum GemmDistribution {
 }
 
 /// Lifetime policy for partials reduced across a GEMM's K partitions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReductionStaging {
     /// Receive every remote partial into one packed buffer, then reduce once.
     #[default]
@@ -194,7 +194,7 @@ pub enum ReductionStaging {
 }
 
 /// How a pointwise kernel's input shards are selected for each output shard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PointwiseInputMapping {
     /// Each input view is selected by its logical overlap with the output and
     /// singleton dimensions may be broadcast.
@@ -203,7 +203,7 @@ pub enum PointwiseInputMapping {
     TileLocal,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum EmptyOutputShardPolicy {
     Skip,
     Reject,
@@ -282,7 +282,7 @@ impl OperatorDispatch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperandRequirement {
     pub format: TensorFormat,
     pub alignment: u32,
@@ -296,14 +296,14 @@ pub struct OperandRequirement {
     pub materialization: OperandMaterialization,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LocalOperandStaging {
     #[default]
     Direct,
     MatchRemote,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum OperandMaterialization {
     #[default]
     Complete,
@@ -337,7 +337,7 @@ impl OperandRequirement {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OutputAliasing {
     Fresh,
     MayAliasInputs(Vec<u16>),
@@ -408,7 +408,7 @@ pub(super) fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -
 
 /// Operand storage and access constraints, shared by operator plans and
 /// concrete kernel calls. A call binds formats to its actual operand buffers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StorageRequirements {
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
@@ -416,7 +416,7 @@ pub struct StorageRequirements {
     pub distinct_elements: Vec<Vec<MemoryOperand>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
@@ -457,14 +457,14 @@ pub fn layout_conversion_strategy(from: &Layout, to: &Layout) -> ConversionStrat
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ConversionPlan {
     pub input: OperandRequirement,
     pub output: OperandRequirement,
     pub strategy: ConversionStrategy,
 }
 
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Hash)]
 pub enum OperatorPlanError {
     #[error("operator plan operand arity does not match its requirements")]
     OperandArity,

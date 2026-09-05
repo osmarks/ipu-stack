@@ -19,14 +19,16 @@ mod mapping;
 mod pointwise;
 mod reduce;
 mod repeat;
+mod reuse;
 use super::block::*;
 use crate::graph::OperationId;
 use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
     ConversionStrategy, CopyOrder, CopyPattern, ElementOrder, GemmDistribution,
-    ImplementationCandidate, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
-    MidRepeat, MidValueId, OperatorDispatch, OutputAliasing, PointwiseInputMapping, Precision,
-    ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
+    ImplementationCandidate, KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation,
+    MidOperationKind, MidRepeat, MidValueId, OperatorDispatch, OutputAliasing,
+    PointwiseInputMapping, Precision, ShardExtent, StorageRequirements, TensorTiling, TensorType,
+    TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError};
 use attention::*;
@@ -144,6 +146,9 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
         estimated_exchange_cycles: graph.estimated_exchange_cycles,
     };
     super::passes::simplify(&mut program);
+    let cycles = crate::estimate::program_cycles(&program, None)?;
+    program.estimated_cycles = cycles.total;
+    program.estimated_exchange_cycles = cycles.exchange;
     Ok(Arc::new(program))
 }
 
@@ -177,7 +182,37 @@ impl BlockBuilder {
             deferred_values: BTreeMap::new(),
             intersection_cache: BTreeMap::new(),
         };
+        let mut used = graph
+            .inputs
+            .iter()
+            .map(|input| input.value)
+            .chain(graph.outputs.iter().copied())
+            .collect::<BTreeSet<_>>();
+        fn uses(operations: &[MidOperation], used: &mut BTreeSet<MidValueId>) {
+            for operation in operations {
+                used.extend(operation.inputs.iter().chain(&operation.results).copied());
+                for deferred in operation.deferred_inputs().iter().flatten() {
+                    used.extend([deferred.source, deferred.producer]);
+                }
+                if let MidOperationKind::Repeat(repeat) = &operation.kind {
+                    used.extend(repeat.iterated_inputs.iter().flatten().copied());
+                    used.extend(
+                        repeat
+                            .body
+                            .arguments
+                            .iter()
+                            .chain(&repeat.body.yields)
+                            .copied(),
+                    );
+                    uses(&repeat.body.operations, used);
+                }
+            }
+        }
+        uses(&graph.operations, &mut used);
         for value in &graph.values {
+            if !used.contains(&value.id) {
+                continue;
+            }
             let layout = &value.tensor_type.format.layout;
             layout.validate_tile_count(tile_count)?;
             let extents = layout.shard_extents(&value.tensor_type.shape)?;
@@ -326,6 +361,12 @@ impl BlockBuilder {
         plan: &crate::OperatorPlan,
         tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
+        if plan.requirements.inputs.len() != operation.inputs.len() {
+            return Err(BlockBuildError::InvalidOperatorPlan);
+        }
+        if self.reuse_implementation(operation, tiles)? {
+            return Ok(());
+        }
         match &plan.dispatch {
             OperatorDispatch::Pointwise {
                 kernel,

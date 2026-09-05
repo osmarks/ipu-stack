@@ -1212,7 +1212,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             })
             .collect::<Vec<_>>()
     } else {
-        retain_precise_operator_candidates(
+        retain_operator_candidates(
             variants,
             inputs,
             output,
@@ -1301,7 +1301,7 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
     }
 }
 
-pub(super) fn retain_precise_operator_candidates(
+pub(super) fn retain_operator_candidates(
     candidates: Vec<OperatorPlan>,
     inputs: &[TensorType],
     output: &TensorShape,
@@ -1312,23 +1312,26 @@ pub(super) fn retain_precise_operator_candidates(
         .into_iter()
         .map(|candidate| {
             let (planned_inputs, planned_output) = candidate.tensor_types(inputs, output);
-            let requirements = &candidate.requirements;
-            let memory = operator_memory_estimate(
-                &candidate.dispatch,
-                requirements,
-                &planned_inputs,
-                &planned_output,
-            );
-            let exchange =
-                costs.operator_exchange_footprint(&candidate, &planned_inputs, &planned_output);
+            // Enumeration only: screen by boundary storage/traffic before
+            // constructing executable fragments in the detailed beam. This is
+            // a heuristic, not an admissible bound or a second operator model.
+            let memory = planned_inputs
+                .iter()
+                .chain(std::iter::once(&planned_output))
+                .map(crate::estimate::tensor_memory)
+                .fold(MemoryUsage::default(), |sum, tensor| {
+                    sum.saturating_add(tensor)
+                });
             let objective = PlanMetrics {
                 standard_contiguous_overflow: 0,
-                cycles: costs.operator_cycles(&candidate, &planned_inputs, &planned_output),
-                standard: memory.peak.standard,
-                interleaved: memory.peak.interleaved,
-                total: memory.peak.total(),
-                maximum_standard_allocation: memory.maximum_standard_temporary_allocation,
-                exchange_rows: exchange.estimated_row_bytes(),
+                cycles: costs
+                    .operator_cycle_override(&candidate, &planned_inputs, &planned_output)
+                    .unwrap_or(memory.total()),
+                standard: memory.standard,
+                interleaved: memory.interleaved,
+                total: memory.total(),
+                maximum_standard_allocation: crate::estimate::maximum_shard_bytes(&planned_output),
+                exchange_rows: 0,
             };
             let compatibility = operator_candidate_compatibility(&candidate);
             (candidate, objective, compatibility)

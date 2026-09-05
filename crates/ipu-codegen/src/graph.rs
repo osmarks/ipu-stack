@@ -58,6 +58,10 @@ impl TensorShape {
 pub struct OperationId(u32);
 
 impl OperationId {
+    pub(crate) const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
     pub const fn index(self) -> u32 {
         self.0
     }
@@ -71,6 +75,10 @@ impl OperationId {
 pub struct ValueId(u32);
 
 impl ValueId {
+    pub(crate) const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
+
     pub const fn index(self) -> u32 {
         self.0
     }
@@ -126,24 +134,24 @@ pub enum OperationKind {
     Repeat(Repeat),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GemmOptions {
     pub transpose_left: bool,
     pub transpose_right: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BroadcastMode {
     #[default]
     Numpy,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AddOptions {
     pub broadcasting: BroadcastMode,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AttentionScale {
     #[default]
     InverseSqrtQueryWidth,
@@ -163,7 +171,7 @@ impl AttentionScale {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AttentionOptions {
     pub causal: bool,
     pub scale: AttentionScale,

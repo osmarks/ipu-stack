@@ -43,7 +43,9 @@ impl BlockBuilder {
                                 .copied()
                                 .find(|source| {
                                     let source = &self.shards[source.index() as usize];
-                                    source.tile == tile && source.extents == *output_extents
+                                    source.tile == tile
+                                        && (matches!(kernel, TileKernelSpec::FlashAttention { .. })
+                                            || source.extents == *output_extents)
                                 })
                                 .ok_or(BlockBuildError::InvalidOperatorPlan)?;
                             self.full_view(source)

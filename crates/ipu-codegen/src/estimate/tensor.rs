@@ -2,6 +2,7 @@
 
 use super::*;
 
+#[cfg(test)]
 pub(crate) fn physical_elements(shape: &TensorShape, layout: &Layout) -> u64 {
     layout
         .resolve(shape)
@@ -20,6 +21,7 @@ pub(crate) fn maximum_shard_bytes(tensor: &TensorType) -> u64 {
         })
 }
 
+#[cfg(test)]
 pub(crate) fn maximum_axis_shard_extent(tensor: &TensorType, axis: usize) -> u64 {
     tensor
         .format

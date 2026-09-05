@@ -94,6 +94,51 @@ pub(crate) fn place_with_standard_ranges(
             bytes: 0,
         });
     }
+    let AllocationAnalysis {
+        iterated,
+        members,
+        root_of_member,
+        root_requirements,
+        root_lifetimes,
+    } = analyze_allocations(program)?;
+
+    let tile_placements = (0..usize::from(program.tile_count))
+        .into_par_iter()
+        .map(|tile| {
+            place_tile(
+                program,
+                u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
+                standard_ranges,
+                &iterated,
+                &members,
+                &root_of_member,
+                &root_requirements,
+                &root_lifetimes,
+            )
+        })
+        .collect::<Result<Vec<_>, PlacementError>>()?;
+    let mut addresses = BTreeMap::new();
+    let mut tile_auxiliary_ranges = vec![Vec::new(); usize::from(program.tile_count)];
+    for (tile, tile_addresses, unused) in tile_placements {
+        addresses.extend(tile_addresses);
+        tile_auxiliary_ranges[usize::from(tile)] = unused;
+    }
+
+    Ok(Placement {
+        shard_addresses: addresses,
+        tile_auxiliary_ranges,
+    })
+}
+
+struct AllocationAnalysis {
+    iterated: Vec<IteratedGroup>,
+    members: BTreeMap<usize, Vec<usize>>,
+    root_of_member: Vec<usize>,
+    root_requirements: BTreeMap<usize, Requirement>,
+    root_lifetimes: BTreeMap<usize, Lifetime>,
+}
+
+fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, PlacementError> {
     let mut sets = DisjointSets::new(program.shards.len());
     for shard in &program.shards {
         if let ShardDefinition::Alias(target) | ShardDefinition::WritableAlias(target) =
@@ -137,32 +182,99 @@ pub(crate) fn place_with_standard_ranges(
             .include(lifetime);
     }
 
-    let tile_placements = (0..usize::from(program.tile_count))
-        .into_par_iter()
-        .map(|tile| {
-            place_tile(
-                program,
-                u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
-                standard_ranges,
-                &iterated,
-                &members,
-                &root_of_member,
-                &root_requirements,
-                &root_lifetimes,
-            )
-        })
-        .collect::<Result<Vec<_>, PlacementError>>()?;
-    let mut addresses = BTreeMap::new();
-    let mut tile_auxiliary_ranges = vec![Vec::new(); usize::from(program.tile_count)];
-    for (tile, tile_addresses, unused) in tile_placements {
-        addresses.extend(tile_addresses);
-        tile_auxiliary_ranges[usize::from(tile)] = unused;
-    }
-
-    Ok(Placement {
-        shard_addresses: addresses,
-        tile_auxiliary_ranges,
+    Ok(AllocationAnalysis {
+        iterated,
+        members,
+        root_of_member,
+        root_requirements,
+        root_lifetimes,
     })
+}
+
+/// Address-independent working sets, using the same alias groups, access tails,
+/// element rounding and lifetimes as physical allocation.
+pub(crate) fn program_memory(
+    program: &LowProgram,
+) -> Result<(crate::MemoryPeaks, crate::MemoryPeaks), PlacementError> {
+    program_memory_with_multiplicity(program, &BTreeMap::new())
+}
+
+pub(crate) fn program_memory_with_multiplicity(
+    program: &LowProgram,
+    multiplicity: &BTreeMap<crate::MidValueId, u32>,
+) -> Result<(crate::MemoryPeaks, crate::MemoryPeaks), PlacementError> {
+    let analysis = analyze_allocations(program)?;
+    let mut events = BTreeMap::<(u16, u64), [i128; 4]>::new();
+    let mut maximum_standard = 0;
+    let mut maximum_temporary = 0;
+    for (root, members) in &analysis.members {
+        let lifetime = analysis.root_lifetimes[root];
+        if !lifetime.seen {
+            continue;
+        }
+        let shard = &program.shards[members[0]];
+        let copies = members
+            .iter()
+            .filter_map(|&index| match program.shards[index].definition {
+                ShardDefinition::Value(value) => multiplicity.get(&value).copied(),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let bytes = u64::from(allocation_bytes(
+            program,
+            members,
+            analysis.root_requirements[root],
+        )?)
+        .saturating_mul(u64::from(copies));
+        let class = match shard.tensor_type.format.layout.memory_class {
+            MemoryClass::Ipu21Standard => {
+                maximum_standard = maximum_standard.max(bytes);
+                0
+            }
+            MemoryClass::Ipu21Interleaved => 1,
+        };
+        let transient = members
+            .iter()
+            .all(|&index| !matches!(program.shards[index].definition, ShardDefinition::Value(_)));
+        for offset in [0, 2]
+            .into_iter()
+            .filter(|&offset| offset == 0 || transient)
+        {
+            events
+                .entry((shard.tile, u64::from(lifetime.first)))
+                .or_default()[offset + class] += i128::from(bytes);
+            events
+                .entry((shard.tile, u64::from(lifetime.last) + 1))
+                .or_default()[offset + class] -= i128::from(bytes);
+        }
+        if transient && class == 0 {
+            maximum_temporary = maximum_temporary.max(bytes);
+        }
+    }
+    let mut live = vec![[0i128; 4]; usize::from(program.tile_count)];
+    let mut peaks = [crate::MemoryPeaks::default(); 2];
+    for ((tile, _), delta) in events {
+        let usage = &mut live[usize::from(tile)];
+        for (live, change) in usage.iter_mut().zip(delta) {
+            *live += change;
+        }
+        for (index, maximum) in [maximum_standard, maximum_temporary]
+            .into_iter()
+            .enumerate()
+        {
+            peaks[index].observe(
+                crate::MemoryUsage {
+                    standard: u64::try_from(usage[2 * index])
+                        .map_err(|_| PlacementError::Overflow)?,
+                    interleaved: u64::try_from(usage[2 * index + 1])
+                        .map_err(|_| PlacementError::Overflow)?,
+                },
+                maximum,
+            );
+        }
+    }
+    Ok((peaks[0], peaks[1]))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -91,6 +91,28 @@ pub struct LogicalExchange {
     pub order: CopyOrder,
 }
 
+impl LogicalExchange {
+    /// Equal storage orders can traverse physical spans while preserving the
+    /// requested coordinates. Share this decision with pricing and encoding.
+    pub(crate) fn span_order(&self, shards: &[BlockValue]) -> CopyOrder {
+        let source = &shards[self.source.shard.index() as usize];
+        if self.order == CopyOrder::Semantic
+            && self.destinations.iter().any(|view| {
+                shards[view.shard.index() as usize]
+                    .tensor_type
+                    .format
+                    .layout
+                    .order
+                    != source.tensor_type.format.layout.order
+            })
+        {
+            CopyOrder::Semantic
+        } else {
+            CopyOrder::Physical
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExchangePhase {
     pub id: ExchangePhaseId,
@@ -119,62 +141,6 @@ pub struct WorkProvenance {
 pub struct KernelOperand {
     /// Views resident on the execution tile which form this ABI operand.
     pub views: Vec<ShardView>,
-}
-
-/// Access contract of an actual kernel buffer, without candidate planning policy.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelAccess {
-    pub format: TensorFormat,
-    pub alignment: u32,
-    pub access_tail_bytes: u32,
-}
-
-impl KernelAccess {
-    pub fn new(format: TensorFormat, alignment: u32) -> Self {
-        Self {
-            format,
-            alignment,
-            access_tail_bytes: 0,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelRequirements {
-    pub inputs: Vec<KernelAccess>,
-    pub output: KernelAccess,
-    pub distinct_elements: Vec<Vec<MemoryOperand>>,
-}
-
-impl KernelRequirements {
-    pub fn new(
-        kernel: &TileKernelSpec,
-        inputs: impl IntoIterator<Item = TensorFormat>,
-        output: TensorFormat,
-    ) -> Self {
-        let alignment = match kernel {
-            TileKernelSpec::Gemm { .. } => 32,
-            TileKernelSpec::Rearrange { .. } => 2,
-            _ => 8,
-        };
-        let mut requirements = Self {
-            inputs: inputs
-                .into_iter()
-                .map(|format| KernelAccess::new(format, alignment))
-                .collect(),
-            output: KernelAccess::new(output, alignment),
-            distinct_elements: Vec::new(),
-        };
-        if let TileKernelSpec::Gemm { multiply, .. } = kernel
-            && let Some(left) = requirements.inputs.first_mut()
-        {
-            left.access_tail_bytes = 8 * multiply.bytes() as u32;
-            requirements
-                .distinct_elements
-                .push(vec![MemoryOperand::Output, MemoryOperand::Input(0)]);
-        }
-        requirements
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

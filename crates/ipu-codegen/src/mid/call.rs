@@ -1,8 +1,96 @@
-//! Shape and extent extraction for kernel specialization.
+//! Address-independent kernel access contracts and call geometry.
 
 use super::*;
 
-pub(super) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
+/// Access contract of an actual kernel buffer, without candidate planning policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelAccess {
+    pub format: TensorFormat,
+    pub alignment: u32,
+    pub access_tail_bytes: u32,
+}
+
+impl KernelAccess {
+    pub fn new(format: TensorFormat, alignment: u32) -> Self {
+        Self {
+            format,
+            alignment,
+            access_tail_bytes: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRequirements {
+    pub inputs: Vec<KernelAccess>,
+    pub output: KernelAccess,
+    pub distinct_elements: Vec<Vec<MemoryOperand>>,
+}
+
+impl KernelRequirements {
+    pub fn new(
+        kernel: &TileKernelSpec,
+        inputs: impl IntoIterator<Item = TensorFormat>,
+        output: TensorFormat,
+    ) -> Self {
+        let alignment = match kernel {
+            TileKernelSpec::Gemm { .. } => 32,
+            TileKernelSpec::Rearrange { .. } => 2,
+            _ => 8,
+        };
+        let mut requirements = Self {
+            inputs: inputs
+                .into_iter()
+                .map(|format| KernelAccess::new(format, alignment))
+                .collect(),
+            output: KernelAccess::new(output, alignment),
+            distinct_elements: Vec::new(),
+        };
+        if let TileKernelSpec::Gemm { multiply, .. } = kernel
+            && let Some(left) = requirements.inputs.first_mut()
+        {
+            left.access_tail_bytes = 8 * multiply.bytes() as u32;
+            requirements
+                .distinct_elements
+                .push(vec![MemoryOperand::Output, MemoryOperand::Input(0)]);
+        }
+        requirements
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum KernelAbiError {
+    #[error("kernel requirements do not match the tile-kernel family")]
+    RequirementMismatch,
+    #[error("kernel run has {actual} pointer operands, ABI requires {expected}")]
+    PointerArity { expected: usize, actual: usize },
+    #[error("kernel operand {0} is fragmented into multiple views")]
+    FragmentedOperand(usize),
+    #[error("kernel {0:?} has no device implementation")]
+    Unavailable(TileKernelSpec),
+    #[error("GEMM output view does not have a matrix row axis")]
+    MissingGemmRows,
+    #[error("kernel element count overflowed")]
+    ElementCountOverflow,
+    #[error("kernel {symbol} requires an element count divisible by {divisor}, got {count}")]
+    UnsupportedElementCount {
+        symbol: &'static str,
+        count: u32,
+        divisor: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AttentionKernelShape {
+    pub(crate) matrices: u32,
+    pub(crate) query_rows: u32,
+    pub(crate) key_rows: u32,
+    pub(crate) query_dimension: u32,
+    pub(crate) value_dimension: u32,
+    pub(crate) scale_bits: u32,
+}
+
+pub(crate) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
     let TileKernelSpec::FlashAttention {
         options,
         accumulate,
@@ -59,7 +147,7 @@ pub(super) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, K
     })
 }
 
-pub(super) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
+pub(crate) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let rank = run.output.extents.len();
     let output_order = &run.requirements.output.format.layout.order;
     let matrix_column_axis = rank
@@ -86,7 +174,7 @@ pub(super) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
         .ok_or(KernelAbiError::MissingGemmRows)
 }
 
-pub(super) fn matrix_extent(
+pub(crate) fn matrix_extent(
     run: &KernelRun,
     logical: bool,
     columns: bool,
@@ -103,7 +191,7 @@ pub(super) fn matrix_extent(
     })
 }
 
-pub(super) fn input_matrix_extent(
+pub(crate) fn input_matrix_extent(
     run: &KernelRun,
     logical: bool,
     columns: bool,
@@ -125,7 +213,7 @@ pub(super) fn input_matrix_extent(
     })
 }
 
-pub(super) fn matrix_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
+pub(crate) fn matrix_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let view = run
         .inputs
         .first()
