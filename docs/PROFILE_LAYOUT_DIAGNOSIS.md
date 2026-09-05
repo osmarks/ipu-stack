@@ -142,7 +142,7 @@ the renderer output is `artifacts/profiles/mlp-historical-layouts-new-model.html
 
 Temporary instrumentation of candidate generation located the loss before mid
 costing: BOTH historical grids survive the initial grid proxy frontier. The
-first produces 24 variants and the second 12, but neither survives
+two grids produce fully specified variants, but neither survives
 `retain_operator_candidates`. For the default cost model that shortlist ranks
 by boundary memory bytes (`operator_cycle_override` is absent), not by compact
 mid execution cost. Some later calls enumerate different tile budgets and lack
@@ -150,3 +150,46 @@ the first grid, but that is not where its original variants were lost. The
 instrumentation was removed after the experiment. This identifies a candidate
 screening problem; increasing the final exchange price cannot recover an
 already discarded candidate.
+
+## Q/K/V batching experiment
+
+The implementation is saved on branch `experiment/qkv-exchange-batching`.
+It extends the existing low exchange consolidation to move independent copy
+preparation before a combined exchange and completion work after it. It only
+crosses local copies, zero-fill, rearrangement and cast kernels within the same
+source operation. Whole-allocation alias/dependence checks reject unsafe moves;
+operator compute, checkpoints and repeats remain barriers. Mid layouts and the
+selected algorithms are unchanged. The main refactor branch retains its previous
+behavior because this experiment substantially increases compilation time.
+
+| Projected attention | Separate preparation | Batched preparation |
+|---|---:|---:|
+| Exchange phases | 21 | 19 |
+| Q/K/V preparation transfers | 181,666 total | 181,666 |
+| Scheduled preparation cycles | 107,906 total | 100,381 |
+| All scheduled exchange cycles | 301,869 | 294,344 |
+| Measured profile span | 782,088 | 775,188 |
+| Build and numerical validation | 49.62 s | 317.77 s |
+| Maximum error | 0.001230 | 0.001230 |
+
+The batched executable passes all 839,808 numerical checks. GEMM smoke and
+attention smoke also pass with the modified lowering. Existing codegen release
+unit tests (93), its doctest, the added dependency-ordering regression and strict
+Clippy pass. This was a controlled experiment, not a full hardware strategy sweep.
+
+The elapsed improvement is 6,900 cycles (0.88%). The combined phase's last entry
+is 284,280 and last exit 384,918 on the shared clock; the next broadcast's last
+entry is 392,628. Thus sparse prerequisite work is now before the combined
+exchange, with another 7,710-cycle tail afterward. It was not eliminated by
+removing the intermediate boundaries. Headless Chromium inspection confirms
+one long preparation exchange followed by the same regular attention blocks.
+
+The scheduler takes 147.97 s provisionally and 162.62 s after placement for the
+larger phase. It still selects the full-duplex schedule. Reserved exchange-table
+space is 23,148 bytes in BOTH baseline and batched builds; batching did not
+increase that reservation. The earlier progress statement describing it as
+increased was incorrect.
+
+Results: `/tmp/batched-preparation.{ipuprofile,ipuexe,log}` and
+`artifacts/profiles/attention-batched-preparation.html`, plus the matching
+barrier JSON. Both newly rendered profiles were checked in Chromium.
