@@ -1231,12 +1231,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         let tiled = crate::low::lower_to_tiles(
             &build_blocks(&lowered).unwrap(),
             config.diagnostic_checkpoints,
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "random case {case}, heads {heads}, width {head_width}, tokens {tokens}: {error}"
-            )
-        });
+        );
         crate::KernelBuildPlan::from_program(&tiled)
             .unwrap_or_else(|error| panic!("random case {case}: {error}"));
         for run in &tiled.kernel_runs {

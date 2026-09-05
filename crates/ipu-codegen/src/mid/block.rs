@@ -37,9 +37,6 @@ pub struct KernelRunId(pub(crate) u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocalCopyId(pub(crate) u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RepeatRunId(pub(crate) u32);
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShardView {
     pub shard: BlockValueId,
@@ -191,6 +188,8 @@ pub struct RepeatIterated {
     pub alignment: u32,
 }
 
+/// A device-wide region preserving each tile's operation order. Entries on
+/// distinct tiles may overlap; exchange markers provide global synchronization.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockRegion {
     pub operations: Vec<BlockOperation>,
@@ -201,7 +200,7 @@ pub enum BlockOperation {
     Exchange(ExchangePhaseId),
     Copy { tile: u16, copy: LocalCopyId },
     Compute { tile: u16, run: KernelRunId },
-    Repeat(BlockRepeat),
+    Repeat(Box<BlockRepeat>),
     Checkpoint(OperationId, u8),
 }
 

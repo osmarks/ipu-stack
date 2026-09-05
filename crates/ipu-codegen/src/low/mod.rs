@@ -2,8 +2,14 @@
 //! All operation expansion and copy materialization belongs to mid builders.
 
 use crate::graph::OperationId;
-use crate::mid::*;
+use crate::mid::{
+    BlockOperation, BlockRegion, ExchangePhaseId, KernelRun, KernelRunId, LocalCopy, LocalCopyId,
+    MidProgram, RepeatCarried, RepeatInvariant, RepeatIterated, WorkProvenance,
+};
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RepeatRunId(u32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatRun {
@@ -74,10 +80,7 @@ impl LowProgram {
 }
 
 /// Projection only: no GEMM, attention, conversion, or layout decisions.
-pub fn lower_to_tiles(
-    program: &Arc<MidProgram>,
-    diagnostic_checkpoints: bool,
-) -> Result<LowProgram, BlockBuildError> {
+pub fn lower_to_tiles(program: &Arc<MidProgram>, diagnostic_checkpoints: bool) -> LowProgram {
     fn project(
         region: &BlockRegion,
         program: &MidProgram,
@@ -113,7 +116,10 @@ pub fn lower_to_tiles(
                 BlockOperation::Repeat(repeat) => {
                     let body = project(&repeat.body, program, repeats, false);
                     for binding in &repeat.bindings {
-                        let id = RepeatRunId(repeats.len() as u32);
+                        let id = RepeatRunId(
+                            u32::try_from(repeats.len())
+                                .expect("too many projected repeat instances"),
+                        );
                         repeats.push(RepeatRun {
                             provenance: repeat.provenance,
                             count: repeat.count,
@@ -131,9 +137,6 @@ pub fn lower_to_tiles(
         }
         tiles
     }
-    if program.tile_count == 0 {
-        return Err(BlockBuildError::EmptyTileGroup);
-    }
     let mut repeat_runs = Vec::new();
     let tiles = project(
         &program.body,
@@ -141,9 +144,9 @@ pub fn lower_to_tiles(
         &mut repeat_runs,
         diagnostic_checkpoints,
     );
-    Ok(LowProgram {
+    LowProgram {
         program: Arc::clone(program),
         tiles,
         repeat_runs,
-    })
+    }
 }

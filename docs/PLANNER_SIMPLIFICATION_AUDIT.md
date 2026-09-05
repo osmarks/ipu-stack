@@ -337,3 +337,10 @@ plan. It needs actual relative span geometry, not another independent heuristic.
 Validation for this checkpoint: 140 workspace release tests (including doctests),
 strict Clippy, and all five canonical hardware workloads pass. Every tile image
 is identical to its preceding completion-final package, including linked code.
+
+The earlier low-expansion boundary notes are superseded by the executable mid
+block migration. GEMM, attention, copy materialization, and reduction construction
+now happen in mid candidate builders; low only projects the resulting program.
+See ARCHITECTURE.md and the latest section of REFACTOR_PROGRESS.md for the current
+representation and validation. Analytical screening still uses recipe-level
+estimates, and general conversion-chain composition remains future work.

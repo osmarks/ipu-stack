@@ -132,16 +132,18 @@ impl BlockBuilder {
                 iterated,
             });
         }
-        tiles.operations.push(BlockOperation::Repeat(BlockRepeat {
-            provenance: WorkProvenance {
-                operation: operation.source,
-                value: operation.results.first().copied(),
-                reason: WorkReason::Repeat,
-            },
-            count: repeat.count,
-            bindings,
-            body,
-        }));
+        tiles
+            .operations
+            .push(BlockOperation::Repeat(Box::new(BlockRepeat {
+                provenance: WorkProvenance {
+                    operation: operation.source,
+                    value: operation.results.first().copied(),
+                    reason: WorkReason::Repeat,
+                },
+                count: repeat.count,
+                bindings,
+                body,
+            })));
         Ok(())
     }
 }

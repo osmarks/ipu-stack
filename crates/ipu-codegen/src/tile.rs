@@ -704,8 +704,7 @@ mod tests {
             let low = lower_to_tiles(
                 &crate::mid::build_blocks(&mid).unwrap(),
                 config.diagnostic_checkpoints,
-            )
-            .unwrap();
+            );
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = lower_exchanges(

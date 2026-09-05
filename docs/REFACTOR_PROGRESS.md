@@ -168,3 +168,26 @@ remain consolidated). 146 workspace release tests and Clippy pass in
 `/tmp/mid-modular-*`. Five `/tmp/mid-optimized-*` hardware runs pass and remain
 byte-identical to `/tmp/mid-blocks-*`; the subsequent method/file extraction
 changes no emitted work and passes the same unit checks.
+
+Final API cleanup: low projection is infallible for a constructed MidProgram and
+imports only executable-block types. Repeat arena identities belong to low;
+boxed mid repeat payloads keep ordinary block-operation entries compact.
+Packaging and diagnostics use low's shared program instead of passing another
+copy of the mid handle through every API. ARCHITECTURE.md now describes the
+current boundary and distinguishes transient recipes, executable blocks, and
+per-tile projection.
+
+Final checks: 146 workspace release tests and strict Clippy pass in
+`/tmp/mid-complete-*`. Five `/tmp/mid-final-*` hardware workloads pass and have
+byte-identical images to the pre-migration `/tmp/copy-order-*` packages. A
+structured two-block MLP repeat passes (`/tmp/mid-extra-repeat.*`, maximum error
+0.000046). Both attention strategies pass when forced on projected attention:
+`/tmp/mid-strategy-flash.*` max error 0.001230 and
+`/tmp/mid-strategy-materialized.*` max error 0.000930. Forced attention smoke
+also passes for both. After the final packaging cleanup, the rebuilt GEMM smoke
+passes with 262144 exact checks and an identical tile image
+(`/tmp/mid-complete-gemm.*`). No runtime/device/kernel-module changes were needed.
+
+The requested block-IR migration is complete: low has no GEMM/attention/conversion
+expansion path. Further work can price expanded blocks directly or compose more
+general layout-conversion chains; neither is claimed by the contiguous-copy pass.

@@ -1,11 +1,8 @@
-//! Mid-level, layout-aware representation.
+//! Candidate selection and executable, layout-aware block IR.
 //!
-//! This is the boundary between semantic graph operations and scheduling. It
-//! records tensor shapes, storage precision, element order, axis tiling, and
-//! memory-class requirements, but deliberately does not assign tile addresses
-//! or emit exchange rows. [`lower`] tries a set of legal operator plans,
-//! prices them with a [`CostModel`], and inserts explicit precision casts and
-//! layout rearrangements at format boundaries.
+//! The analytical beam screens coupled implementation choices. Candidate builders
+//! produce a [`MidProgram`] with explicit blocks and movement before per-tile
+//! projection. Neither low lowering nor placement expands whole operators.
 
 mod block;
 mod implementation;
@@ -340,6 +337,8 @@ pub struct MidInput {
     pub value: MidValueId,
 }
 
+/// Transient beam recipe consumed by the executable-block builder.
+/// This is never passed to low or retained in a selected MidProgram.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImplementationCandidate {
     pub tile_count: u16,

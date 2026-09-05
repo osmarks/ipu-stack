@@ -3,7 +3,10 @@ fn lower_to_tiles(
     graph: &crate::ImplementationCandidate,
     checkpoints: bool,
 ) -> super::BlockBuildResult<crate::LowProgram> {
-    crate::low::lower_to_tiles(&super::build_blocks(graph)?, checkpoints)
+    Ok(crate::low::lower_to_tiles(
+        &super::build_blocks(graph)?,
+        checkpoints,
+    ))
 }
 use super::*;
 use crate::{

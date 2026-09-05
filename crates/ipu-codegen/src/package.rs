@@ -527,16 +527,15 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
-    let (built, mid, low) = build_package_artifacts(graph, config, false)?;
+    let (built, low) = build_package_artifacts(graph, config, false)?;
     let topology = active_topology(low.tile_count)?;
-    let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
+    let inputs = package_inputs(&low, &built.placement, &topology)?;
     let outputs = low
         .outputs
         .iter()
         .enumerate()
         .map(|(index, output)| {
             diagnostic_tensor(
-                &mid,
                 &low,
                 &built.placement,
                 &topology,
@@ -545,7 +544,7 @@ pub fn build_package(
             )
         })
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let precisions = package_precisions(&mid);
+    let precisions = package_precisions(&low);
     Ok(CompiledPackage {
         application: built.application,
         inputs,
@@ -564,15 +563,15 @@ pub fn build_diagnostic_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<DiagnosticPackage> {
-    let (built, mid, low) = build_package_artifacts(graph, config, true)?;
+    let (built, low) = build_package_artifacts(graph, config, true)?;
     let topology = active_topology(low.tile_count)?;
-    let inputs = package_inputs(&mid, &low, &built.placement, &topology)?;
+    let inputs = package_inputs(&low, &built.placement, &topology)?;
     let mut checkpoints = Vec::new();
-    for (source, results) in &mid.checkpoints {
+    for (source, results) in &low.checkpoints {
         let source = *source;
         let tensors = results
             .iter()
-            .map(|&value| diagnostic_tensor(&mid, &low, &built.placement, &topology, value, None))
+            .map(|&value| diagnostic_tensor(&low, &built.placement, &topology, value, None))
             .collect::<PackageBuildResult<Vec<_>>>()?;
         // A fully deferred view operation has no device work or independently
         // materialized boundary to stop at; its consumer's checkpoint covers
@@ -603,7 +602,7 @@ pub fn build_diagnostic_package(
         application: built.application,
         inputs,
         checkpoints,
-        precisions: package_precisions(&mid),
+        precisions: package_precisions(&low),
         exchange_phases: built.exchange_phases,
         exchange_schedule: built.exchange_schedule,
         exchange_code_base: built.exchange_code_base,
@@ -618,7 +617,6 @@ fn package_precisions(mid: &MidProgram) -> BTreeMap<ValueId, Precision> {
 }
 
 fn package_inputs(
-    mid: &MidProgram,
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
@@ -627,7 +625,6 @@ fn package_inputs(
         .iter()
         .map(|input| {
             diagnostic_tensor(
-                mid,
                 low,
                 placement,
                 topology,
@@ -642,7 +639,7 @@ fn build_package_artifacts(
     graph: &ComputeGraph,
     config: &PackageConfig,
     diagnostic_checkpoints: bool,
-) -> PackageBuildResult<(BuiltApplication, std::sync::Arc<MidProgram>, LowProgram)> {
+) -> PackageBuildResult<(BuiltApplication, LowProgram)> {
     validate_tile_count(u32::from(config.pipeline.tile_count))?;
     let mut planning = config.pipeline.clone();
     planning.diagnostic_checkpoints = diagnostic_checkpoints;
@@ -657,7 +654,7 @@ fn build_package_artifacts(
             planning.exchange_schedule_finalists,
         )?)
     })?;
-    let (mid, low, mut exchange_cache) = build_phase("select_finalist", || {
+    let (low, mut exchange_cache) = build_phase("select_finalist", || {
         select_scheduled_finalist(finalists, &planning)
     })?;
     tracing::info!(
@@ -692,17 +689,13 @@ fn build_package_artifacts(
         &kernel_plan,
         &mut exchange_cache,
     )?;
-    Ok((built, mid, low))
+    Ok((built, low))
 }
 
 fn select_scheduled_finalist(
     finalists: Vec<std::sync::Arc<MidProgram>>,
     planning: &PipelineConfig,
-) -> PackageBuildResult<(
-    std::sync::Arc<MidProgram>,
-    LowProgram,
-    crate::exchange::ExchangeScheduleCache,
-)> {
+) -> PackageBuildResult<(LowProgram, crate::exchange::ExchangeScheduleCache)> {
     if finalists.len() == 1 {
         let mid = finalists.into_iter().next().unwrap();
         tracing::info!(
@@ -710,14 +703,14 @@ fn select_scheduled_finalist(
             estimated_exchange_cycles = mid.estimated_exchange_cycles,
             "selected analytical operator plan"
         );
-        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints)?;
-        return Ok((mid, low, crate::exchange::ExchangeScheduleCache::default()));
+        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
+        return Ok((low, crate::exchange::ExchangeScheduleCache::default()));
     }
 
     let topology = active_topology(planning.tile_count)?;
     let mut ranked = Vec::with_capacity(finalists.len());
     for (index, mid) in finalists.into_iter().enumerate() {
-        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints)?;
+        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
         let placement = place(&low)?;
         let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
         let exchanges = crate::exchange::lower_exchanges_cached(
@@ -749,15 +742,15 @@ fn select_scheduled_finalist(
             refined_cycles,
             "scheduled operator-plan finalist"
         );
-        ranked.push((refined_cycles, index, mid, low, exchange_cache));
+        ranked.push((refined_cycles, index, low, exchange_cache));
     }
-    ranked.sort_by_key(|(cycles, index, _, _, _)| (*cycles, *index));
-    let (_, selected, mid, low, exchange_cache) = ranked.remove(0);
+    ranked.sort_by_key(|(cycles, index, _, _)| (*cycles, *index));
+    let (_, selected, low, exchange_cache) = ranked.remove(0);
     tracing::info!(
         selected,
         "selected physically scheduled operator-plan finalist"
     );
-    Ok((mid, low, exchange_cache))
+    Ok((low, exchange_cache))
 }
 
 fn build_package_from_objects(
@@ -1297,14 +1290,13 @@ fn build_package_from_objects(
 }
 
 fn diagnostic_tensor(
-    mid: &MidProgram,
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
     value: crate::MidValueId,
     name: Option<String>,
 ) -> PackageBuildResult<DiagnosticTensor> {
-    let mid_value = mid
+    let mid_value = low
         .logical_values
         .get(value.index() as usize)
         .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
