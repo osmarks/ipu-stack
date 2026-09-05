@@ -109,3 +109,44 @@ Validation: all nine `ipu-profile` release tests pass, including a new regressio
 for arrival skew, repeated epochs, cycle-counter wrap and missing schedule
 metadata. Strict Clippy passes for `ipu-profile` and `ipu-cli`; the command was
 run against all three profiles and its JSON parsed directly.
+
+## Controlled historical-grid experiment
+
+The reconstructed GEMM grids are supported by the current planner. Force them
+with these arguments to `ipu-trivial-test --workload siglip-mlp-benchmark
+--mlp-batch 1`:
+
+```text
+--gemm-plan-constraint 0:4x92x4:4x1:48:interleaved:normal:complete:direct
+--gemm-plan-constraint 2:4x24x15:15x1:48:interleaved:normal:complete:direct
+```
+
+The first triplet is compute rows/columns/partials. The second pair subdivides
+each compute result, so these select 16x92 and 60x24 result distributions.
+Current input placement, padding and exchange scheduling still apply; this is
+not a byte-identical reproduction of the old compiler/package.
+
+| Canonical MLP measurement | Automatic grids | Reconstructed historical grids |
+|---|---:|---:|
+| Compact beam cycles | 413,118 | 310,377 |
+| Compact beam exchange cycles | 139,960 | 123,960 |
+| Expanded analytical cycles | 568,612 | 250,045 |
+| Measured maximum tile cycles | 327,144 | 232,722 |
+| Maximum numerical error | 0.011719 | 0.011719 |
+
+The historical-grid run passes all hardware numerical checks, uses 1,440 active
+compute tiles, and is about 29% faster than the automatic selection. It remains
+slower than the saved historical profile. The profiled executable and build log
+are `/tmp/historical-layouts-new-model.{ipuprofile,ipuexe,log}`;
+the renderer output is `artifacts/profiles/mlp-historical-layouts-new-model.html`.
+
+Temporary instrumentation of candidate generation located the loss before mid
+costing: BOTH historical grids survive the initial grid proxy frontier. The
+first produces 24 variants and the second 12, but neither survives
+`retain_operator_candidates`. For the default cost model that shortlist ranks
+by boundary memory bytes (`operator_cycle_override` is absent), not by compact
+mid execution cost. Some later calls enumerate different tile budgets and lack
+the first grid, but that is not where its original variants were lost. The
+instrumentation was removed after the experiment. This identifies a candidate
+screening problem; increasing the final exchange price cannot recover an
+already discarded candidate.
