@@ -236,6 +236,8 @@ pub fn plan_event_cycles(row: &[u32]) -> Result<u32, ExchangeError> {
 #[derive(Clone, Debug, Default)]
 struct TileProgramSchedule {
     senders: Vec<ScheduledSenderRow>,
+    /// Borrowed transmit lane; no instruction or SRAM access on this tile.
+    reserved_sender_end: u32,
     receive_events: Vec<ReceiveEvent>,
     event_cycles: u32,
     receive_stream: Option<ReceiveStream>,
@@ -386,7 +388,13 @@ impl PhaseProgramBuilder {
                     .tile_states
                     .get(usize::from(tile))
                     .ok_or(ExchangeError::Tile(tile))?;
-                offset = offset.max(schedule.event_cycles);
+                offset = offset.max(
+                    schedule
+                        .senders
+                        .iter()
+                        .map(|row| row.end_cycles)
+                        .fold(schedule.reserved_sender_end, u32::max),
+                );
             }
             for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
                 let schedule = self
@@ -477,6 +485,9 @@ impl PhaseProgramBuilder {
                 .get(usize::from(tile))
                 .ok_or(ExchangeError::Tile(tile))?
                 .clone();
+            schedule.reserved_sender_end = schedule
+                .reserved_sender_end
+                .max(transfer_timing.sender_horizon);
             schedule.event_cycles = schedule.event_cycles.max(transfer_timing.sender_horizon);
             updates.push((tile, schedule));
         }
@@ -607,7 +618,7 @@ impl TileProgramSchedule {
     /// single supervisor instruction, not dual issue from independent lanes.
     fn earliest_sender_offset(&self, row: &PlanRow, requested: u32) -> Result<u32, ExchangeError> {
         let base = sender_row_timing(row, 0)?;
-        let mut offset = requested;
+        let mut offset = requested.max(self.reserved_sender_end.saturating_sub(base.start_cycles));
         loop {
             let start = base
                 .start_cycles

@@ -65,7 +65,7 @@ pub struct ExchangeActivity {
 pub enum ExchangeActivityKind {
     Send,
     Receive,
-    /// This tile's paired-width exchange resources are borrowed by its partner.
+    /// This tile's transmit lane is borrowed by its partner; receiving remains available.
     PartnerBusy,
 }
 
@@ -1832,11 +1832,12 @@ pub fn validate_exchange_schedule(
         {
             if phase.activities[tile].iter().any(|activity| {
                 activity.transfer != partner_busy.transfer
+                    && activity.kind != ExchangeActivityKind::Receive
                     && activity.start_cycle < partner_busy.end_cycle
                     && partner_busy.start_cycle < activity.end_cycle
             }) {
                 return Err(fail(format!(
-                    "phase {} tile {tile} overlaps partner-busy and local bus intervals",
+                    "phase {} tile {tile} overlaps borrowed and local transmit intervals",
                     problem.phase
                 )));
             }
@@ -2012,7 +2013,7 @@ impl<'a> TransferScheduler<'a> {
                 ))
                 .chain(transfer.reserved_source.into_iter().map(|tile| {
                     let availability = tile_availability[usize::from(tile)];
-                    availability.send.max(availability.receive)
+                    availability.send
                 }))
                 .chain(
                     transfer
@@ -2219,7 +2220,7 @@ impl MaterializedSchedule {
         ))
         .chain(transfer.reserved_source.into_iter().map(|tile| {
             let availability = self.tile_availability[usize::from(tile)];
-            (tile, availability.send.max(availability.receive))
+            (tile, availability.send)
         }))
         .chain(
             transfer
@@ -2234,17 +2235,10 @@ impl MaterializedSchedule {
         } else {
             (blocking_tile, latest_availability)
         };
-        let predecessor = if blocking_tile == transfer.source {
+        let predecessor = if blocking_tile == transfer.source
+            || transfer.reserved_source == Some(blocking_tile)
+        {
             last_transfer[usize::from(blocking_tile)].send
-        } else if transfer.reserved_source == Some(blocking_tile) {
-            let predecessor = last_transfer[usize::from(blocking_tile)];
-            if self.tile_availability[usize::from(blocking_tile)].send
-                >= self.tile_availability[usize::from(blocking_tile)].receive
-            {
-                predecessor.send
-            } else {
-                predecessor.receive
-            }
         } else {
             last_transfer[usize::from(blocking_tile)].receive
         };
@@ -2329,9 +2323,7 @@ impl MaterializedSchedule {
         self.tile_availability[usize::from(transfer.source)].send = timing.sender_end;
         if let Some(tile) = transfer.reserved_source {
             self.tile_availability[usize::from(tile)].send = timing.sender_memory_end;
-            self.tile_availability[usize::from(tile)].receive = timing.sender_memory_end;
             last_transfer[usize::from(tile)].send = Some(index);
-            last_transfer[usize::from(tile)].receive = Some(index);
         }
         for (&(tile, _), &receiver_end) in transfer.destinations.iter().zip(&timing.receiver_ends) {
             self.tile_availability[usize::from(tile)].receive = receiver_end;
@@ -2492,7 +2484,6 @@ fn endpoint_work_lower_bound(pending: &[PendingTransfer], tile_count: u16) -> u3
         send_words[usize::from(transfer.source)] += items;
         if let Some(tile) = transfer.reserved_source {
             send_words[usize::from(tile)] += items;
-            receive_words[usize::from(tile)] += items;
         }
         for &(tile, _) in &transfer.destinations {
             receive_words[usize::from(tile)] += items;
@@ -2748,11 +2739,12 @@ fn repair_ready(
 ) -> RepairReady {
     let transfer = &pending[index];
     let earliest_start = std::iter::once(availability[usize::from(transfer.source)].send)
-        .chain(transfer.reserved_source.into_iter().map(|tile| {
-            availability[usize::from(tile)]
-                .send
-                .max(availability[usize::from(tile)].receive)
-        }))
+        .chain(
+            transfer
+                .reserved_source
+                .into_iter()
+                .map(|tile| availability[usize::from(tile)].send),
+        )
         .chain(
             transfer
                 .destinations
@@ -2893,7 +2885,6 @@ fn critical_neighborhood_order(
         availability[usize::from(transfer.source)].send = end;
         if let Some(tile) = transfer.reserved_source {
             availability[usize::from(tile)].send = end;
-            availability[usize::from(tile)].receive = end;
         }
         let bytes = match transfer.words.checked_mul(4) {
             Some(bytes) => bytes,
@@ -3321,6 +3312,60 @@ mod tests {
                 first.neighborhood_improvements,
                 second.neighborhood_improvements
             );
+        }
+    }
+
+    #[test]
+    fn borrowed_transmit_lane_allows_receive_but_excludes_local_send() {
+        let topology = Topology::new(
+            (0..64)
+                .map(ipu_exchange::c600_logical_to_physical)
+                .collect(),
+        )
+        .unwrap();
+        for source in [0, 1] {
+            let partner = source ^ 1;
+            let transfer = |source, destinations: &[u16], words, width| ExchangeScheduleTransfer {
+                source,
+                source_addresses: vec![0x8_0000],
+                destinations: destinations
+                    .iter()
+                    .map(|&tile| ExchangeScheduleDestination {
+                        tile,
+                        address: 0x8_8000,
+                    })
+                    .collect(),
+                words,
+                width,
+            };
+            let problem = ExchangeScheduleProblem {
+                phase: 0,
+                transfers: vec![
+                    transfer(source, &[2, 3], 4096, ExchangeItemWidth::Paired64),
+                    transfer(4, &[partner], 2048, ExchangeItemWidth::Word32),
+                    transfer(partner, &[5], 256, ExchangeItemWidth::Word32),
+                ],
+            };
+            let pending = pending_from_problem(64, &problem).unwrap();
+            let (counts, bases) = receive_configuration(&pending, 64).unwrap();
+            for order in [[0, 1, 2], [1, 0, 2]] {
+                let schedule =
+                    materialize_schedule_order(&topology, &pending, &bases, &counts, 64, &order)
+                        .unwrap();
+                let activities = &schedule.activities[usize::from(partner)];
+                let activity = |kind| activities.iter().find(|a| a.kind == kind).unwrap();
+                let borrowed = activity(ExchangeActivityKind::PartnerBusy);
+                let receive = activity(ExchangeActivityKind::Receive);
+                let send = activity(ExchangeActivityKind::Send);
+                assert!(
+                    receive.start_cycle < borrowed.end_cycle
+                        && borrowed.start_cycle < receive.end_cycle
+                );
+                assert!(send.start_cycle >= borrowed.end_cycle);
+                assert!(endpoint_work_lower_bound(&pending, 64) <= schedule.horizon);
+            }
+            let run = schedule_exchange_problem(64, &problem).unwrap();
+            validate_exchange_schedule(64, &problem, &run.phase).unwrap();
         }
     }
 
