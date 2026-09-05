@@ -40,7 +40,9 @@ offset. They do not contain a list of tiles, local calls or physical byte spans.
 
 Parallel GEMM uses a leading partials dimension followed by a sum. Output-stationary
 GEMM exposes its staged K panels and accumulating output versions. Attention
-exposes Q/K/V materialization, products, softmax and merge. Key blocks are currently
+exposes Q/K/V materialization, products, softmax and merge. Key/value panels
+are packed on a small distributed owner grid and then broadcast through ordinary
+mid copies; consumers do not each repeat the source transform. Key blocks are currently
 statically represented as whole-device operations; tile counts do not multiply
 this representation. Kernel blocking describes the local calls to enumerate later.
 

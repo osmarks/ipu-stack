@@ -1214,6 +1214,23 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
                 ..
             })
         )));
+        for op in &compact.operations {
+            if matches!(
+                op.kind,
+                MidOperationKind::Primitive(Primitive::Compute {
+                    kernel: TileKernelSpec::Gemm { .. } | TileKernelSpec::AttentionSoftmax { .. },
+                    ..
+                })
+            ) {
+                assert_eq!(
+                    compact.values[op.results[0].index() as usize]
+                        .tensor_type
+                        .format
+                        .precision,
+                    Precision::F16
+                );
+            }
+        }
         let program = expand_tiles(&lowered).unwrap();
         let cycles = crate::estimate::program_cycles(&program, None).unwrap();
         assert_eq!(program.estimated_cycles, cycles.total);
@@ -1248,8 +1265,18 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
             "random case {case}: deferred movement must be priced"
         );
         assert!(
-            // Keys and values are separate whole-device materializations.
-            attention_phases <= 2 * tokens.div_ceil(AMP_INNER_BLOCK) as usize + 2,
+            attention_phases
+                <= compact
+                    .operations
+                    .iter()
+                    .filter(|op| op.source == consumer.source
+                        && matches!(
+                            op.kind,
+                            MidOperationKind::Primitive(
+                                Primitive::Copy { .. } | Primitive::MappedCopy { .. }
+                            )
+                        ))
+                    .count(),
             "random case {case}: {attention_phases} attention exchange phases"
         );
     }

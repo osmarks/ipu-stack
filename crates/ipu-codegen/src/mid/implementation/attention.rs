@@ -27,6 +27,7 @@ impl Builder {
         query_type.shape.0[2] = query_width;
         let query_buffer = self.copy(MidValueId(0), query_type, vec![]);
         let mut scores_type = output.clone();
+        scores_type.format.precision = Precision::F16;
         scores_type.shape.0[2] = key_block;
         scores_type.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         scores_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
@@ -77,7 +78,7 @@ impl Builder {
                 row_block: AMP_INNER_BLOCK as u16,
                 column_block: AMP_COLUMN_MICRO as u16,
             });
-            let k = self.copy(MidValueId(1), packed_key, vec![0, start, 0]);
+            let k = self.attention_operand(MidValueId(1), packed_key, start)?;
             let scores = self.compute(
                 vec![query_buffer, k],
                 scores_type.clone(),
@@ -99,7 +100,7 @@ impl Builder {
                 vec![],
             ));
             let weights_id = weights?;
-            let v = self.copy(MidValueId(2), packed_value, vec![0, start, 0]);
+            let v = self.attention_operand(MidValueId(2), packed_value, start)?;
             let product = self.compute(
                 vec![weights_id, v],
                 product_type.clone(),
@@ -127,5 +128,39 @@ impl Builder {
             ));
         }
         result
+    }
+    /// Pack once on a small distributed owner grid, then broadcast native
+    /// panels. Both materializations are ordinary mid values and copies.
+    fn attention_operand(
+        &mut self,
+        input: MidValueId,
+        resident: TensorType,
+        start: u32,
+    ) -> Option<MidValueId> {
+        let heads = u16::try_from(resident.shape.0[0]).ok()?;
+        let columns = u16::try_from(resident.shape.0[2].div_ceil(AMP_COLUMN_MICRO))
+            .ok()?
+            .min(resident.format.layout.tiling.tile_count / heads)
+            .max(1);
+        let mut packed = resident.clone();
+        packed.format.layout.tiling.tile_count = heads.checked_mul(columns)?;
+        packed.format.layout.tiling.replicas = 1;
+        for axis in &mut packed.format.layout.tiling.axes {
+            match axis.axis.resolve(3).ok()? {
+                0 => {
+                    axis.partitions = heads;
+                    axis.tile_stride = Some(1);
+                }
+                2 => {
+                    axis.partitions = columns;
+                    axis.tile_stride = Some(heads);
+                }
+                _ => {
+                    axis.tile_stride = None;
+                }
+            }
+        }
+        let packed = self.copy(input, packed, vec![0, start, 0]);
+        Some(self.copy(packed, resident, vec![]))
     }
 }

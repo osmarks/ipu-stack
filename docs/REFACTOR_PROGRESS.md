@@ -402,3 +402,20 @@ Physical-copy padding correction (2026-09-05):
   this focused regression; the added regression and strict Clippy also pass
   (152 tests combined). Full profiled MLP and attention hardware validation
   are still pending at this checkpoint.
+
+Explicit attention panel distribution (2026-09-05):
+
+- Restored the old algorithm's distributed packing followed by broadcast as
+  ordinary mid copies. Directly transforming at every consumer had produced
+  excessive exchange tables and failed package construction. Low still has no
+  attention strategy code. Intermediate kernel precision is explicit.
+- Physical copies retain shared source/destination padding. This is necessary
+  for word-aligned broadcast of the final 25-row key block in the 729-token
+  attention benchmark. Uncovered padding is still initialized separately.
+- All 152 workspace release tests and strict Clippy pass. Automatic attention,
+  forced Flash, attention smoke, repeated MLP, and scheduled-repeat MLP pass on
+  hardware. Automatic attention build/validation took 38.73 seconds; forced
+  Flash took 39.27 seconds. Forced materialized validation remains pending.
+- The earlier profiled MLP passed at 332,640 cycles, maximum error 0.011719,
+  8.15 seconds mid planning and 233.32 seconds build/validation, about 1.28 GiB
+  peak RSS. A final run will include the shared-padding change above.

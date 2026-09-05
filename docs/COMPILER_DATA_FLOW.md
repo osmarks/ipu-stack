@@ -73,7 +73,8 @@ flowchart LR
 ```
 
 Output-stationary GEMM instead exposes staged K panels and accumulating output
-versions. Attention exposes Q/K/V copies, products, softmax and merge. Selected
+versions. Attention exposes Q/K/V copies, products, softmax and merge. Key/value packing
+on a small owner grid and broadcast to the compute grid are separate mid copies. Selected
 view slices are mapped copies whose output is an ordinary mid value. Tile
 expansion shares physical copy realization across all these uses, including
 padding, direct resident views and destination packing.

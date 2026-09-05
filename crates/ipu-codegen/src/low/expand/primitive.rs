@@ -161,7 +161,20 @@ impl TileGraphBuilder {
                     .checked_add(offset)
                     .ok_or(ExpansionError::IdOverflow)?;
             }
-            let intersections = self.intersecting_shard_set(&inputs, &source_region, tile);
+            let intersections = self
+                .intersecting_shard_set(&inputs, &source_region, tile)
+                .into_iter()
+                .map(|(_, source)| {
+                    (
+                        intersect_extents_with_shared_padding(
+                            &self.shards[source.index() as usize].extents,
+                            &source_region,
+                        )
+                        .expect("selected intersection remains nonempty"),
+                        source,
+                    )
+                })
+                .collect::<Vec<_>>();
             if reuse_local
                 && offsets.iter().all(|&offset| offset == 0)
                 && let [(extents, source)] = intersections.as_slice()
