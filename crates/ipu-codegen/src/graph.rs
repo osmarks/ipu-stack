@@ -58,10 +58,6 @@ impl TensorShape {
 pub struct OperationId(u32);
 
 impl OperationId {
-    pub(crate) const fn from_index(index: u32) -> Self {
-        Self(index)
-    }
-
     pub const fn index(self) -> u32 {
         self.0
     }

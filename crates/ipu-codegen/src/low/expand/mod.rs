@@ -1,44 +1,32 @@
-//! Build executable mid blocks from an implementation candidate.
+//! Expand selected whole-device primitives into tile-local calls and movement.
 
 mod emit;
+mod primitive;
 
-mod attention_blocked;
-mod attention_materialized;
-mod attention_panels;
-mod deferred;
 mod views;
 
-mod attention;
 mod buffers;
 mod conversion;
 mod copies;
 mod gemm;
-mod gemm_parallel;
-mod gemm_streamed;
 mod mapping;
 mod pointwise;
 mod reduce;
 mod repeat;
-mod reuse;
 use crate::graph::OperationId;
 use crate::low::*;
 use crate::storage::{ByteSpan, StorageError};
 use crate::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
-    ConversionStrategy, CopyOrder, CopyPattern, ElementOrder, GemmDistribution, KernelRequirements,
-    Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind, MidProgram, MidRepeat,
-    MidValueId, OperatorDispatch, OutputAliasing, PointwiseInputMapping, Precision, ShardExtent,
-    StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
+    AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, ConversionStrategy, CopyOrder, ElementOrder,
+    KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
+    MidProgram, MidRepeat, MidValueId, OutputAliasing, Precision, ShardExtent, TensorTiling,
+    TensorType, TileKernelSpec,
 };
-use attention::*;
-use conversion::MaterializationBatch;
 use copies::*;
 pub use copies::{logical_view_byte_spans, shard_storage_bytes, view_byte_spans};
-use deferred::*;
 use gemm::*;
 use mapping::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,6 +59,9 @@ pub enum ExpansionError {
 pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
 pub(crate) fn expand_tiles(graph: &MidProgram) -> ExpansionResult<Arc<TileGraph>> {
+    let resolved =
+        crate::mid::implementation::resolve(graph).ok_or(ExpansionError::InvalidOperatorPlan)?;
+    let graph = &resolved;
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
@@ -128,17 +119,17 @@ pub(crate) fn expand_tiles(graph: &MidProgram) -> ExpansionResult<Arc<TileGraph>
         checkpoints: graph
             .operations
             .iter()
-            .filter_map(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Operator { .. } | MidOperationKind::Repeat(_)
-                )
-                .then(|| {
-                    operation
-                        .source
-                        .map(|source| (source, operation.results.clone()))
-                })
-                .flatten()
+            .enumerate()
+            .filter(|(index, operation)| {
+                graph
+                    .operations
+                    .get(index + 1)
+                    .is_none_or(|next| next.source != operation.source)
+            })
+            .filter_map(|(_, operation)| {
+                operation
+                    .source
+                    .map(|source| (source, operation.results.clone()))
             })
             .collect(),
         estimated_cycles: graph.estimated_cycles,
@@ -161,9 +152,7 @@ struct TileGraphBuilder {
     kernel_runs: Vec<KernelRun>,
     local_copies: Vec<LocalCopy>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
-    deferred_conversions: BTreeMap<MidValueId, MidValueId>,
-    deferred_values: BTreeMap<MidValueId, DeferredValue>,
-    intersection_cache: BTreeMap<(MidValueId, Vec<ShardExtent>), ShardIntersections>,
+    materialized_views: BTreeMap<BlockValueId, ShardView>,
 }
 
 impl TileGraphBuilder {
@@ -177,9 +166,7 @@ impl TileGraphBuilder {
             kernel_runs: Vec::new(),
             local_copies: Vec::new(),
             kernel_metadata: Vec::new(),
-            deferred_conversions: BTreeMap::new(),
-            deferred_values: BTreeMap::new(),
-            intersection_cache: BTreeMap::new(),
+            materialized_views: BTreeMap::new(),
         };
         let mut used = graph
             .inputs
@@ -230,20 +217,6 @@ impl TileGraphBuilder {
             state.canonical[value.id.index() as usize] = value_shards;
         }
         Ok(state)
-    }
-
-    fn intersecting_shards(
-        &mut self,
-        source: MidValueId,
-        target: &[ShardExtent],
-        local_tile: u16,
-    ) -> ExpansionResult<Vec<(Vec<ShardExtent>, BlockValueId)>> {
-        let key = (source, target.to_vec());
-        if !self.intersection_cache.contains_key(&key) {
-            let groups = self.shard_intersection_groups(self.value_shards(source)?, target);
-            self.intersection_cache.insert(key.clone(), groups);
-        }
-        Ok(self.select_intersections(&self.intersection_cache[&key], local_tile))
     }
 
     fn shard_intersection_groups(
@@ -298,22 +271,14 @@ impl TileGraphBuilder {
         let mut checkpoint = 0u8;
         for (index, operation) in operations.iter().enumerate() {
             let started = Instant::now();
-            if self.build_deferred_output(operation, &mut tiles)? {
-                tracing::debug!(
-                    operation = index,
-                    source = ?operation.source.map(OperationId::index),
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "deferred fused-operator materialization"
-                );
-                continue;
-            }
             let lowered = match &operation.kind {
+                MidOperationKind::Primitive(primitive) => {
+                    self.build_primitive(operation, primitive, &mut tiles)
+                }
                 MidOperationKind::Repeat(repeat) => {
                     self.build_repeat(operation, repeat, &mut tiles)
                 }
-                MidOperationKind::Operator { plan, .. } => {
-                    self.build_operator(operation, plan, &mut tiles)
-                }
+                MidOperationKind::Operator { .. } => Err(ExpansionError::InvalidOperatorPlan),
                 MidOperationKind::Convert(plan) => {
                     self.build_conversion(operation, plan, &mut tiles)
                 }
@@ -332,10 +297,9 @@ impl TileGraphBuilder {
                 return Err(error);
             }
             if checkpoints
-                && matches!(
-                    operation.kind,
-                    MidOperationKind::Operator { .. } | MidOperationKind::Repeat(_)
-                )
+                && operations
+                    .get(index + 1)
+                    .is_none_or(|next| next.source != operation.source)
                 && let Some(source) = operation.source
             {
                 tiles
@@ -353,95 +317,6 @@ impl TileGraphBuilder {
             );
         }
         Ok(tiles)
-    }
-
-    fn build_operator(
-        &mut self,
-        operation: &MidOperation,
-        plan: &crate::OperatorPlan,
-        tiles: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        if plan.requirements.inputs.len() != operation.inputs.len() {
-            return Err(ExpansionError::InvalidOperatorPlan);
-        }
-        if self.reuse_implementation(operation, tiles)? {
-            return Ok(());
-        }
-        match &plan.dispatch {
-            OperatorDispatch::Pointwise {
-                kernel,
-                input_mapping,
-            } => self.build_pointwise(operation, kernel.clone(), *input_mapping, tiles),
-            OperatorDispatch::BlockedGemm {
-                inner_block,
-                output_column_block,
-                distribution,
-                orientation,
-            } => {
-                let crate::MidOperator::Gemm {
-                    multiply,
-                    accumulate,
-                    ..
-                } = plan.operator
-                else {
-                    return Err(ExpansionError::InvalidOperatorPlan);
-                };
-                let kernel = |mode| TileKernelSpec::Gemm {
-                    multiply,
-                    accumulate,
-                    mode,
-                    weights: crate::GemmWeightLoad::Standard,
-                    inner_block: *inner_block,
-                    output_columns: *output_column_block,
-                };
-                self.build_blocked_gemm(
-                    operation,
-                    kernel(crate::GemmKernelMode::Initialize),
-                    kernel(crate::GemmKernelMode::Accumulate),
-                    *inner_block,
-                    *output_column_block,
-                    *orientation,
-                    *distribution,
-                    &plan.requirements,
-                    tiles,
-                )
-            }
-            OperatorDispatch::BlockedAttention {
-                query_key,
-                probability_value,
-                query_block_rows,
-                key_block_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-            } => self.build_blocked_attention(
-                operation,
-                query_key.clone(),
-                probability_value.clone(),
-                *query_block_rows,
-                *key_block_rows,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                tiles,
-            ),
-            OperatorDispatch::MaterializedAttention {
-                query_key,
-                probability_value,
-                query_block_rows,
-                padded_key_rows,
-                padded_query_dimension,
-                padded_value_dimension,
-            } => self.build_materialized_attention(
-                operation,
-                query_key.clone(),
-                probability_value.clone(),
-                *query_block_rows,
-                *padded_key_rows,
-                *padded_query_dimension,
-                *padded_value_dimension,
-                tiles,
-            ),
-            OperatorDispatch::View => self.build_view(operation, &plan.operator, tiles),
-        }
     }
 
     fn append_fill_zero(
@@ -463,58 +338,6 @@ impl TileGraphBuilder {
             )?,
         )
     }
-
-    fn dispatch_input_view(
-        &mut self,
-        value: MidValueId,
-        tile: u16,
-        ranges: &[(usize, u32, u32)],
-        provenance: WorkProvenance,
-        batch: &mut MaterializationBatch,
-        tiles: &mut BlockRegion,
-    ) -> ExpansionResult<ShardView> {
-        let target = self.local_shard(value, tile)?;
-        let target_view = self.narrow_view(target, ranges)?;
-        let Some(source_value) = self.deferred_conversions.get(&value).copied() else {
-            return Ok(target_view);
-        };
-
-        let staging = self.push_shard(BlockValue {
-            id: BlockValueId(0),
-            tile,
-            tensor_type: self.shards[target.index() as usize].tensor_type.clone(),
-            extents: target_view.extents.clone(),
-            definition: ShardDefinition::ExchangeStaging,
-        })?;
-        let intersections = self.intersecting_shards(source_value, &target_view.extents, tile)?;
-        if intersections.is_empty() {
-            return Err(ExpansionError::InvalidConversionPlan);
-        }
-        let mappings = intersections
-            .into_iter()
-            .map(|(extents, source)| {
-                (
-                    ShardView {
-                        shard: source,
-                        extents: extents.clone(),
-                    },
-                    ShardView {
-                        shard: staging,
-                        extents,
-                    },
-                )
-            })
-            .collect();
-        self.prepare_mapped_views(
-            mappings,
-            CopyOrder::Semantic,
-            CopyOrder::Semantic,
-            provenance,
-            batch,
-            tiles,
-        )?;
-        Ok(self.full_view(staging))
-    }
 }
 
 fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
@@ -528,7 +351,14 @@ fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
                 WorkReason::PrecisionCast
             }
             MidOperationKind::Convert(_) => WorkReason::LayoutRearrangement,
-            MidOperationKind::Operator { .. } => WorkReason::OperatorKernel,
+            MidOperationKind::Primitive(
+                crate::Primitive::Copy { .. }
+                | crate::Primitive::View(_)
+                | crate::Primitive::MappedCopy { .. },
+            ) => WorkReason::OperatorInputs,
+            MidOperationKind::Operator { .. } | MidOperationKind::Primitive(_) => {
+                WorkReason::OperatorKernel
+            }
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },
     }

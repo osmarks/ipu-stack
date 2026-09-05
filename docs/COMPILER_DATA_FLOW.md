@@ -1,131 +1,84 @@
 # Compiler data flow
 
-Updated 2026-09-05 after the primitive-contract, materialization and costing
-refactors. These are curated data-flow diagrams. The older generated
-`ipu-stack-package-callgraph*` artifacts reference removed modules and types.
+Updated 2026-09-05 for the whole-device mid boundary. These curated diagrams
+supersede the older generated `ipu-stack-package-callgraph*` artifacts.
 
-## Planning and execution
+## Selection and execution
 
 ```mermaid
 flowchart TD
-  G[ComputeGraph: semantic values and regions] --> C[Catalogue and shape-dependent candidate enumeration]
-  C --> H[Cheap geometry and boundary-storage screening]
-  H --> SHORT[Bounded branch shortlist from boundary costs]
-  SHORT --> B[Mid implementation builder]
-  B --> M[Executable fragment: blocks, calls, copies, exchanges]
-  M --> CACHE[Per-planning-call cache; selected recipes retain fragments]
-  CACHE --> JOIN[Bind fragments into candidate region]
-  JOIN --> PASS[Adjacent contiguous-copy merging]
-  PASS --> P[Primitive prices and per-tile timelines]
-  PASS --> A[Shared alias, access and lifetime analysis]
-  P --> BEAM[Detailed beam ranking]
-  A --> BEAM
-  BEAM --> JOIN
-  BEAM --> FINAL[Selected candidate; assign parameter ownership]
-  FINAL --> MID[Executable MidProgram]
-  MID --> LOW[LowProgram: per-tile references into shared mid]
-  LOW --> PLACE[Physical SRAM placement]
-  PLACE --> X[Physical exchange scheduling]
-  X --> R[Refine exchange prices using the same timeline evaluator]
-  R --> K[Selected kernels, code sizing and final placement]
-  K --> T[Addressed tile steps and linked tile images]
+  G[ComputeGraph: semantic operations and regions] --> C[Catalogue and geometry screening]
+  C --> B[mid implementation: distributed tensor primitives]
+  B --> CACHE[Compact implementation cache]
+  CACHE --> REGION[Compose compact candidate region]
+  REGION --> COST[Geometry prices and coarse live storage]
+  COST --> BEAM[Beam ranking]
+  BEAM --> FINAL[Selected MidProgram: resolve recipes and deferred movement]
+  FINAL --> EXPAND[low expand: enumerate tile calls and transfers]
+  EXPAND --> TG[TileGraph: storage, views, calls, copies and exchanges]
+  TG --> LOW[LowProgram: per-tile work lists]
+  LOW --> PLACE[Physical allocation]
+  PLACE --> EX[Physical exchange scheduling]
+  EX --> REFINE[Optional finalist reranking from actual timelines]
+  REFINE --> IMAGE[Linked tile images and package]
 ```
 
-The cache indexes standalone executable implementations keyed by the full
-operator plan and boundary tensor types. Its weak references do not retain
-rejected work. Selected operation recipes own an `Arc` to their fragment. Binding checks actual boundary ownership, extents and
-formats, remaps arena identities, and retains original work ordering. Deferred
-inputs and incompatible ownership/capacity require reconstruction by the same
-builder. There is no second expansion path in low.
+Mid selection chooses distributed work. Low expansion realizes that work; it does
+not rebuild a GEMM or attention algorithm. Cached fragments contain distributed
+tensor values, not tile buffers. Final resolution inserts ordinary mid copies
+where selected ownership differs, and maps claimed views directly into consumer
+windows. Low projection only builds per-tile references to the expanded arenas.
 
-Eight shared planning workers bound concurrent construction. Cheap boundary
-costs shortlist branch combinations at twice beam width before constructing new fragments; detailed
-branch analysis composes a concrete region, including consumer-created
-movement for deferred views. It retains only cycle/memory metrics after scoring;
-selected operator fragments remain shared. The old per-operator memory/exchange
-summary fields and their adapter type have been removed. This avoids retaining a whole program
-for every beam branch. Pending views keep their source live; unclaimed offers
-are restored before final ranking. Final block construction applies parameter
-ownership and prices the resulting program again.
-
-Sources: [planner](../crates/ipu-codegen/src/mid/planner.rs),
-[implementation cache](../crates/ipu-codegen/src/estimate/implementation.rs),
-[fragment binding](../crates/ipu-codegen/src/mid/implementation/reuse.rs),
-[timelines](../crates/ipu-codegen/src/estimate/program.rs),
-[allocation analysis](../crates/ipu-codegen/src/place.rs), and
-[finalist selection](../crates/ipu-codegen/src/package.rs).
-
-## Costs and storage
+## Shared prices, different precision
 
 ```mermaid
 flowchart LR
-  CALL[KernelRun with actual operands] --> GEO[mid/call: contracts and geometry]
-  GEO --> PRICE[Primitive kernel price]
-  GEO --> ABI[Backend ABI and specialization]
-  COPY[LocalCopy: bytes and traversal] --> PRICE
-  EX[LogicalExchange: views and traversal] --> SPAN[Shared physical/semantic span choice]
-  SPAN --> LOAD[Endpoint bytes, multicast and span chunks]
-  SPAN --> ENCODE[Physical exchange encoder]
-  PRICE --> TIME[Per-tile timelines]
-  LOAD --> TIME
-  ENCODE --> REFINE[Scheduled phase prices]
-  REFINE --> TIME
-  WORK[Explicit mid work, aliases and access contracts] --> LIFE[Shared allocation analysis]
-  LIFE --> PEAK[Live-byte peaks for planning]
-  LIFE --> PLACE[Alignment, SRAM separation and physical allocation]
+  MID[Mid primitives and tensor layouts] --> GEO[Maximum local geometry]
+  GEO --> PRICE[Shared primitive kernel prices]
+  GEO --> COARSE[Approximate traffic and storage liveness]
+  PRICE --> SCORE[Beam score]
+  COARSE --> SCORE
+  TILE[Expanded calls and movement] --> PRICE
+  TILE --> TIME[Actual per-tile timelines]
+  PRICE --> TIME
+  TILE --> ALLOC[Access requirements and allocation lifetimes]
+  TILE --> SCHED[Exchange scheduler]
+  SCHED --> TIME
 ```
 
-The old GEMM call-count, panel-traffic, attention-scratch and deferred-view cost
-reconstructions have been deleted. A GEMM block inside attention uses the same
-primitive price as any other GEMM. Timelines preserve tile-local order and
-synchronize at exchanges. Repeat composition does not unroll bodies or invent
-barriers at operator boundaries. Scheduled exchange prices use execution
-multiplicity; static exchange row storage does not.
+Beam costing never constructs tile graphs or runs physical allocation analysis.
+Its exchange approximation assumes a representative fragment size rather than
+walking byte spans or predicting the ready queue. Shared kernel prices avoid
+maintaining separate GEMM/attention cost algorithms. Actual timelines and
+scheduled phase prices remain available after expansion. Coarse memory feasibility
+does not guarantee placement, particularly with disjoint ownership groups and
+fragmented exchange tables.
 
-These are still estimates: primitive bandwidth/launch prices need calibration,
-logical endpoint traffic and calibrated fragment overhead are cheaper and less
-precise than physical scheduling,
-and live-byte feasibility does not prove physical placement. Early enumeration
-uses coarse boundary storage and existing grid proxies, not a second staging or
-reduction implementation. Widening the beam can change which candidates survive
-that heuristic. Storage spans walk contiguous lanes rather than individual elements. Semantic
-transfers retain canonical order; physical transfers may traverse rows first.
-Lifetime analysis indexes each exchange phase by tile once, and keeps outputs
-live according to actual block ownership.
+Sources: [mid decomposition](../crates/ipu-codegen/src/mid/implementation.rs),
+[mid primitives](../crates/ipu-codegen/src/mid/primitive.rs),
+[compact costing](../crates/ipu-codegen/src/estimate/mid.rs),
+[shared kernel prices](../crates/ipu-codegen/src/estimate/primitive.rs),
+[tile expansion](../crates/ipu-codegen/src/low/expand/primitive.rs),
+[final timelines](../crates/ipu-codegen/src/estimate/program.rs).
 
-Conversion prices also remain useful before a concrete branch
-exists; they do not determine the detailed region score.
-
-## Movement and contracts
+## Explicit decomposition
 
 ```mermaid
 flowchart LR
-  G[GEMM operand panels] --> MAP[Source/destination mappings]
-  A[Attention query, key and value panels] --> MAP
-  V[Deferred views and eager conversions] --> MAP
-  MAP --> PLAN[CopyPlan: direct movement, staging and padding]
-  PLAN --> BATCH[Materialization batch at exchange boundary]
-  BATCH --> WORK[Local copies, exchanges and rearrangement calls]
-  WORK --> PASS[Adjacent contiguous-copy merging]
+  L[Left materialization] --> GEMM[Distributed partial GEMM]
+  R[Right materialization] --> GEMM
+  GEMM --> P[Tensor with independent-partials axis]
+  P --> SUM[Sum: complete or streamed contributors]
+  SUM --> O[Output tensor]
 ```
 
-The strategy builders choose panel sizes, ownership and reuse. Shared
-materialization owns destination staging, zero padding, local/remote population
-and final transforms. Primitive calls derive access contracts from the actual
-buffers and kernel kind. Executable contracts do not carry candidate aliasing,
-materialization or local-staging policy; inherited contract repair is gone.
+Output-stationary GEMM instead exposes staged K panels and accumulating output
+versions. Attention exposes Q/K/V copies, products, softmax and merge. Selected
+view slices are mapped copies whose output is an ordinary mid value. Tile
+expansion shares physical copy realization across all these uses, including
+padding, direct resident views and destination packing.
 
-## Deferred work
-
-Items #1–#3 from the requested refactor are the implemented flows above.
-**#4, general copy/view chain composition, remains deferred at the user's
-request.** Discuss its interaction with planning before implementing it. The
-current pass only merges adjacent contiguous copies; it does not compose
-`A -> temporary -> B` or redirect arbitrary producers into a consumer layout.
-Padding, aliasing, write order and precision conversions constrain those changes.
-
-Allocation labels also deserve a later review: `ExchangeStaging` still affects
-capacity heuristics. Merging it with ordinary staging requires changing that
-policy, not just renaming variants. `KernelOperand`, `TileWorkRef` and the three
-repeat representations carry distinct grouping/projection/binding information;
-their existence alone is not evidence of useful deletions.
+**General copy/view chain composition (#4) remains deferred at the user's
+request.** Discuss its overlap with planning before implementing it. Resolving
+already selected deferred views is part of the current boundary rewrite; it is
+not an arbitrary producer/consumer layout optimization pass.

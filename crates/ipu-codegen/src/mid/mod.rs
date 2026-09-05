@@ -1,11 +1,9 @@
-//! Candidate selection and executable, layout-aware block IR.
-//!
-//! The analytical beam screens coupled implementation choices. Candidate builders
-//! produce a [`TileGraph`] with explicit blocks and movement before per-tile
-//! projection. Neither low lowering nor placement expands whole operators.
+//! Whole-device implementation selection, tensor primitives, and layouts.
+//! Tile enumeration occurs only after selection, in low expansion.
 
-use crate::low::*;
-
+pub(crate) mod implementation;
+mod primitive;
+pub use primitive::*;
 mod candidates;
 mod catalogue;
 mod layout;
@@ -28,10 +26,10 @@ pub(crate) fn lower_finalists(
     config: &PipelineConfig,
     costs: &impl CostModel,
     count: usize,
-) -> LoweringResult<Vec<std::sync::Arc<TileGraph>>> {
+) -> LoweringResult<Vec<MidProgram>> {
     planner::plan_finalists(graph, config, costs, count)?
         .iter()
-        .map(|candidate| crate::low::expand::expand_tiles(candidate).map_err(LoweringError::from))
+        .map(|program| implementation::resolve(program).ok_or(LoweringError::InvalidImplementation))
         .collect()
 }
 #[cfg(test)]
@@ -252,10 +250,11 @@ pub struct MidValue {
     reason = "keep selected plans inline during beam expansion"
 )]
 pub enum MidOperationKind {
+    Primitive(Primitive),
     Operator {
         plan: OperatorPlan,
         deferred_inputs: Vec<Option<DeferredInputPlan>>,
-        implementation: Option<std::sync::Arc<TileGraph>>,
+        implementation: Option<std::sync::Arc<MidProgram>>,
     },
     Convert(ConversionPlan),
     Repeat(MidRepeat),
@@ -323,8 +322,8 @@ pub struct MidInput {
     pub value: MidValueId,
 }
 
-/// Transient beam recipe consumed by the executable-block builder.
-/// This is never passed to low or retained in a selected TileGraph.
+/// Whole-device tensor program. Search recipes retain compact implementations;
+/// final selection inlines those primitives before low enumerates tiles.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MidProgram {
     pub tile_count: u16,
@@ -341,10 +340,10 @@ pub struct MidProgram {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LoweringError {
+    #[error("selected operator implementation is invalid")]
+    InvalidImplementation,
     #[error("cannot create planning worker pool: {0}")]
     PlanningThreads(String),
-    #[error(transparent)]
-    Blocks(#[from] ExpansionError),
     #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error(transparent)]

@@ -124,7 +124,6 @@ pub struct ExchangePhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkReason {
     OperatorKernel,
-    OperatorInput { input: u16 },
     OperatorInputs,
     PrecisionCast,
     LayoutRearrangement,

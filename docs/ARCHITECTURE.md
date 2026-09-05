@@ -24,101 +24,70 @@ Add broadcasting, and attention causality and scaling. GeLU currently denotes
 the exact function. Attention intentionally has no general mask input; the
 supported form is either causal or unmasked.
 
-## Compiler construction and executable mid IR
+## Whole-device mid and tile expansion
 
-Implementation modules are private; the crate root exposes graph construction,
-package building, and the types used by diagnostics.
+The planner chooses formats, distributed GEMM grids, attention strategy and
+reduction staging. `MidProgram` contains ordinary distributed tensor values and
+whole-device operations. Values specify shape, layout, memory class and ownership
+offset. They do not contain a list of tiles, local calls or physical byte spans.
 
-The planner screens whole-operation choices: formats, GEMM distribution,
-attention strategy and reduction staging. Cheap geometry and boundary-storage
-heuristics precede detailed evaluation. Detailed branches use executable mid
-fragments, shared allocation analysis, and primitive cycle prices. Selected
-`ImplementationCandidate` recipes retain their fragments; binding reuses them
-when boundary ownership, formats and capacity permit. Deferred movement is
-constructed by the same implementation builder in its actual consumer context.
-Final construction applies parameter ownership and reprices the executable
-`MidProgram` before physical scheduling. Low never expands opaque operators.
+`mid/implementation` decomposes selected algorithms into the same mid IR:
 
-`MidProgram` owns ordinary `BlockValue`s for input/output shards, GEMM partials,
-packed panels, reduction accumulators, and other intermediate results. Each has
-a tensor format, concrete extents, ownership tile, and storage/alias definition.
-Logical-value metadata and checkpoint boundaries are retained for diagnostics.
-The whole-device `BlockRegion` orders:
+- copies and mapped view windows into ordinary tensor results;
+- selected kernel grids with explicit operand windows and allocation reuse;
+- sums over an explicit independent-partials dimension;
+- structured repeats.
 
-- compute blocks with explicit input/output views, selected kernel kinds, and
-  bound storage requirements;
-- local copies with relative offsets and contiguous/strided patterns;
-- exchanges with source/destination views and semantic or physical traversal;
-- structured repeats with one shared body and per-tile carried/iterated bindings;
-- optional diagnostic checkpoints.
+Parallel GEMM uses a leading partials dimension followed by a sum. Output-stationary
+GEMM exposes its staged K panels and accumulating output versions. Attention
+exposes Q/K/V materialization, products, softmax and merge. Key blocks are currently
+statically represented as whole-device operations; tile counts do not multiply
+this representation. Kernel blocking describes the local calls to enumerate later.
 
-Entries preserve per-tile order; entries on different tiles may overlap until
-an exchange synchronization. They have explicit storage aliases and accumulating
-writes; the executable region is not a second SSA graph. It contains no SRAM
-addresses, linked kernel symbols, or encoded exchange rows.
+Search recipes retain compact `Arc<MidProgram>` implementations. Final selection
+inlines them, resolves claimed deferred views/conversions into consumer-sized
+copies, and makes ownership-offset materializations explicit. This resolution
+introduces no new search. General copy/view chain composition remains deferred.
 
-GEMM builders emit individual compute blocks, input movement, partial values,
-and reduction steps. The reusable sum builder accepts groups of independent
-block views, deriving complete/streamed receive stages from each group's actual
-contributor count. A single contribution becomes a copy. Its current packed
-FP16 kernel path requires matching contribution coordinates and storage order;
-other layouts require explicit rearrangement before summation. Partial values
-are not represented as interchangeable tensor replicas.
+`low/expand` realizes selected primitives as a `TileGraph`: local storage values,
+relative copies, exchanges, kernel calls and structured repeat bindings. It has
+no GEMM or attention strategy builder. `low/call` derives actual operand access
+contracts; `low/copy` realizes physical/semantic movement, padding and destination
+packing. These physical details do not change the selected distributed algorithm.
+`low/passes` merges adjacent contiguous local copies with dependency checks.
+`low::lower_to_tiles` projects this graph into per-tile work lists sharing its
+arenas through `Arc`. Placement then derives lifetimes and SRAM addresses.
 
-Both blocked and materialized attention use the same executable operations.
-Query/key/value preparation, QK and probability/value GEMMs, softmax, merge, and
-result movement are visible in mid. Their candidate-building helpers are split
-into shared task geometry, panel preparation, and the two attention strategies.
-No attention implementation remains in low.
+## Geometry and costs
 
-`mid/copy` owns relative copy formation and direct-word versus staging policy.
-`CopyOrder` specifies coordinate-preserving or allocation-order traversal for
-both local and inter-tile movement. `mid/passes` merges adjacent contiguous copies
-on each tile, respecting compute, exchange, repeat, and checkpoint boundaries.
-It excludes aliasing source/destination allocations and compacts the copy arena.
-This is not yet arbitrary composition of chained layout conversions.
+`mid/layout` defines precision, order, partitioning, replication, padding and
+memory class. `Layout::resolve` supplies compact partition bounds to both costing
+and expansion. `storage` computes physical and semantic byte spans when needed
+for actual movement. Parameter ownership rotations happen before tile expansion.
 
-## Geometry, costing, and projection
+Beam costing in `estimate/mid` traverses compact primitives. It prices maximum
+local geometry, approximate endpoint traffic/fragment counts, and coarse live
+storage including explicit aliases and temporary requirements. It does not build
+a tile graph, enumerate kernel calls, schedule exchange or invoke allocation
+analysis. `estimate/primitive` shares kernel prices with the final expanded
+timeline evaluator. `estimate/cycles` caches compact operator implementations;
+`estimate/memory` composes candidate regions for costing.
 
-`mid/layout` defines precision, element order, axis tiling, replication, padding,
-and memory class. `Layout::resolve` constructs partition bounds shared by
-estimation and block construction; logical ranges exclude padding and physical
-ranges include padding owned by each shard. Ownership rotations balance parameter
-storage before block construction. `storage` computes byte spans from borrowed
-format/extents without depending on low. Block adapters add identity checks.
+The estimates are deliberately approximate. They sum primitive durations and
+conservatively combine local storage maxima, rather than reproduce tile overlap
+and physical allocation. Exchange uses a coarse fragment-size assumption;
+contention and actual table sizes are resolved later. Final `estimate/program`
+evaluation uses actual tile timelines and can accept measured scheduler phase
+prices for finalist reranking. Placement remains the authority on physical fit.
 
-`mid/operator` and `catalogue` define legal choices; `candidates` specializes
-and cheaply screens them. `estimate/implementation` builds and caches concrete
-fragments. `estimate/program` prices actual kernel calls, copy patterns and
-logical exchange spans, composing per-tile timelines across barriers and repeats.
-`estimate/memory` uses the same alias, access-tail and lifetime analysis as
-placement. `estimate/tensor`, `traffic` and `cycles` retain shared geometry,
-coarse conversion screening and target prices. Deferred view/materialization
-claims emit explicit consumer-sized buffers and movement; low does not rediscover
-them. Shared materialization batches handle destination staging, padding,
-local/remote population and final transforms for GEMM, attention and conversions.
+`kernel/abi` defines calls and scalar arguments; `specialization` shares keys
+between object construction and call lookup. Backend call materialization resolves
+views after placement. `WorkProvenance` retains the source graph operation through
+mid primitives and tile expansion for diagnostics and profiling.
 
-`low::lower_to_tiles` only projects the executable mid region into per-tile work
-lists. It shares the immutable `MidProgram` through `Arc`, including its block,
-copy, exchange, and kernel arenas. It projects repeat bodies and optionally emits
-checkpoints. It cannot expand a whole operator or choose a new materialization.
-Placement derives lifetimes and SRAM addresses from those explicit operations.
-
-Repeat construction preserves an aliasable carried chain; a fresh yield can
-reuse the carried storage after its last read. Iterated input blocks have equal,
-aligned per-tile strides including required access tails. Repeated execution
-advances base pointers rather than unrolling the body or building pointer tables.
-
-`kernel/abi` defines supported calls and scalar arguments; `specialization`
-provides keys shared by object construction and call lookup; `mid/call` supplies
-address-independent call shapes and primitive access contracts. GEMM, rearrangement, and attention recipes are separate modules.
-`device/worker_call.S` marshals declared registers into C++ vertex fields. Backend
-call materialization resolves block views after placement.
-
-`PipelineConfig` supplies candidate construction and packaging with target,
-formats, catalogue, and scheduling/profiling policy. `PackageConfig` adds the
-build environment. `WorkProvenance` follows graph operations through individual
-blocks into placement diagnostics and profiles.
+Repeat expansion preserves an aliasable carried chain. Iterated inputs have
+equal aligned local strides including access tails. Execution advances base
+pointers without unrolling the structured body.
 
 ## Finalized tile programs
 

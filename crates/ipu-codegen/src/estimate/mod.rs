@@ -2,10 +2,11 @@
 //! memory evaluates allocations/liveness, and cycles applies IPU21 prices.
 
 mod cycles;
-mod implementation;
-pub(crate) use implementation::implementation_estimate;
 mod memory;
+mod mid;
+mod primitive;
 mod program;
+pub(crate) use mid::analyze as analyze_mid;
 pub(crate) use program::{ProgramCycles, program_cycles};
 mod tensor;
 mod traffic;

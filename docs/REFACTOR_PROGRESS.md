@@ -356,3 +356,23 @@ Whole-device mid rewrite, representation checkpoint (in progress):
   primitives and geometry-based estimates. Operator decomposition must become
   explicit before generic tile expansion, not merely move behind another name.
 - All 148 release workspace tests pass after the mechanical separation.
+
+Whole-device primitive checkpoint (2026-09-05):
+
+- Mid now contains distributed tensor copies/mapped windows, selected kernel
+  grids, explicit partial-axis sums and structured repeats. Final selection
+  resolves recipes before low tile expansion. Removed the old tile-level GEMM,
+  attention, streamed-conversion and fragment-remapping builders.
+- Beam costing traverses compact primitives and shares pure kernel geometry
+  prices with final timelines. It no longer builds tile graphs or invokes
+  physical allocation analysis. Exchange and memory estimates are coarser.
+- Selected deferred views become mapped copies into ordinary consumer tensors;
+  resident operand views and accumulating/in-place versions remain supported.
+- All 148 workspace release tests pass. Regression coverage includes compact
+  size independent of tile count, fresh/cached implementation equivalence,
+  explicit partial dimensions and resolved attention view windows.
+- GEMM and batched GEMM pass on hardware. Full hardware suite and performance
+  measurements are still in progress at this checkpoint.
+- Attention keys and values are currently separate materializations, so there
+  may be two exchange phases per key block. This is explicit in mid and costing;
+  the former test bound assumed their combined tile-builder batch.

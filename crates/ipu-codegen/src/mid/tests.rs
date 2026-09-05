@@ -1190,6 +1190,30 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         let claims = consumer.deferred_inputs();
         assert_eq!(claims.len(), split.len(), "random case {case}");
         assert!(claims.iter().all(Option::is_some), "random case {case}");
+        let compact = implementation::resolve(&lowered).unwrap();
+        assert!(
+            compact
+                .operations
+                .iter()
+                .all(|op| !matches!(op.kind, MidOperationKind::Operator { .. }))
+        );
+        assert!(
+            !compact
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, MidOperationKind::Primitive(Primitive::View(_))))
+        );
+        assert!(compact.operations.iter().any(|op| matches!(
+            op.kind,
+            MidOperationKind::Primitive(Primitive::MappedCopy { .. })
+        )));
+        assert!(compact.operations.iter().any(|op| matches!(
+            op.kind,
+            MidOperationKind::Primitive(Primitive::Compute {
+                kernel: TileKernelSpec::AttentionSoftmax { .. },
+                ..
+            })
+        )));
         let program = expand_tiles(&lowered).unwrap();
         let cycles = crate::estimate::program_cycles(&program, None).unwrap();
         assert_eq!(program.estimated_cycles, cycles.total);
@@ -1224,7 +1248,8 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
             "random case {case}: deferred movement must be priced"
         );
         assert!(
-            attention_phases <= tokens.div_ceil(AMP_INNER_BLOCK) as usize + 2,
+            // Keys and values are separate whole-device materializations.
+            attention_phases <= 2 * tokens.div_ceil(AMP_INNER_BLOCK) as usize + 2,
             "random case {case}: {attention_phases} attention exchange phases"
         );
     }
@@ -1296,4 +1321,34 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
         2,
     );
     assert_eq!(selected.len(), 2);
+}
+
+#[test]
+fn selected_mid_size_is_independent_of_tile_count() {
+    let mut sizes = Vec::new();
+    for tiles in [1, 4, 64, 1024] {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [1024, 64]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(tiles)
+            .with_active_tile_counts([tiles])
+            .with_input(input, format(Precision::F16, Layout::row_sharded(tiles)));
+        let recipe = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let selected = implementation::resolve(&recipe).unwrap();
+        assert!(selected.operations.iter().all(|op| matches!(
+            op.kind,
+            MidOperationKind::Primitive(_) | MidOperationKind::Convert(_)
+        )));
+        let mut fresh = recipe.clone();
+        for op in &mut fresh.operations {
+            if let MidOperationKind::Operator { implementation, .. } = &mut op.kind {
+                *implementation = None;
+            }
+        }
+        assert_eq!(selected, implementation::resolve(&fresh).unwrap());
+        assert!(crate::estimate::analyze_mid(&selected, &BTreeMap::new()).is_some());
+        sizes.push((selected.values.len(), selected.operations.len()));
+    }
+    assert!(sizes.windows(2).all(|pair| pair[0] == pair[1]), "{sizes:?}");
 }

@@ -16,8 +16,8 @@ pub trait CostModel: Sync {
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> Option<Arc<crate::TileGraph>> {
-        super::implementation_estimate(plan, inputs, output)
+    ) -> Option<Arc<crate::MidProgram>> {
+        crate::mid::implementation::implement(plan, inputs, output)
     }
     fn operator_cycle_override(
         &self,
@@ -82,7 +82,9 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
     spatial_capacity: u16,
     rearrangements: Mutex<RearrangementCache>,
-    implementations: Mutex<super::implementation::ImplementationCache>,
+    implementations: Mutex<
+        HashMap<(OperatorPlan, Vec<TensorType>, TensorType), std::sync::Weak<crate::MidProgram>>,
+    >,
 }
 
 type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
@@ -105,7 +107,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> Option<Arc<crate::TileGraph>> {
+    ) -> Option<Arc<crate::MidProgram>> {
         let mut plan = plan.clone();
         plan.deferred_output = None;
         let key = (plan, inputs.to_vec(), output.clone());

@@ -1,7 +1,7 @@
 //! Price executable work and compose per-tile timelines across barriers/repeats.
 
 use super::{IPU21_TARGET_COSTS as TARGET, *};
-use crate::{BlockOperation, BlockRegion, ExpansionResult, KernelRun, TileGraph, TileKernelSpec};
+use crate::{BlockOperation, BlockRegion, ExpansionResult, KernelRun, TileGraph};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramCycles {
@@ -203,99 +203,34 @@ pub(super) fn phase_traffic(
 }
 
 fn kernel_cycles(run: &KernelRun) -> u64 {
-    let elements = run
-        .output
-        .extents
-        .iter()
-        .map(|extent| u64::from(extent.physical_end - extent.start))
-        .fold(1, u64::saturating_mul);
-    let bytes = elements.saturating_mul(run.requirements.output.format.precision.bytes());
-    let work = match &run.kernel {
-        TileKernelSpec::Gemm {
-            multiply,
-            inner_block,
-            output_columns,
-            ..
-        } => {
-            let rows = crate::gemm_rows(run).map_or(u64::MAX, u64::from);
-            let columns = u64::from(*output_columns);
-            let inner = u64::from(*inner_block);
-            let right = run.requirements.inputs.get(1);
-            let interleaved = right.is_some_and(|input| {
-                input.format.layout.memory_class == MemoryClass::Ipu21Interleaved
-            });
-            let (row_cycles, group_cycles) = match multiply {
-                Precision::F16 => (rows, if interleaved { 940 } else { 1063 }),
-                Precision::F32 => (rows.saturating_mul(4), 2126),
-                Precision::F8F143 { .. } => {
-                    return rows
-                        .saturating_mul(columns)
-                        .saturating_mul(inner)
-                        .saturating_mul(2)
-                        .div_ceil(256)
-                        .saturating_add(TARGET.kernel_launch_cycles);
-                }
-            };
-            return 294u64.saturating_add(
-                inner.div_ceil(16).saturating_mul(
-                    columns
-                        .saturating_mul(row_cycles)
-                        .div_ceil(4)
-                        .saturating_add(
-                            columns
-                                .div_ceil(16)
-                                .saturating_mul(group_cycles)
-                                .div_ceil(4),
-                        ),
-                ),
-            );
-        }
-        TileKernelSpec::FillZero => bytes.div_ceil(48),
-        TileKernelSpec::Gelu => elements.saturating_mul(10),
-        TileKernelSpec::Add => elements.div_ceil(16),
-        TileKernelSpec::ReductionSum { partials } => bytes
-            .saturating_mul(u64::from(*partials).saturating_add(1))
-            .div_ceil(TARGET.reduction_output_bytes_per_cycle),
-        TileKernelSpec::Cast { .. } => elements.div_ceil(8),
-        TileKernelSpec::Rearrange { .. } => {
-            let tensor = TensorType {
-                shape: TensorShape(
-                    run.output
-                        .extents
-                        .iter()
-                        .map(|extent| extent.physical_end - extent.start)
-                        .collect(),
-                ),
-                format: run.requirements.output.format.clone(),
-            };
-            return if tensor.format.layout.order == ElementOrder::RowMajor {
-                elements
-                    .saturating_mul(10)
-                    .saturating_add(TARGET.kernel_launch_cycles)
-            } else {
-                row_major_pack_cycles(&tensor, elements)
-            };
-        }
-        TileKernelSpec::AttentionSoftmax { .. } => elements.saturating_mul(10),
-        TileKernelSpec::AttentionMerge { .. } => elements.saturating_mul(4),
-        TileKernelSpec::FlashAttention { .. } => {
-            let shape = crate::attention_shape(run);
-            return shape.map_or(u64::MAX, |shape| {
-                u64::from(shape.matrices)
-                    .saturating_mul(u64::from(shape.query_rows))
-                    .saturating_mul(u64::from(shape.key_rows))
-                    .saturating_mul(
-                        u64::from(shape.query_dimension) + u64::from(shape.value_dimension),
-                    )
-                    .saturating_mul(4)
-                    .div_ceil(6)
-                    .saturating_add(TARGET.kernel_launch_cycles)
-            });
-        }
+    let tensor = |view: &crate::ShardView, format: &crate::TensorFormat| TensorType {
+        shape: TensorShape(
+            view.extents
+                .iter()
+                .map(|extent| extent.physical_end - extent.start)
+                .collect(),
+        ),
+        format: format.clone(),
     };
-    work.saturating_add(TARGET.kernel_launch_cycles)
+    let inputs = run
+        .inputs
+        .iter()
+        .zip(&run.requirements.inputs)
+        .filter_map(|(operand, access)| {
+            operand
+                .views
+                .first()
+                .map(|view| tensor(view, &access.format))
+        })
+        .collect::<Vec<_>>();
+    super::primitive::kernel_cycles(
+        &run.kernel,
+        &inputs,
+        &tensor(&run.output, &run.requirements.output.format),
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
     let mut chunks = 0u64;
     for phase in &program.exchange_phases {

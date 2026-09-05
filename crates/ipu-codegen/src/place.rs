@@ -191,67 +191,6 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
     })
 }
 
-/// Address-independent working sets, using the same alias groups, access tails,
-/// element rounding and lifetimes as physical allocation.
-pub(crate) fn program_memory_with_multiplicity(
-    program: &LowProgram,
-    multiplicity: &BTreeMap<crate::MidValueId, u32>,
-) -> Result<crate::MemoryPeaks, PlacementError> {
-    let analysis = analyze_allocations(program)?;
-    let mut events = BTreeMap::<(u16, u64), [i128; 2]>::new();
-    let mut maximum_standard = 0;
-    for (root, members) in &analysis.members {
-        let lifetime = analysis.root_lifetimes[root];
-        if !lifetime.seen {
-            continue;
-        }
-        let shard = &program.shards[members[0]];
-        let copies = members
-            .iter()
-            .filter_map(|&index| match program.shards[index].definition {
-                ShardDefinition::Value(value) => multiplicity.get(&value).copied(),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(1);
-        let bytes = u64::from(allocation_bytes(
-            program,
-            members,
-            analysis.root_requirements[root],
-        )?)
-        .saturating_mul(u64::from(copies));
-        let class = match shard.tensor_type.format.layout.memory_class {
-            MemoryClass::Ipu21Standard => {
-                maximum_standard = maximum_standard.max(bytes);
-                0
-            }
-            MemoryClass::Ipu21Interleaved => 1,
-        };
-        events
-            .entry((shard.tile, u64::from(lifetime.first)))
-            .or_default()[class] += i128::from(bytes);
-        events
-            .entry((shard.tile, u64::from(lifetime.last) + 1))
-            .or_default()[class] -= i128::from(bytes);
-    }
-    let mut live = vec![[0i128; 2]; usize::from(program.tile_count)];
-    let mut peak = crate::MemoryPeaks::default();
-    for ((tile, _), delta) in events {
-        let usage = &mut live[usize::from(tile)];
-        for (live, change) in usage.iter_mut().zip(delta) {
-            *live += change;
-        }
-        peak.observe(
-            crate::MemoryUsage {
-                standard: u64::try_from(usage[0]).map_err(|_| PlacementError::Overflow)?,
-                interleaved: u64::try_from(usage[1]).map_err(|_| PlacementError::Overflow)?,
-            },
-            maximum_standard,
-        );
-    }
-    Ok(peak)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn place_tile(
     program: &LowProgram,
@@ -1134,21 +1073,19 @@ mod tests {
             let placement = place(&low).unwrap();
             for tile in 0..tiles {
                 let shard = |value| {
-                    low.shards
+                    low.values
                         .iter()
-                        .find(|shard| {
-                            shard.tile == tile && shard.definition == ShardDefinition::Value(value)
-                        })
+                        .find(|v| v.value == value)
                         .unwrap()
-                        .id
+                        .shards
+                        .iter()
+                        .copied()
+                        .find(|id| low.shards[id.index() as usize].tile == tile)
+                        .unwrap()
                 };
-                let left_address = placement.shard_addresses[&shard(mid.inputs[0].value)];
-                let right_address = placement.shard_addresses[&shard(mid.inputs[1].value)];
                 let sum_address = placement.shard_addresses[&shard(sum)];
                 let output_address = placement.shard_addresses[&shard(output)];
-                assert_ne!(sum_address, left_address);
-                assert_ne!(sum_address, right_address);
-                assert_eq!(output_address, left_address.min(right_address));
+                assert_eq!(output_address, sum_address);
             }
         }
     }

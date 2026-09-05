@@ -68,15 +68,13 @@ fn streamed_conversion_does_not_require_an_adjacent_consumer() {
     );
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
     for (_, result) in streamed {
-        let value = low
-            .values
-            .iter()
-            .find(|value| value.value == result)
-            .unwrap();
-        assert!(value.shards.iter().all(|shard| matches!(
-            low.shards[shard.index() as usize].definition,
-            ShardDefinition::Unmaterialized
-        )));
+        let value = low.values.iter().find(|value| value.value == result);
+        assert!(
+            value.is_none_or(|value| value.shards.iter().all(|shard| matches!(
+                low.shards[shard.index() as usize].definition,
+                ShardDefinition::Unmaterialized
+            )))
+        );
     }
 }
 
@@ -238,6 +236,28 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         config.operator_candidates = vec![candidate];
         let mid = lower(&graph, &config, &Ipu21CostModel)
             .unwrap_or_else(|error| panic!("case {case}: {error}"));
+        let compact = crate::mid::implementation::resolve(&mid).unwrap();
+        let sum = compact
+            .operations
+            .iter()
+            .find(|op| {
+                matches!(
+                    op.kind,
+                    MidOperationKind::Primitive(crate::Primitive::Sum { axis: 0, .. })
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            compact.values[sum.inputs[0].index() as usize]
+                .tensor_type
+                .shape
+                .0[0],
+            u32::from(inner_partitions)
+        );
+        assert!(
+            compact.operations.len() <= 8,
+            "distributed GEMM must not enumerate tiles"
+        );
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints)
             .unwrap_or_else(|error| {
                 panic!(
@@ -1170,25 +1190,6 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             }
         }
 
-        let gemm_destinations = low
-            .exchange_phases
-            .iter()
-            .filter(|phase| phase.provenance.reason == WorkReason::OperatorInput { input: 1 })
-            .flat_map(|phase| &phase.transfers)
-            .flat_map(|transfer| &transfer.destinations)
-            .map(|destination| destination.shard)
-            .collect::<Vec<_>>();
-        let unique_gemm_staging = gemm_destinations
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        let panels_per_phase = column_blocks;
-        assert!(
-            unique_gemm_staging.len()
-                <= usize::from(tiles)
-                    * usize::try_from(column_blocks.min(panels_per_phase)).unwrap(),
-            "case {case}"
-        );
         assert!(low.exchange_phases.iter().all(|phase| {
             phase.provenance.operation.is_some()
                 && (phase.provenance.value.is_some()

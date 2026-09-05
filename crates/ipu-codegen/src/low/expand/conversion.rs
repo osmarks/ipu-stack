@@ -90,22 +90,6 @@ impl TileGraphBuilder {
         plan: &crate::ConversionPlan,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        if plan.output.materialization == crate::OperandMaterialization::DispatchSlices {
-            let ([source], [result]) = (operation.inputs.as_slice(), operation.results.as_slice())
-            else {
-                return Err(ExpansionError::InvalidConversionPlan);
-            };
-            if !plan.strategy.uses_intersections() {
-                return Err(ExpansionError::InvalidConversionPlan);
-            }
-            // Mid lowering selected consumer-sized materialization. It is not
-            // contingent on where other operand conversions appear in the list.
-            self.deferred_conversions.insert(*result, *source);
-            for shard in self.value_shards(*result)?.to_vec() {
-                self.shards[shard.index() as usize].definition = ShardDefinition::Unmaterialized;
-            }
-            return Ok(());
-        }
         match plan.strategy {
             ConversionStrategy::LocalKernel => self.build_local_conversion(operation, plan, tiles),
             ConversionStrategy::DirectRetile | ConversionStrategy::StageLogicalThenTransform => {
@@ -199,7 +183,7 @@ impl TileGraphBuilder {
         self.build_mapped_views(
             mappings,
             copy_order,
-            CopyOrder::Semantic,
+            copy_order,
             operation_provenance(operation),
             tiles,
         )
@@ -213,6 +197,15 @@ impl TileGraphBuilder {
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
+        let physical = if copy_order == CopyOrder::Semantic {
+            self.f16_micro_panel_mappings(mappings.clone())?
+        } else {
+            None
+        };
+        let (mappings, copy_order, exchange_order) = physical
+            .map_or((mappings, copy_order, exchange_order), |mappings| {
+                (mappings, CopyOrder::Physical, CopyOrder::Physical)
+            });
         let mut batch = MaterializationBatch::default();
         self.prepare_mapped_views(
             mappings,

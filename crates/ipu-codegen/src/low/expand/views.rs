@@ -99,16 +99,34 @@ impl TileGraphBuilder {
         output_shards: &[BlockValueId],
         view: AxisFactorView,
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
+        self.window_view_mappings(source_shards, output_shards, view, &[])
+    }
+
+    pub(super) fn window_view_mappings(
+        &self,
+        source_shards: &[BlockValueId],
+        output_shards: &[BlockValueId],
+        view: AxisFactorView,
+        offsets: &[u32],
+    ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
         let mut mappings = Vec::new();
         for &output in output_shards {
-            let output_extents = self.shards[output.index() as usize].extents.clone();
+            let mut output_extents = self.shards[output.index() as usize].extents.clone();
+            for (axis, extent) in output_extents.iter_mut().enumerate() {
+                let offset = offsets.get(axis).copied().unwrap_or(0);
+                extent.start += offset;
+                extent.logical_end += offset;
+                extent.physical_end += offset;
+            }
             let tile = self.shards[output.index() as usize].tile;
             let source_shape = &self.shards[source_shards[0].index() as usize]
                 .tensor_type
                 .shape;
-            let output_shape = &self.shards[output.index() as usize].tensor_type.shape;
-            if view.output_shape(source_shape).as_ref() != Some(output_shape) {
-                return Err(ExpansionError::InvalidOperatorPlan);
+            let output_shape = view
+                .output_shape(source_shape)
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
+            for (extent, &size) in output_extents.iter_mut().zip(&output_shape.0) {
+                extent.logical_end = extent.logical_end.min(size);
             }
             let split = view.split_axis;
             let merge = view.merge_axis;
@@ -119,7 +137,7 @@ impl TileGraphBuilder {
                 stream_extents[merge].logical_end = stream + 1;
                 stream_extents[merge].physical_end = stream + 1;
                 let (target, column_base) = view
-                    .source_extents(source_shape, output_shape, &stream_extents)
+                    .source_extents(source_shape, &output_shape, &stream_extents)
                     .ok_or(ExpansionError::InvalidOperatorPlan)?;
                 for (mut source_extents, source) in
                     self.intersecting_shard_set(source_shards, &target, tile)
@@ -144,6 +162,12 @@ impl TileGraphBuilder {
                         let padding = source_padding.min(destination_padding);
                         source_extents[split].physical_end += padding;
                         destination_extents[split].physical_end += padding;
+                    }
+                    for (axis, extent) in destination_extents.iter_mut().enumerate() {
+                        let offset = offsets.get(axis).copied().unwrap_or(0);
+                        extent.start -= offset;
+                        extent.logical_end -= offset;
+                        extent.physical_end -= offset;
                     }
                     let source_view = ShardView {
                         shard: source,
@@ -172,6 +196,13 @@ impl TileGraphBuilder {
         for (source, destination) in mappings {
             let source_shard = &self.shards[source.shard.index() as usize];
             let destination_shard = &self.shards[destination.shard.index() as usize];
+            if !source_shard
+                .tensor_type
+                .format
+                .supports_f16_micro_panel_exchange(&destination_shard.tensor_type.format)
+            {
+                return Ok(None);
+            }
             let pieces = split_mapping_at_panel_boundaries(
                 source_shard,
                 source,

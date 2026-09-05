@@ -152,7 +152,7 @@ pub(crate) fn region_estimate(
     outputs: &[MidValueId],
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
-) -> Option<(std::sync::Arc<crate::TileGraph>, MemoryPeaks)> {
+) -> Option<(std::sync::Arc<crate::MidProgram>, MemoryPeaks)> {
     let mut outputs = outputs.to_vec();
     // A pending view still needs its source storage at the region boundary.
     for operation in operations.iter().rev() {
@@ -187,15 +187,10 @@ pub(crate) fn region_estimate(
         ..crate::MidProgram::default()
     };
 
-    let program = crate::low::expand::expand_tiles(&candidate).ok()?;
-    let low = crate::lower_to_tiles(&program, false);
-    let mut peak =
-        crate::place::program_memory_with_multiplicity(&low, allocation_multiplicity).ok()?;
-    let rows = super::program::program_footprint(&program)
-        .ok()?
-        .estimated_row_bytes();
-    peak.exchange_rows = rows;
-    peak.standard = peak.standard.saturating_add(rows);
-    peak.total = peak.total.saturating_add(rows);
-    Some((program, peak))
+    let mut program = crate::mid::implementation::resolve(&candidate)?;
+    let (cycles, peak) = super::analyze_mid(&program, allocation_multiplicity)?;
+    program.estimated_cycles = cycles.total;
+    program.estimated_exchange_cycles = cycles.exchange;
+    program.peak_memory = peak;
+    Some((std::sync::Arc::new(program), peak))
 }

@@ -443,12 +443,6 @@ pub enum ConversionStrategy {
     StageLogicalThenTransform,
 }
 
-impl ConversionStrategy {
-    pub const fn uses_intersections(self) -> bool {
-        matches!(self, Self::DirectRetile | Self::StageLogicalThenTransform)
-    }
-}
-
 pub fn layout_conversion_strategy(from: &Layout, to: &Layout) -> ConversionStrategy {
     if from.order == to.order {
         ConversionStrategy::DirectRetile

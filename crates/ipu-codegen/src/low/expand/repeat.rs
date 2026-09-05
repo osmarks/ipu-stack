@@ -158,6 +158,13 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
+    if let MidOperationKind::Primitive(crate::Primitive::Compute {
+        reuse_input: Some(index),
+        ..
+    }) = &operation.kind
+    {
+        return value_can_alias(operation.inputs[*index], target, operations);
+    }
     let Some(plan) = operation.operator_plan() else {
         return false;
     };
@@ -202,6 +209,16 @@ fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (
         for (index, input) in operation.inputs.iter().enumerate() {
             if *input != value {
                 continue;
+            }
+            if let MidOperationKind::Primitive(crate::Primitive::Compute {
+                kernel: TileKernelSpec::Gemm { multiply, .. },
+                ..
+            }) = &operation.kind
+            {
+                alignment = alignment.max(32);
+                if index == 0 {
+                    access_tail = access_tail.max(8 * multiply.bytes() as u32);
+                }
             }
             let requirement = operation
                 .operator_plan()

@@ -15,59 +15,6 @@ impl TileGraphBuilder {
         Ok(id)
     }
 
-    pub(super) fn interleaved_capacity_available(
-        &self,
-        tile: u16,
-        bytes: u32,
-        access_tail: u32,
-    ) -> ExpansionResult<bool> {
-        let used = self
-            .shards
-            .iter()
-            .filter(|shard| {
-                shard.tile == tile
-                    && shard.tensor_type.format.layout.memory_class
-                        == crate::MemoryClass::Ipu21Interleaved
-                    && !matches!(
-                        shard.definition,
-                        ShardDefinition::Alias(_)
-                            | ShardDefinition::WritableAlias(_)
-                            | ShardDefinition::ExchangeStaging
-                    )
-            })
-            .try_fold(0u32, |total, shard| {
-                total
-                    .checked_add(crate::shard_storage_bytes(shard)?)
-                    .and_then(|total| total.checked_add(access_tail))
-                    .ok_or(ExpansionError::IdOverflow)
-            })?;
-        Ok(used
-            .checked_add(bytes)
-            .and_then(|total| total.checked_add(access_tail))
-            .is_some_and(|total| total <= crate::memory::IPU21_INTERLEAVED_REGION_BYTES))
-    }
-
-    pub(super) fn interleaved_usage(&self, access_tail: u32) -> ExpansionResult<Vec<u32>> {
-        let mut used = vec![0u32; usize::from(self.tile_count)];
-        for shard in &self.shards {
-            if shard.tensor_type.format.layout.memory_class == MemoryClass::Ipu21Interleaved
-                && !matches!(
-                    shard.definition,
-                    ShardDefinition::Alias(_)
-                        | ShardDefinition::WritableAlias(_)
-                        | ShardDefinition::ExchangeStaging
-                )
-            {
-                let total = &mut used[usize::from(shard.tile)];
-                *total = total
-                    .checked_add(shard_storage_bytes(shard)?)
-                    .and_then(|total| total.checked_add(access_tail))
-                    .ok_or(ExpansionError::IdOverflow)?;
-            }
-        }
-        Ok(used)
-    }
-
     pub(super) fn value_shards(&self, value: MidValueId) -> ExpansionResult<&[BlockValueId]> {
         self.canonical
             .get(value.index() as usize)
@@ -95,6 +42,9 @@ impl TileGraphBuilder {
     }
 
     pub(super) fn full_view(&self, shard: BlockValueId) -> ShardView {
+        if let Some(view) = self.materialized_views.get(&shard) {
+            return view.clone();
+        }
         ShardView {
             shard,
             extents: self.shards[shard.index() as usize].extents.clone(),

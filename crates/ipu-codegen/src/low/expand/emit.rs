@@ -40,15 +40,6 @@ impl TileGraphBuilder {
         ))
     }
 
-    pub(super) fn append_phase(
-        &mut self,
-        transfers: BTreeMap<ShardView, Vec<ShardView>>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        self.append_ordered_phase(transfers, provenance, CopyOrder::Semantic, tiles)
-    }
-
     pub(super) fn append_physical_phase(
         &mut self,
         transfers: BTreeMap<ShardView, Vec<ShardView>>,

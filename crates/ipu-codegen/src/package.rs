@@ -693,11 +693,11 @@ fn build_package_artifacts(
 }
 
 fn select_scheduled_finalist(
-    finalists: Vec<std::sync::Arc<TileGraph>>,
+    finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
 ) -> PackageBuildResult<(LowProgram, crate::exchange::ExchangeScheduleCache)> {
     if finalists.len() == 1 {
-        let mid = finalists.into_iter().next().unwrap();
+        let mid = crate::low::expand::expand_tiles(&finalists.into_iter().next().unwrap())?;
         tracing::info!(
             estimated_cycles = mid.estimated_cycles,
             estimated_exchange_cycles = mid.estimated_exchange_cycles,
@@ -710,6 +710,7 @@ fn select_scheduled_finalist(
     let topology = active_topology(planning.tile_count)?;
     let mut ranked = Vec::with_capacity(finalists.len());
     for (index, mid) in finalists.into_iter().enumerate() {
+        let mid = crate::low::expand::expand_tiles(&mid)?;
         let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
         let placement = place(&low)?;
         let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
@@ -725,8 +726,7 @@ fn select_scheduled_finalist(
             phase_cycles[phase.id.index() as usize] = u64::from(phase.event_cycles)
                 .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles);
         }
-        let refined = crate::estimate::program_cycles(&mid, Some(&phase_cycles))
-            .map_err(crate::LoweringError::Blocks)?;
+        let refined = crate::estimate::program_cycles(&mid, Some(&phase_cycles))?;
         let scheduled_exchange_cycles = refined.exchange;
         let refined_cycles = refined.total;
         tracing::info!(

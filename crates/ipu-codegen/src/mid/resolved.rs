@@ -6,13 +6,18 @@
 use super::{AxisTiling, Layout, LayoutError, Padding, ShardExtent, TensorTiling};
 use crate::graph::TensorShape;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedAxis {
     partitions: Vec<ShardExtent>,
     stride: u32,
 }
 
 impl ResolvedAxis {
+    pub(crate) fn same_partitioning(&self, other: &Self) -> bool {
+        self.partitions == other.partitions
+            && (self.partitions.len() <= 1 || self.stride == other.stride)
+    }
+
     pub(crate) fn extent(&self, tile: u16) -> ShardExtent {
         self.partitions[(u32::from(tile) / self.stride) as usize % self.partitions.len()]
     }
@@ -296,7 +301,7 @@ impl AxisTiling {
 }
 
 impl TensorTiling {
-    fn axis_strides(&self) -> Result<Vec<u32>, LayoutError> {
+    pub(super) fn axis_strides(&self) -> Result<Vec<u32>, LayoutError> {
         let mut packed_stride = u32::from(self.replicas);
         self.axes
             .iter()
