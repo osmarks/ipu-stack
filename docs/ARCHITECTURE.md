@@ -1,5 +1,9 @@
 # Architecture
 
+See [Compiler data flow and deletion targets](COMPILER_DATA_FLOW.md) for current
+and proposed data-flow diagrams, duplicated cost derivations, and the next
+substantial opportunities to reduce implementation size.
+
 The package path has four explicit components:
 
 1. `ipu-exchange` produces exchange rows.
