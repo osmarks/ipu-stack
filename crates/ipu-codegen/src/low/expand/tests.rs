@@ -4,7 +4,7 @@ fn lower_to_tiles(
     checkpoints: bool,
 ) -> super::ExpansionResult<crate::LowProgram> {
     Ok(crate::low::lower_to_tiles(
-        &super::expand_tiles(graph)?,
+        &crate::expand_tiles(graph)?,
         checkpoints,
     ))
 }
@@ -1666,5 +1666,79 @@ fn general_graph_views_lower_to_correct_relative_copies() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn physical_micro_panels_preserve_retile_coordinates() {
+    let mut rng = fastrand::Rng::with_seed(0x726574696c65);
+    for _ in 0..128 {
+        let rows = rng.u32(1..=120);
+        let columns = rng.u32(2..=20) * 16;
+        let make = |id, rows, columns| BlockValue {
+            id: BlockValueId(id),
+            tile: id as u16,
+            tensor_type: TensorType::new(
+                [rows, columns],
+                Precision::F16,
+                Layout::amp_left(columns as u16, 1),
+            ),
+            extents: vec![
+                ShardExtent {
+                    axis: 0,
+                    start: 0,
+                    logical_end: rows,
+                    physical_end: rows,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: 0,
+                    logical_end: columns,
+                    physical_end: columns,
+                },
+            ],
+            definition: ShardDefinition::Staging,
+        };
+        let source = make(0, rows, columns);
+        let width = rng.u32(1..columns / 16) * 16;
+        let destination = make(1, rows, width);
+        let view = ShardView {
+            shard: source.id,
+            extents: destination.extents.clone(),
+        };
+        let target = ShardView {
+            shard: destination.id,
+            extents: destination.extents.clone(),
+        };
+        let pieces =
+            split_mapping_at_panel_boundaries(&source, view.clone(), &destination, target.clone())
+                .unwrap();
+        let pairs = |a: Vec<ByteSpan>, b: Vec<ByteSpan>| {
+            a.into_iter()
+                .flat_map(|s| s.offset..s.offset + s.bytes)
+                .zip(b.into_iter().flat_map(|s| s.offset..s.offset + s.bytes))
+                .collect::<BTreeSet<_>>()
+        };
+        let expected = pairs(
+            logical_view_byte_spans(&source, &view).unwrap(),
+            logical_view_byte_spans(&destination, &target).unwrap(),
+        );
+        assert_eq!(
+            pairs(
+                view_byte_spans(&source, &view).unwrap(),
+                view_byte_spans(&destination, &target).unwrap()
+            ),
+            expected
+        );
+        let actual = pieces
+            .into_iter()
+            .flat_map(|(a, b)| {
+                pairs(
+                    view_byte_spans(&source, &a).unwrap(),
+                    view_byte_spans(&destination, &b).unwrap(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
     }
 }

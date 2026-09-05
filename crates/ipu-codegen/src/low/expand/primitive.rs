@@ -271,6 +271,25 @@ impl TileGraphBuilder {
         } else {
             right_inner + 1
         };
+        let left_row = if left_inner == left.extents.len() - 1 {
+            left_inner - 1
+        } else {
+            left_inner + 1
+        };
+        let output_row = if output_column == self.shards[output.index() as usize].extents.len() - 1
+        {
+            output_column - 1
+        } else {
+            output_column + 1
+        };
+        let bounds = |extent: ShardExtent| (extent.start, extent.physical_end);
+        if bounds(left.extents[left_row])
+            != bounds(self.shards[output.index() as usize].extents[output_row])
+            || bounds(right.extents[right_column])
+                != bounds(self.shards[output.index() as usize].extents[output_column])
+        {
+            return Err(ExpansionError::InvalidOperatorPlan);
+        }
         let inner = left.extents[left_inner].physical_end - left.extents[left_inner].start;
         if inner != right.extents[right_inner].physical_end - right.extents[right_inner].start
             || *inner_block == 0

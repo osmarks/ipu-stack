@@ -33,7 +33,13 @@ pub(crate) fn lower_finalists(
         .collect()
 }
 #[cfg(test)]
-pub(crate) use crate::low::expand::expand_tiles;
+pub(crate) fn expand_tiles(
+    program: &MidProgram,
+) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
+    let program =
+        implementation::resolve(program).ok_or(crate::ExpansionError::InvalidOperatorPlan)?;
+    crate::low::expand::expand_tiles(&program)
+}
 use planner::*;
 
 use crate::estimate::MemoizedCostModel;

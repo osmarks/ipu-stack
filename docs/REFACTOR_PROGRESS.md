@@ -376,3 +376,17 @@ Whole-device primitive checkpoint (2026-09-05):
 - Attention keys and values are currently separate materializations, so there
   may be two exchange phases per key block. This is explicit in mid and costing;
   the former test bound assumed their combined tile-builder batch.
+
+Boundary enforcement and uneven-grid correction (2026-09-05):
+
+- Low expansion rejects unresolved operator recipes; test-only helpers explicitly
+  resolve them in mid. Split mid decomposition into shared construction, GEMM
+  and attention modules.
+- Full MLP initially failed numerically. Diagnostic execution localized the
+  failure to its first GEMM. New partial tensors had reconstructed unpadded row
+  partitions instead of inheriting the left operand's padded compute rows.
+  Fixed the mid geometry and added a full uneven-MLP coordinate regression;
+  low also rejects mismatched operand/output matrix bounds.
+- Added offline physical-exchange coverage for the 64-tile GEMM smoke shape and
+  a retile coordinate regression. All 151 release workspace tests and strict
+  Clippy pass. Hardware revalidation, including profiled MLP, remains in progress.

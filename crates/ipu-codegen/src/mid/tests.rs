@@ -1335,6 +1335,10 @@ fn selected_mid_size_is_independent_of_tile_count() {
             .with_active_tile_counts([tiles])
             .with_input(input, format(Precision::F16, Layout::row_sharded(tiles)));
         let recipe = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        assert!(
+            crate::low::expand::expand_tiles(&recipe).is_err(),
+            "low must reject unresolved operator recipes"
+        );
         let selected = implementation::resolve(&recipe).unwrap();
         assert!(selected.operations.iter().all(|op| matches!(
             op.kind,
@@ -1351,4 +1355,48 @@ fn selected_mid_size_is_independent_of_tile_count() {
         sizes.push((selected.values.len(), selected.operations.len()));
     }
     assert!(sizes.windows(2).all(|pair| pair[0] == pair[1]), "{sizes:?}");
+}
+
+#[test]
+fn uneven_mlp_products_preserve_global_coordinates() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [1, 729, 1152]).unwrap();
+    let up = graph.parameter("up", [1, 1152, 4304]).unwrap();
+    let down = graph.parameter("down", [1, 4304, 1152]).unwrap();
+    let hidden = graph.gemm(input, up).unwrap();
+    let hidden = graph.gelu(hidden).unwrap();
+    let output = graph.gemm(hidden, down).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(1472)
+        .with_automatic_input(input, Precision::F16)
+        .with_automatic_input(up, Precision::F16)
+        .with_automatic_input(down, Precision::F16);
+    let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+        .unwrap()
+        .remove(0);
+    let tiles = crate::low::expand::expand_tiles(&mid).unwrap();
+    for run in &tiles.kernel_runs {
+        if !matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
+            continue;
+        }
+        let output = &run.output.extents;
+        let left = &run.inputs[0].views[0].extents;
+        let right = &run.inputs[1].views[0].extents;
+        let bounds = |e: &ShardExtent| (e.start, e.logical_end, e.physical_end);
+        assert_eq!(
+            bounds(&left[left.len() - 2]),
+            bounds(&output[output.len() - 2]),
+            "left/output rows {run:?}"
+        );
+        assert_eq!(
+            bounds(&left[left.len() - 1]),
+            bounds(&right[right.len() - 2]),
+            "inner {run:?}"
+        );
+        assert_eq!(
+            bounds(&right[right.len() - 1]),
+            bounds(&output[output.len() - 1]),
+            "right/output columns {run:?}"
+        );
+    }
 }

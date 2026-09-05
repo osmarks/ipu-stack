@@ -59,9 +59,6 @@ pub enum ExpansionError {
 pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
 pub(crate) fn expand_tiles(graph: &MidProgram) -> ExpansionResult<Arc<TileGraph>> {
-    let resolved =
-        crate::mid::implementation::resolve(graph).ok_or(ExpansionError::InvalidOperatorPlan)?;
-    let graph = &resolved;
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }

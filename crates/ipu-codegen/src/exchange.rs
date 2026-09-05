@@ -3540,6 +3540,45 @@ mod tests {
     }
 
     #[test]
+    fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
+        let tiles = 64;
+        let mut graph = ComputeGraph::new();
+        let left = graph.host_input("left", [1, 64, 64]).unwrap();
+        let right = graph.parameter("right", [1, 64, 4096]).unwrap();
+        let output = graph.gemm(left, right).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(tiles)
+            .with_input(
+                left,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::amp_left(64, tiles),
+                },
+            )
+            .with_input(
+                right,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::block_major_matrix(64, tiles),
+                },
+            );
+        let mid = crate::mid::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
+        let low = lower_to_tiles(&expanded, false);
+        let placement = place(&low).unwrap();
+        let phases = lower_exchanges(
+            &low,
+            &placement,
+            &Topology::c600(),
+            ExchangeLoweringOptions::default(),
+        )
+        .unwrap();
+        assert!(!phases.phases.is_empty());
+    }
+
+    #[test]
     fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
         let mut random = fastrand::Rng::with_seed(0x6578_6368);
         for _ in 0..32 {

@@ -54,7 +54,7 @@ scheduled phase prices remain available after expansion. Coarse memory feasibili
 does not guarantee placement, particularly with disjoint ownership groups and
 fragmented exchange tables.
 
-Sources: [mid decomposition](../crates/ipu-codegen/src/mid/implementation.rs),
+Sources: [mid decomposition](../crates/ipu-codegen/src/mid/implementation/mod.rs),
 [mid primitives](../crates/ipu-codegen/src/mid/primitive.rs),
 [compact costing](../crates/ipu-codegen/src/estimate/mid.rs),
 [shared kernel prices](../crates/ipu-codegen/src/estimate/primitive.rs),

@@ -915,7 +915,7 @@ mod tests {
             crate::OperandRequirement::new(format, 8),
         )];
         let candidate = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let mut program = (*crate::low::expand::expand_tiles(&candidate).unwrap()).clone();
+        let mut program = (*crate::expand_tiles(&candidate).unwrap()).clone();
         let work = program
             .body
             .operations
