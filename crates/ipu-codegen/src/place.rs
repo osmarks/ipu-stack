@@ -327,7 +327,44 @@ fn place_tile(
     Ok((tile, addresses, standard.unused_ranges()))
 }
 
+fn shards_by_tile(
+    program: &LowProgram,
+    shards: impl IntoIterator<Item = BlockValueId>,
+) -> Vec<Vec<BlockValueId>> {
+    let mut tiles = vec![Vec::new(); usize::from(program.tile_count)];
+    for shard in shards {
+        tiles[usize::from(program.shards[shard.index() as usize].tile)].push(shard);
+    }
+    for shards in &mut tiles {
+        shards.sort_unstable();
+        shards.dedup();
+    }
+    tiles
+}
+
 fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
+    // Each global phase appears in every tile's projection. Index its touched
+    // blocks once instead of scanning all device transfers once per tile.
+    let exchanges = program
+        .exchange_phases
+        .iter()
+        .map(|phase| {
+            shards_by_tile(
+                program,
+                phase.transfers.iter().flat_map(|transfer| {
+                    std::iter::once(transfer.source.shard)
+                        .chain(transfer.destinations.iter().map(|view| view.shard))
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    let outputs = shards_by_tile(
+        program,
+        program
+            .outputs
+            .iter()
+            .flat_map(|output| output.shards.iter().copied()),
+    );
     let mut lifetimes = vec![Lifetime::default(); program.shards.len()];
     for input in &program.inputs {
         for shard in &input.shards {
@@ -337,12 +374,17 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
     for tile in &program.tiles {
         let mut event = 1u32;
         for work in program.work(tile) {
-            touch_work(program, work, tile.tile, &mut event, &mut lifetimes);
+            touch_work(
+                program,
+                work,
+                tile.tile,
+                &mut event,
+                &mut lifetimes,
+                &exchanges,
+            );
         }
-        for output in &program.outputs {
-            if let Some(shard) = output.shards.get(usize::from(tile.tile)) {
-                lifetimes[shard.index() as usize].touch(event);
-            }
+        for shard in &outputs[usize::from(tile.tile)] {
+            lifetimes[shard.index() as usize].touch(event);
         }
     }
     for (index, lifetime) in lifetimes.iter_mut().enumerate() {
@@ -364,6 +406,7 @@ fn touch_work(
     tile: u16,
     event: &mut u32,
     lifetimes: &mut [Lifetime],
+    exchanges: &[Vec<Vec<BlockValueId>>],
 ) {
     let current = *event;
     let mut touch = |shard: BlockValueId| lifetimes[shard.index() as usize].touch(current);
@@ -379,15 +422,8 @@ fn touch_work(
             touch(copy.destination);
         }
         TileWorkRef::Exchange(id) => {
-            for transfer in &program.exchange_phases[id.index() as usize].transfers {
-                if program.shards[transfer.source.shard.index() as usize].tile == tile {
-                    touch(transfer.source.shard);
-                }
-                for destination in &transfer.destinations {
-                    if program.shards[destination.shard.index() as usize].tile == tile {
-                        touch(destination.shard);
-                    }
-                }
+            for &shard in &exchanges[id.index() as usize][usize::from(tile)] {
+                touch(shard);
             }
         }
         TileWorkRef::Repeat(repeat) => {
@@ -409,7 +445,7 @@ fn touch_work(
             }
             *event = event.saturating_add(1);
             for nested in program.work(&repeat.body) {
-                touch_work(program, nested, tile, event, lifetimes);
+                touch_work(program, nested, tile, event, lifetimes, exchanges);
             }
             let end = *event;
             for carried in &repeat.carried {
@@ -922,6 +958,46 @@ mod tests {
         ComputeGraph, Ipu21CostModel, KernelBuildPlan, Layout, PipelineConfig, Precision,
         TensorFormat, lower, lower_to_tiles, materialize_kernel_run,
     };
+
+    #[test]
+    fn output_lifetimes_follow_ownership_not_output_list_order() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [8, 16]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let format = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(4),
+        };
+        let mut config = PipelineConfig::new(4).with_input(input, format.clone());
+        config.operator_candidates = vec![crate::OperatorCandidate::new(
+            crate::MidOperator::Gelu,
+            [crate::OperandRequirement::new(format.clone(), 8)],
+            crate::OperandRequirement::new(format, 8),
+        )];
+        let candidate = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mut program = (*crate::mid::implementation::build_blocks(&candidate).unwrap()).clone();
+        let work = program
+            .body
+            .operations
+            .iter()
+            .find(|work| matches!(work, crate::BlockOperation::Compute { tile: 0, .. }))
+            .unwrap()
+            .clone();
+        program.body.operations.extend([work.clone(), work]);
+        program.outputs[0].shards.reverse();
+        let low = lower_to_tiles(&std::sync::Arc::new(program), false);
+        let lifetimes = collect_lifetimes(&low);
+        for &id in &low.outputs[0].shards {
+            let tile = low.shards[id.index() as usize].tile;
+            let end = 1 + low.work(&low.tiles[usize::from(tile)]).count() as u32;
+            assert_eq!(
+                lifetimes[id.index() as usize].last,
+                end,
+                "output on tile {tile}"
+            );
+        }
+    }
 
     #[test]
     fn randomized_gemm_placement_respects_classes_and_kernel_views() {

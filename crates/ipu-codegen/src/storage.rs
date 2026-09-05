@@ -62,7 +62,12 @@ pub(crate) fn physical_byte_spans(
     view: &[ShardExtent],
 ) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
-    if shard.extents == view {
+    if shard
+        .extents
+        .iter()
+        .zip(view)
+        .all(|(a, b)| a.start == b.start && a.physical_end == b.physical_end)
+    {
         return Ok(vec![ByteSpan {
             offset: 0,
             bytes: storage_bytes(shard)?,
@@ -71,7 +76,7 @@ pub(crate) fn physical_byte_spans(
     if let Some(spans) = block_major_panel_spans(shard, view)? {
         return Ok(spans);
     }
-    let mut logical = logical_byte_spans(shard, view)?;
+    let mut logical = byte_spans(shard, view, true)?;
     logical.sort_unstable_by_key(|span| span.offset);
     let mut spans = Vec::<ByteSpan>::new();
     for span in logical {
@@ -95,16 +100,43 @@ pub(crate) fn logical_byte_spans(
     shard: TensorStorage<'_>,
     view: &[ShardExtent],
 ) -> StorageResult<Vec<ByteSpan>> {
+    byte_spans(shard, view, false)
+}
+
+// Walk contiguous storage lanes instead of visiting each element. Physical
+// traversal may exchange the two matrix axes; semantic traversal must retain
+// canonical coordinate order for layout conversions.
+fn byte_spans(
+    shard: TensorStorage<'_>,
+    view: &[ShardExtent],
+    physical_order: bool,
+) -> StorageResult<Vec<ByteSpan>> {
     validate_view(shard, view)?;
+    let rank = view.len();
+    let (row_fast, lane) = match shard.format.layout.order {
+        ElementOrder::RowMajor => (false, u32::MAX),
+        ElementOrder::Amp(AmpOrder::Output) => (false, 2),
+        ElementOrder::Amp(AmpOrder::TransposedOutput) => (true, 2),
+        ElementOrder::Amp(AmpOrder::TransposedLeft)
+        | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
+            (true, amp_micro_dimension(shard.format.precision))
+        }
+        _ => (false, amp_micro_dimension(shard.format.precision)),
+    };
+    let swap_axes = physical_order && row_fast && rank >= 2;
+    let lane = if row_fast && !swap_axes { 1 } else { lane };
     let shard_widths = shard
         .extents
         .iter()
         .map(|extent| extent.physical_end - extent.start)
         .collect::<Vec<_>>();
-    let view_widths = view
+    let mut view_widths = view
         .iter()
         .map(|extent| extent.physical_end - extent.start)
         .collect::<Vec<_>>();
+    if swap_axes {
+        view_widths.swap(rank - 2, rank - 1);
+    }
     let elements = view_widths.iter().try_fold(1_u64, |elements, &width| {
         elements
             .checked_mul(u64::from(width))
@@ -115,8 +147,16 @@ pub(crate) fn logical_byte_spans(
     let mut view_coordinates = vec![0; view_widths.len()];
     let mut shard_coordinates = vec![0; shard_widths.len()];
     let mut spans = Vec::<ByteSpan>::new();
-    for logical in 0..elements {
+    let mut logical = 0;
+    while logical < elements {
         decode_row_major(&view_widths, logical, &mut view_coordinates);
+        let remaining = view_widths
+            .last()
+            .zip(view_coordinates.last())
+            .map_or(1, |(&width, &coordinate)| width - coordinate);
+        if swap_axes {
+            view_coordinates.swap(rank - 2, rank - 1);
+        }
         for ((shard_coordinate, view_coordinate), (shard_extent, view_extent)) in shard_coordinates
             .iter_mut()
             .zip(&view_coordinates)
@@ -125,6 +165,16 @@ pub(crate) fn logical_byte_spans(
             *shard_coordinate = view_extent.start - shard_extent.start + view_coordinate;
         }
         let physical = physical_index(shard, &shard_widths, &shard_coordinates)?;
+        let coordinate = if swap_axes {
+            shard_coordinates[rank - 2]
+        } else {
+            shard_coordinates.last().copied().unwrap_or(0)
+        };
+        let run = remaining.min(lane - coordinate % lane);
+        let bytes = run
+            .checked_mul(element_bytes)
+            .ok_or(StorageError::Overflow)?;
+        logical += u64::from(run);
         let offset = u32::try_from(physical)
             .ok()
             .and_then(|index| index.checked_mul(element_bytes))
@@ -133,13 +183,10 @@ pub(crate) fn logical_byte_spans(
             Some(previous) if previous.offset.checked_add(previous.bytes) == Some(offset) => {
                 previous.bytes = previous
                     .bytes
-                    .checked_add(element_bytes)
+                    .checked_add(bytes)
                     .ok_or(StorageError::Overflow)?;
             }
-            _ => spans.push(ByteSpan {
-                offset,
-                bytes: element_bytes,
-            }),
+            _ => spans.push(ByteSpan { offset, bytes }),
         }
     }
     Ok(spans)
@@ -735,6 +782,96 @@ mod tests {
                 })
                 .collect(),
             definition: ShardDefinition::Value(crate::MidValueId::from_index(0)),
+        }
+    }
+
+    #[test]
+    fn partial_span_traversals_preserve_coordinates_in_every_storage_order() {
+        let mut random = fastrand::Rng::with_seed(0x7370_616e);
+        for precision in [
+            Precision::F8F143 { scale_exponent: 0 },
+            Precision::F16,
+            Precision::F32,
+        ] {
+            for order in [
+                ElementOrder::RowMajor,
+                ElementOrder::Amp(AmpOrder::Left),
+                ElementOrder::Amp(AmpOrder::Output),
+                ElementOrder::Amp(AmpOrder::TransposedLeft),
+                ElementOrder::Amp(AmpOrder::TransposedRight),
+                ElementOrder::Amp(AmpOrder::TransposedOutput),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                    row_block: 64,
+                    column_block: 64,
+                }),
+                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
+                    row_block: 64,
+                    column_block: 64,
+                }),
+            ] {
+                let mut block = shard(
+                    Layout {
+                        order,
+                        tiling: TensorTiling::replicated(1),
+                        memory_class: MemoryClass::Ipu21Standard,
+                    },
+                    &[3, 64, 128],
+                );
+                block.tensor_type.format.precision = precision;
+                for extent in &mut block.extents {
+                    extent.start += 7;
+                    extent.logical_end += 7;
+                    extent.physical_end += 7;
+                }
+                for _ in 0..16 {
+                    let view = block
+                        .extents
+                        .iter()
+                        .map(|extent| {
+                            let start = random.u32(extent.start..extent.physical_end);
+                            let end = random.u32(start + 1..=extent.physical_end);
+                            ShardExtent {
+                                start,
+                                logical_end: end,
+                                physical_end: end,
+                                ..*extent
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let mut expected = Vec::new();
+                    for batch in view[0].start..view[0].physical_end {
+                        for row in view[1].start..view[1].physical_end {
+                            for column in view[2].start..view[2].physical_end {
+                                let index = physical_index(
+                                    block.storage(),
+                                    &[3, 64, 128],
+                                    &[batch - 7, row - 7, column - 7],
+                                )
+                                .unwrap();
+                                let offset = index as u32 * precision.bytes() as u32;
+                                expected.extend(offset..offset + precision.bytes() as u32);
+                            }
+                        }
+                    }
+                    let expand = |spans: Vec<ByteSpan>| {
+                        spans
+                            .into_iter()
+                            .flat_map(|span| span.offset..span.offset + span.bytes)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        expand(logical_byte_spans(block.storage(), &view).unwrap()),
+                        expected,
+                        "{precision:?} {order:?}"
+                    );
+                    expected.sort_unstable();
+                    assert_eq!(
+                        expand(physical_byte_spans(block.storage(), &view).unwrap()),
+                        expected,
+                        "{precision:?} {order:?}"
+                    );
+                }
+            }
         }
     }
 

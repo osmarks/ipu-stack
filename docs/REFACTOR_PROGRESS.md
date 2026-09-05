@@ -266,3 +266,20 @@ Planning retention follow-up:
   GEMM and batched GEMM hardware pass at about one second end-to-end and ~100 MiB
   peak host RSS (`/tmp/concrete-mid-v8-*`). Full-size MLP/attention performance and
   hardware validation remain in progress; do not claim them complete yet.
+
+Planning traversal checkpoint:
+
+- Profiled full-size MLP. Lifetime analysis scanned every device-wide transfer
+  for every tile. It now indexes touched blocks by tile once. Output lifetimes
+  also follow actual block ownership instead of assuming tile-ordered outputs.
+- The next profile was dominated by element-by-element storage span traversal.
+  Shared span enumeration now walks contiguous storage lanes, retaining canonical
+  order for semantic transfers and permitting row-fast traversal for physical
+  transfers. Random partial-view tests cover every storage order and precision,
+  including nonzero shard origins, against an element-by-element oracle.
+- Avoid rebuilding unchanged final branch analyses; screen at twice beam width.
+- All 148 release workspace tests and strict Clippy pass (`/tmp/lane-*`). All
+  seven device cases passed after lifetime indexing (`/tmp/indexed-mid-*`),
+  including full MLP, materialized/Flash attention and repeated MLP. MLP took
+  440 seconds and attention 215 seconds before the storage traversal fix.
+  Final traversal performance/device checks are running (`/tmp/lane-mid-*`).

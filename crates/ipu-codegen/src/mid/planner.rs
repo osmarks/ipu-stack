@@ -545,7 +545,7 @@ pub(super) fn lower_operation_candidates(
             .collect::<BTreeSet<_>>();
         // Region construction is reserved for this wider shortlist. The
         // preliminary score uses boundary storage and conversion costs.
-        let screening_width = config.planning_beam_width.max(1).saturating_mul(4);
+        let screening_width = config.planning_beam_width.max(1).saturating_mul(2);
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
@@ -863,8 +863,9 @@ pub(super) fn lower_operation_candidates(
     let beam = beam
         .into_iter()
         .filter_map(|mut branch| {
-            restore_unclaimed_deferred_costs(&mut branch.operations);
-            branch.analysis.take();
+            if restore_unclaimed_deferred_costs(&mut branch.operations) {
+                branch.analysis.take();
+            }
             let peak = beam_memory_peak(
                 costs,
                 &branch,
@@ -1186,7 +1187,8 @@ pub(super) fn deferred_aware_branch_score(
     })
 }
 
-pub(super) fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) {
+pub(super) fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) -> bool {
+    let mut changed = false;
     let claims = deferred_claims(operations);
     for operation in operations {
         let Some(offer) = operation
@@ -1200,6 +1202,7 @@ pub(super) fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) 
             .first()
             .is_some_and(|result| !claims.contains(result))
         {
+            changed = true;
             operation.estimated_cycles = offer.unfused_cycles;
             operation.estimated_exchange_cycles = offer.unfused_exchange_cycles;
             if let MidOperationKind::Operator { plan, .. } = &mut operation.kind {
@@ -1207,6 +1210,7 @@ pub(super) fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) 
             }
         }
     }
+    changed
 }
 
 pub(super) fn format_equality_cost(
