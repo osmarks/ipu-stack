@@ -217,3 +217,10 @@ Packaging still uses provisional scheduling to size exchange tables and generate
 code. It may reuse transfer widths and ordering after final placement, but always
 rebuilds and validates physical rows. Changed normalized rows trigger optimization
 again. Removing this allocation/scheduling cycle is not a current refactoring goal.
+
+Attention-stage assembly workers specialize head/value dimensions and padded
+widths; block row counts are ordinary typed ABI arguments. This supports multiple
+configurations and more than two block sizes in one package without mapping
+intermediate sizes to a "large" specialization. Full-block C++ softmax retains
+its query-row specialization; assembly tail softmax shares workers across both
+query and logical key sizes.

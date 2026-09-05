@@ -7,17 +7,11 @@
 #ifndef ATTENTION_KEY_BLOCK_COLUMNS
 #define ATTENTION_KEY_BLOCK_COLUMNS 64
 #endif
-#ifndef ATTENTION_SMALL_QUERY_ROWS
-#define ATTENTION_SMALL_QUERY_ROWS 1
+#ifndef ATTENTION_QUERY_ROWS
+#define ATTENTION_QUERY_ROWS 1
 #endif
-#ifndef ATTENTION_LARGE_QUERY_ROWS
-#define ATTENTION_LARGE_QUERY_ROWS ATTENTION_SMALL_QUERY_ROWS
-#endif
-#ifndef ATTENTION_SMALL_KEY_ROWS
-#define ATTENTION_SMALL_KEY_ROWS ATTENTION_KEY_BLOCK_COLUMNS
-#endif
-#ifndef ATTENTION_LARGE_KEY_ROWS
-#define ATTENTION_LARGE_KEY_ROWS ATTENTION_KEY_BLOCK_COLUMNS
+#ifndef ATTENTION_KEY_ROWS
+#define ATTENTION_KEY_ROWS ATTENTION_KEY_BLOCK_COLUMNS
 #endif
 
 using namespace poplar;
@@ -138,23 +132,14 @@ __attribute__((always_inline)) bool softmaxBlock(const Scores &scores,
   return true;
 }
 
-#define DEFINE_SOFTMAX_VERTEX(Name, QueryRows, KeyRows)                        \
-  class Name : public MultiVertex {                                           \
-  public:                                                                     \
-    Input<Vector<half, VectorLayout::ONE_PTR>> scores;                         \
-    Input<Vector<half, VectorLayout::ONE_PTR>> unused;                         \
-    Output<Vector<half, VectorLayout::ONE_PTR>> weights;                       \
-                                                                              \
-    bool compute(unsigned worker) {                                            \
-      return softmaxBlock<QueryRows, KeyRows>(scores, weights, worker);        \
-    }                                                                          \
-  }
+class ATTENTION_VERTEX_NAME : public MultiVertex {
+public:
+  Input<Vector<half, VectorLayout::ONE_PTR>> scores;
+  Input<Vector<half, VectorLayout::ONE_PTR>> unused;
+  Output<Vector<half, VectorLayout::ONE_PTR>> weights;
 
-DEFINE_SOFTMAX_VERTEX(AttentionSoftmaxSmallQuerySmallKeyF16,
-                      ATTENTION_SMALL_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS);
-DEFINE_SOFTMAX_VERTEX(AttentionSoftmaxSmallQueryLargeKeyF16,
-                      ATTENTION_SMALL_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS);
-DEFINE_SOFTMAX_VERTEX(AttentionSoftmaxLargeQuerySmallKeyF16,
-                      ATTENTION_LARGE_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS);
-DEFINE_SOFTMAX_VERTEX(AttentionSoftmaxLargeQueryLargeKeyF16,
-                      ATTENTION_LARGE_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS);
+  bool compute(unsigned worker) {
+    return softmaxBlock<ATTENTION_QUERY_ROWS, ATTENTION_KEY_ROWS>(scores, weights,
+                                                               worker);
+  }
+};

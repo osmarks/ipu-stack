@@ -27,6 +27,8 @@ pub enum KernelAvailability {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarValue {
     ElementCount,
+    QueryRows,
+    KeyRows,
     NumPartials,
     ScaleExponent,
     InitialBlock,
@@ -87,6 +89,13 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
         .iter()
         .map(|argument| match argument.value {
             ScalarValue::ElementCount => Ok(count),
+            ScalarValue::QueryRows => gemm_rows(run),
+            ScalarValue::KeyRows => match &run.kernel {
+                TileKernel::Planned(TileKernelSpec::AttentionSoftmax { key_columns, .. }) => {
+                    Ok(*key_columns)
+                }
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
             ScalarValue::NumPartials => match &run.kernel {
                 TileKernel::Planned(TileKernelSpec::ReductionSum { partials }) => {
                     Ok(u32::from(*partials - 1))
@@ -243,17 +252,32 @@ pub fn tile_kernel_abi(
             3,
             Vec::new(),
         ),
-        TileKernelSpec::AttentionSoftmax { .. } => (
+        TileKernelSpec::AttentionSoftmax {
+            key_columns,
+            padded_key_columns,
+            ..
+        } => (
             KernelSymbols::AttentionStageSpecialized,
             KernelAvailability::Implemented,
             1,
-            Vec::new(),
+            if key_columns != padded_key_columns {
+                scalar_arguments(1, &[ScalarValue::QueryRows, ScalarValue::KeyRows])
+            } else {
+                Vec::new()
+            },
         ),
         TileKernelSpec::AttentionMerge { .. } => (
             KernelSymbols::AttentionStageSpecialized,
             KernelAvailability::Implemented,
             2,
-            scalar_arguments(2, &[ScalarValue::InitialBlock, ScalarValue::FinalBlock]),
+            scalar_arguments(
+                2,
+                &[
+                    ScalarValue::InitialBlock,
+                    ScalarValue::FinalBlock,
+                    ScalarValue::QueryRows,
+                ],
+            ),
         ),
         TileKernelSpec::Cast { from, to } => (
             KernelSymbols::Exact(cast_symbol(*from, *to)),

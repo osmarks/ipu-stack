@@ -45,8 +45,30 @@ interface's post-host-exchange visibility is not claimed to be fixed.
    permutation composition remains open; attention fast paths are still specific.
    143 workspace release tests and Clippy pass. Both attention hardware cases
    pass with identical tile images (`/tmp/general-view-*`).
-4. Kernel attention-stage compilation currently assumes one common configuration
-   and at most two query/key sizes. This deserves correction before claiming the
-   kernel design supports arbitrary additional operations/configurations.
+4. Attention-stage compilation no longer assumes one configuration or two row
+   sizes. Tail softmax assembly receives query/key counts as scalar arguments;
+   merge assembly receives query count. Workers specialize only actual constant
+   dimensions and share code across block sizes. Full-block C++ softmax retains
+   per-query-row specialization. Regression coverage includes three query/key
+   sizes and multiple head/value configurations in one build plan.
+   142 release workspace tests and Clippy pass (two older view formula tests
+   were subsumed by the end-to-end rank-2–5 copy test). Both attention hardware
+   workloads pass with unchanged numerical error (`/tmp/attention-contract-*`).
+   Linked code ends 152/120 bytes earlier; generated call code grows 12 bytes;
+   SRAM reservations are unchanged for projected/smoke attention respectively.
+
+## Immediate next simplifications
+
+- ABI still allocates pointer/scalar register lists whose register numbers are
+  ignored by emission. Replace those with an input count and a static typed
+  scalar slice; make fixed ABI register constants shared with emit_compute.
+- low/intersection conversion duplicates preferred-replica intersection logic
+  already available in intersecting_shard_set.
+- ViewSlice wraps only source_ranges; remove that wrapper now that deferred
+  consumer axis selection is kept out of semantic graph geometry.
+- CopyPlan is still expanded with shard geometry during lowering; retaining
+  complete copy recipes earlier needs the parameter tile rotation decision to
+  move out of low initialization. Avoid just introducing another plan copy.
+
 
 No subagents were used. Work is on `refactor/compiler-views-kernels`.

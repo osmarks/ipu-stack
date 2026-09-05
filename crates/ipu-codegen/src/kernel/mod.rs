@@ -1,6 +1,7 @@
 //! Kernel ABI, specialization recipes, and placed call materialization.
 
 mod abi;
+mod attention;
 mod build;
 mod geometry;
 mod specialization;

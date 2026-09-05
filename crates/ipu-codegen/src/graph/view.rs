@@ -77,45 +77,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn factor_views_cover_source_once_for_every_axis_pair() {
-        for rank in 2..=5 {
-            for split in 0..rank {
-                for merge in 0..rank {
-                    if split == merge {
-                        continue;
-                    }
-                    let mut shape = vec![2; rank];
-                    shape[split] = 6;
-                    let source = TensorShape(shape);
-                    let view = AxisFactorView::new(split, merge, 3);
-                    let output = view.output_shape(&source).unwrap();
-                    let mut covered = std::collections::BTreeSet::new();
-                    for linear in 0..output.0.iter().product::<u32>() {
-                        let mut index = linear;
-                        let mut point = vec![(0, 0); rank];
-                        for axis in (0..rank).rev() {
-                            let coordinate = index % output.0[axis];
-                            index /= output.0[axis];
-                            point[axis] = (coordinate, coordinate + 1);
-                        }
-                        let mapped = view.map_slice(&source, &output, &point).unwrap();
-                        let source_index = mapped.source_ranges.iter().zip(&source.0).fold(
-                            0,
-                            |index, (&(start, end), &size)| {
-                                assert_eq!(end, start + 1);
-                                assert!(end <= size);
-                                index * size + start
-                            },
-                        );
-                        assert!(covered.insert(source_index), "two output elements alias");
-                    }
-                    assert_eq!(covered.len() as u32, source.0.iter().product::<u32>());
-                }
-            }
-        }
-    }
-
-    #[test]
     fn factor_views_reject_invalid_shapes_and_nonrectangular_slices() {
         let source = TensorShape(vec![2, 4, 12]);
         for view in [

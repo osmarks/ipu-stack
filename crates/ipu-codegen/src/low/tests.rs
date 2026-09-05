@@ -925,64 +925,6 @@ fn randomized_gemm_grid_orders_align_operands_and_pair_shared_payloads() {
 }
 
 #[test]
-fn randomized_split_head_mappings_are_bijective_rectangles() {
-    let mut random = fastrand::Rng::with_seed(0x6d61_7070_6564_5f68);
-    for _ in 0..CASES * 8 {
-        let batch = random.u32(1..=8);
-        let heads = random.u32(1..=32);
-        let rows = random.u32(1..=256);
-        let width = random.u32(1..=128);
-        let stream = random.u32(0..batch * heads);
-        let row_start = random.u32(0..rows);
-        let row_end = random.u32(row_start + 1..=rows);
-        let column_start = random.u32(0..width);
-        let column_end = random.u32(column_start + 1..=width);
-        let output = vec![
-            ShardExtent {
-                axis: 0,
-                start: stream,
-                logical_end: stream + 1,
-                physical_end: stream + 1,
-            },
-            ShardExtent {
-                axis: 1,
-                start: row_start,
-                logical_end: row_end,
-                physical_end: row_end,
-            },
-            ShardExtent {
-                axis: 2,
-                start: column_start,
-                logical_end: column_end,
-                physical_end: column_end,
-            },
-        ];
-        let (source, base) = AxisFactorView::new(2, 0, heads)
-            .source_extents(
-                &crate::graph::TensorShape(vec![batch, rows, heads * width]),
-                &crate::graph::TensorShape(vec![batch * heads, rows, width]),
-                &output,
-            )
-            .unwrap();
-
-        assert_eq!(source[0].start, stream / heads);
-        assert_eq!(source[1], output[1]);
-        assert_eq!(source[2].start, base + column_start);
-        assert_eq!(source[2].logical_end, base + column_end);
-        assert_eq!(
-            source
-                .iter()
-                .map(|extent| extent.logical_end - extent.start)
-                .product::<u32>(),
-            output
-                .iter()
-                .map(|extent| extent.logical_end - extent.start)
-                .product::<u32>()
-        );
-    }
-}
-
-#[test]
 fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
     let mut random = fastrand::Rng::with_seed(0x7061_6464_6564_5f72);
     for case in 0..CASES * 8 {
@@ -1637,7 +1579,7 @@ fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhas
 
 #[test]
 fn general_graph_views_lower_to_correct_relative_copies() {
-    for rank in 2..=4 {
+    for rank in 2..=5 {
         for split in 0..rank {
             for merge in 0..rank {
                 if split == merge {

@@ -247,3 +247,107 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
         );
     }
 }
+
+#[test]
+fn attention_stages_support_multiple_configurations_and_block_sizes() {
+    let mut stages = Vec::new();
+    for head in [32, 64] {
+        for padded in [32, 64] {
+            for rows in [1, 3, 7] {
+                for keys in [1, padded / 2, padded] {
+                    stages.push((
+                        TileKernelSpec::AttentionSoftmax {
+                            head_dimension: head,
+                            key_columns: keys,
+                            padded_key_columns: padded,
+                        },
+                        rows,
+                    ));
+                }
+            }
+        }
+    }
+    for values in [16, 32] {
+        for rows in [1, 3, 7] {
+            stages.push((
+                TileKernelSpec::AttentionMerge {
+                    value_dimension: values,
+                    padded_value_dimension: values,
+                    key_block_columns: 64,
+                    initial: true,
+                    final_block: false,
+                },
+                rows,
+            ));
+        }
+    }
+    let mut plan = KernelBuildPlan::default();
+    plan.add_attention_stages(stages.clone()).unwrap();
+    // Four softmax dimension pairs and two merge dimension sets; query/key
+    // block sizes share their assembly workers rather than selecting extrema.
+    assert_eq!(
+        plan.compilations
+            .iter()
+            .filter(|compilation| compilation.source == "attention_stages_f16.S")
+            .count(),
+        6
+    );
+    for (kernel, rows) in stages {
+        let (inputs, expected) = match kernel {
+            TileKernelSpec::AttentionSoftmax {
+                key_columns,
+                padded_key_columns,
+                ..
+            } => (
+                1,
+                if key_columns == padded_key_columns {
+                    vec![]
+                } else {
+                    vec![rows, key_columns]
+                },
+            ),
+            TileKernelSpec::AttentionMerge { .. } => (2, vec![1, 0, rows]),
+            _ => unreachable!(),
+        };
+        let format = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_major(TensorTiling::replicated(1)),
+        };
+        let output = ShardView {
+            shard: LowShardId::from_index(0),
+            extents: [rows, 16]
+                .into_iter()
+                .enumerate()
+                .map(|(axis, size)| ShardExtent {
+                    axis: axis as u16,
+                    start: 0,
+                    logical_end: size,
+                    physical_end: size,
+                })
+                .collect(),
+        };
+        let run = KernelRun::new(
+            WorkProvenance {
+                operation: None,
+                value: None,
+                reason: WorkReason::OperatorKernel,
+            },
+            TileKernel::Planned(kernel),
+            (0..inputs)
+                .map(|_| crate::KernelOperand {
+                    views: vec![output.clone()],
+                })
+                .collect(),
+            output,
+            KernelRequirements::Operator(OperatorRequirements {
+                inputs: vec![OperandRequirement::new(format.clone(), 8); inputs],
+                output: OperandRequirement::new(format, 8),
+                output_aliasing: OutputAliasing::Fresh,
+                distinct_elements: Vec::new(),
+            }),
+        );
+        let call = plan.call(&run).unwrap();
+        assert_eq!(call.arguments, expected);
+        assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
+    }
+}

@@ -12,18 +12,6 @@
 #ifndef ATTENTION_KEY_BLOCK_COLUMNS
 #define ATTENTION_KEY_BLOCK_COLUMNS 64
 #endif
-#ifndef ATTENTION_SMALL_QUERY_ROWS
-#define ATTENTION_SMALL_QUERY_ROWS 1
-#endif
-#ifndef ATTENTION_LARGE_QUERY_ROWS
-#define ATTENTION_LARGE_QUERY_ROWS ATTENTION_SMALL_QUERY_ROWS
-#endif
-#ifndef ATTENTION_SMALL_KEY_ROWS
-#define ATTENTION_SMALL_KEY_ROWS ATTENTION_KEY_BLOCK_COLUMNS
-#endif
-#ifndef ATTENTION_LARGE_KEY_ROWS
-#define ATTENTION_LARGE_KEY_ROWS ATTENTION_KEY_BLOCK_COLUMNS
-#endif
 #ifndef ATTENTION_SCALE_BITS
 #define ATTENTION_SCALE_BITS 0x3e000000
 #endif
@@ -51,12 +39,11 @@
 	.set ATTENTION_VALUE_FULL_PANELS, ATTENTION_VALUE_DIMENSION / 16
 	.set ATTENTION_VALUE_TAIL_PAIRS, (ATTENTION_VALUE_DIMENSION % 16 + 1) / 2
 
-#if defined(ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY) || defined(ATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY)
-	// Callable supervisor ABI for softmax: m2 weights, m3 scores, m10 return.
-	// Query/key row counts are specialization constants placed in the shared
-	// worker argument block. The four public entries therefore share one worker
-	// implementation rather than cloning its loops for every edge-block shape.
-	.macro ATTENTION_SOFTMAX_ENTRY name, query_rows, key_rows
+#ifdef ATTENTION_SOFTMAX_SYMBOL
+	// Callable supervisor ABI for softmax: m2 weights, m3 scores, m4 query rows, m5 key rows, m10 return.
+	// Query/key row counts are call arguments. Every block shape shares the
+	// worker implementation for these head and padded-key dimensions.
+	.macro ATTENTION_SOFTMAX_ENTRY name
 	.section .text.\name,"ax",@progbits
 	.globl \name
 	.p2align 2
@@ -66,10 +53,8 @@
 	add $m11, $m11, -16
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
-	setzi $m0, \query_rows
-	st32 $m0, $m11, $m15, 2
-	setzi $m0, \key_rows
-	st32 $m0, $m11, $m15, 3
+	st32 $m4, $m11, $m15, 2
+	st32 $m5, $m11, $m15, 3
 #if ATTENTION_KEY_BLOCK_COLUMNS >= ATTENTION_WORKER_CONTEXTS * ATTENTION_PANEL_COLUMNS
 	setzi $m0, .Lattention_softmax_panel_max_worker
 	runall $m0, $m11, 0
@@ -92,14 +77,7 @@
 	.size \name, .-\name
 	.endm
 
-#ifdef ATTENTION_BUILD_ASSEMBLY_SOFTMAX_SMALL_KEY
-	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_small_query_small_key_f16, ATTENTION_SMALL_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS
-	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_large_query_small_key_f16, ATTENTION_LARGE_QUERY_ROWS, ATTENTION_SMALL_KEY_ROWS
-#endif
-#ifdef ATTENTION_BUILD_ASSEMBLY_SOFTMAX_LARGE_KEY
-	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_small_query_large_key_f16, ATTENTION_SMALL_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS
-	ATTENTION_SOFTMAX_ENTRY ipu_stack_attention_softmax_large_query_large_key_f16, ATTENTION_LARGE_QUERY_ROWS, ATTENTION_LARGE_KEY_ROWS
-#endif
+	ATTENTION_SOFTMAX_ENTRY ATTENTION_SOFTMAX_SYMBOL
 
 	.macro ATTENTION_SOFTMAX_MAX_PAIR
 	ld32 $a0, $m3, $m15, 0
@@ -695,9 +673,10 @@
 #endif
 #endif
 
+#ifdef ATTENTION_MERGE_SYMBOL
 	// Callable supervisor ABI for merge: m2 accumulator, m3 block values,
-	// m4 softmax state, m5 initial-block flag, m6 final-block flag, m10 return.
-	.macro ATTENTION_MERGE_ENTRY name, query_rows
+	// m4 softmax state, m5 initial-block flag, m6 final-block flag, m7 query rows, m10 return.
+	.macro ATTENTION_MERGE_ENTRY name
 	.section .text.\name,"ax",@progbits
 	.globl \name
 	.p2align 2
@@ -710,8 +689,7 @@
 	st32 $m4, $m11, $m15, 2
 	st32 $m5, $m11, $m15, 3
 	st32 $m6, $m11, $m15, 4
-	setzi $m0, \query_rows
-	st32 $m0, $m11, $m15, 5
+	st32 $m7, $m11, $m15, 5
 	setzi $m0, .Lattention_merge_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
@@ -720,8 +698,7 @@
 	.size \name, .-\name
 	.endm
 
-	ATTENTION_MERGE_ENTRY ipu_stack_attention_merge_small_query_f16, ATTENTION_SMALL_QUERY_ROWS
-	ATTENTION_MERGE_ENTRY ipu_stack_attention_merge_large_query_f16, ATTENTION_LARGE_QUERY_ROWS
+	ATTENTION_MERGE_ENTRY ATTENTION_MERGE_SYMBOL
 
 	.macro ATTENTION_MERGE_INITIAL_PAIR
 	ld32 $a0, $m1, $m15, 0
@@ -853,3 +830,5 @@
 	brnz $m0, .Lattention_merge_row
 .Lattention_merge_done:
 	exitz $m15
+
+#endif // ATTENTION_MERGE_SYMBOL
