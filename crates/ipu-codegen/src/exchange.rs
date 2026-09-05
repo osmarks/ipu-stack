@@ -1214,237 +1214,45 @@ fn optimize_owned_pending(
     })
 }
 
-fn critical_transfer_indices(schedule: &MaterializedSchedule) -> BTreeSet<usize> {
-    let maximum_end = schedule
-        .timings
-        .iter()
-        .flatten()
-        .map(|timing| timing.end)
-        .max()
-        .unwrap_or(0);
-    let mut pending = schedule
-        .timings
-        .iter()
-        .enumerate()
-        .filter_map(|(index, timing)| {
-            timing
-                .as_ref()
-                .is_some_and(|timing| timing.end == maximum_end)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let mut critical = BTreeSet::new();
-    while let Some(index) = pending.pop() {
-        if critical.insert(index)
-            && let Some(predecessor) = schedule.timings[index].and_then(|timing| timing.predecessor)
-        {
-            pending.push(predecessor);
-        }
-    }
-    critical
-}
-
+/// Compare complete width choices. A single width change can leave another
+/// path tied at the horizon, so individually profitable transfers are not a
+/// useful prerequisite for pairing. This bounds search to two optimizations.
 fn select_transfer_widths(
     phase: u32,
     topology: &Topology,
-    ordinary_pending: Vec<PendingTransfer>,
+    pending: Vec<PendingTransfer>,
     tile_count: u16,
 ) -> Result<ScheduledPending, ExchangeLoweringError> {
-    let alternatives = paired_transfer_alternatives(&ordinary_pending, topology, tile_count)?;
-    let candidate_count = alternatives.iter().flatten().count();
-    let ordinary = optimize_owned_pending(topology, ordinary_pending.clone(), tile_count)?;
-    if candidate_count == 0 {
-        return Ok(ordinary);
+    let alternatives = paired_transfer_alternatives(&pending, topology, tile_count)?;
+    let candidates = alternatives.iter().flatten().count();
+    if candidates == 0 {
+        return optimize_owned_pending(topology, pending, tile_count);
     }
-
+    let paired = pending
+        .iter()
+        .zip(alternatives)
+        .map(|(ordinary, paired)| paired.unwrap_or_else(|| ordinary.clone()))
+        .collect();
+    let ordinary = optimize_owned_pending(topology, pending, tile_count)?;
+    let paired = match optimize_owned_pending(topology, paired, tile_count) {
+        Ok(paired) => paired,
+        Err(error) => {
+            tracing::debug!(phase, %error, "paired exchange candidate is not encodable");
+            return Ok(ordinary);
+        }
+    };
     let ordinary_horizon = ordinary.optimized.schedule.horizon;
-    let critical = critical_transfer_indices(&ordinary.optimized.schedule);
-    let critical_candidates = alternatives
-        .iter()
-        .enumerate()
-        .filter_map(|(index, alternative)| {
-            (alternative.is_some() && critical.contains(&index)).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    if critical_candidates.is_empty() {
-        tracing::info!(
-            phase,
-            candidate_count,
-            ordinary_horizon,
-            "no paired transfer contributes to the ordinary schedule's critical path"
-        );
-        return Ok(ordinary);
-    }
-
-    let order = &ordinary.optimized.schedule.order;
-    let individual_trials = critical_candidates
-        .par_iter()
-        .map(|&index| {
-            let mut trial = ordinary_pending.clone();
-            trial[index] = alternatives[index]
-                .clone()
-                .expect("critical candidate has a paired alternative");
-            materialize_schedule_order(
-                topology,
-                &trial,
-                &ordinary.incoming_bases,
-                &ordinary.receive_counts,
-                tile_count,
-                order,
-            )
-            .map(|schedule| (index, schedule.horizon))
-        })
-        .collect::<Vec<_>>();
-    let mut rejected = 0usize;
-    let mut beneficial = individual_trials
-        .into_iter()
-        .filter_map(|trial| match trial {
-            Ok((index, horizon)) if horizon < ordinary_horizon => Some((index, horizon)),
-            Ok(_) => None,
-            Err(_) => {
-                rejected += 1;
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    beneficial.sort_unstable_by_key(|&(index, horizon)| (horizon, index));
-    if beneficial.is_empty() {
-        tracing::info!(
-            phase,
-            candidate_count,
-            critical_candidates = critical_candidates.len(),
-            rejected_candidates = rejected,
-            ordinary_horizon,
-            "no individual paired transfer shortens the exchange critical path"
-        );
-        return Ok(ordinary);
-    }
-
-    let mut selected = vec![beneficial[0].0];
-    let (mut pending, mut schedule) = materialize_width_selection(
-        topology,
-        &ordinary_pending,
-        &alternatives,
-        &selected,
-        &ordinary.incoming_bases,
-        &ordinary.receive_counts,
-        tile_count,
-        order,
-    )?;
-    let mut remaining = beneficial
-        .iter()
-        .skip(1)
-        .map(|&(index, _)| index)
-        .collect::<Vec<_>>();
-    let mut subset_trials = 0usize;
-    let mut subset_steps = 0usize;
-    while !remaining.is_empty() {
-        subset_trials += remaining.len();
-        let additions = remaining
-            .par_iter()
-            .map(|&index| {
-                let mut trial = selected.clone();
-                trial.push(index);
-                materialize_width_selection(
-                    topology,
-                    &ordinary_pending,
-                    &alternatives,
-                    &trial,
-                    &ordinary.incoming_bases,
-                    &ordinary.receive_counts,
-                    tile_count,
-                    order,
-                )
-                .map(|(_, schedule)| (index, schedule.horizon))
-            })
-            .collect::<Vec<_>>();
-        let next = additions
-            .into_iter()
-            .filter_map(Result::ok)
-            .min_by_key(|&(index, horizon)| (horizon, index));
-        let Some((index, horizon)) = next.filter(|(_, horizon)| *horizon < schedule.horizon) else {
-            break;
-        };
-        selected.push(index);
-        (pending, schedule) = materialize_width_selection(
-            topology,
-            &ordinary_pending,
-            &alternatives,
-            &selected,
-            &ordinary.incoming_bases,
-            &ordinary.receive_counts,
-            tile_count,
-            order,
-        )?;
-        debug_assert_eq!(schedule.horizon, horizon);
-        remaining.retain(|&candidate| candidate != index);
-        subset_steps += 1;
-    }
-    let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
-    let optimized = improve_pending_schedule(
-        topology,
-        &pending,
-        &incoming_bases,
-        &receive_counts,
-        tile_count,
-        schedule,
-        "transfer-width",
-    )?;
+    let paired_horizon = paired.optimized.schedule.horizon;
+    let use_paired = paired_horizon < ordinary_horizon;
     tracing::info!(
         phase,
-        candidate_count,
-        critical_candidates = critical_candidates.len(),
-        individually_beneficial = beneficial.len(),
-        rejected_candidates = rejected,
-        selected_transfers = selected.len(),
-        subset_trials,
-        subset_steps,
+        candidates,
         ordinary_horizon,
-        selected_horizon = optimized.schedule.horizon,
-        "selected exchange width per transfer"
+        paired_horizon,
+        use_paired,
+        "compared ordinary and paired exchange schedules"
     );
-    Ok(ScheduledPending {
-        pending,
-        receive_counts,
-        incoming_bases,
-        optimized,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn materialize_width_selection(
-    topology: &Topology,
-    ordinary: &[PendingTransfer],
-    alternatives: &[Option<PendingTransfer>],
-    selected: &[usize],
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    tile_count: u16,
-    order: &[usize],
-) -> Result<(Vec<PendingTransfer>, MaterializedSchedule), ExchangeLoweringError> {
-    let selected = selected.iter().copied().collect::<BTreeSet<_>>();
-    let pending = ordinary
-        .iter()
-        .enumerate()
-        .map(|(index, transfer)| {
-            if selected.contains(&index) {
-                alternatives[index]
-                    .clone()
-                    .unwrap_or_else(|| transfer.clone())
-            } else {
-                transfer.clone()
-            }
-        })
-        .collect::<Vec<_>>();
-    let schedule = materialize_schedule_order(
-        topology,
-        &pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-        order,
-    )?;
-    Ok((pending, schedule))
+    Ok(if use_paired { paired } else { ordinary })
 }
 
 fn optimize_pending_schedule(
@@ -3313,6 +3121,43 @@ mod tests {
                 second.neighborhood_improvements
             );
         }
+    }
+
+    #[test]
+    fn width_selection_compares_complete_paired_schedules() {
+        let topology = Topology::c600();
+        let problem = ExchangeScheduleProblem {
+            phase: 0,
+            transfers: [0, 4]
+                .into_iter()
+                .map(|source| ExchangeScheduleTransfer {
+                    source,
+                    source_addresses: vec![0x8_0000],
+                    destinations: [source + 2, source + 3]
+                        .into_iter()
+                        .map(|tile| ExchangeScheduleDestination {
+                            tile,
+                            address: 0x8_8000,
+                        })
+                        .collect(),
+                    words: 4096,
+                    width: ExchangeItemWidth::Word32,
+                })
+                .collect(),
+        };
+        let pending = pending_from_problem(8, &problem).unwrap();
+        let ordinary = optimize_owned_pending(&topology, pending.clone(), 8).unwrap();
+        let selected = select_transfer_widths(0, &topology, pending, 8).unwrap();
+        assert!(
+            selected
+                .pending
+                .iter()
+                .all(|transfer| transfer.width == ExchangeItemWidth::Paired64)
+        );
+        assert!(selected.optimized.schedule.horizon < ordinary.optimized.schedule.horizon);
+        let paired = schedule_problem(0, &selected.pending);
+        let run = schedule_exchange_problem(8, &paired).unwrap();
+        validate_exchange_schedule(8, &paired, &run.phase).unwrap();
     }
 
     #[test]

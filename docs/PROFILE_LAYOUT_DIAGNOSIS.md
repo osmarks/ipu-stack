@@ -278,3 +278,155 @@ regression is the new padding-clear tail plus the longer redistribution schedule
 buffers when `CopyPlan.clear_padding` is set. Required K padding cannot simply
 be left uninitialized. Clearing only uncovered physical ranges is the next
 specific optimization; it has not been implemented in this checkpoint.
+
+
+## Padding, SRAM placement and paired transfers (2026-09-05 follow-up)
+
+### Padding is read, but whole-buffer clearing is excessive
+
+Controlled full-MLP hardware runs distinguish zero padding from irrelevant data:
+
+| Historical grids, current compiler | Numerical result | Maximum tile cycles |
+|---|---|---:|
+| Normal zero initialization | PASS, error 0.011719 | 232,722 |
+| Omit copy destination clears | PASS, error 0.011719 | 219,384 |
+| Fill tails with alternating finite 1.0/0.0 | PASS, error 0.011719 | 232,734 |
+| Fill tails with alternating half NaN/0.0 | All 839,808 outputs NaN | — |
+
+The automatic grid also passes with clears omitted (221,352 cycles versus
+229,314). Thus the omission is not necessarily a numerical failure on a fresh
+run. Host packing zeroes weight padding, so finite activation garbage in padded
+K is multiplied by zero. NaNs are not neutralized by those weights. A destination
+with K range 4032..4304 is physically read through 4320; those last 16 entries
+are real kernel reads. The diagnostic modified the fill helper to use immediate
+`setzi` values and left all subsequent copies unchanged. No diagnostic runtime
+or clear suppression is retained in production.
+
+The historical profile has no equivalent fills, but no corresponding historical
+package is available to prove its initialization/reuse contract. The evidence
+supports retaining initialization of unwritten K tails, not clearing every byte
+of every destination. Row-only padding also triggers whole-buffer clears even
+though padded output rows are not observable. A future optimization should clear
+only uncovered ranges, or prove an existing producer/initialization already
+establishes the required padding. It must not assume uninitialized half values
+are finite. Current initialization is deliberately unchanged in this checkpoint.
+
+Inputs: `/tmp/historical-{no-clear,finite-clear,poison-clear}.log`,
+`/tmp/automatic-no-clear.log`. The poison comparison rejects NaNs even though its
+existing diagnostic prints a misleading maximum absolute error of zero.
+
+### The exchange regression comes from placement-sensitive scheduling
+
+The saved historical snapshot and a fresh reconstruction have exactly the same
+multiset of sources, destinations and transfer lengths in every phase. Phase 2
+has 5,562 transfers, 118,812 destination endpoints, 4,057,128 source words and
+47,503,680 delivered words in both. Replaying the historical snapshot with the
+current word scheduler gives its original 45,670-cycle horizon. Reordering the
+new snapshot to historical geometry order does not recover it.
+
+| Phase-2 snapshot experiment | Word horizon | Paired horizon after lane fix |
+|---|---:|---:|
+| Saved historical addresses | 45,670 | 33,081 |
+| Reconstructed current addresses | 54,090 | 41,599 |
+| Current interleaved addresses shifted together by 4 KiB | 46,056 | 33,081 |
+
+The reconstructed standalone replay differs slightly from the prior packaged
+53,856-cycle schedule: package construction may reuse a provisional ordering.
+Use the same captured replay input when isolating scheduler changes.
+
+All source and destination addresses in interleaved SRAM were shifted together,
+preserving data dependencies and payloads. The word relocation passed hardware
+replay (8,192 checked words); the paired relocation passed offline validation.
+This is an address-placement experiment, not a proposed universal 4 KiB offset
+or a complete relocated MLP package. Other offsets were worse: 8 KiB gave
+51,433 word cycles, 16 KiB 57,826, and 32 KiB restored 54,090.
+
+The effective interleaved memory-element size is 32 KiB. Placement changes which
+simultaneous sends and receives contend for these elements. The raw number of
+potentially conflicting transfer pairs even falls from 9,464 to 8,915; their
+position in the critical schedule matters more than their count. For example,
+tile 0's activation sends begin at 0x81140 historically and 0x80000 now; its
+incoming weights begin at 0x82280 and 0x81140 respectively. The aggregate traffic
+and endpoint-only lower bound do not capture this change.
+
+Reproduction inputs: `profiles/siglip-mlp-f16-b1-scheduler-integrated.exchange-schedule.json`,
+`/tmp/historical-current-exchange.json`, `/tmp/interleaved-shift-4096.json` and
+`/tmp/paired-interleaved-shift.json`. Replay with
+`target/release/ipu-exchange-schedule-bench SNAPSHOT --phase 2`.
+
+### Paired transfers were overconstrained
+
+The sender's paired transfer borrows its partner's transmit lane, but the
+scheduler reserved BOTH directions on that partner. Hardware verifies that the
+partner can receive concurrently. In the first 64-tile probe, the borrowed lane
+is occupied during cycles 31..2079 and a normal receive on that tile runs during
+165..2213. All 8,192 sampled words pass. Both source-pair orientations and both
+scheduling orders were subsequently checked. Unit coverage also checks that a
+local send still cannot overlap the borrowed transmit lane.
+
+The fix applies consistently to the ready queue, exact row builder, critical
+neighborhood ordering, predecessor bookkeeping, endpoint lower bound and
+schedule validator. The row builder retains the borrowed transmit horizon
+separately from receive events. This is committed as 0f90bf7.
+
+Before the fix, pairing all 4,028 eligible phase-2 transfers was worse:
+57,741 cycles on old addresses and 57,122 on new addresses. Source-cohort trials
+found only a tiny historical improvement (45,624) and a modest current one
+(51,301). After the fix, pairing all eligible transfers gives the much better
+33,081/41,599 horizons above. Both complete phases passed hardware replay with
+65,536 checked words each.
+
+The previous per-transfer search required an individual substitution to reduce
+the global horizon before exploring combinations. It could miss improvements
+across tied paths and rebuilt the entire phase for every trial. The replacement
+compares ordinary transfers with all eligible paired transfers, reoptimizing
+both complete choices and accepting pairing only for a strictly shorter horizon.
+It performs at most two optimization calls and preserves the ordinary fallback.
+The existing provisional/final-placement reuse still validates actual rows.
+
+The experiment worktree `../ipu-stack-exchange-scheduler` was also reviewed.
+Its August 15 brief explicitly models simultaneous send/receive and SRAM hazards;
+these experiments were not all from before full duplex. For example, the exact
+checkpoint beam evaluated 32,640 alternatives on the old phase-3 fixture and
+still finished at 16,388 cycles. Those marginal results do not test the corrected
+paired-lane model. None of that search machinery was imported.
+
+### Whole-program result and remaining imbalance
+
+| Full MLP, with normal zero initialization | Before lane/search fix | After |
+|---|---:|---:|
+| Automatic maximum tile cycles | 229,314 | 222,408 |
+| Historical-grid maximum tile cycles | 232,722 | 221,124 |
+| Automatic cropped profile span | 228,654 | 221,742 |
+| Historical-grid cropped profile span | 225,930 | 214,332 |
+
+Full MLP numerical checks pass with error 0.011719. Builds plus hardware checks
+took 72.32 seconds automatically and 23.56 seconds with forced historical grids.
+Profiles: `artifacts/profiles/mlp-paired-fixed.html` and
+`artifacts/profiles/mlp-historical-paired-fixed.html`. The automatic profile was
+inspected in Chromium. Projected attention remains at 523,980 profile cycles and
+passes all 839,808 numerical checks, error 0.001230.
+
+The current MLP's visibly worse balance is real. First GEMM: 495 tiles have 16
+output columns while 963 have 32, with kernel durations about 27–28k and 54–56k
+cycles. Historically only 112 tiles had 32 columns while 1,360 had 48; their
+kernels took about 32k and 48k. Measured compute duty before the first reduction
+exchange falls from 96.4% to 78.8%. The final reduction's longest call rises from
+8,094 to 14,328 cycles (15 versus 27 partials), although the first reduction gets
+cheaper. These are different selected workloads per tile, not slower identical
+kernels. Compact costing does price maximum local geometry, but its coarse
+exchange model lacks physical bank placement, exact fragmentation and overlap.
+The automatic and forced historical compact estimates differ by only about 1%.
+
+The next useful targets are selective padding clears, placement feedback that
+accounts for exchange SRAM conflicts, and better tradeoffs between output-column
+balance and reduction fan-in. A more complicated global scheduler search is not
+required to explain the regressions observed here.
+
+Validation for the completed checkpoint: all 158 workspace release tests and
+strict workspace Clippy pass. Hardware checks pass the four paired-lane probes,
+both complete paired MLP exchange replays, both full MLP layouts, GEMM and batched
+GEMM smoke, attention smoke, repeated MLP, projected attention, and forced
+materialized attention (839,808 checks, maximum error 0.000930). Logs are
+`/tmp/paired-portfolio-{tests,clippy}.log`, `/tmp/paired-final-validation-results.log`
+and `/tmp/paired-validated-*.log`.

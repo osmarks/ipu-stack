@@ -479,3 +479,20 @@ Hardware: automatic MLP 327,144 -> 229,314 maximum tile cycles; projected attent
 tradeoffs and the historical padding/redistribution regression are recorded in
 [the profile diagnosis](PROFILE_LAYOUT_DIAGNOSIS.md#execution-cost-shortlisting-2026-09-05).
 Q/K/V batching remains on its separate experiment branch.
+
+
+## Paired transmit reservation and bounded width selection
+
+Hardware probes exposed an overconstraint: a paired send borrows its partner's
+transmit lane while the partner can still receive. Corrected row scheduling,
+validation and lower bounds (0f90bf7). Replaced the expensive individual-width
+search with a bounded ordinary/all-eligible-paired comparison. The two changes
+remove about 100 Rust lines overall, including added regressions.
+
+MLP maximum tile cycles fall from 229,314 to 222,408 automatically, and from
+232,722 to 221,124 with reconstructed historical grids. NaN-tail injection proves
+that padding reads remain observable; finite-tail controls pass because weights
+are zero-padded. Whole-buffer clears remain a separate optimization opportunity.
+An isolated 4 KiB interleaved relocation recovers the historical paired exchange
+horizon without changing traffic. Detailed experiments and remaining grid
+imbalance are in [the profile diagnosis](PROFILE_LAYOUT_DIAGNOSIS.md#padding-sram-placement-and-paired-transfers-2026-09-05-follow-up).

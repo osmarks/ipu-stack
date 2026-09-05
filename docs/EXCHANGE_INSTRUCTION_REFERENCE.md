@@ -191,3 +191,21 @@ For an ipu-stack failure, inspect in this order:
 
 This ordering localizes a fault to lowering, scheduling, encoding, placement,
 or execution instead of inferring all five from a high-level numerical failure.
+
+
+## Paired sender lane reservation
+
+Hardware replay on 2026-09-05 verifies that a paired-width sender borrows only
+its physical partner's transmit lane. The partner can receive an ordinary
+transfer during that interval. Reserving its receive lane as well needlessly
+serializes full-duplex work. Local sends and other borrowed transmissions must
+still be excluded. The source tile's own SRAM hazards remain unchanged; borrowing
+the partner's transmit lane does not read the partner's SRAM.
+
+A 64-tile probe sends 4,096 words from logical tile 0 to the receiver pair 2/3
+using paired width, while tile 4 sends 2,048 ordinary words to tile 1. Borrowing
+occupies 31..2079 and receiving occupies 165..2213; hardware readback passes.
+Both pair orientations and the reversed construction order are covered by
+`borrowed_transmit_lane_allows_receive_but_excludes_local_send` in codegen tests.
+The complete historical and reconstructed MLP exchange phases also pass paired
+hardware replay. See [the layout diagnosis](PROFILE_LAYOUT_DIAGNOSIS.md#paired-transfers-were-overconstrained).
