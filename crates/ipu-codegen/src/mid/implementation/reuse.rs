@@ -23,12 +23,13 @@ impl BlockBuilder {
             .chain(std::iter::once(output))
             .collect::<Vec<_>>();
         let MidOperationKind::Operator {
-            implementation: Some(fragment),
+            implementation: Some(implementation),
             ..
         } = &operation.kind
         else {
             return Ok(false);
         };
+        let fragment = implementation;
         let mut ids = vec![None; fragment.shards.len()];
         for blocks in &fragment.values {
             let actual = self.value_shards(boundary[blocks.value.index() as usize])?;

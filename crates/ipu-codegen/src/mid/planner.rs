@@ -22,6 +22,34 @@ pub(crate) fn plan_finalists(
     costs: &impl CostModel,
     finalist_count: usize,
 ) -> LoweringResult<Vec<ImplementationCandidate>> {
+    // Fragment construction allocates substantially more than scalar costing.
+    // Use a fixed small pool instead of spreading allocator arenas over every
+    // logical CPU on large build hosts. Concurrent planners share this bound.
+    static POOL: std::sync::OnceLock<Result<rayon::ThreadPool, String>> =
+        std::sync::OnceLock::new();
+    let pool = POOL
+        .get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(
+                    std::thread::available_parallelism()
+                        .map_or(1, usize::from)
+                        .min(8),
+                )
+                .thread_name(|index| format!("ipu-plan-{index}"))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| LoweringError::PlanningThreads(error.clone()))?;
+    pool.install(|| plan_in_pool(graph, config, costs, finalist_count))
+}
+
+fn plan_in_pool(
+    graph: &ComputeGraph,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    finalist_count: usize,
+) -> LoweringResult<Vec<ImplementationCandidate>> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -515,6 +543,9 @@ pub(super) fn lower_operation_candidates(
             )
             .chain(constraints.allocation_copies.keys().copied())
             .collect::<BTreeSet<_>>();
+        // Region construction is reserved for this wider shortlist. The
+        // preliminary score uses boundary storage and conversion costs.
+        let screening_width = config.planning_beam_width.max(1).saturating_mul(4);
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
@@ -550,36 +581,7 @@ pub(super) fn lower_operation_candidates(
                     &mut next.state,
                     &mut next.operations,
                 )?;
-                let peak = beam_memory_peak(
-                    costs,
-                    &next,
-                    &initial,
-                    source,
-                    operation_index,
-                    required_outputs,
-                    graph,
-                    &constraints.allocation_copies,
-                );
-                if peak.fits_ipu21_with_budget(
-                    config.standard_memory_reservation_bytes,
-                    config.tile_memory_budget_bytes,
-                ) {
-                    next.peak_memory = peak;
-                    expanded.push(next);
-                } else {
-                    tracing::trace!(
-                        operation = operation.id.index(),
-                        standard = peak.standard,
-                        interleaved = peak.interleaved,
-                        total = peak.total,
-                        contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
-                            config.standard_memory_reservation_bytes,
-                        ),
-                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan()),
-                        "rejected planning branch for memory"
-                    );
-                    rejected_memory.push(peak);
-                }
+                expanded.push(next);
                 continue;
             }
             let input_ids = operation
@@ -676,6 +678,17 @@ pub(super) fn lower_operation_candidates(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            let candidate_plans = if matches!(operation.kind, OperationKind::Gemm(_)) {
+                retain_operator_candidates(
+                    candidate_plans,
+                    &input_types,
+                    &output_shape,
+                    costs,
+                    config.planning_beam_width.max(1),
+                )
+            } else {
+                candidate_plans
+            };
             let candidate_plans = candidate_plans
                 .into_iter()
                 .flat_map(|plan| {
@@ -713,63 +726,95 @@ pub(super) fn lower_operation_candidates(
                         &mut next.state,
                         &mut next.operations,
                     );
-                    let peak = beam_memory_peak(
-                        costs,
-                        &next,
-                        &initial,
-                        source,
-                        operation_index,
-                        required_outputs,
-                        graph,
-                        &constraints.allocation_copies,
-                    );
-                    (next, peak)
+                    let boundary = next.operations.last().unwrap();
+                    let tensors = boundary
+                        .inputs
+                        .iter()
+                        .chain(&boundary.results)
+                        .map(|id| &next.state.get(*id).tensor_type);
+                    let mut usage = MemoryUsage::default();
+                    let mut maximum_standard = 0;
+                    for tensor in tensors {
+                        let memory = crate::estimate::tensor_memory(tensor);
+                        usage = usage.saturating_add(memory);
+                        maximum_standard = maximum_standard.max(memory.standard);
+                    }
+                    next.peak_memory.observe(usage, maximum_standard);
+                    next
                 })
                 .collect::<Vec<_>>();
-            for (mut next, peak) in evaluated {
-                let fits = peak.fits_ipu21_with_budget(
-                    config.standard_memory_reservation_bytes,
-                    config.tile_memory_budget_bytes,
-                );
-                if fits || branch_contains_gemm_constraint(&next, config) {
-                    if !fits {
-                        tracing::debug!(
-                            operation = operation.id.index(),
-                            standard = peak.standard,
-                            interleaved = peak.interleaved,
-                            total = peak.total,
-                            "retained constrained GEMM past conservative memory estimate"
-                        );
-                    }
-                    next.peak_memory = peak;
-                    expanded.push(next);
-                } else {
-                    tracing::trace!(
-                        operation = operation.id.index(),
-                        standard = peak.standard,
-                        interleaved = peak.interleaved,
-                        total = peak.total,
-                        contiguous_overflow = peak.standard_contiguous_overflow_with_reservation(
-                            config.standard_memory_reservation_bytes,
-                        ),
-                        plan = ?next.operations.last().and_then(|operation| operation.operator_plan()),
-                        "rejected planning branch for memory"
-                    );
-                    rejected_memory.push(peak);
-                }
-            }
+            expanded.extend(evaluated);
             // Prune between parent branches as well as at the end of the
             // operation. Executable fragments can be large; retaining every
             // rejected Cartesian-product branch defeats the planning beam.
-            if expanded.len() > config.planning_beam_width.max(1).saturating_mul(2) {
+            if expanded.len() > screening_width.saturating_mul(2) {
                 expanded = retain_pareto_beam(
                     expanded,
                     &future_origins,
                     constraints,
                     costs,
-                    config.planning_beam_width.max(1),
+                    screening_width,
                 )
                 .0;
+            }
+        }
+        let shortlisted = retain_pareto_beam(
+            expanded,
+            &future_origins,
+            constraints,
+            costs,
+            screening_width,
+        )
+        .0;
+        let evaluated = shortlisted
+            .into_par_iter()
+            .map(|mut branch| {
+                // Construct only shortlisted implementations, retaining the
+                // fragments that the region builder will bind below.
+                for operation in &mut branch.operations {
+                    if let MidOperationKind::Operator {
+                        plan,
+                        implementation,
+                        ..
+                    } = &mut operation.kind
+                        && implementation.is_none()
+                    {
+                        let inputs = operation
+                            .inputs
+                            .iter()
+                            .map(|id| branch.state.get(*id).tensor_type.clone())
+                            .collect::<Vec<_>>();
+                        *implementation = costs.implementation(
+                            plan,
+                            &inputs,
+                            &branch.state.get(operation.results[0]).tensor_type,
+                        );
+                    }
+                }
+                let peak = beam_memory_peak(
+                    costs,
+                    &branch,
+                    &initial,
+                    source,
+                    operation_index,
+                    required_outputs,
+                    graph,
+                    &constraints.allocation_copies,
+                );
+                branch.peak_memory = peak;
+                (branch, peak)
+            })
+            .collect::<Vec<_>>();
+        let mut expanded = Vec::new();
+        for (branch, peak) in evaluated {
+            if peak.fits_ipu21_with_budget(
+                config.standard_memory_reservation_bytes,
+                config.tile_memory_budget_bytes,
+            ) || branch_contains_gemm_constraint(&branch, config)
+            {
+                expanded.push(branch);
+            } else {
+                rejected_memory.push(peak);
             }
         }
         if expanded.is_empty() {
@@ -1266,18 +1311,17 @@ pub(super) fn apply_selected_plan(
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
-    let implementation =
-        costs.implementation(&plan, &converted_types, &state.get(result).tensor_type);
     let mut operator_cycles = costs
         .operator_cycle_override(&plan, &converted_types, &state.get(result).tensor_type)
         .unwrap_or_else(|| {
-            implementation
-                .as_ref()
-                .map_or(u64::MAX, |built| built.program.estimated_cycles)
+            converted_types
+                .iter()
+                .chain(std::iter::once(&state.get(result).tensor_type))
+                .map(crate::estimate::maximum_shard_bytes)
+                .fold(0u64, u64::saturating_add)
+                .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
         });
-    let mut operator_exchange_cycles = implementation
-        .as_ref()
-        .map_or(u64::MAX, |built| built.program.estimated_exchange_cycles);
+    let mut operator_exchange_cycles = 0u64;
     // Preliminary transition prices remain useful for custom planning models.
     // Normal detailed ranking evaluates the emitted region, including movement.
     for ((source, input), requirement) in source_types
@@ -1353,14 +1397,6 @@ pub(super) fn apply_selected_plan(
         output_layout = ?state.get(result).tensor_type.format.layout,
         "costed operator plan"
     );
-    let exchange = implementation
-        .as_ref()
-        .map_or(ExchangeFootprint::default(), |built| built.exchange);
-    let memory = implementation
-        .as_ref()
-        .map_or_else(crate::estimate::unavailable_operator_memory, |built| {
-            built.memory
-        });
     if let Some(offer) = &mut plan.deferred_output {
         offer.unfused_cycles = operator_cycles;
         offer.unfused_exchange_cycles = operator_exchange_cycles;
@@ -1373,13 +1409,11 @@ pub(super) fn apply_selected_plan(
         results: vec![result],
         kind: MidOperationKind::Operator {
             plan,
-            exchange,
             deferred_inputs,
-            implementation: implementation.map(|built| std::sync::Arc::clone(&built.program)),
+            implementation: None,
         },
         estimated_cycles: operator_cycles,
         estimated_exchange_cycles: operator_exchange_cycles,
-        memory,
     });
     values.insert(operation.results[0], result);
 }
@@ -1657,10 +1691,6 @@ pub(super) fn lower_repeat(
         &state.values,
         &body_allocation_multiplicity,
     );
-    let body_exchange_row_bytes = body_operations
-        .iter()
-        .map(|operation| operation.memory.exchange_row_bytes)
-        .fold(0u64, u64::saturating_add);
     let mut results = Vec::new();
     for (origin, input) in operation.results.iter().zip(&inputs) {
         let tensor_type = state.get(*input).tensor_type.clone();
@@ -1688,13 +1718,6 @@ pub(super) fn lower_repeat(
         }),
         estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
         estimated_exchange_cycles: body_exchange_cost.saturating_mul(u64::from(repeat.count)),
-        memory: MemoryEstimate {
-            live: body_peak.conservative_tensor_usage(),
-            temporary: MemoryUsage::default(),
-            peak: body_peak.conservative_tensor_usage(),
-            exchange_row_bytes: body_exchange_row_bytes,
-            maximum_standard_temporary_allocation: 0,
-        },
     });
     Ok(())
 }
@@ -1746,10 +1769,6 @@ pub(super) fn ensure_format(
                 &output.format.layout,
             )
         };
-        let mut memory = conversion_memory_estimate(&input, &output);
-        if input.format.layout.tiling != output.format.layout.tiling {
-            memory.exchange_row_bytes = cost.exchange_row_bytes;
-        }
         let result = state.derived_value(value, output.clone());
         operations.push(MidOperation {
             source: Some(source),
@@ -1766,7 +1785,6 @@ pub(super) fn ensure_format(
             }),
             estimated_cycles: cost.cycles,
             estimated_exchange_cycles: cost.exchange_cycles,
-            memory,
         });
         value = result;
     }

@@ -51,12 +51,9 @@ use planner::*;
 
 use crate::estimate::MemoizedCostModel;
 pub use crate::estimate::{
-    CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel, MemoryEstimate, MemoryPeaks,
-    MemoryUsage,
+    CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, MemoryPeaks, MemoryUsage,
 };
-use crate::estimate::{
-    conversion_memory_estimate, region_peak_memory, region_peak_memory_with_multiplicity,
-};
+use crate::estimate::{region_peak_memory, region_peak_memory_with_multiplicity};
 use crate::graph::{
     AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
     OperationId, OperationKind, Repeat, TensorShape, ValueId,
@@ -268,7 +265,6 @@ pub struct MidValue {
 pub enum MidOperationKind {
     Operator {
         plan: OperatorPlan,
-        exchange: ExchangeFootprint,
         deferred_inputs: Vec<Option<DeferredInputPlan>>,
         implementation: Option<std::sync::Arc<MidProgram>>,
     },
@@ -284,7 +280,6 @@ pub struct MidOperation {
     pub kind: MidOperationKind,
     pub estimated_cycles: u64,
     pub estimated_exchange_cycles: u64,
-    pub memory: MemoryEstimate,
 }
 
 impl MidOperation {
@@ -357,6 +352,8 @@ pub struct ImplementationCandidate {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LoweringError {
+    #[error("cannot create planning worker pool: {0}")]
+    PlanningThreads(String),
     #[error(transparent)]
     Blocks(#[from] BlockBuildError),
     #[error(transparent)]

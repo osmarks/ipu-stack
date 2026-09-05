@@ -249,3 +249,20 @@ general layout-conversion chains; neither is claimed by the contiguous-copy pass
   were stopped during planning. Further performance and hardware validation is
   required before considering #1 complete. Logs: `/tmp/concrete-mid-*`,
   `/tmp/bounded-mid-*`, `/tmp/scheduled-repeat-test.log`.
+
+Planning retention follow-up:
+
+- Fixed the candidate-shortlist width bug when diversity representatives exceeded
+  the requested width. Added a regression. Screening does not discard candidates
+  when the entire set already fits the shortlist.
+- Cheap boundary costs shortlist branches before executable-fragment construction;
+  detailed ranking and memory feasibility still use complete emitted regions.
+  A shared eight-worker pool bounds simultaneous construction on large hosts.
+- Replaced speculative strong-cache retention/eviction with weak references to
+  fragments owned by surviving branches. Removed `MemoryEstimate`, redundant
+  operator exchange summaries and `ImplementationEstimate`; allocation analysis
+  now computes only the region peaks actually consumed by planning.
+- All 146 release workspace tests and strict Clippy pass (`/tmp/lazy-fragment-*`).
+  GEMM and batched GEMM hardware pass at about one second end-to-end and ~100 MiB
+  peak host RSS (`/tmp/concrete-mid-v8-*`). Full-size MLP/attention performance and
+  hardware validation remain in progress; do not claim them complete yet.

@@ -698,22 +698,11 @@ fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
             "random case {case}"
         );
         for finalist in &finalists {
+            let program = build_blocks(finalist).unwrap();
+            let cycles = crate::estimate::program_cycles(&program, None).unwrap();
+            assert_eq!(program.estimated_cycles, cycles.total, "random case {case}");
             assert_eq!(
-                finalist.estimated_cycles,
-                finalist
-                    .operations
-                    .iter()
-                    .map(|operation| operation.estimated_cycles)
-                    .sum::<u64>(),
-                "random case {case}"
-            );
-            assert_eq!(
-                finalist.estimated_exchange_cycles,
-                finalist
-                    .operations
-                    .iter()
-                    .map(|operation| operation.estimated_exchange_cycles)
-                    .sum::<u64>(),
+                program.estimated_exchange_cycles, cycles.exchange,
                 "random case {case}"
             );
             assert!(
@@ -1278,4 +1267,33 @@ fn randomized_unclaimed_deferred_offers_restore_materialization_cost() {
         assert!(operation.operator_plan().unwrap().deferred_output.is_none());
         assert!(operation.estimated_cycles != 0, "random case {case}");
     }
+}
+
+#[test]
+fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
+    let inputs = [
+        TensorType::new([128, 64], Precision::F16, Layout::row_sharded(64)),
+        TensorType::new([64, 64], Precision::F16, Layout::row_sharded(64)),
+    ];
+    let candidates = default_operator_candidates(64)
+        .into_iter()
+        .map(|candidate| candidate.plan)
+        .filter(|plan| matches!(plan.operator, MidOperator::Gemm { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        candidates
+            .iter()
+            .map(operator_candidate_compatibility)
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 2
+    );
+    let selected = retain_operator_candidates(
+        candidates,
+        &inputs,
+        &TensorShape::new([128, 64]),
+        &Ipu21CostModel,
+        2,
+    );
+    assert_eq!(selected.len(), 2);
 }

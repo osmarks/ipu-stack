@@ -1248,8 +1248,14 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
 pub(super) struct OperatorCompatibility {
     pub(super) orientation: Option<GemmOrientation>,
     pub(super) reduction_staging: Option<ReductionStaging>,
-    pub(super) inputs: Vec<(ElementOrderCompatibility, MemoryClass, LocalOperandStaging)>,
+    pub(super) inputs: Vec<(
+        Precision,
+        ElementOrderCompatibility,
+        MemoryClass,
+        LocalOperandStaging,
+    )>,
     pub(super) output: (
+        Precision,
         ElementOrderCompatibility,
         MemoryClass,
         Vec<(TensorAxis, u16, u32)>,
@@ -1278,6 +1284,7 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
             .iter()
             .map(|input| {
                 (
+                    input.format.precision,
                     element_order_compatibility(input.format.layout.order),
                     input.format.layout.memory_class,
                     input.local_staging,
@@ -1285,6 +1292,7 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
             })
             .collect(),
         output: (
+            candidate.requirements.output.format.precision,
             element_order_compatibility(candidate.requirements.output.format.layout.order),
             candidate.requirements.output.format.layout.memory_class,
             candidate
@@ -1308,6 +1316,9 @@ pub(super) fn retain_operator_candidates(
     costs: &impl CostModel,
     width: usize,
 ) -> Vec<OperatorPlan> {
+    if candidates.len() <= width {
+        return candidates;
+    }
     let ranked = candidates
         .into_iter()
         .map(|candidate| {
@@ -1362,12 +1373,15 @@ pub(super) fn retain_operator_candidates(
     let mut selected = BTreeSet::new();
     let mut represented = BTreeSet::new();
     for (index, (_, _, compatibility)) in ranked.iter().enumerate() {
+        if selected.len() >= width {
+            break;
+        }
         if represented.insert(compatibility.clone()) {
             selected.insert(index);
         }
     }
     for index in 0..ranked.len() {
-        if selected.len() == width {
+        if selected.len() >= width {
             break;
         }
         selected.insert(index);

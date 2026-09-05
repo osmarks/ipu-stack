@@ -21,7 +21,7 @@ pub use cycles::{
 };
 pub(crate) use cycles::{IPU21_LOGICAL_FRAGMENT_CYCLES, MemoizedCostModel, row_major_pack_cycles};
 pub(crate) use memory::*;
-pub use memory::{MemoryEstimate, MemoryPeaks, MemoryUsage};
+pub use memory::{MemoryPeaks, MemoryUsage};
 pub(crate) use tensor::*;
 pub(crate) use traffic::*;
 

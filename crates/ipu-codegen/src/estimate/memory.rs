@@ -100,26 +100,6 @@ impl MemoryPeaks {
         self.maximum_standard_allocation
             .saturating_sub(lower_standard.max(upper_standard))
     }
-
-    pub(crate) fn conservative_tensor_usage(self) -> MemoryUsage {
-        MemoryUsage {
-            standard: self.standard.saturating_sub(self.exchange_rows),
-            interleaved: self.interleaved,
-        }
-    }
-}
-
-/// Storage visible at an operator boundary plus phase-local scratch. Peak is
-/// the simultaneous requirement used for candidate feasibility.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MemoryEstimate {
-    pub live: MemoryUsage,
-    pub temporary: MemoryUsage,
-    pub peak: MemoryUsage,
-    pub exchange_row_bytes: u64,
-    /// Largest phase-local standard-addressed buffer which must fit in one
-    /// contiguous standard-memory range.
-    pub maximum_standard_temporary_allocation: u64,
 }
 
 pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
@@ -129,34 +109,6 @@ pub(crate) fn tensor_memory(tensor: &TensorType) -> MemoryUsage {
         maximum_shard_bytes(tensor),
     );
     usage
-}
-
-pub(crate) fn unavailable_operator_memory() -> MemoryEstimate {
-    let maximum = MemoryUsage {
-        standard: u64::MAX,
-        interleaved: u64::MAX,
-    };
-    MemoryEstimate {
-        live: maximum,
-        temporary: maximum,
-        peak: maximum,
-        exchange_row_bytes: u64::MAX,
-        maximum_standard_temporary_allocation: u64::MAX,
-    }
-}
-
-pub(crate) fn conversion_memory_estimate(
-    input: &TensorType,
-    output: &TensorType,
-) -> MemoryEstimate {
-    let live = tensor_memory(input).saturating_add(tensor_memory(output));
-    MemoryEstimate {
-        live,
-        temporary: MemoryUsage::default(),
-        peak: live,
-        exchange_row_bytes: 0,
-        maximum_standard_temporary_allocation: 0,
-    }
 }
 
 pub(crate) fn region_peak_memory(
@@ -237,7 +189,7 @@ pub(crate) fn region_estimate(
 
     let program = crate::mid::implementation::build_blocks(&candidate).ok()?;
     let low = crate::lower_to_tiles(&program, false);
-    let (mut peak, _) =
+    let mut peak =
         crate::place::program_memory_with_multiplicity(&low, allocation_multiplicity).ok()?;
     let rows = super::program::program_footprint(&program)
         .ok()?

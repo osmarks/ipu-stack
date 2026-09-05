@@ -110,7 +110,7 @@ pub(crate) fn build_blocks(graph: &ImplementationCandidate) -> BlockBuildResult<
             })
         })
         .collect();
-    tracing::info!(
+    tracing::debug!(
         shards = state.shards.len(),
         exchange_phases = state.phases.len(),
         "built logical tile schedule"
@@ -300,7 +300,7 @@ impl BlockBuilder {
         for (index, operation) in operations.iter().enumerate() {
             let started = Instant::now();
             if self.build_deferred_output(operation, &mut tiles)? {
-                tracing::info!(
+                tracing::debug!(
                     operation = index,
                     source = ?operation.source.map(OperationId::index),
                     elapsed_ms = started.elapsed().as_millis() as u64,
@@ -320,10 +320,11 @@ impl BlockBuilder {
                 }
             };
             if let Err(error) = lowered {
-                tracing::error!(
+                tracing::debug!(
                     operation = index,
                     source = ?operation.source.map(OperationId::index),
-                    kind = ?operation.kind,
+                    plan = ?operation.operator_plan(),
+                    conversion = ?operation.conversion_plan(),
                     inputs = ?operation.inputs,
                     results = ?operation.results,
                     ?error,
@@ -343,7 +344,7 @@ impl BlockBuilder {
                     .push(BlockOperation::Checkpoint(source, checkpoint));
                 checkpoint ^= 1;
             }
-            tracing::info!(
+            tracing::debug!(
                 operation = index,
                 source = ?operation.source.map(OperationId::index),
                 elapsed_ms = started.elapsed().as_millis() as u64,

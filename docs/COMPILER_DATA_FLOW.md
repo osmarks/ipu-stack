@@ -10,7 +10,8 @@ refactors. These are curated data-flow diagrams. The older generated
 flowchart TD
   G[ComputeGraph: semantic values and regions] --> C[Catalogue and shape-dependent candidate enumeration]
   C --> H[Cheap geometry and boundary-storage screening]
-  H --> B[Mid implementation builder]
+  H --> SHORT[Bounded branch shortlist from boundary costs]
+  SHORT --> B[Mid implementation builder]
   B --> M[Executable fragment: blocks, calls, copies, exchanges]
   M --> CACHE[Per-planning-call cache; selected recipes retain fragments]
   CACHE --> JOIN[Bind fragments into candidate region]
@@ -30,16 +31,19 @@ flowchart TD
   K --> T[Addressed tile steps and linked tile images]
 ```
 
-The cache retains standalone executable implementations keyed by the full
-operator plan and boundary tensor types. Selected operation recipes own an
-`Arc` to their fragment. Binding checks actual boundary ownership, extents and
+The cache indexes standalone executable implementations keyed by the full
+operator plan and boundary tensor types. Its weak references do not retain
+rejected work. Selected operation recipes own an `Arc` to their fragment. Binding checks actual boundary ownership, extents and
 formats, remaps arena identities, and retains original work ordering. Deferred
 inputs and incompatible ownership/capacity require reconstruction by the same
 builder. There is no second expansion path in low.
 
-Detailed branch analysis composes a concrete region, including consumer-created
+Eight shared planning workers bound concurrent construction. Cheap boundary
+costs shortlist branch combinations before constructing new fragments; detailed
+branch analysis composes a concrete region, including consumer-created
 movement for deferred views. It retains only cycle/memory metrics after scoring;
-selected operator fragments remain shared. This avoids retaining a whole program
+selected operator fragments remain shared. The old per-operator memory/exchange
+summary fields and their adapter type have been removed. This avoids retaining a whole program
 for every beam branch. Pending views keep their source live; unclaimed offers
 are restored before final ranking. Final block construction applies parameter
 ownership and prices the resulting program again.

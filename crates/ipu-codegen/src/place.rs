@@ -193,20 +193,13 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
 
 /// Address-independent working sets, using the same alias groups, access tails,
 /// element rounding and lifetimes as physical allocation.
-pub(crate) fn program_memory(
-    program: &LowProgram,
-) -> Result<(crate::MemoryPeaks, crate::MemoryPeaks), PlacementError> {
-    program_memory_with_multiplicity(program, &BTreeMap::new())
-}
-
 pub(crate) fn program_memory_with_multiplicity(
     program: &LowProgram,
     multiplicity: &BTreeMap<crate::MidValueId, u32>,
-) -> Result<(crate::MemoryPeaks, crate::MemoryPeaks), PlacementError> {
+) -> Result<crate::MemoryPeaks, PlacementError> {
     let analysis = analyze_allocations(program)?;
-    let mut events = BTreeMap::<(u16, u64), [i128; 4]>::new();
+    let mut events = BTreeMap::<(u16, u64), [i128; 2]>::new();
     let mut maximum_standard = 0;
-    let mut maximum_temporary = 0;
     for (root, members) in &analysis.members {
         let lifetime = analysis.root_lifetimes[root];
         if !lifetime.seen {
@@ -234,47 +227,29 @@ pub(crate) fn program_memory_with_multiplicity(
             }
             MemoryClass::Ipu21Interleaved => 1,
         };
-        let transient = members
-            .iter()
-            .all(|&index| !matches!(program.shards[index].definition, ShardDefinition::Value(_)));
-        for offset in [0, 2]
-            .into_iter()
-            .filter(|&offset| offset == 0 || transient)
-        {
-            events
-                .entry((shard.tile, u64::from(lifetime.first)))
-                .or_default()[offset + class] += i128::from(bytes);
-            events
-                .entry((shard.tile, u64::from(lifetime.last) + 1))
-                .or_default()[offset + class] -= i128::from(bytes);
-        }
-        if transient && class == 0 {
-            maximum_temporary = maximum_temporary.max(bytes);
-        }
+        events
+            .entry((shard.tile, u64::from(lifetime.first)))
+            .or_default()[class] += i128::from(bytes);
+        events
+            .entry((shard.tile, u64::from(lifetime.last) + 1))
+            .or_default()[class] -= i128::from(bytes);
     }
-    let mut live = vec![[0i128; 4]; usize::from(program.tile_count)];
-    let mut peaks = [crate::MemoryPeaks::default(); 2];
+    let mut live = vec![[0i128; 2]; usize::from(program.tile_count)];
+    let mut peak = crate::MemoryPeaks::default();
     for ((tile, _), delta) in events {
         let usage = &mut live[usize::from(tile)];
         for (live, change) in usage.iter_mut().zip(delta) {
             *live += change;
         }
-        for (index, maximum) in [maximum_standard, maximum_temporary]
-            .into_iter()
-            .enumerate()
-        {
-            peaks[index].observe(
-                crate::MemoryUsage {
-                    standard: u64::try_from(usage[2 * index])
-                        .map_err(|_| PlacementError::Overflow)?,
-                    interleaved: u64::try_from(usage[2 * index + 1])
-                        .map_err(|_| PlacementError::Overflow)?,
-                },
-                maximum,
-            );
-        }
+        peak.observe(
+            crate::MemoryUsage {
+                standard: u64::try_from(usage[0]).map_err(|_| PlacementError::Overflow)?,
+                interleaved: u64::try_from(usage[1]).map_err(|_| PlacementError::Overflow)?,
+            },
+            maximum_standard,
+        );
     }
-    Ok((peaks[0], peaks[1]))
+    Ok(peak)
 }
 
 #[allow(clippy::too_many_arguments)]

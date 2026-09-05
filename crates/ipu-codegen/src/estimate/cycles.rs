@@ -16,7 +16,7 @@ pub trait CostModel: Sync {
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> Option<Arc<super::implementation::ImplementationEstimate>> {
+    ) -> Option<Arc<crate::MidProgram>> {
         super::implementation_estimate(plan, inputs, output)
     }
     fn operator_cycle_override(
@@ -37,7 +37,7 @@ pub trait CostModel: Sync {
         self.operator_cycle_override(plan, inputs, output)
             .unwrap_or_else(|| {
                 self.implementation(plan, inputs, output)
-                    .map_or(u64::MAX, |estimate| estimate.program.estimated_cycles)
+                    .map_or(u64::MAX, |estimate| estimate.estimated_cycles)
             })
     }
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
@@ -105,25 +105,27 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         plan: &OperatorPlan,
         inputs: &[TensorType],
         output: &TensorType,
-    ) -> Option<Arc<super::implementation::ImplementationEstimate>> {
+    ) -> Option<Arc<crate::MidProgram>> {
         let mut plan = plan.clone();
         plan.deferred_output = None;
         let key = (plan, inputs.to_vec(), output.clone());
-        let entry = {
-            let mut cache = self.implementations.lock().unwrap();
-            if !cache.contains_key(&key)
-                && cache.len() >= if self.spatial_capacity > 256 { 16 } else { 256 }
-            {
-                // Retained operations own their fragments independently. Bound
-                // speculative entries so large searches do not retain every
-                // rejected implementation for the lifetime of planning.
-                cache.clear();
-            }
-            cache.entry(key.clone()).or_default().clone()
-        };
-        entry
-            .get_or_init(|| self.inner.implementation(&key.0, &key.1, &key.2))
-            .clone()
+        if let Some(retained) = self
+            .implementations
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Some(retained);
+        }
+        // Branches own executable fragments. Weak cache entries reuse live
+        // implementations without pinning rejected work or evicting survivors.
+        let built = self.inner.implementation(&key.0, &key.1, &key.2)?;
+        self.implementations
+            .lock()
+            .unwrap()
+            .insert(key, Arc::downgrade(&built));
+        Some(built)
     }
     fn operator_cycle_override(
         &self,
