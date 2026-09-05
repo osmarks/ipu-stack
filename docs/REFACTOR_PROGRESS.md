@@ -419,3 +419,12 @@ Explicit attention panel distribution (2026-09-05):
 - The earlier profiled MLP passed at 332,640 cycles, maximum error 0.011719,
   8.15 seconds mid planning and 233.32 seconds build/validation, about 1.28 GiB
   peak RSS. A final run will include the shared-padding change above.
+
+Materialized attention layout correction (2026-09-05):
+
+- Its value matrix now uses a row block equal to the full padded key count,
+  matching the single PV product. The 64-row Flash layout is valid only for
+  Flash's 64-row products. A focused mid-layout regression covers 73 logical
+  key rows padded to a 128-row product.
+- All 153 release workspace tests and strict Clippy pass. Forced materialized
+  hardware validation is running at this checkpoint.

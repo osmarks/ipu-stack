@@ -75,7 +75,7 @@ impl Builder {
             }
             packed_key.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
             packed_value.format.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block: AMP_INNER_BLOCK as u16,
+                row_block: u16::try_from(key_block).ok()?,
                 column_block: AMP_COLUMN_MICRO as u16,
             });
             let k = self.attention_operand(MidValueId(1), packed_key, start)?;

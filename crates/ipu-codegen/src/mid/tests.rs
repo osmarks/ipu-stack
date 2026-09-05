@@ -1427,3 +1427,52 @@ fn uneven_mlp_products_preserve_global_coordinates() {
         );
     }
 }
+
+#[test]
+fn materialized_attention_packs_values_for_the_full_product() {
+    let mut graph = ComputeGraph::new();
+    let query = graph.host_input("query", [4, 17, 72]).unwrap();
+    let key = graph.host_input("key", [4, 73, 72]).unwrap();
+    let value = graph.host_input("value", [4, 73, 72]).unwrap();
+    let output = graph.flash_attention(query, key, value).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(64)
+        .with_attention_strategy(AttentionStrategy::Materialized)
+        .with_automatic_input(query, Precision::F16)
+        .with_automatic_input(key, Precision::F16)
+        .with_automatic_input(value, Precision::F16);
+    let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+        .unwrap()
+        .remove(0);
+    let product = mid
+        .operations
+        .iter()
+        .find(|op| {
+            matches!(
+                op.kind,
+                MidOperationKind::Primitive(Primitive::Compute {
+                    kernel: TileKernelSpec::Gemm {
+                        inner_block: 128,
+                        ..
+                    },
+                    product: Some(ProductAxes {
+                        right_inner: TensorAxis::FromEnd(2),
+                        ..
+                    }),
+                    ..
+                })
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        mid.values[product.inputs[1].index() as usize]
+            .tensor_type
+            .format
+            .layout
+            .order,
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block: 128,
+            column_block: 16
+        })
+    );
+}
