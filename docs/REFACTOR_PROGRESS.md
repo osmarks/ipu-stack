@@ -300,3 +300,34 @@ Concrete exchange-cost correction:
 - All 148 release tests and strict Clippy passed after the pricing change; the
   extended regression and Clippy passed afterward. Final eight-case device run
   (including scheduled-finalist repeated MLP) is `/tmp/fragment-priced-*`.
+
+Final validation record (2026-09-05, complete):
+
+- Combined #1–#3 source size: 52,655 -> 51,545 lines, **1,110 fewer lines**.
+  Count includes comments/tests in tracked `crates/` and `device/` Rust, C++ and
+  assembly sources, compared with `531f1dc`; moves are not counted as deletions.
+- Workspace release tests: 148 passing. Strict workspace/all-target Clippy:
+  passing. Extended fragmentation/scheduled-repeat regression: passing.
+- Final MLP passed numerically (maximum absolute error 0.011719). Mid planning
+  took 64.8 seconds; total package build/device validation took 298.6 seconds.
+  Earlier byte-only scoring with optimized traversal took 365.1 seconds total.
+- **Remaining performance limitation:** pre-cost-refactor MLP mid planning was
+  24.9 seconds, and its exchange schedules were much cheaper to construct.
+  Final MLP peak host RSS is approximately 8.94 GiB. The bounded concrete search
+  remains more expensive and selects different layouts. Fragment calibration
+  improves the score but does not eliminate this regression. Future tuning must
+  consider shortlist diversity, fragment pricing and scheduler construction
+  together; reducing the shortlist blindly can discard good layouts.
+- General copy/view chain composition (#4) remains deferred. Discuss its overlap
+  with planning before implementing it.
+- GEMM, batched GEMM, full MLP, automatic attention, attention smoke, forced Flash,
+  repeated MLP and repeated MLP with `--exchange-schedule-finalists 3` all passed
+  on the final binary. The repeated workload retained only one finalist, so that
+  flag did not exercise multi-finalist reranking; scheduled repeat multiplicity
+  and override behavior are covered by the focused unit regression.
+- Forced materialized attention also passed on the final binary: 839,808
+  numerical checks, maximum error 0.000930. Automatic/forced Flash attention
+  maximum error was 0.001233; repeated MLP maximum error was 0.000046.
+  All nine final device invocations passed without startup/runtime failures.
+- Updated curated graphs in `docs/COMPILER_DATA_FLOW.md`. #1–#3 are implemented
+  and committed; compilation performance remains the explicit limitation above.
