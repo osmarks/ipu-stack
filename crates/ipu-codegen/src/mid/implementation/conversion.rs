@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// Work needed to populate ordinary destination blocks at one exchange boundary.
+#[derive(Default)]
+pub(super) struct MaterializationBatch {
+    pub(super) semantic: BTreeMap<ShardView, Vec<ShardView>>,
+    physical: BTreeMap<ShardView, Vec<ShardView>>,
+    before: Vec<(u16, LocalCopy)>,
+    pub(super) after: Vec<(u16, LocalCopy)>,
+    kernels: Vec<(u16, KernelRun)>,
+}
+
 impl BlockBuilder {
     pub(super) fn unpack_amp_to_row_major(
         &mut self,
@@ -203,10 +213,31 @@ impl BlockBuilder {
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
-        let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-        let mut before_exchange = Vec::new();
-        let mut after_exchange = Vec::new();
-        let mut after_exchange_kernels = Vec::new();
+        let mut batch = MaterializationBatch::default();
+        self.prepare_mapped_views(
+            mappings,
+            copy_order,
+            exchange_order,
+            provenance,
+            &mut batch,
+            tiles,
+        )?;
+        self.append_materialization(batch, provenance, tiles)
+    }
+
+    pub(super) fn prepare_mapped_views(
+        &mut self,
+        mappings: Vec<(ShardView, ShardView)>,
+        copy_order: CopyOrder,
+        exchange_order: CopyOrder,
+        provenance: WorkProvenance,
+        batch: &mut MaterializationBatch,
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
+        let transfers = match exchange_order {
+            CopyOrder::Semantic => &mut batch.semantic,
+            CopyOrder::Physical => &mut batch.physical,
+        };
         let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
         for mapping in mappings {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
@@ -241,9 +272,9 @@ impl BlockBuilder {
                 let destination_tile = self.shards[destination.shard.index() as usize].tile;
                 if source_tile == destination_tile {
                     let copies = if staging.is_some() {
-                        &mut before_exchange
+                        &mut batch.before
                     } else {
-                        &mut after_exchange
+                        &mut batch.after
                     };
                     append_span_copies(
                         &self.shards,
@@ -266,7 +297,7 @@ impl BlockBuilder {
                     .as_ref()
                     .and_then(|staging| staging.kernel.as_ref())
                 {
-                    after_exchange_kernels.push((
+                    batch.kernels.push((
                         tile,
                         self.kernel_run(
                             provenance,
@@ -283,20 +314,29 @@ impl BlockBuilder {
                         &staging,
                         &destination,
                         tile,
-                        &mut after_exchange,
+                        &mut batch.after,
                         CopyOrder::Semantic,
                     )?;
                 }
             }
         }
-        for (tile, copy) in before_exchange {
+        Ok(())
+    }
+
+    pub(super) fn append_materialization(
+        &mut self,
+        batch: MaterializationBatch,
+        provenance: WorkProvenance,
+        tiles: &mut BlockRegion,
+    ) -> BlockBuildResult<()> {
+        for (tile, copy) in batch.before {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        self.append_ordered_phase(transfers, provenance, exchange_order, tiles)?;
-        for (tile, copy) in after_exchange {
+        self.append_mixed_phase(batch.semantic, batch.physical, provenance, tiles)?;
+        for (tile, copy) in batch.after {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        for (tile, run) in after_exchange_kernels {
+        for (tile, run) in batch.kernels {
             self.append_kernel(tiles, tile, run)?;
         }
         Ok(())

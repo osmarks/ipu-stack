@@ -39,8 +39,7 @@ impl BlockBuilder {
         );
         let key_panel_count = padded_query_dimension.div_ceil(AMP_COLUMN_MICRO);
         let value_panel_count = padded_value_dimension.div_ceil(AMP_COLUMN_MICRO);
-        let mut semantic_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-        let mut physical_gathers = BTreeMap::<ShardView, Vec<ShardView>>::new();
+        let mut batch = MaterializationBatch::default();
         let mut prepared = Vec::new();
         for block in 0..blocks {
             let row_start = block * block_rows;
@@ -55,8 +54,7 @@ impl BlockBuilder {
                 padded_query_dimension,
                 ElementOrder::Amp(AmpOrder::TransposedRight),
                 owner_offset,
-                &mut semantic_gathers,
-                &mut physical_gathers,
+                &mut batch,
                 provenance,
                 tiles,
             )?;
@@ -74,8 +72,7 @@ impl BlockBuilder {
                     column_block: AMP_COLUMN_MICRO as u16,
                 }),
                 owner_offset + key_panel_count,
-                &mut semantic_gathers,
-                &mut physical_gathers,
+                &mut batch,
                 provenance,
                 tiles,
             )?;
@@ -86,24 +83,7 @@ impl BlockBuilder {
                 value_panels,
             });
         }
-        self.append_mixed_phase(semantic_gathers, physical_gathers, provenance, tiles)?;
-        for block in &prepared {
-            for panel in block.key_panels.iter().chain(&block.value_panels) {
-                if let Some(row_major) = panel.row_major {
-                    self.append_attention_rearrange(
-                        tiles,
-                        panel.tile,
-                        row_major,
-                        panel.packed,
-                        WorkProvenance {
-                            operation: provenance.operation,
-                            value: provenance.value,
-                            reason: WorkReason::OperatorKernel,
-                        },
-                    )?;
-                }
-            }
-        }
+        self.append_materialization(batch, provenance, tiles)?;
         Ok(prepared)
     }
 

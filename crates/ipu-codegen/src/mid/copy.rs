@@ -188,7 +188,6 @@ pub(crate) struct CopyStaging {
 /// A selected destination recipe. Lowering binds buffers and emits these steps;
 /// it does not price alternative materializations.
 pub(crate) struct CopyPlan {
-    pub direct_word_exchange: bool,
     pub clear_padding: bool,
     pub staging: Option<CopyStaging>,
 }
@@ -202,7 +201,6 @@ impl CopyPlan {
     ) -> StorageResult<Self> {
         if order == CopyOrder::Physical {
             return Ok(Self {
-                direct_word_exchange: false,
                 clear_padding: false,
                 staging: None,
             });
@@ -287,7 +285,6 @@ impl CopyPlan {
             }
         });
         Ok(Self {
-            direct_word_exchange,
             clear_padding: transform && direct_word_exchange && padding,
             staging,
         })

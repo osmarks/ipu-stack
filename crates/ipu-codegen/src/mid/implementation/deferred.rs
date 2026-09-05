@@ -215,9 +215,8 @@ impl BlockBuilder {
         Ok(mappings)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn deferred_panel_benefits_from_word_exchange(
-        &self,
+    pub(super) fn prepare_deferred_panel(
+        &mut self,
         value: MidValueId,
         stream: u32,
         row_start: u32,
@@ -225,37 +224,11 @@ impl BlockBuilder {
         column_start: u32,
         columns: u32,
         destination: BlockValueId,
-    ) -> BlockBuildResult<bool> {
-        let mappings = self.deferred_panel_mappings(
-            value,
-            stream,
-            row_start,
-            rows,
-            column_start,
-            columns,
-            destination,
-        )?;
-        Ok(self
-            .copy_plan(&mappings, destination, CopyOrder::Semantic)?
-            .direct_word_exchange)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn gather_deferred_panel(
-        &self,
-        value: MidValueId,
-        stream: u32,
-        row_start: u32,
-        rows: u32,
-        column_start: u32,
-        columns: u32,
-        destination: BlockValueId,
-        order: CopyOrder,
-        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
-        local_copies: &mut Vec<(u16, LocalCopy)>,
+        provenance: WorkProvenance,
+        batch: &mut MaterializationBatch,
+        tiles: &mut BlockRegion,
     ) -> BlockBuildResult<()> {
-        let destination_tile = self.shards[destination.index() as usize].tile;
-        let mappings = self.deferred_panel_mappings(
+        let mut mappings = self.deferred_panel_mappings(
             value,
             stream,
             row_start,
@@ -264,31 +237,14 @@ impl BlockBuilder {
             columns,
             destination,
         )?;
-        for (source_view, destination_view) in mappings {
-            let mappings = if order == CopyOrder::Physical {
-                self.f16_micro_panel_mappings(vec![(source_view, destination_view)])?
-                    .ok_or(BlockBuildError::InvalidOperatorPlan)?
-            } else {
-                vec![(source_view, destination_view)]
-            };
-            for (source_view, destination_view) in mappings {
-                if self.shards[source_view.shard.index() as usize].tile == destination_tile {
-                    append_span_copies(
-                        &self.shards,
-                        &source_view,
-                        &destination_view,
-                        destination_tile,
-                        local_copies,
-                        order,
-                    )?;
-                } else {
-                    transfers
-                        .entry(source_view)
-                        .or_default()
-                        .push(destination_view);
-                }
-            }
-        }
-        Ok(())
+        let order = if self.deferred_supports_physical_exchange(value, destination) {
+            mappings = self
+                .f16_micro_panel_mappings(mappings)?
+                .ok_or(BlockBuildError::InvalidOperatorPlan)?;
+            CopyOrder::Physical
+        } else {
+            CopyOrder::Semantic
+        };
+        self.prepare_mapped_views(mappings, order, order, provenance, batch, tiles)
     }
 }

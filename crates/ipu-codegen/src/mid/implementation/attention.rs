@@ -4,7 +4,6 @@ use super::*;
 
 pub(super) struct PreparedDistributedPanel {
     pub(super) panel: u32,
-    pub(super) row_major: Option<BlockValueId>,
     pub(super) packed: BlockValueId,
     pub(super) tile: u16,
     pub(super) destinations: Vec<BlockValueId>,
@@ -25,7 +24,6 @@ pub(super) struct AttentionTask {
     pub(super) query_dimension: u32,
     pub(super) value_dimension: u32,
     pub(super) query: BlockValueId,
-    pub(super) query_receive: Option<BlockValueId>,
     pub(super) output: BlockValueId,
     pub(super) scratch: BlockValueId,
     pub(super) weights: BlockValueId,
@@ -99,29 +97,6 @@ impl BlockBuilder {
             } else {
                 canonical_query
             };
-            let direct_query = deferred_query
-                && (self.deferred_supports_physical_exchange(query, query_shard)
-                    || self.deferred_panel_benefits_from_word_exchange(
-                        query,
-                        self.shards[output.index() as usize].extents[rank - 3].start,
-                        self.shards[output.index() as usize].extents[rank - 2].start,
-                        rows,
-                        0,
-                        query_dimension,
-                        query_shard,
-                    )?);
-            let query_receive = (deferred_query && !direct_query)
-                .then(|| {
-                    self.push_attention_buffer(
-                        tile,
-                        rows,
-                        rows,
-                        query_dimension,
-                        query_dimension,
-                        ElementOrder::RowMajor,
-                    )
-                })
-                .transpose()?;
             let scratch = self.push_attention_scratch(
                 tile,
                 rows,
@@ -179,7 +154,6 @@ impl BlockBuilder {
                 query_dimension,
                 value_dimension,
                 query: query_shard,
-                query_receive,
                 output,
                 scratch,
                 weights,

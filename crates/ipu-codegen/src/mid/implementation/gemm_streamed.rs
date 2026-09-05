@@ -76,8 +76,7 @@ impl BlockBuilder {
                 let phase_column_end = phase_column_start
                     .saturating_add(column_phase_width)
                     .min(column_extent);
-                let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-                let mut local_copies = Vec::<(u16, LocalCopy)>::new();
+                let mut batch = MaterializationBatch::default();
                 let mut runs = Vec::with_capacity(output_shards.len());
                 let mut left_views = BTreeMap::<u16, ShardView>::new();
                 for column_start in
@@ -114,8 +113,9 @@ impl BlockBuilder {
                                 *left_value,
                                 tile,
                                 &[(left_rank - 1, inner_start, inner_end)],
-                                &mut transfers,
-                                &mut local_copies,
+                                operation_provenance(operation),
+                                &mut batch,
+                                tiles,
                             )?;
                             left_views.insert(tile, view.clone());
                             view
@@ -178,7 +178,7 @@ impl BlockBuilder {
                                 if let Some(spans) = local_spans {
                                     let mut destination_offset = 0u32;
                                     for span in spans {
-                                        local_copies.push((
+                                        batch.after.push((
                                             tile,
                                             LocalCopy {
                                                 source: right,
@@ -194,7 +194,8 @@ impl BlockBuilder {
                                             .ok_or(BlockBuildError::IdOverflow)?;
                                     }
                                 } else {
-                                    transfers
+                                    batch
+                                        .semantic
                                         .entry(right_view.clone())
                                         .or_default()
                                         .push(self.full_view(resident));
@@ -240,8 +241,8 @@ impl BlockBuilder {
                         ));
                     }
                 }
-                self.append_phase(
-                    transfers,
+                self.append_materialization(
+                    batch,
                     WorkProvenance {
                         operation: operation.source,
                         value: (!self.deferred_conversions.contains_key(left_value))
@@ -254,9 +255,6 @@ impl BlockBuilder {
                     },
                     tiles,
                 )?;
-                for (tile, copy) in local_copies {
-                    self.append_local_copy(tiles, tile, copy)?;
-                }
                 for (tile, run) in runs {
                     self.append_kernel(tiles, tile, run)?;
                 }

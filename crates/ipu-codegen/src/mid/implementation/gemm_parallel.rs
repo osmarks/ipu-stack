@@ -140,8 +140,7 @@ impl BlockBuilder {
             }
         }
         {
-            let mut transfers = BTreeMap::<ShardView, Vec<ShardView>>::new();
-            let mut local_copies = Vec::<(u16, LocalCopy)>::new();
+            let mut batch = MaterializationBatch::default();
             let mut gemm_runs = Vec::<(u16, KernelRun)>::new();
             let mut partials = BTreeMap::<Vec<(u32, u32)>, Vec<(u16, ShardView)>>::new();
             let mut resident_lefts = BTreeMap::<BlockValueId, ShardView>::new();
@@ -173,8 +172,9 @@ impl BlockBuilder {
                             *left_value,
                             left_shard.tile,
                             &restrictions,
-                            &mut transfers,
-                            &mut local_copies,
+                            operation_provenance(operation),
+                            &mut batch,
+                            tiles,
                         )?;
                         if left_requirement.materialization
                             != crate::OperandMaterialization::DispatchSlices
@@ -379,11 +379,12 @@ impl BlockBuilder {
                                         &target_view,
                                         &destination_view,
                                         left_shard.tile,
-                                        &mut local_copies,
+                                        &mut batch.after,
                                         CopyOrder::Semantic,
                                     )?;
                                 } else {
-                                    transfers
+                                    batch
+                                        .semantic
                                         .entry(target_view.clone())
                                         .or_default()
                                         .push(destination_view);
@@ -538,8 +539,8 @@ impl BlockBuilder {
                     }
                 }
             }
-            self.append_phase(
-                transfers,
+            self.append_materialization(
+                batch,
                 WorkProvenance {
                     operation: operation.source,
                     value: Some(*right_value),
@@ -549,9 +550,6 @@ impl BlockBuilder {
                 },
                 tiles,
             )?;
-            for (tile, copy) in local_copies {
-                self.append_local_copy(tiles, tile, copy)?;
-            }
             for (tile, run) in gemm_runs {
                 self.append_kernel(tiles, tile, run)?;
             }

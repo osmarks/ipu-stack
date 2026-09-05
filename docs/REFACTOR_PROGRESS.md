@@ -208,3 +208,22 @@ general layout-conversion chains; neither is claimed by the contiguous-copy pass
 - Deferred at the user's request: copy/view chain composition (#4). Remind the
   user later to discuss its complexity and interaction with planning before
   implementing it. Adjacent-copy behavior remains as before.
+
+## Shared destination materialization (2026-09-05)
+
+- Added one materialization batch at an exchange boundary: destination copy plans
+  select staging and padding, populate local/remote slices, and emit final copies
+  or transforms. GEMM operand slices, deferred attention panels, eager conversions
+  and views use this construction. Ownership, panel size and reuse stay with the
+  implementation strategy.
+- Removed attention query-receive and per-panel row-major buffer bookkeeping,
+  separate attention rearrangement emission and duplicated word-exchange preflight.
+  Removed the now-unused CopyPlan direct-word flag and deferred gather emitter.
+- Net source reduction for this chunk: 187 lines (138 added, 325 removed).
+- Release tests: 146 passed; strict Clippy passed. Hardware: standard five cases,
+  forced blocked SigLIP attention, and two-block repeated MLP all passed. Logs:
+  `/tmp/shared-materialization-*`. The default SigLIP case covers materialized
+  attention; forced flash max error .001230, materialized .000930, repeat .000046.
+- Next: replace operator-shaped cost reconstruction with executable-mid pricing
+  and shared allocation analysis in detailed planning. Copy/view chain composition
+  remains deferred for later discussion with the user.

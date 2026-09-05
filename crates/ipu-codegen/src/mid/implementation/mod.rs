@@ -30,6 +30,7 @@ use crate::mid::{
 };
 use crate::storage::{ByteSpan, StorageError};
 use attention::*;
+use conversion::MaterializationBatch;
 use copies::*;
 pub use copies::{logical_view_byte_spans, shard_storage_bytes, view_byte_spans};
 use deferred::*;
@@ -402,13 +403,6 @@ impl BlockBuilder {
         }
     }
 
-    fn shard_has_padding(&self, shard: BlockValueId) -> bool {
-        self.shards[shard.index() as usize]
-            .extents
-            .iter()
-            .any(|extent| extent.logical_end < extent.physical_end)
-    }
-
     fn append_fill_zero(
         &mut self,
         tiles: &mut BlockRegion,
@@ -434,8 +428,9 @@ impl BlockBuilder {
         value: MidValueId,
         tile: u16,
         ranges: &[(usize, u32, u32)],
-        transfers: &mut BTreeMap<ShardView, Vec<ShardView>>,
-        local_copies: &mut Vec<(u16, LocalCopy)>,
+        provenance: WorkProvenance,
+        batch: &mut MaterializationBatch,
+        tiles: &mut BlockRegion,
     ) -> BlockBuildResult<ShardView> {
         let target = self.local_shard(value, tile)?;
         let target_view = self.narrow_view(target, ranges)?;
@@ -454,31 +449,29 @@ impl BlockBuilder {
         if intersections.is_empty() {
             return Err(BlockBuildError::InvalidConversionPlan);
         }
-        for (extents, source) in intersections {
-            let source_view = ShardView {
-                shard: source,
-                extents: extents.clone(),
-            };
-            let destination_view = ShardView {
-                shard: staging,
-                extents,
-            };
-            if self.shards[source.index() as usize].tile == tile {
-                append_span_copies(
-                    &self.shards,
-                    &source_view,
-                    &destination_view,
-                    tile,
-                    local_copies,
-                    CopyOrder::Semantic,
-                )?;
-            } else {
-                transfers
-                    .entry(source_view)
-                    .or_default()
-                    .push(destination_view);
-            }
-        }
+        let mappings = intersections
+            .into_iter()
+            .map(|(extents, source)| {
+                (
+                    ShardView {
+                        shard: source,
+                        extents: extents.clone(),
+                    },
+                    ShardView {
+                        shard: staging,
+                        extents,
+                    },
+                )
+            })
+            .collect();
+        self.prepare_mapped_views(
+            mappings,
+            CopyOrder::Semantic,
+            CopyOrder::Semantic,
+            provenance,
+            batch,
+            tiles,
+        )?;
         Ok(self.full_view(staging))
     }
 }
