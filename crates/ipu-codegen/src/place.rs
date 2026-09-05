@@ -863,7 +863,7 @@ mod tests {
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&mid, &config).unwrap();
+            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let resident = low
@@ -960,7 +960,7 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let sum = mid.operations[0].results[0];
             let output = mid.operations[1].results[0];
-            let low = lower_to_tiles(&mid, &config).unwrap();
+            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
             let placement = place(&low).unwrap();
             for tile in 0..tiles {
                 let shard = |value| {

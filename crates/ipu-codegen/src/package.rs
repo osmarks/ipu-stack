@@ -725,14 +725,14 @@ fn select_scheduled_finalist(
                 "selected mid-level operation"
             );
         }
-        let low = lower_to_tiles(&mid, planning)?;
+        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints)?;
         return Ok((mid, low, crate::exchange::ExchangeScheduleCache::default()));
     }
 
     let topology = active_topology(planning.tile_count)?;
     let mut ranked = Vec::with_capacity(finalists.len());
     for (index, mid) in finalists.into_iter().enumerate() {
-        let low = lower_to_tiles(&mid, planning)?;
+        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints)?;
         let placement = place(&low)?;
         let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
         let exchanges = crate::exchange::lower_exchanges_cached(

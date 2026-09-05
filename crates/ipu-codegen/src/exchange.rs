@@ -3575,7 +3575,7 @@ mod tests {
                     },
                 );
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-            let low = lower_to_tiles(&mid, &config).unwrap();
+            let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
             let placement = place(&low).unwrap();
             let phases = lower_exchanges(
                 &low,

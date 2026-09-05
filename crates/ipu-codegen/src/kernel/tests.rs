@@ -155,7 +155,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 },
             );
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let plan = KernelBuildPlan::from_program(&low).unwrap();
         let addresses = low
             .shards

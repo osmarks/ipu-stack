@@ -1227,7 +1227,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
                 .sum::<u64>(),
             "random case {case}"
         );
-        let tiled = crate::low::lower_to_tiles(&lowered, &config).unwrap_or_else(|error| {
+        let tiled = crate::low::lower_to_tiles(&lowered, config.diagnostic_checkpoints).unwrap_or_else(|error| {
             panic!(
                 "random case {case}, heads {heads}, width {head_width}, tokens {tokens}: {error}"
             )

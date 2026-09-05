@@ -56,7 +56,7 @@ fn streamed_conversion_does_not_require_an_adjacent_consumer() {
             .iter()
             .any(|&(index, result)| !mid.operations[index + 1].inputs.contains(&result))
     );
-    let low = lower_to_tiles(&mid, &config).unwrap();
+    let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
     for (_, result) in streamed {
         let value = low
             .values
@@ -228,7 +228,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         config.operator_candidates = vec![candidate];
         let mid = lower(&graph, &config, &Ipu21CostModel)
             .unwrap_or_else(|error| panic!("case {case}: {error}"));
-        let low = lower_to_tiles(&mid, &config)
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints)
             .unwrap_or_else(|error| {
                 panic!(
                     "case {case}: {error}; rows={rows} inner={inner} columns={columns} grid={row_partitions}x{column_partitions}x{inner_partitions}"
@@ -361,7 +361,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
                     && plan.requirements.output.format.layout.tiling.tile_count == compute_tiles
             })
         }));
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let parameter_tiles = |name: &str| {
             low.inputs
                 .iter()
@@ -400,7 +400,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         )];
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let runs = low
             .tiles
             .iter()
@@ -465,7 +465,7 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
             .filter_map(|operation| operation.source)
             .collect::<BTreeSet<_>>();
 
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         for run in low
             .tiles
             .iter()
@@ -570,7 +570,7 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
         )];
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.exchange_phases.is_empty(), "random case {case}");
         for tile in &low.tiles {
             for work in low.work(tile) {
@@ -636,7 +636,7 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         )];
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let conversion_phases = low
             .exchange_phases
             .iter()
@@ -1041,7 +1041,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         assert_eq!(low.tiles.len(), usize::from(tiles), "case {case}");
         for tile in &low.tiles {
@@ -1098,7 +1098,7 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
             .with_input(bias, format(tiles))
             .with_input(tensor, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         assert!(
             low.exchange_phases
@@ -1145,7 +1145,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         assert!(std::mem::size_of::<TileWork>() <= 8);
         let mut metadata = Vec::<&Arc<KernelRunMetadata>>::new();
@@ -1270,7 +1270,7 @@ fn randomized_odd_capacities_use_nonempty_active_tile_subsets() {
             .tile_count;
         assert!(selected_tiles <= capacity, "case {case}");
 
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert_eq!(low.tile_count, capacity, "case {case}");
         assert_eq!(low.outputs[0].shards.len(), usize::from(selected_tiles));
         for &shard in &low.outputs[0].shards {
@@ -1340,7 +1340,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                 column_block: crate::mid::AMP_COLUMN_MICRO as u16,
             })
         );
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
             !matches!(work, TileWorkRef::LocalCopy(_)) && !matches!(work, TileWorkRef::Exchange(_))
         })));
@@ -1431,7 +1431,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
             crate::OperandRequirement::new(output_format, 32),
         )];
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         let expected_weight_bytes = inner
             .div_ceil(u32::from(inner_partitions))
@@ -1471,7 +1471,7 @@ fn randomized_repeats_remain_structured_per_tile() {
             config.inputs.insert(parameter, format(tiles));
         }
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         for tile in &low.tiles {
             let repeats = low
@@ -1538,7 +1538,7 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
             config.inputs.insert(weight, format(tiles));
         }
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&mid, &config).unwrap();
+        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         for tile in &low.tiles {
             let repeat = low
                 .work(tile)
@@ -1588,7 +1588,7 @@ fn general_graph_views_lower_to_correct_relative_copies() {
                     },
                 );
                 let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                let low = lower_to_tiles(&mid, &config).unwrap();
+                let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
                 let mut buffers = low
                     .shards
                     .iter()

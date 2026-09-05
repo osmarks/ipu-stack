@@ -13,6 +13,7 @@ pub use copy::*;
 mod catalogue;
 mod layout;
 mod operator;
+mod ownership;
 mod planner;
 mod resolved;
 mod view;
@@ -229,6 +230,8 @@ impl MidValueId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidValue {
     pub id: MidValueId,
+    /// Selected rotation of layout ownership within the graph's tile group.
+    pub tile_offset: u16,
     pub tensor_type: TensorType,
     /// Semantic value represented by this value; conversions retain the same
     /// origin. Region arguments also refer to their high-level argument ID.
@@ -319,6 +322,7 @@ pub struct MidInput {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MidGraph {
+    pub tile_count: u16,
     pub inputs: Vec<MidInput>,
     pub values: Vec<MidValue>,
     pub operations: Vec<MidOperation>,
@@ -332,6 +336,10 @@ pub struct MidGraph {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LoweringError {
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    #[error(transparent)]
+    Storage(#[from] crate::storage::StorageError),
     #[error("mid-level lowering requires a nonzero tile count")]
     EmptyTileGroup,
     #[error("no tensor type was supplied for graph input {0:?}")]

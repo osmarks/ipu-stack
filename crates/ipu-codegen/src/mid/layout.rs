@@ -303,6 +303,20 @@ pub struct ShardExtent {
 }
 
 impl Layout {
+    pub(crate) fn validate_tile_count(&self, available: u16) -> Result<(), LayoutError> {
+        let declared = self.tiling.tile_count;
+        if declared == 0 {
+            return Err(LayoutError::EmptyTileGroup);
+        }
+        if declared > available {
+            return Err(LayoutError::TileCapacity {
+                declared,
+                available,
+            });
+        }
+        Ok(())
+    }
+
     /// Logical ownership and padded bounds, independent of physical placement.
     pub fn shard_extents(
         &self,
@@ -776,6 +790,8 @@ impl Layout {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LayoutError {
+    #[error("layout requires {declared} tiles but the graph has {available}")]
+    TileCapacity { declared: u16, available: u16 },
     #[error("layout has an empty tile group")]
     EmptyTileGroup,
     #[error("axis tiling must have nonzero partitions and block size")]

@@ -77,10 +77,14 @@ interface's post-host-exchange visibility is not claimed to be fixed.
 - ComputeGraph and RegionBuilder now expand one inherent operation-building
   API from graph/builder.rs. No trait imports or call-site API changes are needed.
   142 workspace release tests and Clippy pass for this extraction.
-- Next: record parameter tile rotations on selected MidValue records, moving
-  the balancing choice out of low initialization. Optimize rotation scoring by
-  starting with the existing peak and evaluating only affected tiles; preserve
-  exact old tie-breaking and compare hardware images.
+- Parameter ownership rotations are now recorded in MidValue, and MidGraph owns
+  the target tile count. Low follows this decision and takes only the diagnostic
+  checkpoint flag instead of the entire PipelineConfig. Rotation scoring checks
+  only affected tiles without cloning load arrays; randomized tests compare its
+  exact choices with the old algorithm. 143 workspace release tests and Clippy
+  pass. All five hardware workloads pass (`/tmp/ownership-*`); tile images are
+  byte-identical to their preceding checkpoints, including the operand-constraint
+  and common graph-builder changes.
 - CopyPlan is still expanded with shard geometry during lowering. Do not claim
   full materialization recipes are retained in MidOperation yet.
 

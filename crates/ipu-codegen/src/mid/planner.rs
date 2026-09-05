@@ -182,7 +182,8 @@ pub(crate) fn lower_finalists(
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
             );
-            Ok(MidGraph {
+            let mut graph = MidGraph {
+                tile_count: config.tile_count,
                 inputs: inputs.clone(),
                 values: branch.state.values,
                 operations: branch.operations,
@@ -190,7 +191,9 @@ pub(crate) fn lower_finalists(
                 estimated_cycles,
                 estimated_exchange_cycles,
                 peak_memory,
-            })
+            };
+            graph.assign_parameter_tiles()?;
+            Ok(graph)
         })
         .collect()
 }
@@ -207,6 +210,7 @@ impl LoweringState {
         let id = MidValueId(self.values.len() as u32);
         self.values.push(MidValue {
             id,
+            tile_offset: 0,
             tensor_type,
             origin,
             storage_group: id,

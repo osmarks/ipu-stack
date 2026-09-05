@@ -15,8 +15,8 @@ use crate::mid::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisFactorView, BlockMajorOrder,
     ConversionStrategy, CopyPattern, ElementOrder, GemmDistribution, Layout, LayoutError,
     MemoryClass, MemoryOperand, MidGraph, MidOperation, MidOperationKind, MidRepeat, MidValueId,
-    OperandRequirement, OperatorDispatch, OutputAliasing, PipelineConfig, PointwiseInputMapping,
-    Precision, ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
+    OperandRequirement, OperatorDispatch, OutputAliasing, PointwiseInputMapping, Precision,
+    ShardExtent, StorageRequirements, TensorTiling, TensorType, TileKernelSpec,
 };
 use crate::storage::{ByteSpan, StorageError};
 use conversion::*;
@@ -299,12 +299,6 @@ impl LowProgram {
 pub enum LowLoweringError {
     #[error("low-level lowering requires a nonzero tile count")]
     EmptyTileGroup,
-    #[error("value {value:?} declares {declared} tiles, but the schedule capacity is {scheduled}")]
-    TileCountMismatch {
-        value: MidValueId,
-        declared: u16,
-        scheduled: u16,
-    },
     #[error("value {0:?} does not exist")]
     UnknownValue(MidValueId),
     #[error("operation must have exactly one result")]
@@ -336,22 +330,24 @@ fn append_checkpoint(tiles: &mut [TileWorkList], operation: OperationId, breakpo
 }
 
 /// Produces a logical per-tile schedule by expanding selected operator plans.
-/// Conversions without plans still use a conservative gather fallback.
+/// Follows the ownership rotations recorded in the selected mid-level graph.
 #[tracing::instrument(
     name = "ipu_codegen.low.lower_to_tiles",
-    skip(graph, config),
+    skip(graph),
     fields(
-        tile_count = config.tile_count,
-        operations = graph.operations.len(),
-        profiling = config.profiling
+        tile_count = graph.tile_count,
+        operations = graph.operations.len()
     )
 )]
-pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringResult<LowProgram> {
-    if config.tile_count == 0 {
+pub fn lower_to_tiles(
+    graph: &MidGraph,
+    diagnostic_checkpoints: bool,
+) -> LowLoweringResult<LowProgram> {
+    if graph.tile_count == 0 {
         return Err(LowLoweringError::EmptyTileGroup);
     }
-    let mut state = LoweringState::new(graph, config.tile_count)?;
-    let tiles = state.lower_region(&graph.operations, config.diagnostic_checkpoints)?;
+    let mut state = LoweringState::new(graph)?;
+    let tiles = state.lower_region(&graph.operations, diagnostic_checkpoints)?;
     let inputs = graph
         .inputs
         .iter()
@@ -391,7 +387,7 @@ pub fn lower_to_tiles(graph: &MidGraph, config: &PipelineConfig) -> LowLoweringR
         "built logical tile schedule"
     );
     Ok(LowProgram {
-        tile_count: config.tile_count,
+        tile_count: graph.tile_count,
         shards: state.shards,
         exchange_phases: state.phases,
         inputs,
@@ -433,7 +429,8 @@ impl LoweringState {
         shard
     }
 
-    fn new(graph: &MidGraph, tile_count: u16) -> LowLoweringResult<Self> {
+    fn new(graph: &MidGraph) -> LowLoweringResult<Self> {
+        let tile_count = graph.tile_count;
         let mut state = Self {
             tile_count,
             shards: Vec::new(),
@@ -447,104 +444,20 @@ impl LoweringState {
             deferred_values: BTreeMap::new(),
             intersection_cache: BTreeMap::new(),
         };
-        let parameter_origins = graph
-            .inputs
-            .iter()
-            .filter(|input| input.kind == GraphInputKind::Parameter)
-            .map(|input| graph.values[input.value.index() as usize].origin)
-            .collect::<BTreeSet<_>>();
-        let parameter_values = graph
-            .values
-            .iter()
-            .filter(|value| parameter_origins.contains(&value.origin))
-            .map(|value| value.id)
-            .collect::<BTreeSet<_>>();
-        let parameter_groups = parameter_values
-            .iter()
-            .map(|value| graph.values[value.index() as usize].storage_group)
-            .collect::<BTreeSet<_>>();
-        let mut parameter_bytes = vec![0u64; usize::from(tile_count)];
-        let mut parameter_offsets = BTreeMap::<MidValueId, u16>::new();
         for value in &graph.values {
-            let declared_tiles = value.tensor_type.format.layout.tiling.tile_count;
-            if declared_tiles == 0 || declared_tiles > tile_count {
-                return Err(LowLoweringError::TileCountMismatch {
-                    value: value.id,
-                    declared: declared_tiles,
-                    scheduled: tile_count,
-                });
-            }
-            let extents = value
-                .tensor_type
-                .format
-                .layout
-                .shard_extents(&value.tensor_type.shape)?;
-            let is_parameter = parameter_values.contains(&value.id);
-            let placement_group = value.storage_group;
-            let rotate_parameter = is_parameter || parameter_groups.contains(&placement_group);
-            let parameter_shard_bytes = if rotate_parameter {
-                extents
-                    .iter()
-                    .map(|(_, extents)| {
-                        crate::storage::storage_bytes(crate::storage::TensorStorage {
-                            format: &value.tensor_type.format,
-                            extents,
-                        })
-                        .map(u64::from)
-                        .map_err(LowLoweringError::from)
-                    })
-                    .collect::<LowLoweringResult<Vec<_>>>()?
-            } else {
-                Vec::new()
-            };
-            let parameter_offset = if rotate_parameter {
-                if let Some(&offset) = parameter_offsets.get(&placement_group) {
-                    offset
-                } else {
-                    let offset = (0..tile_count)
-                        .min_by_key(|&offset| {
-                            let mut loads = parameter_bytes.clone();
-                            for (logical, &bytes) in parameter_shard_bytes.iter().enumerate() {
-                                let tile =
-                                    (logical + usize::from(offset)) % usize::from(tile_count);
-                                loads[tile] = loads[tile].saturating_add(bytes);
-                            }
-                            (loads.into_iter().max().unwrap_or(u64::MAX), offset)
-                        })
-                        .ok_or(LowLoweringError::EmptyTileGroup)?;
-                    tracing::debug!(
-                        ?placement_group,
-                        offset,
-                        shards = parameter_shard_bytes.len(),
-                        "assigned parameter storage group to tiles"
-                    );
-                    parameter_offsets.insert(placement_group, offset);
-                    offset
-                }
-            } else {
-                0
-            };
+            let layout = &value.tensor_type.format.layout;
+            layout.validate_tile_count(tile_count)?;
+            let extents = layout.shard_extents(&value.tensor_type.shape)?;
             let mut value_shards = Vec::with_capacity(extents.len());
-            for (logical_shard, (owner_tile, extents)) in extents.into_iter().enumerate() {
-                let mut shard = LowShard {
+            for (owner, extents) in extents {
+                let id = state.push_shard(LowShard {
                     id: LowShardId(0),
-                    tile: 0,
+                    tile: ((usize::from(owner) + usize::from(value.tile_offset))
+                        % usize::from(tile_count)) as u16,
                     tensor_type: value.tensor_type.clone(),
                     extents,
                     definition: ShardDefinition::Value(value.id),
-                };
-                shard.tile = if rotate_parameter {
-                    let tile = (usize::from(owner_tile) + usize::from(parameter_offset))
-                        % usize::from(tile_count);
-                    let bytes = parameter_shard_bytes[logical_shard];
-                    parameter_bytes[tile] = parameter_bytes[tile]
-                        .checked_add(bytes)
-                        .ok_or(LowLoweringError::IdOverflow)?;
-                    u16::try_from(tile).map_err(|_| LowLoweringError::IdOverflow)?
-                } else {
-                    owner_tile
-                };
-                let id = state.push_shard(shard)?;
+                })?;
                 value_shards.push(id);
             }
             state.canonical[value.id.index() as usize] = value_shards;
