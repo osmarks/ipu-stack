@@ -108,7 +108,14 @@ pub(crate) fn program_cycles(
             .iter()
             .map(|phase| {
                 let traffic = phase_traffic(program, phase)?;
-                Ok(super::cycles::exchange_endpoint_cycles(&traffic, 1))
+                // Fragmented transfers also consume routing/pointer events.
+                // Use the same calibration as materialization selection;
+                // bandwidth alone makes scattered views look nearly free.
+                Ok(super::cycles::exchange_endpoint_cycles(&traffic, 1).max(
+                    traffic
+                        .maximum_fragments()
+                        .saturating_mul(super::IPU21_LOGICAL_FRAGMENT_CYCLES),
+                ))
             })
             .collect::<BlockBuildResult<Vec<_>>>()?
     };
@@ -318,7 +325,7 @@ mod tests {
         let body = BlockRegion {
             operations: vec![BlockOperation::Exchange(phase)],
         };
-        let program = MidProgram {
+        let mut program = MidProgram {
             tile_count: 2,
             shards: vec![],
             kernel_runs: vec![],
@@ -352,6 +359,53 @@ mod tests {
             }
         );
         assert_eq!(program_footprint(&program).unwrap().phases, 1);
+
+        // Identical payloads with many routing fragments must not receive the
+        // same analytical price. Scheduled prices replace that approximation.
+        let full = vec![ShardExtent {
+            axis: 0,
+            start: 0,
+            logical_end: 128,
+            physical_end: 128,
+        }];
+        program.shards = (0..2)
+            .map(|tile| BlockValue {
+                id: BlockValueId::from_index(tile),
+                tile: tile as u16,
+                tensor_type: TensorType::new(
+                    [128],
+                    Precision::F16,
+                    Layout::row_major(TensorTiling::replicated(2)),
+                ),
+                extents: full.clone(),
+                definition: ShardDefinition::Value(crate::MidValueId::from_index(tile)),
+            })
+            .collect();
+        let transfer = |extents: Vec<ShardExtent>| LogicalExchange {
+            source: ShardView {
+                shard: BlockValueId::from_index(0),
+                extents: extents.clone(),
+            },
+            destinations: vec![ShardView {
+                shard: BlockValueId::from_index(1),
+                extents,
+            }],
+            order: crate::CopyOrder::Physical,
+        };
+        program.exchange_phases[0].transfers = vec![transfer(full)];
+        let contiguous = program_cycles(&program, None).unwrap();
+        program.exchange_phases[0].transfers = (0..64)
+            .map(|i| {
+                transfer(vec![ShardExtent {
+                    axis: 0,
+                    start: i * 2,
+                    logical_end: i * 2 + 2,
+                    physical_end: i * 2 + 2,
+                }])
+            })
+            .collect();
+        assert!(program_cycles(&program, None).unwrap().total > contiguous.total);
+        assert_eq!(program_cycles(&program, Some(&[123])).unwrap().total, 861);
     }
 
     #[test]

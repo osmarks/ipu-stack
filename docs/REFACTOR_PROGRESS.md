@@ -283,3 +283,20 @@ Planning traversal checkpoint:
   including full MLP, materialized/Flash attention and repeated MLP. MLP took
   440 seconds and attention 215 seconds before the storage traversal fix.
   Final traversal performance/device checks are running (`/tmp/lane-mid-*`).
+
+Concrete exchange-cost correction:
+
+- Final traversal run passed GEMM, batched GEMM and full MLP. MLP mid planning
+  fell to 66.7 seconds, but total build/run remained 365 seconds because the
+  chosen layout produces far more physical exchange fragments than the old
+  analytical model's choice. Remaining attention cases were stopped in planning
+  to test the following scoring correction; they are not recorded as passed.
+- Detailed exchange cycle prices now include the existing materialization
+  fragment-event calibration, taking the maximum of bandwidth and event costs.
+  Previously actual fragments affected table storage only, making scattered
+  transfers too cheap in detailed ranking. Scheduled phase prices still replace
+  the approximation. The repeat regression now verifies equal-payload fragmented
+  exchanges cost more and scheduled prices override that difference.
+- All 148 release tests and strict Clippy passed after the pricing change; the
+  extended regression and Clippy passed afterward. Final eight-case device run
+  (including scheduled-finalist repeated MLP) is `/tmp/fragment-priced-*`.

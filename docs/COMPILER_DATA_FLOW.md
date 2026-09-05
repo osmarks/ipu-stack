@@ -39,7 +39,7 @@ inputs and incompatible ownership/capacity require reconstruction by the same
 builder. There is no second expansion path in low.
 
 Eight shared planning workers bound concurrent construction. Cheap boundary
-costs shortlist branch combinations before constructing new fragments; detailed
+costs shortlist branch combinations at twice beam width before constructing new fragments; detailed
 branch analysis composes a concrete region, including consumer-created
 movement for deferred views. It retains only cycle/memory metrics after scoring;
 selected operator fragments remain shared. The old per-operator memory/exchange
@@ -83,11 +83,17 @@ barriers at operator boundaries. Scheduled exchange prices use execution
 multiplicity; static exchange row storage does not.
 
 These are still estimates: primitive bandwidth/launch prices need calibration,
-logical endpoint traffic is cheaper and less precise than physical scheduling,
+logical endpoint traffic and calibrated fragment overhead are cheaper and less
+precise than physical scheduling,
 and live-byte feasibility does not prove physical placement. Early enumeration
 uses coarse boundary storage and existing grid proxies, not a second staging or
 reduction implementation. Widening the beam can change which candidates survive
-that heuristic. Conversion prices also remain useful before a concrete branch
+that heuristic. Storage spans walk contiguous lanes rather than individual elements. Semantic
+transfers retain canonical order; physical transfers may traverse rows first.
+Lifetime analysis indexes each exchange phase by tile once, and keeps outputs
+live according to actual block ownership.
+
+Conversion prices also remain useful before a concrete branch
 exists; they do not determine the detailed region score.
 
 ## Movement and contracts
