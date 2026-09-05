@@ -331,3 +331,17 @@ Final validation record (2026-09-05, complete):
   All nine final device invocations passed without startup/runtime failures.
 - Updated curated graphs in `docs/COMPILER_DATA_FLOW.md`. #1–#3 are implemented
   and committed; compilation performance remains the explicit limitation above.
+
+Profiled hardware measurement (2026-09-05):
+
+- Rebuilt the same selected full MLP plan with profiling enabled: batch 1,
+  tokens 729, dimension 1152, hidden dimension 4304, one block, no biases.
+  Hardware passed, maximum absolute error 0.011719.
+- Measured maximum tile start-to-end duration: **336,318 cycles**; minimum
+  263,682 cycles. At the benchmark's configured 1.5 GHz this is 224.212 us,
+  64.484 effective GEMM TFLOP/s. Analytical estimate was 549,747 cycles.
+  Artifacts: `/tmp/fragment-priced-mlp-profile.{log,json,ipuexe}`.
+- A five-second CPU sample during physical scheduling attributed 63.9% to
+  `BinaryHeap<ReadyTransfer>::pop`, 3.4% to its push, and 4.6% to
+  `earliest_transfer_offset_impl`. This is a short sample, not an attribution
+  across the whole build. `/tmp/final-mlp-scheduler-{perf.data,report.txt}`.
