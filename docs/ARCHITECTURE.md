@@ -76,11 +76,16 @@ storage including explicit aliases and temporary requirements. It does not build
 a tile graph, enumerate kernel calls, schedule exchange or invoke allocation
 analysis. `estimate/primitive` shares kernel prices with the final expanded
 timeline evaluator. `estimate/cycles` caches compact operator implementations;
-`estimate/memory` composes candidate regions for costing.
+`estimate/memory` composes candidate regions for costing. Candidate shortlisting
+and preliminary beam ranking use these compact execution prices, not boundary
+memory as a proxy for cycles. Shortlisting preserves reduction fan-in and result
+partition diversity. The implementation cache retains strong references for one
+search, so rejected candidates can be reused without rebuilding their regions.
 
 The estimates are deliberately approximate. They sum primitive durations and
 conservatively combine local storage maxima, rather than reproduce tile overlap
-and physical allocation. Exchange uses a coarse fragment-size assumption;
+and physical allocation. Exchange uses a layout-informed coarse fragment-size assumption (smaller for
+packed linear redistribution);
 contention and actual table sizes are resolved later. Final `estimate/program`
 evaluation uses actual tile timelines and can accept measured scheduler phase
 prices for finalist reranking. Placement remains the authority on physical fit.

@@ -244,7 +244,7 @@ fn operation_cost(
                 remote.div_ceil(stages)
             };
             scratch.standard = bytes.saturating_mul(per_stage.saturating_add(2));
-            let (exchange, footprint) = exchange_price(bytes.saturating_mul(remote), stages);
+            let (exchange, footprint) = exchange_price(bytes.saturating_mul(remote), stages, 256);
             price.exchange = exchange;
             rows = footprint;
             price.total = exchange
@@ -276,7 +276,8 @@ fn operation_cost(
                     .saturating_mul(destinations)
                     .div_ceil(sources)
                     .min(maximum_shard_bytes(input));
-                let (exchange, footprint) = exchange_price(bytes.max(sends), 1);
+                let (exchange, footprint) =
+                    exchange_price(bytes.max(sends), 1, movement_fragment_bytes(input, output));
                 price.exchange = exchange;
                 rows = footprint;
             }
@@ -308,13 +309,42 @@ fn operation_cost(
     Some((price, scratch, rows))
 }
 
-fn exchange_price(bytes: u64, phases: u64) -> (u64, u64) {
+/// Packed matrices with linear ownership cross row/panel boundaries. Use their
+/// native column grain as a conservative fragment size, rather than treating
+/// these mappings like long contiguous blocked transfers. No tile enumeration.
+fn movement_fragment_bytes(input: &TensorType, output: &TensorType) -> u64 {
+    if input.format.layout.tiling != output.format.layout.tiling
+        && [input, output]
+            .iter()
+            .any(|t| t.format.layout.tiling.linear_grain().is_some())
+    {
+        return [input, output]
+            .into_iter()
+            .filter_map(|t| {
+                (t.format.layout.order != ElementOrder::RowMajor)
+                    .then(|| {
+                        t.format
+                            .layout
+                            .order
+                            .retained_linear_column_grain(t.format.precision)
+                    })
+                    .flatten()
+                    .map(|grain| u64::from(grain) * t.format.precision.bytes())
+            })
+            .min()
+            .unwrap_or(256)
+            .min(256);
+    }
+    256
+}
+
+fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     if bytes == 0 || phases == 0 {
         return (0, 0);
     }
     // Coarse useful-payload assumption for blocked tensor movement. Placement
     // and physical scheduling later determine the actual fragmentation.
-    let fragments = bytes.div_ceil(256).max(phases);
+    let fragments = bytes.div_ceil(fragment_bytes.max(1)).max(phases);
     let cycles = bytes
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
         .max(fragments.saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES))

@@ -1476,3 +1476,58 @@ fn materialized_attention_packs_values_for_the_full_product() {
         })
     );
 }
+
+#[test]
+fn shortlist_prices_execution_instead_of_boundary_storage() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [1, 729, 1152]).unwrap();
+    let weight = graph.parameter("weight", [1, 1152, 4304]).unwrap();
+    let output = graph.gemm(input, weight).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let mut plans = Vec::new();
+    for (r, c, k) in [(4, 92, 4), (3, 27, 18)] {
+        let config = PipelineConfig::new(1472)
+            .with_automatic_input(input, Precision::F16)
+            .with_automatic_input(weight, Precision::F16)
+            .with_gemm_plan_constraint(GemmPlanConstraint {
+                source_operation: 0,
+                orientation: GemmOrientation::Normal,
+                row_partitions: r,
+                column_partitions: c,
+                inner_partitions: k,
+                result_row_partitions: k,
+                result_column_partitions: 1,
+                output_column_block: if k == 4 { 48 } else { 160 },
+                weight_memory_class: MemoryClass::Ipu21Interleaved,
+                reduction_staging: ReductionStaging::Complete,
+                local_weight_staging: LocalOperandStaging::Direct,
+            });
+        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        plans.push(
+            mid.operations
+                .iter()
+                .find_map(|op| op.operator_plan())
+                .unwrap()
+                .clone(),
+        );
+    }
+    let inputs = [
+        TensorType::new([1, 729, 1152], Precision::F16, Layout::row_sharded(1472)),
+        TensorType::new([1, 1152, 4304], Precision::F16, Layout::row_sharded(1472)),
+    ];
+    let output = TensorShape::new([1, 729, 4304]);
+    let boundary_bytes = |plan: &OperatorPlan| {
+        let (inputs, output) = plan.tensor_types(&inputs, &output);
+        inputs
+            .iter()
+            .chain(std::iter::once(&output))
+            .map(|t| crate::estimate::tensor_memory(t).total())
+            .sum::<u64>()
+    };
+    assert!(boundary_bytes(&plans[0]) > boundary_bytes(&plans[1]));
+    let expected = plans[0].clone();
+    let selected = retain_operator_candidates(plans, &inputs, &output, &Ipu21CostModel, 1);
+    assert_eq!(selected, vec![expected]);
+}

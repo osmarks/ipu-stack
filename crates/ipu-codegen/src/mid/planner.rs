@@ -543,8 +543,8 @@ pub(super) fn lower_operation_candidates(
             )
             .chain(constraints.allocation_copies.keys().copied())
             .collect::<BTreeSet<_>>();
-        // Region construction is reserved for this wider shortlist. The
-        // preliminary score uses boundary storage and conversion costs.
+        // Compose full region liveness only for this wider shortlist. Each
+        // operator already has a compact implementation and execution price.
         let screening_width = config.planning_beam_width.max(1).saturating_mul(2);
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
@@ -1315,17 +1315,18 @@ pub(super) fn apply_selected_plan(
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())
         .collect::<Vec<_>>();
+    let implementation =
+        costs.implementation(&plan, &converted_types, &state.get(result).tensor_type);
     let mut operator_cycles = costs
         .operator_cycle_override(&plan, &converted_types, &state.get(result).tensor_type)
         .unwrap_or_else(|| {
-            converted_types
-                .iter()
-                .chain(std::iter::once(&state.get(result).tensor_type))
-                .map(crate::estimate::maximum_shard_bytes)
-                .fold(0u64, u64::saturating_add)
-                .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+            implementation
+                .as_ref()
+                .map_or(u64::MAX, |p| p.estimated_cycles)
         });
-    let mut operator_exchange_cycles = 0u64;
+    let mut operator_exchange_cycles = implementation
+        .as_ref()
+        .map_or(0, |p| p.estimated_exchange_cycles);
     // Preliminary transition prices remain useful for custom planning models.
     // Normal detailed ranking evaluates the emitted region, including movement.
     for ((source, input), requirement) in source_types
@@ -1414,7 +1415,7 @@ pub(super) fn apply_selected_plan(
         kind: MidOperationKind::Operator {
             plan,
             deferred_inputs,
-            implementation: None,
+            implementation,
         },
         estimated_cycles: operator_cycles,
         estimated_exchange_cycles: operator_exchange_cycles,

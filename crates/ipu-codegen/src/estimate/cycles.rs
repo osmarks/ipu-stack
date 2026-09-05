@@ -82,9 +82,8 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
     spatial_capacity: u16,
     rearrangements: Mutex<RearrangementCache>,
-    implementations: Mutex<
-        HashMap<(OperatorPlan, Vec<TensorType>, TensorType), std::sync::Weak<crate::MidProgram>>,
-    >,
+    implementations:
+        Mutex<HashMap<(OperatorPlan, Vec<TensorType>, TensorType), Arc<crate::MidProgram>>>,
 }
 
 type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
@@ -111,22 +110,16 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         let mut plan = plan.clone();
         plan.deferred_output = None;
         let key = (plan, inputs.to_vec(), output.clone());
-        if let Some(retained) = self
-            .implementations
-            .lock()
-            .unwrap()
-            .get(&key)
-            .and_then(std::sync::Weak::upgrade)
-        {
+        if let Some(retained) = self.implementations.lock().unwrap().get(&key).cloned() {
             return Some(retained);
         }
-        // Branches own executable fragments. Weak cache entries reuse live
-        // implementations without pinning rejected work or evicting survivors.
+        // These are compact whole-device fragments. Retain them for this search
+        // so shortlist and branch costing do not reconstruct rejected candidates.
         let built = self.inner.implementation(&key.0, &key.1, &key.2)?;
         self.implementations
             .lock()
             .unwrap()
-            .insert(key, Arc::downgrade(&built));
+            .insert(key, built.clone());
         Some(built)
     }
     fn operator_cycle_override(

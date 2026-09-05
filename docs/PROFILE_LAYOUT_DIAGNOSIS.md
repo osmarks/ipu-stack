@@ -193,3 +193,88 @@ increased was incorrect.
 Results: `/tmp/batched-preparation.{ipuprofile,ipuexe,log}` and
 `artifacts/profiles/attention-batched-preparation.html`, plus the matching
 barrier JSON. Both newly rendered profiles were checked in Chromium.
+
+
+## Execution-cost shortlisting (2026-09-05)
+
+The operator shortlist now prices compact mid implementations, including staging
+and reductions. Preliminary beam ranking uses the same implementation prices.
+Only shortlisted regions receive full composed liveness evaluation. Neither step
+expands tiles or invokes physical scheduling. Geometry diversity preserves both
+reduction fan-in and result subdivision, without spending each diversity slot on
+another memory/staging variant of the same geometry. A regression checks that a
+historical first-GEMM grid survives despite its larger boundary storage.
+
+The cache now retains compact implementations for the duration of one search;
+candidate evaluation uses the existing bounded parallel pool. Weak references
+caused repeated reconstruction during screening. An intermediate uncached trial
+spent 83 seconds planning; final MLP planning took 11.419 seconds (with concurrent
+test compilation). The coarse movement model also uses native packed column
+grain for linear redistribution: F16 AmpLeft gets 32-byte representative payloads
+instead of 256 bytes. This is a conservative heuristic, not span enumeration.
+An intermediate choice otherwise appeared cheap but expanded roughly 195,000
+movement fragments.
+
+| Measurement | Previous automatic | New automatic |
+|---|---:|---:|
+| MLP maximum tile benchmark cycles | 327,144 | 229,314 |
+| MLP compact estimated cycles | 413,118 | 307,309 |
+| MLP expanded analytical cycles | 568,612 | 282,747 |
+| MLP build and numerical validation | 244.67 s | 71.93 s |
+| Projected attention cropped profile span | 782,088 | 523,980 |
+| Attention build and numerical validation | 49.62 s | 43.05 s |
+
+Device improvements are 29.9% and 33.0%, respectively. These results retain the
+main branch's separate Q/K/V preparation, without experimental batching. Both
+new profiles were rendered and inspected in Chromium:
+`artifacts/profiles/mlp-shortlist.html` and
+`artifacts/profiles/attention-shortlist.html`. Attention preparation still has
+substantial idle time despite the faster overall selection.
+
+Tradeoffs: MLP peak build RSS is 1,718,228 KiB (1.64 GiB), versus about 1.31 GiB
+previously. Its replicated host input payload grows from 45,411,840 to 272,471,040
+bytes; weights remain 19,869,696 bytes. Reported device cycles exclude host
+initialization, so this is a device-execution improvement, not a measurement of
+end-to-end request latency. The new cropped MLP profile span is 228,654 cycles;
+it differs from the maximum tile benchmark counter above.
+
+Validation: all 156 workspace release tests and strict workspace Clippy pass.
+Hardware passes full MLP (maximum error 0.011719), full projected attention
+(839,808 checks, error 0.001230), GEMM, batched GEMM, attention smoke, repeated
+MLP, and forced materialized attention (839,808 checks, error 0.000930).
+New linear layouts exposed an in-place pointwise bug: expansion selected the
+first shard on a tile instead of the shard with matching extents. The fix and
+multi-shard alias regression are committed separately as f360c4a.
+Build/profile inputs are `/tmp/shortlist-fragments-{mlp,attention}.*`;
+additional validation logs are `/tmp/shortlist-validated-*.log`.
+
+## Why reconstructed historical grids remain slower
+
+Compare the same profile window: the saved historical MLP spans 205,392 cycles;
+its reconstructed grids span 225,930, a difference of 20,538 cycles (10.0%).
+Comparing the old cropped span directly with the new 232,722 maximum-tile
+benchmark counter overstates the regression. Historical workload provenance is
+incomplete; this is a grid reconstruction, not a byte-identical package replay.
+
+Shared-clock phase analysis shows the initial exchange and first GEMM are
+identical. First reduction work is 11,061,624 tile-cycles over 1,472 tiles, with
+a maximum sample of 7,920 cycles in both profiles. GeLU work is also identical.
+Before the second GEMM, the new lowering clears destination padding by zeroing
+whole buffers on 432 tiles. Its largest fill takes 13,482 cycles and clears
+50,048 F16 elements. The next exchange's last arrival moves from 93,636 to
+107,010, a 13,374-cycle delay.
+
+That exchange's scheduled duration grows from 45,670 to 53,856 cycles (+8,186).
+Its measured duration after the last arrival grows by 8,208. The precise source
+of this remaining mapping/placement/scheduling difference has not been isolated.
+The subsequent GEMM recovers about 1,100 cycles of the accumulated gap. The final
+exchange schedule is identical (12,527 cycles), as is final reduction work:
+10,195,632 tile-cycles over 1,440 tiles, maximum sample 8,094 cycles. The final
+profile endpoints differ by 20,538 cycles.
+
+Thus reduction throughput is not the cause for these fixed grids. Most of the
+regression is the new padding-clear tail plus the longer redistribution schedule.
+`low/expand/conversion.rs::prepare_mapped_views` currently clears whole copy
+buffers when `CopyPlan.clear_padding` is set. Required K padding cannot simply
+be left uninitialized. Clearing only uncovered physical ranges is the next
+specific optimization; it has not been implemented in this checkpoint.

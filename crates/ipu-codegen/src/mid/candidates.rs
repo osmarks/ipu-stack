@@ -1248,6 +1248,10 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
 pub(super) struct OperatorCompatibility {
     pub(super) orientation: Option<GemmOrientation>,
     pub(super) reduction_staging: Option<ReductionStaging>,
+    // Preserve different reduction fan-ins through local screening: their
+    // result ownership and cost to the next consumer differ substantially.
+    pub(super) inner_partitions: Option<u16>,
+    pub(super) result_partitions: Option<(u16, u16)>,
     pub(super) inputs: Vec<(
         Precision,
         ElementOrderCompatibility,
@@ -1263,21 +1267,35 @@ pub(super) struct OperatorCompatibility {
 }
 
 pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> OperatorCompatibility {
-    let (orientation, reduction_staging) = match candidate.dispatch {
-        OperatorDispatch::BlockedGemm {
-            orientation,
-            distribution:
-                GemmDistribution::ParallelReduction {
-                    reduction_staging, ..
-                },
-            ..
-        } => (Some(orientation), Some(reduction_staging)),
-        OperatorDispatch::BlockedGemm { orientation, .. } => (Some(orientation), None),
-        _ => (None, None),
-    };
+    let (orientation, reduction_staging, inner_partitions, result_partitions) =
+        match candidate.dispatch {
+            OperatorDispatch::BlockedGemm {
+                orientation,
+                distribution:
+                    GemmDistribution::ParallelReduction {
+                        reduction_staging,
+                        inner_partitions,
+                        result_row_partitions,
+                        result_column_partitions,
+                        ..
+                    },
+                ..
+            } => (
+                Some(orientation),
+                Some(reduction_staging),
+                Some(inner_partitions),
+                Some((result_row_partitions, result_column_partitions)),
+            ),
+            OperatorDispatch::BlockedGemm { orientation, .. } => {
+                (Some(orientation), None, Some(1), None)
+            }
+            _ => (None, None, None, None),
+        };
     OperatorCompatibility {
         orientation,
         reduction_staging,
+        inner_partitions,
+        result_partitions,
         inputs: candidate
             .requirements
             .inputs
@@ -1320,29 +1338,31 @@ pub(super) fn retain_operator_candidates(
         return candidates;
     }
     let ranked = candidates
-        .into_iter()
+        .into_par_iter()
         .map(|candidate| {
             let (planned_inputs, planned_output) = candidate.tensor_types(inputs, output);
-            // Enumeration only: screen by boundary storage/traffic before
-            // constructing executable fragments in the detailed beam. This is
-            // a heuristic, not an admissible bound or a second operator model.
-            let memory = planned_inputs
-                .iter()
-                .chain(std::iter::once(&planned_output))
-                .map(crate::estimate::tensor_memory)
-                .fold(MemoryUsage::default(), |sum, tensor| {
-                    sum.saturating_add(tensor)
-                });
+            // Price the compact whole-device implementation, including staging
+            // and reduction work. Boundary bytes are not an execution cost and
+            // systematically discard useful larger-K, lower-fan-in GEMM grids.
+            let implementation = costs.implementation(&candidate, &planned_inputs, &planned_output);
+            let peak = implementation
+                .as_ref()
+                .map(|p| p.peak_memory)
+                .unwrap_or_default();
             let objective = PlanMetrics {
-                standard_contiguous_overflow: 0,
+                standard_contiguous_overflow: peak.standard_contiguous_overflow,
                 cycles: costs
                     .operator_cycle_override(&candidate, &planned_inputs, &planned_output)
-                    .unwrap_or(memory.total()),
-                standard: memory.standard,
-                interleaved: memory.interleaved,
-                total: memory.total(),
-                maximum_standard_allocation: crate::estimate::maximum_shard_bytes(&planned_output),
-                exchange_rows: 0,
+                    .unwrap_or_else(|| {
+                        implementation
+                            .as_ref()
+                            .map_or(u64::MAX, |p| p.estimated_cycles)
+                    }),
+                standard: peak.standard,
+                interleaved: peak.interleaved,
+                total: peak.total,
+                maximum_standard_allocation: peak.maximum_standard_allocation,
+                exchange_rows: peak.exchange_rows,
             };
             let compatibility = operator_candidate_compatibility(&candidate);
             (candidate, objective, compatibility)
@@ -1376,7 +1396,15 @@ pub(super) fn retain_operator_candidates(
         if selected.len() >= width {
             break;
         }
-        if represented.insert(compatibility.clone()) {
+        // Reserve diversity for compute/reduction geometry and future output
+        // use, not multiple memory/staging variants of the same geometry.
+        // Remaining slots below retain those local memory tradeoffs by cost.
+        if represented.insert((
+            compatibility.orientation,
+            compatibility.inner_partitions,
+            compatibility.result_partitions,
+            &compatibility.output,
+        )) {
             selected.insert(index);
         }
     }

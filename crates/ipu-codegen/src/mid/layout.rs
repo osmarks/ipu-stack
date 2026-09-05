@@ -124,7 +124,7 @@ impl ElementOrder {
 
     /// Smallest column span which remains a self-contained physical fragment
     /// when canonical linear ownership divides a matrix into row segments.
-    pub(super) fn retained_linear_column_grain(self, precision: Precision) -> Option<u32> {
+    pub(crate) fn retained_linear_column_grain(self, precision: Precision) -> Option<u32> {
         match self {
             Self::RowMajor => Some(1),
             Self::Amp(AmpOrder::Left) => Some(match precision {

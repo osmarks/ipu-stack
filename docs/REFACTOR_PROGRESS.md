@@ -463,3 +463,19 @@ Completed whole-device mid rewrite (2026-09-05):
   above. Logs and packages are under `/tmp/whole-mid-*`; architecture and data-flow
   documentation describe the completed boundary. General copy/view chain
   composition (#4) remains deferred pending discussion of its planning overlap.
+
+
+## Execution-cost shortlist and historical timing diagnosis
+
+Replaced boundary-memory screening with compact mid execution prices in both
+operator shortlisting and preliminary beam ranking. Preserved reduction geometry
+diversity and priced fragmented packed-linear movement more conservatively.
+Search-scoped strong caching now makes sense because implementations are compact
+whole-device regions; this supersedes the earlier weak-cache/boundary-screening
+checkpoint above. Fixed in-place reuse for multiple linear shards on one tile.
+
+Hardware: automatic MLP 327,144 -> 229,314 maximum tile cycles; projected attention
+782,088 -> 523,980 profile cycles. Full validation, cache/input-replication
+tradeoffs and the historical padding/redistribution regression are recorded in
+[the profile diagnosis](PROFILE_LAYOUT_DIAGNOSIS.md#execution-cost-shortlisting-2026-09-05).
+Q/K/V batching remains on its separate experiment branch.
