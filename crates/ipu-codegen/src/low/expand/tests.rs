@@ -236,7 +236,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         config.operator_candidates = vec![candidate];
         let mid = lower(&graph, &config, &Ipu21CostModel)
             .unwrap_or_else(|error| panic!("case {case}: {error}"));
-        let compact = crate::mid::implementation::resolve(&mid).unwrap();
+        let compact = crate::mid::implementation::resolve(mid.clone()).unwrap();
         let sum = compact
             .operations
             .iter()

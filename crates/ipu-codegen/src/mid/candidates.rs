@@ -251,101 +251,56 @@ pub(super) fn plans(
                 precision: Precision::F32,
                 layout: Layout::attention_output(heads, query_partitions),
             };
-            plans.push(OperatorPlan {
-                operator: MidOperator::FlashAttention {
-                    options,
-                    accumulate: AccumulationPrecision::F32,
-                },
-                dispatch: OperatorDispatch::BlockedAttention {
-                    query_key: TileKernelSpec::Gemm {
-                        multiply: Precision::F16,
+            for (materialized, key_block_rows) in
+                [(false, AMP_INNER_BLOCK), (true, padded_key_rows)]
+            {
+                plans.push(OperatorPlan {
+                    operator: MidOperator::FlashAttention {
+                        options,
                         accumulate: AccumulationPrecision::F32,
-                        mode: GemmKernelMode::Initialize,
-                        weights: GemmWeightLoad::Standard,
-                        inner_block: padded_query_dimension,
-                        output_columns: AMP_INNER_BLOCK,
                     },
-                    probability_value: TileKernelSpec::Gemm {
-                        multiply: Precision::F16,
-                        accumulate: AccumulationPrecision::F32,
-                        mode: GemmKernelMode::Initialize,
-                        weights: GemmWeightLoad::Standard,
-                        inner_block: AMP_INNER_BLOCK,
-                        output_columns: padded_value_dimension,
+                    dispatch: OperatorDispatch::Attention {
+                        materialized,
+                        key_block_rows,
+                        padded_query_dimension,
+                        padded_value_dimension,
                     },
-                    query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
-                    key_block_rows: AMP_INNER_BLOCK,
-                    padded_query_dimension,
-                    padded_value_dimension,
-                },
-                requirements: StorageRequirements {
-                    inputs: vec![
-                        OperandRequirement::new(query_format.clone(), 8)
-                            .with_materialization(OperandMaterialization::DispatchSlices),
-                        OperandRequirement::new(key_format.clone(), 8)
-                            .with_materialization(OperandMaterialization::DispatchSlices),
-                        OperandRequirement::new(value_format.clone(), 8)
-                            .with_materialization(OperandMaterialization::DispatchSlices),
-                    ],
-                    output: OperandRequirement::new(output_format.clone(), 8),
-                    output_aliasing: OutputAliasing::Fresh,
-                    distinct_elements: Vec::new(),
-                },
-                deferred_output: None,
-            });
-            plans.push(OperatorPlan {
-                operator: MidOperator::FlashAttention {
-                    options,
-                    accumulate: AccumulationPrecision::F32,
-                },
-                dispatch: OperatorDispatch::MaterializedAttention {
-                    query_key: TileKernelSpec::Gemm {
-                        multiply: Precision::F16,
-                        accumulate: AccumulationPrecision::F32,
-                        mode: GemmKernelMode::Initialize,
-                        weights: GemmWeightLoad::Standard,
-                        inner_block: padded_query_dimension,
-                        output_columns: padded_key_rows,
+                    requirements: StorageRequirements {
+                        inputs: [&query_format, &key_format, &value_format]
+                            .into_iter()
+                            .map(|format| {
+                                OperandRequirement::new(format.clone(), 8)
+                                    .with_materialization(OperandMaterialization::DispatchSlices)
+                            })
+                            .collect(),
+                        output: OperandRequirement::new(output_format.clone(), 8),
+                        output_aliasing: OutputAliasing::Fresh,
+                        distinct_elements: Vec::new(),
                     },
-                    probability_value: TileKernelSpec::Gemm {
-                        multiply: Precision::F16,
-                        accumulate: AccumulationPrecision::F32,
-                        mode: GemmKernelMode::Initialize,
-                        weights: GemmWeightLoad::Standard,
-                        inner_block: padded_key_rows,
-                        output_columns: padded_value_dimension,
-                    },
-                    query_block_rows: query_rows.div_ceil(u32::from(query_partitions)),
-                    padded_key_rows,
-                    padded_query_dimension,
-                    padded_value_dimension,
-                },
-                requirements: StorageRequirements {
-                    inputs: vec![
-                        OperandRequirement::new(query_format, 8)
-                            .with_materialization(OperandMaterialization::DispatchSlices),
-                        OperandRequirement::new(key_format, 8)
-                            .with_materialization(OperandMaterialization::DispatchSlices),
-                        OperandRequirement::new(value_format, 8)
-                            .with_materialization(OperandMaterialization::DispatchSlices),
-                    ],
-                    output: OperandRequirement::new(output_format, 8),
-                    output_aliasing: OutputAliasing::Fresh,
-                    distinct_elements: Vec::new(),
-                },
-                deferred_output: None,
-            });
+                    deferred_output: None,
+                });
+            }
         }
         match config.attention_strategy {
             AttentionStrategy::Automatic => {}
             AttentionStrategy::Flash => plans.retain(|plan| {
                 !matches!(
                     plan.dispatch,
-                    OperatorDispatch::MaterializedAttention { .. }
+                    OperatorDispatch::Attention {
+                        materialized: true,
+                        ..
+                    }
                 )
             }),
-            AttentionStrategy::Materialized => plans
-                .retain(|plan| !matches!(plan.dispatch, OperatorDispatch::BlockedAttention { .. })),
+            AttentionStrategy::Materialized => plans.retain(|plan| {
+                !matches!(
+                    plan.dispatch,
+                    OperatorDispatch::Attention {
+                        materialized: false,
+                        ..
+                    }
+                )
+            }),
         }
     }
     if let [input] = inputs
@@ -360,13 +315,7 @@ pub(super) fn plans(
                     candidate.format_policy,
                     OperatorFormatPolicy::PreserveInputLayout(0)
                 )
-                && matches!(
-                    candidate.plan.dispatch,
-                    OperatorDispatch::Pointwise {
-                        input_mapping: PointwiseInputMapping::TileLocal,
-                        ..
-                    }
-                )
+                && matches!(candidate.plan.dispatch, OperatorDispatch::Pointwise { .. })
                 && candidate.plan.requirements.inputs[0].format.precision == input.format.precision
         }) {
             let grain = candidate.plan.requirements.inputs[0]
@@ -621,8 +570,7 @@ pub(super) fn independent_parameter_storage(
             ..
         } => output_column_block,
         OperatorDispatch::Pointwise { .. }
-        | OperatorDispatch::BlockedAttention { .. }
-        | OperatorDispatch::MaterializedAttention { .. }
+        | OperatorDispatch::Attention { .. }
         | OperatorDispatch::View => {
             return Vec::new();
         }
@@ -1348,7 +1296,6 @@ pub(super) fn retain_operator_candidates(
                 .map(|p| p.peak_memory)
                 .unwrap_or_default();
             let objective = PlanMetrics {
-                standard_contiguous_overflow: peak.standard_contiguous_overflow,
                 cycles: costs
                     .operator_cycle_override(&candidate, &planned_inputs, &planned_output)
                     .unwrap_or_else(|| {
@@ -1356,11 +1303,7 @@ pub(super) fn retain_operator_candidates(
                             .as_ref()
                             .map_or(u64::MAX, |p| p.estimated_cycles)
                     }),
-                standard: peak.standard,
-                interleaved: peak.interleaved,
-                total: peak.total,
-                maximum_standard_allocation: peak.maximum_standard_allocation,
-                exchange_rows: peak.exchange_rows,
+                memory: peak,
             };
             let compatibility = operator_candidate_compatibility(&candidate);
             (candidate, objective, compatibility)
@@ -1382,23 +1325,23 @@ pub(super) fn retain_operator_candidates(
     let mut ranked = frontier;
     ranked.sort_by_key(|(_, objective, _)| {
         (
-            objective.standard_contiguous_overflow,
+            objective.memory.standard_contiguous_overflow(),
             objective.cycles,
-            objective.total,
-            objective.interleaved,
-            objective.exchange_rows,
+            objective.memory.total,
+            objective.memory.interleaved,
+            objective.memory.exchange_rows,
         )
     });
     let has_feasible = ranked
         .iter()
-        .any(|(_, metrics, _)| metrics.standard_contiguous_overflow == 0);
+        .any(|(_, metrics, _)| metrics.memory.standard_contiguous_overflow() == 0);
     let mut selected = BTreeSet::new();
     let mut represented = BTreeSet::new();
     for (index, (_, objective, compatibility)) in ranked.iter().enumerate() {
         if selected.len() >= width {
             break;
         }
-        if has_feasible && objective.standard_contiguous_overflow != 0 {
+        if has_feasible && objective.memory.standard_contiguous_overflow() != 0 {
             continue;
         }
         // Preserve K splits and distinct scatter directions before spending
@@ -1423,7 +1366,7 @@ pub(super) fn retain_operator_candidates(
         if selected.len() >= width {
             break;
         }
-        if !has_feasible || objective.standard_contiguous_overflow == 0 {
+        if !has_feasible || objective.memory.standard_contiguous_overflow() == 0 {
             selected.insert(index);
         }
     }
@@ -1443,8 +1386,8 @@ pub(super) fn retain_operator_candidates(
                         && candidate.requirements.output == plan.requirements.output
                         && signature.inputs != compatibility.inputs
                         && objective.cycles == metrics.cycles
-                        && objective.standard_contiguous_overflow
-                            == metrics.standard_contiguous_overflow
+                        && objective.memory.standard_contiguous_overflow()
+                            == metrics.memory.standard_contiguous_overflow()
                 })
         {
             selected.insert(index);
@@ -1548,7 +1491,7 @@ pub(super) fn operator_matches(operation: &OperationKind, operator: MidOperator)
     match (operation, operator) {
         (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
         (OperationKind::Gelu, MidOperator::Gelu) => true,
-        (OperationKind::Add(expected), MidOperator::Add(options)) => *expected == options,
+        (OperationKind::Add, MidOperator::Add) => true,
         (OperationKind::View(expected), MidOperator::View(view)) => *expected == view,
         (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
             *expected == options

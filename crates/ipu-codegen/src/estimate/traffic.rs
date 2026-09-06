@@ -4,8 +4,6 @@ use super::*;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
-    pub remote_fragments: u64,
-    pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
@@ -182,15 +180,6 @@ pub(crate) fn conversion_traffic(
                 traffic.maximum_local_intersections.max(local_intersections);
         }
     }
-    traffic.remote_fragments = remote.len() as u64;
-    traffic.maximum_routed_fragments = if from.order == to.order {
-        traffic.maximum_intersections
-    } else {
-        traffic
-            .maximum_destination_bytes
-            .saturating_sub(traffic.maximum_local_bytes)
-            .div_ceil(4)
-    };
     for (source, extents) in remote {
         traffic.exchange.add_outgoing(
             source,

@@ -353,3 +353,83 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     .estimated_row_bytes();
     (cycles, rows)
 }
+
+pub(crate) fn region_peak_memory(
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+) -> MemoryPeaks {
+    region_peak_memory_with_multiplicity(initial, operations, outputs, values, &BTreeMap::new())
+}
+
+pub(crate) fn region_peak_memory_with_multiplicity(
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+    allocation_multiplicity: &BTreeMap<MidValueId, u32>,
+) -> MemoryPeaks {
+    region_estimate(
+        initial,
+        operations,
+        outputs,
+        values,
+        allocation_multiplicity,
+    )
+    .map_or_else(unavailable_memory, |(_, peak)| peak)
+}
+
+pub(crate) fn unavailable_memory() -> MemoryPeaks {
+    MemoryPeaks {
+        standard: u64::MAX,
+        interleaved: u64::MAX,
+        total: u64::MAX,
+        ..MemoryPeaks::default()
+    }
+}
+
+pub(crate) fn region_estimate(
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+    allocation_multiplicity: &BTreeMap<MidValueId, u32>,
+) -> Option<(ProgramCycles, MemoryPeaks)> {
+    let mut outputs = outputs.to_vec();
+    // A pending view still needs its source storage at the region boundary.
+    for operation in operations.iter().rev() {
+        if let Some(offer) = operation
+            .operator_plan()
+            .and_then(|plan| plan.deferred_output)
+            && operation
+                .results
+                .iter()
+                .any(|result| outputs.contains(result))
+        {
+            outputs.push(operation.inputs[offer.source_input]);
+        }
+    }
+    let candidate = crate::MidProgram {
+        tile_count: values
+            .iter()
+            .map(|value| value.tensor_type.format.layout.tiling.tile_count)
+            .max()
+            .unwrap_or(1),
+        inputs: initial
+            .iter()
+            .map(|&value| crate::MidInput {
+                name: String::new(),
+                kind: crate::GraphInputKind::Host,
+                value,
+            })
+            .collect(),
+        values: values.to_vec(),
+        operations: operations.to_vec(),
+        outputs,
+        ..crate::MidProgram::default()
+    };
+
+    let program = crate::mid::implementation::resolve(candidate)?;
+    analyze(&program, allocation_multiplicity)
+}

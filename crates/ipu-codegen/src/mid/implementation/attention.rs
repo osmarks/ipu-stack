@@ -6,13 +6,21 @@ impl Builder {
     pub(super) fn attention(
         &mut self,
         output: &TensorType,
-        query_key: &TileKernelSpec,
-        probability_value: &TileKernelSpec,
         key_block: u32,
         query_width: u32,
         value_width: u32,
         materialized: bool,
     ) -> Option<MidValueId> {
+        let product = |inner_block, output_columns| TileKernelSpec::Gemm {
+            multiply: Precision::F16,
+            accumulate: AccumulationPrecision::F32,
+            mode: GemmKernelMode::Initialize,
+            weights: GemmWeightLoad::Standard,
+            inner_block,
+            output_columns,
+        };
+        let query_key = product(query_width, key_block);
+        let probability_value = product(key_block, value_width);
         let query = self.tensor(MidValueId(0)).clone();
         let key = self.tensor(MidValueId(1)).clone();
         let value = self.tensor(MidValueId(2)).clone();

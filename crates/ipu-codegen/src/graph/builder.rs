@@ -21,7 +21,7 @@ macro_rules! graph_operations {
         }
 
         pub fn add(&mut self, left: ValueId, right: ValueId) -> GraphResult<ValueId> {
-            self.inferred_result(OperationKind::Add(AddOptions::default()), [left, right])
+            self.inferred_result(OperationKind::Add, [left, right])
         }
 
         /// Apply a logical axis split/merge; materialization is selected by planning.

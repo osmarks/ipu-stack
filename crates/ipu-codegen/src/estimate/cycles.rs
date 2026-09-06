@@ -55,7 +55,6 @@ pub trait CostModel: Sync {
 pub struct RearrangementCost {
     pub cycles: u64,
     pub exchange_cycles: u64,
-    pub exchange_row_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -209,24 +208,6 @@ pub(super) fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
 }
 
-fn exchange_endpoint_footprint(
-    traffic: &ExchangeEndpointTraffic,
-    phases: u64,
-) -> ExchangeFootprint {
-    if traffic.is_empty() || phases == 0 {
-        return ExchangeFootprint::default();
-    }
-    let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
-    ExchangeFootprint {
-        phases,
-        maximum_transfer_chunks_per_tile: traffic
-            .maximum_payload_bytes()
-            .div_ceil(transfer_bytes)
-            .max(traffic.maximum_fragments())
-            .max(phases),
-    }
-}
-
 // Indexed F16 layout transforms execute scalar address arithmetic as well as
 // their loads and stores. The transposed-right panel is a contiguous copy:
 // its final coefficient permutation is performed by the GEMM's ld*putcs
@@ -302,14 +283,12 @@ impl CostModel for Ipu21CostModel {
             return RearrangementCost {
                 cycles: u64::MAX / 8,
                 exchange_cycles: u64::MAX / 8,
-                exchange_row_bytes: u64::MAX / 8,
             };
         }
         let Some(traffic) = conversion_traffic(shape, precision, from, to) else {
             return RearrangementCost {
                 cycles: u64::MAX / 8,
                 exchange_cycles: u64::MAX / 8,
-                exchange_row_bytes: u64::MAX / 8,
             };
         };
         let direct_retile = strategy == ConversionStrategy::DirectRetile;
@@ -329,19 +308,9 @@ impl CostModel for Ipu21CostModel {
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        let mut exchange_footprint =
-            exchange_endpoint_footprint(endpoint_traffic, u64::from(traffic.remote_fragments != 0));
-        exchange_footprint.maximum_transfer_chunks_per_tile = exchange_footprint
-            .maximum_transfer_chunks_per_tile
-            .max(traffic.maximum_routed_fragments);
         RearrangementCost {
             cycles: exchange_cycles.saturating_add(local_cycles),
             exchange_cycles,
-            exchange_row_bytes: if from.tiling == to.tiling {
-                0
-            } else {
-                exchange_footprint.estimated_row_bytes()
-            },
         }
     }
 }
@@ -351,8 +320,7 @@ mod tests {
     use super::*;
     use crate::{MidOperator, OperatorDispatch};
     use crate::{
-        OperandRequirement, OutputAliasing, PointwiseInputMapping, StorageRequirements,
-        TensorFormat, TileKernelSpec,
+        OperandRequirement, OutputAliasing, StorageRequirements, TensorFormat, TileKernelSpec,
     };
 
     const CASES: usize = 32;
@@ -360,7 +328,6 @@ mod tests {
     fn pointwise_dispatch() -> OperatorDispatch {
         OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
-            input_mapping: PointwiseInputMapping::TileLocal,
         }
     }
 
@@ -404,18 +371,6 @@ mod tests {
             );
             let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");
-            let footprint = exchange_endpoint_footprint(&traffic, phases);
-            let transfer_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
-            assert_eq!(footprint.phases, phases, "case {case}");
-            assert!(
-                footprint.maximum_transfer_chunks_per_tile
-                    >= outgoing.max(incoming).div_ceil(transfer_bytes),
-                "case {case}"
-            );
-            assert!(
-                footprint.maximum_transfer_chunks_per_tile >= traffic.maximum_fragments(),
-                "case {case}"
-            );
         }
     }
 
@@ -430,10 +385,7 @@ mod tests {
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(tiles));
             let unsharded =
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(1));
-            for operator in [
-                MidOperator::Gelu,
-                MidOperator::Add(crate::AddOptions::default()),
-            ] {
+            for operator in [MidOperator::Gelu, MidOperator::Add] {
                 let sharded_cycles = Ipu21CostModel.operator_cycles(
                     &OperatorPlan {
                         operator,

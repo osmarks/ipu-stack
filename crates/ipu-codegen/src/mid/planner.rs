@@ -325,23 +325,18 @@ pub(super) struct FutureBeamState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PlanMetrics {
     pub(super) cycles: u64,
-    pub(super) standard: u64,
-    pub(super) interleaved: u64,
-    pub(super) total: u64,
-    pub(super) maximum_standard_allocation: u64,
-    pub(super) standard_contiguous_overflow: u64,
-    pub(super) exchange_rows: u64,
+    pub(super) memory: MemoryPeaks,
 }
 
 impl PlanMetrics {
     pub(super) fn dominates(self, other: Self) -> bool {
         let no_worse = self.cycles <= other.cycles
-            && self.standard <= other.standard
-            && self.interleaved <= other.interleaved
-            && self.total <= other.total
-            && self.maximum_standard_allocation <= other.maximum_standard_allocation
-            && self.standard_contiguous_overflow <= other.standard_contiguous_overflow
-            && self.exchange_rows <= other.exchange_rows;
+            && self
+                .memory
+                .objectives()
+                .into_iter()
+                .zip(other.memory.objectives())
+                .all(|(a, b)| a <= b);
         no_worse && self != other
     }
 }
@@ -955,12 +950,7 @@ pub(super) fn retain_pareto_beam(
             cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
                 format_equality_cost(&branch, &constraints.required_equal_formats, costs),
             ),
-            standard: branch.peak_memory.standard,
-            interleaved: branch.peak_memory.interleaved,
-            total: branch.peak_memory.total,
-            maximum_standard_allocation: branch.peak_memory.maximum_standard_allocation,
-            standard_contiguous_overflow: branch.peak_memory.standard_contiguous_overflow,
-            exchange_rows: branch.peak_memory.exchange_rows,
+            memory: branch.peak_memory,
         };
         groups.entry(signature).or_default().push(RankedBeamBranch {
             compatibility: future_format_compatibility(&branch, future_origins),
@@ -1017,23 +1007,21 @@ pub(super) fn retain_pareto_beam(
                 diversity += 1;
             }
         }
-        let objectives: [fn(&RankedBeamBranch) -> u64; 6] = [
-            |entry: &RankedBeamBranch| entry.objective.standard,
-            |entry: &RankedBeamBranch| entry.objective.interleaved,
-            |entry: &RankedBeamBranch| entry.objective.total,
-            |entry: &RankedBeamBranch| entry.objective.maximum_standard_allocation,
-            |entry: &RankedBeamBranch| entry.objective.standard_contiguous_overflow,
-            |entry: &RankedBeamBranch| entry.objective.exchange_rows,
-        ];
         selected.insert(0);
-        for objective in objectives {
+        for dimension in 0..MemoryPeaks::OBJECTIVE_COUNT {
             if selected.len() == width {
                 break;
             }
             let index = frontier
                 .iter()
                 .enumerate()
-                .min_by_key(|(index, entry)| (objective(entry), entry.objective.cycles, *index))
+                .min_by_key(|(index, entry)| {
+                    (
+                        entry.objective.memory.objectives()[dimension],
+                        entry.objective.cycles,
+                        *index,
+                    )
+                })
                 .map(|(index, _)| index)
                 .unwrap();
             if selected.insert(index) {
@@ -1453,7 +1441,7 @@ pub(super) fn beam_memory_peak(
     branch
         .analysis
         .get_or_init(|| {
-            let (program, peak) = crate::estimate::region_estimate(
+            let (cycles, peak) = crate::estimate::region_estimate(
                 initial,
                 &branch.operations,
                 &live,
@@ -1476,14 +1464,7 @@ pub(super) fn beam_memory_peak(
                         .is_some()
                 })
             });
-            Some((
-                crate::estimate::ProgramCycles {
-                    total: program.estimated_cycles,
-                    exchange: program.estimated_exchange_cycles,
-                },
-                peak,
-                primitive,
-            ))
+            Some((cycles, peak, primitive))
         })
         .as_ref()
         .map_or_else(crate::estimate::unavailable_memory, |(_, peak, _)| *peak)

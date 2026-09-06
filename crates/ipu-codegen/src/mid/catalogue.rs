@@ -251,13 +251,13 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
         format_preserving_unary_candidate(MidOperator::Gelu, rows_f16.clone()),
         format_preserving_unary_candidate(MidOperator::Gelu, rows_f32.clone()),
         pointwise_operator_candidate(
-            MidOperator::Add(AddOptions::default()),
+            MidOperator::Add,
             [rows_f16.clone(), rows_f16.clone()],
             rows_f16,
         )
         .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
         pointwise_operator_candidate(
-            MidOperator::Add(AddOptions::default()),
+            MidOperator::Add,
             [rows_f32.clone(), rows_f32.clone()],
             rows_f32,
         )

@@ -28,7 +28,7 @@ pub(crate) fn lower_finalists(
     count: usize,
 ) -> LoweringResult<Vec<MidProgram>> {
     planner::plan_finalists(graph, config, costs, count)?
-        .iter()
+        .into_iter()
         .map(|program| implementation::resolve(program).ok_or(LoweringError::InvalidImplementation))
         .collect()
 }
@@ -36,8 +36,8 @@ pub(crate) fn lower_finalists(
 pub(crate) fn expand_tiles(
     program: &MidProgram,
 ) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
-    let program =
-        implementation::resolve(program).ok_or(crate::ExpansionError::InvalidOperatorPlan)?;
+    let program = implementation::resolve(program.clone())
+        .ok_or(crate::ExpansionError::InvalidOperatorPlan)?;
     crate::low::expand::expand_tiles(&program)
 }
 use planner::*;
@@ -48,8 +48,8 @@ pub use crate::estimate::{
 };
 use crate::estimate::{region_peak_memory, region_peak_memory_with_multiplicity};
 use crate::graph::{
-    AddOptions, AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation,
-    OperationId, OperationKind, Repeat, TensorShape, ValueId,
+    AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation, OperationId,
+    OperationKind, Repeat, TensorShape, ValueId,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -425,7 +425,7 @@ fn profile_mlp_finalist_expansion() {
                 );
             }
         }
-        let mid = implementation::resolve(&mid).unwrap();
+        let mid = implementation::resolve(mid.clone()).unwrap();
         let start = std::time::Instant::now();
         let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
         eprintln!(

@@ -16,7 +16,7 @@ pub enum MidOperator {
         accumulate: AccumulationPrecision,
     },
     Gelu,
-    Add(AddOptions),
+    Add,
     View(AxisFactorView),
     FlashAttention {
         options: AttentionOptions,
@@ -119,7 +119,6 @@ impl GemmOrientation {
 pub enum OperatorDispatch {
     Pointwise {
         kernel: TileKernelSpec,
-        input_mapping: PointwiseInputMapping,
     },
     BlockedGemm {
         inner_block: u32,
@@ -127,19 +126,10 @@ pub enum OperatorDispatch {
         orientation: GemmOrientation,
         distribution: GemmDistribution,
     },
-    BlockedAttention {
-        query_key: TileKernelSpec,
-        probability_value: TileKernelSpec,
-        query_block_rows: u32,
+    Attention {
+        /// Full-key materialization or online softmax over successive blocks.
+        materialized: bool,
         key_block_rows: u32,
-        padded_query_dimension: u32,
-        padded_value_dimension: u32,
-    },
-    MaterializedAttention {
-        query_key: TileKernelSpec,
-        probability_value: TileKernelSpec,
-        query_block_rows: u32,
-        padded_key_rows: u32,
         padded_query_dimension: u32,
         padded_value_dimension: u32,
     },
@@ -209,16 +199,6 @@ impl ReductionStaging {
             Self::Batched(limit) => u64::from(limit.get()).min(remote.max(1)),
         }
     }
-}
-
-/// How a pointwise kernel's input shards are selected for each output shard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PointwiseInputMapping {
-    /// Each input view is selected by its logical overlap with the output and
-    /// singleton dimensions may be broadcast.
-    BroadcastToOutput,
-    /// Each input must already have a shard resident on the output tile.
-    TileLocal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -293,9 +273,7 @@ impl OperatorDispatch {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
             Self::View => EmptyOutputShardPolicy::Reject,
-            Self::BlockedGemm { .. }
-            | Self::BlockedAttention { .. }
-            | Self::MaterializedAttention { .. } => EmptyOutputShardPolicy::Reject,
+            Self::BlockedGemm { .. } | Self::Attention { .. } => EmptyOutputShardPolicy::Reject,
         }
     }
 }
@@ -378,11 +356,9 @@ pub(super) fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
         MidOperator::Gemm { .. } => blocked_gemm_dispatch(AMP_OUTPUT_COLUMN_BLOCK),
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
-            input_mapping: PointwiseInputMapping::TileLocal,
         },
-        MidOperator::Add(_) => OperatorDispatch::Pointwise {
+        MidOperator::Add => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Add,
-            input_mapping: PointwiseInputMapping::BroadcastToOutput,
         },
         MidOperator::View(_) => OperatorDispatch::View,
         MidOperator::FlashAttention {
@@ -393,7 +369,6 @@ pub(super) fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
                 options,
                 accumulate,
             },
-            input_mapping: PointwiseInputMapping::TileLocal,
         },
     }
 }
@@ -769,7 +744,7 @@ impl OperatorPlan {
                 },
             )
             | (
-                MidOperator::Add(_),
+                MidOperator::Add,
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::Add,
                     ..
@@ -790,10 +765,8 @@ impl OperatorPlan {
                     options,
                     accumulate,
                 },
-                OperatorDispatch::BlockedAttention {
-                    query_key,
-                    probability_value,
-                    query_block_rows,
+                OperatorDispatch::Attention {
+                    materialized,
                     key_block_rows,
                     padded_query_dimension,
                     padded_value_dimension,
@@ -804,8 +777,9 @@ impl OperatorPlan {
                 };
                 if options.causal
                     || *accumulate != AccumulationPrecision::F32
-                    || *query_block_rows == 0
-                    || *key_block_rows != AMP_INNER_BLOCK
+                    || *key_block_rows == 0
+                    || !key_block_rows.is_multiple_of(AMP_INNER_BLOCK)
+                    || (!materialized && *key_block_rows != AMP_INNER_BLOCK)
                     || *padded_query_dimension == 0
                     || *padded_value_dimension == 0
                     || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
@@ -821,53 +795,6 @@ impl OperatorPlan {
                     || query.format.layout.tiling.tile_count
                         != output.format.layout.tiling.tile_count
                     || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                    || !matches!(query_key, TileKernelSpec::Gemm { .. })
-                    || !matches!(probability_value, TileKernelSpec::Gemm { .. })
-                {
-                    Err(OperatorPlanError::InvalidBlocking)
-                } else {
-                    Ok(())
-                }
-            }
-            (
-                MidOperator::FlashAttention {
-                    options,
-                    accumulate,
-                },
-                OperatorDispatch::MaterializedAttention {
-                    query_key,
-                    probability_value,
-                    query_block_rows,
-                    padded_key_rows,
-                    padded_query_dimension,
-                    padded_value_dimension,
-                },
-            ) => {
-                let [query, key, value] = inputs else {
-                    return Err(OperatorPlanError::OperandArity);
-                };
-                if options.causal
-                    || *accumulate != AccumulationPrecision::F32
-                    || *query_block_rows == 0
-                    || *padded_key_rows == 0
-                    || !padded_key_rows.is_multiple_of(AMP_INNER_BLOCK)
-                    || *padded_query_dimension == 0
-                    || *padded_value_dimension == 0
-                    || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
-                    || !matches!(
-                        key.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::TransposedRight)
-                    )
-                    || !matches!(
-                        value.format.layout.order,
-                        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                    )
-                    || output.format.layout.order != ElementOrder::RowMajor
-                    || query.format.layout.tiling.tile_count
-                        != output.format.layout.tiling.tile_count
-                    || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                    || !matches!(query_key, TileKernelSpec::Gemm { .. })
-                    || !matches!(probability_value, TileKernelSpec::Gemm { .. })
                 {
                     Err(OperatorPlanError::InvalidBlocking)
                 } else {

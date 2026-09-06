@@ -124,7 +124,7 @@ pub enum OperationKind {
     Gemm(GemmOptions),
     /// Exact Gaussian error linear unit.
     Gelu,
-    Add(AddOptions),
+    Add,
     View(AxisFactorView),
     FlashAttention(AttentionOptions),
     Repeat(Repeat),
@@ -134,17 +134,6 @@ pub enum OperationKind {
 pub struct GemmOptions {
     pub transpose_left: bool,
     pub transpose_right: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum BroadcastMode {
-    #[default]
-    Numpy,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct AddOptions {
-    pub broadcasting: BroadcastMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -538,9 +527,7 @@ fn infer_shape(
             Ok(TensorShape(output))
         }
         OperationKind::Gelu => Ok(input(0)?.clone()),
-        OperationKind::Add(AddOptions {
-            broadcasting: BroadcastMode::Numpy,
-        }) => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
+        OperationKind::Add => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
         OperationKind::View(view) => view.output_shape(input(0)?).ok_or_else(|| {
             GraphError::InvalidShape("view axes, factor, or output dimensions are invalid".into())
         }),

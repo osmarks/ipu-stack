@@ -941,7 +941,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
             OperatorCandidate::new(
-                MidOperator::Add(AddOptions::default()),
+                MidOperator::Add,
                 [
                     OperandRequirement::new(add_left.clone(), 8),
                     OperandRequirement::new(add_right.clone(), 8),
@@ -994,7 +994,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
                     operation.kind,
                     MidOperationKind::Operator {
                         plan: OperatorPlan {
-                            operator: MidOperator::Add(_),
+                            operator: MidOperator::Add,
                             ..
                         },
                         ..
@@ -1190,7 +1190,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         let claims = consumer.deferred_inputs();
         assert_eq!(claims.len(), split.len(), "random case {case}");
         assert!(claims.iter().all(Option::is_some), "random case {case}");
-        let compact = implementation::resolve(&lowered).unwrap();
+        let compact = implementation::resolve(lowered.clone()).unwrap();
         assert!(
             compact
                 .operations
@@ -1366,7 +1366,7 @@ fn selected_mid_size_is_independent_of_tile_count() {
             crate::low::expand::expand_tiles(&recipe).is_err(),
             "low must reject unresolved operator recipes"
         );
-        let selected = implementation::resolve(&recipe).unwrap();
+        let selected = implementation::resolve(recipe.clone()).unwrap();
         assert!(selected.operations.iter().all(|op| matches!(
             op.kind,
             MidOperationKind::Primitive(_) | MidOperationKind::Convert(_)
@@ -1377,7 +1377,7 @@ fn selected_mid_size_is_independent_of_tile_count() {
                 *implementation = None;
             }
         }
-        assert_eq!(selected, implementation::resolve(&fresh).unwrap());
+        assert_eq!(selected, implementation::resolve(fresh.clone()).unwrap());
         assert!(crate::estimate::analyze_mid(&selected, &BTreeMap::new()).is_some());
         sizes.push((selected.values.len(), selected.operations.len()));
     }
@@ -1611,7 +1611,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
                 .implementation(plan, &inputs, &output)
                 .unwrap()
                 .peak_memory
-                .standard_contiguous_overflow
+                .standard_contiguous_overflow()
                 == 0
         }));
     }

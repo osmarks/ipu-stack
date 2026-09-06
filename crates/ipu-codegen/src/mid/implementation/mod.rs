@@ -60,37 +60,17 @@ pub(crate) fn implement(
             *orientation,
             *distribution,
         )?,
-        OperatorDispatch::BlockedAttention {
-            query_key,
-            probability_value,
-            query_block_rows: _,
+        OperatorDispatch::Attention {
+            materialized,
             key_block_rows,
             padded_query_dimension,
             padded_value_dimension,
         } => b.attention(
             output,
-            query_key,
-            probability_value,
             *key_block_rows,
             *padded_query_dimension,
             *padded_value_dimension,
-            false,
-        )?,
-        OperatorDispatch::MaterializedAttention {
-            query_key,
-            probability_value,
-            query_block_rows: _,
-            padded_key_rows,
-            padded_query_dimension,
-            padded_value_dimension,
-        } => b.attention(
-            output,
-            query_key,
-            probability_value,
-            *padded_key_rows,
-            *padded_query_dimension,
-            *padded_value_dimension,
-            true,
+            *materialized,
         )?,
     };
     b.program.outputs = vec![result];
@@ -275,10 +255,10 @@ fn project_grid(
 
 /// Inline compact operator implementations into the same whole-device IR.
 /// This is algorithm decomposition, not tile expansion or another search.
-pub(crate) fn resolve(program: &MidProgram) -> Option<MidProgram> {
-    let mut result = program.clone();
-    result.operations = resolve_region(&program.operations, &mut result.values, &program.outputs)?;
-    Some(result)
+pub(crate) fn resolve(mut program: MidProgram) -> Option<MidProgram> {
+    program.operations =
+        resolve_region(&program.operations, &mut program.values, &program.outputs)?;
+    Some(program)
 }
 
 fn resolve_region(

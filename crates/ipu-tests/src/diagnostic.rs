@@ -443,7 +443,7 @@ fn evaluate_operations(
                 &values[&operation.inputs[0]],
                 super::gelu_reference,
             )],
-            OperationKind::Add(_) => vec![add(
+            OperationKind::Add => vec![add(
                 &values[&operation.inputs[0]],
                 &values[&operation.inputs[1]],
             )?],

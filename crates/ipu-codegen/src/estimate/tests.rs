@@ -112,15 +112,6 @@ fn conversion_traffic_reference(
         traffic.maximum_local_intersections =
             traffic.maximum_local_intersections.max(local_intersections);
     }
-    traffic.remote_fragments = remote.len() as u64;
-    traffic.maximum_routed_fragments = if from.order == to.order {
-        traffic.maximum_intersections
-    } else {
-        traffic
-            .maximum_destination_bytes
-            .saturating_sub(traffic.maximum_local_bytes)
-            .div_ceil(4)
-    };
     for (source, extents) in remote {
         traffic
             .exchange
@@ -176,7 +167,18 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
             "case {case}"
         );
         assert!(
-            fragmented.remote_fragments >= aligned.remote_fragments,
+            fragmented
+                .exchange
+                .outgoing_lanes
+                .iter()
+                .map(|load| load.fragments)
+                .sum::<u64>()
+                >= aligned
+                    .exchange
+                    .outgoing_lanes
+                    .iter()
+                    .map(|load| load.fragments)
+                    .sum::<u64>(),
             "case {case}: {fragmented:?} {aligned:?}"
         );
         assert!(
