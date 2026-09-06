@@ -215,6 +215,9 @@ fn operation_cost(
                     if *inner_block == 0 || *output_columns == 0 {
                         return None;
                     }
+                    if let Some(group) = out.format.layout.order.gemm_output_group() {
+                        *output_columns = (*output_columns).min(group);
+                    }
                     calls = u64::from(inputs[0].shape.0[left_axis].div_ceil(*inner_block))
                         .checked_mul(u64::from(
                             out.shape.0[column_axis].div_ceil(*output_columns),
@@ -282,7 +285,11 @@ fn operation_cost(
                 .exchange
                 .saturating_add(bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
                 .saturating_add(IPU21_TARGET_COSTS.local_copy_call_cycles);
-            if input.format.layout.order != output.format.layout.order {
+            if input.format.layout.order != output.format.layout.order
+                && !input
+                    .format
+                    .supports_f16_micro_panel_exchange(&output.format)
+            {
                 scratch.standard = bytes;
                 let elements = bytes.div_ceil(output.format.precision.bytes());
                 price.total = price.total.saturating_add(

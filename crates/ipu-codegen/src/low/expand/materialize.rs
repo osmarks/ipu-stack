@@ -39,6 +39,7 @@ impl TileGraphBuilder {
             } else if matches!(
                 source_order,
                 ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
+                    | ElementOrder::BlockMajor(_)
             ) {
                 let mut provenance = operation_provenance(operation);
                 provenance.reason = WorkReason::OperatorKernel;

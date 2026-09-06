@@ -17,6 +17,27 @@ pub(crate) fn interleaved_f16_gemm_cycles(rows: u64, inner: u64, columns: u64) -
     )
 }
 
+/// Packed stores assign complete 16-row groups to workers. Price their
+/// occupancy and pipeline restarts, not just the useful rows. Group overheads
+/// are calibrated against the K240/C64/R48 standard/interleaved hardware runs.
+pub(crate) fn f16_packed_gemm_cycles(
+    rows: u64,
+    inner: u64,
+    columns: u64,
+    interleaved: bool,
+) -> u64 {
+    let group = rows
+        .div_ceil(96)
+        .saturating_mul(384 + 132)
+        .saturating_add(if interleaved { 160 } else { 194 });
+    294u64.saturating_add(
+        inner
+            .div_ceil(16)
+            .saturating_mul(columns.div_ceil(16))
+            .saturating_mul(group),
+    )
+}
+
 /// Row-wise softmax: packed maxima and fused exponent/store/sum take 71
 /// issue groups per full 16-key panel. Masked pairs and zero padding use short
 /// scalar loops; no tile program needs to be constructed to price them.

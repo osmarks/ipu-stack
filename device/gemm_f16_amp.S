@@ -12,6 +12,9 @@
 #ifndef GEMM_OUTPUT_COLUMNS
 #define GEMM_OUTPUT_COLUMNS 64
 #endif
+#ifndef GEMM_OUTPUT_GROUP
+#define GEMM_OUTPUT_GROUP 0
+#endif
 #ifndef GEMM_RIGHT_BYTE_OFFSET
 #define GEMM_RIGHT_BYTE_OFFSET 0
 #endif
@@ -265,6 +268,24 @@
 	.macro GEMM_WORKER name, retained_output_name, retained_inner_name, rows
 	.p2align 3
 \name:
+#if GEMM_OUTPUT_GROUP
+	ld32 $m0, $mvertex_base, $m15, 0
+	ld32 $m1, $mvertex_base, $m15, 1
+	bri .Lpacked_rows_\@
+\retained_output_name:
+	add $m0, $m0, 512
+	ld32 $m1, $mvertex_base, $m15, 1
+.Lpacked_rows_\@:
+	PARTITION_ROWS ((\rows) / 16)
+	brz $m5, .Lgemm_f16_no_rows_\@
+	shl $m6, $m6, 9
+	add $m2, $m1, $m6
+	shl $m7, $m6, GEMM_OUTPUT_GROUP_SHIFT
+	add $m9, $m0, $m7
+.Lpacked_chunk_\@:
+	add $m3, $m9, 32
+	setzi $m8, 15
+#else
 	PARTITION_ROWS \rows
 	shl $m6, $m6, 5
 	.if (\rows) < 6
@@ -285,7 +306,13 @@
 	add $m2, $m1, $m6
 	add $m3, $m9, 32
 	add $m8, $m5, -1
+#endif
 .Lgemm_f16_load_mode_\@:
+#if GEMM_OUTPUT_GROUP
+	ld32 $m7, $mvertex_base, $m15, 1
+	cmpeq $m7, $m1, $m7
+	brz $m7, .Lf16_accumulate_\@
+#endif
 	ld32 $m7, $mvertex_base, $m15, 5
 	brz $m7, .Lf16_accumulate_\@
 
@@ -351,8 +378,16 @@
 		GEMM_AMP $a6:7, $azeros, $azeros, GEMM_TAMP_P3
 	}
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
+#if GEMM_OUTPUT_GROUP
+	bri .Lpacked_next_\@
+#else
 	exitz $mzero
+#endif
 \retained_inner_name:
+#if GEMM_OUTPUT_GROUP
+	add $m1, $m1, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
+	bri .Lpacked_rows_\@
+#else
 	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
 	.endif
@@ -360,6 +395,7 @@
 	// retained output. Place that entry immediately before the accumulate
 	// body so dispatch does not pay an additional branch for every panel.
 	add $m2, $m2, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
+#endif
 .Lf16_accumulate_\@:
 	setzi $a6, CLEAR_AACC
 	uput $FP_CLR, $a6
@@ -434,6 +470,13 @@
 	}
 	st64pace $a6:7, $m10:11+=, $mzero, 0b00
 	st64pace $a4:5, $m10:11+=, $mzero, 0b00
+#if GEMM_OUTPUT_GROUP
+.Lpacked_next_\@:
+	add $m2, $m2, 512
+	add $m9, $m9, GEMM_OUTPUT_GROUP * 32
+	add $m5, $m5, -1
+	brnz $m5, .Lpacked_chunk_\@
+#endif
 	exitz $mzero
 .Lgemm_f16_no_rows_\@:
 	exitz $mzero

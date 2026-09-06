@@ -169,8 +169,15 @@ impl TileGraphBuilder {
             return Err(ExpansionError::InvalidOperatorPlan);
         }
         let columns = self.shards[output.index() as usize].extents[output_column];
-        for column in (columns.start..columns.physical_end).step_by(*output_columns as usize) {
-            let column_end = (column + output_columns).min(columns.physical_end);
+        let group = self.shards[output.index() as usize]
+            .tensor_type
+            .format
+            .layout
+            .order
+            .gemm_output_group();
+        let column_step = group.map_or(*output_columns, |group| (*output_columns).min(group));
+        for column in (columns.start..columns.physical_end).step_by(column_step as usize) {
+            let column_end = (column + column_step).min(columns.physical_end);
             for k in (0..inner).step_by(*inner_block as usize) {
                 let width = (inner - k).min(*inner_block);
                 let l = self.narrow_view(

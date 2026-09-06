@@ -243,6 +243,9 @@ impl OperatorDispatch {
             *column_partitions,
             GridOrder::ColumnsFast,
         );
+        if output.format.layout.order.gemm_output_group().is_some() {
+            partial.format.layout.order = output.format.layout.order;
+        }
         let column_axis = orientation.matrix_axes(output.shape.0.len()).1;
         let source_axis = output
             .format
@@ -574,12 +577,15 @@ impl OperatorPlan {
                                 right.format.layout.order,
                                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                             )
-                            && output.format.layout.order
+                            && (output.format.layout.order
                                 == ElementOrder::Amp(if *multiply == Precision::F16 {
                                     AmpOrder::Left
                                 } else {
                                     AmpOrder::Output
                                 })
+                                || (*multiply == Precision::F16
+                                    && output.format.layout.order.gemm_output_group().is_some()
+                                    && !output.format.layout.order.gemm_output_transposed()))
                     }
                     GemmOrientation::Swapped => {
                         matches!(
@@ -587,12 +593,15 @@ impl OperatorPlan {
                             ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
                         ) && right.format.layout.order
                             == ElementOrder::Amp(AmpOrder::TransposedLeft)
-                            && output.format.layout.order
+                            && (output.format.layout.order
                                 == ElementOrder::Amp(if *multiply == Precision::F16 {
                                     AmpOrder::TransposedLeft
                                 } else {
                                     AmpOrder::TransposedOutput
                                 })
+                                || (*multiply == Precision::F16
+                                    && output.format.layout.order.gemm_output_group().is_some()
+                                    && output.format.layout.order.gemm_output_transposed()))
                     }
                 };
                 if options.transpose_left || options.transpose_right || !formats_match_orientation {

@@ -22,17 +22,18 @@ impl TileGraphBuilder {
         let sources = self.value_shards(source)?.to_vec();
         for &source_shard in &sources {
             let source = &self.shards[source_shard.index() as usize];
-            let compatible = source.extents.len() == 3
+            let compatible = source.extents.len() >= 2
                 && source.tensor_type.format.precision == Precision::F16
                 && match source.tensor_type.format.layout.order {
                     ElementOrder::Amp(AmpOrder::Output) => {
-                        let columns = source.extents[2];
+                        let columns = source.extents[source.extents.len() - 1];
                         (columns.physical_end - columns.start).is_multiple_of(AMP_COLUMN_MICRO)
                     }
                     ElementOrder::Amp(AmpOrder::TransposedLeft) => {
-                        let rows = source.extents[1];
+                        let rows = source.extents[source.extents.len() - 2];
                         (rows.physical_end - rows.start).is_multiple_of(AMP_COLUMN_MICRO)
                     }
+                    ElementOrder::BlockMajor(_) => true,
                     _ => false,
                 };
             if !compatible {

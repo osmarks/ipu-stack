@@ -2,7 +2,7 @@
 //! and final scheduled tile timelines. No tile IR is needed to evaluate them.
 
 use super::*;
-use crate::{AmpOrder, TileKernelSpec};
+use crate::TileKernelSpec;
 
 pub(crate) fn kernel_cycles(
     kernel: &TileKernelSpec,
@@ -26,10 +26,7 @@ pub(crate) fn kernel_cycles(
             ..
         } => {
             let column_axis = output.shape.0.len().saturating_sub(
-                if matches!(
-                    output.format.layout.order,
-                    ElementOrder::Amp(AmpOrder::TransposedOutput | AmpOrder::TransposedLeft)
-                ) {
+                if output.format.layout.order.gemm_output_transposed() {
                     2
                 } else {
                     1
@@ -47,6 +44,16 @@ pub(crate) fn kernel_cycles(
             let interleaved = inputs.get(1).is_some_and(|input| {
                 input.format.layout.memory_class == MemoryClass::Ipu21Interleaved
             });
+            if *multiply == Precision::F16
+                && output.format.layout.order.gemm_output_group().is_some()
+            {
+                return crate::kernel::cost::f16_packed_gemm_cycles(
+                    rows,
+                    inner,
+                    columns,
+                    interleaved,
+                );
+            }
             if *multiply == Precision::F16 && interleaved {
                 return crate::kernel::cost::interleaved_f16_gemm_cycles(rows, inner, columns);
             }

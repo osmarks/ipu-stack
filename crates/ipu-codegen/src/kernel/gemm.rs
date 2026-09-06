@@ -24,7 +24,13 @@ pub(super) fn specialized_gemm_symbol(
 impl KernelBuildPlan {
     pub(super) fn add_gemm(
         &mut self,
-        (precision, weights, inner_block, output_columns): (Precision, GemmWeightLoad, u32, u32),
+        (precision, weights, inner_block, output_columns, output_group): (
+            Precision,
+            GemmWeightLoad,
+            u32,
+            u32,
+            u32,
+        ),
         values: BTreeSet<u32>,
     ) {
         let values = values.into_iter().collect::<Vec<_>>();
@@ -37,6 +43,11 @@ impl KernelBuildPlan {
             "_interleaved"
         } else {
             ""
+        };
+        let weight_suffix = if output_group == 0 {
+            weight_suffix.to_owned()
+        } else {
+            format!("{weight_suffix}_packed{output_group}")
         };
         for pair in values.chunks(2) {
             let small = pair[0];
@@ -51,7 +62,7 @@ impl KernelBuildPlan {
                 specialized_gemm_symbol(
                     prefix,
                     mode,
-                    weight_suffix,
+                    &weight_suffix,
                     inner_block,
                     output_columns,
                     size,
@@ -71,6 +82,7 @@ impl KernelBuildPlan {
                         output_columns,
                         mode,
                         small,
+                        output_group,
                     ),
                     symbols[row_index].clone(),
                 );
@@ -83,6 +95,7 @@ impl KernelBuildPlan {
                             output_columns,
                             mode,
                             large,
+                            output_group,
                         ),
                         symbols[row_index + 1].clone(),
                     );
@@ -90,6 +103,11 @@ impl KernelBuildPlan {
             }
             let single_rows = pair.len() == 1;
             let mut flags = vec![
+                format!("-DGEMM_OUTPUT_GROUP={output_group}"),
+                format!(
+                    "-DGEMM_OUTPUT_GROUP_SHIFT={}",
+                    output_group.max(16).ilog2() - 4
+                ),
                 format!("-DGEMM_SMALL_ROWS={small}"),
                 format!("-DGEMM_LARGE_ROWS={large}"),
                 format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),

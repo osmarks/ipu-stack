@@ -478,6 +478,24 @@ pub(super) fn plans(
                 vec![candidate]
             }
         };
+        if config.gemm_output_packing != GemmOutputPacking::Native
+            && (grouped_output.is_some() || config.gemm_output_packing == GemmOutputPacking::Packed)
+        {
+            let additions = variants
+                .iter()
+                .filter(|plan| {
+                    matches!(
+                        plan.dispatch,
+                        OperatorDispatch::BlockedGemm {
+                            distribution: GemmDistribution::OutputStationary,
+                            ..
+                        }
+                    )
+                })
+                .filter_map(|plan| packed_gemm_output(plan, output))
+                .collect::<Vec<_>>();
+            variants.extend(additions);
+        }
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -504,7 +522,19 @@ pub(super) fn plans(
             }
         }
     }
-    plans.retain(|plan| plan_fits_operator_memory(plan, inputs, output, config));
+    plans.retain(|plan| {
+        (config.gemm_output_packing != GemmOutputPacking::Packed
+            || !matches!(plan.operator, MidOperator::Gemm { .. })
+            || plan
+                .requirements
+                .output
+                .format
+                .layout
+                .order
+                .gemm_output_group()
+                .is_some())
+            && plan_fits_operator_memory(plan, inputs, output, config)
+    });
     if let Some(constraint) = gemm_constraint {
         plans.retain(|plan| {
             gemm_plan_matches(constraint, &plan.dispatch, &plan.requirements.inputs)
@@ -648,6 +678,64 @@ pub(super) fn independent_parameter_storage(
             independent
         })
         .collect()
+}
+
+/// A packed alternative keeps the compute grid but gives both producers and
+/// reductions the same panel order. Native layouts remain separate candidates.
+fn packed_gemm_output(plan: &OperatorPlan, output: &TensorShape) -> Option<OperatorPlan> {
+    let MidOperator::Gemm {
+        multiply: Precision::F16,
+        ..
+    } = plan.operator
+    else {
+        return None;
+    };
+    let OperatorDispatch::BlockedGemm {
+        orientation,
+        distribution,
+        ..
+    } = plan.dispatch
+    else {
+        return None;
+    };
+    if matches!(distribution, GemmDistribution::ParallelReduction { result_row_partitions, result_column_partitions, .. }
+        if result_row_partitions != 1 || result_column_partitions != 1)
+    {
+        return None;
+    }
+    let mut packed = plan.clone();
+    let (left, right) = orientation.operand_indices();
+    let (row, column) = orientation.matrix_axes(output.0.len());
+    let pad = |layout: &mut Layout, axis: usize, multiple| -> Option<()> {
+        let tiling = layout
+            .tiling
+            .axes
+            .iter_mut()
+            .find(|a| a.axis.resolve(output.0.len()) == Ok(axis))?;
+        tiling.shard_padding_multiple = multiple;
+        tiling.padding = Padding::Zero;
+        Some(())
+    };
+    pad(&mut packed.requirements.inputs[left].format.layout, row, 16)?;
+    pad(
+        &mut packed.requirements.inputs[right].format.layout,
+        column,
+        64,
+    )?;
+    let layout = &mut packed.requirements.output.format.layout;
+    pad(layout, row, 16)?;
+    pad(layout, column, 64)?;
+    layout.order = ElementOrder::BlockMajor(match orientation {
+        GemmOrientation::Normal => BlockMajorOrder::TransposedMatrix {
+            row_block: 64,
+            column_block: 16,
+        },
+        GemmOrientation::Swapped => BlockMajorOrder::Matrix {
+            row_block: 64,
+            column_block: 16,
+        },
+    });
+    Some(packed)
 }
 
 pub(super) fn parallel_reduction_candidates(
@@ -1093,7 +1181,16 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                             );
                             staged.requirements.inputs[physical_right_index].local_staging =
                                 local_staging;
-                            variants.push(staged);
+                            if config.gemm_output_packing != GemmOutputPacking::Native
+                                && (grouped_output.is_some()
+                                    || config.gemm_output_packing == GemmOutputPacking::Packed)
+                                && let Some(packed) = packed_gemm_output(&staged, output)
+                            {
+                                variants.push(packed);
+                            }
+                            if config.gemm_output_packing != GemmOutputPacking::Packed {
+                                variants.push(staged);
+                            }
                         }
                     }
                 }

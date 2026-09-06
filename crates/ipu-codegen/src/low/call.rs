@@ -151,16 +151,11 @@ pub(crate) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let rank = run.output.extents.len();
     let output_order = &run.requirements.output.format.layout.order;
     let matrix_column_axis = rank
-        .checked_sub(
-            if matches!(
-                output_order,
-                ElementOrder::Amp(AmpOrder::TransposedOutput | AmpOrder::TransposedLeft)
-            ) {
-                2
-            } else {
-                1
-            },
-        )
+        .checked_sub(if output_order.gemm_output_transposed() {
+            2
+        } else {
+            1
+        })
         .ok_or(KernelAbiError::MissingGemmRows)?;
     run.output
         .extents

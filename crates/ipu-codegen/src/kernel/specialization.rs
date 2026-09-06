@@ -13,6 +13,7 @@ pub(super) enum RearrangeTarget {
 pub(super) enum UnpackSource {
     AmpOutput,
     AmpTransposedLeft,
+    Blocked(BlockMajorOrder),
 }
 
 impl UnpackSource {
@@ -20,6 +21,7 @@ impl UnpackSource {
         match order {
             ElementOrder::Amp(AmpOrder::Output) => Some(Self::AmpOutput),
             ElementOrder::Amp(AmpOrder::TransposedLeft) => Some(Self::AmpTransposedLeft),
+            ElementOrder::BlockMajor(order) => Some(Self::Blocked(order)),
             _ => None,
         }
     }
@@ -28,6 +30,8 @@ impl UnpackSource {
         match self {
             Self::AmpOutput => 0,
             Self::AmpTransposedLeft => 1,
+            Self::Blocked(BlockMajorOrder::Matrix { .. }) => 2,
+            Self::Blocked(BlockMajorOrder::TransposedMatrix { .. }) => 3,
         }
     }
 }
@@ -60,7 +64,15 @@ impl RearrangeTarget {
 /// The same key selects a build recipe and resolves its eventual call.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum KernelSpecialization {
-    Gemm(Precision, GemmWeightLoad, u32, u32, GemmKernelMode, u32),
+    Gemm(
+        Precision,
+        GemmWeightLoad,
+        u32,
+        u32,
+        GemmKernelMode,
+        u32,
+        u32,
+    ),
     Attention(AttentionKernelShape),
     Softmax(u32, u32, u32),
     Merge(u32, u32, u32),
@@ -107,6 +119,13 @@ impl KernelSpecialization {
                 *output_columns,
                 *mode,
                 gemm_rows(run)?,
+                run.requirements
+                    .output
+                    .format
+                    .layout
+                    .order
+                    .gemm_output_group()
+                    .unwrap_or(0),
             ),
             TileKernelSpec::FlashAttention { .. } => Self::Attention(attention_shape(run)?),
             TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. } => {
@@ -139,7 +158,7 @@ impl KernelSpecialization {
 
 #[derive(Default)]
 pub(super) struct KernelInventory {
-    pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32), BTreeSet<u32>>,
+    pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
     pub(super) gelu: bool,
     pub(super) reduction_add: bool,
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
@@ -168,9 +187,17 @@ impl KernelInventory {
                         continue;
                     }
                     match KernelSpecialization::from_run(run)? {
-                        KernelSpecialization::Gemm(precision, weights, inner, columns, _, rows) => {
+                        KernelSpecialization::Gemm(
+                            precision,
+                            weights,
+                            inner,
+                            columns,
+                            _,
+                            rows,
+                            output_group,
+                        ) => {
                             self.rows
-                                .entry((precision, weights, inner, columns))
+                                .entry((precision, weights, inner, columns, output_group))
                                 .or_default()
                                 .insert(rows);
                         }

@@ -85,6 +85,31 @@ pub(crate) enum F16MicroPanelOrder {
 }
 
 impl ElementOrder {
+    /// GEMM stores complete 16-row micro-panels in this column-group order.
+    pub(crate) fn gemm_output_group(self) -> Option<u32> {
+        match self {
+            Self::BlockMajor(
+                BlockMajorOrder::Matrix {
+                    row_block,
+                    column_block: 16,
+                }
+                | BlockMajorOrder::TransposedMatrix {
+                    row_block,
+                    column_block: 16,
+                },
+            ) if row_block >= 16 && row_block.is_power_of_two() => Some(u32::from(row_block)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn gemm_output_transposed(self) -> bool {
+        matches!(
+            self,
+            Self::Amp(AmpOrder::TransposedLeft | AmpOrder::TransposedOutput)
+                | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
+        )
+    }
+
     /// This packing is consumed as contiguous K-major panels, while a generic
     /// intersection rearrangement produces rectangular tensor-coordinate
     /// views. It must therefore be selected for an automatic input or produced

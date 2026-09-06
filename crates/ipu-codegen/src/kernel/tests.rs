@@ -136,7 +136,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
         let right = graph.parameter("right", [64, 64]).unwrap();
         let result = graph.gemm(left, right).unwrap();
         graph.set_outputs([result]).unwrap();
-        let config = PipelineConfig::new(tiles)
+        let mut config = PipelineConfig::new(tiles)
             .with_active_tile_counts([tiles])
             .with_input(
                 left,
@@ -152,6 +152,14 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                     layout: Layout::block_major_matrix(64, tiles),
                 },
             );
+        // This fixture exercises row specialization of a single GEMM family,
+        // independently of changes to the planner's relative strategy costs.
+        config.operator_candidates.retain(|candidate| {
+            matches!(candidate,
+            crate::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
+                crate::OperatorDispatch::BlockedGemm { orientation: crate::GemmOrientation::Normal,
+                    distribution: crate::GemmDistribution::OutputStationary, .. }))
+        });
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(
             &crate::expand_tiles(&mid).unwrap(),
@@ -168,7 +176,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             .symbols
             .keys()
             .filter_map(|key| match key {
-                KernelSpecialization::Gemm(_, _, _, _, _, rows) => Some(*rows),
+                KernelSpecialization::Gemm(_, _, _, _, _, rows, _) => Some(*rows),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -477,5 +485,66 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
             run.requirements.clone(),
         );
         assert!(materialize(&run).is_err(), "offset={offset} bytes={bytes}");
+    }
+}
+
+#[test]
+fn packed_gemm_stores_bind_without_output_copies() {
+    let orientation = crate::GemmOrientation::Normal;
+    {
+        for rows in [17, 96, 129] {
+            let mut graph = ComputeGraph::new();
+            let left = graph.host_input("left", [1, rows, 64]).unwrap();
+            let right = graph.parameter("right", [64, 80]).unwrap();
+            let output = graph.gemm(left, right).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let format = TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_major(TensorTiling::replicated(1)),
+            };
+            let mut config = PipelineConfig::new(1)
+                .with_input(left, format.clone())
+                .with_input(right, format);
+            config.gemm_output_packing = crate::GemmOutputPacking::Packed;
+            config.operator_candidates.retain(|candidate| matches!(candidate,
+                crate::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
+                    crate::OperatorDispatch::BlockedGemm { orientation: candidate_orientation,
+                        distribution: crate::GemmDistribution::OutputStationary, .. } if candidate_orientation == orientation)));
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+            let build = KernelBuildPlan::from_program(&low).unwrap();
+            let addresses = low
+                .shards
+                .iter()
+                .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
+                .collect();
+            let mut products = 0;
+            for run in &low.kernel_runs {
+                if !matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
+                    continue;
+                }
+                products += 1;
+                assert!(gemm_rows(run).unwrap().is_multiple_of(16));
+                assert_eq!(
+                    run.requirements
+                        .output
+                        .format
+                        .layout
+                        .order
+                        .gemm_output_group(),
+                    Some(64)
+                );
+                let step =
+                    materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new())
+                        .unwrap();
+                assert!(step.symbol.contains("packed64"));
+                let source = &low.shards[run.output.shard.index() as usize];
+                assert_eq!(
+                    source.tensor_type.format.layout.order,
+                    run.requirements.output.format.layout.order
+                );
+            }
+            assert!(products > 0);
+        }
     }
 }

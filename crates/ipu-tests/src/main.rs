@@ -141,6 +141,9 @@ struct Arguments {
     /// Restrict attention planning for controlled strategy comparisons.
     #[arg(long, value_enum, default_value_t = AttentionMode::Auto)]
     attention_strategy: AttentionMode,
+    /// Compare native and packed GEMM stores, or force one for diagnostics.
+    #[arg(long, value_parser = ["auto", "native", "packed"], default_value = "auto")]
+    gemm_output_packing: String,
     #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
     attention_heads: u32,
     /// Defaults to SigLIP's 4304-wide intermediate for the canonical 1152D
@@ -403,11 +406,16 @@ fn main() -> Result<()> {
     if arguments.reuse_package
         && matches!(
             arguments.workload,
-            Workload::GemmSmoke | Workload::BatchedGemmSmoke | Workload::MlpSmoke
+            Workload::GemmSmoke
+                | Workload::BatchedGemmSmoke
+                | Workload::MlpSmoke
+                | Workload::GemmBenchmark
+                | Workload::SiglipAttentionBenchmark
+                | Workload::SiglipMlpBenchmark
         )
     {
         bail!(
-            "numerical smoke tests require compilation to retain logical storage metadata; omit --reuse-package"
+            "numerical workloads require compilation to retain logical storage metadata; omit --reuse-package"
         );
     }
     if !matches!(arguments.workload, Workload::GemmBenchmark)
@@ -575,6 +583,11 @@ fn main() -> Result<()> {
     }
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
+    pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
+        "native" => ipu_codegen::GemmOutputPacking::Native,
+        "packed" => ipu_codegen::GemmOutputPacking::Packed,
+        _ => ipu_codegen::GemmOutputPacking::Automatic,
+    };
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
     pipeline = pipeline.with_attention_strategy(arguments.attention_strategy.into());
     for constraint in &arguments.gemm_plan_constraint {
@@ -931,6 +944,9 @@ fn main() -> Result<()> {
                 run_projected_attention_benchmark(
                     &runtime,
                     &application,
+                    compiled_package
+                        .as_ref()
+                        .context("attention validation needs logical storage metadata")?,
                     arguments.attention_batch,
                     arguments.attention_heads,
                     arguments.clock_hz,
@@ -977,6 +993,9 @@ fn main() -> Result<()> {
                 run_gemm_benchmark(
                     &runtime,
                     &application,
+                    compiled_package
+                        .as_ref()
+                        .context("GEMM validation needs logical storage metadata")?,
                     active_tiles,
                     benchmark_rows,
                     arguments.benchmark_inner,
@@ -1181,6 +1200,7 @@ fn run_reference(
 fn run_projected_attention_benchmark(
     runtime: &Runtime,
     application: &Application,
+    package: &CompiledPackage,
     batch: u32,
     heads: u32,
     clock_hz: u64,
@@ -1193,22 +1213,13 @@ fn run_projected_attention_benchmark(
     let model_width = heads
         .checked_mul(SIGLIP_ATTENTION_HEAD_DIMENSION)
         .context("attention model width overflow")?;
-    let input = application
-        .inputs
-        .iter()
-        .find(|binding| binding.name == "input")
-        .context("projected attention package has no input binding")?;
-    let input_bytes = filled_f16_binding(input, f32_to_half(1.0))?;
-    let weight_bits = f32_to_half(1.0 / model_width as f32);
-    let mut weights = Vec::new();
-    for name in ["query.weight", "key.weight", "value.weight"] {
-        let binding = application
-            .weights
-            .iter()
-            .find(|binding| binding.name == name)
-            .with_context(|| format!("projected attention package has no {name} binding"))?;
-        weights.extend_from_slice(&filled_f16_binding(binding, weight_bits)?);
-    }
+    let (weights, input_bytes) = constant_inputs(application, package, |name| {
+        if name == "input" {
+            1.0
+        } else {
+            1.0 / model_width as f32
+        }
+    })?;
     let actual = run_initialized_program(
         runtime,
         application,
@@ -1540,6 +1551,7 @@ fn run_initialized_program(
 fn run_gemm_benchmark(
     runtime: &Runtime,
     application: &Application,
+    package: &CompiledPackage,
     execution_tiles: u16,
     rows: u32,
     inner: u32,
@@ -1553,18 +1565,9 @@ fn run_gemm_benchmark(
     if clock_hz == 0 {
         bail!("benchmark clock must be nonzero");
     }
-    let left = application
-        .inputs
-        .iter()
-        .find(|binding| binding.name == "left")
-        .context("benchmark package has no left binding")?;
-    let right = application
-        .weights
-        .iter()
-        .find(|binding| binding.name == "right")
-        .context("benchmark package has no right binding")?;
-    let left_bytes = filled_f16_binding(left, 0x3c00)?;
-    let right_bytes = filled_f16_binding(right, 0x3400)?;
+    let (right_bytes, left_bytes) = constant_inputs(application, package, |name| {
+        if name == "left" { 1.0 } else { 0.25 }
+    })?;
     let output = run_initialized_program(
         runtime,
         application,
@@ -1572,7 +1575,14 @@ fn run_gemm_benchmark(
         &left_bytes,
         timeout_seconds,
     )?;
-    let maximum_absolute_error = verify_benchmark_output(application, &output, inner)?;
+    let tensor = package
+        .outputs
+        .iter()
+        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
+        .context("benchmark package has no logical output storage map")?;
+    let expected = vec![inner as f32 * 0.25; usize::try_from(tensor.shape.elements())?];
+    let maximum_absolute_error =
+        verify_logical_f16_output(application, tensor, &output, &expected, (0.01, 0.002))?;
     if !profiling_enabled {
         println!(
             "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
@@ -1734,34 +1744,6 @@ fn validate_mlp_benchmark_shape(
     Ok(())
 }
 
-fn verify_benchmark_output(application: &Application, bytes: &[u8], inner: u32) -> Result<f32> {
-    let (binding, base) = output_binding(application, "output.0")?;
-    let size = binding_size(binding);
-    if size == 0 || !size.is_multiple_of(2) {
-        bail!("benchmark graph output is not a nonempty F16 binding");
-    }
-    let start = usize::try_from(base)?;
-    let end = usize::try_from(
-        base.checked_add(size)
-            .context("benchmark output overflow")?,
-    )?;
-    let output = bytes
-        .get(start..end)
-        .context("benchmark graph output exceeds host output")?;
-    let expected = inner as f32 * 0.25;
-    let mut maximum = 0.0f32;
-    for raw in output.chunks_exact(2) {
-        let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
-        maximum = maximum.max((actual - expected).abs());
-    }
-    if maximum > expected.abs() * 0.002 + 0.01 {
-        bail!(
-            "benchmark numerical output differs from {expected}: maximum absolute error {maximum}"
-        );
-    }
-    Ok(maximum)
-}
-
 fn verify_logical_f16_output(
     application: &Application,
     tensor: &DiagnosticTensor,
@@ -1872,22 +1854,28 @@ fn binding_size(binding: &Binding) -> u64 {
         .unwrap_or(0)
 }
 
-fn filled_f16_binding(binding: &Binding, bits: u16) -> Result<Vec<u8>> {
-    let size = binding
-        .slices
+/// Constants describe logical tensors too: padding must remain zero when the
+/// selected GEMM grid rounds up the inner dimension.
+fn constant_inputs(
+    application: &Application,
+    package: &CompiledPackage,
+    value: impl Fn(&str) -> f32,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let tensors = package
+        .inputs
         .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .context("binding has no slices")?;
-    if size & 1 != 0 {
-        bail!("binding {} has an odd byte count", binding.name);
-    }
-    let pair = bits.to_le_bytes();
-    let mut bytes = vec![0; usize::try_from(size)?];
-    for chunk in bytes.chunks_exact_mut(2) {
-        chunk.copy_from_slice(&pair);
-    }
-    Ok(bytes)
+        .map(|tensor| {
+            let constant = value(tensor.name.as_deref().unwrap_or(""));
+            Ok((
+                tensor.value,
+                diagnostic::HostTensor {
+                    shape: tensor.shape.0.clone(),
+                    values: vec![constant; usize::try_from(tensor.shape.elements())?],
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    diagnostic::pack_inputs(application, &package.inputs, &tensors)
 }
 
 fn gelu_reference(value: f32) -> f32 {

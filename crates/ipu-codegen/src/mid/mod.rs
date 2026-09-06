@@ -28,7 +28,25 @@ pub(crate) fn lower_finalists(
     costs: &impl CostModel,
     count: usize,
 ) -> LoweringResult<Vec<MidProgram>> {
-    planner::plan_finalists(graph, config, costs, count)?
+    let mut candidates = planner::plan_finalists(graph, config, costs, count)?;
+    // New storage choices must not evict the native baseline from a bounded
+    // beam before the complete implementations can be compared. This repeats
+    // compact planning only; identical candidates share one tile expansion.
+    if config.gemm_output_packing == GemmOutputPacking::Automatic
+        && graph
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation.kind, OperationKind::View(_)))
+    {
+        let mut native = config.clone();
+        native.gemm_output_packing = GemmOutputPacking::Native;
+        for candidate in planner::plan_finalists(graph, &native, costs, count)? {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates
         .into_iter()
         .map(|program| implementation::resolve(program).ok_or(LoweringError::InvalidImplementation))
         .collect()
@@ -74,6 +92,14 @@ pub struct GemmPlanConstraint {
     pub local_weight_staging: LocalOperandStaging,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GemmOutputPacking {
+    #[default]
+    Automatic,
+    Native,
+    Packed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
     pub tile_count: u16,
@@ -96,6 +122,8 @@ pub struct PipelineConfig {
     /// Diagnostic constraints which retain only one GEMM plan family for the
     /// named source operations.
     pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
+    /// Compare native output with panel-packed projection output, or force a mode for diagnostics.
+    pub gemm_output_packing: GemmOutputPacking,
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
@@ -149,6 +177,7 @@ impl PipelineConfig {
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
             gemm_plan_constraints: Vec::new(),
+            gemm_output_packing: GemmOutputPacking::Automatic,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),

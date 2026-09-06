@@ -55,12 +55,65 @@ pub fn materialize_kernel_run(
     overrides: &BTreeMap<BlockValueId, TileAddress>,
 ) -> Result<ComputeStep, KernelMaterializationError> {
     let call = plan.call(run)?;
-    let resolve = |view: &crate::ShardView| {
+    let packed_group = run
+        .requirements
+        .output
+        .format
+        .layout
+        .order
+        .gemm_output_group()
+        .filter(|_| {
+            matches!(
+                run.kernel,
+                TileKernelSpec::Gemm {
+                    multiply: Precision::F16,
+                    ..
+                }
+            )
+        });
+    if let Some(group) = packed_group {
+        let shard = &shards[run.output.shard.index() as usize];
+        let column = run.output.extents.len()
+            - if run
+                .requirements
+                .output
+                .format
+                .layout
+                .order
+                .gemm_output_transposed()
+            {
+                2
+            } else {
+                1
+            };
+        let row = if column + 1 == run.output.extents.len() {
+            column - 1
+        } else {
+            column + 1
+        };
+        let extent = run.output.extents[column];
+        let start = extent.start - shard.extents[column].start;
+        let end = extent.physical_end - shard.extents[column].start;
+        if run.output.extents[row] != shard.extents[row]
+            || !gemm_rows(run)?.is_multiple_of(16)
+            || !start.is_multiple_of(16)
+            || end <= start
+            || start / group != (end - 1) / group
+        {
+            return Err(KernelAbiError::RequirementMismatch.into());
+        }
+    }
+    let resolve = |view: &crate::ShardView, packed: bool| {
         let shard = shards.get(view.shard.index() as usize).ok_or(
             KernelMaterializationError::UnplacedShard(view.shard.index()),
         )?;
         let spans = view_byte_spans(shard, view)?;
-        let [span] = spans.as_slice() else {
+        let span = if spans.len() == 1 || packed {
+            spans.first()
+        } else {
+            None
+        };
+        let Some(span) = span else {
             return Err(KernelMaterializationError::FragmentedView {
                 shard: view.shard.index(),
                 spans: spans.len(),
@@ -80,7 +133,7 @@ pub fn materialize_kernel_run(
             ))?;
         add_address_offset(base, span.offset)
     };
-    let mut output_address = resolve(&run.output)?;
+    let mut output_address = resolve(&run.output, packed_group.is_some())?;
     if let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel {
         let output_spans =
             view_byte_spans(&shards[run.output.shard.index() as usize], &run.output)?;
@@ -97,7 +150,7 @@ pub fn materialize_kernel_run(
     let input_addresses = run
         .inputs
         .iter()
-        .map(|operand| resolve(&operand.views[0]))
+        .map(|operand| resolve(&operand.views[0], false))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
         symbol: call.symbol,

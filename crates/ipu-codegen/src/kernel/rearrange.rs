@@ -14,9 +14,27 @@ impl KernelBuildPlan {
         ),
     ) {
         let order_index = order.codelet_index();
+        let (row_block, column_block) = match order {
+            UnpackSource::Blocked(
+                BlockMajorOrder::Matrix {
+                    row_block,
+                    column_block,
+                }
+                | BlockMajorOrder::TransposedMatrix {
+                    row_block,
+                    column_block,
+                },
+            ) => (row_block, column_block),
+            _ => (16, 16),
+        };
         let suffix = format!(
             "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
         );
+        let suffix = if order_index >= 2 {
+            format!("{suffix}_b{row_block}_{column_block}")
+        } else {
+            suffix
+        };
         let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
         let call = format!("ipu_stack_unpack_amp_to_row_major_f16_{suffix}");
         self.compilations.push(KernelCompilation {
@@ -25,6 +43,8 @@ impl KernelBuildPlan {
             flags: vec![
                 "-O2".into(),
                 format!("-DUNPACK_SOURCE_ORDER={order_index}"),
+                format!("-DUNPACK_ROW_BLOCK={row_block}"),
+                format!("-DUNPACK_COLUMN_BLOCK={column_block}"),
                 format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
                 format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
                 format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),

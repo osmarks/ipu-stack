@@ -22,7 +22,13 @@ using namespace poplar;
 #define UNPACK_VERTEX_NAME UnpackAmpToRowMajorF16
 #endif
 
-static_assert(UNPACK_SOURCE_ORDER == 0 || UNPACK_SOURCE_ORDER == 1);
+#ifndef UNPACK_ROW_BLOCK
+#define UNPACK_ROW_BLOCK 16
+#endif
+#ifndef UNPACK_COLUMN_BLOCK
+#define UNPACK_COLUMN_BLOCK 16
+#endif
+static_assert(UNPACK_SOURCE_ORDER <= 3);
 static_assert(UNPACK_SOURCE_ORDER == 0 || UNPACK_PHYSICAL_ROWS % 16 == 0);
 static_assert(UNPACK_PHYSICAL_COLUMNS % 16 == 0 || UNPACK_SOURCE_ORDER == 1);
 static_assert(UNPACK_PHYSICAL_COLUMNS % 2 == 0);
@@ -64,9 +70,17 @@ public:
             const unsigned physicalColumn = physicalPair * 2 + semanticColumn % 2;
             physical = (semanticColumn / 16) * physicalRowCount * 16 + row * 16 +
                        physicalColumn;
-#else
+#elif UNPACK_SOURCE_ORDER == 1
             physical = (row / 16) * physicalColumnCount * 16 +
                        semanticColumn * 16 + row % 16;
+#else
+            constexpr bool transposed = UNPACK_SOURCE_ORDER == 3;
+            const unsigned r = transposed ? semanticColumn : row;
+            const unsigned c = transposed ? row : semanticColumn;
+            constexpr unsigned cols = transposed ? physicalRowCount : physicalColumnCount;
+            const unsigned panel = (r / UNPACK_ROW_BLOCK) * (cols / UNPACK_COLUMN_BLOCK) * (UNPACK_ROW_BLOCK / 16)
+                + (c / UNPACK_COLUMN_BLOCK) * (UNPACK_ROW_BLOCK / 16) + (r % UNPACK_ROW_BLOCK) / 16;
+            physical = panel * 16 * UNPACK_COLUMN_BLOCK + (c % UNPACK_COLUMN_BLOCK) * 16 + r % 16;
 #endif
             const unsigned sourceWord = sourceWords[(matrixBase + physical) / 2];
             const unsigned value =
