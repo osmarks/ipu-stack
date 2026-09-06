@@ -1099,6 +1099,7 @@ impl PhaseReplayPackage {
         &self,
         device: &Device,
         sample_limit: usize,
+        tiles: &[u16],
         serviced: &mut bool,
     ) -> Result<()> {
         if *serviced {
@@ -1121,7 +1122,20 @@ impl PhaseReplayPackage {
                 );
             }
         }
-        let samples = replay_samples(&self.expected, sample_limit);
+        for tile in tiles {
+            if !self.expected.iter().any(|span| span.tile == *tile) {
+                bail!(
+                    "exchange replay phase {} has no touched words on logical tile {tile}",
+                    self.phase
+                );
+            }
+        }
+        let expected = self
+            .expected
+            .iter()
+            .filter(|span| tiles.is_empty() || tiles.contains(&span.tile))
+            .collect::<Vec<_>>();
+        let samples = replay_samples(&expected, sample_limit);
         let mut checked = 0usize;
         for (tile, samples) in samples {
             let physical = topology.physical(tile)?;
@@ -1264,7 +1278,7 @@ impl PhaseReplayPackage {
     }
 }
 
-fn replay_samples(expected: &[ExpectedSpan], limit: usize) -> BTreeMap<u16, Vec<(u32, u32)>> {
+fn replay_samples(expected: &[&ExpectedSpan], limit: usize) -> BTreeMap<u16, Vec<(u32, u32)>> {
     let total_words = expected.iter().map(|span| span.words.len()).sum::<usize>();
     let wanted = limit.min(total_words);
     let mut selected = std::collections::BTreeSet::<(usize, usize)>::new();

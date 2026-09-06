@@ -77,6 +77,9 @@ struct Arguments {
     /// exact exchange-phase replay.
     #[arg(long, default_value_t = 8192)]
     exchange_replay_samples: usize,
+    /// Restrict replay readback to these logical tiles (comma-separated).
+    #[arg(long, value_delimiter = ',', requires = "exchange_replay_phase")]
+    exchange_replay_tiles: Vec<u16>,
     /// Replay only this prefix of the selected phase's transfer list.
     #[arg(long, requires = "exchange_replay_phase")]
     exchange_replay_transfer_limit: Option<usize>,
@@ -86,8 +89,8 @@ struct Arguments {
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
-    /// Write the address-resolved pre-scheduling exchange input and exit.
-    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "exchange_replay_phase"])]
+    /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
+    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
@@ -822,7 +825,9 @@ fn main() -> Result<()> {
             compiled.exchange_schedule.phases.len(),
             transfers
         );
-        return Ok(());
+        if arguments.exchange_replay_phase.is_none() {
+            return Ok(());
+        }
     }
     if let Some(phase) = arguments.exchange_replay_phase {
         let compiled = compiled_package
@@ -1016,7 +1021,12 @@ fn execute_exchange_replay(
         let executed = session
             .invoke_streaming_deferred_with_poll("run", &[0; 4], |device| {
                 replay
-                    .service_readback(device, arguments.exchange_replay_samples, &mut serviced)
+                    .service_readback(
+                        device,
+                        arguments.exchange_replay_samples,
+                        &arguments.exchange_replay_tiles,
+                        &mut serviced,
+                    )
                     .map_err(|error| DriverError::Invalid(error.to_string()))
             })
             .inspect_err(|error| {
