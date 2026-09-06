@@ -691,3 +691,59 @@ route bubbles, placement-dependent SRAM conflicts and pre-exchange compute tails
 are distinct mechanisms. A universal per-transfer switchover charge or occupancy
 penalty would conflate them. Useful profile annotations would name the actual
 blocking endpoint, memory hazard, dependency or encoding restriction behind gaps.
+
+## Hardware validation of outer release timing (2026-09-06)
+
+Unconditional removal is **not valid** with the present row timing model.
+The shortened ordinary-unicast final-reduction replay passes 16384 sampled words,
+but both ordinary and paired multicast replays time out despite offline validation.
+Full historical and automatic MLP execution also fails with that unrestricted
+change; historical diagnostics report an exchange address error. These are
+hardware failures, not merely unfavorable schedule estimates.
+
+Production now enables route pipelining only when every transfer in the physical
+phase is Word32 with exactly one destination. A phase containing multicast or a
+paired transfer retains the old outer release bound. Queue priority still uses
+endpoint availability; ordinary-unicast row construction receives only true
+memory-dependency readiness and resolves endpoint events at their actual offsets.
+The multicast/paired guard compensates for an unresolved timing-model limitation;
+it is not evidence that all such hardware traffic fundamentally needs these gaps.
+
+The restricted implementation restores the paired snapshot's exact old schedule
+(41599 cycles, 519885 row words). Ordinary and paired multicast hardware replays
+then each pass 16384 sampled words. The ordinary-unicast reduction retains its
+7991-cycle horizon versus 12527 before the change. A regression test verifies that
+an independent send can start before the preceding receive finishes, while receive
+payloads remain disjoint. All 164 workspace release tests pass; Clippy passes with
+the documented allowances.
+
+Full hardware MLP validation:
+
+| Measurement | Previous | Restricted pipelining |
+|---|---:|---:|
+| Historical-grid MLP maximum tile cycles | 211572 | 204594 |
+| Automatic-grid MLP maximum tile cycles | 214890 | 207114 |
+| Historical first reduction schedule | 5638 | 3779 |
+| Historical final reduction schedule | 12527 | 7991 |
+| Automatic first reduction schedule | 3635 | 2861 |
+| Automatic final reduction schedule | 25866 | 15700 |
+
+Both full MLPs pass with unchanged maximum absolute error 0.011719. Their multicast
+redistribution schedules remain 41599 and 29240 cycles. In the automatic profile,
+the median first-reduction receive gap falls from 82 to zero cycles. Final-reduction
+median send gaps fall from 41 to zero and receive gaps from 81 to 47; substantial
+residual contention/tails remain, but the route-latency bubble is partly removed.
+
+Profiles are `artifacts/profiles/mlp-historical-route-pipelining.html` and
+`artifacts/profiles/mlp-route-pipelining.html`. Implementation commits are
+`8c3c3e9` and `9bb29b2`. Logs include `/tmp/route-reduction.log`,
+`/tmp/route-guarded-{multicast,word-multicast,historical,automatic}.log`,
+`/tmp/route-guarded-{tests,clippy}.log`, and `/tmp/route-guarded-results.log`.
+Unrestricted failure logs are `/tmp/route-{multicast,word-multicast,historical,automatic}.log`.
+Additional hardware checks pass GEMM smoke, batched GEMM, a repeated two-block MLP,
+and full projected attention (839808 output checks, maximum error 0.001230).
+Their logs are `/tmp/route-guarded-{gemm,batched,repeat,attention}.log`.
+The automatic MLP build/run took 99.27 seconds versus 77.70 in the preceding
+finite-padding validation; historical took 28.19 versus 25.25. These were not
+controlled host-time benchmarks, but scheduling-time impact merits profiling
+separately from the demonstrated device-cycle improvement.
