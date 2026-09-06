@@ -9,11 +9,20 @@ struct ModelledPlan {
     challenger: Option<Vec<u16>>,
 }
 
+/// Selected work and its completed provisional allocation/schedule. Package
+/// sizing consumes these same artifacts before support storage changes addresses.
+pub(super) struct ScheduledPlan {
+    pub program: LowProgram,
+    pub placement: crate::Placement,
+    pub phases: Vec<crate::PhysicalExchangePhase>,
+    pub cache: crate::exchange::ExchangeScheduleCache,
+}
+
 pub(super) fn select_scheduled_finalist(
     finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
-) -> PackageBuildResult<(LowProgram, crate::exchange::ExchangeScheduleCache)> {
+) -> PackageBuildResult<ScheduledPlan> {
     let topology = active_topology(planning.tile_count)?;
     let screened = finalists
         .into_par_iter()
@@ -98,15 +107,20 @@ pub(super) fn select_scheduled_finalist(
                     refined_cycles = refined.total,
                     "scheduled operator-plan finalist"
                 );
-                Ok(((refined.total, index, mapped), low, cache))
+                Ok((
+                    (refined.total, index, mapped),
+                    ScheduledPlan {
+                        program: low,
+                        placement,
+                        phases: exchanges.phases,
+                        cache,
+                    },
+                ))
             };
             match schedule() {
                 Ok(candidate) => {
                     feasible = true;
-                    if best
-                        .as_ref()
-                        .is_none_or(|(score, _, _)| candidate.0 < *score)
-                    {
+                    if best.as_ref().is_none_or(|(score, _)| candidate.0 < *score) {
                         best = Some(candidate);
                     }
                 }
@@ -118,13 +132,13 @@ pub(super) fn select_scheduled_finalist(
         }
         scheduled += usize::from(feasible);
     }
-    let ((_, selected, mapped), low, cache) = best.ok_or(failure)?;
+    let ((_, selected, mapped), plan) = best.ok_or(failure)?;
     tracing::info!(
         selected,
         mapped,
         "selected physically scheduled operator-plan finalist"
     );
-    Ok((low, cache))
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -141,8 +155,9 @@ mod tests {
         let mut finalists = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
         let expected = crate::low::expand::expand_tiles(&finalists[0]).unwrap();
         finalists.insert(0, crate::MidProgram::default());
-        let (selected, _) = select_scheduled_finalist(finalists, &config, None).unwrap();
-        assert_eq!(selected, lower_to_tiles(&expected, false));
+        let selected = select_scheduled_finalist(finalists, &config, None).unwrap();
+        assert_eq!(selected.program, lower_to_tiles(&expected, false));
+        assert_eq!(selected.placement, place(&selected.program).unwrap());
         assert!(matches!(
             select_scheduled_finalist(vec![crate::MidProgram::default()], &config, None),
             Err(PackageBuildError::Low(

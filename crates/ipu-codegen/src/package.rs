@@ -3,7 +3,7 @@ mod profile;
 use profile::{instrument_profile, profile_binding, profile_step_count};
 mod selection;
 mod tile_program;
-use selection::select_scheduled_finalist;
+use selection::{ScheduledPlan, select_scheduled_finalist};
 pub use tile_program::build_tile_program_package;
 
 use crate::ValueBlocks;
@@ -307,9 +307,10 @@ fn build_package_artifacts(
             planning.exchange_schedule_finalists.max(4),
         )?)
     })?;
-    let (low, mut exchange_cache) = build_phase("select_finalist", || {
+    let mut selected = build_phase("select_finalist", || {
         select_scheduled_finalist(finalists, &planning, config.tile_mapping.as_deref())
     })?;
+    let low = &selected.program;
     tracing::info!(
         logical_shards = low.shards.len(),
         exchange_phases = low.exchange_phases.len(),
@@ -320,7 +321,7 @@ fn build_package_artifacts(
             .toolchain
             .compile(&config.runtime_source, "static_runtime", &[])?)
     })?;
-    let kernel_plan = build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(&low)?))?;
+    let kernel_plan = build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(low)?))?;
     let objects = build_phase("compile_kernels", || {
         let mut objects = vec![fs::read(&runtime_artifact.object)?];
         for compilation in &kernel_plan.compilations {
@@ -333,18 +334,20 @@ fn build_package_artifacts(
         }
         Ok(objects)
     })?;
-    let built =
-        build_package_from_objects(&low, &planning, &objects, &kernel_plan, &mut exchange_cache)?;
-    Ok((built, low))
+    let built = build_package_from_objects(&mut selected, &planning, &objects, &kernel_plan)?;
+    Ok((built, selected.program))
 }
 
 fn build_package_from_objects(
-    program: &LowProgram,
+    selected: &mut ScheduledPlan,
     config: &PipelineConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
-    exchange_cache: &mut crate::exchange::ExchangeScheduleCache,
 ) -> PackageBuildResult<BuiltApplication> {
+    let program = &selected.program;
+    let provisional_placement = &selected.placement;
+    let provisional_exchanges = &selected.phases;
+    let exchange_cache = &mut selected.cache;
     let topology = active_topology(program.tile_count)?;
     let retained_runtime = runtime_retained_symbols(program, config);
     let layout = build_phase("link_runtime", || {
@@ -368,20 +371,9 @@ fn build_package_from_objects(
         RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
     )?;
 
-    let provisional_placement = build_phase("plan_exchange_storage", || Ok(place(program)?))?;
-    let provisional_exchanges = build_phase("lower_exchanges_provisional", || {
-        Ok(crate::exchange::lower_exchanges_cached(
-            program,
-            &provisional_placement,
-            &topology,
-            false,
-            exchange_cache,
-        )?)
-    })?
-    .phases;
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
-        &provisional_exchanges,
+        provisional_exchanges,
         execution_tile_count,
         program.tile_count,
     )?;
@@ -446,20 +438,20 @@ fn build_package_from_objects(
         .inputs
         .iter()
         .filter(|input| input.kind == crate::GraphInputKind::Host)
-        .map(|input| input_binding(program, &provisional_placement, &topology, input))
+        .map(|input| input_binding(program, provisional_placement, &topology, input))
         .collect::<PackageBuildResult<Vec<_>>>()?;
     let provisional_weights = program
         .inputs
         .iter()
         .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .map(|input| input_binding(program, &provisional_placement, &topology, input))
+        .map(|input| input_binding(program, provisional_placement, &topology, input))
         .collect::<PackageBuildResult<Vec<_>>>()?;
     let mut provisional_outputs = program
         .outputs
         .iter()
         .enumerate()
         .map(|(index, output)| {
-            output_binding(program, &provisional_placement, &topology, output, index)
+            output_binding(program, provisional_placement, &topology, output, index)
         })
         .collect::<PackageBuildResult<Vec<_>>>()?;
     if let Some(storage) = &profile_storage {
@@ -540,8 +532,8 @@ fn build_package_from_objects(
         .collect::<BTreeMap<_, _>>();
     let provisional_finalizer = TileProgramLowering::new(
         program,
-        &provisional_placement,
-        &provisional_exchanges,
+        provisional_placement,
+        provisional_exchanges,
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
@@ -563,7 +555,7 @@ fn build_package_from_objects(
                 if let Some(storage) = &profile_storage {
                     instrument_profile(
                         program,
-                        &provisional_exchanges,
+                        provisional_exchanges,
                         logical,
                         u32::try_from(physical)?,
                         &mut tile_program,

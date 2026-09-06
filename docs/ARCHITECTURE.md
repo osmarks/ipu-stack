@@ -163,7 +163,9 @@ and attention stages no longer inherit unrelated enclosing-operator constraints.
 
 `package/selection` expands a bounded shortlist in parallel, models tile mappings,
 and exactly schedules the best candidates. It retains the projected baseline and
-its provisional placement instead of rebuilding them. Infeasible alternatives
+its provisional placement instead of rebuilding them. Package sizing consumes
+that placement and the completed exchange rows directly; it does not repeat
+provisional scheduling after selecting a winner. Infeasible alternatives
 are rejected individually; an entirely infeasible shortlist returns its error.
 Both finalist ranking and final-package reporting use `scheduled_program_cycles`
 to compose actual exchange horizons with the optimized compute/copy timeline.
