@@ -62,7 +62,7 @@ struct Arguments {
     #[arg(long, requires = "exchange_diagnostics")]
     exchange_diagnostic_case: Option<u32>,
     /// Replace the compiled workload with a tokenized replay of one exact
-    /// physical exchange phase and verify every touched word after execution.
+    /// physical exchange phase and verify sampled words after execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     exchange_replay_phase: Option<usize>,
     /// Replay a phase from an exported address-resolved schedule without

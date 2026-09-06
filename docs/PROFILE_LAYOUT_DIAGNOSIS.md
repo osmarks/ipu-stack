@@ -1028,3 +1028,103 @@ with exactly 202,392 maximum tile cycles. Its placement search takes 37.7 s;
 most of that is reoptimizing the large final-reduction phase. Final artifacts
 are `/tmp/placement-validated-automatic.{log,ipuexe,ipuprofile}`, and the automatic
 HTML above has been refreshed from that run.
+
+## Recovering historical plans during shortlisting (2026-09-06)
+
+`retain_operator_candidates` now ranks known contiguous-memory overflow ahead
+of cycle cost. If its Pareto frontier contains feasible candidates, overflowing
+ones cannot consume diversity or remainder slots. When every candidate reports
+overflow, the least-overflowing alternatives remain available for the existing
+region-level diagnostics rather than silently producing an empty pool.
+
+The original geometry/output diversity screen retains up to `width` primary
+implementations. Each can retain one additional equal-cycle alternative with
+the same operator, dispatch, output requirements and overflow, but different
+input memory/staging requirements. The local pool is therefore bounded at
+`2 * width` (128 with the default 64); the complete-program beam remains 64.
+Giving every memory variant an independent diversity slot crowded out useful
+grids, while charging tied pairs against the original 64-candidate cap moved
+the cutoff problem elsewhere. Keeping one alternative alongside its primary
+preserves the geometry budget with a bounded amount of extra local screening.
+
+The new unconstrained full-size MLP regression verifies both standard and
+interleaved variants of `4x92x4` and `4x24x15` survive local and pooled screens,
+that their retained pool has no known contiguous-memory overflow, and that the
+complete historical interleaved pair reaches the first eight final beam plans.
+No GEMM constraints are supplied to generation or planning; constraints in the
+test are only identifiers used to inspect the results.
+
+The complete historical pair is now finalist 4 (zero-based), with compact cost
+310,377 versus 303,439 for finalist 0. Its expanded estimate is 248,066 versus
+275,103 for finalist 0. Thus the earlier pruning failure is fixed, but coarse
+ranking still underestimates the historical pair's relative merit. The default
+one-finalist build uses the historical first GEMM with the `3x18x27` standard-
+weight downprojection. The five-finalist physical scheduler can now see the
+historical pair without forcing its grids.
+
+Implementation commits: `f4ab243`, `dcb8227`. Workspace release tests pass (171,
+one ignored), as does strict workspace Clippy. The strengthened complete-beam
+regression also passes independently. Logs: `/tmp/shortlist-tests.log`,
+`/tmp/shortlist-clippy-final.log`, `/tmp/shortlist-final-regression.log`, and
+`/tmp/shortlist-finalists.log` (manual eight-finalist expansion).
+
+With `--exchange-schedule-finalists 5`, physical ranking selects finalist 4:
+refined cost 240,326 versus 241,677 for finalist 0. Before the receiver-control
+fix below, its generated package was byte-identical (SHA256
+`2bd21384cacc990e106682adeaeec00469604ce54900d96a0f43ce8262a46ffa`)
+to the previously hardware-validated historical package at 194,574 maximum
+cycles. The default finalist count remains one; these changes make the plan
+available without hard-coding a model-specific preference.
+
+### Paired pointer collision exposed by the recovered default plan
+
+The newly available default hybrid (`4x92x4` followed by `3x18x27`) exposed a
+receiver-codegen bug after SRAM placement optimization. Without the placement
+shift it passed at 198,030 cycles; with the 28 KiB shift, 501 output values
+failed, starting at row 488, column 640. Intermediate checks passed the first
+GEMM and GELU. Broad 131,072-word samples of both later exchanges missed the
+corruption.
+
+Exhaustive phase-2 replay readback on the 27 downprojection contributor tiles
+(`982 + 18*k`, `k=0..26`) found unwritten activation words on tile 1216. Transfer
+3239 is a 144-word paired multicast from tile 966; transfer 5330 is an ordinary
+weight multicast from tile 612. The scheduler combined the paired destination
+pointer with the next ordinary XPIC source selection into a directionless
+`SENDPICP`. The receive-event representation distinguished paired source
+controls, but had erased the corresponding distinction for pointers.
+
+`bd75bd4` preserves `PairedPointer` through scheduling and forbids that
+combination, just as paired XPIC controls were already excluded. Ordinary
+control fusion and continuous paired receive mode remain available. The exact
+route combination is covered by a scheduling regression. All 684,088 touched
+words on those 27 tiles then matched; this exhaustive readback itself exceeded
+the host protocol's ten-second timeout after verification. `f20eb3c` adds
+`--exchange-replay-tiles` for focused checks and allows exporting a schedule
+while replaying it, avoiding a second full model build to obtain diagnostics.
+
+Workspace release tests after the exchange fix: 172 passed, one ignored;
+strict workspace Clippy also passes. Logs: `/tmp/shortlist-complete-tests.log`,
+`/tmp/shortlist-complete-clippy.log`, `/tmp/hybrid-target-replay.log` (failure),
+and `/tmp/hybrid-target-fixed.log` (complete word verification).
+
+The focused tile-1216 replay completes normally with all 25,456 words checked
+(`/tmp/hybrid-focused-fixed.log`). The regression was also verified to fail
+when the old pointer classification was temporarily restored. The full default
+MLP now passes numerical validation with the optimized placement at 197,388
+maximum cycles (164,634 minimum), maximum absolute error 0.011719. Its profile
+is `artifacts/profiles/mlp-shortlist-default.html`; raw artifacts and build log
+are `/tmp/shortlist-fixed-default.{ipuexe,ipuprofile,log}`. Compact planning took
+12.95 seconds in this run.
+
+Re-running all five finalists with the receiver fix preserves every refined
+score and again selects finalist 4. The physical-selection stage takes 161
+seconds in this run (some overlap with diagnostic compilation/replay); finalist
+expansion and full exchange scheduling dominate that time. This is separate
+from the approximately thirteen-second compact planning step.
+
+The automatically selected historical plan then passes full hardware numerical
+validation at 194,574 maximum cycles (178,230 minimum), maximum absolute error
+0.011719. The rendered profile is
+`artifacts/profiles/mlp-shortlist-historical.html`; raw artifacts and log are
+`/tmp/shortlist-fixed-five.{ipuexe,ipuprofile,log}`. Both recovered plans are now
+validated with the paired-pointer fix and SRAM placement optimization enabled.
