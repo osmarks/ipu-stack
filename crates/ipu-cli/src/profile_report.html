@@ -161,6 +161,9 @@ canvas {
         <span class="legend-item"><span class="legend-swatch" style="background:#9a547f"></span>partner bus</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#8ebeb4"></span>exchange idle</span>
         <span class="legend-item"><span class="legend-swatch" style="background:#c58b24"></span>sync</span>
+        <label><input id="transferTexture" type="checkbox" checked> Texture</label>
+        <span class="legend-item" title="Timeline texture; hover for TX and RX details"><span class="legend-swatch" style="background:repeating-linear-gradient(135deg,#777 0 3px,#ddd 3px 4px)"></span>multicast /</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:repeating-linear-gradient(90deg,#777 0 4px,#fff 4px 6px)"></span>paired |</span>
       </div>
     </div>
     <div class="overview-wrap"><canvas id="overview"></canvas></div>
@@ -179,8 +182,9 @@ const metadataSets = DATA.metadataSets.map(([start, count]) => {
   return entries;
 });
 const exchangeActivityKinds = ["send", "receive", "partnerBusy"];
-const activitySets = DATA.activitySets.map(activities => activities.map(([kind, start, end]) => ({
+const activitySets = DATA.activitySets.map(activities => activities.map(([kind, start, end, fanout = 0, paired = 0]) => ({
   kind: exchangeActivityKinds[kind] || "exchangeIdle",
+  fanout, paired: !!paired,
   start,
   end,
 })));
@@ -380,8 +384,9 @@ function displaySegments(sample) {
     const send = activity.kind === "send" ? 1 : 0;
     const receive = activity.kind === "receive" ? 1 : 0;
     const partnerBusy = activity.kind === "partnerBusy" ? 1 : 0;
-    events.push({ time: start, send, receive, partnerBusy });
-    events.push({ time: end, send: -send, receive: -receive, partnerBusy: -partnerBusy });
+    const multicast = activity.fanout > (activity.paired ? 2 : 1) ? 1 : 0, paired = activity.paired ? 1 : 0;
+    events.push({ time: start, send, receive, partnerBusy, multicast, paired });
+    events.push({ time: end, send: -send, receive: -receive, partnerBusy: -partnerBusy, multicast: -multicast, paired: -paired });
   }
   events.sort((a, b) => a.time - b.time);
   const activityKind = (send, receive, partnerBusy) => {
@@ -391,23 +396,54 @@ function displaySegments(sample) {
     if (partnerBusy) return "partnerBusy";
     return "exchangeIdle";
   };
-  let cursor = exchangeStart, send = 0, receive = 0, partnerBusy = 0, event = 0;
+  let cursor = exchangeStart, send = 0, receive = 0, partnerBusy = 0, multicast = 0, paired = 0, event = 0;
   while (event < events.length) {
     const time = events[event].time;
-    if (time > cursor) segments.push({ kind: activityKind(send, receive, partnerBusy), start: cursor, end: time });
+    if (time > cursor) segments.push({ kind: activityKind(send, receive, partnerBusy), multicast: multicast > 0, paired: paired > 0, start: cursor, end: time });
     while (event < events.length && events[event].time === time) {
       send += events[event].send;
       receive += events[event].receive;
       partnerBusy += events[event].partnerBusy;
+      multicast += events[event].multicast;
+      paired += events[event].paired;
       event++;
     }
     cursor = time;
   }
-  if (cursor < exchangeEnd) segments.push({ kind: activityKind(send, receive, partnerBusy), start: cursor, end: exchangeEnd });
+  if (cursor < exchangeEnd) segments.push({ kind: activityKind(send, receive, partnerBusy), multicast: multicast > 0, paired: paired > 0, start: cursor, end: exchangeEnd });
   if (exchangeEnd < sampleEnd) {
     segments.push({ kind: "synchronization", start: exchangeEnd, end: sampleEnd });
   }
   return segments;
+}
+const transferTextures = new Map();
+function transferTexture(multicast, paired) {
+  const key = `${multicast}:${paired}`;
+  if (!transferTextures.has(key)) {
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 8;
+    const ctx = canvas.getContext("2d");
+    ctx.strokeStyle = "rgba(255,255,255,0.45)";
+    if (multicast) {
+      ctx.beginPath();
+      ctx.moveTo(0, 8); ctx.lineTo(8, 0);
+      ctx.stroke();
+    }
+    if (paired) {
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      ctx.fillRect(2, 0, 2, 8);
+    }
+    transferTextures.set(key, ctx.createPattern(canvas, "repeat"));
+  }
+  return transferTextures.get(key);
+}
+function exchangeDetailsAt(sample, time) {
+  const origin = scheduledExchangeBounds(sample)?.eventStart ?? sample.offset;
+  return sample.exchangeActivities.filter(activity => time >= origin + activity.start && time < origin + activity.end).map(activity => {
+    const role = { send: "TX", receive: "RX", partnerBusy: "partner TX lane" }[activity.kind];
+    const route = activity.fanout === 0 ? "route/width unknown (older profile)" : `${activity.paired ? "paired " : ""}${activity.fanout > (activity.paired ? 2 : 1) ? `multicast to ${activity.fanout} tiles` : activity.paired ? "unicast to a tile pair" : "unicast"}`;
+    return `${role}: ${route}`;
+  });
 }
 function displayKindAt(sample, time) {
   const segment = displaySegments(sample).find(segment => time >= segment.start && time < segment.end);
@@ -671,6 +707,7 @@ function drawOverview() {
   ctx.strokeRect(x + 0.5, 1.5, Math.min(width - x - 1, w), height - 3);
 }
 function drawTimeline() {
+  const textures = document.getElementById("transferTexture").checked;
   const ctx = timeline.getContext("2d");
   const ratio = 1;
   const left = 0, top = 0, right = 0, rowH = state.timelineRowHeight;
@@ -713,6 +750,10 @@ function drawTimeline() {
         const w = Math.max(1, plotW * (clippedEnd - clippedStart) / (viewEnd - viewStart));
         ctx.fillStyle = selected ? sampleColor(sample, segment.kind) : "#9b9b9b";
         ctx.fillRect(x, y, w, rowH);
+        if (selected && textures && (segment.multicast || segment.paired)) {
+          ctx.fillStyle = transferTexture(segment.multicast, segment.paired);
+          ctx.fillRect(x, y, w, rowH);
+        }
       }
     }
   });
@@ -960,6 +1001,7 @@ function zoomToRange(start, end) {
 document.getElementById("search").addEventListener("input", () => { state.focus = null; render(); });
 document.getElementById("kind").addEventListener("change", () => { state.focus = null; render(); });
 document.getElementById("timelineRowHeight").addEventListener("change", render);
+document.getElementById("transferTexture").addEventListener("change", render);
 document.getElementById("timelineStart").addEventListener("change", render);
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
@@ -979,6 +1021,7 @@ timeline.addEventListener("mousemove", event => {
     `tile ${hit.tile}`,
     sampleTitle(hit.sample),
     `${hit.kind} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
+    ...exchangeDetailsAt(hit.sample, hit.time),
     `range ${formatRange(hit.sample)}`,
     formatMetadata(hit.sample),
   ]);

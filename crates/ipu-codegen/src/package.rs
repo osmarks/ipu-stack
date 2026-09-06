@@ -1896,6 +1896,8 @@ fn profile_step(
                     .ok_or_else(|| invalid("profile exchange tile is missing"))?
                     .iter()
                     .map(|activity| ProfileExchangeActivity {
+                        fanout: activity.fanout,
+                        paired: activity.paired,
                         kind: match activity.kind {
                             crate::ExchangeActivityKind::Send => ProfileExchangeActivityKind::Send,
                             crate::ExchangeActivityKind::Receive => {

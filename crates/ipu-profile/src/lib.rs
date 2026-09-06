@@ -1006,6 +1006,8 @@ mod tests {
                 .map(|_| {
                     let start_cycle = random.u32(0..event_cycles);
                     ProfileExchangeActivity {
+                        fanout: 0,
+                        paired: false,
                         kind: match random.u8(0..3) {
                             0 => ProfileExchangeActivityKind::Send,
                             1 => ProfileExchangeActivityKind::Receive,

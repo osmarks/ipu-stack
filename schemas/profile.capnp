@@ -17,6 +17,8 @@ struct ExchangeActivity {
   kind @0 :ExchangeActivityKind;
   startCycle @1 :UInt32;
   endCycle @2 :UInt32;
+  fanout @3 :UInt16; # Zero means unavailable in older profiles.
+  paired @4 :Bool;
 }
 
 struct ProfileStep {

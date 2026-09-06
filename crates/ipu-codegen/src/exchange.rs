@@ -50,6 +50,8 @@ pub struct ExchangeRowPatch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExchangeActivity {
+    pub fanout: u16,
+    pub paired: bool,
     /// Stable index of the physical transfer within this phase.
     pub transfer: u32,
     pub kind: ExchangeActivityKind,
@@ -2099,6 +2101,8 @@ impl MaterializedSchedule {
         self.scheduled_sends[usize::from(transfer.source)]
             .push((transfer.source_shard, transfer.source_offset));
         self.activities[usize::from(transfer.source)].push(ExchangeActivity {
+            fanout: transfer.destinations.len() as u16,
+            paired: transfer.width == ExchangeItemWidth::Paired64,
             transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
             kind: ExchangeActivityKind::Send,
             start_cycle: timing.start,
@@ -2109,6 +2113,8 @@ impl MaterializedSchedule {
         });
         if let Some(tile) = transfer.reserved_source {
             self.activities[usize::from(tile)].push(ExchangeActivity {
+                fanout: transfer.destinations.len() as u16,
+                paired: transfer.width == ExchangeItemWidth::Paired64,
                 transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 kind: ExchangeActivityKind::PartnerBusy,
                 start_cycle: timing.start,
@@ -2126,6 +2132,8 @@ impl MaterializedSchedule {
             .zip(&timing.receiver_memory_ends)
         {
             self.activities[usize::from(tile)].push(ExchangeActivity {
+                fanout: transfer.destinations.len() as u16,
+                paired: transfer.width == ExchangeItemWidth::Paired64,
                 transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 kind: ExchangeActivityKind::Receive,
                 start_cycle,

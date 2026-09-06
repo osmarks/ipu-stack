@@ -617,8 +617,8 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
     let mut string_indices = HashMap::new();
     let mut metadata_sets = Vec::<Vec<[u32; 2]>>::new();
     let mut metadata_indices = HashMap::<Vec<[u32; 2]>, u32>::new();
-    let mut activity_sets = Vec::<Vec<[u32; 3]>>::new();
-    let mut activity_indices = HashMap::<Vec<[u32; 3]>, u32>::new();
+    let mut activity_sets = Vec::<Vec<[u32; 5]>>::new();
+    let mut activity_indices = HashMap::<Vec<[u32; 5]>, u32>::new();
     let mut steps = Vec::<StepKey>::new();
     let mut step_indices = HashMap::<StepKey, u32>::new();
     let base_cycle = cycle_origin(report);
@@ -686,6 +686,8 @@ fn render_profile_html(report: &ProfileReport) -> Result<String> {
                                 },
                                 activity.start_cycle,
                                 activity.end_cycle,
+                                u32::from(activity.fanout),
+                                u32::from(activity.paired),
                             ]
                         })
                         .collect::<Vec<_>>();

@@ -34,6 +34,9 @@ pub enum ProfileExchangeActivityKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileExchangeActivity {
+    /// Number of destination tiles; zero means unknown in older profiles.
+    pub fanout: u16,
+    pub paired: bool,
     pub kind: ProfileExchangeActivityKind,
     /// Estimated event-cycle offset within the exchange phase.
     pub start_cycle: u32,
@@ -135,6 +138,8 @@ impl ProfileReport {
                     });
                     output_activity.set_start_cycle(activity.start_cycle);
                     output_activity.set_end_cycle(activity.end_cycle);
+                    output_activity.set_fanout(activity.fanout);
+                    output_activity.set_paired(activity.paired);
                 }
             }
         }
@@ -190,6 +195,8 @@ impl ProfileReport {
                                     .iter()
                                     .map(|activity| {
                                         Ok(ProfileExchangeActivity {
+                                            fanout: activity.get_fanout(),
+                                            paired: activity.get_paired(),
                                             kind: match activity.get_kind()? {
                                                 profile_capnp::ExchangeActivityKind::Send => {
                                                     ProfileExchangeActivityKind::Send
@@ -1026,6 +1033,8 @@ fn write_profile_tiles(
                 });
                 output_activity.set_start_cycle(activity.start_cycle);
                 output_activity.set_end_cycle(activity.end_cycle);
+                output_activity.set_fanout(activity.fanout);
+                output_activity.set_paired(activity.paired);
             }
         }
     }
@@ -1076,6 +1085,8 @@ fn read_profile_tiles(
                                 .iter()
                                 .map(|activity| {
                                     Ok(ProfileExchangeActivity {
+                                        fanout: activity.get_fanout(),
+                                        paired: activity.get_paired(),
                                         kind: match activity.get_kind()? {
                                             application_capnp::ProfileExchangeActivityKind::Send => {
                                                 ProfileExchangeActivityKind::Send
@@ -1251,11 +1262,15 @@ mod tests {
                 }],
                 exchange_activities: vec![
                     ProfileExchangeActivity {
+                        fanout: 2,
+                        paired: true,
                         kind: ProfileExchangeActivityKind::Receive,
                         start_cycle: 3,
                         end_cycle: 11,
                     },
                     ProfileExchangeActivity {
+                        fanout: 2,
+                        paired: true,
                         kind: ProfileExchangeActivityKind::PartnerBusy,
                         start_cycle: 1,
                         end_cycle: 3,
@@ -1489,11 +1504,15 @@ mod tests {
                         exchange_activities: if kind == ProfileStepKind::Exchange {
                             vec![
                                 ProfileExchangeActivity {
+                                    fanout: 2,
+                                    paired: true,
                                     kind: ProfileExchangeActivityKind::Send,
                                     start_cycle: 2,
                                     end_cycle: 6,
                                 },
                                 ProfileExchangeActivity {
+                                    fanout: 2,
+                                    paired: true,
                                     kind: ProfileExchangeActivityKind::PartnerBusy,
                                     start_cycle: 6,
                                     end_cycle: 8,
