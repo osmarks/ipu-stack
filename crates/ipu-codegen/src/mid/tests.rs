@@ -1479,6 +1479,21 @@ fn materialized_attention_packs_values_for_the_full_product() {
             column_block: 16
         })
     );
+    assert!(mid.values.iter().any(|value| {
+        value.tensor_type.format.layout.order == ElementOrder::Amp(AmpOrder::TransposedRight)
+            && value
+                .tensor_type
+                .format
+                .layout
+                .tiling
+                .axes
+                .iter()
+                .any(|axis| {
+                    axis.axis.resolve(3) == Ok(1)
+                        && axis.partitions == 2
+                        && axis.block_size == AMP_INNER_BLOCK
+                })
+    }));
 }
 
 #[test]

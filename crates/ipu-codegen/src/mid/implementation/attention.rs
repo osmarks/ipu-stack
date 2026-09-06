@@ -164,8 +164,17 @@ impl Builder {
         resident: &TensorType,
         key_block: u32,
     ) -> Option<MidValueId> {
+        // K consists of independent 64-row AMP panels even when the consumer
+        // uses the entire key matrix. Distribute preparation by panel instead
+        // of tying its ownership to the consumer's GEMM block size.
+        let preparation_rows =
+            if resident.format.layout.order == ElementOrder::Amp(AmpOrder::TransposedRight) {
+                key_block.min(AMP_INNER_BLOCK)
+            } else {
+                key_block
+            };
         let heads = u16::try_from(resident.shape.0[0]).ok()?;
-        let blocks = u16::try_from(resident.shape.0[1].div_ceil(key_block))
+        let blocks = u16::try_from(resident.shape.0[1].div_ceil(preparation_rows))
             .ok()?
             .min(resident.format.layout.tiling.tile_count / heads)
             .max(1);
@@ -184,6 +193,7 @@ impl Builder {
                 }
                 1 => {
                     axis.partitions = blocks;
+                    axis.block_size = preparation_rows;
                     axis.tile_stride = Some(heads.checked_mul(columns)?);
                 }
                 2 => {
