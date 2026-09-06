@@ -16,7 +16,7 @@ pub use crate::graph::AxisFactorView;
 
 use candidates::*;
 use catalogue::*;
-pub use catalogue::{OperatorCandidate, OperatorFormatPolicy};
+pub use catalogue::{ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy};
 pub use layout::*;
 pub use operator::*;
 #[cfg(test)]

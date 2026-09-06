@@ -41,11 +41,11 @@ impl<'a> CandidateSearch<'a> {
                                 .operator_candidates
                                 .iter()
                                 .filter(|candidate| {
-                                    operator_matches(&consumer.kind, candidate.plan.operator)
+                                    operator_matches(&consumer.kind, candidate.operator())
                                 })
                                 .any(|candidate| {
                                     matches!(
-                                        candidate.format_policy,
+                                        candidate.format_policy(),
                                         OperatorFormatPolicy::PreserveInputLayout(_)
                                     )
                                 })
@@ -57,8 +57,8 @@ impl<'a> CandidateSearch<'a> {
             config
                 .operator_candidates
                 .iter()
-                .filter(|candidate| operator_matches(&operation.kind, candidate.plan.operator))
-                .filter_map(|candidate| match candidate.format_policy {
+                .filter(|candidate| operator_matches(&operation.kind, candidate.operator()))
+                .filter_map(|candidate| match candidate.format_policy() {
                     OperatorFormatPolicy::Concrete => None,
                     OperatorFormatPolicy::PreserveInputLayout(index) => Some(usize::from(index)),
                 })

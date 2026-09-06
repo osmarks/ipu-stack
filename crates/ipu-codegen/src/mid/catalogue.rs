@@ -1,10 +1,23 @@
-//! Shape-independent implementation seeds and their format policies.
+//! Concrete implementations and explicitly enabled shape-dependent families.
 
 use super::*;
 
-/// Complete formats and placement requirements of one whole-device operator plan.
+/// An explicitly enabled concrete implementation or shape-dependent family.
+// Most entries are concrete; keep their storage inline as in the original catalogue.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OperatorCandidate {
+pub enum OperatorCandidate {
+    Concrete(ConcreteOperatorCandidate),
+    /// F16 GEMMs with independently distributed K partials and a reduction.
+    ParallelGemm {
+        tile_count: u16,
+        options: GemmOptions,
+        accumulate: AccumulationPrecision,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConcreteOperatorCandidate {
     pub plan: OperatorPlan,
     pub format_policy: OperatorFormatPolicy,
 }
@@ -19,6 +32,45 @@ pub enum OperatorFormatPolicy {
 }
 
 impl OperatorCandidate {
+    pub fn parallel_gemm(tile_count: u16) -> Self {
+        Self::ParallelGemm {
+            tile_count,
+            options: GemmOptions::default(),
+            accumulate: gemm_accumulation_precision(Precision::F16),
+        }
+    }
+
+    pub fn concrete(&self) -> Option<&ConcreteOperatorCandidate> {
+        match self {
+            Self::Concrete(candidate) => Some(candidate),
+            _ => None,
+        }
+    }
+
+    pub fn operator(&self) -> MidOperator {
+        match self {
+            Self::Concrete(candidate) => candidate.plan.operator,
+            Self::ParallelGemm {
+                options,
+                accumulate,
+                ..
+            } => MidOperator::Gemm {
+                options: *options,
+                multiply: Precision::F16,
+                accumulate: *accumulate,
+            },
+        }
+    }
+
+    pub fn format_policy(&self) -> OperatorFormatPolicy {
+        self.concrete()
+            .map_or(OperatorFormatPolicy::Concrete, |candidate| {
+                candidate.format_policy
+            })
+    }
+}
+
+impl ConcreteOperatorCandidate {
     pub fn new(
         operator: MidOperator,
         inputs: impl IntoIterator<Item = OperandRequirement>,
@@ -278,14 +330,20 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
         }
     }
     unique
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .chain(std::iter::once(OperatorCandidate::parallel_gemm(
+            tile_count,
+        )))
+        .collect()
 }
 
 pub(super) fn pointwise_operator_candidate(
     operator: MidOperator,
     inputs: impl IntoIterator<Item = TensorFormat>,
     output: TensorFormat,
-) -> OperatorCandidate {
-    OperatorCandidate::new(
+) -> ConcreteOperatorCandidate {
+    ConcreteOperatorCandidate::new(
         operator,
         inputs
             .into_iter()
@@ -297,10 +355,49 @@ pub(super) fn pointwise_operator_candidate(
 pub(super) fn format_preserving_unary_candidate(
     operator: MidOperator,
     format: TensorFormat,
-) -> OperatorCandidate {
+) -> ConcreteOperatorCandidate {
     pointwise_operator_candidate(operator, [format.clone()], format)
         .with_preserved_input_layout(0)
         .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
+}
+
+pub(super) fn gemm_plan(
+    operator: MidOperator,
+    layouts: [Layout; 3],
+    left_tail: u32,
+    dispatch: OperatorDispatch,
+) -> OperatorPlan {
+    let MidOperator::Gemm {
+        multiply: precision,
+        ..
+    } = operator
+    else {
+        unreachable!("GEMM operand contract requires a GEMM operator");
+    };
+    let [left, right, output] = layouts;
+    let operand = |layout| OperandRequirement::new(TensorFormat { precision, layout }, 32);
+    let orientation = match dispatch {
+        OperatorDispatch::BlockedGemm { orientation, .. } => orientation,
+        _ => unreachable!("GEMM operand contract requires a GEMM dispatch"),
+    };
+    let left_index = orientation.operand_indices().0;
+    let mut inputs = vec![operand(left), operand(right)];
+    inputs[left_index].access_tail_bytes = left_tail;
+    inputs[left_index].materialization = OperandMaterialization::DispatchSlices;
+    OperatorPlan {
+        operator,
+        dispatch,
+        requirements: StorageRequirements {
+            inputs,
+            output: operand(output),
+            output_aliasing: OutputAliasing::Fresh,
+            distinct_elements: vec![vec![
+                MemoryOperand::Output,
+                MemoryOperand::Input(left_index as u16),
+            ]],
+        },
+        deferred_output: None,
+    }
 }
 
 pub(super) fn amp_gemm_operator_candidate(
@@ -309,53 +406,36 @@ pub(super) fn amp_gemm_operator_candidate(
     left_tail: u32,
     output_columns: u32,
     tile_count: u16,
-) -> OperatorCandidate {
+) -> ConcreteOperatorCandidate {
     let operator = MidOperator::Gemm {
         options: GemmOptions::default(),
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    OperatorCandidate::new(
-        operator,
-        [
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: Layout::amp_left(inner, tile_count),
-                },
-                32,
-            )
-            .with_access_tail(left_tail)
-            .with_materialization(OperandMaterialization::DispatchSlices),
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: Layout::block_major_matrix_storage(
-                        inner,
-                        AMP_OUTPUT_COLUMN_BLOCK,
-                        tile_count,
-                        1,
-                        1,
-                        MemoryClass::Ipu21Standard,
-                    ),
-                },
-                32,
-            ),
-        ],
-        OperandRequirement::new(
-            TensorFormat {
-                precision,
-                layout: if precision == Precision::F16 {
+    ConcreteOperatorCandidate {
+        plan: gemm_plan(
+            operator,
+            [
+                Layout::amp_left(inner, tile_count),
+                Layout::block_major_matrix_storage(
+                    inner,
+                    AMP_OUTPUT_COLUMN_BLOCK,
+                    tile_count,
+                    1,
+                    1,
+                    MemoryClass::Ipu21Standard,
+                ),
+                if precision == Precision::F16 {
                     Layout::amp_left_result(tile_count)
                 } else {
                     Layout::amp_output(tile_count)
                 },
-            },
-            32,
+            ],
+            left_tail,
+            blocked_gemm_dispatch(output_columns),
         ),
-    )
-    .with_distinct_elements(vec![MemoryOperand::Output, MemoryOperand::Input(0)])
-    .with_dispatch(blocked_gemm_dispatch(output_columns))
+        format_policy: OperatorFormatPolicy::Concrete,
+    }
 }
 
 pub(super) fn amp_grid_gemm_operator_candidate(
@@ -365,7 +445,7 @@ pub(super) fn amp_grid_gemm_operator_candidate(
     output_columns: u32,
     grid: AmpGridShape,
     weights: AmpWeightPlacement,
-) -> OperatorCandidate {
+) -> ConcreteOperatorCandidate {
     let right_layout = match (weights.inner_partitions, weights.memory_class) {
         (1, MemoryClass::Ipu21Standard) => Layout::block_major_matrix_grid(
             inner,
@@ -389,36 +469,19 @@ pub(super) fn amp_grid_gemm_operator_candidate(
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
     };
-    OperatorCandidate::new(
-        operator,
-        [
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: Layout::amp_left_grid(
-                        inner,
-                        grid.tile_count,
-                        grid.row_partitions,
-                        grid.column_partitions,
-                        grid.order,
-                    ),
-                },
-                32,
-            )
-            .with_access_tail(left_tail)
-            .with_materialization(OperandMaterialization::DispatchSlices),
-            OperandRequirement::new(
-                TensorFormat {
-                    precision,
-                    layout: right_layout,
-                },
-                32,
-            ),
-        ],
-        OperandRequirement::new(
-            TensorFormat {
-                precision,
-                layout: if precision == Precision::F16 {
+    ConcreteOperatorCandidate {
+        plan: gemm_plan(
+            operator,
+            [
+                Layout::amp_left_grid(
+                    inner,
+                    grid.tile_count,
+                    grid.row_partitions,
+                    grid.column_partitions,
+                    grid.order,
+                ),
+                right_layout,
+                if precision == Precision::F16 {
                     Layout::amp_left_result_grid(
                         output_columns,
                         grid.tile_count,
@@ -435,12 +498,12 @@ pub(super) fn amp_grid_gemm_operator_candidate(
                         grid.order,
                     )
                 },
-            },
-            32,
+            ],
+            left_tail,
+            blocked_gemm_dispatch(output_columns),
         ),
-    )
-    .with_distinct_elements(vec![MemoryOperand::Output, MemoryOperand::Input(0)])
-    .with_dispatch(blocked_gemm_dispatch(output_columns))
+        format_policy: OperatorFormatPolicy::Concrete,
+    }
 }
 
 pub(super) fn blocked_gemm_dispatch(output_columns: u32) -> OperatorDispatch {

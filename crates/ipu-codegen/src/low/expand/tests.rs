@@ -43,7 +43,7 @@ fn streamed_conversion_does_not_require_an_adjacent_consumer() {
     config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
     config.operator_candidates.retain(|candidate| {
         matches!(
-            candidate.plan.operator,
+            candidate.operator(),
             MidOperator::Gemm {
                 multiply: Precision::F16,
                 ..
@@ -209,7 +209,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                 crate::mid::GridOrder::ColumnsFast,
             ),
         };
-        let candidate = OperatorCandidate::new(
+        let candidate = ConcreteOperatorCandidate::new(
             operator,
             [
                 OperandRequirement::new(left_format.clone(), 32),
@@ -233,7 +233,10 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let mut config = PipelineConfig::new(tiles)
             .with_input(left, left_format)
             .with_input(right, right_format);
-        config.operator_candidates = vec![candidate];
+        config.operator_candidates = vec![candidate]
+            .into_iter()
+            .map(OperatorCandidate::Concrete)
+            .collect();
         let mid = lower(&graph, &config, &Ipu21CostModel)
             .unwrap_or_else(|error| panic!("case {case}: {error}"));
         let compact = crate::mid::implementation::resolve(mid.clone()).unwrap();
@@ -372,7 +375,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
             .with_input(left, left_format.clone())
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format.clone());
-        config.operator_candidates = vec![OperatorCandidate::new(
+        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gemm {
                 options: crate::GemmOptions::default(),
                 multiply: Precision::F16,
@@ -383,7 +386,10 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
                 OperandRequirement::new(right_format, 32),
             ],
             OperandRequirement::new(output_format, 32),
-        )];
+        )]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         assert!(mid.operations.iter().all(|operation| {
@@ -424,11 +430,14 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(tiles).with_input(input, tensor_format.clone());
-        config.operator_candidates = vec![OperatorCandidate::new(
+        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
             [OperandRequirement::new(tensor_format.clone(), 8)],
             OperandRequirement::new(tensor_format, 8),
-        )];
+        )]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
@@ -595,11 +604,14 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
-        config.operator_candidates = vec![OperatorCandidate::new(
+        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
             [OperandRequirement::new(input_format, 8)],
             OperandRequirement::new(output_format, 8),
-        )];
+        )]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
@@ -661,11 +673,14 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format);
-        config.operator_candidates = vec![OperatorCandidate::new(
+        config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
             [OperandRequirement::new(target_format.clone(), 8)],
             OperandRequirement::new(target_format, 8),
-        )];
+        )]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
@@ -1318,6 +1333,9 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
         config.operator_candidates.retain(|candidate| {
+            let Some(candidate) = candidate.concrete() else {
+                return false;
+            };
             matches!(
                 candidate.plan.dispatch,
                 OperatorDispatch::BlockedGemm {
@@ -1431,7 +1449,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let mut config = PipelineConfig::new(tiles)
             .with_input(left, left_format.clone())
             .with_input(right, right_format.clone());
-        config.operator_candidates = vec![crate::OperatorCandidate::new(
+        config.operator_candidates = vec![crate::ConcreteOperatorCandidate::new(
             crate::MidOperator::Gemm {
                 options: crate::GemmOptions::default(),
                 multiply: Precision::F16,
@@ -1442,7 +1460,10 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
                 crate::OperandRequirement::new(right_format, 32).with_local_staging(local_staging),
             ],
             crate::OperandRequirement::new(output_format, 32),
-        )];
+        )]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
@@ -1755,14 +1776,17 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     let input = graph.host_input("input", [3, 17, 32]).unwrap();
     let output = graph.gelu(input).unwrap();
     graph.set_outputs([output]).unwrap();
-    let mut candidate = OperatorCandidate::new(
+    let mut candidate = ConcreteOperatorCandidate::new(
         MidOperator::Gelu,
         [OperandRequirement::new(format.clone(), 8)],
         OperandRequirement::new(format.clone(), 8),
     );
     candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
     let mut config = PipelineConfig::new(4).with_input(input, format);
-    config.operator_candidates = vec![candidate];
+    config.operator_candidates = vec![candidate]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let low = lower_to_tiles(&mid, false).unwrap();
     assert!(low.kernel_runs.len() > 4);

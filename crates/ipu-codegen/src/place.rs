@@ -925,11 +925,14 @@ mod tests {
             layout: Layout::row_sharded(4),
         };
         let mut config = PipelineConfig::new(4).with_input(input, format.clone());
-        config.operator_candidates = vec![crate::OperatorCandidate::new(
+        config.operator_candidates = vec![crate::ConcreteOperatorCandidate::new(
             crate::MidOperator::Gelu,
             [crate::OperandRequirement::new(format.clone(), 8)],
             crate::OperandRequirement::new(format, 8),
-        )];
+        )]
+        .into_iter()
+        .map(crate::OperatorCandidate::Concrete)
+        .collect();
         let candidate = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut program = (*crate::expand_tiles(&candidate).unwrap()).clone();
         let work = program

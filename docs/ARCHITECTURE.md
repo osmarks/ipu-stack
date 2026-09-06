@@ -158,6 +158,16 @@ The beam planner applies the returned candidates and compares whole-region costs
 and memory. Operator-specific validation and diagnostic constraint policy remain
 with candidate generation.
 
+The catalogue distinguishes concrete plans from the explicit `ParallelGemm`
+family. Each active tile budget registers that family independently of its
+output-stationary plans. Parallel generation constructs layouts and dispatch
+from the GEMM semantics and chosen grid; it never clones an output-stationary
+template or tests its layout to decide whether to run. Both distributions use
+one AMP operand-contract constructor, including orientation-aware read tails,
+materialization and SRAM-element separation. To configure a concrete candidate,
+wrap a `ConcreteOperatorCandidate` in `OperatorCandidate::Concrete`; to enable
+the F16 parallel family, use `OperatorCandidate::parallel_gemm(tile_count)`.
+
 Candidate recipes use `StorageRequirements` for format and materialization choices.
 Mid calls construct `KernelRequirements` from the actual buffers and primitive
 kernel kind. These contain only operand formats, alignment/access tails and SRAM

@@ -677,7 +677,7 @@ fn main() -> Result<()> {
             // of allowing a different GEMM precision to confound the sweep.
             pipeline.operator_candidates.retain(|candidate| {
                 !matches!(
-                    candidate.plan.operator,
+                    candidate.operator(),
                     MidOperator::Gemm { multiply, .. } if multiply != Precision::F16
                 )
             });

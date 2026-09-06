@@ -322,16 +322,22 @@ pub(super) fn plans(
         && config.conversion_streaming != ConversionStreamingPolicy::Always
     {
         let mut flat_candidates = BTreeMap::new();
-        for candidate in config.operator_candidates.iter().filter(|candidate| {
-            operator_matches(&operation.kind, candidate.plan.operator)
-                && candidate.plan.requirements.inputs.len() == 1
-                && matches!(
-                    candidate.format_policy,
-                    OperatorFormatPolicy::PreserveInputLayout(0)
-                )
-                && matches!(candidate.plan.dispatch, OperatorDispatch::Pointwise { .. })
-                && candidate.plan.requirements.inputs[0].format.precision == input.format.precision
-        }) {
+        for candidate in config
+            .operator_candidates
+            .iter()
+            .filter_map(OperatorCandidate::concrete)
+            .filter(|candidate| {
+                operator_matches(&operation.kind, candidate.plan.operator)
+                    && candidate.plan.requirements.inputs.len() == 1
+                    && matches!(
+                        candidate.format_policy,
+                        OperatorFormatPolicy::PreserveInputLayout(0)
+                    )
+                    && matches!(candidate.plan.dispatch, OperatorDispatch::Pointwise { .. })
+                    && candidate.plan.requirements.inputs[0].format.precision
+                        == input.format.precision
+            })
+        {
             let grain = candidate.plan.requirements.inputs[0]
                 .alignment
                 .div_ceil(input.format.precision.bytes() as u32);
@@ -434,38 +440,44 @@ pub(super) fn plans(
     for candidate in config
         .operator_candidates
         .iter()
-        .filter(|candidate| operator_matches(&operation.kind, candidate.plan.operator))
+        .filter(|candidate| operator_matches(&operation.kind, candidate.operator()))
     {
-        let OperatorCandidate {
-            plan: mut candidate,
-            format_policy,
-        } = candidate.clone();
-        if let OperatorFormatPolicy::PreserveInputLayout(index) = format_policy {
-            let Some((actual, requirement)) = inputs
-                .get(usize::from(index))
-                .zip(candidate.requirements.inputs.get_mut(usize::from(index)))
-            else {
-                continue;
-            };
-            if actual.format.precision != requirement.format.precision
-                || candidate.requirements.output.format.precision != requirement.format.precision
-            {
-                continue;
+        let mut variants = match candidate {
+            OperatorCandidate::ParallelGemm { tile_count, .. } => parallel_reduction_candidates(
+                candidate.operator(),
+                *tile_count,
+                inputs,
+                output,
+                config,
+                costs,
+                distributed_result_is_useful,
+                gemm_constraint,
+                grouped_output,
+            ),
+            OperatorCandidate::Concrete(concrete) => {
+                let ConcreteOperatorCandidate {
+                    plan: mut candidate,
+                    format_policy,
+                } = concrete.clone();
+                if let OperatorFormatPolicy::PreserveInputLayout(index) = format_policy {
+                    let Some((actual, requirement)) = inputs
+                        .get(usize::from(index))
+                        .zip(candidate.requirements.inputs.get_mut(usize::from(index)))
+                    else {
+                        continue;
+                    };
+                    if actual.format.precision != requirement.format.precision
+                        || candidate.requirements.output.format.precision
+                            != requirement.format.precision
+                    {
+                        continue;
+                    }
+                    requirement.format.layout = actual.format.layout.clone();
+                    candidate.requirements.output.format.layout = actual.format.layout.clone();
+                }
+                vec![candidate]
             }
-            requirement.format.layout = actual.format.layout.clone();
-            candidate.requirements.output.format.layout = actual.format.layout.clone();
-        }
-        let mut variants = vec![candidate.clone()];
-        variants.extend(parallel_reduction_candidates(
-            &candidate,
-            inputs,
-            output,
-            config,
-            costs,
-            distributed_result_is_useful,
-            gemm_constraint,
-            grouped_output,
-        ));
+        };
         for (input_index, _) in parameter_inputs
             .iter()
             .enumerate()
@@ -639,7 +651,8 @@ pub(super) fn independent_parameter_storage(
 }
 
 pub(super) fn parallel_reduction_candidates(
-    candidate: &OperatorPlan,
+    operator: MidOperator,
+    tile_count: u16,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -652,7 +665,8 @@ pub(super) fn parallel_reduction_candidates(
         .into_iter()
         .flat_map(|orientation| {
             parallel_reduction_candidates_for_orientation(
-                candidate,
+                operator,
+                tile_count,
                 inputs,
                 output,
                 config,
@@ -667,7 +681,8 @@ pub(super) fn parallel_reduction_candidates(
 }
 
 pub(super) fn parallel_reduction_candidates_for_orientation(
-    candidate: &OperatorPlan,
+    operator: MidOperator,
+    tile_count: u16,
     inputs: &[TensorType],
     output: &TensorShape,
     config: &PipelineConfig,
@@ -677,24 +692,6 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<OperatorPlan> {
-    let OperatorDispatch::BlockedGemm {
-        output_column_block,
-        distribution: GemmDistribution::OutputStationary,
-        ..
-    } = candidate.dispatch
-    else {
-        return Vec::new();
-    };
-    if !matches!(
-        candidate.operator,
-        MidOperator::Gemm {
-            multiply: Precision::F16,
-            ..
-        }
-    ) || output_column_block != AMP_OUTPUT_COLUMN_BLOCK
-    {
-        return Vec::new();
-    }
     let [left, right] = inputs else {
         return Vec::new();
     };
@@ -713,17 +710,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         GemmOrientation::Normal => (normal_rows, normal_columns),
         GemmOrientation::Swapped => (normal_columns, normal_rows),
     };
-    // Generate the shape-specialized family once from the ordinary C64 seed.
-    // Each grid chooses the exact padded local K and C extents, so one tile
-    // call traverses all of its AMP micro-groups without fixed K64/C64
-    // boundaries.
-    let tile_count = candidate
-        .requirements
-        .output
-        .format
-        .layout
-        .tiling
-        .tile_count;
+    // Each grid determines its own padded K/C extents and operand layouts.
     let column_groups = columns.div_ceil(AMP_COLUMN_MICRO);
     let inner_groups = inner.div_ceil(AMP_COLUMN_MICRO);
     let Ok(inner_groups) = u16::try_from(inner_groups) else {
@@ -744,22 +731,6 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     let grouped_column_groups = grouped_column_groups
         .and_then(|groups| u16::try_from(groups).ok())
         .filter(|groups| *groups >= column_groups);
-    let output_seed_partitions = candidate
-        .requirements
-        .output
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == TensorAxis::FromEnd(1))
-        .map(|axis| axis.partitions);
-    if output_seed_partitions != Some(tile_count)
-        || candidate.requirements.inputs[1].format.layout.memory_class != MemoryClass::Ipu21Standard
-        || candidate.requirements.inputs[1].local_staging != LocalOperandStaging::Direct
-    {
-        return Vec::new();
-    }
     let outer_rows = left.shape.0[..left.shape.0.len() - 2]
         .iter()
         .copied()
@@ -821,27 +792,17 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     .saturating_mul(u64::from(local_rows))
                     .saturating_mul(u64::from(local_inner))
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(
-                        candidate.requirements.inputs[orientation.operand_indices().0]
-                            .format
-                            .precision
-                            .bytes(),
-                    );
+                    .saturating_mul(Precision::F16.bytes());
                 let right_bytes = u64::from(local_columns)
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                     .saturating_mul(u64::from(local_inner))
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(
-                        candidate.requirements.inputs[orientation.operand_indices().1]
-                            .format
-                            .precision
-                            .bytes(),
-                    );
+                    .saturating_mul(Precision::F16.bytes());
                 let partial_bytes = outer_rows
                     .saturating_mul(u64::from(local_rows))
                     .saturating_mul(u64::from(local_columns))
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(candidate.requirements.output.format.precision.bytes());
+                    .saturating_mul(Precision::F16.bytes());
                 // Operand staging and the local partial coexist during
                 // convolution. Complete staging is evaluated later by the
                 // ordinary operator-memory model.
@@ -943,59 +904,50 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             continue;
         };
         for memory_class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
-            let mut variant = candidate.clone();
-            match orientation {
-                GemmOrientation::Normal => {
-                    variant.requirements.inputs[0].format.layout = Layout::amp_left_parallel_grid(
+            let input_layouts = match orientation {
+                GemmOrientation::Normal => [
+                    Layout::amp_left_parallel_grid(
                         kernel_inner_block_u16,
                         used_tiles,
                         row_partitions,
                         column_partitions,
                         inner_partitions,
-                    );
-                    variant.requirements.inputs[1].format.layout =
-                        Layout::block_major_matrix_storage(
-                            kernel_inner_block_u16,
-                            kernel_output_columns,
-                            column_partitions,
-                            inner_partitions,
-                            1,
-                            memory_class,
-                        );
-                    balance_parallel_gemm_columns(
-                        &mut variant.requirements.inputs[1].format.layout,
-                        TensorAxis::FromEnd(1),
-                    );
-                }
-                GemmOrientation::Swapped => {
-                    let mut physical_left = variant.requirements.inputs[1].clone();
-                    physical_left.format.layout = Layout::amp_transposed_left_parallel_grid(
+                    ),
+                    Layout::block_major_matrix_storage(
                         kernel_inner_block_u16,
-                        used_tiles,
-                        row_partitions,
+                        kernel_output_columns,
                         column_partitions,
                         inner_partitions,
-                    );
-                    physical_left.materialization = OperandMaterialization::DispatchSlices;
-                    let mut physical_right = variant.requirements.inputs[0].clone();
-                    physical_right.format.layout = Layout::transposed_block_major_matrix_storage(
+                        1,
+                        memory_class,
+                    ),
+                ],
+                GemmOrientation::Swapped => [
+                    Layout::transposed_block_major_matrix_storage(
                         kernel_inner_block_u16,
                         kernel_output_columns,
                         column_partitions,
                         inner_partitions,
                         row_partitions,
                         memory_class,
-                    );
-                    balance_parallel_gemm_columns(
-                        &mut physical_right.format.layout,
-                        TensorAxis::FromEnd(2),
-                    );
-                    physical_right.materialization = OperandMaterialization::Complete;
-                    variant.requirements.inputs = vec![physical_right, physical_left];
-                    variant.requirements.distinct_elements =
-                        vec![vec![MemoryOperand::Output, MemoryOperand::Input(1)]];
-                }
-            }
+                    ),
+                    Layout::amp_transposed_left_parallel_grid(
+                        kernel_inner_block_u16,
+                        used_tiles,
+                        row_partitions,
+                        column_partitions,
+                        inner_partitions,
+                    ),
+                ],
+            };
+            let mut input_layouts = input_layouts;
+            balance_parallel_gemm_columns(
+                &mut input_layouts[orientation.operand_indices().1],
+                match orientation {
+                    GemmOrientation::Normal => TensorAxis::FromEnd(1),
+                    GemmOrientation::Swapped => TensorAxis::FromEnd(2),
+                },
+            );
             let physical_right_index = orientation.operand_indices().1;
             let local_staging_options: &[_] = match orientation {
                 GemmOrientation::Normal => &[LocalOperandStaging::Direct],
@@ -1055,7 +1007,6 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     {
                         continue;
                     }
-                    let mut result_variant = variant.clone();
                     let mut result_layout = match orientation {
                         GemmOrientation::Normal => Layout::amp_left_result_grid(
                             result_column_block,
@@ -1077,17 +1028,13 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                         GemmOrientation::Swapped => TensorAxis::FromEnd(2),
                     };
                     balance_parallel_gemm_columns(&mut result_layout, physical_column_axis);
-                    result_variant.requirements.output.format.layout = result_layout;
+
                     let (physical_row_axis, physical_rows, physical_left_index) = match orientation
                     {
                         GemmOrientation::Normal => (TensorAxis::FromEnd(2), normal_rows, 0),
                         GemmOrientation::Swapped => (TensorAxis::FromEnd(1), normal_columns, 1),
                     };
-                    let result_rows = result_variant
-                        .requirements
-                        .output
-                        .format
-                        .layout
+                    let result_rows = result_layout
                         .tiling
                         .axes
                         .iter()
@@ -1100,18 +1047,17 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                         continue;
                     }
                     pad_axis_to_f16_exchange_word(
-                        &mut result_variant.requirements.inputs[physical_left_index]
-                            .format
-                            .layout,
+                        &mut input_layouts[physical_left_index],
                         physical_row_axis,
                     );
-                    pad_axis_to_f16_exchange_word(
-                        &mut result_variant.requirements.output.format.layout,
-                        physical_row_axis,
-                    );
+                    pad_axis_to_f16_exchange_word(&mut result_layout, physical_row_axis);
                     if grouped
                         && !grouped_output.is_some_and(|grouping| {
-                            apply_grouped_output_layout(&mut result_variant, grouping)
+                            apply_grouped_output_layout(
+                                &mut input_layouts[1],
+                                &mut result_layout,
+                                grouping,
+                            )
                         })
                     {
                         continue;
@@ -1122,10 +1068,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     );
                     for &local_staging in local_staging_options {
                         for &reduction_staging in &staging_options {
-                            let mut staged = result_variant.clone();
-                            staged.requirements.inputs[physical_right_index].local_staging =
-                                local_staging;
-                            staged.dispatch = OperatorDispatch::BlockedGemm {
+                            let dispatch = OperatorDispatch::BlockedGemm {
                                 inner_block: kernel_inner_block,
                                 output_column_block: kernel_output_columns,
                                 orientation,
@@ -1138,6 +1081,18 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                                     reduction_staging,
                                 },
                             };
+                            let mut staged = gemm_plan(
+                                operator,
+                                [
+                                    input_layouts[0].clone(),
+                                    input_layouts[1].clone(),
+                                    result_layout.clone(),
+                                ],
+                                16,
+                                dispatch,
+                            );
+                            staged.requirements.inputs[physical_right_index].local_staging =
+                                local_staging;
                             variants.push(staged);
                         }
                     }
@@ -1428,13 +1383,11 @@ pub(super) fn balance_parallel_gemm_columns(layout: &mut Layout, axis: TensorAxi
 }
 
 pub(super) fn apply_grouped_output_layout(
-    candidate: &mut OperatorPlan,
+    input: &mut Layout,
+    output: &mut Layout,
     grouping: GroupedOutputLayout,
 ) -> bool {
-    if candidate.requirements.output.format.precision != Precision::F16
-        || grouping.groups == 0
-        || grouping.physical_lane_multiple == 0
-    {
+    if grouping.groups == 0 || grouping.physical_lane_multiple == 0 {
         return false;
     }
     let configure = |layout: &mut Layout| {
@@ -1459,8 +1412,7 @@ pub(super) fn apply_grouped_output_layout(
         axis.padding = Padding::Zero;
         true
     };
-    configure(&mut candidate.requirements.inputs[1].format.layout)
-        && configure(&mut candidate.requirements.output.format.layout)
+    configure(input) && configure(output)
 }
 
 pub(super) fn pad_axis_to_f16_exchange_word(layout: &mut Layout, axis: TensorAxis) {

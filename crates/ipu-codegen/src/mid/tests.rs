@@ -183,26 +183,14 @@ fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
         let k = u32::from(inner_partitions) * 64 + random.u32(0..64);
         let n = u32::from(column_partitions) * output_columns + random.u32(0..output_columns);
         let m = u32::from(row_partitions) + random.u32(0..=16);
-        let base = amp_grid_gemm_operator_candidate(
-            Precision::F16,
-            64,
-            16,
-            output_columns,
-            AmpGridShape {
-                tile_count: tiles,
-                row_partitions: 1,
-                column_partitions: tiles,
-                order: GridOrder::ColumnsFast,
-            },
-            AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
-        );
         let inputs = [
             TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
             TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
         ];
         let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
         let candidates = parallel_reduction_candidates(
-            &base.plan,
+            OperatorCandidate::parallel_gemm(tiles).operator(),
+            tiles,
             &inputs,
             &TensorShape(vec![m, n]),
             &config,
@@ -544,7 +532,7 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             },
         );
         let accumulate = gemm_accumulation_precision(multiply);
-        let candidate = OperatorCandidate::new(
+        let candidate = ConcreteOperatorCandidate::new(
             MidOperator::Gemm {
                 options: GemmOptions::default(),
                 multiply,
@@ -570,7 +558,10 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let mut config = PipelineConfig::new(tiles)
             .with_input(left, format(precision(&mut random), linear.clone()))
             .with_input(right, format(precision(&mut random), linear));
-        config.operator_candidates = vec![candidate.clone()];
+        config.operator_candidates = vec![candidate.clone()]
+            .into_iter()
+            .map(OperatorCandidate::Concrete)
+            .collect();
 
         let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap_or_else(|error| {
             panic!(
@@ -658,18 +649,18 @@ fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
         let product = graph.gemm(activated, weights).unwrap();
         graph.set_outputs([product]).unwrap();
 
-        let candidates = vec![
-            OperatorCandidate::new(
+        let candidates = [
+            ConcreteOperatorCandidate::new(
                 MidOperator::Gelu,
                 [OperandRequirement::new(row.clone(), 8)],
                 OperandRequirement::new(row.clone(), 8),
             ),
-            OperatorCandidate::new(
+            ConcreteOperatorCandidate::new(
                 MidOperator::Gelu,
                 [OperandRequirement::new(row.clone(), 8)],
                 OperandRequirement::new(left.clone(), 8),
             ),
-            OperatorCandidate::new(
+            ConcreteOperatorCandidate::new(
                 MidOperator::Gemm {
                     options: GemmOptions::default(),
                     multiply: Precision::F16,
@@ -687,7 +678,11 @@ fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
                 .with_input(activation, row.clone())
                 .with_input(weights, right.clone())
                 .with_planning_beam_width(beam_width);
-            config.operator_candidates = candidates.clone();
+            config.operator_candidates = candidates
+                .iter()
+                .cloned()
+                .map(OperatorCandidate::Concrete)
+                .collect();
             config
         };
         let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
@@ -934,13 +929,13 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .with_input(key, random_format(&mut random, tiles))
             .with_input(attention_value, random_format(&mut random, tiles));
         config.operator_candidates = vec![
-            OperatorCandidate::new(
+            ConcreteOperatorCandidate::new(
                 MidOperator::Gelu,
                 [OperandRequirement::new(gelu_input.clone(), 8)],
                 OperandRequirement::new(gelu_output.clone(), 8),
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
-            OperatorCandidate::new(
+            ConcreteOperatorCandidate::new(
                 MidOperator::Add,
                 [
                     OperandRequirement::new(add_left.clone(), 8),
@@ -949,7 +944,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
                 OperandRequirement::new(add_output.clone(), 8),
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
-            OperatorCandidate::new(
+            ConcreteOperatorCandidate::new(
                 MidOperator::FlashAttention {
                     options: AttentionOptions::default(),
                     accumulate: attention_accumulate,
@@ -961,7 +956,10 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
                 ],
                 OperandRequirement::new(attention_output.clone(), 8),
             ),
-        ];
+        ]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
 
         let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let operators = lowered
@@ -1329,7 +1327,10 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
     ];
     let candidates = default_operator_candidates(64)
         .into_iter()
-        .map(|candidate| candidate.plan)
+        .filter_map(|candidate| match candidate {
+            OperatorCandidate::Concrete(concrete) => Some(concrete.plan),
+            _ => None,
+        })
         .filter(|plan| matches!(plan.operator, MidOperator::Gemm { .. }))
         .collect::<Vec<_>>();
     assert!(
@@ -1617,4 +1618,77 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
     }
     // Do not pin complete-beam membership to the historical kernel timings:
     // changes to compute throughput can legitimately favor different grids.
+}
+
+#[test]
+fn parallel_gemm_family_does_not_depend_on_concrete_templates() {
+    let tiles = 16;
+    let mut graph = ComputeGraph::new();
+    let left = graph.host_input("left", [16, 128]).unwrap();
+    let right = graph.parameter("right", [128, 128]).unwrap();
+    let output = graph.gemm(left, right).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let inputs = [
+        TensorType::new([16, 128], Precision::F16, Layout::row_sharded(tiles)),
+        TensorType::new([128, 128], Precision::F16, Layout::row_sharded(tiles)),
+    ];
+    let mut config = PipelineConfig::new(tiles);
+    let generate = |config: &PipelineConfig| {
+        plans(
+            &graph.operations()[0],
+            &inputs,
+            &[false, true],
+            &TensorShape::new([16, 128]),
+            config,
+            &Ipu21CostModel,
+            true,
+            None,
+            &[],
+        )
+    };
+    config.operator_candidates = vec![OperatorCandidate::parallel_gemm(tiles)];
+    let parallel = generate(&config);
+    assert!(!parallel.is_empty());
+    assert!(parallel.iter().all(|plan| matches!(
+        plan.dispatch,
+        OperatorDispatch::BlockedGemm {
+            distribution: GemmDistribution::ParallelReduction { .. },
+            ..
+        }
+    )));
+    for orientation in [GemmOrientation::Normal, GemmOrientation::Swapped] {
+        let plan = parallel.iter().find(|plan| matches!(plan.dispatch,
+            OperatorDispatch::BlockedGemm { orientation: actual, .. } if actual == orientation
+        )).expect("both GEMM orientations remain available");
+        let (left, right) = orientation.operand_indices();
+        assert_eq!(plan.requirements.inputs[left].access_tail_bytes, 16);
+        assert_eq!(plan.requirements.inputs[right].access_tail_bytes, 0);
+        assert_eq!(
+            plan.requirements.distinct_elements,
+            vec![vec![
+                MemoryOperand::Output,
+                MemoryOperand::Input(left as u16)
+            ]]
+        );
+    }
+    // The former C64 trigger now offers only the explicitly configured plan.
+    config.operator_candidates = vec![amp_gemm_operator_candidate(
+        Precision::F16,
+        64,
+        16,
+        64,
+        tiles,
+    )]
+    .into_iter()
+    .map(OperatorCandidate::Concrete)
+    .collect();
+    let concrete = generate(&config);
+    assert!(!concrete.is_empty());
+    assert!(concrete.iter().all(|plan| matches!(
+        plan.dispatch,
+        OperatorDispatch::BlockedGemm {
+            distribution: GemmDistribution::OutputStationary,
+            ..
+        }
+    )));
 }
