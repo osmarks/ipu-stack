@@ -672,6 +672,14 @@ impl TileProgramSchedule {
                 .or(base.format_start_cycles)
                 .ok_or(ExchangeError::Schedule("receive source timing"))?;
             offset = offset.max(stream.source_end_cycles.saturating_sub(source_cycles));
+            // Paired format activates two events before its first SRAM write.
+            // It must not reinterpret the tail of an ordinary receive that is
+            // still travelling from XPIC to the local payload stream.
+            if stream.mode == ReceiveMode::Ordinary
+                && let Some(format_start) = base.format_start_cycles
+            {
+                offset = offset.max(stream.pointer_end_cycles.saturating_sub(format_start));
+            }
             if base.pointer_address != stream.next_address {
                 let pointer_cycles = base
                     .pointer_cycles
@@ -3560,6 +3568,25 @@ mod tests {
                     "receiver={receiver} count={count}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn paired_format_waits_for_the_previous_ordinary_payload_to_drain() {
+        let topology = Topology::c600();
+        for receiver in [2, 3, 46, 47] {
+            let mut schedule = TileProgramSchedule::default();
+            let ordinary = topology
+                .multicast(0, &[receiver], 972, 0)
+                .unwrap()
+                .receivers[0];
+            let previous = schedule.append_receiver_at(&ordinary, 0, 972).unwrap();
+            let pair = [receiver & !1, receiver | 1];
+            let row = topology.paired_multicast(4, &pair, 176).unwrap().receivers
+                [usize::from(receiver & 1)];
+            let offset = schedule.earliest_receiver_offset(&row, 176, 0).unwrap();
+            let timing = receive_row_timing(&row, offset).unwrap();
+            assert!(timing.format_start_cycles.unwrap() >= previous.payload_end);
         }
     }
 
