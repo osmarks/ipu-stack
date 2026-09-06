@@ -182,8 +182,8 @@ def run_case(args, name, up, down):
                   seconds=None if recovered else time.monotonic() - start, **extract(log))
     if result["hardware_pass"]:
         for report, options in [("barriers", ["profile-barriers"]),
-                                ("kernels", ["profile-query", "--group-by", "kernel", "--limit", "1000"]),
-                                ("operations", ["profile-query", "--group-by", "operation", "--limit", "1000"])]:
+                                ("kernels", ["profile-query", "--shared-clock", "--group-by", "kernel", "--limit", "1000"]),
+                                ("operations", ["profile-query", "--shared-clock", "--group-by", "operation", "--limit", "1000"])]:
             data = subprocess.check_output([args.cli, *options, str(folder / "execution.ipuprofile"), "--json"])
             (folder / f"{report}.json").write_bytes(data)
         barriers = json.loads((folder / "barriers.json").read_text())
@@ -209,12 +209,14 @@ def main():
     parser.add_argument("--cli", default="target/release/ipu-stack")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--jobs", type=int, default=1, help="Concurrent builds; hardware access is serialized")
+    parser.add_argument("--exclude", action="append", default=[], help="Skip a named initial case")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     cases, counts = manifest()
+    cases = [case for case in cases if case[0] not in args.exclude]
     inventory = dict(screened_grids=counts, cases=[dict(name=name, up=dataclasses.asdict(up),
                      down=dataclasses.asdict(down)) for name, up, down in cases])
     inventory["revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
