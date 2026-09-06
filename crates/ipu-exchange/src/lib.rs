@@ -845,14 +845,18 @@ struct ReceiveEvent {
 }
 
 fn receive_events_can_share_instruction(left: ReceiveEvent, right: ReceiveEvent) -> bool {
-    // SENDPICP cannot safely combine paired format transitions with XPIC.
-    // The SDK emits these as separate instructions; hardware faults even
-    // when the transition belongs to the preceding transfer.
-    left.kind != ReceiveEventKind::Format
-        && right.kind != ReceiveEventKind::Format
-        && left.cycles == right.cycles
-        && ((left.kind.is_pic() && right.kind.is_xpic())
-            || (left.kind.is_xpic() && right.kind.is_pic()))
+    // Only ordinary pointer/mux controls are supported in SENDPICP. Combining
+    // paired XPIC with an ordinary pointer also faults (not just format/XPIC),
+    // including when the controls belong to different overlapping transfers.
+    let ordinary_pair = |pic: ReceiveEventKind, xpic: ReceiveEventKind| {
+        pic == ReceiveEventKind::Pointer
+            && matches!(
+                xpic,
+                ReceiveEventKind::OrdinarySource | ReceiveEventKind::OrdinaryNeutral
+            )
+    };
+    left.cycles == right.cycles
+        && (ordinary_pair(left.kind, right.kind) || ordinary_pair(right.kind, left.kind))
 }
 
 fn validate_receive_events(events: &[ReceiveEvent]) -> Result<(), ExchangeError> {
@@ -3585,6 +3589,23 @@ mod tests {
             let timing = receive_row_timing(&row, offset).unwrap();
             assert!(timing.format_start_cycles.unwrap() >= previous.payload_end);
         }
+    }
+
+    #[test]
+    fn paired_source_setup_does_not_merge_with_an_ordinary_pointer() {
+        let topology = Topology::c600();
+        let mut schedule = TileProgramSchedule::default();
+        let ordinary = topology.multicast(0, &[2], 53, 0).unwrap().receivers[0];
+        schedule.append_receiver_at(&ordinary, 0, 53).unwrap();
+        let paired = topology
+            .paired_multicast(4, &[2, 3], 176)
+            .unwrap()
+            .receivers[0];
+        let offset = schedule.earliest_receiver_offset(&paired, 176, 0).unwrap();
+        let timing = receive_row_timing(&paired, offset).unwrap();
+        assert_eq!(timing.source_cycles, Some(56));
+        schedule.append_receiver_at(&paired, offset, 176).unwrap();
+        schedule.finish().unwrap();
     }
 
     #[test]
