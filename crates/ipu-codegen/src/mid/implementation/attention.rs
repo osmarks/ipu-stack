@@ -93,11 +93,13 @@ impl Builder {
             let mut value_block_type = packed_value.clone();
             key_block_type.shape.0[1] = valid;
             value_block_type.shape.0[1] = valid;
-            // Only the GEMM coefficient blocks need interleaved SRAM for
-            // double-width loads. Keep the distributed packing buffers small
-            // in the standard-memory arena.
-            key_block_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
-            value_block_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+            // Small streaming coefficient blocks benefit from double-width
+            // loads. Interleaving a full K/V matrix partitions too much SRAM
+            // away from the large standard-memory projection weights.
+            if !materialized {
+                key_block_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+                value_block_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+            }
             let k = self.copy(key_panels, key_block_type, vec![0, start, 0]);
             // Flash broadcasts K/V together. Full materialization keeps their
             // large resident matrices in disjoint lifetimes.
