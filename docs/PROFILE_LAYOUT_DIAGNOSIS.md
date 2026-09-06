@@ -835,3 +835,75 @@ exchange event time falls from 130174 to 86826. These figures come from
 `/tmp/multicast-attention.ipuprofile`; they are exchange-phase totals, not total
 model latency. A final historical-MLP rerun retains 204258 max tile cycles after
 the mixed-format fix (its redistribution horizon changes by one event to 42618).
+
+## Persistent paired format and first-phase topology experiment (2026-09-06)
+
+Paired XPIC source ownership now lasts only for the item stream, rather than
+extending through the downstream format teardown. Contiguous transfers with the
+same incoming format keep it active: the composer drops the previous disable and
+next enable, and switches sources directly. Pointer writes still use their own
+payload-arrival timing. Gaps, format changes and ordinary/paired transitions keep
+explicit controls. The four-message regression reproduces the SDK's exact source
+and pointer events with only one format enable and disable.
+
+The automatic MLP's first exchange has 807 transfers, all with two destinations.
+Those destinations form 486 disjoint pairs, and all 807 transfers have matching,
+8-byte-aligned destination addresses. Pairing logical tiles `486+i` and `972+i`
+for `i=0..485` therefore makes every first-phase transfer eligible for paired mode.
+A consistent physical permutation for this experiment keeps tiles 0..485 and
+1458..1471 fixed, maps `486+i` to C600 logical slot `486+2*i`, and maps `972+i`
+to slot `487+2*i`. Source/destination addresses and payloads are unchanged.
+
+The transformed first phase passes hardware replay with 16384 sampled words. It
+is **not faster**: its scheduled length grows from 6265 to 6423 events. Paired TX
+borrows the neighboring transmit lane. After assigning 972 receiver tiles to
+complete pairs, almost all 486 busy sources must share pairs with other busy
+sources. Half-width-duration sends serialize on those pairs, preserving the same
+6144-event endpoint bandwidth lower bound. The existing first phase is already
+close to that bound; receiver pairing alone cannot supply more transmit bandwidth.
+
+Scoring the same physical permutation across all four phases also exposes the
+other cost: only 777 of the 2331 previously paired redistribution transfers remain
+pairable. No production topology policy was changed based on this experiment.
+A general topology optimizer belongs at the backend's logical-to-physical mapping
+boundary and must score shared transmit-lane pressure and every exchange phase,
+not merely reward pairs of receivers. No GEMM kernel/layout rewrite is needed to
+express this mapping, but this particular mapping is not an improvement.
+
+| Automatic MLP exchange phase | Existing mapping | Receiver-pair permutation |
+|---|---:|---:|
+| Input multicast | 6265 | 6423 |
+| First reduction | 2861 | 2832 |
+| Redistribution | 29575 | 30922 |
+| Final reduction | 15700 | 16188 |
+| Sum of scheduled horizons | 54401 | 56365 |
+
+These are exact row-scheduler horizons at the captured addresses, not an end-to-end
+MLP timing for the alternate topology. Only the transformed first phase was run
+on hardware. This experiment relabelled source/destination tile IDs in the exported
+snapshot to equivalent C600 slots and reselected complete-pair widths; it did not
+change tensor coordinates or introduce a GEMM-specific layout.
+
+Persistent paired-format hardware results, using the existing topology:
+
+| Measurement | Before | Persistent paired format |
+|---|---:|---:|
+| Automatic MLP max tile cycles | 209298 | 207930 |
+| Historical MLP max tile cycles | 204258 | 202764 |
+| Automatic redistribution horizon | 30944 | 29575 |
+| Historical redistribution horizon | 42618 | 41194 |
+
+Both full MLPs pass with unchanged maximum absolute error 0.011719. All 169
+workspace release tests, Clippy with the existing allowances, and all 20 hardware
+boundary cases pass. The full automatic MLP also exposed the unsafe paired-XPIC /
+ordinary-pointer SENDPICP combination described in the instruction reference; the
+composer separates those controls, and a focused regression protects that boundary.
+
+Updated profiles are `artifacts/profiles/mlp-paired-streams.html` and
+`artifacts/profiles/mlp-historical-paired-streams.html`. Evidence includes
+`/tmp/retain-paired-final-full-results.log`, `/tmp/retain-paired-{automatic,historical}.log`,
+`/tmp/paired-streams-final-{tests,clippy,boundaries}.log`,
+`/tmp/paired-topology-schedules.log`, `/tmp/paired-topology-first-replay.log`, and
+`/tmp/paired-topology-final-redistribution.log`. The topology experiment snapshots
+are `/tmp/retain-paired-auto.json` (baseline) and `/tmp/paired-topology-auto.json`;
+its logical-slot permutation is `/tmp/paired-topology-permutation.json`.

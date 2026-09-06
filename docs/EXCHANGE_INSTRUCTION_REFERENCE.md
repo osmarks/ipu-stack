@@ -279,10 +279,12 @@ For logical tile 2 / physical tile 64, the compute-exchange sequence is:
 These are decoded instruction timings of SDK programs that passed hardware
 checks, not timestamp measurements of the fabric. They prove tightly consecutive
 multicast streams are executable. In particular, the SDK retains paired format
-across all four messages. Our primitive composition still tears it down per
-message, so compatible paired streams have further room for improvement. Removing
-that overhead requires tracking persistent format ownership separately from XPIC
-source ownership; relaxing the outer scheduler alone does not accomplish it.
+across all four messages. The composer now retains that format across contiguous compatible transfers,
+tracking the format interval separately from XPIC source ownership. It removes the
+old format teardown, redundant activation, and paired neutral/source bounce at
+the shared boundary. A format change or a gap retains the explicit transition.
+The ordinary-to-paired drain constraint remains in force. The exact source and
+pointer events above are covered by a regression test.
 
 `python3 scripts/exchange-boundaries.py --sdk SDK_DIRECTORY --output /tmp/boundaries`
 replays ordinary count boundaries, paired sequences, distant and repeated sources,
@@ -290,3 +292,11 @@ and mixed ordinary/paired transitions through the production scheduler. Each cas
 its snapshot, package and hardware log. Run it from the repository root, with no
 other process using the device. The receive destinations use distinct addresses,
 so pointer-boundary errors cannot be hidden by contiguous output allocation.
+
+Tighter paired source windows also exposed a cross-transfer SENDPICP encoding
+hazard: a paired XPIC source selection combined with an ordinary PIC pointer write
+faulted with an address error in the automatic MLP. The phase composer now only
+combines ordinary XPIC controls with pointer writes. Paired source/neutral and
+format controls remain separate incoming-control instructions (they can still
+share an outgoing send through single-control SENDPIC). This restriction does not
+restore the route-latency gap or the redundant paired-format transitions.
