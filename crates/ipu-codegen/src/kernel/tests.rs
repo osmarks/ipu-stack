@@ -446,6 +446,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
         TileKernelSpec::FillZero {
             offset: 16,
             bytes: 56,
+            padding_only: false,
         },
         Vec::new(),
         ShardView {
@@ -483,7 +484,11 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
     for (offset, bytes) in [(48, 56), (1, 8), (0, 7), (u32::MAX - 7, 16)] {
         let run = KernelRun::new(
             run.provenance,
-            TileKernelSpec::FillZero { offset, bytes },
+            TileKernelSpec::FillZero {
+                offset,
+                bytes,
+                padding_only: false,
+            },
             run.inputs.clone(),
             run.output.clone(),
             run.requirements.clone(),

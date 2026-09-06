@@ -31,6 +31,8 @@ pub enum TileKernelSpec {
     FillZero {
         offset: u32,
         bytes: u32,
+        /// Copy mappings cover every logical element; only padding needs initialization.
+        padding_only: bool,
     },
     Gemm {
         multiply: Precision,

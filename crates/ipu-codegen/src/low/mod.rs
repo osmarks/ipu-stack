@@ -4,6 +4,7 @@ mod call;
 mod copy;
 pub(crate) mod expand;
 mod graph;
+mod initialization;
 mod passes;
 pub(crate) use call::*;
 pub use copy::*;
@@ -87,7 +88,8 @@ impl LowProgram {
     }
 }
 
-/// Projection only: no GEMM, attention, conversion, or layout decisions.
+/// Project tile work and remove redundant finite-only initialization.
+/// Numerical inputs/results must be finite; loading must first initialize SRAM.
 pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) -> LowProgram {
     fn project(
         region: &BlockRegion,
@@ -152,9 +154,11 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
         &mut repeat_runs,
         diagnostic_checkpoints,
     );
-    LowProgram {
+    let mut low = LowProgram {
         program: Arc::clone(program),
         tiles,
         repeat_runs,
-    }
+    };
+    initialization::reuse_finite_padding(&mut low);
+    low
 }

@@ -327,6 +327,7 @@ impl TileGraphBuilder {
             tiles,
             shard,
             crate::ByteSpan { offset: 0, bytes },
+            false,
             provenance,
         )
     }
@@ -340,6 +341,17 @@ impl TileGraphBuilder {
         ranges: &[crate::ByteSpan],
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
+        let block = &self.shards[shard.index() as usize];
+        let padding = crate::low::copy::uncovered_copy_bytes(
+            block.storage(),
+            &[crate::CopyMapping {
+                source: block.storage(),
+                source_extents: &block.extents,
+                destination_extents: &block.extents,
+            }],
+            CopyOrder::Semantic,
+        )?;
+        let padding_only = !padding.is_empty() && ranges == padding;
         let mut ranges = ranges.iter().copied().peekable();
         let launch_bytes = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles * 48;
         while let Some(mut range) = ranges.next() {
@@ -349,7 +361,7 @@ impl TileGraphBuilder {
                 range.bytes = next.offset + next.bytes - range.offset;
                 ranges.next();
             }
-            self.append_zero_range(tiles, shard, range, provenance)?;
+            self.append_zero_range(tiles, shard, range, padding_only, provenance)?;
         }
         Ok(())
     }
@@ -359,6 +371,7 @@ impl TileGraphBuilder {
         tiles: &mut BlockRegion,
         shard: BlockValueId,
         range: crate::ByteSpan,
+        padding_only: bool,
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
         let tile = self.shards[shard.index() as usize].tile;
@@ -370,6 +383,7 @@ impl TileGraphBuilder {
                 TileKernelSpec::FillZero {
                     offset: range.offset,
                     bytes: range.bytes,
+                    padding_only,
                 },
                 Vec::new(),
                 self.full_view(shard),

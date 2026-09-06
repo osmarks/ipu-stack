@@ -34,6 +34,12 @@ ipu_stack_static_start:
 	setzi $m0, TILE_MUX_EXCHANGE
 	put 0xa0, $m0
 	put 0xa7, $m15
+	// Numerical kernels require finite results. Treat overflow as a fault;
+	// worker FP_CTL inherits FP_ICTL on activation.
+	get $m0, $FP_ICTL
+	setzi $m1, 1 << CSR_S_FP_ICTL__OFLO__SHIFT
+	or $m0, $m0, $m1
+	put $FP_ICTL, $m0
 	setzi $m11, ipu_stack_static_worker_stack_base
 	put 0x21, $m11
 	add $m11, $m11, WORKER_BASE_STRIDE

@@ -81,7 +81,7 @@ pub fn materialize_kernel_run(
         add_address_offset(base, span.offset)
     };
     let mut output_address = resolve(&run.output)?;
-    if let TileKernelSpec::FillZero { offset, bytes } = run.kernel {
+    if let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel {
         let output_spans =
             view_byte_spans(&shards[run.output.shard.index() as usize], &run.output)?;
         let allocation_bytes = output_spans[0].bytes;
