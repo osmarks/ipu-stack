@@ -7,6 +7,7 @@ check. Logs, profiles, predictions, failures and device timings are retained.
 """
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -109,7 +110,6 @@ def extract(log):
         "compact_exchange": r"retained operator-plan finalist.*?estimated_exchange_cycles=(\d+)",
         "expanded_cycles": r"selected analytical operator plan estimated_cycles=(\d+)",
         "expanded_exchange": r"selected analytical operator plan.*?estimated_exchange_cycles=(\d+)",
-        "cycles": r"effectiveGemmTflops",  # Parsed below from the benchmark line.
     }
     for key, pattern in patterns.items():
         match = re.search(pattern, log)
@@ -188,6 +188,8 @@ def main():
     cases, counts = manifest()
     inventory = dict(screened_grids=counts, cases=[dict(name=name, up=dataclasses.asdict(up),
                      down=dataclasses.asdict(down)) for name, up, down in cases])
+    inventory["revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    inventory["binary_sha256"] = hashlib.file_digest(Path(args.binary).open("rb"), "sha256").hexdigest()
     (args.output / "manifest.json").write_text(json.dumps(inventory, indent=2) + "\n")
     print(f"{len(cases)} initial cases; screened grids: {counts}", flush=True)
     if args.dry_run:
