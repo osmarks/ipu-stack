@@ -1,8 +1,6 @@
 # Architecture
 
-See [Compiler data flow and deletion targets](COMPILER_DATA_FLOW.md) for current
-and proposed data-flow diagrams, duplicated cost derivations, and the next
-substantial opportunities to reduce implementation size.
+See [Compiler data flow](COMPILER_DATA_FLOW.md) for the selection, costing and execution boundaries.
 
 The package path has four explicit components:
 
@@ -19,9 +17,9 @@ region with carried values, invariants, and per-iteration value sequences.
 Shapes are semantic and support arbitrary rank; GEMM operates on the final two
 axes and broadcasts leading batch axes.
 
-Operations retain semantics which affect planning: GEMM transpose flags, NumPy
-Add broadcasting, and attention causality and scaling. GeLU currently denotes
-the exact function. Attention intentionally has no general mask input; the
+Operations retain semantics which affect planning: GEMM transpose flags and
+attention causality and scaling. Add always uses NumPy broadcasting; GeLU uses
+the tanh approximation. Attention intentionally has no general mask input; the
 supported form is either causal or unmasked.
 
 ## Whole-device mid and tile expansion
@@ -76,7 +74,8 @@ storage including explicit aliases and temporary requirements. It does not build
 a tile graph, enumerate kernel calls, schedule exchange or invoke allocation
 analysis. `estimate/primitive` shares kernel prices with the final expanded
 timeline evaluator. `estimate/cycles` caches compact operator implementations;
-`estimate/memory` composes candidate regions for costing. Candidate shortlisting
+`estimate/mid` composes and prices candidate regions; `estimate/memory` defines
+allocation sizes, feasibility and the shared Pareto objectives. Candidate shortlisting
 and preliminary beam ranking use these compact execution prices, not boundary
 memory as a proxy for cycles. Shortlisting preserves reduction fan-in and result
 partition diversity. The implementation cache retains strong references for one
@@ -159,3 +158,21 @@ separation constraints; they do not retain candidate aliasing, staging or
 materialization policy. GEMM calls, including those inside attention, require
 their actual left operand's read tail and output/left SRAM separation. Reductions
 and attention stages no longer inherit unrelated enclosing-operator constraints.
+
+## Package selection and diagnostics
+
+`package/selection` expands a bounded shortlist in parallel, models tile mappings,
+and exactly schedules the best candidates. It retains the projected baseline and
+its provisional placement instead of rebuilding them. Infeasible alternatives
+are rejected individually; an entirely infeasible shortlist returns its error.
+Both finalist ranking and final-package reporting use `scheduled_program_cycles`
+to compose actual exchange horizons with the optimized compute/copy timeline.
+
+`package/placement` screens physical tile mappings and SRAM offsets;
+`package/profile` owns instrumentation and profile metadata. `package/tile_program`
+packages explicit address-resolved programs for hardware diagnostics. The parent
+module coordinates linking, memory reservation and final image construction.
+
+`exchange/order` proposes alternative dependency-respecting orders;
+`exchange/diagnostic` reports row hazards, endpoint pressure and critical chains.
+The physical scheduler and its timing/validation rules remain in `exchange`.

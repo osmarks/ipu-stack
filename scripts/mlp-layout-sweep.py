@@ -119,7 +119,14 @@ def manifest():
 
 def prepare_cohort(args, cases, **metadata):
     """Freeze the compiler and device sources; reject mixed experiment resumes."""
-    source = Path(__file__).resolve().parent.parent / "device"
+    manifest_path = args.output / "manifest.json"
+    previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else None
+    if previous is not None and "kernel_build_id" not in previous:
+        raise RuntimeError("Unversioned experiment cohort; use a fresh output directory")
+    if previous is None and any(args.output.glob("*/result.json")):
+        raise RuntimeError("Existing results have no cohort manifest; use a fresh output directory")
+    source = (args.output / "device" if previous is not None else
+              Path(__file__).resolve().parent.parent / "device")
     build_id = subprocess.check_output([args.cli, "kernel-build-id", str(source)], text=True).strip()
     inventory = dict(metadata, revision=subprocess.check_output(
         ["git", "rev-parse", "HEAD"], text=True).strip(), kernel_build_id=build_id,
@@ -127,9 +134,7 @@ def prepare_cohort(args, cases, **metadata):
         cases=[dict(name=n, up=dataclasses.asdict(u), down=dataclasses.asdict(d),
                     mapping=getattr(args, "tile_mappings", {}).get(n)) for n, u, d in cases])
     inventory = json.loads(json.dumps(inventory))
-    manifest_path = args.output / "manifest.json"
-    if manifest_path.exists():
-        previous = json.loads(manifest_path.read_text())
+    if previous is not None:
         if any(previous.get(key) != inventory[key]
                for key in ["binary_sha256", "kernel_build_id", "cases"]):
             raise RuntimeError("Changed or unversioned experiment cohort; use a fresh output directory")
@@ -137,7 +142,10 @@ def prepare_cohort(args, cases, **metadata):
         shutil.copytree(source, args.output / "device", dirs_exist_ok=True)
         shutil.copy2(args.binary, args.output / "cohort-binary")
         manifest_path.write_text(json.dumps(inventory, indent=2) + "\n")
-    args.binary = str(args.output / "cohort-binary")
+    binary = args.output / "cohort-binary"
+    if hashlib.file_digest(binary.open("rb"), "sha256").hexdigest() != inventory["binary_sha256"]:
+        raise RuntimeError("Frozen cohort binary differs from its manifest")
+    args.binary = str(binary)
     args.runtime_source = str(args.output / "device" / "static_runtime.S")
 
 

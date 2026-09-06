@@ -1,7 +1,7 @@
 # Compiler data flow
 
-Updated 2026-09-05 for the whole-device mid boundary. These curated diagrams
-supersede the older generated `ipu-stack-package-callgraph*` artifacts.
+Updated 2026-09-06 for the whole-device mid boundary and staged physical selection.
+These curated diagrams supersede the older generated `ipu-stack-package-callgraph*` artifacts.
 
 ## Selection and execution
 
@@ -18,10 +18,13 @@ flowchart TD
   FINAL --> EXPAND[low expand: enumerate tile calls and transfers]
   EXPAND --> TG[TileGraph: storage, views, calls, copies and exchanges]
   TG --> LOW[LowProgram: per-tile work lists]
-  LOW --> PLACE[Physical allocation]
-  PLACE --> EX[Physical exchange scheduling]
-  EX --> REFINE[Optional finalist reranking from actual timelines]
-  REFINE --> IMAGE[Linked tile images and package]
+  LOW --> PLACE[Provisional physical allocation]
+  PLACE --> MODEL[Model mappings and shortlist complete layouts]
+  MODEL --> EX[Exact scheduling and finalist selection]
+  EX --> SUPPORT[Link and reserve package support storage]
+  SUPPORT --> FINALPLACE[Final allocation and bounded SRAM refinement]
+  FINALPLACE --> REPLAY[Replay or rebuild schedules with final addresses]
+  REPLAY --> IMAGE[Tile images and final timeline cost]
 ```
 
 Mid selection chooses distributed work. Low expansion realizes that work; it does
@@ -102,3 +105,9 @@ lifetimes. This ordering is explicit in mid; low has no attention strategy build
 request.** Discuss its overlap with planning before implementing it. Resolving
 already selected deferred views is part of the current boundary rewrite; it is
 not an arbitrary producer/consumer layout optimization pass.
+
+Candidate attention dispatches retain geometry and the materialization choice once.
+The mid implementation derives QK/PV kernel specifications from that geometry.
+Pointwise operand selection follows tensor shapes and ownership; it has no separate
+mapping-policy field. Region cost analysis returns cycles and memory directly,
+while only reusable operator implementations retain `Arc<MidProgram>` values.

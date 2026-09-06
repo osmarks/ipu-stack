@@ -255,3 +255,22 @@ increased. Remaining compact/exchange and other primitive-cost errors need
 attention before claiming a planner-performance improvement. Validation logs
 and profiles are in `instruction-cost/` and `instruction-cost-historical/`
 under the sweep artifact directory, separate from the frozen sweep cohort.
+
+## Cleanup follow-up (2026-09-06)
+
+New sweep cohorts freeze both the compiler binary and device sources, including
+`static_runtime.S`, and record the device-source digest. Resumes use that source
+snapshot and verify the cohort before accepting existing results. Both sweep
+drivers share this implementation and the common hardware lock. Case filtering
+happens after manifest validation, so `--only`/`--exclude` do not rewrite provenance.
+Old cohorts without source provenance require a fresh directory for further runs.
+
+The analyzer takes its build ID from the cohort or an existing calibration database;
+legacy data can supply `--build-id` explicitly. It never labels historical profiles
+with the current checkout's source hash. Duplicate pre-upgrade GELU/reduction formulas
+have been removed; calibrated instruction prices live in `kernel/cost.rs`.
+
+New logs report the final placed program's cost through the same timeline composer
+used by finalist selection, including sync overhead and repeat multiplicity. The
+sweep reads the selected finalist's estimates, rather than assuming finalist zero
+won. Existing legacy result files and reports are retained unchanged.
