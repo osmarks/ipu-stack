@@ -701,30 +701,20 @@
 	ATTENTION_MERGE_ENTRY ATTENTION_MERGE_SYMBOL
 
 	.macro ATTENTION_MERGE_INITIAL_PAIR
-	ld32 $a0, $m1, $m15, 0
+	ld32step $a0, $mzero, $m1+=, 1
 	f16v2tof32 $a0:1, $a0
-	st64 $a0:1, $m0, $m15, 0
-	add $m1, $m1, 4
-	add $m0, $m0, 8
+	f32v2mul $a0:1, $a6:B, $a0:1
+	st64step $a0:1, $mzero, $m0+=, 1
 	.endm
 
 	.macro ATTENTION_MERGE_UPDATE_PAIR
-	ld32 $a0, $m1, $m15, 0
+	ld32step $a0, $mzero, $m1+=, 1
 	f16v2tof32 $a0:1, $a0
-	ld64 $a2:3, $m0, $m15, 0
+	{ ld64 $a2:3, $m0, $m15, 0
+	  f32v2mul $a0:1, $a6:B, $a0:1 }
 	f32v2mul $a2:3, $a5:B, $a2:3
-	f32v2mul $a0:1, $a6:B, $a0:1
 	f32v2add $a2:3, $a2:3, $a0:1
-	st64 $a2:3, $m0, $m15, 0
-	add $m1, $m1, 4
-	add $m0, $m0, 8
-	.endm
-
-	.macro ATTENTION_MERGE_NORMALIZE_PAIR
-	ld64 $a0:1, $m0, $m15, 0
-	f32v2mul $a0:1, $a7:B, $a0:1
-	st64 $a0:1, $m0, $m15, 0
-	add $m0, $m0, 8
+	st64step $a2:3, $mzero, $m0+=, 1
 	.endm
 
 	.worker
@@ -762,6 +752,10 @@
 	brz $m6, .Lattention_merge_update_state
 	st32 $a0, $m8, $m15, 0
 	st32 $a1, $m8, $m15, 1
+	ldconst $a6, 0x3f800000
+	brz $m7, .Lattention_merge_initial_ready
+	f32oox $a6, $a1
+.Lattention_merge_initial_ready:
 	.if ATTENTION_VALUE_FULL_PANELS
 	setzi $m2, ATTENTION_VALUE_FULL_PANELS
 .Lattention_merge_initial_panels:
@@ -775,7 +769,7 @@
 	.rept ATTENTION_VALUE_TAIL_PAIRS
 	ATTENTION_MERGE_INITIAL_PAIR
 	.endr
-	bri .Lattention_merge_maybe_normalize
+	bri .Lattention_merge_next_row
 
 .Lattention_merge_update_state:
 	ld32 $a2, $m8, $m15, 0
@@ -790,6 +784,13 @@
 	f32add $a3, $a3, $a1
 	st32 $a4, $m8, $m15, 0
 	st32 $a3, $m8, $m15, 1
+	// Normalize the final update through its coefficients, avoiding a second
+	// pass over the output. Persistent sums and coefficients remain FP32.
+	brz $m7, .Lattention_merge_update_ready
+	f32oox $a7, $a3
+	f32mul $a5, $a5, $a7
+	f32mul $a6, $a6, $a7
+.Lattention_merge_update_ready:
 	.if ATTENTION_VALUE_FULL_PANELS
 	setzi $m2, ATTENTION_VALUE_FULL_PANELS
 .Lattention_merge_update_panels:
@@ -804,26 +805,6 @@
 	ATTENTION_MERGE_UPDATE_PAIR
 	.endr
 
-.Lattention_merge_maybe_normalize:
-	brz $m7, .Lattention_merge_next_row
-	ld32 $a7, $m8, $m15, 1
-	f32oox $a7, $a7
-	ld32 $m0, $mvertex_base, $m15, 0
-	setzi $m2, ATTENTION_PADDED_VALUE_DIMENSION * 4
-	mul $m2, $m9, $m2
-	add $m0, $m0, $m2
-	setzi $m2, ATTENTION_VALUE_FULL_PANELS
-	.if ATTENTION_VALUE_FULL_PANELS
-.Lattention_merge_normalize_panels:
-	.rept 8
-	ATTENTION_MERGE_NORMALIZE_PAIR
-	.endr
-	sub $m2, $m2, 1
-	brnz $m2, .Lattention_merge_normalize_panels
-	.endif
-	.rept ATTENTION_VALUE_TAIL_PAIRS
-	ATTENTION_MERGE_NORMALIZE_PAIR
-	.endr
 .Lattention_merge_next_row:
 	add $m9, $m9, 6
 	cmpult $m0, $m9, $m5

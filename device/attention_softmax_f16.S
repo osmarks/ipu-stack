@@ -40,10 +40,12 @@ ATTENTION_SOFTMAX_SYMBOL:
 	ldconst $a6, 0xfbfffbff
 	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16 - 1
 .Lsoftmax_max_panel:
-	.rept 8
 	ld32step $a0, $mzero, $m3+=, 1
-	f16v2max $a6, $a6, $a0
+	.rept 7
+	{ ld32step $a0, $mzero, $m3+=, 1
+	  f16v2max $a6, $a6, $a0 }
 	.endr
+	f16v2max $a6, $a6, $a0
 	add $m3, $m3, $m8
 	brnzdec $m7, .Lsoftmax_max_panel
 	f16v2tof32 $a6:7, $a6
@@ -63,18 +65,24 @@ ATTENTION_SOFTMAX_SYMBOL:
 	setzi $a7, 0
 	mov $m3, $m9
 	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16 - 1
-.Lsoftmax_exp_panel:
-	.rept 8
-	ld32step $a0, $mzero, $m3+=, 1
+	.macro SOFTMAX_EXP_PAIR
 	f16v2tof32 $a0:1, $a0
 	f32v2mul $a0:1, $a4:B, $a0:1
 	f32v2add $a0:1, $a5:B, $a0:1
 	f32v2tof16 $a0, $a0:1
 	f16v2exp $a0, $a0
-	f16v2tof32 $a2:3, $a0
 	{ st32step $a0, $mzero, $m2+=, 1
+	  f16v2tof32 $a2:3, $a0 }
+	.endm
+.Lsoftmax_exp_panel:
+	ld32step $a0, $mzero, $m3+=, 1
+	.rept 7
+	SOFTMAX_EXP_PAIR
+	{ ld32step $a0, $mzero, $m3+=, 1
 	  f32v2add $a6:7, $a6:7, $a2:3 }
 	.endr
+	SOFTMAX_EXP_PAIR
+	f32v2add $a6:7, $a6:7, $a2:3
 	add $m3, $m3, $m8
 	add $m2, $m2, $m8
 	brnzdec $m7, .Lsoftmax_exp_panel
