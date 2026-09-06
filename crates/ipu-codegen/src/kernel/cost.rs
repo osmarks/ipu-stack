@@ -17,6 +17,47 @@ pub(crate) fn interleaved_f16_gemm_cycles(rows: u64, inner: u64, columns: u64) -
     )
 }
 
+/// Full-block softmax: each worker owns every sixth query row. Per 16-key
+/// panel, the packed maximum and fused exponent/store/sum take 71 issue groups.
+pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64) -> u64 {
+    if rows == 0 {
+        return 0;
+    }
+    216u64.saturating_add(
+        rows.div_ceil(6)
+            .saturating_mul(6)
+            .saturating_mul(31u64.saturating_add(keys.div_ceil(16).saturating_mul(71))),
+    )
+}
+
+/// Merge preserves FP32 state. Pair loops issue four groups for initialization
+/// and six for updates; final normalization is folded into the row coefficients.
+pub(crate) fn f16_attention_merge_cycles(
+    rows: u64,
+    values: u64,
+    initial: bool,
+    final_block: bool,
+) -> u64 {
+    if rows == 0 {
+        return 0;
+    }
+    let panels = values / 16;
+    let row = (if initial { 27u64 } else { 34u64 })
+        .saturating_add(u64::from(panels != 0))
+        .saturating_add(panels.saturating_mul(3))
+        .saturating_add(
+            values
+                .div_ceil(2)
+                .saturating_mul(if initial { 4 } else { 6 }),
+        )
+        .saturating_add(if final_block {
+            if initial { 3 } else { 5 }
+        } else {
+            0
+        });
+    222u64.saturating_add(rows.div_ceil(6).saturating_mul(6).saturating_mul(row))
+}
+
 /// reduce_add_f16.S: six workers, eight elements per iteration, eleven issue
 /// groups (including repeat alignment) plus two per remote partial. Setup includes supervisor rendezvous.
 /// A one-partial sum is an identity and requires no reduction invocation.
@@ -63,6 +104,22 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attention_row_models_match_hardware() {
+        for rows in [7, 8] {
+            assert_eq!(f16_softmax_cycles(rows, 64), 3996);
+            assert_eq!(f16_attention_merge_cycles(rows, 72, true, false), 2430);
+            assert_eq!(f16_attention_merge_cycles(rows, 72, false, false), 3378);
+            assert_eq!(f16_attention_merge_cycles(rows, 72, false, true), 3438);
+        }
+        assert_eq!(f16_softmax_cycles(0, 64), 0);
+        assert_eq!(f16_softmax_cycles(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(
+            f16_attention_merge_cycles(u64::MAX, u64::MAX, false, true),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn reduction_matches_unmerged_hardware_samples() {

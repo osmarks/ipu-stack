@@ -15,6 +15,9 @@ pub(crate) fn kernel_cycles(
         .0
         .iter()
         .fold(1u64, |n, &width| n.saturating_mul(u64::from(width)));
+    let rows = output.shape.0[..output.shape.0.len().saturating_sub(1)]
+        .iter()
+        .fold(1u64, |n, &width| n.saturating_mul(u64::from(width)));
     let work = match kernel {
         TileKernelSpec::Gemm {
             multiply,
@@ -77,6 +80,13 @@ pub(crate) fn kernel_cycles(
         TileKernelSpec::Gelu if output.format.precision == Precision::F16 => {
             return crate::kernel::cost::f16_gelu_cycles(elements);
         }
+        TileKernelSpec::AttentionSoftmax {
+            key_columns,
+            padded_key_columns,
+            ..
+        } if key_columns == padded_key_columns => {
+            return crate::kernel::cost::f16_softmax_cycles(rows, u64::from(*key_columns));
+        }
         TileKernelSpec::Gelu | TileKernelSpec::AttentionSoftmax { .. } => {
             elements.saturating_mul(10)
         }
@@ -94,7 +104,19 @@ pub(crate) fn kernel_cycles(
                 row_major_pack_cycles(output, elements)
             };
         }
-        TileKernelSpec::AttentionMerge { .. } => elements.saturating_mul(4),
+        TileKernelSpec::AttentionMerge {
+            value_dimension,
+            initial,
+            final_block,
+            ..
+        } => {
+            return crate::kernel::cost::f16_attention_merge_cycles(
+                rows,
+                u64::from(*value_dimension),
+                *initial,
+                *final_block,
+            );
+        }
         TileKernelSpec::FlashAttention { .. } => {
             let [query, key, value] = inputs else {
                 return u64::MAX;
