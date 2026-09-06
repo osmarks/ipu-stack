@@ -266,18 +266,44 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<BlockRegion> {
         let mut tiles = BlockRegion::default();
         let mut checkpoint = 0u8;
-        for (index, operation) in operations.iter().enumerate() {
+        let mut index = 0;
+        while index < operations.len() {
+            let operation = &operations[index];
             let started = Instant::now();
-            let lowered = match &operation.kind {
-                MidOperationKind::Primitive(primitive) => {
-                    self.build_primitive(operation, primitive, &mut tiles)
+            let group = crate::mid::independent_copy_prefix(&operations[index..]);
+            let lowered = if group > 1 {
+                let mut batch = conversion::MaterializationBatch::default();
+                for operation in &operations[index..index + group] {
+                    let MidOperationKind::Primitive(crate::Primitive::Copy {
+                        mapping,
+                        reuse_local,
+                    }) = &operation.kind
+                    else {
+                        unreachable!()
+                    };
+                    self.prepare_copy_tensor(
+                        operation,
+                        mapping,
+                        *reuse_local,
+                        &mut batch,
+                        &mut tiles,
+                    )?;
                 }
-                MidOperationKind::Repeat(repeat) => {
-                    self.build_repeat(operation, repeat, &mut tiles)
-                }
-                MidOperationKind::Operator { .. } => Err(ExpansionError::InvalidOperatorPlan),
-                MidOperationKind::Convert(plan) => {
-                    self.build_conversion(operation, plan, &mut tiles)
+                let mut provenance = operation_provenance(operation);
+                provenance.value = None;
+                self.append_materialization(batch, provenance, &mut tiles)
+            } else {
+                match &operation.kind {
+                    MidOperationKind::Primitive(primitive) => {
+                        self.build_primitive(operation, primitive, &mut tiles)
+                    }
+                    MidOperationKind::Repeat(repeat) => {
+                        self.build_repeat(operation, repeat, &mut tiles)
+                    }
+                    MidOperationKind::Operator { .. } => Err(ExpansionError::InvalidOperatorPlan),
+                    MidOperationKind::Convert(plan) => {
+                        self.build_conversion(operation, plan, &mut tiles)
+                    }
                 }
             };
             if let Err(error) = lowered {
@@ -295,7 +321,7 @@ impl TileGraphBuilder {
             }
             if checkpoints
                 && operations
-                    .get(index + 1)
+                    .get(index + group.max(1))
                     .is_none_or(|next| next.source != operation.source)
                 && let Some(source) = operation.source
             {
@@ -312,6 +338,7 @@ impl TileGraphBuilder {
                 exchange_phases = self.phases.len(),
                 "lowered mid operation to tile work"
             );
+            index += group.max(1);
         }
         Ok(tiles)
     }

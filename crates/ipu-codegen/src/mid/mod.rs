@@ -2,6 +2,7 @@
 //! Tile enumeration occurs only after selection, in low expansion.
 
 mod copy;
+pub(crate) use copy::independent_copy_prefix;
 pub(crate) mod implementation;
 mod primitive;
 pub use primitive::*;
@@ -46,10 +47,18 @@ pub(crate) fn lower_finalists(
             }
         }
     }
-    candidates
+    let resolved = candidates
         .into_iter()
         .map(|program| implementation::resolve(program).ok_or(LoweringError::InvalidImplementation))
-        .collect()
+        .collect::<LoweringResult<Vec<_>>>()?;
+    let mut candidates = Vec::with_capacity(resolved.len() * 2);
+    for program in resolved {
+        if let Some(rotated) = program.with_disjoint_copy_sources() {
+            candidates.push(rotated);
+        }
+        candidates.push(program);
+    }
+    Ok(candidates)
 }
 #[cfg(test)]
 pub(crate) fn expand_tiles(

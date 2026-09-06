@@ -199,15 +199,6 @@ impl TileGraphBuilder {
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        let physical = if copy_order == CopyOrder::Semantic {
-            self.f16_micro_panel_mappings(mappings.clone())?
-        } else {
-            None
-        };
-        let (mappings, copy_order, exchange_order) = physical
-            .map_or((mappings, copy_order, exchange_order), |mappings| {
-                (mappings, CopyOrder::Physical, CopyOrder::Physical)
-            });
         let mut batch = MaterializationBatch::default();
         self.prepare_mapped_views(
             mappings,
@@ -229,6 +220,15 @@ impl TileGraphBuilder {
         batch: &mut MaterializationBatch,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
+        let physical = if copy_order == CopyOrder::Semantic {
+            self.f16_micro_panel_mappings(mappings.clone())?
+        } else {
+            None
+        };
+        let (mappings, copy_order, exchange_order) = physical
+            .map_or((mappings, copy_order, exchange_order), |mappings| {
+                (mappings, CopyOrder::Physical, CopyOrder::Physical)
+            });
         let transfers = match exchange_order {
             CopyOrder::Semantic => &mut batch.semantic,
             CopyOrder::Physical => &mut batch.physical,

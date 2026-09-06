@@ -10,6 +10,19 @@ impl TileGraphBuilder {
         reuse_local: bool,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
+        let mut batch = conversion::MaterializationBatch::default();
+        self.prepare_copy_tensor(operation, mapping, reuse_local, &mut batch, body)?;
+        self.append_materialization(batch, operation_provenance(operation), body)
+    }
+
+    pub(super) fn prepare_copy_tensor(
+        &mut self,
+        operation: &MidOperation,
+        mapping: &crate::CoordinateMapping,
+        reuse_local: bool,
+        batch: &mut conversion::MaterializationBatch,
+        body: &mut BlockRegion,
+    ) -> ExpansionResult<()> {
         let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
         else {
             return Err(ExpansionError::ResultArity);
@@ -71,11 +84,12 @@ impl TileGraphBuilder {
                 },
             )
         };
-        self.build_mapped_views(
+        self.prepare_mapped_views(
             mappings,
             order,
             order,
             operation_provenance(operation),
+            batch,
             body,
         )
     }

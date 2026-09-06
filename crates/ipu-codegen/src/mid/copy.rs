@@ -2,6 +2,36 @@
 
 use super::*;
 
+/// Batch adjacent independent copies from the same semantic operation. Their
+/// local preparations precede one shared exchange; dependent copies and semantic
+/// checkpoint boundaries keep their original order.
+pub(crate) fn independent_copy_prefix(operations: &[MidOperation]) -> usize {
+    let mut inputs = BTreeSet::new();
+    let mut outputs = BTreeSet::new();
+    let source = operations.first().and_then(|operation| operation.source);
+    operations
+        .iter()
+        .take_while(|operation| {
+            if operation.source != source
+                || !matches!(
+                    operation.kind,
+                    MidOperationKind::Primitive(crate::Primitive::Copy { .. })
+                )
+                || operation.inputs.iter().any(|id| outputs.contains(id))
+                || operation
+                    .results
+                    .iter()
+                    .any(|id| inputs.contains(id) || outputs.contains(id))
+            {
+                return false;
+            }
+            inputs.extend(operation.inputs.iter().copied());
+            outputs.extend(operation.results.iter().copied());
+            true
+        })
+        .count()
+}
+
 fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool)> {
     match &operation.kind {
         MidOperationKind::Primitive(Primitive::Copy {

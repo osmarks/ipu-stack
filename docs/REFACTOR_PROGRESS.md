@@ -715,3 +715,37 @@ than removal of the redundant representations addressed here.
   package byte for byte. Broader shared-input/grid lookahead remains separate work.
 - Validation: 125 codegen release tests and the doctest pass (one manual test
   ignored); workspace Clippy passes with the existing argument/type allowances.
+
+## Group independent attention preparation (2026-09-06)
+
+- Adjacent independent mid copies from the same semantic operation now prepare
+  their local work into one materialization batch before a shared exchange.
+  Dependencies and checkpoint boundaries end a batch. Standalone copies use the
+  same preparation implementation; physical micro-panel normalization lives in
+  the shared entry point.
+- Finalists also offer disjoint ownership for single-consumer reduction results
+  requiring AMP-transposed view preparation, when their owner sets fit on the
+  device. Existing tile offsets express this placement; partial GEMM ownership
+  stays unchanged. Shared storage uses and required outputs prevent rotation.
+  Both original and rotated placements are compared by expanded costing and
+  exchange scheduling.
+- C600 automatic attention improves from **373,980 to 355,320 renderer-cropped
+  cycles** (5.0%). Q/K unpacking uses two disjoint sets of 460 tiles: starts fall
+  in 74,406–76,320 and 74,802–76,698 respectively, and both finish by 88,968.
+  All three projection reductions use disjoint 460-tile owner sets. This groups
+  preparation; it does not fuse unpacking into reduction stores.
+- Constant-output hardware validation checks all 839,808 attention elements
+  (maximum error 0.001230). Gaussian semantic checkpoints also pass (projection
+  maximum errors 0.001953 / 0.001141 / 0.001953, attention 0.000088).
+  Artifacts: `artifacts/layout-sweep/attention-grouped-guard/{profile.html,
+  execution.ipuprofile,model.ipuexe,run.log,summary.json}` and Gaussian logs in
+  `attention-grouped-gaussian`.
+- The first profiled package stalled during host completion. Its final host row
+  ended at 0x4fffc without reserving supervisor fetch lookahead across the SRAM
+  boundary. Host code now reserves the same 64-byte guard as exchange tables;
+  the relocated package passes. The placement fix is validated, though the
+  precise hardware mechanism of the unguarded failure is not established.
+- Validation: 128 codegen release tests and the doctest pass (one manual test
+  ignored); ownership regression checks dependencies, semantic boundaries,
+  shared consumers and output aliases. Clippy uses the existing argument-count
+  and type-complexity allowances.
