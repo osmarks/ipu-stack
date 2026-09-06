@@ -491,22 +491,6 @@ pub(super) fn plans(
             }
             requirement.format.layout = actual.format.layout.clone();
             candidate.requirements.output.format.layout = actual.format.layout.clone();
-        } else if let OperatorFormatPolicy::PreserveInputTiling(index) = format_policy {
-            let Some((actual, requirement)) = inputs
-                .get(usize::from(index))
-                .zip(candidate.requirements.inputs.get_mut(usize::from(index)))
-            else {
-                continue;
-            };
-            if actual.format.precision != requirement.format.precision
-                || candidate.requirements.output.format.precision != requirement.format.precision
-                || actual.format.layout.order != requirement.format.layout.order
-            {
-                continue;
-            }
-            requirement.format.layout = actual.format.layout.clone();
-            candidate.requirements.output.format.layout.tiling =
-                actual.format.layout.tiling.clone();
         }
         let mut variants = vec![candidate.clone()];
         variants.extend(parallel_reduction_candidates(

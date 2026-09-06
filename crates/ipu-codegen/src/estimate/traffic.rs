@@ -4,17 +4,13 @@ use super::*;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
-    pub source_payload_bytes: u64,
     pub remote_fragments: u64,
     pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
-    pub maximum_remote_destination_bytes: u64,
-    pub maximum_remote_destination_fragments: u64,
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
     pub maximum_local_intersections: u64,
-    pub source_lane_loads: Vec<ExchangeEndpointLoad>,
-    pub remote_destination_loads: Vec<ExchangeEndpointLoad>,
+    pub exchange: ExchangeEndpointTraffic,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,13 +37,6 @@ pub(crate) struct ExchangeEndpointTraffic {
 }
 
 impl ExchangeEndpointTraffic {
-    pub(crate) fn from_conversion(traffic: &ConversionTraffic) -> Self {
-        Self {
-            outgoing_lanes: traffic.source_lane_loads.clone(),
-            incoming_tiles: traffic.remote_destination_loads.clone(),
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn from_maxima(
         outgoing_bytes: u64,
@@ -61,8 +50,8 @@ impl ExchangeEndpointTraffic {
         traffic
     }
 
-    pub(crate) fn add_outgoing(&mut self, bus: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(&mut self.outgoing_lanes, bus, bytes, fragments);
+    pub(crate) fn add_outgoing(&mut self, tile: u16, bytes: u64, fragments: u64) {
+        add_endpoint_load(&mut self.outgoing_lanes, tile, bytes, fragments);
     }
 
     pub(crate) fn add_incoming(&mut self, tile: u16, bytes: u64, fragments: u64) {
@@ -185,17 +174,9 @@ pub(crate) fn conversion_traffic(
                     remote.insert((source_tiles[0], extents.clone()));
                 }
             }
-            add_endpoint_load(
-                &mut traffic.remote_destination_loads,
-                destination_tile,
-                remote_bytes,
-                remote_fragments,
-            );
-            traffic.maximum_remote_destination_bytes =
-                traffic.maximum_remote_destination_bytes.max(remote_bytes);
-            traffic.maximum_remote_destination_fragments = traffic
-                .maximum_remote_destination_fragments
-                .max(remote_fragments);
+            traffic
+                .exchange
+                .add_incoming(destination_tile, remote_bytes, remote_fragments);
             traffic.maximum_local_bytes = traffic.maximum_local_bytes.max(local_bytes);
             traffic.maximum_local_intersections =
                 traffic.maximum_local_intersections.max(local_intersections);
@@ -210,20 +191,12 @@ pub(crate) fn conversion_traffic(
             .saturating_sub(traffic.maximum_local_bytes)
             .div_ceil(4)
     };
-    traffic.source_payload_bytes = remote
-        .iter()
-        .map(|(_, extents)| range_elements(extents).saturating_mul(element_bytes))
-        .sum();
-    let mut source_buses = HashMap::<u16, (u64, u64)>::new();
-    for (source, extents) in &remote {
-        let role = source_buses.entry(*source).or_default();
-        role.0 = role
-            .0
-            .saturating_add(range_elements(extents).saturating_mul(element_bytes));
-        role.1 = role.1.saturating_add(1);
-    }
-    for (bus, (bytes, fragments)) in source_buses {
-        add_endpoint_load(&mut traffic.source_lane_loads, bus, bytes, fragments);
+    for (source, extents) in remote {
+        traffic.exchange.add_outgoing(
+            source,
+            range_elements(&extents).saturating_mul(element_bytes),
+            1,
+        );
     }
     Some(traffic)
 }

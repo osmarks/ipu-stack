@@ -173,8 +173,6 @@ pub struct Ipu21CostModel;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipu21TargetCosts {
     pub exchange_bytes_per_cycle: u64,
-    pub standard_load_bytes_per_cycle: u64,
-    pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
     pub local_copy_call_cycles: u64,
     pub exchange_phase_cycles: u64,
@@ -184,10 +182,6 @@ pub struct Ipu21TargetCosts {
 // Target::getExchangeBytesPerCycle.
 pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     exchange_bytes_per_cycle: 4,
-    // Target::getMemcpyBytesPerCycle. Interleaved reads use both memory
-    // elements, while an ordinary read or local copy uses one data path.
-    standard_load_bytes_per_cycle: 8,
-    interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
     // A finalized six-worker local-copy invocation, including supervisor and
     // worker rendezvous overhead, takes 288 tile cycles on IPU21.
@@ -319,8 +313,8 @@ impl CostModel for Ipu21CostModel {
             };
         };
         let direct_retile = strategy == ConversionStrategy::DirectRetile;
-        let endpoint_traffic = ExchangeEndpointTraffic::from_conversion(&traffic);
-        let exchange_cycles = exchange_endpoint_cycles(&endpoint_traffic, 1);
+        let endpoint_traffic = &traffic.exchange;
+        let exchange_cycles = exchange_endpoint_cycles(endpoint_traffic, 1);
         let (local_bytes, local_calls) = if direct_retile {
             (
                 traffic.maximum_local_bytes,
@@ -335,10 +329,8 @@ impl CostModel for Ipu21CostModel {
         let local_cycles = local_bytes
             .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
             .saturating_add(local_calls.saturating_mul(IPU21_TARGET_COSTS.local_copy_call_cycles));
-        let mut exchange_footprint = exchange_endpoint_footprint(
-            &endpoint_traffic,
-            u64::from(traffic.remote_fragments != 0),
-        );
+        let mut exchange_footprint =
+            exchange_endpoint_footprint(endpoint_traffic, u64::from(traffic.remote_fragments != 0));
         exchange_footprint.maximum_transfer_chunks_per_tile = exchange_footprint
             .maximum_transfer_chunks_per_tile
             .max(traffic.maximum_routed_fragments);

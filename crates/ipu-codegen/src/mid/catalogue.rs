@@ -16,9 +16,6 @@ pub enum OperatorFormatPolicy {
     /// Resolve both the selected input and output to the input value's full
     /// layout. This is the normal policy for layout-transparent unary work.
     PreserveInputLayout(u16),
-    /// Preserve the input's tile distribution while allowing the candidate to
-    /// select a different element order or memory class for its output.
-    PreserveInputTiling(u16),
 }
 
 impl OperatorCandidate {
@@ -50,11 +47,6 @@ impl OperatorCandidate {
 
     pub fn with_preserved_input_layout(mut self, input: u16) -> Self {
         self.format_policy = OperatorFormatPolicy::PreserveInputLayout(input);
-        self
-    }
-
-    pub fn with_preserved_input_tiling(mut self, input: u16) -> Self {
-        self.format_policy = OperatorFormatPolicy::PreserveInputTiling(input);
         self
     }
 

@@ -100,14 +100,7 @@ fn conversion_traffic_reference(
         }
         traffic.maximum_destination_bytes =
             traffic.maximum_destination_bytes.max(destination_bytes);
-        traffic.maximum_remote_destination_bytes = traffic
-            .maximum_remote_destination_bytes
-            .max(destination_bytes.saturating_sub(local_bytes));
-        traffic.maximum_remote_destination_fragments = traffic
-            .maximum_remote_destination_fragments
-            .max(remote_intersections);
-        add_endpoint_load(
-            &mut traffic.remote_destination_loads,
+        traffic.exchange.add_incoming(
             *destination_tile,
             destination_bytes.saturating_sub(local_bytes),
             remote_intersections,
@@ -128,18 +121,10 @@ fn conversion_traffic_reference(
             .saturating_sub(traffic.maximum_local_bytes)
             .div_ceil(4)
     };
-    traffic.source_payload_bytes = remote
-        .iter()
-        .map(|(_, extents)| range_elements(extents) * precision.bytes())
-        .sum();
-    let mut source_buses = BTreeMap::<u16, (u64, u64)>::new();
-    for (source, extents) in &remote {
-        let role = source_buses.entry(*source).or_default();
-        role.0 += range_elements(extents) * precision.bytes();
-        role.1 += 1;
-    }
-    for (bus, (bytes, fragments)) in source_buses {
-        add_endpoint_load(&mut traffic.source_lane_loads, bus, bytes, fragments);
+    for (source, extents) in remote {
+        traffic
+            .exchange
+            .add_outgoing(source, range_elements(&extents) * precision.bytes(), 1);
     }
     traffic
 }

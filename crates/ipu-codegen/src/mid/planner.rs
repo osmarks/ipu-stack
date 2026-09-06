@@ -526,7 +526,6 @@ pub(super) fn lower_operation_candidates(
                                     matches!(
                                         candidate.format_policy,
                                         OperatorFormatPolicy::PreserveInputLayout(_)
-                                            | OperatorFormatPolicy::PreserveInputTiling(_)
                                     )
                                 })
                         }))
@@ -558,8 +557,7 @@ pub(super) fn lower_operation_candidates(
                 .filter(|candidate| operator_matches(&operation.kind, candidate.plan.operator))
                 .filter_map(|candidate| match candidate.format_policy {
                     OperatorFormatPolicy::Concrete => None,
-                    OperatorFormatPolicy::PreserveInputLayout(index)
-                    | OperatorFormatPolicy::PreserveInputTiling(index) => Some(usize::from(index)),
+                    OperatorFormatPolicy::PreserveInputLayout(index) => Some(usize::from(index)),
                 })
                 .collect()
         };
