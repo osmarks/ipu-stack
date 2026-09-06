@@ -1845,3 +1845,44 @@ fn generic_view_distributes_matrix_rows_instead_of_whole_batches() {
     let output = &program.values[program.outputs[0].index() as usize];
     assert!(output.tensor_type.format.layout.tiling.tile_count > 1);
 }
+
+#[test]
+fn automatic_repeat_state_keeps_an_unreplicated_boundary() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("state", [1, 17, 64]).unwrap();
+    let weight = graph.parameter("weight", [1, 64, 64]).unwrap();
+    let output = graph
+        .repeat(3, [input], [weight], [], |body, args| {
+            Ok(vec![body.gemm(args.carried[0], args.invariants[0])?])
+        })
+        .unwrap()[0];
+    graph.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(64)
+        .with_automatic_input(input, Precision::F16)
+        .with_automatic_input(weight, Precision::F16);
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let repeat = mid
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            MidOperationKind::Repeat(repeat) => Some((op, repeat)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        mid.values[repeat.1.body.arguments[0].index() as usize]
+            .tensor_type
+            .format
+            .layout
+            .tiling
+            .replicas,
+        1
+    );
+    for (input, argument) in repeat.0.inputs.iter().zip(&repeat.1.body.arguments) {
+        assert_eq!(
+            mid.values[input.index() as usize].tensor_type,
+            mid.values[argument.index() as usize].tensor_type
+        );
+    }
+    crate::expand_tiles(&mid).unwrap();
+}

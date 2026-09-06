@@ -1450,7 +1450,13 @@ pub(super) fn lower_repeat(
         };
         let value = state.value_in_storage_group(origin, tensor_type, storage_group);
         if argument_index < inputs.len() {
-            if state.automatic_inputs.contains(&inputs[argument_index]) {
+            // A carried buffer persists across iterations. Letting its first
+            // consumer retarget it to a replicated GEMM input also forces the
+            // loop output to retain every replica. Keep its boundary layout;
+            // ordinary mid conversions prepare each consumer's operands.
+            if argument_index >= repeat.carried_inputs
+                && state.automatic_inputs.contains(&inputs[argument_index])
+            {
                 state.automatic_inputs.insert(value);
             }
             if state.parameter_values.contains(&inputs[argument_index]) {
@@ -1499,7 +1505,7 @@ pub(super) fn lower_repeat(
         state,
         &body_constraints,
     )?;
-    for index in 0..repeat.carried_inputs {
+    for index in 0..inputs.len() {
         let body_layout = state
             .get(arguments[index])
             .tensor_type
