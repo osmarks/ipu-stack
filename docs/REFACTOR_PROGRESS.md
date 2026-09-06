@@ -496,3 +496,62 @@ are zero-padded. Whole-buffer clears remain a separate optimization opportunity.
 An isolated 4 KiB interleaved relocation recovers the historical paired exchange
 horizon without changing traffic. Detailed experiments and remaining grid
 imbalance are in [the profile diagnosis](PROFILE_LAYOUT_DIAGNOSIS.md#padding-sram-placement-and-paired-transfers-2026-09-05-follow-up).
+
+
+## Cleanup and consolidation (2026-09-06)
+
+Reviewed the branch history, historical simplification audits, compiler data flow,
+planner representations, kernel contracts, package construction, exchange reuse,
+and sweep tooling. This pass removes obsolete state rather than changing the
+whole-device mid boundary or the representable layout families.
+
+- Attention now stores its geometry and materialization choice once. Its mid
+  implementation derives QK/PV kernel specifications; candidate construction and
+  validation share a single path. Removed unused query-block and pointwise-mapping
+  fields, the unused PreserveInputTiling policy, and the one-mode Add options.
+- Conversion costing owns endpoint traffic directly. Removed unused traffic
+  maxima, duplicate aggregation/maps, and the unread exchange-row estimate.
+  Region analysis returns cycle/memory estimates directly, without allocating a
+  throwaway Arc program. Mid resolution consumes owned programs. Memory feasibility
+  derives contiguous overflow and shares Pareto dimensions with both shortlists.
+- Finalist screening retains projected work and provisional placement. Infeasible
+  alternatives no longer abort viable finalists; a regression covers rejection,
+  successful fallback, and empty/all-invalid lists. Projected attention exercised
+  this in practice: shortlisted alternatives 1 and 3 had unaligned exchanges.
+- Split package selection, profile instrumentation and explicit tile-program
+  packaging from orchestration. Split exchange ordering heuristics and diagnostic
+  reporting from scheduling. Consolidated runtime-symbol inventory and removed
+  the single-Boolean exchange-options wrapper.
+- Cached exchange replay now retries the incremental instruction-alignment path
+  used by greedy construction. An eight-transfer regression proves the old replay
+  fails and the corrected replay retains identical normalized rows. Memory-hazard
+  and row-equality validation still gate reuse; search heuristics are unchanged.
+- Sweep drivers share frozen compiler/device-source cohorts and validate resumes.
+  Historical calibration no longer uses today's source hash. Removed duplicate
+  obsolete instruction formulas. Final timeline reporting shares the finalist
+  composer, and log extraction follows the selected finalist.
+
+Validation: 180 workspace release tests pass, one manual timing test is ignored;
+strict Clippy passes with the existing argument-count/type-complexity allowances.
+Python syntax, frozen-cohort resume/provenance checks and selected-finalist log
+extraction pass. MLP passes numerically at 172,236 renderer cycles. Both the initial
+cleanup package and the final representation-cleanup build are byte-identical to
+`16e93e6`'s validated package (SHA-256
+`abc4356557b5d0747f27b40e6c07049d416ae0332ba968686f7108738d93501e`).
+The later cache-only fix is covered by exact normalized-row equivalence tests.
+
+Attention smoke passes in both configured modes (4,896 checks each). Projected
+online and materialized attention each pass 839,808 checks, with maximum errors
+0.001230 and 0.000930 respectively. Profiles, packages and logs are under
+`artifacts/layout-sweep/cleanup/`; no identical hardware benchmark was repeated.
+
+Tracked Rust/C/C++/assembly/header/Python/shell sources under crates, device and
+scripts decrease from 53,947 to 53,770 lines: 177 fewer, including new regression
+tests and provenance checks. The main package module falls from 2,282 to 1,366
+lines; the main exchange module falls from 3,600 to 2,296. File splits are included
+in those totals, not counted as deletions.
+
+General view/copy composition and consumer/producer layout negotiation remain
+separate architectural work, as previously requested. Broader layout search,
+exchange ordering models and new ISA kernels are performance/feature work rather
+than removal of the redundant representations addressed here.
