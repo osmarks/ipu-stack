@@ -334,7 +334,12 @@ pub(crate) fn prepare_inputs(
             .with_context(|| format!("diagnostic metadata for {} is missing", input.name))?;
         let scale = match input.kind {
             ipu_codegen::GraphInputKind::Host => 0.25,
-            ipu_codegen::GraphInputKind::Parameter => 0.0625,
+            ipu_codegen::GraphInputKind::Parameter => {
+                // Keep variance bounded as width and repeat depth change.
+                let rank = metadata.shape.0.len();
+                let fan_in = metadata.shape.0[rank.saturating_sub(2)];
+                (fan_in as f32).sqrt().recip()
+            }
         };
         let seed = 0x4449_4147_4e4f_5354 ^ u64::from(input.value.index());
         let data = (0..input.shape.elements())

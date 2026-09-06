@@ -2,10 +2,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, AttentionStrategy, BlockMajorOrder, CompiledPackage, ComputeGraph, DiagnosticTensor,
-    GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging, MemoryClass, MidOperator,
-    PackageConfig, PipelineConfig, Precision, ReductionStaging, TensorFormat,
-    amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
+    AmpOrder, AttentionStrategy, AxisFactorView, BlockMajorOrder, CompiledPackage, ComputeGraph,
+    DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging,
+    MemoryClass, MidOperator, PackageConfig, PipelineConfig, Precision, ReductionStaging,
+    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
     build_package,
 };
 use ipu_driver::DriverError;
@@ -138,6 +138,9 @@ struct Arguments {
     /// Independent attention batches, flattened into the head axis.
     #[arg(long, default_value_t = 1)]
     attention_batch: u32,
+    /// Sequential projected attention blocks, represented by one structured repeat.
+    #[arg(long, default_value_t = 1)]
+    attention_blocks: u32,
     /// Restrict attention planning for controlled strategy comparisons.
     #[arg(long, value_enum, default_value_t = AttentionMode::Auto)]
     attention_strategy: AttentionMode,
@@ -428,7 +431,9 @@ fn main() -> Result<()> {
         bail!("--benchmark-* shape options require --workload gemm-benchmark");
     }
     if !matches!(arguments.workload, Workload::SiglipAttentionBenchmark)
-        && (arguments.attention_batch != 1 || arguments.attention_heads != SIGLIP_ATTENTION_HEADS)
+        && (arguments.attention_batch != 1
+            || arguments.attention_heads != SIGLIP_ATTENTION_HEADS
+            || arguments.attention_blocks != 1)
     {
         bail!("--attention-* shape options require --workload siglip-attention-benchmark");
     }
@@ -437,6 +442,9 @@ fn main() -> Result<()> {
         .attention_batch
         .checked_mul(arguments.attention_heads)
         .context("attention batch/head count overflow")?;
+    if arguments.attention_blocks == 0 {
+        bail!("--attention-blocks must be nonzero");
+    }
     if attention_streams == 0 {
         bail!("--attention-batch and --attention-heads must be nonzero");
     }
@@ -672,22 +680,65 @@ fn main() -> Result<()> {
                     model_width,
                 ],
             )?;
-            let query_weights = graph.parameter("query.weight", [model_width, model_width])?;
-            let key_weights = graph.parameter("key.weight", [model_width, model_width])?;
-            let value_weights = graph.parameter("value.weight", [model_width, model_width])?;
-            let query_projection = graph.gemm(input, query_weights)?;
-            let key_projection = graph.gemm(input, key_weights)?;
-            let value_projection = graph.gemm(input, value_weights)?;
-            let query = graph.split_heads(query_projection, arguments.attention_heads)?;
-            let key = graph.split_heads(key_projection, arguments.attention_heads)?;
-            let value = graph.split_heads(value_projection, arguments.attention_heads)?;
-            let output = graph.flash_attention(query, key, value)?;
+            let mut weights = [Vec::new(), Vec::new(), Vec::new()];
+            for block in 0..arguments.attention_blocks {
+                for (name, weights) in ["query", "key", "value"].into_iter().zip(&mut weights) {
+                    let name = if arguments.attention_blocks == 1 {
+                        format!("{name}.weight")
+                    } else {
+                        format!("{name}.{block}.weight")
+                    };
+                    let weight = graph.parameter(name, [model_width, model_width])?;
+                    pipeline = pipeline.with_automatic_input(weight, Precision::F16);
+                    weights.push(weight);
+                }
+            }
+            let output = if arguments.attention_blocks == 1 {
+                let query = graph.gemm(input, weights[0][0])?;
+                let key = graph.gemm(input, weights[1][0])?;
+                let value = graph.gemm(input, weights[2][0])?;
+                let query = graph.split_heads(query, arguments.attention_heads)?;
+                let key = graph.split_heads(key, arguments.attention_heads)?;
+                let value = graph.split_heads(value, arguments.attention_heads)?;
+                graph.flash_attention(query, key, value)?
+            } else {
+                let initial = graph.split_heads(input, arguments.attention_heads)?;
+                let mut sequences = Vec::new();
+                for (index, weights) in weights.into_iter().enumerate() {
+                    sequences
+                        .push(graph.value_sequence(format!("attention weights {index}"), weights)?);
+                }
+                graph.repeat(
+                    arguments.attention_blocks,
+                    [initial],
+                    [],
+                    sequences,
+                    |body, args| {
+                        let input = body.view(
+                            args.carried[0],
+                            AxisFactorView::new(0, 2, arguments.attention_heads),
+                        )?;
+                        let query = body.gemm(input, args.iterated[0])?;
+                        let key = body.gemm(input, args.iterated[1])?;
+                        let value = body.gemm(input, args.iterated[2])?;
+                        let query = body.split_heads(query, arguments.attention_heads)?;
+                        let key = body.split_heads(key, arguments.attention_heads)?;
+                        let value = body.split_heads(value, arguments.attention_heads)?;
+                        Ok(vec![body.flash_attention(query, key, value)?])
+                    },
+                )?[0]
+            };
             graph.set_outputs([output])?;
-            pipeline = pipeline
-                .with_automatic_input(input, Precision::F16)
-                .with_automatic_input(query_weights, Precision::F16)
-                .with_automatic_input(key_weights, Precision::F16)
-                .with_automatic_input(value_weights, Precision::F16);
+            pipeline = pipeline.with_automatic_input(
+                input,
+                if arguments.attention_blocks == 1 {
+                    Precision::F16
+                } else {
+                    // The carried state is the F32 attention result. Keep that
+                    // precision across iterations; GEMMs still select F16 inputs.
+                    Precision::F32
+                },
+            );
             // This benchmark compares the two F16 attention strategies. Keep
             // projection precision controlled as batch size changes instead
             // of allowing a different GEMM precision to confound the sweep.
@@ -950,7 +1001,7 @@ fn main() -> Result<()> {
                     compiled_package
                         .as_ref()
                         .context("attention validation needs logical storage metadata")?,
-                    arguments.attention_batch,
+                    arguments.attention_blocks,
                     arguments.attention_heads,
                     arguments.clock_hz,
                     arguments.timeout_seconds,
@@ -1170,7 +1221,7 @@ fn run_gemm(
             ))
         })
         .collect::<Vec<_>>();
-    verify_logical_f16_output(application, tensor, &bytes, &expected, (0.0, 0.0))?;
+    verify_logical_output(application, tensor, &bytes, &expected, (0.0, 0.0))?;
     println!("gemmNumericalChecks={} numericalTest=PASS", expected.len());
     Ok(())
 }
@@ -1196,7 +1247,7 @@ fn run_reference(
         .get(&tensor.value)
         .context("host reference has no graph output")?;
     let maximum_error =
-        verify_logical_f16_output(application, tensor, &output, &expected.values, tolerance)?;
+        verify_logical_output(application, tensor, &output, &expected.values, tolerance)?;
     Ok((output, maximum_error))
 }
 
@@ -1204,15 +1255,12 @@ fn run_projected_attention_benchmark(
     runtime: &Runtime,
     application: &Application,
     package: &CompiledPackage,
-    batch: u32,
+    blocks: u32,
     heads: u32,
     clock_hz: u64,
     timeout_seconds: u64,
     profile_output: Option<&Path>,
 ) -> Result<()> {
-    let streams = batch
-        .checked_mul(heads)
-        .context("attention stream overflow")?;
     let model_width = heads
         .checked_mul(SIGLIP_ATTENTION_HEAD_DIMENSION)
         .context("attention model width overflow")?;
@@ -1232,67 +1280,24 @@ fn run_projected_attention_benchmark(
     )?;
     write_profile(application, &actual, clock_hz, profile_output)?;
 
-    let output = application
+    let tensor = package
         .outputs
         .iter()
-        .find(|binding| binding.name == "output.0")
-        .context("projected attention package has no output binding")?;
-    let populated = output.slices.iter().filter(|slice| slice.size != 0).count();
-    let query_partitions = u32::try_from(populated)? / streams;
-    if query_partitions == 0 {
-        bail!("projected attention output has no populated shards");
-    }
-    let expected = expected_projection_value(model_width);
-    let padded_width = padded_attention_width();
-    let mut maximum_error = 0.0f32;
-    let mut checks = 0usize;
-    let mut first_mismatch = None;
-    let mut mismatches = 0usize;
-    let mut mismatches_by_column = vec![0usize; SIGLIP_ATTENTION_HEAD_DIMENSION as usize];
-    for stream in 0..streams {
-        for partition in 0..query_partitions {
-            let tile = partition * streams + stream;
-            let slice = &output.slices[usize::try_from(tile)?];
-            let (_, rows) = balanced_range(SIGLIP_ATTENTION_TOKENS, query_partitions, partition);
-            for row in 0..rows {
-                for column in 0..SIGLIP_ATTENTION_HEAD_DIMENSION {
-                    let linear = u64::from(row * padded_width + column);
-                    let offset = usize::try_from(slice.file_offset + linear * 4)?;
-                    let observed = f32::from_le_bytes(
-                        actual
-                            .get(offset..offset + 4)
-                            .context("projected attention output exceeds host data")?
-                            .try_into()
-                            .unwrap(),
-                    );
-                    maximum_error = maximum_error.max((observed - expected).abs());
-                    if (observed - expected).abs() > 0.02 {
-                        mismatches += 1;
-                        mismatches_by_column[column as usize] += 1;
-                        first_mismatch.get_or_insert((stream, partition, row, column, observed));
-                    }
-                    checks += 1;
-                }
-            }
-        }
-    }
-    if maximum_error > 0.02 {
-        bail!(
-            "projected attention numerical verification failed: checks={checks} mismatches={mismatches} expected={expected:.6} maximumError={maximum_error:.6} firstMismatch={first_mismatch:?} mismatchesByColumn={mismatches_by_column:?}"
-        );
-    }
+        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
+        .context("attention package has no logical output storage map")?;
+    let expected = expected_projection_value(model_width).powi(i32::try_from(blocks)?);
+    let reference = vec![expected; usize::try_from(tensor.shape.elements())?];
+    let maximum_error =
+        verify_logical_output(application, tensor, &actual, &reference, (0.02, 0.0))?;
     println!(
-        "attentionNumericalChecks={checks} expected={expected:.6} maxError={maximum_error:.6} numericalTest=PASS"
+        "attentionNumericalChecks={} blocks={blocks} expected={expected:.6} maxError={maximum_error:.6} numericalTest=PASS",
+        reference.len()
     );
     Ok(())
 }
 
 fn expected_projection_value(model_width: u32) -> f32 {
     half_to_f32(f32_to_half(1.0 / model_width as f32)) * model_width as f32
-}
-
-fn padded_attention_width() -> u32 {
-    SIGLIP_ATTENTION_HEAD_DIMENSION.div_ceil(16) * 16
 }
 
 fn run_attention_smoke(
@@ -1585,7 +1590,7 @@ fn run_gemm_benchmark(
         .context("benchmark package has no logical output storage map")?;
     let expected = vec![inner as f32 * 0.25; usize::try_from(tensor.shape.elements())?];
     let maximum_absolute_error =
-        verify_logical_f16_output(application, tensor, &output, &expected, (0.01, 0.002))?;
+        verify_logical_output(application, tensor, &output, &expected, (0.01, 0.002))?;
     if !profiling_enabled {
         println!(
             "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
@@ -1747,7 +1752,7 @@ fn validate_mlp_benchmark_shape(
     Ok(())
 }
 
-fn verify_logical_f16_output(
+fn verify_logical_output(
     application: &Application,
     tensor: &DiagnosticTensor,
     bytes: &[u8],
@@ -1755,7 +1760,7 @@ fn verify_logical_f16_output(
     tolerance: (f32, f32),
 ) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
-    if tensor.precision != Precision::F16
+    if !matches!(tensor.precision, Precision::F16 | Precision::F32)
         || expected.len() != usize::try_from(tensor.shape.elements())?
     {
         bail!("logical output metadata is inconsistent with its reference");
@@ -1775,10 +1780,19 @@ fn verify_logical_f16_output(
             .context("output binding slice is missing")?;
         for (index, offset) in diagnostic::shard_elements(tensor, shard)? {
             let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
+            let width = if tensor.precision == Precision::F16 {
+                2
+            } else {
+                4
+            };
             let raw = bytes
-                .get(start..start + 2)
+                .get(start..start + width)
                 .context("logical output exceeds host output")?;
-            let actual = half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()));
+            let actual = if tensor.precision == Precision::F16 {
+                half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()))
+            } else {
+                f32::from_le_bytes(raw.try_into().unwrap())
+            };
             let reference = expected[index];
             let error = (actual - reference).abs();
             checked += 1;
@@ -2309,19 +2323,29 @@ mod tests {
             } else {
                 Layout::amp_left_result_grid(64, tiles, row_parts, column_parts, order)
             };
-            let tensor_type = TensorType::new(shape, Precision::F16, layout);
+            let precision = if random.bool() {
+                Precision::F16
+            } else {
+                Precision::F32
+            };
+            let tensor_type = TensorType::new(shape, precision, layout);
             let mut graph = ComputeGraph::new();
             let value = graph.host_input("output.0", shape)?;
             let mut tensor = DiagnosticTensor {
                 name: Some("output.0".into()),
                 value,
                 shape: tensor_type.shape.clone(),
-                precision: Precision::F16,
+                precision,
                 shards: Vec::new(),
             };
             let mut binding = Binding {
                 name: "output.0".into(),
-                dtype: "f16".into(),
+                dtype: if precision == Precision::F16 {
+                    "f16"
+                } else {
+                    "f32"
+                }
+                .into(),
                 shape: shape.to_vec(),
                 slices: Vec::new(),
             };
@@ -2378,7 +2402,7 @@ mod tests {
             let (_, repacked) = diagnostic::pack_inputs(&application, &[tensor.clone()], &values)?;
             assert_eq!(packed, repacked);
             assert_eq!(
-                verify_logical_f16_output(&application, &tensor, &packed, &expected, (0.0, 0.0))?,
+                verify_logical_output(&application, &tensor, &packed, &expected, (0.0, 0.0))?,
                 0.0
             );
             let shard = tensor
@@ -2400,9 +2424,13 @@ mod tests {
             let (_, offset) = diagnostic::shard_elements(&tensor, shard)?[0];
             let offset = (slice.file_offset + u64::from(offset)) as usize;
             let mut corrupted = packed;
-            corrupted[offset..offset + 2].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());
+            if precision == Precision::F16 {
+                corrupted[offset..offset + 2].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());
+            } else {
+                corrupted[offset..offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+            }
             assert!(
-                verify_logical_f16_output(&application, &tensor, &corrupted, &expected, (0.0, 0.0))
+                verify_logical_output(&application, &tensor, &corrupted, &expected, (0.0, 0.0))
                     .is_err()
             );
         }
