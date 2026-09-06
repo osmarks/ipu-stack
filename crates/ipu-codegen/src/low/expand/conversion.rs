@@ -289,12 +289,6 @@ impl TileGraphBuilder {
                             .layout
                             .memory_class
                             == MemoryClass::Ipu21Standard
-                        && self.shards[destination.shard.index() as usize]
-                            .tensor_type
-                            .format
-                            .layout
-                            .memory_class
-                            == MemoryClass::Ipu21Interleaved
                     {
                         batch
                             .loopback_candidates
@@ -365,7 +359,7 @@ impl TileGraphBuilder {
                 CopyOrder::Physical => &mut batch.physical,
             };
             // Keep the existing multicast send; only add its local receiver.
-            // Different memory classes guarantee disjoint exchange elements.
+            // Placement separates same-class source/receiver SRAM elements.
             let spans = match order {
                 CopyOrder::Semantic => logical_view_byte_spans,
                 CopyOrder::Physical => view_byte_spans,

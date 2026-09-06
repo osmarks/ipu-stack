@@ -25,7 +25,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         (2, true, CopyOrder::Physical, true),
         (0, true, CopyOrder::Physical, false),
         (1, true, CopyOrder::Physical, false),
-        (2, false, CopyOrder::Physical, false),
+        (2, false, CopyOrder::Physical, true),
         (2, true, CopyOrder::Semantic, false),
     ] {
         let mut graph = ComputeGraph::new();
@@ -75,6 +75,30 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             .filter(|view| builder.shards[view.shard.index() as usize].tile == 0)
             .count();
         assert_eq!(self_receivers, usize::from(loopback));
+        if loopback {
+            let mut graph = (*crate::expand_tiles(&mid).unwrap()).clone();
+            graph.shards = builder.shards;
+            graph.exchange_phases = builder.phases;
+            graph.local_copies = builder.local_copies;
+            graph.kernel_runs = builder.kernel_runs;
+            graph.body = region;
+            let low = crate::low::lower_to_tiles(&Arc::new(graph), false);
+            let placement = crate::place(&low).unwrap();
+            for transfer in low.exchange_phases.iter().flat_map(|p| &p.transfers) {
+                let source = placement.shard_addresses[&transfer.source.shard];
+                let source_elements = crate::exchange::effective_memory_elements(source, 128);
+                for destination in &transfer.destinations {
+                    if low.shards[destination.shard.index() as usize].tile == 0 {
+                        let address = placement.shard_addresses[&destination.shard];
+                        assert!(
+                            crate::exchange::effective_memory_elements(address, 128)
+                                .iter()
+                                .all(|e| !source_elements.contains(e))
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
