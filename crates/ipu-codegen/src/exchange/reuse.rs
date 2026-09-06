@@ -97,14 +97,25 @@ impl ScheduleRecipe {
         let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
         // Recompute alias dependencies, SRAM-element hazards, receiver setup,
         // repeat-source hazards, and instruction alignment at the final addresses.
-        let schedule = materialize_schedule_order(
-            topology,
-            &pending,
-            &incoming_bases,
-            &receive_counts,
-            tile_count,
-            &self.order,
-        )?;
+        // The original greedy schedule may have needed incremental encoding
+        // validation. Replay must use the same fallback before comparing rows.
+        let replay = |validate_encoding| {
+            materialize_schedule_order(
+                topology,
+                &pending,
+                &incoming_bases,
+                &receive_counts,
+                tile_count,
+                &self.order,
+                validate_encoding,
+            )
+        };
+        let schedule = match replay(false) {
+            Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
+                "SENDPICP instruction alignment",
+            ))) => replay(true)?,
+            result => result?,
+        };
         // Identical normalized rows preserve compact table sharing and the
         // provisional code-size reservation, not just the total cycle count.
         if normalized_rows(&schedule)? != self.rows {
@@ -185,7 +196,8 @@ mod tests {
         let mut pending = transfers();
         let (counts, bases) = receive_configuration(&pending, 4).unwrap();
         assert!(
-            materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &[1, 0]).is_ok()
+            materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &[1, 0], false)
+                .is_ok()
         );
         // Transfer 1 now reads bytes written by transfer 0. The old order is
         // no longer legal even though transfer lengths and tile counts match.
@@ -194,13 +206,72 @@ mod tests {
         pending[1].refresh_source_elements();
         let (counts, bases) = receive_configuration(&pending, 4).unwrap();
         assert!(
-            materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &[0, 1]).is_ok()
+            materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &[0, 1], false)
+                .is_ok()
         );
         for order in [[1, 0], [0, 0], [0, 2]] {
             assert!(
-                materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &order)
+                materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &order, false)
                     .is_err()
             );
         }
+    }
+    #[test]
+    fn replay_preserves_incrementally_aligned_rows() {
+        let topology = Topology::c600();
+        // Reduced multicast fixture: the fast construction violates SENDPICP
+        // alignment; incremental validation produces valid, reusable rows.
+        let transfers: [(u16, u32, &[u16], u32); 8] = [
+            (3, 3, &[5, 6], 10),
+            (0, 7, &[4, 5, 6, 7], 4),
+            (2, 8, &[4, 6], 9),
+            (2, 9, &[6, 7], 13),
+            (0, 10, &[5, 6, 7], 15),
+            (2, 12, &[4, 5, 6, 7], 10),
+            (1, 17, &[6], 18),
+            (2, 18, &[5, 6, 7], 2),
+        ];
+        let problem = ExchangeScheduleProblem {
+            phase: 0,
+            transfers: transfers
+                .into_iter()
+                .map(
+                    |(source, offset, destinations, words)| ExchangeScheduleTransfer {
+                        source,
+                        source_addresses: vec![0x10000 + offset * 128],
+                        destinations: destinations
+                            .iter()
+                            .map(|&tile| ExchangeScheduleDestination {
+                                tile,
+                                address: 0x40000 + offset * 128,
+                            })
+                            .collect(),
+                        words,
+                        width: ExchangeItemWidth::Word32,
+                    },
+                )
+                .collect(),
+        };
+        let pending = pending_from_problem(8, &problem).unwrap();
+        let (counts, bases) = receive_configuration(&pending, 8).unwrap();
+        let aligned = materialize_greedy_schedule(&topology, &pending, &bases, &counts, 8).unwrap();
+        assert!(
+            materialize_schedule_order(
+                &topology,
+                &pending,
+                &bases,
+                &counts,
+                8,
+                &aligned.order,
+                false
+            )
+            .is_err()
+        );
+        let recipe = ScheduleRecipe {
+            widths: vec![ExchangeItemWidth::Word32; pending.len()],
+            order: aligned.order.clone(),
+            rows: normalized_rows(&aligned).unwrap(),
+        };
+        assert!(recipe.replay(&topology, &pending, 8).unwrap().is_some());
     }
 }

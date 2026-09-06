@@ -1039,6 +1039,7 @@ fn improve_pending_schedule(
             receive_counts,
             tile_count,
             &order,
+            false,
         );
         if let Ok(matching) = matching
             && schedule_score(&matching) < schedule_score(&schedule)
@@ -1059,6 +1060,7 @@ fn improve_pending_schedule(
             receive_counts,
             tile_count,
             &repaired_order,
+            false,
         );
         let Ok(repaired) = repaired else {
             break;
@@ -1973,6 +1975,7 @@ fn materialize_schedule_order(
     receive_counts: &[usize],
     tile_count: u16,
     order: &[usize],
+    validate_encoding: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     if order.len() != pending.len() {
         return Err(ExchangeLoweringError::Overflow);
@@ -2008,7 +2011,7 @@ fn materialize_schedule_order(
             receive_counts,
             index,
             dependency_ready,
-            false,
+            validate_encoding,
             &mut last_transfer,
         )?);
     }

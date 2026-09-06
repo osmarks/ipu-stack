@@ -279,7 +279,7 @@ fn borrowed_transmit_lane_allows_receive_but_excludes_local_send() {
         let (counts, bases) = receive_configuration(&pending, 64).unwrap();
         for order in [[0, 1, 2], [1, 0, 2]] {
             let schedule =
-                materialize_schedule_order(&topology, &pending, &bases, &counts, 64, &order)
+                materialize_schedule_order(&topology, &pending, &bases, &counts, 64, &order, false)
                     .unwrap();
             let activities = &schedule.activities[usize::from(partner)];
             let activity = |kind| activities.iter().find(|a| a.kind == kind).unwrap();
