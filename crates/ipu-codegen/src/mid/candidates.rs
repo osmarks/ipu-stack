@@ -2,6 +2,22 @@
 
 use super::*;
 
+mod search;
+pub(super) use search::CandidateSearch;
+
+// Explicit diagnostic plans bypass heuristic memory rejection; concrete
+// placement still decides whether their storage fits.
+pub(super) fn contains_forced_plan(operations: &[MidOperation], config: &PipelineConfig) -> bool {
+    operations.iter().any(|operation| {
+        operation.source.is_some_and(|source| {
+            config
+                .gemm_plan_constraints
+                .iter()
+                .any(|constraint| constraint.source_operation == source.index())
+        })
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct GroupedOutputLayout {
     pub(super) groups: u16,
@@ -21,9 +37,8 @@ pub(super) struct ParallelGridProxy {
     pub(super) grouped: bool,
 }
 
-pub(super) fn grouped_output_layout(
-    source: &[Operation],
-    operation_index: usize,
+fn grouped_output_layout(
+    consumers: &[Operation],
     operation: &Operation,
     output: &TensorShape,
     value_uses: &BTreeMap<ValueId, usize>,
@@ -32,7 +47,7 @@ pub(super) fn grouped_output_layout(
     if value_uses.get(&result).copied() != Some(1) {
         return None;
     }
-    let consumer = source[operation_index + 1..]
+    let consumer = consumers
         .iter()
         .find(|candidate| candidate.inputs.contains(&result))?;
     let OperationKind::View(view) = consumer.kind else {
@@ -49,9 +64,8 @@ pub(super) fn grouped_output_layout(
     })
 }
 
-pub(super) fn direct_consumer_layouts(
-    source: &[Operation],
-    operation_index: usize,
+fn direct_consumer_layouts(
+    consumers: &[Operation],
     result: ValueId,
     output: &TensorShape,
     config: &PipelineConfig,
@@ -72,7 +86,7 @@ pub(super) fn direct_consumer_layouts(
         .unwrap_or(u16::MAX)
         .min(config.tile_count / streams);
     let mut layouts = Vec::new();
-    for consumer in &source[operation_index + 1..] {
+    for consumer in consumers {
         for input_index in consumer
             .inputs
             .iter()

@@ -436,13 +436,6 @@ pub(super) fn future_format_compatibility(
     FutureFormatCompatibility(formats)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct PlanCacheKey {
-    pub(super) input_shapes: Vec<TensorShape>,
-    pub(super) parameter_inputs: Vec<bool>,
-    pub(super) format_sensitive_inputs: Vec<(usize, TensorFormat)>,
-}
-
 #[derive(Default)]
 pub(super) struct RegionPlanningConstraints {
     /// Number of simultaneously resident blocks represented by a region value.
@@ -504,27 +497,6 @@ pub(super) fn lower_operation_candidates(
         analysis: std::sync::OnceLock::new(),
     }];
     for (operation_index, operation) in source.iter().enumerate() {
-        let distributed_result_is_useful = operation.results.first().is_some_and(|result| {
-            required_outputs.contains(result)
-                || (value_uses.get(result).copied() == Some(1)
-                    && source[operation_index + 1..]
-                        .iter()
-                        .find(|consumer| consumer.inputs.contains(result))
-                        .is_some_and(|consumer| {
-                            config
-                                .operator_candidates
-                                .iter()
-                                .filter(|candidate| {
-                                    operator_matches(&consumer.kind, candidate.plan.operator)
-                                })
-                                .any(|candidate| {
-                                    matches!(
-                                        candidate.format_policy,
-                                        OperatorFormatPolicy::PreserveInputLayout(_)
-                                    )
-                                })
-                        }))
-        });
         let future_origins = source[operation_index + 1..]
             .iter()
             .flat_map(|operation| operation_graph_inputs(operation, graph))
@@ -543,22 +515,16 @@ pub(super) fn lower_operation_candidates(
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
-        let format_sensitive_indices = if matches!(operation.kind, OperationKind::View(_)) {
-            (0..operation.inputs.len()).collect::<BTreeSet<_>>()
-        } else {
-            config
-                .operator_candidates
-                .iter()
-                .filter(|candidate| operator_matches(&operation.kind, candidate.plan.operator))
-                .filter_map(|candidate| match candidate.format_policy {
-                    OperatorFormatPolicy::Concrete => None,
-                    OperatorFormatPolicy::PreserveInputLayout(index) => Some(usize::from(index)),
-                })
-                .collect()
-        };
-        let mut plan_cache = BTreeMap::<PlanCacheKey, Vec<OperatorPlan>>::new();
-        let mut plan_cache_hits = 0usize;
-        let mut generated_plan_sets = 0usize;
+        let mut candidates = CandidateSearch::new(
+            operation,
+            &source[operation_index + 1..],
+            operation
+                .results
+                .first()
+                .is_some_and(|result| required_outputs.contains(result)),
+            &value_uses,
+            config,
+        );
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
                 saw_candidate = true;
@@ -586,119 +552,25 @@ pub(super) fn lower_operation_candidates(
                 .iter()
                 .map(|value| branch.state.get(*value).tensor_type.clone())
                 .collect::<Vec<_>>();
-            if matches!(operation.kind, OperationKind::Gemm(_))
-                && input_types.get(1).is_some_and(|right| {
-                    right.shape.0[..right.shape.0.len().saturating_sub(2)]
-                        .iter()
-                        .any(|&extent| extent != 1)
-                })
-            {
-                return Err(LoweringError::UnsupportedGemmBatching(operation.id));
-            }
             let output_shape = shapes
                 .get(&operation.results[0])
                 .cloned()
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
-            let grouped_output = grouped_output_layout(
-                source,
-                operation_index,
-                operation,
-                &output_shape,
-                &value_uses,
-            );
-            let direct_consumer_layouts = direct_consumer_layouts(
-                source,
-                operation_index,
-                operation.results[0],
-                &output_shape,
-                config,
-            );
             let parameter_inputs = input_ids
                 .iter()
                 .map(|id| branch.state.parameter_values.contains(id))
                 .collect::<Vec<_>>();
-            let cache_key = PlanCacheKey {
-                input_shapes: input_types
-                    .iter()
-                    .map(|input| input.shape.clone())
-                    .collect(),
-                parameter_inputs: parameter_inputs.clone(),
-                format_sensitive_inputs: format_sensitive_indices
-                    .iter()
-                    .filter_map(|&index| {
-                        input_types
-                            .get(index)
-                            .map(|input| (index, input.format.clone()))
-                    })
-                    .collect(),
-            };
-            let cached = if let Some(cached) = plan_cache.get(&cache_key) {
-                plan_cache_hits += 1;
-                cached
-            } else {
-                generated_plan_sets += 1;
-                let generated = plans(
-                    operation,
-                    &input_types,
-                    &parameter_inputs,
-                    &output_shape,
-                    config,
-                    costs,
-                    distributed_result_is_useful,
-                    grouped_output,
-                    &direct_consumer_layouts,
-                );
-                plan_cache.entry(cache_key).or_insert(generated)
-            };
-            let candidate_plans = cached
+            let automatic_inputs = input_ids
                 .iter()
-                .filter(|&plan| {
-                    input_ids
-                        .iter()
-                        .zip(&plan.requirements.inputs)
-                        .all(|(id, requirement)| {
-                            let current = &branch.state.get(*id).tensor_type.format.layout;
-                            branch.state.automatic_inputs.contains(id)
-                                || current.order == requirement.format.layout.order
-                                || !requirement.format.layout.order.requires_direct_population()
-                                || (current.order == ElementOrder::RowMajor
-                                    && requirement
-                                        .format
-                                        .layout
-                                        .order
-                                        .supports_row_major_population())
-                        })
-                })
-                .cloned()
+                .map(|id| branch.state.automatic_inputs.contains(id))
                 .collect::<Vec<_>>();
-            let candidate_plans = if matches!(operation.kind, OperationKind::Gemm(_)) {
-                retain_operator_candidates(
-                    candidate_plans,
-                    &input_types,
-                    &output_shape,
-                    costs,
-                    config.planning_beam_width.max(1),
-                )
-            } else {
-                candidate_plans
-            };
-            let candidate_plans = candidate_plans
-                .into_iter()
-                .flat_map(|plan| {
-                    let mut complete = plan.clone();
-                    for requirement in &mut complete.requirements.inputs {
-                        requirement.materialization = OperandMaterialization::Complete;
-                    }
-                    match config.conversion_streaming {
-                        ConversionStreamingPolicy::Never => vec![complete],
-                        ConversionStreamingPolicy::Always => vec![plan],
-                        ConversionStreamingPolicy::WhenRequired if complete == plan => {
-                            vec![complete]
-                        }
-                        ConversionStreamingPolicy::WhenRequired => vec![complete, plan],
-                    }
-                })
-                .collect::<Vec<_>>();
+            let candidate_plans = candidates.generate(
+                &input_types,
+                &parameter_inputs,
+                &automatic_inputs,
+                &output_shape,
+                costs,
+            )?;
             saw_candidate |= !candidate_plans.is_empty();
             let evaluated = candidate_plans
                 .into_par_iter()
@@ -803,7 +675,7 @@ pub(super) fn lower_operation_candidates(
             if peak.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
-            ) || branch_contains_gemm_constraint(&branch, config)
+            ) || contains_forced_plan(&branch.operations, config)
             {
                 expanded.push(branch);
             } else {
@@ -846,8 +718,8 @@ pub(super) fn lower_operation_candidates(
             equivalent,
             diversity_representatives = diversity,
             best_cycles = deferred_aware_branch_score(&expanded[0], &future_origins),
-            generated_plan_sets,
-            plan_cache_hits,
+            generated_plan_sets = candidates.generated_plan_sets,
+            plan_cache_hits = candidates.plan_cache_hits,
             "retained planning beam"
         );
         beam = expanded;
@@ -872,7 +744,7 @@ pub(super) fn lower_operation_candidates(
             (peak.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
-            ) || branch_contains_gemm_constraint(&branch, config))
+            ) || contains_forced_plan(&branch.operations, config))
             .then(|| {
                 branch.peak_memory = peak;
                 branch
@@ -891,20 +763,6 @@ pub(super) fn lower_operation_candidates(
         return Err(LoweringError::NoCandidate(source[0].id));
     }
     Ok(beam)
-}
-
-pub(super) fn branch_contains_gemm_constraint(
-    branch: &BeamBranch,
-    config: &PipelineConfig,
-) -> bool {
-    branch.operations.iter().any(|operation| {
-        operation.source.is_some_and(|source| {
-            config
-                .gemm_plan_constraints
-                .iter()
-                .any(|constraint| constraint.source_operation == source.index())
-        })
-    })
 }
 
 #[allow(clippy::too_many_arguments)]

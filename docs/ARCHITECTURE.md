@@ -151,6 +151,13 @@ intermediate sizes to a "large" specialization. Full-block C++ softmax retains
 its query-row specialization; assembly tail softmax shares workers across both
 query and logical key sizes.
 
+`mid/candidates/search` owns per-operation candidate caching, input eligibility,
+consumer layout hints and local shortlisting. It accepts tensor types and input
+properties from each beam branch; it does not inspect or mutate planner state.
+The beam planner applies the returned candidates and compares whole-region costs
+and memory. Operator-specific validation and diagnostic constraint policy remain
+with candidate generation.
+
 Candidate recipes use `StorageRequirements` for format and materialization choices.
 Mid calls construct `KernelRequirements` from the actual buffers and primitive
 kernel kind. These contain only operand formats, alignment/access tails and SRAM
@@ -171,7 +178,9 @@ Both finalist ranking and final-package reporting use `scheduled_program_cycles`
 to compose actual exchange horizons with the optimized compute/copy timeline.
 
 `package/placement` screens physical tile mappings and SRAM offsets;
-`package/profile` owns instrumentation and profile metadata. `package/tile_program`
+`package/profile` owns instrumentation and profile metadata. `package/bindings`
+constructs host-visible bindings and physical-tile memory ranges for both sizing
+and final placement. `package/tile_program`
 packages explicit address-resolved programs for hardware diagnostics. The parent
 module coordinates linking, memory reservation and final image construction.
 
