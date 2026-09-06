@@ -54,9 +54,11 @@ fn main() -> Result<()> {
             .replace(".L", ".Lreference_")
             .replace("GELU_", "REFERENCE_GELU_")
             .replace("LOAD_GELU_CONSTANTS", "LOAD_REFERENCE_GELU_CONSTANTS");
-        source += &format!("\n#include \"{}\"\n", device.join(name).display());
+        source.push('\n');
+        source += &fs::read_to_string(device.join(name))?;
     }
     source += "\n.section .text.kernel_test_benign_fp,\"ax\",@progbits\n.supervisor\n.p2align 2\n.globl kernel_test_benign_fp\nkernel_test_benign_fp:\nget $m0, $FP_ICTL\nldconst $m1, 0xfffffff8\nand $m0, $m0, $m1\nput $FP_ICTL, $m0\nbr $m10\n";
+    source += "\n.section .text.kernel_test_strict_fp,\"ax\",@progbits\n.supervisor\n.p2align 2\n.globl kernel_test_strict_fp\nkernel_test_strict_fp:\nget $m0, $FP_ICTL\nsetzi $m1, 7\nor $m0, $m0, $m1\nput $FP_ICTL, $m0\nbr $m10\n";
     let wrapper = args.output.join("kernel_equivalence.S");
     fs::write(&wrapper, source)?;
     let mut programs = (0..1472)
@@ -131,6 +133,9 @@ fn main() -> Result<()> {
         }
 
         for (symbol, output) in [(format!("reference_{name}"), old), (name.into(), new)] {
+            if *partials == 1 && output == new {
+                steps.push(call("kernel_test_strict_fp", 0, &[], &[0]));
+            }
             let initial = if *inplace { output } else { input };
             let inputs = if *partials == 1 {
                 vec![initial]
@@ -291,9 +296,6 @@ fn main() -> Result<()> {
             position += 2;
             let reference = if *partials == 1 {
                 let x = f16::from_bits(values[element]).to_f64();
-                if x.abs() > 8.0 {
-                    continue;
-                }
                 x * 0.5
                     * (1.0
                         + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh())

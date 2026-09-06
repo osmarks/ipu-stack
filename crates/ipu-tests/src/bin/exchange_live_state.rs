@@ -15,6 +15,9 @@ struct Arguments {
     /// Also stop context zero briefly to recover its program counter.
     #[arg(long)]
     program_counter: bool,
+    /// Read worker status and operand pointers instead of supervisor exchange registers.
+    #[arg(long)]
+    workers: bool,
 }
 
 fn main() -> Result<()> {
@@ -27,6 +30,19 @@ fn main() -> Result<()> {
             continue;
         }
         let physical = topology.physical(logical)?;
+        if arguments.workers {
+            for worker in 1..=6 {
+                let status = device.read_tile_worker_status(physical, worker)?;
+                let registers = (2..=4)
+                    .map(|register| device.read_tile_m_register(physical, worker, register))
+                    .collect::<Result<Vec<_>, _>>()?;
+                println!(
+                    "logical={logical} worker={worker} status=0x{status:08x} exception={:?} pointers={registers:?}",
+                    ipu_driver::TileException::from_status(status)
+                );
+            }
+            continue;
+        }
         let context = device
             .tile_context_state(physical, 0)
             .with_context(|| format!("read tile {logical} context state"))?;

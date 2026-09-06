@@ -132,7 +132,7 @@ pub(crate) fn f16_reduction_cycles(elements: u64, partials: u64) -> u64 {
 }
 
 /// gelu_f16.S has a fast path for whole 16-element blocks. Other even lengths
-/// use 64-issue-group blocks and a 16-issue-group scalar-pair tail. Evaluate
+/// use 88-issue-group blocks and a 20-issue-group scalar-pair tail. Evaluate
 /// at most six worker spans, independent of tensor size or tile count. The
 /// tail setup conservatively covers the final worker's six-cycle exit skew.
 pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
@@ -140,7 +140,7 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
         return 0;
     }
     if elements.is_multiple_of(16) {
-        return 300u64.saturating_add(elements.div_ceil(96).saturating_mul(366));
+        return 330u64.saturating_add(elements.div_ceil(96).saturating_mul(510));
     }
     (0..6)
         .map(|worker| {
@@ -151,9 +151,9 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
             let blocks = if pairs < 8 { 0 } else { (pairs - 8) / 48 + 1 };
             let tail = pairs.saturating_sub(blocks.saturating_mul(48));
             blocks
-                .saturating_mul(384)
-                .saturating_add(tail.saturating_mul(96))
-                .saturating_add(if tail == 0 { 300 } else { 312 })
+                .saturating_mul(528)
+                .saturating_add(tail.saturating_mul(120))
+                .saturating_add(if tail == 0 { 330 } else { 342 })
         })
         .max()
         .unwrap_or(0)
@@ -202,17 +202,17 @@ mod tests {
     #[test]
     fn gelu_tracks_hardware_for_blocks_and_pair_tails() {
         for (elements, measured) in [
-            (2, 408),
-            (6, 600),
-            (14, 984),
-            (16, 666),
-            (18, 684),
-            (30, 984),
-            (94, 978),
-            (96, 666),
-            (98, 792),
-            (1408, 5790),
-            (2208, 8718),
+            (2, 462),
+            (6, 702),
+            (14, 1182),
+            (16, 840),
+            (18, 858),
+            (30, 1182),
+            (94, 1176),
+            (96, 840),
+            (98, 990),
+            (1408, 7980),
+            (2208, 12060),
         ] {
             let predicted = f16_gelu_cycles(elements);
             assert!(predicted >= measured && predicted - measured <= 6);

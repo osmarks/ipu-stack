@@ -13,10 +13,14 @@
 
 	.macro GELU_PAIR value
 	// tanh GeLU: x/2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))).
-	f16v2mul $a2, \value, \value
-	f16v2mul $a2, $a2, \value
+	ld32 $a2, $mvertex_base, $m15, 3
+	f16v2min $a3, \value, $a2
+	ld32 $a2, $mvertex_base, $m15, 4
+	f16v2max $a3, $a3, $a2
+	f16v2mul $a2, $a3, $a3
+	f16v2mul $a2, $a2, $a3
 	f16v2mul $a2, $a4, $a2
-	f16v2add $a2, \value, $a2
+	f16v2add $a2, $a3, $a2
 	f16v2mul $a2, $a5, $a2
 	f16v2tanh $a2, $a2
 	f16v2add $a2, $a6, $a2
@@ -29,16 +33,26 @@
 	ldconst $a5, GELU_ALPHA_F16X2
 	ldconst $a6, ONE_F16X2
 	ldconst $a7, HALF_F16X2
+	// Bound the tanh polynomial, not the final x: |x|>=8 is saturated.
+	// Bounds live in the worker arguments; only eight ARF registers are writable.
 	.endm
 
-	.macro GELU_TWO_PAIRS
+	.macro GELU_TWO_PAIRS offset
+	ld32 $a2, $mvertex_base, $m15, 3
+	ld32 $a3, $mvertex_base, $m15, 3
+	f16v4min $a0:1, $a0:1, $a2:3
+	ld32 $a2, $mvertex_base, $m15, 4
+	ld32 $a3, $mvertex_base, $m15, 4
+	f16v4max $a0:1, $a0:1, $a2:3
 	f16v4mul $a2:3, $a0:1, $a0:1
 	f16v4mul $a2:3, $a2:3, $a0:1
 	f16v4mul $a2:3, $a4:BL, $a2:3
 	f16v4add $a2:3, $a0:1, $a2:3
 	f16v4mul $a2:3, $a5:BL, $a2:3
-	f16v2tanh $a2, $a2
-	f16v2tanh $a3, $a3
+	{ ld32 $a0, $m3, $m15, \offset
+	  f16v2tanh $a2, $a2 }
+	{ ld32 $a1, $m3, $m15, (\offset + 1)
+	  f16v2tanh $a3, $a3 }
 	f16v4add $a2:3, $a6:BL, $a2:3
 	f16v4mul $a2:3, $a7:BL, $a2:3
 	f16v4mul $a2:3, $a0:1, $a2:3
@@ -47,22 +61,22 @@
 	.macro GELU_EIGHT_PAIRS
 	ld32 $a0, $m3, $m15, 0
 	ld32 $a1, $m3, $m15, 1
-	GELU_TWO_PAIRS
+	GELU_TWO_PAIRS 0
 	st32 $a2, $m2, $m15, 0
 	st32 $a3, $m2, $m15, 1
 	ld32 $a0, $m3, $m15, 2
 	ld32 $a1, $m3, $m15, 3
-	GELU_TWO_PAIRS
+	GELU_TWO_PAIRS 2
 	st32 $a2, $m2, $m15, 2
 	st32 $a3, $m2, $m15, 3
 	ld32 $a0, $m3, $m15, 4
 	ld32 $a1, $m3, $m15, 5
-	GELU_TWO_PAIRS
+	GELU_TWO_PAIRS 4
 	st32 $a2, $m2, $m15, 4
 	st32 $a3, $m2, $m15, 5
 	ld32 $a0, $m3, $m15, 6
 	ld32 $a1, $m3, $m15, 7
-	GELU_TWO_PAIRS
+	GELU_TWO_PAIRS 6
 	st32 $a2, $m2, $m15, 6
 	st32 $a3, $m2, $m15, 7
 	.endm
@@ -74,14 +88,18 @@
 	.type \symbol,@function
 \symbol:
 	.supervisor
-	add $m11, $m11, -16
+	add $m11, $m11, -32
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
 	st32 $m4, $m11, $m15, 2
+	ldconst $m0, 0x48004800
+	st32 $m0, $m11, $m15, 3
+	ldconst $m0, 0xc800c800
+	st32 $m0, $m11, $m15, 4
 	setzi $m0, \worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
-	add $m11, $m11, 16
+	add $m11, $m11, 32
 	br $m10
 	.size \symbol, .-\symbol
 	.endm
