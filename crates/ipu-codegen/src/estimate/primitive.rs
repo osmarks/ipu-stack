@@ -103,6 +103,14 @@ pub(crate) fn kernel_cycles(
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }
+        TileKernelSpec::Cast {
+            from: Precision::F32,
+            to: Precision::F16,
+        } => {
+            // Six workers convert one pair per iteration, including loop and
+            // address updates. Include wrapper startup and the scalar tail.
+            return 330 + elements.div_ceil(12).saturating_mul(48);
+        }
         TileKernelSpec::Cast { .. } => elements.div_ceil(8),
         TileKernelSpec::Rearrange { from, .. } => {
             if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)

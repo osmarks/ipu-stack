@@ -223,7 +223,11 @@ pub fn tile_kernel_abi(
             ),
             TileKernelSpec::Cast { from, to } => (
                 KernelSymbols::Exact(cast_symbol(*from, *to)),
-                KernelAvailability::Required,
+                if (*from, *to) == (Precision::F32, Precision::F16) {
+                    KernelAvailability::Implemented
+                } else {
+                    KernelAvailability::Required
+                },
                 1,
                 &[ScalarValue::ElementCount],
             ),

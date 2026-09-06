@@ -31,6 +31,7 @@ impl KernelBuildPlan {
         let KernelInventory {
             rows,
             gelu,
+            cast_f32_f16,
             reduction_add,
             rearrangements,
             unpacks,
@@ -57,7 +58,21 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["ipu_stack_reduce_sum_f16".into()],
             });
         }
-        let has_worker_codelets = !rearrangements.is_empty() || !unpacks.is_empty();
+        if cast_f32_f16 {
+            plan.compilations.push(KernelCompilation {
+                source: "cast_f32_f16.cpp",
+                name: "cast_f32_f16_codelet".into(),
+                flags: vec!["-O2".into()],
+                retained_symbols: Vec::new(),
+            });
+            plan.add_worker_wrapper(
+                "cast_f32_f16_wrapper".into(),
+                "ipu_stack_cast_f32_f16",
+                "CastF32ToF16",
+                &[3, 2, 4],
+            );
+        }
+        let has_worker_codelets = cast_f32_f16 || !rearrangements.is_empty() || !unpacks.is_empty();
         for shape in unpacks {
             plan.add_unpack(shape);
         }

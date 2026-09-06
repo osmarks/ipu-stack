@@ -160,6 +160,7 @@ impl KernelSpecialization {
 pub(super) struct KernelInventory {
     pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
     pub(super) gelu: bool,
+    pub(super) cast_f32_f16: bool,
     pub(super) reduction_add: bool,
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     pub(super) unpacks: BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
@@ -182,6 +183,13 @@ impl KernelInventory {
                         return Err(KernelAbiError::Unavailable(kernel.clone()));
                     }
                     if matches!(abi.symbols, KernelSymbols::Exact(_)) {
+                        self.cast_f32_f16 |= matches!(
+                            kernel,
+                            TileKernelSpec::Cast {
+                                from: Precision::F32,
+                                to: Precision::F16
+                            }
+                        );
                         self.gelu |= matches!(kernel, TileKernelSpec::Gelu);
                         self.reduction_add |= matches!(kernel, TileKernelSpec::ReductionSum { .. });
                         continue;

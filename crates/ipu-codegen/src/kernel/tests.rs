@@ -548,3 +548,50 @@ fn packed_gemm_stores_bind_without_output_copies() {
         }
     }
 }
+
+#[test]
+fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
+    let plan = KernelBuildPlan::from_inventory(KernelInventory {
+        cast_f32_f16: true,
+        ..KernelInventory::default()
+    })
+    .unwrap();
+    for count in [1, 2, 11, 12, 13, 72, 729, 1152] {
+        let format = |precision| TensorFormat {
+            precision,
+            layout: Layout::row_major(TensorTiling::replicated(1)),
+        };
+        let view = |id| ShardView {
+            shard: BlockValueId::from_index(id),
+            extents: vec![ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: count,
+                physical_end: count,
+            }],
+        };
+        let run = KernelRun::new(
+            WorkProvenance {
+                operation: None,
+                value: None,
+                reason: WorkReason::PrecisionCast,
+            },
+            TileKernelSpec::Cast {
+                from: Precision::F32,
+                to: Precision::F16,
+            },
+            vec![crate::KernelOperand {
+                views: vec![view(0)],
+            }],
+            view(1),
+            KernelRequirements {
+                inputs: vec![KernelAccess::new(format(Precision::F32), 8)],
+                output: KernelAccess::new(format(Precision::F16), 8),
+                distinct_elements: Vec::new(),
+            },
+        );
+        let call = plan.call(&run).unwrap();
+        assert_eq!(call.arguments, [count]);
+        assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
+    }
+}
