@@ -1136,13 +1136,25 @@ fn build_package_from_objects(
         execution_tile_count,
         true,
     )?;
-    if exchange_rows
-        .as_ref()
-        .is_some_and(|storage| finalizer.exchange_code_end() > storage.range.end)
-    {
-        return Err(invalid(
-            "final exchange rows exceeded their planned allocation",
-        ));
+    if let Some(storage) = &exchange_rows {
+        // Placement can change row sharing and instruction alignment. The
+        // entire SRAM element is already excluded from tensor storage, so
+        // let final rows use its padding while retaining fetch look-ahead.
+        let capacity_end = storage.reserved.end - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD;
+        tracing::debug!(
+            planned_bytes = storage.range.len(),
+            final_bytes = finalizer.exchange_code_end() - storage.range.start,
+            capacity_bytes = capacity_end - storage.range.start,
+            "checked final exchange table capacity"
+        );
+        if finalizer.exchange_code_end() > capacity_end {
+            return Err(invalid(format!(
+                "final exchange rows require {} bytes; planned {}, reserved capacity {}",
+                finalizer.exchange_code_end() - storage.range.start,
+                storage.range.len(),
+                capacity_end - storage.range.start,
+            )));
+        }
     }
     let prepared = build_phase("prepare_tile_code", || {
         physical_to_logical

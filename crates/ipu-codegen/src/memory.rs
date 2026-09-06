@@ -32,7 +32,8 @@ pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * ipu_package::TILE_M
 pub(crate) struct MemoryAllocation {
     pub name: &'static str,
     pub range: Range<u32>,
-    reserved: Range<u32>,
+    /// Entire reservation, including end alignment and any trailing guard.
+    pub reserved: Range<u32>,
 }
 
 #[derive(Clone, Debug)]
