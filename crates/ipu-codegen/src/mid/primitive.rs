@@ -16,21 +16,31 @@ pub struct ProductAxes {
     pub output_column: TensorAxis,
 }
 
+/// Map output coordinates back to the source: first add the window offsets,
+/// then apply the optional factor-axis view. Layout/storage order is separate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoordinateMapping {
+    pub offsets: Vec<u32>,
+    pub view: Option<AxisFactorView>,
+}
+
+impl From<AxisFactorView> for CoordinateMapping {
+    fn from(view: AxisFactorView) -> Self {
+        Self {
+            offsets: Vec::new(),
+            view: Some(view),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Primitive {
-    /// Populate an ordinary distributed output tensor. Each source coordinate
-    /// is the corresponding output coordinate plus its selected axis offset.
-    /// Storage order changes and padding are part of this materialization.
+    /// Populate a distributed output using a logical coordinate mapping.
+    /// Ownership, storage-order changes and padding follow the tensor layouts.
     Copy {
-        offsets: Vec<u32>,
-        /// Retain a compatible resident view instead of copying read-only data.
+        mapping: CoordinateMapping,
+        /// Reuse compatible resident storage when lowering can prove it safe.
         reuse_local: bool,
-    },
-    View(AxisFactorView),
-    /// Materialize a window of a logical view directly from its source.
-    MappedCopy {
-        view: AxisFactorView,
-        offsets: Vec<u32>,
     },
     /// Invoke the selected kernel over the output distribution. GEMM blocking
     /// enumerates local calls later; it does not choose distribution or staging.

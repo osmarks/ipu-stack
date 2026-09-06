@@ -3,7 +3,7 @@
 mod emit;
 mod primitive;
 
-mod views;
+mod materialize;
 
 mod buffers;
 mod conversion;
@@ -403,11 +403,9 @@ fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
                 WorkReason::PrecisionCast
             }
             MidOperationKind::Convert(_) => WorkReason::LayoutRearrangement,
-            MidOperationKind::Primitive(
-                crate::Primitive::Copy { .. }
-                | crate::Primitive::View(_)
-                | crate::Primitive::MappedCopy { .. },
-            ) => WorkReason::OperatorInputs,
+            MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => {
+                WorkReason::OperatorInputs
+            }
             MidOperationKind::Operator { .. } | MidOperationKind::Primitive(_) => {
                 WorkReason::OperatorKernel
             }

@@ -129,6 +129,15 @@ convenience constructor, with no separate graph or mid operator kind. The mappin
 axes, validates the output shape, and maps rectangular slices back to their
 source. Materialized and deferred lowering share this geometry. This is a
 split/merge view primitive, not yet a general reshape/permutation composition.
+At executable mid level, all materialization uses `Primitive::Copy` with a
+`CoordinateMapping` and `reuse_local` policy. The mapping adds window offsets
+and then applies an optional `AxisFactorView`; an empty mapping is identity.
+Full views and consumer windows share the same lowering in `low/expand/materialize`,
+including physical micro-panel exchange and AMP unpacking fallback. Local storage
+reuse is currently proven only for compatible identity copies. Deferred view
+binding attaches its mapping to the consumer's copy instead of changing operation
+kind; deferred cost accounting is unchanged.
+
 Attention-specific candidate layouts remain, alongside a row-major fallback for
 other axis pairs. Their emitted movement is priced directly. The host reference evaluator uses an
 independent forward mapping to check the compiler's inverse slice mapping.

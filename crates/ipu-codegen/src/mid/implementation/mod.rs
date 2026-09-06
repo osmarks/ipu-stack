@@ -45,7 +45,14 @@ pub(crate) fn implement(
             let MidOperator::View(view) = plan.operator else {
                 return None;
             };
-            b.emit(vec![MidValueId(0)], output.clone(), Primitive::View(view))
+            b.emit(
+                vec![MidValueId(0)],
+                output.clone(),
+                Primitive::Copy {
+                    mapping: view.into(),
+                    reuse_local: false,
+                },
+            )
         }
         OperatorDispatch::BlockedGemm {
             inner_block,
@@ -166,7 +173,10 @@ impl Builder {
             vec![input],
             output,
             Primitive::Copy {
-                offsets,
+                mapping: CoordinateMapping {
+                    offsets,
+                    view: None,
+                },
                 reuse_local,
             },
         )
@@ -341,13 +351,15 @@ fn resolve_region(
                     for value in step.inputs.iter_mut().chain(&mut step.results) {
                         *value = ids[value.index() as usize]?;
                     }
-                    if let MidOperationKind::Primitive(Primitive::Copy { offsets, .. }) = &step.kind
+                    if let MidOperationKind::Primitive(Primitive::Copy {
+                        mapping,
+                        reuse_local,
+                    }) = &mut step.kind
+                        && mapping.view.is_none()
                         && let Some(&(source, view)) = views.get(&step.inputs[0])
                     {
-                        step.kind = MidOperationKind::Primitive(Primitive::MappedCopy {
-                            view,
-                            offsets: offsets.clone(),
-                        });
+                        mapping.view = Some(view);
+                        *reuse_local = false;
                         step.inputs[0] = source;
                     }
                     if let MidOperationKind::Primitive(Primitive::Compute { operands, .. }) =
@@ -369,16 +381,13 @@ fn resolve_region(
                                     source: operation.source,
                                     inputs: vec![mapping.map_or(*input, |(source, _)| source)],
                                     results: vec![id],
-                                    kind: MidOperationKind::Primitive(mapping.map_or(
-                                        Primitive::Copy {
-                                            offsets: vec![],
-                                            reuse_local: true,
-                                        },
-                                        |(_, view)| Primitive::MappedCopy {
-                                            view,
-                                            offsets: vec![],
-                                        },
-                                    )),
+                                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                                        mapping: mapping.map_or_else(
+                                            CoordinateMapping::default,
+                                            |(_, view)| view.into(),
+                                        ),
+                                        reuse_local: mapping.is_none(),
+                                    }),
                                     estimated_cycles: 0,
                                     estimated_exchange_cycles: 0,
                                 });

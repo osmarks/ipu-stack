@@ -1189,21 +1189,28 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         assert_eq!(claims.len(), split.len(), "random case {case}");
         assert!(claims.iter().all(Option::is_some), "random case {case}");
         let compact = implementation::resolve(lowered.clone()).unwrap();
+        for claim in claims.iter().flatten() {
+            assert!(
+                compact
+                    .operations
+                    .iter()
+                    .all(|op| !op.results.contains(&claim.producer)),
+                "claimed view must not be separately materialized"
+            );
+        }
+
         assert!(
             compact
                 .operations
                 .iter()
                 .all(|op| !matches!(op.kind, MidOperationKind::Operator { .. }))
         );
-        assert!(
-            !compact
-                .operations
-                .iter()
-                .any(|op| matches!(op.kind, MidOperationKind::Primitive(Primitive::View(_))))
-        );
         assert!(compact.operations.iter().any(|op| matches!(
             op.kind,
-            MidOperationKind::Primitive(Primitive::MappedCopy { .. })
+            MidOperationKind::Primitive(Primitive::Copy {
+                mapping: CoordinateMapping { view: Some(_), .. },
+                ..
+            })
         )));
         assert!(compact.operations.iter().any(|op| matches!(
             op.kind,
@@ -1268,12 +1275,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
                     .operations
                     .iter()
                     .filter(|op| op.source == consumer.source
-                        && matches!(
-                            op.kind,
-                            MidOperationKind::Primitive(
-                                Primitive::Copy { .. } | Primitive::MappedCopy { .. }
-                            )
-                        ))
+                        && matches!(op.kind, MidOperationKind::Primitive(Primitive::Copy { .. })))
                     .count(),
             "random case {case}: {attention_phases} attention exchange phases"
         );

@@ -13,26 +13,9 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<()> {
         match primitive {
             Primitive::Copy {
-                offsets,
+                mapping,
                 reuse_local,
-            } => self.copy_tensor(operation, offsets, *reuse_local, body),
-            Primitive::MappedCopy { view, offsets } => {
-                let inputs = self.value_shards(operation.inputs[0])?.to_vec();
-                let outputs = self.value_shards(operation.results[0])?.to_vec();
-                let mappings = self.window_view_mappings(&inputs, &outputs, *view, offsets)?;
-                let physical = self.f16_micro_panel_mappings(mappings.clone())?;
-                let (mappings, order) = physical.map_or((mappings, CopyOrder::Semantic), |m| {
-                    (m, CopyOrder::Physical)
-                });
-                self.build_mapped_views(
-                    mappings,
-                    order,
-                    order,
-                    operation_provenance(operation),
-                    body,
-                )
-            }
-            Primitive::View(view) => self.build_view(operation, *view, body),
+            } => self.copy_tensor(operation, mapping, *reuse_local, body),
             Primitive::Sum { axis, staging } => {
                 self.sum_tensor(operation, usize::from(*axis), *staging, body)
             }
@@ -125,130 +108,6 @@ impl TileGraphBuilder {
             .map(|&(axis, start, end)| (usize::from(axis), start, end))
             .collect::<Vec<_>>();
         self.narrow_view(source, &ranges)
-    }
-
-    fn copy_tensor(
-        &mut self,
-        operation: &MidOperation,
-        offsets: &[u32],
-        reuse_local: bool,
-        body: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
-        else {
-            return Err(ExpansionError::ResultArity);
-        };
-        let inputs = self.value_shards(*input)?.to_vec();
-        let outputs = self.value_shards(*output)?.to_vec();
-        let mut mappings = Vec::new();
-        for output in outputs {
-            let destination = &self.shards[output.index() as usize];
-            let tile = destination.tile;
-            let mut source_region = destination.extents.clone();
-            for (axis, extent) in source_region.iter_mut().enumerate() {
-                let offset = offsets.get(axis).copied().unwrap_or(0);
-                extent.start = extent
-                    .start
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-                extent.logical_end = extent
-                    .logical_end
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-                extent.physical_end = extent
-                    .physical_end
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-            }
-            let intersections = self
-                .intersecting_shard_set(&inputs, &source_region, tile)
-                .into_iter()
-                .map(|(_, source)| {
-                    (
-                        intersect_extents_with_shared_padding(
-                            &self.shards[source.index() as usize].extents,
-                            &source_region,
-                        )
-                        .expect("selected intersection remains nonempty"),
-                        source,
-                    )
-                })
-                .collect::<Vec<_>>();
-            if reuse_local
-                && offsets.iter().all(|&offset| offset == 0)
-                && let [(extents, source)] = intersections.as_slice()
-                && *extents == self.shards[output.index() as usize].extents
-                && self.shards[source.index() as usize].tile == tile
-                && self.shards[source.index() as usize]
-                    .tensor_type
-                    .format
-                    .precision
-                    == self.shards[output.index() as usize]
-                        .tensor_type
-                        .format
-                        .precision
-                && self.shards[source.index() as usize]
-                    .tensor_type
-                    .format
-                    .layout
-                    .order
-                    == self.shards[output.index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .order
-            {
-                let mut view = self.full_view(*source);
-                view.extents = extents.clone();
-                self.materialized_views.insert(output, view);
-                self.shards[output.index() as usize].definition = ShardDefinition::Unmaterialized;
-                continue;
-            }
-            if intersections.is_empty() {
-                self.append_fill_zero(body, output, operation_provenance(operation))?;
-            }
-            for (source_extents, source) in intersections {
-                let mut destination_extents = source_extents.clone();
-                for (axis, extent) in destination_extents.iter_mut().enumerate() {
-                    let offset = offsets.get(axis).copied().unwrap_or(0);
-                    extent.start -= offset;
-                    extent.logical_end -= offset;
-                    extent.physical_end -= offset;
-                }
-                mappings.push((
-                    ShardView {
-                        shard: self.full_view(source).shard,
-                        extents: source_extents,
-                    },
-                    ShardView {
-                        shard: output,
-                        extents: destination_extents,
-                    },
-                ));
-            }
-        }
-        let order = if self.shards[inputs[0].index() as usize]
-            .tensor_type
-            .format
-            .layout
-            .order
-            == self.shards[self.value_shards(*output)?[0].index() as usize]
-                .tensor_type
-                .format
-                .layout
-                .order
-        {
-            CopyOrder::Physical
-        } else {
-            CopyOrder::Semantic
-        };
-        self.build_mapped_views(
-            mappings,
-            order,
-            order,
-            operation_provenance(operation),
-            body,
-        )
     }
 
     fn product_calls(

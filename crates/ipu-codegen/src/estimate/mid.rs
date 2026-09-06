@@ -252,10 +252,7 @@ fn operation_cost(
                     crate::kernel::cost::f16_reduction_cycles(elements, tail + 1)
                 });
         }
-        MidOperationKind::Primitive(
-            Primitive::Copy { .. } | Primitive::View(_) | Primitive::MappedCopy { .. },
-        )
-        | MidOperationKind::Convert(_) => {
+        MidOperationKind::Primitive(Primitive::Copy { .. }) | MidOperationKind::Convert(_) => {
             let input = tensor(operation.inputs[0]);
             let bytes = maximum_shard_bytes(output);
             let same_ownership = crate::mid::implementation::same_distribution(input, output)
@@ -264,7 +261,10 @@ fn operation_cost(
             if !same_ownership
                 || matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::View(_) | Primitive::MappedCopy { .. })
+                    MidOperationKind::Primitive(Primitive::Copy {
+                        mapping: crate::CoordinateMapping { view: Some(_), .. },
+                        ..
+                    })
                 )
             {
                 let destinations = u64::from(output.format.layout.tiling.tile_count);
