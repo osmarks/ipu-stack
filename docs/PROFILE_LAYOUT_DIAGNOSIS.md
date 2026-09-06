@@ -964,3 +964,67 @@ work: that bound excludes multicast coupling, SRAM hazards and control costs.
 Nevertheless, the identical-traffic address experiment establishes a substantial
 placement-sensitive tail. Conflict-aware placement and ordering are better next
 targets than assuming a fundamental multicast throughput limit.
+
+## Bounded exchange-aware placement (2026-09-06)
+
+Package construction now tries interleaved-arena starts at 4 KiB increments
+within one 32 KiB memory element. Candidates go through the ordinary allocator,
+including aliases, lifetimes, kernel alignment/distinct-element requirements,
+repeat strides and final package support-memory reservations. Infeasible
+candidates are skipped. The baseline remains available.
+
+A cheap address-only score sums send-bytes × receive-bytes for opposing accesses
+that share any effective SRAM element within a tile and exchange phase. Grouping
+fragments by element set avoids quadratic work in fragment count. This is an
+approximation to contention under independent arrivals, not an exchange-cycle
+estimate: it deliberately leaves pairing, multicast coupling, instruction costs,
+repeat source-address hazards and ordering to the real scheduler. The shortlist
+uses physical view spans and does not expand operator internals again.
+
+Only the best lower-scoring candidate is scheduled. It is accepted only if the
+sum of scheduled phase horizons, weighted by structured-repeat execution counts,
+improves and its compact exchange table fits reserved storage. The candidate
+uses a copy of the existing schedule cache; unchanged normalized rows can reuse
+validated recipes. Unschedulable alternatives fall back to the baseline. This
+happens after operator/layout selection, so the search adds no branches to the
+mid-level planner.
+
+| Profile | Selected offset | Redistribution before → after | Hardware max tile cycles before → after |
+|---|---:|---:|---:|
+| Historical grids | 4 KiB | 41,194 → 32,939 | 202,764 → 194,574 |
+| Automatic grids | 28 KiB | 29,575 → 24,612 | 207,930 → 202,392 |
+
+Both complete MLPs pass numerical validation (maximum absolute error 0.011719).
+The historical exchange improves 20.0%, and the full model improves 4.0%; the
+automatic exchange improves 16.8%, and its full model improves 2.7%. The actual
+allocator reproduces the earlier historical snapshot offset result.
+
+Artifacts: `/tmp/placement-search-{historical,automatic}.{log,ipuexe,ipuprofile}`;
+HTML in `artifacts/profiles/mlp-historical-placement.html` and
+`artifacts/profiles/mlp-placement.html`. The historical search takes about 15 s,
+dominated by rescheduling; build time remains the principal tradeoff. This is a
+bounded global arena-offset search, not per-buffer or per-tile optimization.
+It does not claim to eliminate the remaining schedule tail.
+
+Validation includes 170 passing workspace release tests (one ignored), strict
+workspace Clippy, and randomized kernel placement with nonzero arena offsets.
+A regression checks the concrete tile-368 weight-buffer conflict and its removal
+by relocation. Additional hardware coverage is recorded below.
+
+The historical profile's phase-2 arrival spread remains 14,904 cycles, while its
+measured duration after last arrival drops from 41,454 to 33,192 cycles. Thus the
+runtime improvement matches the shorter exchange rather than changed preceding
+compute. The rendered timeline was also checked in headless Chromium.
+
+GEMM, batched GEMM, attention smoke, a two-block structured-repeat MLP, and full
+SigLIP attention pass on hardware. Attention checks 839,808 values with maximum
+error 0.001230. Its placement remains unchanged: no candidate improves the cheap
+score, so no additional complete schedule is evaluated (the placement/scoring
+pass itself takes about 5 s). Logs are `/tmp/placement-validated-*.log` and
+`/tmp/placement-validation-results.log`.
+
+The final automatic MLP rebuild, including schedule-cache reuse, also passes
+with exactly 202,392 maximum tile cycles. Its placement search takes 37.7 s;
+most of that is reoptimizing the large final-reduction phase. Final artifacts
+are `/tmp/placement-validated-automatic.{log,ipuexe,ipuprofile}`, and the automatic
+HTML above has been refreshed from that run.
