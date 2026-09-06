@@ -1297,15 +1297,10 @@ pub(super) struct OperatorCompatibility {
     // result ownership and cost to the next consumer differ substantially.
     pub(super) inner_partitions: Option<u16>,
     pub(super) result_partitions: Option<(u16, u16)>,
-    pub(super) inputs: Vec<(
-        Precision,
-        ElementOrderCompatibility,
-        MemoryClass,
-        LocalOperandStaging,
-    )>,
+    pub(super) inputs: Vec<(Precision, ElementOrder, MemoryClass, LocalOperandStaging)>,
     pub(super) output: (
         Precision,
-        ElementOrderCompatibility,
+        ElementOrder,
         MemoryClass,
         Vec<(TensorAxis, u16, u32)>,
     ),
@@ -1348,7 +1343,7 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
             .map(|input| {
                 (
                     input.format.precision,
-                    element_order_compatibility(input.format.layout.order),
+                    input.format.layout.order,
                     input.format.layout.memory_class,
                     input.local_staging,
                 )
@@ -1356,7 +1351,7 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
             .collect(),
         output: (
             candidate.requirements.output.format.precision,
-            element_order_compatibility(candidate.requirements.output.format.layout.order),
+            candidate.requirements.output.format.layout.order,
             candidate.requirements.output.format.layout.memory_class,
             candidate
                 .requirements

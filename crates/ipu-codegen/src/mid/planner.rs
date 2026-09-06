@@ -349,13 +349,16 @@ pub(super) struct RankedBeamBranch {
     pub(super) order: usize,
 }
 
+// Retain the complete panel order: shared activations packed with different
+// K block sizes can have different costs at later consumers. Ownership counts
+// remain searchable within a family.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct FutureFormatCompatibility(
     Vec<(
         ValueId,
         FutureFormatRole,
         Precision,
-        ElementOrderCompatibility,
+        ElementOrder,
         MemoryClass,
         Vec<(TensorAxis, u16, u32)>,
     )>,
@@ -365,27 +368,6 @@ pub(super) struct FutureFormatCompatibility(
 pub(super) enum FutureFormatRole {
     Value,
     DeferredSource,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum ElementOrderCompatibility {
-    RowMajor,
-    BlockMajorMatrix,
-    BlockMajorTransposedMatrix,
-    Amp(AmpOrder),
-}
-
-pub(super) fn element_order_compatibility(order: ElementOrder) -> ElementOrderCompatibility {
-    match order {
-        ElementOrder::RowMajor => ElementOrderCompatibility::RowMajor,
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
-            ElementOrderCompatibility::BlockMajorMatrix
-        }
-        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
-            ElementOrderCompatibility::BlockMajorTransposedMatrix
-        }
-        ElementOrder::Amp(order) => ElementOrderCompatibility::Amp(order),
-    }
 }
 
 fn future_formats<'a>(
@@ -438,7 +420,7 @@ fn future_format_compatibility(
                     origin,
                     role,
                     format.precision,
-                    element_order_compatibility(format.layout.order),
+                    format.layout.order,
                     format.layout.memory_class,
                     axes,
                 )

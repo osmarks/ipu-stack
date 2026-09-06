@@ -616,3 +616,48 @@ than removal of the redundant representations addressed here.
   Profiles and rendered HTML are in
   `artifacts/layout-sweep/attention-packed-balanced-{flash,materialized}`;
   additional calibration runs are `gemm-packed-{full-panels,panel-boundaries}`.
+
+## Consumer layout requests through views (2026-09-06)
+
+- A compact backward pass gathers consumer order requirements, deduplicates
+  requests at fanout, and propagates them through matrix-column-to-batch factor
+  views. Factor chains multiply the required group count. Propagation stops at
+  compute operators and at unsupported axis mappings; it does not select a
+  producer implementation or run tile expansion/scheduling.
+- GEMM candidate generation uses those requests to retain native and compatible
+  output alternatives. Head-grouped swapped grids are now generated along the
+  physical row axis. Uniform shards that already divide heads exactly also
+  satisfy grouping; explicit per-head padding is not mandatory in that case.
+- Local pruning and the forward beam reserve the cheapest representatives of
+  requested compatibility classes before incidental format/grid diversity.
+  Deferred views retain their source compatibility until materialization is
+  costed. All producer, input preparation, reduction and consumer movement costs
+  remain in the forward search.
+- Compatible F16 panel exchange can populate a GEMM input after its shared
+  activation has acquired a different panel layout. This is enabled for complete
+  values; the dispatch-slice staging ABI does not support this cross-order path.
+  A panel-splitting bug that counted existing tail padding twice is fixed.
+- Regression coverage includes multi-view propagation and fanout, stopping at
+  compute boundaries, unsupported mappings, narrow local/region beams, natural
+  head-aligned shards, and already-padded panel mappings. The streaming test now
+  supplies an explicitly row-major activation so rearrangement is required even
+  when a better plan could otherwise eliminate all conversions.
+- A diagnostic fixing projection 2 to
+  `16x46x2:1x1:16:standard:swapped:complete:direct` runs in **391,842 renderer
+  cycles**, versus the original 411,030. Its expanded model predicts 399,060.
+  Constant-output checks and Gaussian checkpoints pass. This plan still unpacks
+  Q/K; it is not a conversion-free attention implementation. The package, log,
+  profile and rendered HTML are under
+  `artifacts/layout-sweep/attention-consumer-compatible-v`.
+- Beam compatibility now retains the complete element order, including panel
+  block sizes, and removes the lossy `ElementOrderCompatibility` adapter.
+- Automatic Flash and materialized selection remain byte-identical to the
+  validated 411,030/406,218-cycle packages. Output-request diversity makes the
+  compatible alternatives available but does not recover the complete faster
+  diagnostic combination in unconstrained shortlisting. Preserving more operand
+  panel geometries locally did not change those finalists and was not retained.
+  Final comparison builds are `attention-consumer-orders-{flash,materialized}`;
+  `attention-consumer-compatible-v-final` reproduces the measured diagnostic
+  package byte for byte. Broader shared-input/grid lookahead remains separate work.
+- Validation: 125 codegen release tests and the doctest pass (one manual test
+  ignored); workspace Clippy passes with the existing argument/type allowances.
