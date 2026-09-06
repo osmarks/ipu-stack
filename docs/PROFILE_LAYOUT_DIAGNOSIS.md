@@ -573,3 +573,56 @@ These measurements do not change the default finalist count.
 
 Logs: `/tmp/reset-{all-writes,mailbox,memory-check}.log`,
 `/tmp/finalist-expansion-timing.log`, and `/tmp/mlp-two-finalists.log`.
+
+## Exact historical-plan discard points (2026-09-06)
+
+Instrumenting `retain_operator_candidates` and every beam-pruning boundary with
+both complete historical GEMM constraints locates the loss before beam search.
+The trace uses the ordinary automatic full-size MLP configuration, including its
+shape-aware tile counts and 64-plan shortlist. Ranks below are one-based.
+
+* First GEMM, `4x92x4`, result `4x1`, 48 output columns, interleaved weights:
+  it survives its local orientation/tile-count screen, ranked 12th out of 548
+  Pareto candidates (1628 variants before Pareto filtering). The pooled screen
+  in `lower_operation_candidates` receives 1503 candidates, including this plan.
+  It remains Pareto-undominated, but ranks 82nd of 359 and loses the 64-slot
+  selection. Its compact implementation costs 100947 cycles.
+* The diversity representative taking its slot is `1x269x4`, result `4x1`,
+  16 output columns, priced at 92287 cycles. Diversity groups include orientation,
+  reduction fan-in, result partitions and output format, but exclude compute
+  row/column counts and input memory class. This representative already reports
+  a 425984-byte standard allocation and 66640-byte contiguous-memory overflow.
+  Region memory validation subsequently rejects it with the same overflow.
+  At that point the historical alternative has already disappeared.
+* Second GEMM, `4x24x15`, result `15x1`, 48 output columns, interleaved weights:
+  its exact variant is discarded in the local candidate-family screen. It ranks
+  54th, at 106963 cycles. The immediately preceding candidate has identical
+  geometry with standard-SRAM weights and exactly the same estimated cycles,
+  total memory, peak interleaved memory and exchange-row bytes. It receives the
+  shared diversity slot; all 64 slots fill before the interleaved variant can
+  enter through the cost-ranked remainder. This occurs in both generated families
+  containing that historical variant.
+
+Thus the historical pair is never presented to complete-program finalist ranking;
+raising only `exchange_schedule_finalists` cannot recover it. The existing
+`shortlist_prices_execution_instead_of_boundary_storage` regression compares two
+forced plans, so it does not cover these pooled/diversity losses.
+
+A temporary feasibility-first sort confirms the first issue but is insufficient
+on its own: it preserves a standard-weight version of the first historical grid,
+while the interleaved version still loses an equal-cost diversity tie. That
+experiment was reverted after measurement. The production ranking is unchanged.
+The next costing work should account for known memory infeasibility before
+spending diversity slots, and distinguish movement/placement alternatives that
+currently receive identical coarse prices. Conflict reduction remains relevant
+after selection; exact physical scheduling of more finalists cannot repair an
+operator plan discarded at these earlier screens.
+
+Trace logs are `/tmp/historical-search-{final-trace,memory,feasible}.log`.
+The manual finalist-expansion benchmark now prints every finalist's GEMM dispatch
+and weight memory class, so its timing output also identifies the layouts tested.
+The labeled rerun identifies finalist 4 (expanded estimate 253837 cycles) as
+`3x162x3` followed by `5x24x12`, both with standard-SRAM weights, rather than the
+historical pair. It remains an untested hardware candidate. The run passes and
+reproduces all eight earlier expanded estimates; output is in
+`/tmp/historical-finalist-geometries.log`.

@@ -403,13 +403,29 @@ fn profile_mlp_finalist_expansion() {
         .with_automatic_input(up, Precision::F16)
         .with_automatic_input(down, Precision::F16);
     let start = std::time::Instant::now();
-    let finalists = lower_finalists(&graph, &config, &crate::Ipu21CostModel, 8).unwrap();
+    let finalists = planner::plan_finalists(&graph, &config, &crate::Ipu21CostModel, 8).unwrap();
     eprintln!(
         "compact planning: {:?}, {} finalists",
         start.elapsed(),
         finalists.len()
     );
     for (index, mid) in finalists.into_iter().enumerate() {
+        for operation in &mid.operations {
+            if let Some(plan) = operation.operator_plan()
+                && let OperatorDispatch::BlockedGemm { orientation, .. } = plan.dispatch
+            {
+                eprintln!(
+                    "finalist {index}: source {:?}, {:?}, weight memory {:?}",
+                    operation.source,
+                    plan.dispatch,
+                    plan.requirements.inputs[orientation.operand_indices().1]
+                        .format
+                        .layout
+                        .memory_class,
+                );
+            }
+        }
+        let mid = implementation::resolve(&mid).unwrap();
         let start = std::time::Instant::now();
         let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
         eprintln!(
