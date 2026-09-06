@@ -172,8 +172,12 @@ pub(super) fn split_mapping_at_panel_boundaries(
                 destination_shard.extents[destination_row_axis].physical_end
                     - destination_rows.logical_end,
             );
-        source.extents[source_row_axis].physical_end += padding;
-        destination.extents[destination_row_axis].physical_end += padding;
+        source.extents[source_row_axis].physical_end = source_rows
+            .physical_end
+            .max(source_rows.logical_end + padding);
+        destination.extents[destination_row_axis].physical_end = destination_rows
+            .physical_end
+            .max(destination_rows.logical_end + padding);
     }
 
     let rows = aligned_ranges(

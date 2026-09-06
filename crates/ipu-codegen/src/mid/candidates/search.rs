@@ -15,6 +15,7 @@ pub(in crate::mid) struct CandidateSearch<'a> {
     consumers: &'a [Operation],
     value_uses: &'a BTreeMap<ValueId, usize>,
     config: &'a PipelineConfig,
+    demands: &'a OutputDemands,
     format_sensitive_indices: BTreeSet<usize>,
     distributed_result_is_useful: bool,
     cache: BTreeMap<PlanCacheKey, Vec<OperatorPlan>>,
@@ -29,6 +30,7 @@ impl<'a> CandidateSearch<'a> {
         result_required: bool,
         value_uses: &'a BTreeMap<ValueId, usize>,
         config: &'a PipelineConfig,
+        demands: &'a OutputDemands,
     ) -> Self {
         let distributed_result_is_useful = operation.results.first().is_some_and(|result| {
             result_required
@@ -69,6 +71,7 @@ impl<'a> CandidateSearch<'a> {
             consumers,
             value_uses,
             config,
+            demands,
             format_sensitive_indices,
             distributed_result_is_useful,
             cache: BTreeMap::new(),
@@ -117,21 +120,50 @@ impl<'a> CandidateSearch<'a> {
             cached
         } else {
             self.generated_plan_sets += 1;
-            let grouped_output =
-                grouped_output_layout(self.consumers, operation, output_shape, self.value_uses);
+            let output_demands = self.demands.get(operation.results[0]);
+            let mut groupings = output_demands
+                .iter()
+                .map(|d| d.column_groups)
+                .filter(|&groups| groups > 1)
+                .collect::<BTreeSet<_>>();
+            if let Some(grouping) =
+                grouped_output_layout(self.consumers, operation, output_shape, self.value_uses)
+            {
+                groupings.insert(grouping.groups);
+            }
+            let mut groupings = groupings
+                .into_iter()
+                .map(|groups| {
+                    Some(GroupedOutputLayout {
+                        groups,
+                        physical_lane_multiple: AMP_COLUMN_MICRO,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if groupings.is_empty() {
+                groupings.push(None);
+            }
             let direct_consumer_layouts =
                 direct_consumer_layouts(self.consumers, operation.results[0], output_shape, config);
-            let generated = plans(
-                operation,
-                input_types,
-                parameter_inputs,
-                output_shape,
-                config,
-                costs,
-                self.distributed_result_is_useful,
-                grouped_output,
-                &direct_consumer_layouts,
-            );
+            let mut generated = Vec::new();
+            for grouped_output in groupings {
+                for plan in plans(
+                    operation,
+                    input_types,
+                    parameter_inputs,
+                    output_shape,
+                    config,
+                    costs,
+                    self.distributed_result_is_useful,
+                    grouped_output,
+                    &direct_consumer_layouts,
+                    output_demands,
+                ) {
+                    if !generated.contains(&plan) {
+                        generated.push(plan);
+                    }
+                }
+            }
             self.cache.entry(cache_key).or_insert(generated)
         };
         let candidate_plans = cached
@@ -145,6 +177,10 @@ impl<'a> CandidateSearch<'a> {
                         let current = &input.format.layout;
                         automatic
                             || current.order == requirement.format.layout.order
+                            || (config.conversion_streaming != ConversionStreamingPolicy::Always
+                                && input
+                                    .format
+                                    .supports_f16_micro_panel_exchange(&requirement.format))
                             || !requirement.format.layout.order.requires_direct_population()
                             || (current.order == ElementOrder::RowMajor
                                 && requirement
@@ -157,12 +193,13 @@ impl<'a> CandidateSearch<'a> {
             .cloned()
             .collect::<Vec<_>>();
         let candidate_plans = if matches!(operation.kind, OperationKind::Gemm(_)) {
-            retain_operator_candidates(
+            retain_operator_candidates_for_demands(
                 candidate_plans,
                 input_types,
                 output_shape,
                 costs,
                 config.planning_beam_width.max(1),
+                self.demands.get(operation.results[0]),
             )
         } else {
             candidate_plans
@@ -173,6 +210,20 @@ impl<'a> CandidateSearch<'a> {
                 let mut complete = plan.clone();
                 for requirement in &mut complete.requirements.inputs {
                     requirement.materialization = OperandMaterialization::Complete;
+                }
+                let panel_population = input_types.iter().zip(&plan.requirements.inputs).any(
+                    |(input, requirement)| {
+                        input.format.layout.order != requirement.format.layout.order
+                            && requirement.format.layout.order.requires_direct_population()
+                            && input
+                                .format
+                                .supports_f16_micro_panel_exchange(&requirement.format)
+                    },
+                );
+                // Cross-order panel exchange is currently implemented for a
+                // complete value, not the dispatch-slice staging ABI.
+                if panel_population {
+                    return vec![complete];
                 }
                 match config.conversion_streaming {
                     ConversionStreamingPolicy::Never => vec![complete],

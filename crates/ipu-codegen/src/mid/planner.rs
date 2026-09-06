@@ -345,6 +345,7 @@ pub(super) struct RankedBeamBranch {
     pub(super) branch: BeamBranch,
     pub(super) objective: PlanMetrics,
     pub(super) compatibility: FutureFormatCompatibility,
+    requested_formats: Vec<(ValueId, Vec<bool>)>,
     pub(super) order: usize,
 }
 
@@ -387,53 +388,63 @@ pub(super) fn element_order_compatibility(order: ElementOrder) -> ElementOrderCo
     }
 }
 
-pub(super) fn future_format_compatibility(
-    branch: &BeamBranch,
+fn future_formats<'a>(
+    branch: &'a BeamBranch,
     future_origins: &BTreeSet<ValueId>,
-) -> FutureFormatCompatibility {
-    let mut formats = Vec::new();
+) -> Vec<(ValueId, FutureFormatRole, &'a MidValue)> {
+    let mut values = Vec::new();
     for &origin in future_origins {
         let Some(&id) = branch.values.get(&origin) else {
             continue;
         };
-        let mut add = |role, format: &TensorFormat| {
-            let axes = format
-                .layout
-                .tiling
-                .axes
-                .iter()
-                .map(|axis| (axis.axis, axis.padding_groups, axis.shard_padding_multiple))
-                .collect();
-            formats.push((
-                origin,
-                role,
-                format.precision,
-                element_order_compatibility(format.layout.order),
-                format.layout.memory_class,
-                axes,
-            ));
-        };
-        add(
-            FutureFormatRole::Value,
-            &branch.state.get(id).tensor_type.format,
-        );
-        let deferred_source = branch
+        values.push((origin, FutureFormatRole::Value, branch.state.get(id)));
+        if let Some(source) = branch
             .operations
             .iter()
             .rev()
-            .find(|operation| operation.results.first() == Some(&id))
-            .and_then(|operation| {
-                let offer = operation.operator_plan()?.deferred_output?;
-                operation.inputs.get(offer.source_input).copied()
-            });
-        if let Some(source) = deferred_source {
-            add(
+            .find(|op| op.results.first() == Some(&id))
+            .and_then(|op| {
+                op.operator_plan()?
+                    .deferred_output
+                    .map(|offer| op.inputs[offer.source_input])
+            })
+        {
+            values.push((
+                origin,
                 FutureFormatRole::DeferredSource,
-                &branch.state.get(source).tensor_type.format,
-            );
+                branch.state.get(source),
+            ));
         }
     }
-    FutureFormatCompatibility(formats)
+    values
+}
+
+fn future_format_compatibility(
+    values: &[(ValueId, FutureFormatRole, &MidValue)],
+) -> FutureFormatCompatibility {
+    FutureFormatCompatibility(
+        values
+            .iter()
+            .map(|&(origin, role, value)| {
+                let format = &value.tensor_type.format;
+                let axes = format
+                    .layout
+                    .tiling
+                    .axes
+                    .iter()
+                    .map(|axis| (axis.axis, axis.padding_groups, axis.shard_padding_multiple))
+                    .collect();
+                (
+                    origin,
+                    role,
+                    format.precision,
+                    element_order_compatibility(format.layout.order),
+                    format.layout.memory_class,
+                    axes,
+                )
+            })
+            .collect(),
+    )
 }
 
 #[derive(Default)]
@@ -489,6 +500,7 @@ pub(super) fn lower_operation_candidates(
     {
         *value_uses.entry(value).or_default() += 1;
     }
+    let demands = OutputDemands::new(source, shapes, config);
     let mut beam = vec![BeamBranch {
         values: values.clone(),
         state: state.clone(),
@@ -524,6 +536,7 @@ pub(super) fn lower_operation_candidates(
                 .is_some_and(|result| required_outputs.contains(result)),
             &value_uses,
             config,
+            &demands,
         );
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
@@ -619,6 +632,7 @@ pub(super) fn lower_operation_candidates(
                     constraints,
                     costs,
                     screening_width,
+                    &demands,
                 )
                 .0;
             }
@@ -629,6 +643,7 @@ pub(super) fn lower_operation_candidates(
             constraints,
             costs,
             screening_width,
+            &demands,
         )
         .0;
         let evaluated = shortlisted
@@ -709,6 +724,7 @@ pub(super) fn lower_operation_candidates(
             constraints,
             costs,
             config.planning_beam_width.max(1),
+            &demands,
         );
         tracing::debug!(
             operation = operation.id.index(),
@@ -800,6 +816,7 @@ pub(super) fn retain_pareto_beam(
     constraints: &RegionPlanningConstraints,
     costs: &impl CostModel,
     width: usize,
+    demands: &OutputDemands,
 ) -> (Vec<BeamBranch>, usize, usize, usize) {
     let mut groups = BTreeMap::<FutureBeamState, Vec<RankedBeamBranch>>::new();
     for (order, branch) in branches.into_iter().enumerate() {
@@ -810,8 +827,30 @@ pub(super) fn retain_pareto_beam(
             ),
             memory: branch.peak_memory,
         };
+        let formats = future_formats(&branch, future_origins);
+        let requested_formats = formats
+            .iter()
+            .filter_map(|(_, _, value)| {
+                let requests = demands.get(value.origin);
+                (!requests.is_empty()).then(|| {
+                    (
+                        value.origin,
+                        requests
+                            .iter()
+                            .map(|d| {
+                                d.matches(
+                                    &value.tensor_type.format.layout,
+                                    &value.tensor_type.shape,
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+            })
+            .collect();
         groups.entry(signature).or_default().push(RankedBeamBranch {
-            compatibility: future_format_compatibility(&branch, future_origins),
+            compatibility: future_format_compatibility(&formats),
+            requested_formats,
             branch,
             objective,
             order,
@@ -856,6 +895,20 @@ pub(super) fn retain_pareto_beam(
         // physical order and ownership axes determine which imminent
         // consumers can use a value without a qualitatively different
         // conversion.
+        let mut requested_families = BTreeSet::new();
+        for (index, entry) in frontier.iter().enumerate() {
+            if selected.len() == width {
+                break;
+            }
+            // Deferred views retain their source's compatibility as well as
+            // the offered output format until materialization is costed.
+            if !entry.requested_formats.is_empty()
+                && requested_families.insert(entry.requested_formats.clone())
+                && selected.insert(index)
+            {
+                diversity += 1;
+            }
+        }
         let mut represented = BTreeSet::new();
         for (index, entry) in frontier.iter().enumerate() {
             if selected.len() == width {

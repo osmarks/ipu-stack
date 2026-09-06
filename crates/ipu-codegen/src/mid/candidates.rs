@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod demand;
+pub(super) use demand::{OutputDemand, OutputDemands};
 mod search;
 pub(super) use search::CandidateSearch;
 
@@ -125,6 +127,7 @@ pub(super) fn plans(
     distributed_result_is_useful: bool,
     grouped_output: Option<GroupedOutputLayout>,
     direct_consumer_layouts: &[Layout],
+    output_demands: &[OutputDemand],
 ) -> Vec<OperatorPlan> {
     let mut plans = Vec::new();
     let gemm_constraint = config
@@ -453,6 +456,7 @@ pub(super) fn plans(
                 distributed_result_is_useful,
                 gemm_constraint,
                 grouped_output,
+                output_demands,
             ),
             OperatorCandidate::Concrete(concrete) => {
                 let ConcreteOperatorCandidate {
@@ -748,6 +752,7 @@ pub(super) fn parallel_reduction_candidates(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
+    output_demands: &[OutputDemand],
 ) -> Vec<OperatorPlan> {
     [GemmOrientation::Normal, GemmOrientation::Swapped]
         .into_iter()
@@ -763,6 +768,7 @@ pub(super) fn parallel_reduction_candidates(
                 distributed_result_is_useful,
                 constraint,
                 grouped_output,
+                output_demands,
             )
         })
         .collect()
@@ -779,6 +785,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
+    output_demands: &[OutputDemand],
 ) -> Vec<OperatorPlan> {
     let [left, right] = inputs else {
         return Vec::new();
@@ -809,12 +816,13 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     };
     let grouped_column_groups = grouped_output.and_then(|grouping| {
         let groups = u32::from(grouping.groups);
-        (groups != 0 && columns.is_multiple_of(groups)).then(|| {
-            let columns_per_group = columns / groups;
-            columns_per_group
-                .div_ceil(grouping.physical_lane_multiple)
-                .saturating_mul(groups)
-        })
+        (orientation == GemmOrientation::Normal && groups != 0 && columns.is_multiple_of(groups))
+            .then(|| {
+                let columns_per_group = columns / groups;
+                columns_per_group
+                    .div_ceil(grouping.physical_lane_multiple)
+                    .saturating_mul(groups)
+            })
     });
     let grouped_column_groups = grouped_column_groups
         .and_then(|groups| u16::try_from(groups).ok())
@@ -833,23 +841,40 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         for column_partitions in 1..=maximum_columns {
             let grouped_options = [
                 (column_partitions <= column_groups).then_some((false, column_groups)),
-                grouped_output.and_then(|grouping| {
-                    let physical = grouped_column_groups?;
-                    column_partitions
+                grouped_output.and_then(|grouping| match orientation {
+                    GemmOrientation::Normal => column_partitions
                         .is_multiple_of(grouping.groups)
-                        .then_some((true, physical))
+                        .then_some((true, grouped_column_groups?)),
+                    GemmOrientation::Swapped => normal_columns
+                        .is_multiple_of(u32::from(grouping.groups))
+                        .then_some((true, column_groups)),
                 }),
             ];
             for (grouped, physical_column_groups) in grouped_options.into_iter().flatten() {
-                let row_partitions = (tile_count / inner_partitions / column_partitions)
+                let mut row_partitions = (tile_count / inner_partitions / column_partitions)
                     .min(u16::try_from(rows).unwrap_or(u16::MAX));
+                if grouped && orientation == GemmOrientation::Swapped {
+                    let groups = grouped_output.unwrap().groups;
+                    row_partitions = row_partitions / groups * groups;
+                }
+                if row_partitions == 0 {
+                    continue;
+                }
                 let used_tiles = row_partitions
                     .saturating_mul(column_partitions)
                     .saturating_mul(inner_partitions);
                 if used_tiles < tile_count.div_ceil(2) || u32::from(row_partitions) > rows {
                     continue;
                 }
-                let local_rows = rows.div_ceil(u32::from(row_partitions));
+                let local_rows = if grouped && orientation == GemmOrientation::Swapped {
+                    let groups = u32::from(grouped_output.unwrap().groups);
+                    (rows / groups)
+                        .div_ceil(AMP_COLUMN_MICRO)
+                        .div_ceil(u32::from(row_partitions) / groups)
+                        * AMP_COLUMN_MICRO
+                } else {
+                    rows.div_ceil(u32::from(row_partitions))
+                };
                 let local_columns =
                     u32::from(physical_column_groups).div_ceil(u32::from(column_partitions));
                 let local_inner = u32::from(inner_groups).div_ceil(u32::from(inner_partitions));
@@ -1185,6 +1210,13 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                                 && (grouped_output.is_some()
                                     || config.gemm_output_packing == GemmOutputPacking::Packed)
                                 && let Some(packed) = packed_gemm_output(&staged, output)
+                                && (config.gemm_output_packing == GemmOutputPacking::Packed
+                                    || output_demands.iter().any(|demand| {
+                                        demand.matches(
+                                            &packed.requirements.output.format.layout,
+                                            output,
+                                        )
+                                    }))
                             {
                                 variants.push(packed);
                             }
@@ -1224,12 +1256,13 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             })
             .collect::<Vec<_>>()
     } else {
-        retain_operator_candidates(
+        retain_operator_candidates_for_demands(
             variants,
             inputs,
             output,
             costs,
             config.planning_beam_width.max(1),
+            output_demands,
         )
     };
     tracing::debug!(
@@ -1339,12 +1372,24 @@ pub(super) fn operator_candidate_compatibility(candidate: &OperatorPlan) -> Oper
     }
 }
 
+#[cfg(test)]
 pub(super) fn retain_operator_candidates(
     candidates: Vec<OperatorPlan>,
     inputs: &[TensorType],
     output: &TensorShape,
     costs: &impl CostModel,
     width: usize,
+) -> Vec<OperatorPlan> {
+    retain_operator_candidates_for_demands(candidates, inputs, output, costs, width, &[])
+}
+
+pub(super) fn retain_operator_candidates_for_demands(
+    candidates: Vec<OperatorPlan>,
+    inputs: &[TensorType],
+    output: &TensorShape,
+    costs: &impl CostModel,
+    width: usize,
+    demands: &[OutputDemand],
 ) -> Vec<OperatorPlan> {
     if candidates.len() <= width {
         return candidates;
@@ -1402,6 +1447,26 @@ pub(super) fn retain_operator_candidates(
         .iter()
         .any(|(_, metrics, _)| metrics.memory.standard_contiguous_overflow() == 0);
     let mut selected = BTreeSet::new();
+    // Reserve useful output families before fine-grained K/grid diversity.
+    // All representatives are ranked by ordinary producer cost.
+    if !demands.is_empty() {
+        let mut families = BTreeSet::new();
+        for (index, (plan, objective, _)) in ranked.iter().enumerate() {
+            if selected.len() >= width {
+                break;
+            }
+            if has_feasible && objective.memory.standard_contiguous_overflow() != 0 {
+                continue;
+            }
+            let family = demands
+                .iter()
+                .map(|d| d.matches(&plan.requirements.output.format.layout, output))
+                .collect::<Vec<_>>();
+            if families.insert(family) {
+                selected.insert(index);
+            }
+        }
+    }
     let mut represented = BTreeSet::new();
     for (index, (_, objective, compatibility)) in ranked.iter().enumerate() {
         if selected.len() >= width {

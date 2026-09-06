@@ -476,7 +476,13 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(16)
             .with_active_tile_counts([16])
-            .with_automatic_input(input, Precision::F16)
+            .with_input(
+                input,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::row_sharded(16),
+                },
+            )
             .with_automatic_input(up, Precision::F16)
             .with_automatic_input(down, Precision::F16);
         config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
@@ -1052,6 +1058,23 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             logical_view(&destination),
         )
         .unwrap_or_else(|error| panic!("case {case}, rows {rows}: {error}"));
+        // Input mappings may already carry shared tail padding. Splitting
+        // them again must not extend either side beyond its allocation.
+        let mut padded_source = logical_view(&source);
+        let mut padded_destination = logical_view(&destination);
+        padded_source.extents[0].physical_end = panel_rows;
+        padded_destination.extents[0].physical_end = panel_rows;
+        assert_eq!(
+            mappings,
+            split_mapping_at_panel_boundaries(
+                &source,
+                padded_source,
+                &destination,
+                padded_destination,
+            )
+            .unwrap(),
+            "case {case}, rows {rows}"
+        );
         let source_bytes = mappings
             .iter()
             .flat_map(|(view, _)| view_byte_spans(&source, view).unwrap())

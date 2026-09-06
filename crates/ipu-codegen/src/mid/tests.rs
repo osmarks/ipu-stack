@@ -198,6 +198,7 @@ fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
             true,
             None,
             None,
+            &[],
         );
         assert!(
             !candidates.is_empty(),
@@ -1576,6 +1577,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
             true,
             None,
             &[],
+            &[],
         );
         let retained = retain_operator_candidates(
             generated,
@@ -1646,6 +1648,7 @@ fn parallel_gemm_family_does_not_depend_on_concrete_templates() {
             true,
             None,
             &[],
+            &[],
         )
     };
     config.operator_candidates = vec![OperatorCandidate::parallel_gemm(tiles)];
@@ -1693,4 +1696,125 @@ fn parallel_gemm_family_does_not_depend_on_concrete_templates() {
             ..
         }
     )));
+}
+
+#[test]
+fn value_projection_retains_head_grouped_swapped_output_from_packed_activations() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [1, 729, 1152]).unwrap();
+    let w = graph.parameter("w", [1, 1152, 1152]).unwrap();
+    let projection = graph.gemm(x, w).unwrap();
+    let heads = graph.split_heads(projection, 16).unwrap();
+    let result = graph.flash_attention(heads, heads, heads).unwrap();
+    graph.set_outputs([result]).unwrap();
+    let config = PipelineConfig::new(1472).with_planning_beam_width(4);
+    let demands = OutputDemands::new(graph.operations(), graph.value_shapes(), &config);
+    let uses = BTreeMap::from([(projection, 1)]);
+    let mut search = CandidateSearch::new(
+        &graph.operations()[0],
+        &graph.operations()[1..],
+        false,
+        &uses,
+        &config,
+        &demands,
+    );
+    let inputs = [
+        TensorType::new([1, 729, 1152], Precision::F16, Layout::amp_left(64, 1472)),
+        TensorType::new([1, 1152, 1152], Precision::F16, Layout::row_sharded(1472)),
+    ];
+    let candidates = search
+        .generate(
+            &inputs,
+            &[false, true],
+            &[false, true],
+            graph.value_shape(projection).unwrap(),
+            &Ipu21CostModel,
+        )
+        .unwrap();
+    let requested = OutputDemand {
+        order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block: 64,
+            column_block: 16,
+        }),
+        column_groups: 16,
+    };
+    assert!(
+        candidates.iter().any(|plan| requested.matches(
+            &plan.requirements.output.format.layout,
+            graph.value_shape(projection).unwrap()
+        )),
+        "missing V-compatible output among {} candidates",
+        candidates.len()
+    );
+    assert!(candidates.iter().any(|plan| matches!(
+        plan.dispatch,
+        OperatorDispatch::BlockedGemm {
+            orientation: GemmOrientation::Normal,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn beam_reserves_requested_formats_before_incidental_layout_diversity() {
+    let mut graph = ComputeGraph::new();
+    let projection = graph.host_input("projection", [1, 17, 288]).unwrap();
+    let heads = graph.split_heads(projection, 4).unwrap();
+    graph.flash_attention(heads, heads, heads).unwrap();
+    let config = PipelineConfig::new(4);
+    let demands = OutputDemands::new(graph.operations(), graph.value_shapes(), &config);
+    let mut compatible = Layout::row_major(TensorTiling::sharded(TensorAxis::FromEnd(1), 4));
+    compatible.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
+    let requested = OutputDemand {
+        order: compatible.order,
+        column_groups: 4,
+    };
+    let shape = graph.value_shape(projection).unwrap();
+    assert!(requested.matches(&compatible, shape));
+    let branches = [Layout::row_sharded(1), Layout::amp_left(64, 1), compatible]
+        .into_iter()
+        .zip([1, 2, 10])
+        .map(|(layout, total)| {
+            let mut state = LoweringState::default();
+            let id = state.value(
+                projection,
+                TensorType::new(shape.0.clone(), Precision::F16, layout),
+            );
+            BeamBranch {
+                values: BTreeMap::from([(projection, id)]),
+                state,
+                operations: Vec::new(),
+                peak_memory: MemoryPeaks::default(),
+                analysis: std::sync::OnceLock::from(Some((
+                    crate::estimate::ProgramCycles { total, exchange: 0 },
+                    MemoryPeaks::default(),
+                    true,
+                ))),
+            }
+        })
+        .collect();
+    let (retained, _, _, _) = retain_pareto_beam(
+        branches,
+        &BTreeSet::from([projection]),
+        &RegionPlanningConstraints::default(),
+        &Ipu21CostModel,
+        2,
+        &demands,
+    );
+    assert_eq!(retained.len(), 2);
+    assert!(retained.iter().any(|branch| {
+        requested.matches(
+            &branch
+                .state
+                .get(branch.values[&projection])
+                .tensor_type
+                .format
+                .layout,
+            shape,
+        )
+    }));
+    assert_eq!(
+        deferred_aware_branch_score(&retained[0], &BTreeSet::new()),
+        1
+    );
 }
