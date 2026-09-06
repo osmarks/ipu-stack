@@ -3,8 +3,6 @@
 import argparse
 import csv
 import json
-import math
-import re
 from pathlib import Path
 import subprocess
 
@@ -38,46 +36,22 @@ def calibration(rows, key, actual="renderer_cycles"):
                 regret_cycles=int(selected[actual] - measured.min()))
 
 
-def instruction_model_report(database):
-    """Offline checks against instruction counts; do not change planner prices."""
-    families = {}
-    for sample in database["measurements"]:
-        key = sample["key"]
-        dimensions = key["dimensions"]
-        spec = dimensions.get("kernelSpec", "")
-        n = int(dimensions.get("outputElements", 0))
-        gemm = re.search(r"gemm_f16_init_(small|large)_rows_interleaved_k(\d+)_c(\d+)_r(\d+)_r(\d+)", key["kernel"])
-        if spec == "Gelu":
-            family = "GELU (logical size; padding may add waves)"
-            predicted = 300 + 558 * math.ceil(n / 96)
-        elif spec.startswith("ReductionSum"):
-            family = "F16 reduction"
-            partials = int(re.search(r"partials: (\d+)", spec)[1])
-            predicted = 282 + 6 * math.ceil(n / 48) * (9 + 6 * (partials - 1))
-        elif gemm:
-            family = "Interleaved F16 GEMM"
-            size, inner, columns, small, large = gemm.groups()
-            rows = int(small if size == "small" else large)
-            predicted = 294 + math.ceil(int(inner) / 16) * math.ceil(int(columns) / 16) * (4 * rows + 160)
-        else:
-            continue
-        actual = sample["medianCycles"]
-        families.setdefault(family, []).append((abs(predicted - actual), abs(predicted / actual - 1)))
-    lines = ["", "## Instruction-count checks", "",
-             "Offline diagnostics only; these formulas were not used to select or cost the sweep.",
-             "Each row counts distinct exported kernel/metadata keys, not independent hardware runs.", "",
-             "| Kernel | Keys | Median absolute error (%) | Maximum error (cycles) |",
-             "|---|---:|---:|---:|"]
-    for family, errors in families.items():
-        lines.append(f"| {family} | {len(errors)} | {np.median([e[1] for e in errors]) * 100:.3f} | {max(e[0] for e in errors)} |")
-    return lines
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--cli", default="target/release/ipu-stack")
+    parser.add_argument("--build-id", help="Device source hash for a legacy cohort without recorded provenance")
     args = parser.parse_args()
+    manifest = args.directory / "manifest.json"
+    recorded = json.loads(manifest.read_text()).get("kernel_build_id") if manifest.exists() else None
+    database_path = args.directory / "kernel-measurements.json"
+    if not recorded and database_path.exists():
+        recorded = json.loads(database_path.read_text())["buildId"]
+    if args.build_id and recorded and args.build_id != recorded:
+        parser.error("--build-id disagrees with the recorded cohort")
+    build_id = recorded or args.build_id
+    if not build_id:
+        parser.error("cohort has no device-source provenance; supply its historical --build-id")
     records = []
     for path in sorted(args.directory.glob("*/result.json")):
         record = json.loads(path.read_text())
@@ -153,13 +127,9 @@ def main():
     # Existing profiler retains kernel geometry and cycle distributions; keep
     # these measurements available for calibration without refitting the model
     # against the same samples used to judge its current ranking.
-    build_id = subprocess.check_output([args.cli, "kernel-build-id", "device"], text=True).splitlines()[0]
     subprocess.run([args.cli, "profile-calibrate", *[str(args.directory / r["name"] / "execution.ipuprofile")
                     for r in passed], "--build-id", build_id,
                     "--output", str(args.directory / "kernel-measurements.json")], check=True)
-    database = json.loads((args.directory / "kernel-measurements.json").read_text())
-    lines += instruction_model_report(database)
-    (args.directory / "report.md").write_text("\n".join(lines) + "\n")
     print(f"best={best[0]['name']} cycles={best[0]['renderer_cycles']} completed={len(records)} passes={len(passed)}")
 
 

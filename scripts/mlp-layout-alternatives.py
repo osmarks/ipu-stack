@@ -2,12 +2,9 @@
 """Controlled result-grid, tile-placement and bounded-reduction experiments."""
 import argparse
 import dataclasses
-import hashlib
 import importlib.util
 import json
 from pathlib import Path
-import shutil
-import subprocess
 import sys
 
 spec = importlib.util.spec_from_file_location("sweep", Path(__file__).with_name("mlp-layout-sweep.py"))
@@ -81,23 +78,8 @@ def main():
         mapping = [(tile // 92) * 92 + (tile % 2) * 46 + (tile % 92) // 2
                    for tile in range(1472)]
         args.tile_mappings.update({name: mapping for name, _, _ in cases})
+    sweep.prepare_cohort(args, cases)
     cases = [case for case in cases if not args.only or case[0] in args.only]
-    binary = args.output / "cohort-binary"
-    digest = hashlib.file_digest(Path(args.binary).open("rb"), "sha256").hexdigest()
-    manifest = dict(revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-                    binary_sha256=digest, cases=[dict(name=n, up=dataclasses.asdict(u),
-                    down=dataclasses.asdict(d), mapping=args.tile_mappings.get(n)) for n, u, d in cases])
-    path = args.output / "manifest.json"
-    manifest = json.loads(json.dumps(manifest))
-    if path.exists():
-        previous = json.loads(path.read_text())
-        if any(previous[key] != manifest[key] for key in ["binary_sha256", "cases"]):
-            raise RuntimeError("Changed experiment manifest; use a fresh output directory")
-    else:
-        path.write_text(json.dumps(manifest, indent=2) + "\n")
-    if not binary.exists():
-        shutil.copy2(args.binary, binary)
-    args.binary = str(binary)
     sweep.run_cases(args, cases, [])
 
 

@@ -14,6 +14,7 @@ import itertools
 import math
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
 
@@ -116,6 +117,30 @@ def manifest():
     return cases, counts
 
 
+def prepare_cohort(args, cases, **metadata):
+    """Freeze the compiler and device sources; reject mixed experiment resumes."""
+    source = Path(__file__).resolve().parent.parent / "device"
+    build_id = subprocess.check_output([args.cli, "kernel-build-id", str(source)], text=True).strip()
+    inventory = dict(metadata, revision=subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True).strip(), kernel_build_id=build_id,
+        binary_sha256=hashlib.file_digest(Path(args.binary).open("rb"), "sha256").hexdigest(),
+        cases=[dict(name=n, up=dataclasses.asdict(u), down=dataclasses.asdict(d),
+                    mapping=getattr(args, "tile_mappings", {}).get(n)) for n, u, d in cases])
+    inventory = json.loads(json.dumps(inventory))
+    manifest_path = args.output / "manifest.json"
+    if manifest_path.exists():
+        previous = json.loads(manifest_path.read_text())
+        if any(previous.get(key) != inventory[key]
+               for key in ["binary_sha256", "kernel_build_id", "cases"]):
+            raise RuntimeError("Changed or unversioned experiment cohort; use a fresh output directory")
+    else:
+        shutil.copytree(source, args.output / "device", dirs_exist_ok=True)
+        shutil.copy2(args.binary, args.output / "cohort-binary")
+        manifest_path.write_text(json.dumps(inventory, indent=2) + "\n")
+    args.binary = str(args.output / "cohort-binary")
+    args.runtime_source = str(args.output / "device" / "static_runtime.S")
+
+
 def extract(log):
     result = {}
     patterns = {
@@ -128,6 +153,21 @@ def extract(log):
         match = re.search(pattern, log)
         if match and match.lastindex:
             result[key] = int(match[1])
+    lines = log.splitlines()
+    fields = lambda line: {key: int(value) for key, value in re.findall(r"\b(\w+)=(\d+)\b", line)}
+    selected = next((fields(line)["selected"] for line in reversed(lines)
+                     if "selected physically scheduled operator-plan finalist" in line), 0)
+    for line in lines:
+        values = fields(line)
+        if values.get("finalist") == selected:
+            for message, prefix in [("retained operator-plan finalist", "compact"),
+                                    ("modelled expanded operator plan", "expanded")]:
+                if message in line:
+                    result[prefix + "_cycles"] = values["estimated_cycles"]
+                    result[prefix + "_exchange"] = values["estimated_exchange_cycles"]
+        if "costed final placed program" in line:
+            result["refined_cycles"] = values["final_cycles"]
+            result["refined_exchange"] = values["final_exchange"]
     benchmark = next((line for line in log.splitlines() if "effectiveGemmTflops=" in line), "")
     for key in ["cycles", "minimumTileCycles", "maximumAbsoluteError"]:
         match = re.search(rf"\b{key}=([\d.]+)", benchmark)
@@ -158,7 +198,8 @@ def run_case(args, name, up, down):
             raise RuntimeError(f"stale manifest in {folder}")
         return add_renderer_cycles(args, folder, previous)
     command = [args.binary, args.config, "--sdk", args.sdk,
-               "--device-lock", str(args.output.resolve() / "device.lock"),
+               "--device-lock", str(Path(__file__).resolve().parent.parent / "artifacts/layout-sweep/device.lock"),
+               "--runtime-source", args.runtime_source,
                "--workload", "siglip-mlp-benchmark", "--mlp-batch", "1",
                "--package", str(folder / "model.ipuexe"),
                "--profile-output", str(folder / "execution.ipuprofile")]
@@ -205,7 +246,7 @@ def run_case(args, name, up, down):
         barriers = json.loads((folder / "barriers.json").read_text())
         result["scheduled_exchange"] = sum(b["scheduledEventCycles"] for b in barriers)
         result["exchange_after_arrival"] = sum(b["afterLastArrivalCycles"] for b in barriers)
-        if "expanded_cycles" in result:
+        if "expanded_cycles" in result and "refined_cycles" not in result:
             result["refined_cycles"] = (result["expanded_cycles"] - result["expanded_exchange"]
                                         + result["scheduled_exchange"])
     record_path.write_text(json.dumps(result, indent=2) + "\n")
@@ -248,12 +289,9 @@ def main():
         parser.error("--jobs must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     cases, counts = manifest()
+    if not args.dry_run:
+        prepare_cohort(args, cases, screened_grids=counts)
     cases = [case for case in cases if case[0] not in args.exclude]
-    inventory = dict(screened_grids=counts, cases=[dict(name=name, up=dataclasses.asdict(up),
-                     down=dataclasses.asdict(down)) for name, up, down in cases])
-    inventory["revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    inventory["binary_sha256"] = hashlib.file_digest(Path(args.binary).open("rb"), "sha256").hexdigest()
-    (args.output / "manifest.json").write_text(json.dumps(inventory, indent=2) + "\n")
     print(f"{len(cases)} initial cases; screened grids: {counts}", flush=True)
     if args.dry_run:
         return
