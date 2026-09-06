@@ -284,19 +284,13 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     plan.add_attention_stages(
         stages
             .iter()
-            .map(|(kernel, rows)| KernelSpecialization::stage(kernel, *rows).unwrap())
+            .map(|(kernel, _)| KernelSpecialization::stage(kernel).unwrap())
             .collect(),
     )
     .unwrap();
-    // Four softmax dimension pairs and two merge dimension sets; query/key
-    // block sizes share their assembly workers rather than selecting extrema.
-    assert_eq!(
-        plan.compilations
-            .iter()
-            .filter(|compilation| compilation.source == "attention_stages_f16.S")
-            .count(),
-        6
-    );
+    // Four dimension pairs each have full/masked softmax, plus two merges.
+    // Query-row counts share assembly instead of producing more codelets.
+    assert_eq!(plan.compilations.len(), 10);
     for (kernel, rows) in stages {
         let (inputs, expected) = match kernel {
             TileKernelSpec::AttentionSoftmax { key_columns, .. } => (1, vec![rows, key_columns]),

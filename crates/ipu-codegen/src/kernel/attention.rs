@@ -48,8 +48,8 @@ impl KernelBuildPlan {
     ) -> Result<(), KernelAbiError> {
         let mut compiled = BTreeSet::new();
         for key in stages {
-            let (name, symbol, flags) = match key {
-                KernelSpecialization::Softmax(head, keys, padded, _) => {
+            let (name, symbol, source, flags) = match key {
+                KernelSpecialization::Softmax(head, keys, padded) => {
                     let full = keys == padded;
                     let name = format!(
                         "attention_softmax_d{head}_p{padded}_{}",
@@ -59,26 +59,14 @@ impl KernelBuildPlan {
                     let scale_bits = (1.0_f32 / (head as f32).sqrt()).to_bits();
                     let flags = vec![
                         format!("-DATTENTION_HEAD_DIMENSION={head}"),
+                        format!("-DATTENTION_FULL_BLOCK={}", u8::from(full)),
                         format!("-DATTENTION_KEY_BLOCK_COLUMNS={padded}"),
                         format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
                         format!("-DATTENTION_SOFTMAX_SYMBOL={symbol}"),
                     ];
-                    self.symbols.insert(key, symbol.clone());
-                    if compiled.insert(symbol.clone()) {
-                        self.compilations.push(KernelCompilation {
-                            source: if full {
-                                "attention_softmax_f16.S"
-                            } else {
-                                "attention_stages_f16.S"
-                            },
-                            name,
-                            flags,
-                            retained_symbols: vec![symbol],
-                        });
-                    }
-                    continue;
+                    (name, symbol, "attention_softmax_f16.S", flags)
                 }
-                KernelSpecialization::Merge(values, padded, keys, _) => {
+                KernelSpecialization::Merge(values, padded, keys) => {
                     let name = format!("attention_merge_v{values}_p{padded}_k{keys}");
                     let symbol = format!("ipu_stack_{name}_f16");
                     let flags = vec![
@@ -87,14 +75,14 @@ impl KernelBuildPlan {
                         format!("-DATTENTION_KEY_BLOCK_COLUMNS={keys}"),
                         format!("-DATTENTION_MERGE_SYMBOL={symbol}"),
                     ];
-                    (name, symbol, flags)
+                    (name, symbol, "attention_merge_f16.S", flags)
                 }
                 _ => return Err(KernelAbiError::RequirementMismatch),
             };
             self.symbols.insert(key, symbol.clone());
             if compiled.insert(symbol.clone()) {
                 self.compilations.push(KernelCompilation {
-                    source: "attention_stages_f16.S",
+                    source,
                     name,
                     flags,
                     retained_symbols: vec![symbol],

@@ -17,17 +17,32 @@ pub(crate) fn interleaved_f16_gemm_cycles(rows: u64, inner: u64, columns: u64) -
     )
 }
 
-/// Full-block softmax: each worker owns every sixth query row. Per 16-key
-/// panel, the packed maximum and fused exponent/store/sum take 71 issue groups.
-pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64) -> u64 {
+/// Row-wise softmax: packed maxima and fused exponent/store/sum take 71
+/// issue groups per full 16-key panel. Masked pairs and zero padding use short
+/// scalar loops; no tile program needs to be constructed to price them.
+pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
     if rows == 0 {
         return 0;
     }
-    216u64.saturating_add(
-        rows.div_ceil(6)
-            .saturating_mul(6)
-            .saturating_mul(31u64.saturating_add(keys.div_ceil(16).saturating_mul(71))),
-    )
+    let full_panels = keys / 16;
+    let mut row = 31u64.saturating_add(full_panels.saturating_mul(71));
+    let launch = if keys == padded_keys {
+        216u64
+    } else {
+        let pairs = (keys % 16) / 2;
+        let zero_pairs = 8 - (keys % 16).div_ceil(2);
+        let zero_panels = (padded_keys / 16).saturating_sub(full_panels.saturating_add(1));
+        row = row
+            .saturating_add(21)
+            .saturating_add(if full_panels != 0 { 4 } else { 2 })
+            .saturating_add(2 * u64::from(pairs != 0))
+            .saturating_add(12 * pairs + 12 * (keys % 2))
+            .saturating_add(u64::from(zero_pairs != 0) + 2 * zero_pairs)
+            .saturating_add(u64::from(zero_panels != 0))
+            .saturating_add(zero_panels.saturating_mul(10));
+        234
+    };
+    launch.saturating_add(rows.div_ceil(6).saturating_mul(6).saturating_mul(row))
 }
 
 /// Merge preserves FP32 state. Pair loops issue four groups for initialization
@@ -108,13 +123,14 @@ mod tests {
     #[test]
     fn attention_row_models_match_hardware() {
         for rows in [7, 8] {
-            assert_eq!(f16_softmax_cycles(rows, 64), 3996);
+            assert_eq!(f16_softmax_cycles(rows, 64, 64), 3996);
+            assert_eq!(f16_softmax_cycles(rows, 25, 64), 2838);
             assert_eq!(f16_attention_merge_cycles(rows, 72, true, false), 2430);
             assert_eq!(f16_attention_merge_cycles(rows, 72, false, false), 3378);
             assert_eq!(f16_attention_merge_cycles(rows, 72, false, true), 3438);
         }
-        assert_eq!(f16_softmax_cycles(0, 64), 0);
-        assert_eq!(f16_softmax_cycles(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(f16_softmax_cycles(0, 64, 64), 0);
+        assert_eq!(f16_softmax_cycles(u64::MAX, u64::MAX, u64::MAX), u64::MAX);
         assert_eq!(
             f16_attention_merge_cycles(u64::MAX, u64::MAX, false, true),
             u64::MAX

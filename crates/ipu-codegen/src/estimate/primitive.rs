@@ -84,12 +84,14 @@ pub(crate) fn kernel_cycles(
             key_columns,
             padded_key_columns,
             ..
-        } if key_columns == padded_key_columns => {
-            return crate::kernel::cost::f16_softmax_cycles(rows, u64::from(*key_columns));
+        } => {
+            return crate::kernel::cost::f16_softmax_cycles(
+                rows,
+                u64::from(*key_columns),
+                u64::from(*padded_key_columns),
+            );
         }
-        TileKernelSpec::Gelu | TileKernelSpec::AttentionSoftmax { .. } => {
-            elements.saturating_mul(10)
-        }
+        TileKernelSpec::Gelu => elements.saturating_mul(10),
         TileKernelSpec::Add => elements.div_ceil(16),
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
