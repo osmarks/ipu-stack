@@ -213,3 +213,32 @@ but differs from primitive costing's larger fixed per-group coefficient.
 These formulas are diagnostics, not a model fitted and evaluated on the same
 sweep. Tail paths, other precisions and standard weight storage require their
 own checks before changing planner prices.
+
+## Constant-time kernel costing update
+
+`kernel/cost.rs` now owns the calibrated interleaved-F16 GEMM and F16 reduction
+loop formulas. Compact mid costing and final tile-timeline costing share them;
+GEMM grid screening also shares the micro-group formula. Mid sums charge each
+streamed reduction invocation separately, including its launch/setup overhead.
+The previous reduction byte-throughput constant and its separate mid formula
+were removed. No instruction generation, tile expansion or additional finalist
+scheduling is involved in evaluating these prices. Standard-weight GEMM,
+other precisions and GELU retain their prior estimates in this change.
+
+The codegen suite passes (including independent hardware-derived kernel-cost
+fixtures), as does workspace Clippy with the previously documented exceptions.
+Both an unconstrained MLP and a fixed historical MLP pass numerical hardware
+validation. The fixed historical plan still runs at 188,196 renderer cycles;
+its expanded estimate falls from 248,066 to 212,951. Substituting the final
+exchange schedule yields 194,556, previously 229,671.
+
+This does **not** yet improve automatic selection: the new selected plan runs
+at 195,990 renderer cycles, versus the previous default's 190,578. Historical
+geometry survives both operator shortlists and the bounded complete-plan beam,
+but no longer reaches the first eight complete candidates. The regression test
+now checks beam survival independently of exact rank under calibrated prices.
+Neither the beam width nor the number of physically scheduled finalists was
+increased. Remaining compact/exchange and other primitive-cost errors need
+attention before claiming a planner-performance improvement. Validation logs
+and profiles are in `instruction-cost/` and `instruction-cost-historical/`
+under the sweep artifact directory, separate from the frozen sweep cohort.
