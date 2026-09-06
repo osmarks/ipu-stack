@@ -1,4 +1,5 @@
 /target
+/artifacts/layout-sweep/
 .env
 __pycache__/
 *.pyc

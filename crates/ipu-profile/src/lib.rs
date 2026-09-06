@@ -163,7 +163,8 @@ pub struct CalibrationMeasurement {
 }
 
 /// Collates profiled kernel and local-copy calls. Consecutive calls merged by
-/// profiling are divided by their recorded invocation count before aggregation.
+/// profiling are divided by their invocation count only when their executable
+/// ABIs are identical. Older profiles cannot certify merged sample geometry.
 pub fn calibrate_profiles(
     reports: &[ProfileReport],
     target: impl Into<String>,
@@ -190,12 +191,24 @@ pub fn calibrate_profiles(
                     .and_then(|entry| entry.value.parse::<u32>().ok())
                     .unwrap_or(1)
                     .max(1);
+                if invocations > 1
+                    && !sample
+                        .step
+                        .metadata
+                        .iter()
+                        .any(|entry| entry.name == "uniformInvocations" && entry.value == "true")
+                {
+                    continue;
+                }
                 let dimensions = sample
                     .step
                     .metadata
                     .iter()
                     .filter(|entry| {
-                        !matches!(entry.name.as_str(), "reason" | "value" | "invocations")
+                        !matches!(
+                            entry.name.as_str(),
+                            "reason" | "value" | "invocations" | "uniformInvocations"
+                        )
                     })
                     .map(|entry| (entry.name.clone(), entry.value.clone()))
                     .collect();
@@ -1113,6 +1126,10 @@ mod tests {
                 value: "2".into(),
             },
             ProfileMetadata {
+                name: "uniformInvocations".into(),
+                value: "true".into(),
+            },
+            ProfileMetadata {
                 name: "reason".into(),
                 value: "OperatorKernel".into(),
             },
@@ -1140,5 +1157,35 @@ mod tests {
         assert_eq!(measurement.maximum_cycles, 30);
         assert!(!measurement.key.dimensions.contains_key("reason"));
         assert!(!measurement.key.dimensions.contains_key("invocations"));
+    }
+
+    #[test]
+    fn calibration_excludes_merged_calls_without_uniform_geometry() {
+        let mut unproven = sample(0, ProfileStepKind::Compute, "reduction", 0, 1000);
+        unproven.step.metadata.push(ProfileMetadata {
+            name: "invocations".into(),
+            value: "2".into(),
+        });
+        let mut mixed = unproven.clone();
+        mixed.step.metadata.push(ProfileMetadata {
+            name: "uniformInvocations".into(),
+            value: "false".into(),
+        });
+        let single = sample(1, ProfileStepKind::Compute, "reduction", 1000, 1600);
+        let database = calibrate_profiles(
+            &[ProfileReport {
+                clock_hz: 1_500_000_000,
+                tiles: vec![TileProfile {
+                    physical_tile: 0,
+                    samples: vec![unproven, mixed, single],
+                }],
+            }],
+            "ipu21",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(database.measurements.len(), 1);
+        assert_eq!(database.measurements[0].samples, 1);
+        assert_eq!(database.measurements[0].minimum_cycles, 600);
     }
 }

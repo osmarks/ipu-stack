@@ -1758,6 +1758,10 @@ fn instrument_profile(
         if schedule.len() != tile_program.steps.len() {
             return Err(invalid("tile profile work does not match finalized steps"));
         }
+        let same_call = std::iter::once(false).chain(tile_program.steps.windows(2).map(|pair| {
+            matches!((&pair[0], &pair[1]), (crate::TileStep::Compute(a), crate::TileStep::Compute(b))
+                if a.symbol == b.symbol && a.arguments == b.arguments)
+        })).collect::<Vec<_>>();
         for (index, (&work, step)) in schedule.iter().zip(&mut tile_program.steps).enumerate() {
             if index != 0 && profile_work_can_merge(schedule[index - 1], work) {
                 continue;
@@ -1788,6 +1792,23 @@ fn instrument_profile(
                 name: "invocations".into(),
                 value: invocations.to_string(),
             });
+            if let crate::TileStep::Compute(call) = step {
+                // Rendering may group calls with different sizes. Only groups
+                // with identical executable ABIs can be averaged for costing.
+                description.metadata.extend([
+                    ProfileMetadata {
+                        name: "uniformInvocations".into(),
+                        value: same_call[index + 1..index + invocations]
+                            .iter()
+                            .all(|same| *same)
+                            .to_string(),
+                    },
+                    ProfileMetadata {
+                        name: "arguments".into(),
+                        value: format!("{:?}", call.arguments),
+                    },
+                ]);
+            }
             description.local_index = u32::try_from(plans.len())?;
             plans.push(description);
         }
