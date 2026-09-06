@@ -510,10 +510,20 @@ fn collect_exchange_rows(
 
 fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep]) {
     for step in steps {
-        match step {
-            crate::TileStep::Compute(compute) => symbols.push(compute.symbol.clone()),
-            crate::TileStep::Repeat(repeat) => collect_compute_symbols(symbols, &repeat.body),
-            crate::TileStep::Exchange(_) | crate::TileStep::Checkpoint(_) => {}
+        let profile = match step {
+            crate::TileStep::Compute(compute) => {
+                symbols.push(compute.symbol.clone());
+                &compute.profile
+            }
+            crate::TileStep::Repeat(repeat) => {
+                collect_compute_symbols(symbols, &repeat.body);
+                &repeat.profile
+            }
+            crate::TileStep::Exchange(exchange) => &exchange.profile,
+            crate::TileStep::Checkpoint(checkpoint) => &checkpoint.profile,
+        };
+        if profile.before.is_some() || profile.after.is_some() {
+            symbols.push(SAMPLE_CYCLE_SYMBOL.into());
         }
     }
 }

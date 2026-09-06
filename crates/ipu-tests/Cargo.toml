@@ -32,3 +32,7 @@ rand_distr.workspace = true
 rand_xoshiro.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[[bin]]
+name = "ipu-kernel-equivalence"
+path = "src/bin/kernel_equivalence.rs"
