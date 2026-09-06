@@ -46,6 +46,57 @@ provisional finalist score, which precedes its final SRAM placement search.
 Exchange schedule horizons are compared separately with cycles after the last
 barrier arrival; arrival spread is not added to both compute and exchange.
 
+## Results (2026-09-06)
+
+All 55 initial cases and four adaptive combinations completed: 49 numerical
+hardware passes, ten build rejections, no hardware correctness failures.
+The rejections were four SRAM-capacity failures, four absent legal candidates,
+and two swapped-up layouts with exchange payloads not divisible into words.
+Thus this is a broad sample of executable candidates, not a proof about every
+layout the tensor representation can describe.
+
+| Choice | Renderer interval (cycles) |
+|---|---:|
+| Historical geometry, standard down-weight input (`down-22`) | 186,630 |
+| Up `5x135x2`, historical down (`up-15`) | 187,842 |
+| Historical | 188,196 |
+| Default selected plan | 190,578 |
+
+The best result is only 0.83% faster than historical. Both use the same GEMM
+kernels and have identical profiled GEMM work. Mid implementation materializes
+F16 weights into interleaved compute storage even when their requested input
+memory class is standard. The changed materialization/placement shortens the
+GELU-to-down exchange from 32,939 to 31,382 scheduled cycles; this accounts for
+almost the entire 1,566-cycle gain. The sweep found no substantially better
+compute partitioning. The apparent 3.3% gain from `up-15` on full hardware
+counters shrinks to 0.19% after applying the renderer's cut point.
+
+Across the 45 passing initial cases (adaptive combinations excluded):
+
+| Estimate | Median predicted/measured | Spearman rank correlation | Selection regret (cycles) |
+|---|---:|---:|---:|
+| Compact mid | 1.649 | 0.885 | 3,948 |
+| Expanded | 1.329 | 0.848 | 14,124 |
+| Expanded with final placed exchange | 1.222 | 0.931 | 1,212 |
+
+Expanded exchange estimates exceed final scheduled horizons by a median
+factor of 1.355; compact exchange estimates by 2.378. Substituting final
+schedules helps ranking substantially, but does not fix compute-cost bias.
+The instruction-count reduction diagnostic matches all 100 exported geometry
+keys exactly; the interleaved GEMM diagnostic has 0.30% median absolute error
+across 179 keys. These are local kernel checks, not complete-plan predictions.
+
+Artifacts are under `artifacts/layout-sweep/`: `report.md`, `summary.csv`,
+`cost-calibration.svg`, raw profiles, exact constraints and logs. The best
+rendered timeline is `down-22/profile.html`. The sweep preserves its executable
+as `cohort-binary`; post-sweep metadata validation runs are kept separately
+under `verification/`. Two additional best-plan runs both reproduced 186,630
+renderer cycles; the historical repeat reproduced 188,196. All passed numerical
+checks. These runs include the new profile ABI metadata, confirming unchanged
+execution timing; all 76 exported verification calibration keys include scalar
+arguments. Profile/codegen tests and workspace Clippy passed with the existing
+`too_many_arguments` and `type_complexity` exceptions.
+
 ## What the current representation actually permits
 
 There are three separate questions: whether ownership/storage can be
