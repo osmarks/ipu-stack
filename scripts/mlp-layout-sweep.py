@@ -6,10 +6,11 @@ planner's shortlist. Every selected case gets a complete build and numerical
 check. Logs, profiles, predictions, failures and device timings are retained.
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import dataclasses
 import hashlib
 import json
+import itertools
 import math
 from pathlib import Path
 import re
@@ -225,11 +226,17 @@ def main():
     results = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         # Bound in-flight work and stop submitting cases after a hardware error.
-        for offset in range(0, len(cases), args.jobs):
-            pending = [pool.submit(run_case, args, *case) for case in cases[offset:offset + args.jobs]]
-            for future in as_completed(pending):
+        remaining = iter(cases)
+        pending = {pool.submit(run_case, args, *case)
+                   for case in itertools.islice(remaining, args.jobs)}
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
                 results.append(future.result())
                 (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            # Inspect every completed result before replacing finished work.
+            for case in itertools.islice(remaining, len(completed)):
+                pending.add(pool.submit(run_case, args, *case))
     # Explore coupling: cross the three fastest independent alternatives on
     # each side. Preserve the initial stratified sample for calibration.
     winners = {}
