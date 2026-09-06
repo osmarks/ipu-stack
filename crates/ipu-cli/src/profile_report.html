@@ -163,7 +163,7 @@ canvas {
         <span class="legend-item"><span class="legend-swatch" style="background:#c58b24"></span>sync</span>
         <label><input id="transferTexture" type="checkbox" checked> Texture</label>
         <span class="legend-item" title="Timeline texture; hover for TX and RX details"><span class="legend-swatch" style="background:repeating-linear-gradient(135deg,#777 0 3px,#ddd 3px 4px)"></span>multicast /</span>
-        <span class="legend-item"><span class="legend-swatch" style="background:repeating-linear-gradient(90deg,#777 0 4px,#fff 4px 6px)"></span>paired |</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:repeating-linear-gradient(45deg,#777 0 3px,#ddd 3px 4px)"></span>paired \</span>
       </div>
     </div>
     <div class="overview-wrap"><canvas id="overview"></canvas></div>
@@ -430,8 +430,9 @@ function transferTexture(multicast, paired) {
       ctx.stroke();
     }
     if (paired) {
-      ctx.fillStyle = "rgba(255,255,255,0.55)";
-      ctx.fillRect(2, 0, 2, 8);
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.lineTo(8, 8);
+      ctx.stroke();
     }
     transferTextures.set(key, ctx.createPattern(canvas, "repeat"));
   }

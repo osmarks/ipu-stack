@@ -907,3 +907,60 @@ Updated profiles are `artifacts/profiles/mlp-paired-streams.html` and
 `/tmp/paired-topology-final-redistribution.log`. The topology experiment snapshots
 are `/tmp/retain-paired-auto.json` (baseline) and `/tmp/paired-topology-auto.json`;
 its logical-slot permutation is `/tmp/paired-topology-permutation.json`.
+
+## Historical-layout GELU-to-downprojection occupancy (2026-09-06)
+
+The persistent-paired-stream hardware profile
+`/tmp/retain-paired-historical.ipuprofile`, rendered as
+`artifacts/profiles/mlp-historical-paired-streams.html`, separates two effects:
+phase 2 has 14,904 cycles of arrival spread, then 41,454 measured cycles after
+last arrival. Its static exchange horizon is 41,194 cycles. Arrival imbalance
+therefore adds synchronization time but does not explain the sparse transfer
+tail within that horizon.
+
+Integrating the embedded phase-2 activities over all 1,472 tiles gives 49.5%
+receive occupancy (53.0% with any send/receive/borrowed-lane activity). These are
+static scheduled intervals, not sampled hardware utilization. Some tiles finish
+their exchange and start compute before the global horizon, so the percentages
+are not utilization of only the tiles still executing exchange.
+
+| Scheduled cycle interval | Activation RX occupancy | Weight RX occupancy |
+|---|---:|---:|
+| 0–10,000 | 91.3% | 0.0% |
+| 10,000–20,000 | 41.3% | 11.6% |
+| 20,000–30,000 | 1.8% | 33.9% |
+| 30,000–41,194 | 1.9% | 19.7% |
+
+The phase combines activation redistribution (fanout 23/24, mostly paired) with
+720 ordinary weight broadcasts: 360 source tiles each send 4,148 + 2,764 words
+to four destinations. Weight transfers account for about 95% of receive work
+after cycle 20,000. Low TX occupancy by itself is expected for multicast; the
+falling RX occupancy is the more useful symptom.
+
+A concrete SRAM conflict occurs on logical tile 368. It receives 4,148 weight
+words at 0x87d40 during cycles 16,872–21,020 (write hazard ends 21,025), then sends
+4,148 weight words from 0x80000 during 21,025–25,173. These different buffers
+share the effective 32 KiB interleaved memory element: the incoming buffer
+starts just below 0x88000. Thus full duplex cannot overlap these particular
+accesses under the validated memory-hazard model. Its next 2,764-word send and
+receive *do* overlap, at 25,173–27,937. This is not blanket send/receive
+serialization or a long multicast instruction gap. Four-destination broadcasts
+also couple receiver availability, allowing one tile's delay to hold up others.
+
+Offline replay of `/tmp/paired-all-new.json` gives 41,194 cycles. Shifting all
+interleaved source/destination addresses by 4 KiB, preserving traffic and
+relative addresses, gives 32,939 cycles, a 20.0% reduction. Both runs pass the
+schedule validator and retain the 23,544-cycle endpoint lower bound. The shifted
+input is `/tmp/paired-stream-shift4096.json`; tile 368's decoded original row is
+`/tmp/paired-stream-tile368.log`. On that tile the shift moves the incoming
+weight buffer entirely beyond 0x88000 while its outgoing buffer stays below,
+removing the illustrated conflict. This experiment reruns scheduling, so the
+8,255-cycle improvement measures placement and ordering together, not an
+additive accounting of individual stalls. This new shifted schedule has not
+been run on hardware or integrated into a complete relocated package.
+
+The remaining gap to the endpoint bound is not all demonstrated avoidable
+work: that bound excludes multicast coupling, SRAM hazards and control costs.
+Nevertheless, the identical-traffic address experiment establishes a substantial
+placement-sensitive tail. Conflict-aware placement and ordering are better next
+targets than assuming a fundamental multicast throughput limit.
