@@ -490,3 +490,86 @@ also pass. Logs: `/tmp/selective-final-{tests,clippy}.log`,
 `/tmp/merged-validated-*.log`.
 Forced materialized attention also passes all 839,808 checks, maximum error
 0.000930, after the final range-merging change.
+
+## Finite numerical contract and reset investigation (2026-09-06)
+
+Numerical inputs and operation results are assumed finite under the normal input
+contract. Low scheduling may therefore omit copy-created K-padding clears when
+all tensor storage is F16, every logical destination element is written, and
+all consumers use that storage as GEMM activations against zero-padded parameter
+coefficients. Parameter provenance follows copies and aliases. Other consumers,
+missing logical data, mixed-precision arenas and repeat bindings without an
+established parameter proof retain initialization. Discarded row padding remains
+zero: arbitrary finite row values could cause overflow despite unobserved outputs.
+The runtime enables `FP_ICTL.OFLO`; worker activations inherit it. This is distinct
+from `NANOO`, which controls NaN-on-overflow behavior.
+
+The invariant starts at device reset/loading and survives same-precision SRAM
+reuse. It does not follow merely from starting a second invocation: a previous
+FP32 writer could leave FP16 NaN bit patterns. This first implementation deliberately
+uses the stronger all-F16-arena proof instead of allocation-history dataflow across
+mixed precisions.
+
+`gc-reset -m` was traced with GDB and compared with the driver. The SDK generates
+a short register-initialization program and uses the autoloader to install it
+while initializing tile SRAM. The driver's secondary-bootloader installation
+already uses the corresponding two-stage SRAM initialization sequence. It is now
+factored into one helper, also exposed as `Device::reset_tile_memory`. The API
+requires device reset and configuration first; invoking just the autoloader
+sequence against debug-halted live state does not establish the same guarantee.
+
+A destructive hardware regression poisons five addresses on tiles 0, 1, 63, 735,
+and 1471 with `0x7e007e00`, verifies the poison, resets/reconfigures the device,
+clears SRAM, and checks every address again. The addresses cover the bootstrap,
+standard SRAM, interleaved SRAM and the final SRAM word. All 25 checks pass; the
+autoloader portion takes about 66.9 ms. TDI inspection follows the SDK's all-seven-
+contexts halt and ATOV protocol. No TDI instruction encoding or primary/secondary
+register-access change was needed. The reproducible check is
+`crates/ipu-driver/examples/reset_memory.rs`; its arguments are configuration,
+an idle package and the SDK secondary-bootloader ELF.
+
+The final conservative pass removes 72 clear calls from the historical MLP and
+36 from the automatic MLP. Maximum tile cycles remain 211572 and 214890,
+respectively. Most merged clear ranges cover both K padding and discarded rows,
+so the finite-value proof cannot remove the whole call. An earlier prototype
+removed all 6528 historical clears and ran in 207786 cycles, but did not preserve
+discarded-row zeros; that optimization was narrowed to avoid spurious overflow
+faults. Recovering that saving requires separating row initialization from
+K-padding initialization rather than dropping their combined clears.
+
+All 163 workspace release tests and Clippy (with the documented allowances) pass.
+Hardware validation with overflow faults enabled passes full automatic and
+historical MLPs, GEMM, batched GEMM, attention smoke, a repeated two-block MLP,
+and both full projected and materialized attention. The latter check all 839808
+outputs, with maximum errors 0.001230 and 0.000930, respectively. A deliberate
+overflow-fault injection has not been tested. Structured-repeat and mixed-
+precision programs conservatively retain their padding clears.
+
+## Finalist expansion versus scheduling
+
+Compact exchange cost takes the larger of maximum outgoing bus bytes and maximum
+incoming tile bytes, divides by four bytes per cycle, and adds 600 cycles per
+nonempty exchange phase. Geometry-based traffic includes replication, grouping
+and padding. Fragmentation also influences staging choices and exchange-table
+storage estimates; packed-linear movement uses representative native grains.
+This does not model physical SRAM bank conflicts, detailed routes, paired-send
+opportunities or the final send/receive schedule.
+
+The manual `profile_mlp_finalist_expansion` test retains eight full-size MLP
+finalists without scheduling their exchanges. Compact planning took 12.22 s;
+individual expansions took 1.87, 2.54, 2.36, 2.78, 3.70, 2.35, 2.49 and 2.72 s.
+Their expanded analytical totals were 282747, 287715, 288507, 281275, 253837,
+296064, 288265 and 298810 cycles. Thus another compact finalist can look much
+better after expansion, and expansion itself is much cheaper than scheduling.
+
+The existing `--exchange-schedule-finalists 2` does full placement and physical
+exchange scheduling for both candidates. That selection stage took 47.60 s,
+considerably longer than the individual expansions above. It retained two modern
+geometries, not the historical combination; refined estimates were 267829 and
+269754 cycles, so finalist zero still won. Hardware passed at 214884 cycles.
+A sensible next step is cheap expanded-analytical reranking before scheduling a
+smaller subset, rather than physically scheduling every retained candidate.
+These measurements do not change the default finalist count.
+
+Logs: `/tmp/reset-{all-writes,mailbox,memory-check}.log`,
+`/tmp/finalist-expansion-timing.log`, and `/tmp/mlp-two-finalists.log`.
