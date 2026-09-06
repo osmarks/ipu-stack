@@ -749,3 +749,23 @@ than removal of the redundant representations addressed here.
   ignored); ownership regression checks dependencies, semantic boundaries,
   shared consumers and output aliases. Clippy uses the existing argument-count
   and type-complexity allowances.
+
+### Materialized comparison
+
+- Forced materialized attention with the same changes takes **376,494 cropped
+  cycles**, versus its previous 406,218 (7.3% faster) and current streaming
+  attention's 355,320 (materialized is 6.0% slower).
+- Full constant-output validation passes 839,808 elements with maximum error
+  0.000930. Gaussian checkpoints pass with projection errors
+  0.001953 / 0.001141 / 0.001953 and attention error 0.000109.
+- Full K/V broadcasts retain disjoint lifetimes and standard-memory residents.
+  Consequently the standard-to-interleaved multicast loopback optimization does
+  not remove their local copies. The longest K copy takes 13,914 cycles over
+  48 invocations. V packing still uses only 80 tiles and takes up to 22,956
+  cycles per tile. QK / probability-V GEMMs reach 54,744 / 53,712 cycles;
+  softmax reaches 40,326 and merge only 2,466. These are individual kernel
+  durations, not additive end-to-end stage costs.
+- Profile, renderer, package, summary and run log are under
+  `artifacts/layout-sweep/attention-grouped-materialized`; Gaussian checkpoints
+  are under `attention-grouped-materialized-gaussian`. Each generated program
+  was executed once. No additional implementation change was needed.
