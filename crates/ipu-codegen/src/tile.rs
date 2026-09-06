@@ -303,17 +303,24 @@ pub(crate) fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, 
         destination_stride,
     } = copy.pattern
     {
-        return (aligned(8)
-            && source_stride.is_multiple_of(8)
-            && destination_stride.is_multiple_of(8)
-            && rows >= 2
-            && row_bytes != 0
-            && row_bytes.is_multiple_of(8)
-            && row_bytes.checked_mul(rows) == Some(bytes))
-        .then(|| {
+        if rows < 2 || row_bytes == 0 || row_bytes.checked_mul(rows) != Some(bytes) {
+            return None;
+        }
+        return [
+            (8, crate::COPY_STRIDED_U64_SYMBOL),
+            (4, crate::COPY_STRIDED_U32_SYMBOL),
+        ]
+        .into_iter()
+        .find(|&(width, _)| {
+            aligned(width)
+                && row_bytes.is_multiple_of(width)
+                && source_stride.is_multiple_of(width)
+                && destination_stride.is_multiple_of(width)
+        })
+        .map(|(width, symbol)| {
             (
-                crate::COPY_STRIDED_U64_SYMBOL,
-                vec![row_bytes / 8, rows, source_stride, destination_stride],
+                symbol,
+                vec![row_bytes / width, rows, source_stride, destination_stride],
             )
         });
     }

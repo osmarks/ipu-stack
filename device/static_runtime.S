@@ -319,14 +319,15 @@ ipu_stack_fill_zero_u64:
 .Lfill_zero_u64_worker_done:
 	exitz $m15
 
-	.section .text.ipu_stack_copy_strided_u64,"ax",@progbits
+	.macro strided_copy bits, shift
+	.section .text.ipu_stack_copy_strided_u\bits,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/row, m5 rows,
 	// m6 source stride, m7 destination stride, m10 return. One call replaces
 	// the supervisor launch and return overhead of many short row copies.
-	.globl ipu_stack_copy_strided_u64
+	.globl ipu_stack_copy_strided_u\bits
 	.p2align 2
-	.type ipu_stack_copy_strided_u64,@function
-ipu_stack_copy_strided_u64:
+	.type ipu_stack_copy_strided_u\bits,@function
+ipu_stack_copy_strided_u\bits:
 	.supervisor
 	add $m11, $m11, -24
 	st32 $m2, $m11, $m15, 0
@@ -335,16 +336,16 @@ ipu_stack_copy_strided_u64:
 	st32 $m5, $m11, $m15, 3
 	st32 $m6, $m11, $m15, 4
 	st32 $m7, $m11, $m15, 5
-	setzi $m0, .Lcopy_strided_u64_worker
+	setzi $m0, .Lcopy_strided_u\bits\()_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 24
 	br $m10
-	.size ipu_stack_copy_strided_u64, .-ipu_stack_copy_strided_u64
+	.size ipu_stack_copy_strided_u\bits, .-ipu_stack_copy_strided_u\bits
 
 	.worker
 	.p2align 2
-.Lcopy_strided_u64_worker:
+.Lcopy_strided_u\bits\()_worker:
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
 	ld32 $m5, $mvertex_base, $m15, 2
@@ -354,12 +355,12 @@ ipu_stack_copy_strided_u64:
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
 	cmpult $m9, $m4, $m6
-	brz $m9, .Lcopy_strided_u64_done
+	brz $m9, .Lcopy_strided_u\bits\()_done
 	mul $m9, $m4, $m7
 	add $m3, $m3, $m9
 	mul $m9, $m4, $m8
 	add $m2, $m2, $m9
-	shl $m1, $m5, 3
+	shl $m1, $m5, \shift
 	// Each worker owns rows context, context + 6, ... . Account for the full
 	// six-row step after the inner loop has already advanced by one row width.
 	shl $m0, $m7, 1
@@ -370,22 +371,37 @@ ipu_stack_copy_strided_u64:
 	add $m9, $m9, $m8
 	shl $m9, $m9, 1
 	sub $m1, $m9, $m1
-.Lcopy_strided_u64_row:
+.Lcopy_strided_u\bits\()_row:
+	.if \bits == 64
 	add $m9, $m5, 0
-.Lcopy_strided_u64_word:
+.Lcopy_strided_u\bits\()_word:
 	ld64 $a0:1, $m3, $m15, 0
 	st64 $a0:1, $m2, $m15, 0
 	add $m3, $m3, 8
 	add $m2, $m2, 8
 	sub $m9, $m9, 1
-	brnz $m9, .Lcopy_strided_u64_word
+	brnz $m9, .Lcopy_strided_u\bits\()_word
+	.else
+	// Hardware repetition and post-incrementing addresses keep the 32-bit
+	// fallback to one load and one store per word.
+	{ rpt $m5, 1
+	  fnop }
+	{ ld32step $a0, $mzero, $m3+=, 1
+	  fnop }
+	{ st32step $a0, $mzero, $m2+=, 1
+	  fnop }
+	.endif
 	add $m3, $m3, $m0
 	add $m2, $m2, $m1
 	add $m4, $m4, 6
 	cmpult $m9, $m4, $m6
-	brnz $m9, .Lcopy_strided_u64_row
-.Lcopy_strided_u64_done:
+	brnz $m9, .Lcopy_strided_u\bits\()_row
+.Lcopy_strided_u\bits\()_done:
 	exitz $m15
+	.endm
+
+	strided_copy 64, 3
+	strided_copy 32, 2
 
 	.section .text.ipu_stack_static_repeat_call,"ax",@progbits
 	// Compact call loop used by static host schedules. ABI: m2 iteration count,

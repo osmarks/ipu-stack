@@ -1128,6 +1128,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
                 crate::COPY_U32_SYMBOL,
                 crate::COPY_U64_SYMBOL,
                 crate::COPY_STRIDED_U64_SYMBOL,
+                crate::COPY_STRIDED_U32_SYMBOL,
             ]
             .map(String::from),
         );

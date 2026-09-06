@@ -73,6 +73,7 @@ pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";
 pub const COPY_U16_SYMBOL: &str = "ipu_stack_static_copy_u16";
 pub const COPY_U32_SYMBOL: &str = "ipu_stack_static_copy_u32";
 pub const COPY_U64_SYMBOL: &str = "ipu_stack_copy_u64";
+pub const COPY_STRIDED_U32_SYMBOL: &str = "ipu_stack_copy_strided_u32";
 pub const COPY_STRIDED_U64_SYMBOL: &str = "ipu_stack_copy_strided_u64";
 pub const FILL_ZERO_U64_SYMBOL: &str = "ipu_stack_fill_zero_u64";
 pub const PATCH_WORD_SYMBOL: &str = "ipu_stack_static_patch_word";
