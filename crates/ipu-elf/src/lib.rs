@@ -91,6 +91,16 @@ impl Toolchain {
     ) -> Result<KernelArtifact, ElfError> {
         let source = source.as_ref();
         let cache = self.cached_artifact(source, flags)?;
+        fs::create_dir_all(cache.gp.parent().unwrap())?;
+        // A completed artifact is immutable. Serialize cache misses so another
+        // process cannot inspect or overwrite partially generated files.
+        let cache_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cache.gp.with_extension("lock"))?;
+        cache_lock.lock()?;
         if cache.object.is_file()
             && cache.metadata.is_file()
             && cache.gp.is_file()
@@ -105,7 +115,6 @@ impl Toolchain {
             target = %self.target,
             "compiling kernel"
         );
-        fs::create_dir_all(cache.gp.parent().unwrap())?;
         let mut command = Command::new(&self.popc);
         command.arg("--target").arg(&self.target);
         if !flags.iter().any(|flag| flag.starts_with("-O")) {

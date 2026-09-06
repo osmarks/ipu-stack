@@ -57,7 +57,8 @@ def main():
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(sorted(records, key=lambda r: r.get("cycles", float("inf"))))
-    colors = {"up": "#2977b8", "down": "#ce6728", "cross": "#378449", "baseline": "#30343a"}
+    colors = {"up": "#2977b8", "down": "#ce6728", "joint": "#874bb6",
+              "cross": "#378449", "baseline": "#30343a"}
     figure, axes = plt.subplots(2, 2, figsize=(11, 9), constrained_layout=True)
     for axis, key, title in zip(axes.flat, keys + ["expanded_exchange"],
                                ["Compact plan", "Expanded plan", "Expanded + final exchange schedule",

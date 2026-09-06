@@ -33,6 +33,9 @@ struct Arguments {
     bootloader: Option<PathBuf>,
     #[arg(long, default_value = "/dev/ipu0")]
     device: String,
+    /// Serialize hardware access after compilation using this advisory lock.
+    #[arg(long)]
+    device_lock: Option<PathBuf>,
     #[arg(long, default_value = "/tmp/ipu-trivial.ipuexe")]
     package: PathBuf,
     /// Load an existing --package without rebuilding it.
@@ -487,6 +490,7 @@ fn main() -> Result<()> {
         let bootloader_bytes =
             fs::read(&bootloader).with_context(|| format!("read {}", bootloader.display()))?;
         {
+            let _device_lock = lock_device(&arguments)?;
             let runtime = open_and_load_once(
                 &arguments.device,
                 &configuration,
@@ -864,6 +868,7 @@ fn main() -> Result<()> {
         application.host_exchange.startup_mark
     };
     {
+        let _device_lock = lock_device(&arguments)?;
         let runtime = open_and_load_once(
             &arguments.device,
             &configuration,
@@ -997,6 +1002,26 @@ fn open_and_load_once(
     Ok(runtime)
 }
 
+fn lock_device(arguments: &Arguments) -> Result<Option<fs::File>> {
+    arguments
+        .device_lock
+        .as_ref()
+        .map(|path| {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .with_context(|| format!("open device lock {}", path.display()))?;
+            tracing::info!(path = %path.display(), "waiting for hardware ownership");
+            file.lock().context("acquire hardware ownership")?;
+            tracing::info!(path = %path.display(), "acquired hardware ownership");
+            Ok(file)
+        })
+        .transpose()
+}
+
 fn execute_exchange_replay(
     arguments: &Arguments,
     replay: &exchange_stress::PhaseReplayPackage,
@@ -1008,6 +1033,7 @@ fn execute_exchange_replay(
     let bootloader_bytes =
         fs::read(bootloader).with_context(|| format!("read {}", bootloader.display()))?;
     {
+        let _device_lock = lock_device(arguments)?;
         let runtime = open_and_load_once(
             &arguments.device,
             &configuration,

@@ -6,6 +6,7 @@ planner's shortlist. Every selected case gets a complete build and numerical
 check. Logs, profiles, predictions, failures and device timings are retained.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import dataclasses
 import hashlib
 import json
@@ -100,6 +101,16 @@ def manifest():
             pair = (plan, DOWN) if side == "up" else (UP, plan)
             if not any(pair == (up, down) for _, up, down in cases):
                 cases.append((f"{side}-{index:02d}", *pair))
+    # Independent coordinate sweeps can miss a pair whose boundary is only
+    # cheap when both sides change. Cover shared row grids and matching the
+    # downprojection compute rows to the up-projection's scattered result.
+    up_grids, down_grids = grids(1152, 4304), grids(4304, 1152)
+    for rows in [3, 6, 8]:
+        up = next(plan for _, plan in up_grids if plan.r == rows)
+        down = next(plan for _, plan in down_grids if plan.r == rows)
+        cases.append((f"joint-rows-{rows}", up, down))
+    for name, up in [("joint-result-rows-4", UP), ("joint-result-rows-8", Plan(8, 90, 2, 48))]:
+        cases.append((name, up, Plan(16, 23, 4, 64)))
     return cases, counts
 
 
@@ -135,25 +146,39 @@ def run_case(args, name, up, down):
             raise RuntimeError(f"stale manifest in {folder}")
         return previous
     command = [args.binary, args.config, "--sdk", args.sdk,
+               "--device-lock", str(args.output.resolve() / "device.lock"),
                "--workload", "siglip-mlp-benchmark", "--mlp-batch", "1",
                "--package", str(folder / "model.ipuexe"),
                "--profile-output", str(folder / "execution.ipuprofile")]
     for constraint in constraints:
         command += ["--gemm-plan-constraint", constraint]
-    (folder / "command.json").write_text(json.dumps(command, indent=2))
+    log_path = folder / "build.log"
+    # Recover a completed run if the coordinator was stopped between process
+    # completion and writing its summary. Never recover a partial/failing run.
+    recovered = log_path.exists() and "hardwareTest=PASS" in log_path.read_text()
+    if recovered:
+        old_command = json.loads((folder / "command.json").read_text())
+        old_constraints = [old_command[i + 1] for i, arg in enumerate(old_command)
+                           if arg == "--gemm-plan-constraint"]
+        if old_constraints != constraints:
+            raise RuntimeError(f"stale completed build in {folder}")
+    else:
+        (folder / "command.json").write_text(json.dumps(command, indent=2))
     print(f"START {name}: {' '.join(constraints)}", flush=True)
     start = time.monotonic()
-    with (folder / "build.log").open("w") as output:
-        try:
-            completed = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
-                                       timeout=args.timeout)
-            status = completed.returncode
-        except subprocess.TimeoutExpired:
-            status = "timeout"
-    log = (folder / "build.log").read_text()
+    status = 0
+    if not recovered:
+        with log_path.open("w") as output:
+            try:
+                completed = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT,
+                                           timeout=args.timeout)
+                status = completed.returncode
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+    log = log_path.read_text()
     result = dict(name=name, constraints=constraints, up=dataclasses.asdict(up),
                   down=dataclasses.asdict(down), status=status,
-                  seconds=time.monotonic() - start, **extract(log))
+                  seconds=None if recovered else time.monotonic() - start, **extract(log))
     if result["hardware_pass"]:
         for report, options in [("barriers", ["profile-barriers"]),
                                 ("kernels", ["profile-query", "--group-by", "kernel", "--limit", "1000"]),
@@ -167,7 +192,7 @@ def run_case(args, name, up, down):
             result["refined_cycles"] = (result["expanded_cycles"] - result["expanded_exchange"]
                                         + result["scheduled_exchange"])
     record_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"DONE {name}: status={status}, cycles={result.get('cycles')}, seconds={result['seconds']:.1f}", flush=True)
+    print(f"DONE {name}: status={status}, cycles={result.get('cycles')}, seconds={result['seconds']}", flush=True)
     # Never silently continue a hardware correctness failure as a slow layout.
     if not result["hardware_pass"] and "application loaded" in log:
         raise RuntimeError(f"hardware failure: inspect {folder / 'build.log'}")
@@ -182,8 +207,11 @@ def main():
     parser.add_argument("--binary", default="target/release/ipu-trivial-test")
     parser.add_argument("--cli", default="target/release/ipu-stack")
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--jobs", type=int, default=1, help="Concurrent builds; hardware access is serialized")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
     cases, counts = manifest()
     inventory = dict(screened_grids=counts, cases=[dict(name=name, up=dataclasses.asdict(up),
@@ -195,9 +223,13 @@ def main():
     if args.dry_run:
         return
     results = []
-    for case in cases:
-        results.append(run_case(args, *case))
-        (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        # Bound in-flight work and stop submitting cases after a hardware error.
+        for offset in range(0, len(cases), args.jobs):
+            pending = [pool.submit(run_case, args, *case) for case in cases[offset:offset + args.jobs]]
+            for future in as_completed(pending):
+                results.append(future.result())
+                (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     # Explore coupling: cross the three fastest independent alternatives on
     # each side. Preserve the initial stratified sample for calibration.
     winners = {}
