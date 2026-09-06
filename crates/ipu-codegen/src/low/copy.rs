@@ -119,7 +119,13 @@ fn coalesce_copies<Buffer: Clone>(
         let destination_stride = second
             .destination_offset
             .saturating_sub(first.destination_offset);
-        if source_stride == 0 || destination_stride == 0 {
+        if source_stride == 0
+            || destination_stride == 0
+            || !first.source_offset.is_multiple_of(8)
+            || !first.destination_offset.is_multiple_of(8)
+            || !source_stride.is_multiple_of(8)
+            || !destination_stride.is_multiple_of(8)
+        {
             coalesced.push(first.clone());
             index += 1;
             continue;

@@ -1105,11 +1105,8 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
             match work {
                 crate::TileWorkRef::LocalCopy(copy) => {
                     copies.local = true;
-                    copies.halfword |= !match copy.pattern {
-                        crate::CopyPattern::Contiguous => copy.bytes,
-                        crate::CopyPattern::Strided { row_bytes, .. } => row_bytes,
-                    }
-                    .is_multiple_of(4);
+                    copies.halfword |= crate::tile::local_copy_call(copy)
+                        .is_some_and(|(symbol, _)| symbol == crate::COPY_U16_SYMBOL);
                 }
                 crate::TileWorkRef::Kernel(run) => {
                     copies.zero |= matches!(run.kernel, crate::TileKernelSpec::FillZero { .. });

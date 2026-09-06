@@ -291,8 +291,11 @@ fn lower_work(
     Ok(steps)
 }
 
-fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> {
+pub(crate) fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> {
     let bytes = copy.bytes;
+    let aligned = |width| {
+        copy.source_offset.is_multiple_of(width) && copy.destination_offset.is_multiple_of(width)
+    };
     if let crate::CopyPattern::Strided {
         rows,
         row_bytes,
@@ -300,7 +303,10 @@ fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> 
         destination_stride,
     } = copy.pattern
     {
-        return (rows >= 2
+        return (aligned(8)
+            && source_stride.is_multiple_of(8)
+            && destination_stride.is_multiple_of(8)
+            && rows >= 2
             && row_bytes != 0
             && row_bytes.is_multiple_of(8)
             && row_bytes.checked_mul(rows) == Some(bytes))
@@ -311,12 +317,12 @@ fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> 
             )
         });
     }
-    if bytes >= 6 * 8 && bytes.is_multiple_of(8) {
+    if aligned(8) && bytes >= 6 * 8 && bytes.is_multiple_of(8) {
         let words = bytes / 8;
         Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
-    } else if bytes != 0 && bytes.is_multiple_of(4) {
+    } else if aligned(4) && bytes != 0 && bytes.is_multiple_of(4) {
         Some((crate::COPY_U32_SYMBOL, vec![bytes / 4]))
-    } else if bytes != 0 && bytes.is_multiple_of(2) {
+    } else if aligned(2) && bytes != 0 && bytes.is_multiple_of(2) {
         Some((crate::COPY_U16_SYMBOL, vec![bytes / 2]))
     } else {
         None
@@ -749,27 +755,33 @@ mod tests {
     }
 
     #[test]
-    fn randomized_local_copy_calls_never_launch_zero_work_workers() {
+    fn randomized_local_copy_calls_respect_alignment_and_worker_counts() {
         let mut random = fastrand::Rng::with_seed(0x636f_7079);
         for _ in 0..1_000 {
             let words = random.u32(1..=4_096);
             let bytes = words * 4;
             let copy = crate::LocalCopy {
                 source: crate::BlockValueId::from_index(0),
-                source_offset: 0,
+                source_offset: 2 * random.u32(0..4),
                 destination: crate::BlockValueId::from_index(1),
-                destination_offset: 0,
+                destination_offset: 2 * random.u32(0..4),
                 bytes,
                 pattern: crate::CopyPattern::Contiguous,
             };
             let (symbol, arguments) = local_copy_call(&copy).unwrap();
             if symbol == crate::COPY_U64_SYMBOL {
+                assert!(copy.source_offset.is_multiple_of(8));
+                assert!(copy.destination_offset.is_multiple_of(8));
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
                 assert!(arguments[1] < 6);
-            } else {
-                assert_eq!(symbol, crate::COPY_U32_SYMBOL);
+            } else if symbol == crate::COPY_U32_SYMBOL {
+                assert!(copy.source_offset.is_multiple_of(4));
+                assert!(copy.destination_offset.is_multiple_of(4));
                 assert_eq!(arguments, [words]);
+            } else {
+                assert_eq!(symbol, crate::COPY_U16_SYMBOL);
+                assert_eq!(arguments, [bytes / 2]);
             }
         }
     }
