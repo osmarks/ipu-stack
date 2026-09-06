@@ -3412,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn point_to_point_matches_cpp_oracle_vectors() {
+    fn point_to_point_primitive_encodings() {
         let topology = Topology::c600();
         let cases = [
             (
@@ -3481,7 +3481,7 @@ mod tests {
     }
 
     #[test]
-    fn multicast_matches_cpp_oracle_vectors() {
+    fn multicast_primitive_encodings() {
         let topology = Topology::c600();
         let plan = topology.multicast(0, &[274, 1286], 3, 0).unwrap();
         assert_eq!(plan.sender[0], 0x41800003);

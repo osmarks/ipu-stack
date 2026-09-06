@@ -747,3 +747,91 @@ The automatic MLP build/run took 99.27 seconds versus 77.70 in the preceding
 finite-padding validation; historical took 28.19 versus 25.25. These were not
 controlled host-time benchmarks, but scheduling-time impact merits profiling
 separately from the demonstrated device-cycle improvement.
+
+## Multicast timing audit and SDK validation (2026-09-06)
+
+This supersedes the temporary multicast restriction above. Three receive-boundary
+errors, rather than a fabric-wide multicast spacing requirement, explained the
+failed unrestricted runs:
+
+1. The 52-word primitive put PIC one event early; composition then overwrote the
+   previous transfer's final word at the next destination.
+2. The phase composer combined paired-format teardown and the next source control,
+   although the primitive generator already avoided that unsafe instruction.
+3. Paired-format activation could precede the end of an ordinary payload by two
+   events. This caused `TEXCH_RERR_MODI` on two automatic-MLP tiles even after the
+   first two fixes. A two-transfer mixed-width replay reproduces it independently.
+
+All three have targeted regression tests and before/after hardware reproducers.
+The blanket outer release guard is removed; the row scheduler now constrains the
+actual source, pointer and format events. The ordinary and paired captured MLP
+exchange replays pass 16384 sampled words each. Full historical and automatic MLPs
+pass with unchanged maximum absolute error 0.011719.
+
+| Measurement | Restricted route pipelining | Corrected multicast pipelining |
+|---|---:|---:|
+| Historical MLP max tile cycles | 204594 | 204258 |
+| Automatic MLP max tile cycles | 207114 | 209298 |
+| Historical redistribution schedule | 41599 | 42618 |
+| Automatic redistribution schedule | 29240 | 30944 |
+
+Removing constraints is **not** a monotonic improvement to the greedy scheduler's
+choice of order. The historical full run saves only 336 cycles, and the automatic
+run regresses 2184 (1.05%). Redistribution becomes worse even though individual
+route setups can begin earlier. These measurements establish correctness and
+remove a false hardware assumption; they do not establish a general speedup.
+
+The SDK oracle demonstrates a specific remaining opportunity: four ordinary
+52-word multicasts have source cutovers 52 events apart, and four paired 352-word
+multicasts have cutovers 176 events apart. It keeps paired receive format active
+across compatible transfers, while our composer still tears it down per transfer.
+That persistent format state is the next concrete way to remove paired gaps;
+ordering and SRAM conflicts remain separate issues. See the exact decoded SDK
+events and reproduction commands in
+[the instruction reference](EXCHANGE_INSTRUCTION_REFERENCE.md#sdk-comparison-and-repeatable-hardware-probes).
+
+The HTML renderer now carries destination fanout and paired-width metadata through
+both package and profile schemas. Direction colours are unchanged; optional diagonal
+texture marks multicast, vertical texture marks paired width, and hover reports
+TX and RX independently, including mixed bidirectional cases. A transfer to one
+physical tile pair is labelled paired unicast. Old profiles explicitly report
+unknown route/width instead of silently being labelled unicast. Headless Chromium
+checks cover rendering, texture toggling, mixed TX/RX details and missing old metadata.
+
+Updated profiles:
+
+* `artifacts/profiles/mlp-historical-multicast-pipelining.html`
+* `artifacts/profiles/mlp-multicast-pipelining.html`
+* `artifacts/profiles/attention-multicast-pipelining.html`
+
+Logs: `/tmp/multicast-format-full-results.log`,
+`/tmp/multicast-drain-full-results.log`, `/tmp/mixed-single-{before,after}.log`,
+`/tmp/multicast-before-format-drain-automatic.log`,
+`/tmp/sdk-sequence-{ordinary,paired}.log`, and
+`/tmp/multicast-complete-{tests,clippy}.log`. The committed scripts reproduce
+boundary tests and SDK sequences without depending on these temporary files.
+
+The tighter schedules also exposed an attention package-sizing check that compared
+final compact rows only with the provisional payload length. Final placement can
+change row sharing/alignment, but the allocator already reserves an entire SRAM
+element. The check now uses that existing reservation minus the 64-byte supervisor
+fetch guard. It does not move tensors or consume another element; genuine capacity
+overflow still fails with planned, required and available byte counts.
+
+
+Final validation passes all 167 workspace release tests and Clippy with the existing
+argument-count/type-complexity allowances. All 20 committed boundary cases pass on
+hardware, including repeated-source ordinary/paired sends and mixed-width receive
+pairs. GEMM smoke, batched GEMM (786432 numerical checks), repeated MLP, and full
+projected attention (839808 checks, maximum error 0.001230) pass. Final logs are
+`/tmp/exchange-boundaries-complete.log`, `/tmp/multicast-attention-final-result.log`,
+and `/tmp/multicast-capacity-{tests,clippy}.log`.
+
+
+Attention benefits substantially: with identical sample/transfer counts, measured
+exchange-phase time falls from 149676 to 106356 cycles (28.9%), and scheduled
+exchange event time falls from 130174 to 86826. These figures come from
+`profile-inspect` on `/tmp/route-guarded-attention.ipuprofile` and
+`/tmp/multicast-attention.ipuprofile`; they are exchange-phase totals, not total
+model latency. A final historical-MLP rerun retains 204258 max tile cycles after
+the mixed-format fix (its redistribution horizon changes by one event to 42618).

@@ -95,8 +95,8 @@ sendpic(words - 1, control_selector, control_value)
 `sctl` is the three-bit send-control field, not an opaque format number. Two
 bits enable the two exchange-fabric directions independently; values 1 and 2
 select one direction and 3 broadcasts in both. The remaining bit selects
-64-bit rather than 32-bit items. ipu-stack's internal tensor exchanges are
-currently 32-bit-word streams, so they use only values 1, 2, or 3. A zero
+64-bit rather than 32-bit items. Internal tensor exchanges use values 1, 2,
+or 3 for ordinary words, and 5, 6, or 7 for paired transfers. A zero
 direction field advances the outgoing event stream without putting a packet
 on either route.
 
@@ -209,3 +209,84 @@ Both pair orientations and the reversed construction order are covered by
 `borrowed_transmit_lane_allows_receive_but_excludes_local_send` in codegen tests.
 The complete historical and reconstructed MLP exchange phases also pass paired
 hardware replay. See [the layout diagnosis](PROFILE_LAYOUT_DIAGNOSIS.md#paired-transfers-were-overconstrained).
+
+
+## Composing multicast receive boundaries (2026-09-06)
+
+Multicast does **not** require a whole route-latency gap between transfers.
+The ordinary receiver's payload arrives 52 + 2 × physical-row events after
+its XPIC source selection. Source selection and local pointer ownership must
+therefore be scheduled separately. Absolute-address receive rows are also used
+for repeated unicasts; this encoding is not a multicast-only timing constraint.
+
+Two boundary errors were hidden by the old outer scheduler's receive-end guard:
+
+* The reverse-engineered 52-word primitive programmed PIC one event early to
+  avoid an aligned composite instruction. That works in isolation, but the row
+  composer treated PIC setup as first payload arrival. In a four-transfer replay,
+  the next destination received the previous transfer's last word and subsequent
+  words shifted by one. PIC setup now uses the same payload-arrival offset as
+  other lengths. The standalone neutral control is one event later; composition
+  puts source teardown at the exact end of the word stream.
+* The composer permitted a previous paired-format teardown and the next XPIC
+  source selection in one directionless SENDPICP. A two-transfer replay faults
+  with this combination. The SDK sequence uses separate controls. Primitive
+  paired generation already rejected coincident format/source events; the same
+  restriction now applies across primitive boundaries. The scheduler separates
+  the events instead of delaying the next transfer until all old payloads arrive.
+
+The second restriction is a hardware-tested encoding restriction of this
+implementation, not a claim that every possible combined format control is
+architecturally forbidden. Ordinary PIC-pointer plus XPIC combinations remain
+supported. Other local constraints remain: outgoing streams cannot overlap,
+receiver source/pointer windows cannot overlap, paired transmit borrowing reserves
+the partner's outgoing lane, SRAM hazards can delay transfers, and composite
+instructions need alignment. Those are distinct from an outer route-latency gap.
+
+A third error affected ordinary-to-paired transitions: checking the new PIC
+pointer against the previous payload end is insufficient. Paired format activates
+**two events before** that pointer update. Activation must wait for the ordinary
+payload to drain, or its last words are interpreted in the wrong format. Hardware
+reports `TEXCH_RERR_MODI`. A 972-word unicast followed by a 352-word paired transfer
+reproduces the fault on logical receiver 3 or 46; receivers 2 and 47 pass because
+their role in the pair imposes a later source constraint. All four pass when format
+activation, rather than pointer setup, respects the preceding ordinary payload.
+
+### SDK comparison and repeatable hardware probes
+
+`scripts/sdk-multicast-sequence.cpp` builds, saves and executes four SDK Copies
+from logical tiles 0/4/6/8 to tile 2 and a configurable second receiver. Compile
+with the SDK enabled:
+
+```sh
+g++ -std=c++17 -O2 scripts/sdk-multicast-sequence.cpp -o /tmp/sdk-sequence \
+  -I"$POPLAR_SDK_ENABLED/include" -L"$POPLAR_SDK_ENABLED/lib" \
+  -Wl,-rpath,"$POPLAR_SDK_ENABLED/lib" -lpoplar
+/tmp/sdk-sequence /tmp/sdk-ordinary.poplar_exec 52 5
+/tmp/sdk-sequence /tmp/sdk-paired.poplar_exec 352 3
+```
+
+Both pass on SDK 3.4.0 and C600 hardware (416 and 2816 words). Extract their tile
+ELFs with `../ipu-exchange-re/tools/extract_gc_exe.sh`; disassemble with that
+repository's `tools/sdk-exchange-oracle/instructions.cpp` and `libipu_arch_info`.
+For logical tile 2 / physical tile 64, the compute-exchange sequence is:
+
+| SDK sequence | XPIC source events | PIC pointer events | Format events |
+|---|---|---|---|
+| Four ordinary 52-word multicasts | 2, 54, 106, 158 | 56, 108, 160, 212 | none |
+| Four paired 352-word multicasts | 1, 177, 353, 529 | 56, 232, 408, 584 | enable 54, disable 758 |
+
+These are decoded instruction timings of SDK programs that passed hardware
+checks, not timestamp measurements of the fabric. They prove tightly consecutive
+multicast streams are executable. In particular, the SDK retains paired format
+across all four messages. Our primitive composition still tears it down per
+message, so compatible paired streams have further room for improvement. Removing
+that overhead requires tracking persistent format ownership separately from XPIC
+source ownership; relaxing the outer scheduler alone does not accomplish it.
+
+`python3 scripts/exchange-boundaries.py --sdk SDK_DIRECTORY --output /tmp/boundaries`
+replays ordinary count boundaries, paired sequences, distant and repeated sources,
+and mixed ordinary/paired transitions through the production scheduler. Each case writes
+its snapshot, package and hardware log. Run it from the repository root, with no
+other process using the device. The receive destinations use distinct addresses,
+so pointer-boundary errors cannot be hidden by contiguous output allocation.
