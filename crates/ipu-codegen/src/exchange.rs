@@ -1,7 +1,9 @@
 //! Physical exchange programs generated from logical shard transfers.
 
 mod reuse;
+mod traffic;
 pub(crate) use reuse::ExchangeScheduleCache;
+pub(crate) use traffic::MappingTraffic;
 
 use crate::{
     BlockValueId, ExchangePhaseId, LogicalExchange, LowProgram, Placement, ShardDefinition,

@@ -1,6 +1,67 @@
 //! Bounded SRAM placement search after package support storage is reserved.
 
 use super::*;
+use std::collections::BTreeSet;
+
+/// Screen geometry-derived embeddings by resource load, retaining one challenger.
+pub(super) fn model_mapping(
+    program: &LowProgram,
+    search: bool,
+) -> PackageBuildResult<(u64, Option<Vec<u16>>)> {
+    let baseline = place(program)?;
+    let traffic = crate::exchange::MappingTraffic::new(program, &baseline)?;
+    let multiplicities = exchange_multiplicities(program);
+    let identity = (0..program.tile_count).collect::<Vec<_>>();
+    let baseline_score = traffic.score(&identity, &multiplicities);
+    let mut blocks = BTreeSet::from([program.tile_count]);
+    for shard in &program.shards {
+        for axis in &shard.tensor_type.format.layout.tiling.axes {
+            if let Some(stride) = axis.tile_stride {
+                for block in [stride, stride.saturating_mul(axis.partitions)] {
+                    if block > 1 && block <= program.tile_count {
+                        blocks.insert(block);
+                    }
+                }
+            }
+        }
+    }
+    let mut best = None;
+    let mut best_score = baseline_score;
+    let mut candidates = 0;
+    for block in blocks.into_iter().filter(|_| search) {
+        for width in 2..block {
+            if !block.is_multiple_of(width) {
+                continue;
+            }
+            let mapping = (0..program.tile_count)
+                .map(|tile| {
+                    let base = tile / block * block;
+                    let local = tile % block;
+                    if u32::from(base) + u32::from(block) <= u32::from(program.tile_count) {
+                        base + local % width * (block / width) + local / width
+                    } else {
+                        tile
+                    }
+                })
+                .collect::<Vec<_>>();
+            let score = traffic.score(&mapping, &multiplicities);
+            candidates += 1;
+            tracing::debug!(block, width, cycles=score.0, pressure=%score.1, "modelled tile mapping");
+            if score.0 < baseline_score.0 && score < best_score {
+                best_score = score;
+                best = Some(mapping);
+            }
+        }
+    }
+    tracing::info!(candidates, baseline_cycles=baseline_score.0, candidate_cycles=best_score.0,
+        baseline_pressure=%baseline_score.1, candidate_pressure=%best_score.1,
+        "screened tile mappings by exchange resource load");
+    let selected = best.as_deref().unwrap_or(&identity);
+    let cycles =
+        crate::estimate::program_cycles(&program.program, Some(&traffic.phase_cycles(selected)))?
+            .total;
+    Ok((cycles, best))
+}
 
 /// Apply ownership-preserving placement before projecting per-tile work.
 pub(super) fn map_tiles(
@@ -92,14 +153,7 @@ pub(super) fn improve_exchange_placement(
             return Ok((baseline, exchanges));
         }
     };
-    let mut multiplicities = vec![0u64; program.exchange_phases.len()];
-    for tile in &program.tiles {
-        let mut counts = vec![0u64; multiplicities.len()];
-        count_exchanges(program, tile, 1, &mut counts);
-        for (maximum, count) in multiplicities.iter_mut().zip(counts) {
-            *maximum = (*maximum).max(count);
-        }
-    }
+    let multiplicities = exchange_multiplicities(program);
     let cycles = |lowered: &crate::exchange::LoweredExchanges| -> u64 {
         lowered
             .phases
@@ -126,6 +180,18 @@ pub(super) fn improve_exchange_placement(
     } else {
         Ok((baseline, exchanges))
     }
+}
+
+fn exchange_multiplicities(program: &LowProgram) -> Vec<u64> {
+    let mut multiplicities = vec![0u64; program.exchange_phases.len()];
+    for tile in &program.tiles {
+        let mut counts = vec![0u64; multiplicities.len()];
+        count_exchanges(program, tile, 1, &mut counts);
+        for (maximum, count) in multiplicities.iter_mut().zip(counts) {
+            *maximum = (*maximum).max(count);
+        }
+    }
+    multiplicities
 }
 
 fn count_exchanges(

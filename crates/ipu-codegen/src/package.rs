@@ -665,7 +665,7 @@ fn build_package_artifacts(
             graph,
             &planning,
             &Ipu21CostModel,
-            planning.exchange_schedule_finalists,
+            planning.exchange_schedule_finalists.max(4),
         )?)
     })?;
     let (low, mut exchange_cache) = build_phase("select_finalist", || {
@@ -711,55 +711,70 @@ fn select_scheduled_finalist(
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
 ) -> PackageBuildResult<(LowProgram, crate::exchange::ExchangeScheduleCache)> {
-    if finalists.len() == 1 {
-        let mut mid = crate::low::expand::expand_tiles(&finalists.into_iter().next().unwrap())?;
-        placement::map_tiles(&mut mid, tile_mapping)?;
-        tracing::info!(
-            estimated_cycles = mid.estimated_cycles,
-            estimated_exchange_cycles = mid.estimated_exchange_cycles,
-            "selected analytical operator plan"
-        );
-        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
-        return Ok((low, crate::exchange::ExchangeScheduleCache::default()));
-    }
-
     let topology = active_topology(planning.tile_count)?;
-    let mut ranked = Vec::with_capacity(finalists.len());
-    for (index, mid) in finalists.into_iter().enumerate() {
-        let mut mid = crate::low::expand::expand_tiles(&mid)?;
-        placement::map_tiles(&mut mid, tile_mapping)?;
-        let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
-        let placement = place(&low)?;
-        let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
-        let exchanges = crate::exchange::lower_exchanges_cached(
-            &low,
-            &placement,
-            &topology,
-            crate::ExchangeLoweringOptions::default(),
-            &mut exchange_cache,
-        )?;
-        let mut phase_cycles = vec![0; mid.exchange_phases.len()];
-        for phase in &exchanges.phases {
-            phase_cycles[phase.id.index() as usize] = u64::from(phase.event_cycles)
-                .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles);
+    let mut modelled = finalists
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, mid)| -> PackageBuildResult<_> {
+            let mut expanded = crate::low::expand::expand_tiles(&mid)?;
+            placement::map_tiles(&mut expanded, tile_mapping)?;
+            let baseline = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
+            let (cycles, challenger) = placement::model_mapping(&baseline, tile_mapping.is_none())?;
+            tracing::info!(
+                finalist = index,
+                modelled_cycles = cycles,
+                estimated_cycles = expanded.estimated_cycles,
+                estimated_exchange_cycles = expanded.estimated_exchange_cycles,
+                "modelled expanded operator plan"
+            );
+            Ok((cycles, index, expanded, challenger))
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
+    modelled.sort_by_key(|(cycles, index, _, _)| (*cycles, *index));
+    modelled.truncate(planning.exchange_schedule_finalists);
+    let mut ranked = Vec::with_capacity(modelled.len() * 2);
+    for (_, index, expanded, challenger) in modelled {
+        for (mapped, mapping) in [(false, None), (true, challenger.as_deref())] {
+            if mapped && mapping.is_none() {
+                continue;
+            }
+            let mut mid = expanded.clone();
+            placement::map_tiles(&mut mid, mapping)?;
+            let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
+            let placement = place(&low)?;
+            let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
+            let exchanges = crate::exchange::lower_exchanges_cached(
+                &low,
+                &placement,
+                &topology,
+                crate::ExchangeLoweringOptions::default(),
+                &mut exchange_cache,
+            )?;
+            let mut phase_cycles = vec![0; mid.exchange_phases.len()];
+            for phase in &exchanges.phases {
+                phase_cycles[phase.id.index() as usize] = u64::from(phase.event_cycles)
+                    .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles);
+            }
+            let refined = crate::estimate::program_cycles(&mid, Some(&phase_cycles))?;
+            let scheduled_exchange_cycles = refined.exchange;
+            let refined_cycles = refined.total;
+            tracing::info!(
+                finalist = index,
+                mapped,
+                analytical_cycles = mid.estimated_cycles,
+                analytical_exchange_cycles = mid.estimated_exchange_cycles,
+                scheduled_exchange_cycles,
+                refined_cycles,
+                "scheduled operator-plan finalist"
+            );
+            ranked.push((refined_cycles, index, mapped, low, exchange_cache));
         }
-        let refined = crate::estimate::program_cycles(&mid, Some(&phase_cycles))?;
-        let scheduled_exchange_cycles = refined.exchange;
-        let refined_cycles = refined.total;
-        tracing::info!(
-            finalist = index,
-            analytical_cycles = mid.estimated_cycles,
-            analytical_exchange_cycles = mid.estimated_exchange_cycles,
-            scheduled_exchange_cycles,
-            refined_cycles,
-            "scheduled operator-plan finalist"
-        );
-        ranked.push((refined_cycles, index, low, exchange_cache));
     }
-    ranked.sort_by_key(|(cycles, index, _, _)| (*cycles, *index));
-    let (_, selected, low, exchange_cache) = ranked.remove(0);
+    ranked.sort_by_key(|(cycles, index, mapped, _, _)| (*cycles, *index, *mapped));
+    let (_, selected, mapped, low, exchange_cache) = ranked.remove(0);
     tracing::info!(
         selected,
+        mapped,
         "selected physically scheduled operator-plan finalist"
     );
     Ok((low, exchange_cache))

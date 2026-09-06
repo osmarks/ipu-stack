@@ -1071,10 +1071,13 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             .min(inner_partitions);
             let mut result_partition_options = vec![(1, 1)];
             if distributed_result_is_useful {
-                if inner_partitions <= maximum_result_rows {
-                    result_partition_options.push((inner_partitions, 1));
-                } else if inner_partitions <= maximum_result_columns {
-                    result_partition_options.push((1, inner_partitions));
+                for result_rows in 1..=maximum_result_rows {
+                    if inner_partitions.is_multiple_of(result_rows) {
+                        let result_columns = inner_partitions / result_rows;
+                        if result_columns <= maximum_result_columns {
+                            result_partition_options.push((result_rows, result_columns));
+                        }
+                    }
                 }
             }
             if let Some(constraint) = constraint {
