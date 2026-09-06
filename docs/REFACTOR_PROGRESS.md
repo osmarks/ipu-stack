@@ -761,7 +761,7 @@ than removal of the redundant representations addressed here.
 - Full K/V broadcasts retain disjoint lifetimes and standard-memory residents.
   Consequently the standard-to-interleaved multicast loopback optimization does
   not remove their local copies. The longest K copy takes 13,914 cycles over
-  48 invocations. V packing still uses only 80 tiles and takes up to 22,956
+  48 invocations. K packing still uses only 80 tiles and takes up to 22,956
   cycles per tile. QK / probability-V GEMMs reach 54,744 / 53,712 cycles;
   softmax reaches 40,326 and merge only 2,466. These are individual kernel
   durations, not additive end-to-end stage costs.
@@ -769,3 +769,38 @@ than removal of the redundant representations addressed here.
   `artifacts/layout-sweep/attention-grouped-materialized`; Gaussian checkpoints
   are under `attention-grouped-materialized-gaussian`. Each generated program
   was executed once. No additional implementation change was needed.
+
+## Standard-memory loopback and distributed K packing (2026-09-06)
+
+- The hardware mechanism already supports standard-to-standard multicast
+  loopback when read and receive touch separate SRAM elements. The restriction
+  was in materialization selection. An 18-case exchange test passes on C600,
+  alternating standard and interleaved destinations at 1, 2, 51, 52, 53, 64, 65,
+  128 and 512 words (`artifacts/layout-sweep/loopback-standard-check`).
+- Same-class local multicast endpoints now use the allocator's existing
+  distinct-element requirement, reserving whole elements for source and
+  destination. Existing physical scheduling checks remain authoritative. The
+  regression checks both copy selection and actual separated placement.
+- Materialized attention with this change alone takes **352,848 cropped cycles**,
+  down from 376,494. Its longest remaining `copy_u64` call is 1,626 cycles,
+  versus 13,914. Profile and log: `attention-standard-loopback` under
+  `artifacts/layout-sweep`.
+- Correction to the previous description: the 80-tile, 729-row packing kernel
+  is K's AmpTransposedRight preparation, not V packing. Preparation ownership
+  was unnecessarily tied to the full consumer key block. It now distributes
+  native 64-row AMP panels independently, keeping the resident GEMM format.
+  The mid implementation also supplies this choice to costing.
+- Packing uses 960 tiles (880 full panels at 1,500 cycles and 80 tails at 2,712),
+  versus 80 tiles with a 22,956-cycle maximum. With both changes materialized
+  attention takes **320,256 cropped cycles**, 14.9% faster than 376,494.
+  Streaming attention remains **355,320**, making materialized 9.9% faster for
+  this shape. These are forced-strategy comparisons, not an automatic-strategy
+  selection result.
+- Both strategies pass all 839,808 constant-output checks. Materialized Gaussian
+  checkpoints pass with maximum errors Q/K/V 0.001953 / 0.001141 / 0.001953 and
+  attention 0.000109. Final artifacts: `attention-panel-pack`,
+  `attention-panel-pack-gaussian`, and `attention-panel-pack-flash` under
+  `artifacts/layout-sweep`, including rendered profiles for both strategies.
+- Validation: 128 release codegen tests plus the doctest pass; Clippy passes with
+  existing argument-count/type-complexity allowances. Each test package was run
+  once. Code commits: `335a1be` and `f7ef4da`.
