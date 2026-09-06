@@ -438,11 +438,14 @@ impl PhaseProgramBuilder {
         source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
         source_schedule.finish()?;
         for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
-            let mut receiver_schedule = self
-                .tile_states
-                .get(usize::from(receiver))
-                .ok_or(ExchangeError::Tile(receiver))?
-                .clone();
+            let mut receiver_schedule = if receiver == source {
+                source_schedule.clone()
+            } else {
+                self.tile_states
+                    .get(usize::from(receiver))
+                    .ok_or(ExchangeError::Tile(receiver))?
+                    .clone()
+            };
             receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
             receiver_schedule.finish()?;
         }
@@ -494,17 +497,26 @@ impl PhaseProgramBuilder {
             updates.push((tile, schedule));
         }
 
+        let mut seen_receivers = HashSet::new();
         for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
-            if receiver == source || updates.iter().any(|(tile, _)| *tile == receiver) {
+            if !seen_receivers.insert(receiver)
+                || (receiver != source && updates.iter().any(|(tile, _)| *tile == receiver))
+            {
                 return Err(ExchangeError::DuplicateTile);
             }
-            let mut receiver_schedule = self
-                .tile_states
-                .get(usize::from(receiver))
-                .ok_or(ExchangeError::Tile(receiver))?
-                .clone();
-            receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
-            updates.push((receiver, receiver_schedule));
+            if receiver == source {
+                updates[0]
+                    .1
+                    .append_receiver_at(row, schedule_offset, words)?;
+            } else {
+                let mut receiver_schedule = self
+                    .tile_states
+                    .get(usize::from(receiver))
+                    .ok_or(ExchangeError::Tile(receiver))?
+                    .clone();
+                receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
+                updates.push((receiver, receiver_schedule));
+            }
         }
         for (tile, schedule) in updates {
             self.tile_states[usize::from(tile)] = schedule;
@@ -531,9 +543,6 @@ impl PhaseProgramBuilder {
             .iter()
             .zip(&plan.receivers)
             .map(|(&receiver, row)| {
-                if receiver == source {
-                    return Err(ExchangeError::DuplicateTile);
-                }
                 let schedule = self
                     .tile_states
                     .get(usize::from(receiver))
@@ -2621,8 +2630,11 @@ impl Topology {
     ) -> Result<MulticastPlan, ExchangeError> {
         validate_count(count)?;
         let source_physical = u32::from(self.physical(sender_logical)?);
-        let mut used = HashSet::from([sender_logical]);
+        let mut used = HashSet::new();
+        // Loopback is validated as part of a multicast with remote receivers.
+        // A source-only route would use a different send direction.
         if receiver_logical.is_empty()
+            || receiver_logical == [sender_logical]
             || receiver_logical
                 .iter()
                 .any(|receiver| !used.insert(*receiver) || self.physical(*receiver).is_err())
@@ -3489,6 +3501,46 @@ mod tests {
                     .all(|word| *word == 0)
             );
         }
+    }
+
+    #[test]
+    fn multicast_loopback_preserves_both_roles() {
+        let topology = Topology::c600();
+        for words in [1, 2, 51, 52, 53, 64, 65, 128, 512] {
+            let receivers = [0, 274, 1286];
+            let mut plan = topology.multicast(0, &receivers, words, 0).unwrap();
+            for row in &mut plan.receivers {
+                patch_receiver_address(row, 0x98000).unwrap();
+            }
+            let mut builder = PhaseProgramBuilder::new(1472);
+            let offset = builder
+                .earliest_transfer_offset(0, &[], &receivers, &plan, words, 0)
+                .unwrap();
+            builder
+                .append_transfer_at(0, &[], &receivers, &plan, offset, words)
+                .unwrap();
+            let programs = builder.finish().unwrap();
+            let mut combined = TileProgramSchedule::default();
+            combined.append_sender_at(&plan.sender, offset).unwrap();
+            combined
+                .append_receiver_at(&plan.receivers[0], offset, words)
+                .unwrap();
+            assert_eq!(
+                programs.programs[0].as_ref().unwrap(),
+                &combined.finish().unwrap()
+            );
+            assert_ne!(combined.finish().unwrap(), plan.sender.to_vec());
+            assert!(programs.programs[274].is_some());
+            assert!(programs.programs[1286].is_some());
+        }
+        assert!(matches!(
+            topology.multicast(0, &[0, 0, 274], 64, 0),
+            Err(ExchangeError::ReceiverSet)
+        ));
+        assert!(matches!(
+            topology.multicast(0, &[0], 64, 0),
+            Err(ExchangeError::ReceiverSet)
+        ));
     }
 
     #[test]

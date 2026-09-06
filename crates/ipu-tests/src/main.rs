@@ -235,6 +235,8 @@ enum ExchangeStressPattern {
     Random,
     /// Controlled full-duplex cases with one tile sending and receiving.
     Overlap,
+    /// Multicast to the source itself and remote tiles in separate SRAM banks.
+    Loopback,
     /// Paired 64-bit sends across the standard/interleaved SRAM bank matrix.
     Wide,
 }
@@ -490,6 +492,7 @@ fn main() -> Result<()> {
                 arguments.exchange_max_transfers,
                 arguments.exchange_compute_delay,
                 matches!(arguments.exchange_pattern, ExchangeStressPattern::Overlap),
+                matches!(arguments.exchange_pattern, ExchangeStressPattern::Loopback),
                 &toolchain,
                 &runtime_source,
             )?

@@ -456,6 +456,7 @@ pub(crate) fn build(
     maximum_transfers: u32,
     maximum_compute_delay: u32,
     overlap_sweep: bool,
+    loopback: bool,
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<StressPackage> {
@@ -484,6 +485,7 @@ pub(crate) fn build(
     let topology = Topology::c600();
     let mut rng = fastrand::Rng::with_seed(seed);
     let mut destination_cursors = vec![DATA_BASE; usize::from(active_tiles)];
+    let mut interleaved_cursors = vec![INTERLEAVED_DESTINATION_BASE; usize::from(active_tiles)];
     let mut source_cursors = vec![SOURCE_BASE; usize::from(active_tiles)];
     let mut expected_cursors = vec![EXPECTED_BASE; usize::from(active_tiles)];
     let mut buffers = BTreeMap::<u16, Vec<u8>>::new();
@@ -503,8 +505,16 @@ pub(crate) fn build(
             rng.usize(2..=8).min(tiles.len())
         };
         let group = &tiles[..group_tiles];
-        let contiguous_receiver = (!overlap_sweep && case == 0).then_some(group[0]);
-        let shape = if overlap_sweep {
+        let contiguous_receiver = (!overlap_sweep && !loopback && case == 0).then_some(group[0]);
+        let shape = if loopback {
+            vec![TransferSpec {
+                source: group[0],
+                destinations: group.to_vec(),
+                words: [1, 2, 51, 52, 53, 64, 65, 128, 512][case as usize / 2 % 9]
+                    .min(maximum_words),
+                schedule_offset: None,
+            }]
+        } else if overlap_sweep {
             overlap_specs(&topology, case, &group[..3], maximum_words, &mut rng)?
         } else if let Some(receiver) = contiguous_receiver {
             let sources = group
@@ -570,7 +580,8 @@ pub(crate) fn build(
             schedule_offset,
         } in shape
         {
-            let chained = (contiguous_receiver.is_none()
+            let chained = (!loopback
+                && contiguous_receiver.is_none()
                 && !available_payloads[usize::from(source)].is_empty()
                 && rng.usize(0..4) == 0)
                 .then(|| {
@@ -607,7 +618,9 @@ pub(crate) fn build(
             let destination_addresses = destinations
                 .iter()
                 .map(|&tile| {
-                    if contiguous_receiver == Some(tile) {
+                    if loopback && case % 2 == 1 {
+                        allocate(&mut interleaved_cursors, tile, bytes, 0xa0000, &mut rng)
+                    } else if contiguous_receiver == Some(tile) {
                         allocate_with_fixed_padding(
                             &mut destination_cursors,
                             tile,
@@ -786,7 +799,13 @@ pub(crate) fn build(
     let application = build_tile_program_package(&programs, &data, &[], toolchain, runtime_source)?;
     eprintln!(
         "exchangeStress seed={seed:#x} pattern={} cases={cases} transfers={} activeTiles={active_tiles} maxWords={maximum_words} maxTransfers={maximum_transfers} maxComputeDelay={maximum_compute_delay}",
-        if overlap_sweep { "overlap" } else { "random" },
+        if loopback {
+            "loopback"
+        } else if overlap_sweep {
+            "overlap"
+        } else {
+            "random"
+        },
         transfers.len(),
     );
     Ok(StressPackage {

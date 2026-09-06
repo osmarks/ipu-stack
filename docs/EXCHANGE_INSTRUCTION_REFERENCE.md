@@ -11,6 +11,41 @@ events before codegen can use it.
 
 ## Architectural model
 
+### Multicast loopback (C600 hardware, 2026-09-06)
+
+An ordinary 32-bit multicast can include its transmitting tile among the
+receivers. The source tile executes the combined send and receive controls;
+its own data returns through the fabric into the configured destination.
+`Topology::multicast` and `PhaseProgramBuilder` support this combination.
+Duplicate receivers remain invalid. Source-only and paired loopback have not
+been validated and remain unsupported.
+
+The `exchange-stress --exchange-pattern loopback` diagnostic checks the source
+and every remote receiver against independently prepared expected data. Eighteen
+random routes, each including the sender and remote receivers, passed at lengths
+1, 2, 51, 52, 53, 64, 65, 128 and 512 words, each with standard and interleaved
+destinations. Source buffers were standard SRAM at `0x65000`, destination buffers
+at `0x60000` or `0x98000`, in separate banks. This demonstrates those bank
+arrangements, not arbitrary overlapping or same-bank transfers.
+
+Reproduce with:
+
+```sh
+target/release/ipu-trivial-test c600-init.ipucfg \
+  --workload exchange-stress --exchange-pattern loopback \
+  --tiles 1472 --exchange-cases 18 --exchange-max-words 512 \
+  --exchange-max-transfers 1 --exchange-compute-delay 1 \
+  --exchange-diagnostics --package /tmp/loopback.ipuexe \
+  --device-lock artifacts/layout-sweep/device.lock
+```
+
+Results: `artifacts/exchange-loopback/loopback-bank-matrix.log`. An earlier
+eight-route test with 128 words and standard destinations also passed.
+The production copy planner still emits local copies: using loopback there
+requires including the self-receiver in scheduling and memory-conflict checks.
+
+### Receive controls
+
 There is no receive instruction. A receiver writes incoming words through two
 independently timed configuration streams:
 
