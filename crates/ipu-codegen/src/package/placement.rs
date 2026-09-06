@@ -2,6 +2,46 @@
 
 use super::*;
 
+/// Apply ownership-preserving placement before projecting per-tile work.
+pub(super) fn map_tiles(
+    graph: &mut std::sync::Arc<crate::TileGraph>,
+    mapping: Option<&[u16]>,
+) -> PackageBuildResult<()> {
+    let Some(mapping) = mapping else {
+        return Ok(());
+    };
+    let mut sorted = mapping.to_vec();
+    sorted.sort_unstable();
+    if sorted != (0..graph.tile_count).collect::<Vec<_>>() {
+        return Err(invalid(
+            "tile mapping must be a bijection over active tiles",
+        ));
+    }
+    fn map_region(body: &mut crate::BlockRegion, mapping: &[u16]) {
+        for operation in &mut body.operations {
+            match operation {
+                crate::BlockOperation::Copy { tile, .. }
+                | crate::BlockOperation::Compute { tile, .. } => {
+                    *tile = mapping[usize::from(*tile)]
+                }
+                crate::BlockOperation::Repeat(repeat) => {
+                    for binding in &mut repeat.bindings {
+                        binding.tile = mapping[usize::from(binding.tile)];
+                    }
+                    map_region(&mut repeat.body, mapping);
+                }
+                _ => {}
+            }
+        }
+    }
+    let graph = std::sync::Arc::make_mut(graph);
+    for shard in &mut graph.shards {
+        shard.tile = mapping[usize::from(shard.tile)];
+    }
+    map_region(&mut graph.body, mapping);
+    Ok(())
+}
+
 pub(super) fn improve_exchange_placement(
     program: &LowProgram,
     standard_ranges: &[(u32, u32)],
@@ -110,5 +150,42 @@ fn count_exchanges(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tile_mapping_preserves_shards_and_projected_work() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [32, 16]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
+        let mid = crate::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mut expanded = crate::expand_tiles(&mid).unwrap();
+        let original = expanded.clone();
+        let before = lower_to_tiles(&original, false);
+        let mapping = [2, 0, 3, 1];
+        map_tiles(&mut expanded, Some(&mapping)).unwrap();
+        let after = lower_to_tiles(&expanded, false);
+        for (old, new) in original.shards.iter().zip(&expanded.shards) {
+            let mut expected = old.clone();
+            expected.tile = mapping[usize::from(old.tile)];
+            assert_eq!(*new, expected);
+        }
+        for tile in &before.tiles {
+            assert_eq!(
+                tile.work,
+                after.tiles[usize::from(mapping[usize::from(tile.tile)])].work
+            );
+        }
+        assert_eq!(original.exchange_phases, expanded.exchange_phases);
+        let valid = expanded.clone();
+        assert!(map_tiles(&mut expanded, Some(&[0, 0, 2, 3])).is_err());
+        assert_eq!(expanded, valid);
+        assert!(map_tiles(&mut expanded, Some(&[0, 1])).is_err());
     }
 }

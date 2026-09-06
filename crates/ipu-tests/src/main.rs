@@ -117,6 +117,9 @@ struct Arguments {
         conflicts_with = "reuse_package"
     )]
     gemm_plan_constraint: Vec<GemmPlanConstraint>,
+    /// JSON array mapping planned tile indices to execution tile indices.
+    #[arg(long)]
+    tile_mapping: Option<PathBuf>,
     #[arg(long, default_value_t = c600_tile_count())]
     tiles: u32,
     #[arg(long)]
@@ -347,7 +350,12 @@ fn parse_gemm_plan_constraint(value: &str) -> Result<GemmPlanConstraint, String>
         reduction_staging: match *reduction {
             "complete" => ReductionStaging::Complete,
             "streamed" => ReductionStaging::Streamed,
-            _ => return Err("reduction must be complete or streamed".into()),
+            value if value.starts_with("batch-") => ReductionStaging::Batched(
+                value[6..]
+                    .parse()
+                    .map_err(|_| "batch size must be a nonzero u16")?,
+            ),
+            _ => return Err("reduction must be complete, streamed, or batch-N".into()),
         },
         local_weight_staging: match *local {
             "direct" => LocalOperandStaging::Direct,
@@ -787,6 +795,11 @@ fn main() -> Result<()> {
             .with_automatic_input(right, Precision::F16);
     }
     let package_config = PackageConfig {
+        tile_mapping: arguments
+            .tile_mapping
+            .as_ref()
+            .map(|path| -> Result<Vec<u16>> { Ok(serde_json::from_slice(&fs::read(path)?)?) })
+            .transpose()?,
         toolchain: Toolchain::from_sdk(&arguments.sdk),
         kernel_source_directory: runtime_source
             .parent()

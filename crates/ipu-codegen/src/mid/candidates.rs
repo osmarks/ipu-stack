@@ -1077,6 +1077,19 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     result_partition_options.push((1, inner_partitions));
                 }
             }
+            if let Some(constraint) = constraint {
+                let pair = (
+                    constraint.result_row_partitions,
+                    constraint.result_column_partitions,
+                );
+                if pair.0 <= maximum_result_rows
+                    && pair.1 <= maximum_result_columns
+                    && u32::from(pair.0) * u32::from(pair.1) <= u32::from(inner_partitions)
+                    && !result_partition_options.contains(&pair)
+                {
+                    result_partition_options.push(pair);
+                }
+            }
             for (result_row_partitions, result_column_partitions) in result_partition_options {
                 let result_rows = row_partitions.saturating_mul(result_row_partitions);
                 let result_columns = column_partitions.saturating_mul(result_column_partitions);
@@ -1154,10 +1167,12 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     {
                         continue;
                     }
+                    let staging_options = constraint.map_or_else(
+                        || vec![ReductionStaging::Complete, ReductionStaging::Streamed],
+                        |constraint| vec![constraint.reduction_staging],
+                    );
                     for &local_staging in local_staging_options {
-                        for reduction_staging in
-                            [ReductionStaging::Complete, ReductionStaging::Streamed]
-                        {
+                        for &reduction_staging in &staging_options {
                             let mut staged = result_variant.clone();
                             staged.requirements.inputs[physical_right_index].local_staging =
                                 local_staging;

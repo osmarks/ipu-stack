@@ -233,24 +233,24 @@ fn operation_cost(
             let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);
             let remote = contributors.saturating_sub(1);
             let bytes = maximum_shard_bytes(output);
-            let stages = if *staging == crate::ReductionStaging::Streamed {
-                remote
-            } else {
-                u64::from(remote != 0)
-            };
-            let per_stage = if stages == 0 {
-                0
-            } else {
-                remote.div_ceil(stages)
-            };
+            let per_stage = staging.remote_partials_per_stage(remote);
+            let stages = remote.div_ceil(per_stage);
             scratch.standard = bytes.saturating_mul(per_stage.saturating_add(2));
             let (exchange, footprint) = exchange_price(bytes.saturating_mul(remote), stages, 256);
             price.exchange = exchange;
             rows = footprint;
             let elements = bytes.div_ceil(output.format.precision.bytes());
-            price.total = exchange.saturating_add(stages.saturating_mul(
-                crate::kernel::cost::f16_reduction_cycles(elements, per_stage + 1),
-            ));
+            let full_stages = remote / per_stage;
+            let tail = remote % per_stage;
+            price.total = exchange
+                .saturating_add(full_stages.saturating_mul(
+                    crate::kernel::cost::f16_reduction_cycles(elements, per_stage + 1),
+                ))
+                .saturating_add(if tail == 0 {
+                    0
+                } else {
+                    crate::kernel::cost::f16_reduction_cycles(elements, tail + 1)
+                });
         }
         MidOperationKind::Primitive(
             Primitive::Copy { .. } | Primitive::View(_) | Primitive::MappedCopy { .. },

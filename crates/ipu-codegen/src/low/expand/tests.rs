@@ -278,6 +278,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                         if partials == match reduction_staging {
                             crate::ReductionStaging::Complete => inner_partitions,
                             crate::ReductionStaging::Streamed => 2,
+                            crate::ReductionStaging::Batched(limit) => limit.get() + 1,
                         }
                 ) && run.inputs.len() == 2
             }),

@@ -197,6 +197,18 @@ pub enum ReductionStaging {
     /// temporary SRAM at the expense of additional exchange epochs and kernel
     /// launches.
     Streamed,
+    /// Receive at most this many remote partials per exchange epoch.
+    Batched(std::num::NonZeroU16),
+}
+
+impl ReductionStaging {
+    pub(crate) fn remote_partials_per_stage(self, remote: u64) -> u64 {
+        match self {
+            Self::Complete => remote.max(1),
+            Self::Streamed => 1,
+            Self::Batched(limit) => u64::from(limit.get()).min(remote.max(1)),
+        }
+    }
 }
 
 /// How a pointwise kernel's input shards are selected for each output shard.

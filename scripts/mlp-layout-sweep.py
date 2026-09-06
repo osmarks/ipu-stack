@@ -29,10 +29,11 @@ class Plan:
     distributed: bool = True
     reduction: str = "complete"
     local: str = "direct"
+    result_grid: tuple[int, int] | None = None
 
     def constraint(self, operation):
-        result = self.k if self.distributed else 1
-        return (f"{operation}:{self.r}x{self.c}x{self.k}:{result}x1:"
+        rr, rc = self.result_grid or (self.k if self.distributed else 1, 1)
+        return (f"{operation}:{self.r}x{self.c}x{self.k}:{rr}x{rc}:"
                 f"{self.columns}:{self.memory}:{self.orientation}:{self.reduction}:{self.local}")
 
 
@@ -161,6 +162,11 @@ def run_case(args, name, up, down):
                "--workload", "siglip-mlp-benchmark", "--mlp-batch", "1",
                "--package", str(folder / "model.ipuexe"),
                "--profile-output", str(folder / "execution.ipuprofile")]
+    mapping = getattr(args, "tile_mappings", {}).get(name)
+    if mapping is not None:
+        mapping_path = folder / "tile-mapping.json"
+        mapping_path.write_text(json.dumps(mapping) + "\n")
+        command += ["--tile-mapping", str(mapping_path)]
     for constraint in constraints:
         command += ["--gemm-plan-constraint", constraint]
     log_path = folder / "build.log"

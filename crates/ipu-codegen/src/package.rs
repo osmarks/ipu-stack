@@ -85,6 +85,8 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
+    /// Optional bijection from planned tile indices to execution tile indices.
+    pub tile_mapping: Option<Vec<u16>>,
 }
 
 /// Data embedded in one logical tile image for a finalized tile-program package.
@@ -667,7 +669,7 @@ fn build_package_artifacts(
         )?)
     })?;
     let (low, mut exchange_cache) = build_phase("select_finalist", || {
-        select_scheduled_finalist(finalists, &planning)
+        select_scheduled_finalist(finalists, &planning, config.tile_mapping.as_deref())
     })?;
     tracing::info!(
         logical_shards = low.shards.len(),
@@ -707,9 +709,11 @@ fn build_package_artifacts(
 fn select_scheduled_finalist(
     finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
+    tile_mapping: Option<&[u16]>,
 ) -> PackageBuildResult<(LowProgram, crate::exchange::ExchangeScheduleCache)> {
     if finalists.len() == 1 {
-        let mid = crate::low::expand::expand_tiles(&finalists.into_iter().next().unwrap())?;
+        let mut mid = crate::low::expand::expand_tiles(&finalists.into_iter().next().unwrap())?;
+        placement::map_tiles(&mut mid, tile_mapping)?;
         tracing::info!(
             estimated_cycles = mid.estimated_cycles,
             estimated_exchange_cycles = mid.estimated_exchange_cycles,
@@ -722,7 +726,8 @@ fn select_scheduled_finalist(
     let topology = active_topology(planning.tile_count)?;
     let mut ranked = Vec::with_capacity(finalists.len());
     for (index, mid) in finalists.into_iter().enumerate() {
-        let mid = crate::low::expand::expand_tiles(&mid)?;
+        let mut mid = crate::low::expand::expand_tiles(&mid)?;
+        placement::map_tiles(&mut mid, tile_mapping)?;
         let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
         let placement = place(&low)?;
         let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();

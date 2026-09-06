@@ -23,10 +23,8 @@ impl TileGraphBuilder {
                 return Err(ExpansionError::InvalidOperatorPlan);
             };
             let remote_count = contributors.len() - 1;
-            let remote_partials_per_stage = match staging {
-                crate::ReductionStaging::Complete => remote_count.max(1),
-                crate::ReductionStaging::Streamed => 1,
-            };
+            let remote_partials_per_stage =
+                staging.remote_partials_per_stage(remote_count as u64) as usize;
             let reduction_stages = remote_count.div_ceil(remote_partials_per_stage);
             reduction_transfers.resize_with(
                 reduction_stages.max(reduction_transfers.len()),
@@ -275,6 +273,7 @@ mod tests {
         for staging in [
             crate::ReductionStaging::Complete,
             crate::ReductionStaging::Streamed,
+            crate::ReductionStaging::Batched(std::num::NonZeroU16::new(2).unwrap()),
         ] {
             let mut builder = TileGraphBuilder::new(&MidProgram {
                 tile_count: 4,
