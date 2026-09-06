@@ -1833,3 +1833,15 @@ fn beam_reserves_requested_formats_before_incidental_layout_diversity() {
         1
     );
 }
+
+#[test]
+fn generic_view_distributes_matrix_rows_instead_of_whole_batches() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("heads", [16, 729, 72]).unwrap();
+    let output = graph.view(input, AxisFactorView::new(0, 2, 16)).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(1472).with_automatic_input(input, Precision::F16);
+    let program = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let output = &program.values[program.outputs[0].index() as usize];
+    assert!(output.tensor_type.format.layout.tiling.tile_count > 1);
+}

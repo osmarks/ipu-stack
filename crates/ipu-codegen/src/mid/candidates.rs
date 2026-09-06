@@ -192,9 +192,16 @@ pub(super) fn plans(
         && let [input] = inputs
     {
         let row_major = |shape: &TensorShape| {
+            // Keep complete rows, distributing the matrix row axis rather
+            // than concentrating an entire batch on one tile.
+            let axis = shape.0.len().saturating_sub(2);
             Layout::row_major(TensorTiling::sharded(
-                TensorAxis::FromStart(0),
-                u16::try_from(shape.0[0])
+                TensorAxis::FromEnd(if axis == 0 && shape.0.len() == 1 {
+                    1
+                } else {
+                    2
+                }),
+                u16::try_from(shape.0[axis])
                     .unwrap_or(u16::MAX)
                     .min(config.tile_count)
                     .max(1),
