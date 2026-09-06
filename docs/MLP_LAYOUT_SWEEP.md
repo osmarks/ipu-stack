@@ -10,7 +10,7 @@ staging. These are `(M partitions, N partitions, K partitions)`.
 ```sh
 cargo build --release -p ipu-tests -p ipu-cli
 python3 scripts/mlp-layout-sweep.py --sdk "$POPLAR_SDK_ENABLED" \
-    --output artifacts/layout-sweep --jobs 4
+    --output artifacts/layout-sweep --jobs 16
 python3 scripts/analyze-mlp-layout-sweep.py artifacts/layout-sweep
 ```
 
