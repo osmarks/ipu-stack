@@ -1625,7 +1625,10 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
         .with_automatic_input(input, Precision::F16)
         .with_automatic_input(up, Precision::F16)
         .with_automatic_input(down, Precision::F16);
-    let finalists = lower_finalists(&graph, &config, &Ipu21CostModel, 8).unwrap();
+    // Calibration may reorder complete plans. Check survival in the bounded
+    // beam rather than fixing this geometry's rank under one set of prices.
+    let finalists =
+        lower_finalists(&graph, &config, &Ipu21CostModel, config.planning_beam_width).unwrap();
     assert!(
         finalists
             .iter()

@@ -176,7 +176,6 @@ pub struct Ipu21TargetCosts {
     pub standard_load_bytes_per_cycle: u64,
     pub interleaved_load_bytes_per_cycle: u64,
     pub local_copy_bytes_per_cycle: u64,
-    pub reduction_output_bytes_per_cycle: u64,
     pub local_copy_call_cycles: u64,
     pub exchange_phase_cycles: u64,
     pub kernel_launch_cycles: u64,
@@ -190,10 +189,6 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     standard_load_bytes_per_cycle: 8,
     interleaved_load_bytes_per_cycle: 16,
     local_copy_bytes_per_cycle: 8,
-    // Reduction-add reads two partials and writes one. Current IPU21 profiles
-    // sustain roughly one output byte per cycle after all three interleaved
-    // streams and worker imbalance are included.
-    reduction_output_bytes_per_cycle: 1,
     // A finalized six-worker local-copy invocation, including supervisor and
     // worker rendezvous overhead, takes 288 tile cycles on IPU21.
     local_copy_call_cycles: 288,

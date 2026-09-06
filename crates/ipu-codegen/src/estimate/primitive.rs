@@ -15,7 +15,6 @@ pub(crate) fn kernel_cycles(
         .0
         .iter()
         .fold(1u64, |n, &width| n.saturating_mul(u64::from(width)));
-    let bytes = elements.saturating_mul(output.format.precision.bytes());
     let work = match kernel {
         TileKernelSpec::Gemm {
             multiply,
@@ -45,8 +44,11 @@ pub(crate) fn kernel_cycles(
             let interleaved = inputs.get(1).is_some_and(|input| {
                 input.format.layout.memory_class == MemoryClass::Ipu21Interleaved
             });
+            if *multiply == Precision::F16 && interleaved {
+                return crate::kernel::cost::interleaved_f16_gemm_cycles(rows, inner, columns);
+            }
             let (row_cycles, group_cycles) = match multiply {
-                Precision::F16 => (rows, if interleaved { 940 } else { 1063 }),
+                Precision::F16 => (rows, 1063),
                 Precision::F32 => (rows.saturating_mul(4), 2126),
                 Precision::F8F143 { .. } => {
                     return rows
@@ -76,9 +78,9 @@ pub(crate) fn kernel_cycles(
             elements.saturating_mul(10)
         }
         TileKernelSpec::Add => elements.div_ceil(16),
-        TileKernelSpec::ReductionSum { partials } => bytes
-            .saturating_mul(u64::from(*partials) + 1)
-            .div_ceil(target.reduction_output_bytes_per_cycle),
+        TileKernelSpec::ReductionSum { partials } => {
+            return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
+        }
         TileKernelSpec::Cast { .. } => elements.div_ceil(8),
         TileKernelSpec::Rearrange { .. } => {
             return if output.format.layout.order == ElementOrder::RowMajor {

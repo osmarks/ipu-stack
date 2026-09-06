@@ -3,6 +3,7 @@
 mod abi;
 mod attention;
 mod build;
+pub(crate) mod cost;
 mod gemm;
 mod rearrange;
 mod specialization;

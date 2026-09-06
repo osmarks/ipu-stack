@@ -731,9 +731,6 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
 ) -> Vec<OperatorPlan> {
-    // Residual supervisor, weight-feed, and worker setup cost after retained
-    // state, measured on IPU21 independently of the four issue cycles per row.
-    const AMP_F16_MICROBLOCK_FIXED_CYCLES: u64 = 160;
     let OperatorDispatch::BlockedGemm {
         output_column_block,
         distribution: GemmDistribution::OutputStationary,
@@ -860,10 +857,9 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                 // invocation structure, including its fixed weight-feed and
                 // worker/supervisor cost. Pure arithmetic work is almost
                 // constant across grids and incorrectly favors tiny row runs.
-                let row_run_cycles = outer_rows
-                    .saturating_mul(u64::from(local_rows))
-                    .saturating_mul(4)
-                    .saturating_add(AMP_F16_MICROBLOCK_FIXED_CYCLES);
+                let row_run_cycles = crate::kernel::cost::f16_gemm_microgroup_cycles(
+                    outer_rows.saturating_mul(u64::from(local_rows)),
+                );
                 let compute = u64::from(local_columns)
                     .saturating_mul(u64::from(local_inner))
                     .saturating_mul(row_run_cycles);

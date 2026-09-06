@@ -247,13 +247,10 @@ fn operation_cost(
             let (exchange, footprint) = exchange_price(bytes.saturating_mul(remote), stages, 256);
             price.exchange = exchange;
             rows = footprint;
-            price.total = exchange
-                .saturating_add(
-                    bytes
-                        .saturating_mul(contributors)
-                        .div_ceil(IPU21_TARGET_COSTS.reduction_output_bytes_per_cycle),
-                )
-                .saturating_add(stages.saturating_mul(IPU21_TARGET_COSTS.kernel_launch_cycles));
+            let elements = bytes.div_ceil(output.format.precision.bytes());
+            price.total = exchange.saturating_add(stages.saturating_mul(
+                crate::kernel::cost::f16_reduction_cycles(elements, per_stage + 1),
+            ));
         }
         MidOperationKind::Primitive(
             Primitive::Copy { .. } | Primitive::View(_) | Primitive::MappedCopy { .. },
