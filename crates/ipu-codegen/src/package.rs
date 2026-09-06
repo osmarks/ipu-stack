@@ -1,4 +1,10 @@
 mod placement;
+mod profile;
+use profile::{instrument_profile, profile_binding, profile_step_count};
+mod selection;
+mod tile_program;
+use selection::select_scheduled_finalist;
+pub use tile_program::build_tile_program_package;
 
 use crate::ValueBlocks;
 use crate::graph::{ComputeGraph, OperationId, ValueId};
@@ -161,373 +167,6 @@ struct BuiltApplication {
     exchange_phases: Vec<crate::PhysicalExchangePhase>,
     exchange_schedule: crate::ExchangeScheduleSnapshot,
     exchange_code_base: u32,
-}
-
-/// Builds an application from address-resolved tile programs.
-///
-/// This is the low-level counterpart to [`build_package`]. It deliberately has
-/// no tensor bindings: callers supply initialized tile data and inspect it
-/// through driver diagnostics. A zero-payload `run` rendezvous starts execution
-/// after loading, so breakpoints in the program cannot race the loader.
-pub fn build_tile_program_package(
-    programs: &[TileProgram],
-    data: &[TileProgramData],
-    outputs: &[Binding],
-    toolchain: &Toolchain,
-    runtime_source: &std::path::Path,
-) -> PackageBuildResult<Application> {
-    let topology = Topology::c600();
-    let execution_tiles = u16::try_from(topology.tile_count())?;
-    if programs.len() != usize::from(execution_tiles)
-        || programs
-            .iter()
-            .enumerate()
-            .any(|(tile, program)| usize::from(program.tile) != tile)
-    {
-        return Err(invalid(
-            "finalized tile programs must cover every C600 logical tile in order",
-        ));
-    }
-    if data
-        .iter()
-        .any(|segment| segment.tile >= execution_tiles || segment.data.is_empty())
-    {
-        return Err(invalid(
-            "tile-program data has an invalid tile or empty payload",
-        ));
-    }
-
-    let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
-    let objects = vec![fs::read(runtime_artifact.object)?];
-    let kernels = KernelBuildPlan::default();
-    let mut retained_runtime = vec![
-        COMPLETE_SYMBOL.into(),
-        HOST_RUN_SYMBOL.into(),
-        REPEAT_CALL_SYMBOL.into(),
-        WORKER_BARRIER_SYMBOL.into(),
-    ];
-    for program in programs {
-        collect_compute_symbols(&mut retained_runtime, &program.steps);
-    }
-    retained_runtime.sort_unstable();
-    retained_runtime.dedup();
-    let layout = link_runtime(
-        &objects,
-        runtime_symbols(0, 0, 0)?,
-        &kernels,
-        &retained_runtime,
-    )?;
-    let symbols = layout
-        .symbols
-        .clone()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
-    let linked_end = linked_end(&layout)?;
-    let mut memory = TileMemoryMap::new();
-    reserve_linked_image(&mut memory, &layout, "linked runtime")?;
-    memory.reserve(
-        "host exchange aperture",
-        ipu_exchange::EXCHANGE_WINDOW_BASE
-            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-    )?;
-    memory.reserve(
-        "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
-    )?;
-    let mut tile_data = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
-    for segment in data {
-        let bytes = u32::try_from(segment.data.len())?;
-        let end = segment
-            .address
-            .checked_add(bytes)
-            .ok_or_else(|| invalid("tile data range overflow"))?;
-        tile_data[usize::from(segment.tile)].push((segment.address, end));
-    }
-    let mut tile_rows = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
-    for program in programs {
-        let mut rows = BTreeMap::new();
-        collect_exchange_rows(&mut rows, &program.steps)?;
-        tile_rows[usize::from(program.tile)].extend(rows);
-    }
-    for tile in 0..execution_tiles {
-        for &(data_start, data_end) in &tile_data[usize::from(tile)] {
-            if let Some(&(row_start, row_end)) = tile_rows[usize::from(tile)]
-                .iter()
-                .find(|&&(row_start, row_end)| data_start < row_end && row_start < data_end)
-            {
-                return Err(invalid(format!(
-                    "tile {tile} data at 0x{data_start:x}..0x{data_end:x} overlaps exchange row 0x{row_start:x}..0x{row_end:x}"
-                )));
-            }
-        }
-    }
-    // Generated and linked code use common addresses on every tile, so choose
-    // them against the union of tile-local data and row ranges. Data on one
-    // tile may otherwise legally share an address with a row on another tile.
-    let mut tile_local_ranges = tile_data
-        .into_iter()
-        .chain(tile_rows)
-        .flatten()
-        .collect::<Vec<_>>();
-    tile_local_ranges.sort_unstable();
-    let mut merged_tile_local = Vec::<(u32, u32)>::new();
-    for (start, end) in tile_local_ranges {
-        if let Some((_, previous_end)) = merged_tile_local.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged_tile_local.push((start, end));
-        }
-    }
-    for (start, end) in merged_tile_local {
-        memory.reserve("tile-local data or exchange rows", start..end)?;
-    }
-
-    let launch = Binding {
-        name: "run-gate".into(),
-        dtype: "u32".into(),
-        shape: vec![1],
-        slices: vec![RegionSlice {
-            tile: u32::from(topology.physical(0)?),
-            tile_address: COMPLETION_ADDRESS + 4,
-            file_offset: 0,
-            size: 4,
-        }],
-    };
-    let finish = Binding {
-        name: "run-finish".into(),
-        dtype: "u32".into(),
-        shape: vec![1],
-        slices: vec![RegionSlice {
-            tile: u32::from(topology.physical(0)?),
-            tile_address: COMPLETION_ADDRESS + 8,
-            file_offset: 0,
-            size: 4,
-        }],
-    };
-    let mut run_outputs = outputs.to_vec();
-    run_outputs.push(finish);
-    let host_bounds = crate::IPU21_DATA_BASE..TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
-    let sizing_host_base = memory.next_free(
-        linked_end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        8,
-        "host programs",
-    )?;
-    let provisional_ranges = memory.free_ranges(host_bounds.clone());
-    let provisional_host = host::plan(
-        &[],
-        std::slice::from_ref(&launch),
-        &run_outputs,
-        execution_tiles,
-        sizing_host_base,
-        &vec![provisional_ranges; usize::from(execution_tiles)],
-    )?;
-    let host_code_bytes = provisional_host
-        .end
-        .checked_sub(sizing_host_base)
-        .ok_or_else(|| invalid("host program size underflow"))?;
-    let host_code = memory.allocate(MemoryRequest {
-        name: "host programs",
-        bytes: host_code_bytes,
-        alignment: 8,
-        bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        end_alignment: 8,
-        guard_after: 0,
-    })?;
-    let host_ranges = memory.free_ranges(host_bounds.clone());
-    let host = host::plan(
-        &[],
-        std::slice::from_ref(&launch),
-        &run_outputs,
-        execution_tiles,
-        host_code.range.start,
-        &vec![host_ranges; usize::from(execution_tiles)],
-    )?;
-    if host.end - host_code.range.start > host_code_bytes {
-        return Err(invalid("host program grew after placement"));
-    }
-    let mut host_data_ranges = host
-        .segments
-        .iter()
-        .flatten()
-        .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
-        .map(|segment| (segment.address, segment.address + segment.memory_size))
-        .collect::<Vec<_>>();
-    host_data_ranges.sort_unstable();
-    let mut merged_host_data = Vec::<(u32, u32)>::new();
-    for (start, end) in host_data_ranges {
-        if let Some((_, previous_end)) = merged_host_data.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged_host_data.push((start, end));
-        }
-    }
-    for (start, end) in merged_host_data {
-        memory.reserve("host program data", start..end)?;
-    }
-
-    let sizing_address = memory.next_free(
-        host_code.range.end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        8,
-        "generated tile programs",
-    )?;
-    let maximum_bytes = programs.iter().try_fold(0u32, |maximum, program| {
-        let physical = topology.physical(program.tile)?;
-        let generated = emit(
-            program,
-            &symbols,
-            &host.programs[usize::from(physical)],
-            &CodegenOptions {
-                code_address: sizing_address,
-                ..CodegenOptions::default()
-            },
-        )?;
-        Ok::<_, PackageBuildError>(maximum.max(u32::try_from(generated.bytes.len())?))
-    })?;
-    let code_address = memory
-        .allocate(MemoryRequest {
-            name: "generated tile programs",
-            bytes: maximum_bytes,
-            alignment: 4,
-            bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-            // Supervisor instruction fetch and exchange/paired memory access
-            // cannot safely use the same standard-memory element. Reserve the
-            // rest of the element so subsequently placed tensor data cannot
-            // become the source of an exchange while code executes from it.
-            end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-            guard_after: 0,
-        })?
-        .range
-        .start;
-    let generated = programs
-        .iter()
-        .map(|program| {
-            let physical = topology.physical(program.tile)?;
-            Ok(emit(
-                program,
-                &symbols,
-                &host.programs[usize::from(physical)],
-                &CodegenOptions {
-                    code_address,
-                    ..CodegenOptions::default()
-                },
-            )?)
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-
-    let mut segments = vec![Vec::new(); usize::from(execution_tiles)];
-    for segment in data {
-        let physical = topology.physical(segment.tile)?;
-        segments[usize::from(physical)].push(Segment {
-            address: segment.address,
-            memory_size: u32::try_from(segment.data.len())?,
-            data: segment.data.clone(),
-            flags: SEGMENT_READ | SEGMENT_WRITE,
-        });
-    }
-    for (physical, host_segments) in host.segments.iter().enumerate() {
-        segments[physical].extend(host_segments.iter().cloned());
-    }
-    let context = TileBuildContext {
-        objects: &objects,
-        kernel_plan: &kernels,
-        retained_runtime: &retained_runtime,
-        code_address,
-        host_staging_address: host.staging_address,
-    };
-    let mut tiles = Vec::with_capacity(usize::from(execution_tiles));
-    for logical in 0..execution_tiles {
-        let physical = topology.physical(logical)?;
-        tiles.push(build_tile(
-            u32::from(physical),
-            u32::from(logical),
-            &generated[usize::from(logical)],
-            &segments[usize::from(physical)],
-            &context,
-        )?);
-    }
-    tiles.sort_unstable_by_key(|tile| tile.physical_tile);
-    let mut application = Application {
-        tiles,
-        ..Application::default()
-    };
-    add_linked_debug_map(&mut application, &layout)?;
-    for (logical, program) in generated.iter().enumerate() {
-        let physical = u32::from(topology.physical(u16::try_from(logical)?)?);
-        add_generated_debug_map(&mut application, physical, code_address, program)?;
-    }
-    application.outputs.push(Binding {
-        name: "completion".into(),
-        dtype: "u32".into(),
-        shape: vec![1],
-        slices: vec![RegionSlice {
-            tile: 0,
-            tile_address: COMPLETION_ADDRESS,
-            file_offset: 0,
-            size: 4,
-        }],
-    });
-    application.outputs.extend(run_outputs);
-    application.inputs.push(launch);
-    application.entry_points.push(EntryPoint {
-        name: "run".into(),
-        command: 0,
-        external_syncs: 0,
-    });
-    application.host_exchange = host.protocol;
-    application.validate()?;
-    Ok(application)
-}
-
-fn collect_exchange_rows(
-    rows: &mut BTreeMap<u32, u32>,
-    steps: &[crate::TileStep],
-) -> PackageBuildResult<()> {
-    for step in steps {
-        match step {
-            crate::TileStep::Exchange(exchange) => {
-                let bytes = u32::try_from(exchange.program.words.len())?
-                    .checked_mul(4)
-                    .ok_or_else(|| invalid("exchange row size overflow"))?;
-                let end = exchange
-                    .program
-                    .address
-                    .checked_add(bytes)
-                    .ok_or_else(|| invalid("exchange row range overflow"))?;
-                rows.entry(exchange.program.address)
-                    .and_modify(|existing| *existing = (*existing).max(end))
-                    .or_insert(end);
-            }
-            crate::TileStep::Repeat(repeat) => collect_exchange_rows(rows, &repeat.body)?,
-            crate::TileStep::Compute(_) | crate::TileStep::Checkpoint(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep]) {
-    for step in steps {
-        let profile = match step {
-            crate::TileStep::Compute(compute) => {
-                symbols.push(compute.symbol.clone());
-                &compute.profile
-            }
-            crate::TileStep::Repeat(repeat) => {
-                collect_compute_symbols(symbols, &repeat.body);
-                &repeat.profile
-            }
-            crate::TileStep::Exchange(exchange) => &exchange.profile,
-            crate::TileStep::Checkpoint(checkpoint) => &checkpoint.profile,
-        };
-        if profile.before.is_some() || profile.after.is_some() {
-            symbols.push(SAMPLE_CYCLE_SYMBOL.into());
-        }
-    }
 }
 
 /// Compiles and packages a compute graph into a directly loadable IPU21
@@ -694,95 +333,14 @@ fn build_package_artifacts(
         }
         Ok(objects)
     })?;
-    let mut package_config = config.clone();
-    package_config.pipeline = planning;
-    let built = build_package_from_objects(
-        &low,
-        &package_config,
-        &objects,
-        &kernel_plan,
-        &mut exchange_cache,
-    )?;
+    let built =
+        build_package_from_objects(&low, &planning, &objects, &kernel_plan, &mut exchange_cache)?;
     Ok((built, low))
-}
-
-fn select_scheduled_finalist(
-    finalists: Vec<crate::MidProgram>,
-    planning: &PipelineConfig,
-    tile_mapping: Option<&[u16]>,
-) -> PackageBuildResult<(LowProgram, crate::exchange::ExchangeScheduleCache)> {
-    let topology = active_topology(planning.tile_count)?;
-    let mut modelled = finalists
-        .into_par_iter()
-        .enumerate()
-        .map(|(index, mid)| -> PackageBuildResult<_> {
-            let mut expanded = crate::low::expand::expand_tiles(&mid)?;
-            placement::map_tiles(&mut expanded, tile_mapping)?;
-            let baseline = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
-            let (cycles, challenger) = placement::model_mapping(&baseline, tile_mapping.is_none())?;
-            tracing::info!(
-                finalist = index,
-                modelled_cycles = cycles,
-                estimated_cycles = expanded.estimated_cycles,
-                estimated_exchange_cycles = expanded.estimated_exchange_cycles,
-                "modelled expanded operator plan"
-            );
-            Ok((cycles, index, expanded, challenger))
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    modelled.sort_by_key(|(cycles, index, _, _)| (*cycles, *index));
-    modelled.truncate(planning.exchange_schedule_finalists);
-    let mut ranked = Vec::with_capacity(modelled.len() * 2);
-    for (_, index, expanded, challenger) in modelled {
-        for (mapped, mapping) in [(false, None), (true, challenger.as_deref())] {
-            if mapped && mapping.is_none() {
-                continue;
-            }
-            let mut mid = expanded.clone();
-            placement::map_tiles(&mut mid, mapping)?;
-            let low = lower_to_tiles(&mid, planning.diagnostic_checkpoints);
-            let placement = place(&low)?;
-            let mut exchange_cache = crate::exchange::ExchangeScheduleCache::default();
-            let exchanges = crate::exchange::lower_exchanges_cached(
-                &low,
-                &placement,
-                &topology,
-                crate::ExchangeLoweringOptions::default(),
-                &mut exchange_cache,
-            )?;
-            let mut phase_cycles = vec![0; mid.exchange_phases.len()];
-            for phase in &exchanges.phases {
-                phase_cycles[phase.id.index() as usize] = u64::from(phase.event_cycles)
-                    .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles);
-            }
-            let refined = crate::estimate::program_cycles(&mid, Some(&phase_cycles))?;
-            let scheduled_exchange_cycles = refined.exchange;
-            let refined_cycles = refined.total;
-            tracing::info!(
-                finalist = index,
-                mapped,
-                analytical_cycles = mid.estimated_cycles,
-                analytical_exchange_cycles = mid.estimated_exchange_cycles,
-                scheduled_exchange_cycles,
-                refined_cycles,
-                "scheduled operator-plan finalist"
-            );
-            ranked.push((refined_cycles, index, mapped, low, exchange_cache));
-        }
-    }
-    ranked.sort_by_key(|(cycles, index, mapped, _, _)| (*cycles, *index, *mapped));
-    let (_, selected, mapped, low, exchange_cache) = ranked.remove(0);
-    tracing::info!(
-        selected,
-        mapped,
-        "selected physically scheduled operator-plan finalist"
-    );
-    Ok((low, exchange_cache))
 }
 
 fn build_package_from_objects(
     program: &LowProgram,
-    config: &PackageConfig,
+    config: &PipelineConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
     exchange_cache: &mut crate::exchange::ExchangeScheduleCache,
@@ -827,7 +385,7 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
-    let profile_samples = config.pipeline.profiling.then(|| {
+    let profile_samples = config.profiling.then(|| {
         program
             .tiles
             .iter()
@@ -1018,14 +576,8 @@ fn build_package_from_objects(
                     host,
                     &CodegenOptions {
                         code_address: sizing_code_address,
-                        initial_profile_address: config
-                            .pipeline
-                            .profiling
-                            .then_some(PROFILE_START_CYCLE),
-                        final_profile_address: config
-                            .pipeline
-                            .profiling
-                            .then_some(PROFILE_END_CYCLE),
+                        initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
+                        final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
                 )?;
@@ -1081,7 +633,7 @@ fn build_package_from_objects(
             &placement,
             &topology,
             crate::ExchangeLoweringOptions {
-                diagnostics: config.pipeline.exchange_diagnostics,
+                diagnostics: config.exchange_diagnostics,
             },
             exchange_cache,
         )?)
@@ -1121,7 +673,7 @@ fn build_package_from_objects(
         .enumerate()
         .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    if config.pipeline.profiling {
+    if config.profiling {
         outputs.push(cycle_binding(
             "profile.start-cycle",
             PROFILE_START_CYCLE,
@@ -1237,14 +789,8 @@ fn build_package_from_objects(
                     host,
                     &CodegenOptions {
                         code_address,
-                        initial_profile_address: config
-                            .pipeline
-                            .profiling
-                            .then_some(PROFILE_START_CYCLE),
-                        final_profile_address: config
-                            .pipeline
-                            .profiling
-                            .then_some(PROFILE_END_CYCLE),
+                        initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
+                        final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
                         ..CodegenOptions::default()
                     },
                 )?)
@@ -1598,7 +1144,7 @@ fn link_runtime(
     )?)
 }
 
-fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec<String> {
+fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Vec<String> {
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
@@ -1607,72 +1153,59 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PackageConfig) -> Vec
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
         }
     }
-    if config.pipeline.profiling {
+    if config.profiling {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {
         symbols.push(crate::HOST_RUN_SYMBOL.into());
         symbols.push(crate::REPEAT_CALL_SYMBOL.into());
     }
-    if program
-        .tiles
-        .iter()
-        .any(|tile| tile_has_local_copy(program, tile))
-    {
-        if program
-            .tiles
-            .iter()
-            .any(|tile| tile_has_halfword_copy(program, tile))
-        {
-            symbols.push(crate::COPY_U16_SYMBOL.into());
-        }
-        symbols.push(crate::COPY_U32_SYMBOL.into());
-        symbols.push(crate::COPY_U64_SYMBOL.into());
-        symbols.push(crate::COPY_STRIDED_U64_SYMBOL.into());
+    #[derive(Default)]
+    struct CopySymbols {
+        local: bool,
+        halfword: bool,
+        zero: bool,
     }
-    if program
-        .tiles
-        .iter()
-        .any(|tile| tile_has_fill_zero(program, tile))
-    {
+    let mut copies = CopySymbols::default();
+    fn collect(program: &LowProgram, tile: &crate::TileWorkList, copies: &mut CopySymbols) {
+        for work in program.work(tile) {
+            match work {
+                crate::TileWorkRef::LocalCopy(copy) => {
+                    copies.local = true;
+                    copies.halfword |= !match copy.pattern {
+                        crate::CopyPattern::Contiguous => copy.bytes,
+                        crate::CopyPattern::Strided { row_bytes, .. } => row_bytes,
+                    }
+                    .is_multiple_of(4);
+                }
+                crate::TileWorkRef::Kernel(run) => {
+                    copies.zero |= matches!(run.kernel, crate::TileKernelSpec::FillZero { .. });
+                }
+                crate::TileWorkRef::Repeat(repeat) => collect(program, &repeat.body, copies),
+                _ => {}
+            }
+        }
+    }
+    for tile in &program.tiles {
+        collect(program, tile, &mut copies);
+    }
+    if copies.halfword {
+        symbols.push(crate::COPY_U16_SYMBOL.into());
+    }
+    if copies.local {
+        symbols.extend(
+            [
+                crate::COPY_U32_SYMBOL,
+                crate::COPY_U64_SYMBOL,
+                crate::COPY_STRIDED_U64_SYMBOL,
+            ]
+            .map(String::from),
+        );
+    }
+    if copies.zero {
         symbols.push(crate::FILL_ZERO_U64_SYMBOL.into());
     }
     symbols
-}
-
-fn tile_has_fill_zero(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
-    program.work(tile).any(|work| match work {
-        crate::TileWorkRef::Kernel(run) => {
-            matches!(run.kernel, crate::TileKernelSpec::FillZero { .. })
-        }
-        crate::TileWorkRef::Repeat(repeat) => tile_has_fill_zero(program, &repeat.body),
-        crate::TileWorkRef::Exchange(_)
-        | crate::TileWorkRef::LocalCopy(_)
-        | crate::TileWorkRef::Checkpoint(..) => false,
-    })
-}
-
-fn tile_has_halfword_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
-    program.work(tile).any(|work| match work {
-        crate::TileWorkRef::LocalCopy(copy) => match copy.pattern {
-            crate::CopyPattern::Contiguous => !copy.bytes.is_multiple_of(4),
-            crate::CopyPattern::Strided { row_bytes, .. } => !row_bytes.is_multiple_of(4),
-        },
-        crate::TileWorkRef::Repeat(repeat) => tile_has_halfword_copy(program, &repeat.body),
-        crate::TileWorkRef::Exchange(_)
-        | crate::TileWorkRef::Kernel(_)
-        | crate::TileWorkRef::Checkpoint(..) => false,
-    })
-}
-
-fn tile_has_local_copy(program: &LowProgram, tile: &crate::TileWorkList) -> bool {
-    program.work(tile).any(|work| match work {
-        crate::TileWorkRef::LocalCopy(_) => true,
-        crate::TileWorkRef::Repeat(repeat) => tile_has_local_copy(program, &repeat.body),
-        crate::TileWorkRef::Exchange(_)
-        | crate::TileWorkRef::Kernel(_)
-        | crate::TileWorkRef::Checkpoint(..) => false,
-    })
 }
 
 fn input_binding(
@@ -1724,462 +1257,6 @@ fn cycle_binding(name: &str, address: u32, tile_count: u16, topology: &Topology)
             })
             .collect(),
     }
-}
-
-fn profile_binding(
-    program: &LowProgram,
-    physical_to_logical: &[u16],
-    address: u32,
-) -> PackageBuildResult<Binding> {
-    let mut file_offset = 0u64;
-    let mut sample_count = 0u32;
-    let slices = physical_to_logical
-        .iter()
-        .enumerate()
-        .filter_map(|(physical, &logical)| {
-            let steps = if logical < program.tile_count {
-                profile_step_count(program, &program.tiles[usize::from(logical)])
-            } else {
-                inactive_profile_work(program).len()
-            };
-            (steps != 0).then_some((physical, steps))
-        })
-        .map(|(physical, steps)| {
-            let samples = u32::try_from(steps + 1)?;
-            let size = u64::from(samples)
-                .checked_mul(4)
-                .ok_or_else(|| invalid("profile binding size overflow"))?;
-            let slice = RegionSlice {
-                tile: u32::try_from(physical)?,
-                tile_address: address,
-                file_offset,
-                size,
-            };
-            file_offset = file_offset
-                .checked_add(size)
-                .ok_or_else(|| invalid("profile binding offset overflow"))?;
-            sample_count = sample_count
-                .checked_add(samples)
-                .ok_or_else(|| invalid("profile binding sample count overflow"))?;
-            Ok(slice)
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    Ok(Binding {
-        name: PROFILE_CYCLES_BINDING.into(),
-        dtype: "u32".into(),
-        shape: vec![sample_count],
-        slices,
-    })
-}
-
-fn instrument_profile(
-    program: &LowProgram,
-    exchanges: &[crate::PhysicalExchangePhase],
-    logical_tile: u16,
-    physical_tile: u32,
-    tile_program: &mut crate::TileProgram,
-    address: u32,
-) -> PackageBuildResult<TileProfilePlan> {
-    let mut plans = Vec::with_capacity(tile_program.steps.len());
-    if logical_tile < program.tile_count {
-        let schedule = program
-            .work(&program.tiles[usize::from(logical_tile)])
-            .collect::<Vec<_>>();
-        if schedule.len() != tile_program.steps.len() {
-            return Err(invalid("tile profile work does not match finalized steps"));
-        }
-        let same_call = std::iter::once(false).chain(tile_program.steps.windows(2).map(|pair| {
-            matches!((&pair[0], &pair[1]), (crate::TileStep::Compute(a), crate::TileStep::Compute(b))
-                if a.symbol == b.symbol && a.arguments == b.arguments)
-        })).collect::<Vec<_>>();
-        for (index, (&work, step)) in schedule.iter().zip(&mut tile_program.steps).enumerate() {
-            if index != 0 && profile_work_can_merge(schedule[index - 1], work) {
-                continue;
-            }
-            let following = schedule[index + 1..].iter().find_map(|work| match work {
-                crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
-                crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
-                crate::TileWorkRef::Exchange(_)
-                | crate::TileWorkRef::LocalCopy(_)
-                | crate::TileWorkRef::Checkpoint(..) => None,
-            });
-            step_profile(step).before = Some(profile_address(address, plans.len())?);
-            let mut description = profile_step(
-                program,
-                exchanges,
-                logical_tile,
-                index,
-                work,
-                step,
-                following,
-            )?;
-            let invocations = schedule[index + 1..]
-                .iter()
-                .take_while(|&&next| profile_work_can_merge(work, next))
-                .count()
-                + 1;
-            description.metadata.push(ProfileMetadata {
-                name: "invocations".into(),
-                value: invocations.to_string(),
-            });
-            if let crate::TileStep::Compute(call) = step {
-                // Rendering may group calls with different sizes. Only groups
-                // with identical executable ABIs can be averaged for costing.
-                description.metadata.extend([
-                    ProfileMetadata {
-                        name: "uniformInvocations".into(),
-                        value: same_call[index + 1..index + invocations]
-                            .iter()
-                            .all(|same| *same)
-                            .to_string(),
-                    },
-                    ProfileMetadata {
-                        name: "arguments".into(),
-                        value: format!("{:?}", call.arguments),
-                    },
-                ]);
-            }
-            description.local_index = u32::try_from(plans.len())?;
-            plans.push(description);
-        }
-    } else {
-        let schedule = inactive_profile_work(program);
-        if schedule.len() != tile_program.steps.len() {
-            return Err(invalid(
-                "inactive tile profile does not match finalized steps",
-            ));
-        }
-        for (index, (work, step)) in schedule
-            .into_iter()
-            .zip(&mut tile_program.steps)
-            .enumerate()
-        {
-            if let (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) =
-                (work, &*step)
-            {
-                step_profile(step).before = Some(profile_address(address, index)?);
-                plans.push(ProfileStep {
-                    local_index: u32::try_from(index)?,
-                    phase: u32::try_from(index)?,
-                    epoch: 0,
-                    operation: format!("operation.{}", operation.index()),
-                    kind: ProfileStepKind::Idle,
-                    kernel: "diagnostic-checkpoint".into(),
-                    metadata: Vec::new(),
-                    exchange_activities: Vec::new(),
-                    exchange_event_cycles: 0,
-                });
-                continue;
-            }
-            let (phase, provenance) = match (work, &*step) {
-                (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
-                    let phase = &program.exchange_phases[id.index() as usize];
-                    (0x8000_0000 | id.index(), &phase.provenance)
-                }
-                (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => {
-                    (u32::try_from(index)?, &repeat.provenance)
-                }
-                _ => return Err(invalid("inactive tile contains executable work")),
-            };
-            step_profile(step).before = Some(profile_address(address, index)?);
-            plans.push(inactive_tile_description(index, phase, provenance)?);
-        }
-    }
-    if let Some(last) = tile_program.steps.last_mut() {
-        step_profile(last).after = Some(profile_address(address, plans.len())?);
-    }
-    Ok(TileProfilePlan {
-        physical_tile,
-        steps: plans,
-    })
-}
-
-fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
-    program
-        .tiles
-        .first()
-        .into_iter()
-        .flat_map(|tile| program.work(tile))
-        .filter(|work| {
-            matches!(
-                work,
-                crate::TileWorkRef::Exchange(_)
-                    | crate::TileWorkRef::Repeat(_)
-                    | crate::TileWorkRef::Checkpoint(..)
-            )
-        })
-        .collect()
-}
-
-fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkList) -> usize {
-    let mut previous = None;
-    let mut count = 0;
-    for work in program.work(tile) {
-        if previous.is_none_or(|previous| !profile_work_can_merge(previous, work)) {
-            count += 1;
-        }
-        previous = Some(work);
-    }
-    count
-}
-
-fn profile_work_can_merge(
-    previous: crate::TileWorkRef<'_>,
-    current: crate::TileWorkRef<'_>,
-) -> bool {
-    matches!(
-        (previous, current),
-        (crate::TileWorkRef::Kernel(previous), crate::TileWorkRef::Kernel(current))
-            if previous.kernel == current.kernel && previous.provenance == current.provenance
-    ) || matches!(
-        (previous, current),
-        (
-            crate::TileWorkRef::LocalCopy(previous),
-            crate::TileWorkRef::LocalCopy(current)
-        ) if previous.bytes == current.bytes && previous.pattern == current.pattern
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn profile_step(
-    program: &LowProgram,
-    exchanges: &[crate::PhysicalExchangePhase],
-    logical_tile: u16,
-    index: usize,
-    work: crate::TileWorkRef<'_>,
-    step: &mut crate::TileStep,
-    following: Option<&crate::WorkProvenance>,
-) -> PackageBuildResult<ProfileStep> {
-    match (work, step) {
-        (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(exchange)) => {
-            let phase = &program.exchange_phases[id.index() as usize];
-            if !exchange.active {
-                exchange_synchronization_description(
-                    index,
-                    0x8000_0000 | id.index(),
-                    &phase.provenance,
-                )
-            } else {
-                let mut description = profile_description(
-                    index,
-                    0x8000_0000 | id.index(),
-                    &phase.provenance,
-                    ProfileStepKind::Exchange,
-                    "exchange",
-                )?;
-                let physical = exchanges
-                    .get(id.index() as usize)
-                    .ok_or_else(|| invalid("profile exchange phase is missing"))?;
-                description.exchange_activities = physical
-                    .activities
-                    .get(usize::from(logical_tile))
-                    .ok_or_else(|| invalid("profile exchange tile is missing"))?
-                    .iter()
-                    .map(|activity| ProfileExchangeActivity {
-                        fanout: activity.fanout,
-                        paired: activity.paired,
-                        kind: match activity.kind {
-                            crate::ExchangeActivityKind::Send => ProfileExchangeActivityKind::Send,
-                            crate::ExchangeActivityKind::Receive => {
-                                ProfileExchangeActivityKind::Receive
-                            }
-                            crate::ExchangeActivityKind::PartnerBusy => {
-                                ProfileExchangeActivityKind::PartnerBusy
-                            }
-                        },
-                        start_cycle: activity.start_cycle,
-                        end_cycle: activity.end_cycle,
-                    })
-                    .collect();
-                description.exchange_event_cycles = physical.event_cycles;
-                Ok(description)
-            }
-        }
-        (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
-            let mut description = profile_description(
-                index,
-                u32::try_from(index)?,
-                &run.provenance,
-                ProfileStepKind::Compute,
-                &compute.symbol,
-            )?;
-            description.metadata.push(ProfileMetadata {
-                name: "kernelSpec".into(),
-                value: format!("{:?}", run.kernel),
-            });
-            description.metadata.push(ProfileMetadata {
-                name: "outputElements".into(),
-                value: view_logical_elements(&run.output).to_string(),
-            });
-            for (operand, input) in run.inputs.iter().enumerate() {
-                description.metadata.push(ProfileMetadata {
-                    name: format!("input{operand}Elements"),
-                    value: input
-                        .views
-                        .iter()
-                        .map(view_logical_elements)
-                        .sum::<u64>()
-                        .to_string(),
-                });
-            }
-            Ok(description)
-        }
-        (crate::TileWorkRef::LocalCopy(copy), crate::TileStep::Compute(compute)) => {
-            if let Some(provenance) = following {
-                let mut description = profile_description(
-                    index,
-                    u32::try_from(index)?,
-                    provenance,
-                    ProfileStepKind::Compute,
-                    &compute.symbol,
-                )?;
-                description.metadata[0].value = "LocalCopy".into();
-                description.metadata.extend([
-                    ProfileMetadata {
-                        name: "bytes".into(),
-                        value: copy.bytes.to_string(),
-                    },
-                    ProfileMetadata {
-                        name: "pattern".into(),
-                        value: format!("{:?}", copy.pattern),
-                    },
-                ]);
-                Ok(description)
-            } else {
-                Ok(ProfileStep {
-                    local_index: u32::try_from(index)?,
-                    phase: u32::try_from(index)?,
-                    epoch: 0,
-                    operation: String::new(),
-                    kind: ProfileStepKind::Compute,
-                    kernel: compute.symbol.clone(),
-                    metadata: vec![
-                        ProfileMetadata {
-                            name: "reason".into(),
-                            value: "LocalCopy".into(),
-                        },
-                        ProfileMetadata {
-                            name: "bytes".into(),
-                            value: copy.bytes.to_string(),
-                        },
-                        ProfileMetadata {
-                            name: "pattern".into(),
-                            value: format!("{:?}", copy.pattern),
-                        },
-                    ],
-                    exchange_activities: Vec::new(),
-                    exchange_event_cycles: 0,
-                })
-            }
-        }
-        (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => profile_description(
-            index,
-            u32::try_from(index)?,
-            &repeat.provenance,
-            ProfileStepKind::Compute,
-            "repeat",
-        ),
-        (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) => {
-            Ok(ProfileStep {
-                local_index: u32::try_from(index)?,
-                phase: u32::try_from(index)?,
-                epoch: 0,
-                operation: format!("operation.{}", operation.index()),
-                kind: ProfileStepKind::Synchronization,
-                kernel: "diagnostic-checkpoint".into(),
-                metadata: Vec::new(),
-                exchange_activities: Vec::new(),
-                exchange_event_cycles: 0,
-            })
-        }
-        _ => Err(invalid(
-            "tile profile work kind does not match finalized step",
-        )),
-    }
-}
-
-fn view_logical_elements(view: &crate::ShardView) -> u64 {
-    view.extents.iter().fold(1u64, |elements, extent| {
-        elements.saturating_mul(u64::from(extent.logical_end.saturating_sub(extent.start)))
-    })
-}
-
-fn exchange_synchronization_description(
-    index: usize,
-    phase: u32,
-    provenance: &crate::WorkProvenance,
-) -> PackageBuildResult<ProfileStep> {
-    let mut description = profile_description(
-        index,
-        phase,
-        provenance,
-        ProfileStepKind::Synchronization,
-        "sync",
-    )?;
-    description.metadata[0].value = "ExchangeBarrier".into();
-    Ok(description)
-}
-
-fn inactive_tile_description(
-    index: usize,
-    phase: u32,
-    provenance: &crate::WorkProvenance,
-) -> PackageBuildResult<ProfileStep> {
-    let mut description =
-        profile_description(index, phase, provenance, ProfileStepKind::Idle, "idle")?;
-    description.metadata[0].value = "InactiveTile".into();
-    Ok(description)
-}
-
-fn profile_description(
-    index: usize,
-    phase: u32,
-    provenance: &crate::WorkProvenance,
-    kind: ProfileStepKind,
-    kernel: &str,
-) -> PackageBuildResult<ProfileStep> {
-    let mut metadata = vec![ProfileMetadata {
-        name: "reason".into(),
-        value: format!("{:?}", provenance.reason),
-    }];
-    if let Some(value) = provenance.value {
-        metadata.push(ProfileMetadata {
-            name: "value".into(),
-            value: value.index().to_string(),
-        });
-    }
-    Ok(ProfileStep {
-        local_index: u32::try_from(index)?,
-        phase,
-        epoch: 0,
-        operation: provenance
-            .operation
-            .map(|operation| format!("operation.{}", operation.index()))
-            .unwrap_or_default(),
-        kind,
-        kernel: kernel.into(),
-        metadata,
-        exchange_activities: Vec::new(),
-        exchange_event_cycles: 0,
-    })
-}
-
-fn step_profile(step: &mut crate::TileStep) -> &mut crate::StepProfile {
-    match step {
-        crate::TileStep::Exchange(exchange) => &mut exchange.profile,
-        crate::TileStep::Compute(compute) => &mut compute.profile,
-        crate::TileStep::Repeat(repeat) => &mut repeat.profile,
-        crate::TileStep::Checkpoint(checkpoint) => &mut checkpoint.profile,
-    }
-}
-
-fn profile_address(base: u32, index: usize) -> PackageBuildResult<u32> {
-    base.checked_add(
-        u32::try_from(index)?
-            .checked_mul(4)
-            .ok_or_else(|| invalid("profile address overflow"))?,
-    )
-    .ok_or_else(|| invalid("profile address overflow"))
 }
 
 fn binding(

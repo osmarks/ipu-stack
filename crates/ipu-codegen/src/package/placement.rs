@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 /// Screen geometry-derived embeddings by resource load, retaining one challenger.
 pub(super) fn model_mapping(
     program: &LowProgram,
+    baseline: &crate::Placement,
     search: bool,
 ) -> PackageBuildResult<(u64, Option<Vec<u16>>)> {
-    let baseline = place(program)?;
-    let traffic = crate::exchange::MappingTraffic::new(program, &baseline)?;
+    let traffic = crate::exchange::MappingTraffic::new(program, baseline)?;
     let multiplicities = exchange_multiplicities(program);
     let identity = (0..program.tile_count).collect::<Vec<_>>();
     let baseline_score = traffic.score(&identity, &multiplicities);
