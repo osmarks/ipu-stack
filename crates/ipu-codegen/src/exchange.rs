@@ -1987,7 +1987,6 @@ struct TileMemorySchedule {
 }
 
 struct MaterializedSchedule {
-    pipeline_routes: bool,
     builder: PhaseProgramBuilder,
     horizon: u32,
     tile_availability: Vec<TileAvailability>,
@@ -2002,12 +2001,6 @@ impl MaterializedSchedule {
     fn new(tile_count: u16, transfers: &[PendingTransfer]) -> Self {
         let transfer_count = transfers.len();
         Self {
-            // Hardware validates overlapped route setup for ordinary unicast.
-            // Multicast/paired row timing still relies on the outer receive
-            // release guard; removing it can stall a phase despite validation.
-            pipeline_routes: transfers.iter().all(|transfer| {
-                transfer.destinations.len() == 1 && transfer.width == ExchangeItemWidth::Word32
-            }),
             builder: PhaseProgramBuilder::new(tile_count),
             horizon: 0,
             tile_availability: vec![TileAvailability::default(); usize::from(tile_count)],
@@ -2073,14 +2066,10 @@ impl MaterializedSchedule {
                 source_elements: &transfer.source_elements,
                 words: transfer.words,
                 width: transfer.width,
-                // Ordinary unicast can begin route setup before the previous
-                // payload arrives. Other phases retain the existing outer
-                // guard until their row timing model is corrected.
-                schedule_offset: if self.pipeline_routes {
-                    dependency_ready
-                } else {
-                    latest_availability.max(dependency_ready)
-                },
+                // Endpoint constraints are enforced at their actual source,
+                // payload and control events by the row builder. Only true
+                // memory dependencies constrain the whole transfer's release.
+                schedule_offset: dependency_ready,
             },
             &mut self.builder,
             validate_encoding,
