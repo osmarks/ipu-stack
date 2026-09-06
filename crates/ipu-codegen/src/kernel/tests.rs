@@ -299,18 +299,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     );
     for (kernel, rows) in stages {
         let (inputs, expected) = match kernel {
-            TileKernelSpec::AttentionSoftmax {
-                key_columns,
-                padded_key_columns,
-                ..
-            } => (
-                1,
-                if key_columns == padded_key_columns {
-                    vec![]
-                } else {
-                    vec![rows, key_columns]
-                },
-            ),
+            TileKernelSpec::AttentionSoftmax { key_columns, .. } => (1, vec![rows, key_columns]),
             TileKernelSpec::AttentionMerge { .. } => (2, vec![1, 0, rows]),
             _ => unreachable!(),
         };

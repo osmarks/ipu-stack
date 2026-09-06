@@ -205,19 +205,11 @@ pub fn tile_kernel_abi(
                 3,
                 &[],
             ),
-            TileKernelSpec::AttentionSoftmax {
-                key_columns,
-                padded_key_columns,
-                ..
-            } => (
+            TileKernelSpec::AttentionSoftmax { .. } => (
                 KernelSymbols::Specialized,
                 KernelAvailability::Implemented,
                 1,
-                if key_columns != padded_key_columns {
-                    &[ScalarValue::QueryRows, ScalarValue::KeyRows]
-                } else {
-                    &[]
-                },
+                &[ScalarValue::QueryRows, ScalarValue::KeyRows],
             ),
             TileKernelSpec::AttentionMerge { .. } => (
                 KernelSymbols::Specialized,
