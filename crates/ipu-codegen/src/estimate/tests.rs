@@ -132,27 +132,14 @@ fn conversion_traffic_reference(
         .iter()
         .map(|(_, extents)| range_elements(extents) * precision.bytes())
         .sum();
-    let mut source_roles = BTreeMap::<u16, (u64, u64)>::new();
-    for (source, extents) in &remote {
-        let role = source_roles.entry(*source).or_default();
-        role.0 += range_elements(extents) * precision.bytes();
-        role.1 += 1;
-    }
-    for (bytes, fragments) in source_roles.into_values() {
-        traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
-        traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
-    }
     let mut source_buses = BTreeMap::<u16, (u64, u64)>::new();
     for (source, extents) in &remote {
-        let role = source_buses.entry(*source / 2).or_default();
+        let role = source_buses.entry(*source).or_default();
         role.0 += range_elements(extents) * precision.bytes();
         role.1 += 1;
     }
     for (bus, (bytes, fragments)) in source_buses {
-        traffic.maximum_source_bus_payload_bytes =
-            traffic.maximum_source_bus_payload_bytes.max(bytes);
-        traffic.maximum_source_bus_fragments = traffic.maximum_source_bus_fragments.max(fragments);
-        add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
+        add_endpoint_load(&mut traffic.source_lane_loads, bus, bytes, fragments);
     }
     traffic
 }

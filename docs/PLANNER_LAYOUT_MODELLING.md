@@ -17,7 +17,8 @@ into the search.
 
 The resource model charges:
 
-* Shared transmit-bus payload for adjacent C600 execution tiles.
+* Independent transmit-lane payload per C600 tile, with explicit partner-lane
+  occupancy for paired transfers.
 * Independent per-tile receive payload.
 * Combined send/receive service on each SRAM element.
 * Ordinary and eligible paired-transfer alternatives, choosing the lower modeled
@@ -55,3 +56,41 @@ better ordering/contention model or the later autotuning facility.
 This change introduces no hardware-based search, new tensor layout layer, or
 per-tile details in mid. The placement resource model lives beside physical
 exchange preparation and shares its fragmentation code.
+
+## Corrected transmit-lane assumption
+
+The previous compact model incorrectly summed adjacent tiles' ordinary sends as
+one shared four-byte-per-cycle resource. The physical scheduler only reserves a
+neighbor's transmit lane for paired transfers. The hardware-validated control
+profile provides a concrete counterexample: physical tiles 0 and 2 both send
+ordinary multicast traffic in phase 0, over intervals [25, 4173) and [24, 4172).
+Their 4,147-cycle overlap rules out that serialization assumption. Both compact
+traffic accounting and the new placement model now charge ordinary lanes
+independently. This also removes false mapping gains from merely separating
+ordinary senders that already can transmit concurrently.
+The entire measured exchange after the last barrier arrival lasts 7,332 cycles,
+less than the 8,296 cycles those two sends alone would require if serialized.
+
+## Validation
+
+The automatic SigLIP MLP runs in **172,236 renderer cycles**, versus 178,782
+before these changes (3.66% faster). It is within 78 cycles of the manually
+swept 172,158-cycle combination. The chosen compute grids are `2x92x8` up and
+`3x18x27` down; it keeps the identity tile mapping. The compact model ranks it
+fourth, while the expanded traffic model ranks it first. Final SRAM placement
+removes another 1,014 scheduled exchange cycles.
+
+The MLP numerical check passes with maximum absolute error 0.015625. Attention
+smoke also passes (maximum error 0.000113). The codegen suite passes 110 tests
+with one ignored, and workspace Clippy passes with the existing complexity
+exceptions. The independent-lane regression also schedules two ordinary sends
+from adjacent tiles and checks that they overlap.
+The build-only verification after correcting lane accounting produced the same
+package SHA-256 as the measured build:
+`abc4356557b5d0747f27b40e6c07049d416ae0332ba968686f7108738d93501e`.
+No additional hardware run was needed for that identical package.
+
+Logs, the exchange snapshot and the rendered MLP profile are under
+`artifacts/layout-sweep/modelled-planning/`. The measured profile is
+`final/profile.html`. Earlier exploratory model versions and their results are
+retained separately there; they are not the final planner's performance.

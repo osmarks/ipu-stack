@@ -166,6 +166,10 @@ permutations, and bounded reduction batches. See
 improves the upgraded-kernel control by 0.97%, or 1.70% combined with a mapping
 within 92-tile groups. Tested global mappings and smaller batches lose. Trees,
 finer K ownership, and general local storage maps remain unmeasured.
+Normal planning now incorporates result factors and modelled placement;
+[PLANNER_LAYOUT_MODELLING.md](PLANNER_LAYOUT_MODELLING.md) records the staged
+search, corrected independent transmit-lane accounting, and automatic MLP result
+of 172,236 renderer cycles.
 
 ## ISA review
 

@@ -5,11 +5,7 @@ use super::*;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionTraffic {
     pub source_payload_bytes: u64,
-    pub maximum_source_payload_bytes: u64,
     pub remote_fragments: u64,
-    pub maximum_source_fragments: u64,
-    pub maximum_source_bus_payload_bytes: u64,
-    pub maximum_source_bus_fragments: u64,
     pub maximum_routed_fragments: u64,
     pub maximum_destination_bytes: u64,
     pub maximum_remote_destination_bytes: u64,
@@ -17,7 +13,7 @@ pub(crate) struct ConversionTraffic {
     pub maximum_local_bytes: u64,
     pub maximum_intersections: u64,
     pub maximum_local_intersections: u64,
-    pub source_bus_loads: Vec<ExchangeEndpointLoad>,
+    pub source_lane_loads: Vec<ExchangeEndpointLoad>,
     pub remote_destination_loads: Vec<ExchangeEndpointLoad>,
 }
 
@@ -35,19 +31,19 @@ impl ExchangeEndpointLoad {
 }
 
 /// Resource-indexed work for one or more transfers which share an exchange
-/// phase. Sends from an adjacent tile pair occupy one shared bus; receives are
-/// independent per tile. Keeping those roles separate allows independently
+/// phase. Ordinary sends and receives have independent lanes per tile; only
+/// paired transfers borrow a neighbor's transmit lane. Keeping roles separate allows independently
 /// produced traffic estimates to be combined before finding the bottleneck.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExchangeEndpointTraffic {
-    pub outgoing_buses: Vec<ExchangeEndpointLoad>,
+    pub outgoing_lanes: Vec<ExchangeEndpointLoad>,
     pub incoming_tiles: Vec<ExchangeEndpointLoad>,
 }
 
 impl ExchangeEndpointTraffic {
     pub(crate) fn from_conversion(traffic: &ConversionTraffic) -> Self {
         Self {
-            outgoing_buses: traffic.source_bus_loads.clone(),
+            outgoing_lanes: traffic.source_lane_loads.clone(),
             incoming_tiles: traffic.remote_destination_loads.clone(),
         }
     }
@@ -66,7 +62,7 @@ impl ExchangeEndpointTraffic {
     }
 
     pub(crate) fn add_outgoing(&mut self, bus: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(&mut self.outgoing_buses, bus, bytes, fragments);
+        add_endpoint_load(&mut self.outgoing_lanes, bus, bytes, fragments);
     }
 
     pub(crate) fn add_incoming(&mut self, tile: u16, bytes: u64, fragments: u64) {
@@ -74,7 +70,7 @@ impl ExchangeEndpointTraffic {
     }
 
     pub(crate) fn maximum_outgoing_bytes(&self) -> u64 {
-        self.outgoing_buses
+        self.outgoing_lanes
             .iter()
             .map(|load| load.bytes)
             .max()
@@ -95,7 +91,7 @@ impl ExchangeEndpointTraffic {
     }
 
     pub(crate) fn maximum_outgoing_fragments(&self) -> u64 {
-        self.outgoing_buses
+        self.outgoing_lanes
             .iter()
             .map(|load| load.fragments)
             .max()
@@ -218,31 +214,16 @@ pub(crate) fn conversion_traffic(
         .iter()
         .map(|(_, extents)| range_elements(extents).saturating_mul(element_bytes))
         .sum();
-    let mut source_roles = HashMap::<u16, (u64, u64)>::new();
-    for (source, extents) in &remote {
-        let role = source_roles.entry(*source).or_default();
-        role.0 = role
-            .0
-            .saturating_add(range_elements(extents).saturating_mul(element_bytes));
-        role.1 = role.1.saturating_add(1);
-    }
-    for (bytes, fragments) in source_roles.into_values() {
-        traffic.maximum_source_payload_bytes = traffic.maximum_source_payload_bytes.max(bytes);
-        traffic.maximum_source_fragments = traffic.maximum_source_fragments.max(fragments);
-    }
     let mut source_buses = HashMap::<u16, (u64, u64)>::new();
     for (source, extents) in &remote {
-        let role = source_buses.entry(*source / 2).or_default();
+        let role = source_buses.entry(*source).or_default();
         role.0 = role
             .0
             .saturating_add(range_elements(extents).saturating_mul(element_bytes));
         role.1 = role.1.saturating_add(1);
     }
     for (bus, (bytes, fragments)) in source_buses {
-        traffic.maximum_source_bus_payload_bytes =
-            traffic.maximum_source_bus_payload_bytes.max(bytes);
-        traffic.maximum_source_bus_fragments = traffic.maximum_source_bus_fragments.max(fragments);
-        add_endpoint_load(&mut traffic.source_bus_loads, bus, bytes, fragments);
+        add_endpoint_load(&mut traffic.source_lane_loads, bus, bytes, fragments);
     }
     Some(traffic)
 }

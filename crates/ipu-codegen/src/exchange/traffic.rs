@@ -69,7 +69,7 @@ impl MappingTraffic {
             .iter()
             .map(|phase| {
                 let score = |pairing: bool| {
-                    let mut buses = vec![0u64; self.tile_count.div_ceil(2)];
+                    let mut buses = vec![0u64; self.tile_count];
                     let mut receives = vec![0u64; self.tile_count];
                     let mut elements = BTreeMap::<(u16, ExchangeMemoryElement), u64>::new();
                     for transfer in phase {
@@ -94,7 +94,10 @@ impl MappingTraffic {
                                         .is_ok()
                             });
                         let cycles = u64::from(transfer.words) / if paired { 2 } else { 1 };
-                        buses[usize::from(source / 2)] += cycles;
+                        buses[usize::from(source)] += cycles;
+                        if paired {
+                            buses[usize::from(partner)] += cycles;
+                        }
                         for element in &transfer.source_elements {
                             *elements.entry((source, *element)).or_default() += cycles;
                         }
@@ -150,12 +153,27 @@ mod tests {
     }
 
     #[test]
-    fn mapping_prices_shared_buses_and_preserves_paired_receive_opportunities() {
+    fn mapping_prices_independent_lanes_and_borrowed_pairing() {
         let traffic = MappingTraffic {
             phases: vec![vec![transfer(0, &[2], 100), transfer(1, &[3], 100)]],
             tile_count: 4,
         };
-        assert_eq!(traffic.score(&[0, 1, 2, 3], &[1]).0, 200);
+        let scheduled =
+            schedule_exchange_problem(4, &schedule_problem(0, &traffic.phases[0])).unwrap();
+        let send = |tile: usize| {
+            scheduled.phase.activities[tile]
+                .iter()
+                .find(|activity| activity.kind == ExchangeActivityKind::Send)
+                .unwrap()
+        };
+        assert!(
+            send(0)
+                .end_cycle
+                .min(send(1).end_cycle)
+                .saturating_sub(send(0).start_cycle.max(send(1).start_cycle))
+                > 50
+        );
+        assert_eq!(traffic.score(&[0, 1, 2, 3], &[1]).0, 100);
         assert_eq!(traffic.score(&[0, 2, 1, 3], &[1]).0, 100);
         assert_eq!(traffic.score(&[0, 2, 1, 3], &[3]).0, 300);
         let multicast = MappingTraffic {
