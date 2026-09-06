@@ -41,8 +41,15 @@ target/release/ipu-trivial-test c600-init.ipucfg \
 
 Results: `artifacts/exchange-loopback/loopback-bank-matrix.log`. An earlier
 eight-route test with 128 words and standard destinations also passed.
-The production copy planner still emits local copies: using loopback there
-requires including the self-receiver in scheduling and memory-conflict checks.
+The copy planner now folds standard-to-interleaved local copies into an existing
+multicast when source view and copy order match, the spans are word-aligned, and
+the local receiver introduces no additional message boundaries. It requires at
+least two existing remote destinations; standalone copies, point-to-point sends,
+same-class copies, and staging conversions retain their local kernels. This is
+a conservative eligibility heuristic, not an exact comparison of both schedules.
+The physical scheduler includes the self-receiver in its receive-bus and memory
+hazards. Snapshot validation checks every repeated source address against the
+self-receiver's memory elements. Paired loopback remains disabled.
 
 ### Receive controls
 

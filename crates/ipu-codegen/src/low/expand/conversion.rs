@@ -10,6 +10,7 @@ pub(super) struct MaterializationBatch {
     before: Vec<(u16, LocalCopy)>,
     pub(super) after: Vec<(u16, LocalCopy)>,
     kernels: Vec<(u16, KernelRun)>,
+    loopback_candidates: Vec<(ShardView, ShardView, CopyOrder)>,
 }
 
 impl TileGraphBuilder {
@@ -280,6 +281,26 @@ impl TileGraphBuilder {
                 let source_tile = self.shards[source.shard.index() as usize].tile;
                 let destination_tile = self.shards[destination.shard.index() as usize].tile;
                 if source_tile == destination_tile {
+                    if staging.is_none()
+                        && copy_order == exchange_order
+                        && self.shards[source.shard.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .memory_class
+                            == MemoryClass::Ipu21Standard
+                        && self.shards[destination.shard.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .memory_class
+                            == MemoryClass::Ipu21Interleaved
+                    {
+                        batch
+                            .loopback_candidates
+                            .push((source, destination, copy_order));
+                        continue;
+                    }
                     let copies = if staging.is_some() {
                         &mut batch.before
                     } else {
@@ -334,10 +355,56 @@ impl TileGraphBuilder {
 
     pub(super) fn append_materialization(
         &mut self,
-        batch: MaterializationBatch,
+        mut batch: MaterializationBatch,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
+        for (source, destination, order) in batch.loopback_candidates {
+            let transfers = match order {
+                CopyOrder::Semantic => &mut batch.semantic,
+                CopyOrder::Physical => &mut batch.physical,
+            };
+            // Keep the existing multicast send; only add its local receiver.
+            // Different memory classes guarantee disjoint exchange elements.
+            let spans = match order {
+                CopyOrder::Semantic => logical_view_byte_spans,
+                CopyOrder::Physical => view_byte_spans,
+            };
+            let source_spans = spans(&self.shards[source.shard.index() as usize], &source)?;
+            let destination_spans = spans(
+                &self.shards[destination.shard.index() as usize],
+                &destination,
+            )?;
+            let aligned = source_spans
+                .iter()
+                .chain(&destination_spans)
+                .all(|span| span.offset % 4 == 0 && span.bytes % 4 == 0);
+            if let Some(destinations) = transfers.get_mut(&source)
+                && destinations.len() >= 2
+                && aligned
+                // The local receiver must not split existing messages further.
+                && destinations.iter().any(|view| {
+                    spans(&self.shards[view.shard.index() as usize], view).is_ok_and(|remote|
+                        remote.iter().map(|span| span.bytes)
+                            .eq(destination_spans.iter().map(|span| span.bytes)))
+                })
+                && destinations.iter().all(|view| {
+                    self.shards[view.shard.index() as usize].tile
+                        != self.shards[source.shard.index() as usize].tile
+                })
+            {
+                destinations.push(destination);
+            } else {
+                append_span_copies(
+                    &self.shards,
+                    &source,
+                    &destination,
+                    self.shards[source.shard.index() as usize].tile,
+                    &mut batch.after,
+                    order,
+                )?;
+            }
+        }
         for (tile, copy) in batch.before {
             self.append_local_copy(tiles, tile, copy)?;
         }

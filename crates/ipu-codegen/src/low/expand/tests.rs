@@ -19,6 +19,65 @@ use std::collections::BTreeSet;
 
 const CASES: usize = 32;
 
+#[test]
+fn local_materialization_joins_only_compatible_existing_multicasts() {
+    for (remote_count, interleaved, exchange_order, loopback) in [
+        (2, true, CopyOrder::Physical, true),
+        (0, true, CopyOrder::Physical, false),
+        (1, true, CopyOrder::Physical, false),
+        (2, false, CopyOrder::Physical, false),
+        (2, true, CopyOrder::Semantic, false),
+    ] {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [16, 16]).unwrap();
+        graph.set_outputs([input]).unwrap();
+        let config = PipelineConfig::new(3).with_input(input, format(1));
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mut builder = TileGraphBuilder::new(&mid).unwrap();
+        let source = builder.full_view(builder.shards[0].id);
+        let mut mappings = Vec::new();
+        for tile in 0..=remote_count {
+            let mut destination = builder.shards[0].clone();
+            destination.tile = tile;
+            destination.definition = ShardDefinition::Staging;
+            if interleaved {
+                destination.tensor_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+            }
+            let id = builder.push_shard(destination).unwrap();
+            mappings.push((source.clone(), builder.full_view(id)));
+        }
+        let provenance = WorkProvenance {
+            operation: None,
+            value: None,
+            reason: WorkReason::LayoutRearrangement,
+        };
+        let mut batch = conversion::MaterializationBatch::default();
+        let mut region = BlockRegion::default();
+        builder
+            .prepare_mapped_views(
+                mappings,
+                CopyOrder::Physical,
+                exchange_order,
+                provenance,
+                &mut batch,
+                &mut region,
+            )
+            .unwrap();
+        builder
+            .append_materialization(batch, provenance, &mut region)
+            .unwrap();
+        assert_eq!(builder.local_copies.is_empty(), loopback);
+        let self_receivers = builder
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.transfers)
+            .flat_map(|transfer| &transfer.destinations)
+            .filter(|view| builder.shards[view.shard.index() as usize].tile == 0)
+            .count();
+        assert_eq!(self_receivers, usize::from(loopback));
+    }
+}
+
 fn format(tiles: u16) -> TensorFormat {
     TensorFormat {
         precision: Precision::F16,

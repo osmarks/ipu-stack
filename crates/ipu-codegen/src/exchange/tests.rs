@@ -6,6 +6,46 @@ use crate::{
 };
 
 #[test]
+fn multicast_loopback_schedules_both_roles_and_rejects_bank_aliases() {
+    for words in [1, 52, 65, 512] {
+        let mut problem = ExchangeScheduleProblem {
+            phase: 0,
+            transfers: vec![ExchangeScheduleTransfer {
+                source: 0,
+                source_addresses: vec![0x65000],
+                destinations: [0, 1, 2]
+                    .into_iter()
+                    .map(|tile| ExchangeScheduleDestination {
+                        tile,
+                        address: 0x98000,
+                    })
+                    .collect(),
+                words,
+                width: ExchangeItemWidth::Word32,
+            }],
+        };
+        let run = schedule_exchange_problem(4, &problem).unwrap();
+        validate_exchange_schedule(4, &problem, &run.phase).unwrap();
+        assert!(
+            run.phase.activities[0]
+                .iter()
+                .any(|a| a.kind == ExchangeActivityKind::Send)
+        );
+        assert!(
+            run.phase.activities[0]
+                .iter()
+                .any(|a| a.kind == ExchangeActivityKind::Receive)
+        );
+        problem.transfers[0].destinations[0].address = 0x65004;
+        assert!(schedule_exchange_problem(4, &problem).is_err());
+        // Every alternative source address in a repeated phase must be safe.
+        problem.transfers[0].destinations[0].address = 0x98000;
+        problem.transfers[0].source_addresses.push(0x98004);
+        assert!(schedule_exchange_problem(4, &problem).is_err());
+    }
+}
+
+#[test]
 fn randomized_ready_matchings_have_maximum_cardinality() {
     let mut random = fastrand::Rng::with_seed(0x6d61_7463_6869_6e67);
     for _ in 0..128 {

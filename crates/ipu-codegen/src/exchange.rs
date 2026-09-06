@@ -836,7 +836,17 @@ fn pending_from_problem(
                 .iter()
                 .map(|destination| {
                     if destination.tile >= tile_count
-                        || destination.tile == transfer.source
+                        || (destination.tile == transfer.source
+                            && (transfer.width != ExchangeItemWidth::Word32
+                                || transfer.destinations.len() < 2
+                                || transfer.source_addresses.iter().any(|&address| {
+                                    spans_share_effective_memory_element(
+                                        address,
+                                        transfer.words,
+                                        destination.address,
+                                        transfer.words,
+                                    )
+                                })))
                         || !destination_tiles.insert(destination.tile)
                     {
                         return Err(ExchangeLoweringError::InvalidSnapshot(format!(
@@ -2082,6 +2092,18 @@ fn append_transfer(
     } = transfer;
     if words == 0 || source_elements.is_empty() {
         return Err(ExchangeLoweringError::UnalignedPayload);
+    }
+    if destinations.iter().any(|&(tile, address)| {
+        tile == source
+            && (width != ExchangeItemWidth::Word32
+                || destinations.len() < 2
+                || effective_memory_elements(address, words)
+                    .iter()
+                    .any(|element| source_elements.contains(element)))
+    }) {
+        return Err(ExchangeLoweringError::Invariant(
+            "multicast loopback requires separate source and destination memory elements".into(),
+        ));
     }
     let tiles = destinations.iter().map(|entry| entry.0).collect::<Vec<_>>();
     let item_count = width.item_count(words)?;
