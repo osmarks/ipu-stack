@@ -17,20 +17,31 @@ pub(crate) fn interleaved_f16_gemm_cycles(rows: u64, inner: u64, columns: u64) -
     )
 }
 
-/// Packed stores assign complete 16-row groups to workers. Price their
-/// occupancy and pipeline restarts, not just the useful rows. Group overheads
-/// are calibrated against the K240/C64/R48 standard/interleaved hardware runs.
+/// Packed stores balance rows across the six workers and split their ranges
+/// at 16-row panel boundaries. Six scalar iterations model worker occupancy
+/// without expanding tiles or emitting instructions.
 pub(crate) fn f16_packed_gemm_cycles(
     rows: u64,
     inner: u64,
     columns: u64,
     interleaved: bool,
 ) -> u64 {
-    let group = rows
-        .div_ceil(96)
-        .saturating_mul(384 + 132)
-        .saturating_add(if interleaved { 160 } else { 194 });
-    294u64.saturating_add(
+    let worker = (0..6)
+        .map(|worker| {
+            let count = rows / 6 + u64::from(worker < rows % 6);
+            if count == 0 {
+                return 0;
+            }
+            let start = worker * (rows / 6) + worker.min(rows % 6);
+            let chunks = (start % 16 + count).div_ceil(16);
+            count
+                .saturating_mul(24)
+                .saturating_add(chunks.saturating_mul(184))
+        })
+        .max()
+        .unwrap_or(0);
+    let group = worker.saturating_add(if interleaved { 170 } else { 202 });
+    342u64.saturating_add(
         inner
             .div_ceil(16)
             .saturating_mul(columns.div_ceil(16))
@@ -197,6 +208,25 @@ mod tests {
         }
         assert_eq!(f16_gelu_cycles(0), 0);
         assert_eq!(f16_gelu_cycles(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn packed_gemm_tracks_panel_boundaries_and_weight_memory() {
+        // Device profiles: projected attention and GEMM with worker ranges
+        // crossing multiple 16-row output panels.
+        for (rows, inner, columns, interleaved, measured) in [
+            (48, 240, 64, false, 35022u64),
+            (48, 240, 64, true, 33102),
+            (96, 64, 64, true, 12108),
+            (128, 64, 64, true, 19944),
+        ] {
+            let predicted = f16_packed_gemm_cycles(rows, inner, columns, interleaved);
+            assert!(predicted.abs_diff(measured) * 100 < measured);
+        }
+        assert_eq!(
+            f16_packed_gemm_cycles(u64::MAX, u64::MAX, u64::MAX, true),
+            u64::MAX
+        );
     }
 
     #[test]

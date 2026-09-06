@@ -276,15 +276,22 @@
 	add $m0, $m0, 512
 	ld32 $m1, $mvertex_base, $m15, 1
 .Lpacked_rows_\@:
-	PARTITION_ROWS ((\rows) / 16)
+	PARTITION_ROWS \rows
 	brz $m5, .Lgemm_f16_no_rows_\@
-	shl $m6, $m6, 9
-	add $m2, $m1, $m6
-	shl $m7, $m6, GEMM_OUTPUT_GROUP_SHIFT
-	add $m9, $m0, $m7
+	shl $m2, $m6, 5
+	add $m2, $m1, $m2
+	shr $m7, $m6, 4
+	shl $m7, $m7, (GEMM_OUTPUT_GROUP_SHIFT + 9)
+	and $m6, $m6, 15
+	shl $m9, $m6, 5
+	add $m9, $m9, $m7
+	add $m9, $m9, $m0
 .Lpacked_chunk_\@:
+	setzi $m4, 16
+	sub $m4, $m4, $m6
+	min $m4, $m4, $m5
 	add $m3, $m9, 32
-	setzi $m8, 15
+	add $m8, $m4, -1
 #else
 	PARTITION_ROWS \rows
 	shl $m6, $m6, 5
@@ -472,9 +479,14 @@
 	st64pace $a4:5, $m10:11+=, $mzero, 0b00
 #if GEMM_OUTPUT_GROUP
 .Lpacked_next_\@:
-	add $m2, $m2, 512
-	add $m9, $m9, GEMM_OUTPUT_GROUP * 32
-	add $m5, $m5, -1
+	shl $m7, $m4, 5
+	add $m2, $m2, $m7
+	shl $m6, $m6, 5
+	setzi $m7, GEMM_OUTPUT_GROUP * 32
+	sub $m7, $m7, $m6
+	add $m9, $m9, $m7
+	zero $m6
+	sub $m5, $m5, $m4
 	brnz $m5, .Lpacked_chunk_\@
 #endif
 	exitz $mzero

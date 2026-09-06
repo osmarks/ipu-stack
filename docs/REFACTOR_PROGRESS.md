@@ -575,3 +575,44 @@ than removal of the redundant representations addressed here.
   Their head views were already folded by the old special case: this generalizes
   composition, but does not yet eliminate their packing kernels. Producer output
   layout negotiation and distributing packing work remain separate improvements.
+
+## Packed GEMM output alternatives (2026-09-06)
+
+- F16 GEMMs can store 16-row micro-panels directly in 64-column block-major
+  groups. Parallel partials and their reductions preserve that order, so a
+  compatible consumer can exchange panels without first running a pack kernel.
+  Native AMP output remains a separate candidate. The current packed family
+  supports output-stationary and unscattered parallel-reduction results; it is
+  not a general arbitrary-stride output ABI.
+- Packed stores reuse the AMP arithmetic loops. Workers receive balanced row
+  ranges and split them at panel boundaries. Costing counts each worker's rows
+  and panel transitions in six scalar iterations, without tile expansion or
+  code generation. Padding, downstream movement and fallback unpacking also
+  participate in plan cost.
+- `--gemm-output-packing auto|native|packed` permits direct comparisons. Automatic
+  planning retains the native-only shortlist as well as the mixed shortlist so
+  additional output choices cannot evict the existing baseline before final
+  costing. This repeats compact planning, not scheduling identical candidates.
+- Benchmark constant initialization now packs logical tensors and leaves padding
+  zero. Filling padded GEMM K lanes with the constant had introduced extra dot
+  product terms. Numerical GEMM/attention benchmarks now require a fresh package
+  build (logical binding metadata is unavailable through `--reuse-package`).
+- Hardware results (renderer-cropped cycles, one run per generated program):
+
+  | Attention | Native output | Forced packed output |
+  | --- | ---: | ---: |
+  | Flash | 411,030 | 515,532 |
+  | Materialized | 406,218 | 600,924 |
+
+  Both forced-packed attention runs pass 839,808 logical output checks. Small
+  Gaussian attention also passes all four checkpoints. Balancing worker rows
+  improves packed Flash from 538,194 cycles, but the selected layout still has
+  an incompatible orientation requiring unpacking, and slower projection GEMMs.
+  Automatic output selection reproduces the existing native packages byte for
+  byte for both attention implementations.
+- Packed kernel calibration covers standard/interleaved weights at R48/K240/C64
+  (35,022/33,102 cycles), and aligned/cross-panel worker ranges at R96 and R128,
+  K64/C64 (12,108/19,944). The scalar estimate is within 1% on those samples.
+  Profiles and rendered HTML are in
+  `artifacts/layout-sweep/attention-packed-balanced-{flash,materialized}`;
+  additional calibration runs are `gemm-packed-{full-panels,panel-boundaries}`.
