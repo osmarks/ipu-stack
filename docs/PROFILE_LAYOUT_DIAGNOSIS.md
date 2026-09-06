@@ -626,3 +626,68 @@ The labeled rerun identifies finalist 4 (expanded estimate 253837 cycles) as
 historical pair. It remains an untested hardware candidate. The run passes and
 reproduces all eight earlier expanded estimates; output is in
 `/tmp/historical-finalist-geometries.log`.
+
+## Phase-specific gaps and route-pipelining probe (2026-09-06)
+
+The endpoint model should be shared movement analysis over tensor ownership,
+logical regions and storage order, not GEMM-specific estimation. Copies/views
+supply redistribution; reductions supply contributor-to-result gathers. Their
+traffic can enter the same per-phase endpoint and fragment accounting.
+
+The fine-grained exchange intervals in the renderer describe generated schedule
+activity, positioned within measured exchange samples. They are not independent
+hardware measurements of every individual transfer. Extracting these intervals
+from `artifacts/profiles/mlp-selective-clears.html` gives:
+
+| Physical phase | Role | Send intervals | Receive intervals | Median receive payload cycles | Median gap between receives | Scheduled horizon |
+|---|---|---:|---:|---:|---:|---:|
+| 0 | First GEMM input distribution | 807 | 1614 | 3072 | 93 | 6381 |
+| 1 | First GEMM reduction | 6456 | 6456 | 640 | 82 | 3635 |
+| 2 | Redistribution before GEMM 2 | 3931 | 55116 | 320 | 86 | 29240 |
+| 3 | Final reduction | 155880 | 155880 | 64 | 81 | 25866 |
+
+These are interval counts, including encoded transfer chunks. Phase 2 is heavily
+multicast; phase 3 is unicast and much more fragmented. The final reduction has
+27 independent partials in the automatic layout, versus 15 historically. Different
+partial values cannot be replaced by broadcasting a single value, although their
+partitioning and physical packing can change how many fragments are needed.
+Low reduction expansion explicitly creates local seed copies into packed reduction
+storage and result copies into output views. Those explain some `copy_u64` work
+adjacent to exchanges; a local copy is not mandatory exchange teardown. Some
+terminal copies currently lack operation provenance in profile metadata.
+
+Barrier arrival spread is separate from exchange scheduling: phase 1 has 32064
+cycles of spread after the unbalanced first GEMM, phase 2 has 16428 after reduction,
+GeLU and staging, and phase 3 has 12618 after GEMM 2. Moving a transfer inside an
+exchange cannot eliminate the preceding compute tail.
+
+A specific outer-scheduler constraint may unnecessarily serialize route latency.
+`TransferScheduler::next` returns an endpoint-availability maximum as if it were
+only a data-dependency release time. `MaterializedSchedule::append` also starts
+from the maximum receiver payload completion. But `PhaseProgramBuilder` already
+checks source-selection timing, payload-arrival timing, receive pointers, encoding
+and SRAM hazards at their distinct offsets. Starting a new schedule only after
+the previous receive completes can leave a route-latency bubble.
+
+A temporary two-line probe passed only actual dependency readiness to the row
+builder, leaving its endpoint/encoding checks and memory-hazard checks enabled:
+
+| Saved replay | Baseline initial / optimized horizon | Probe initial / optimized horizon |
+|---|---:|---:|
+| Historical-grid current-address final reduction, 63720 unicast transfers | 12527 / 12527 | 7991 / 7991 |
+| Current-address paired redistribution, 5562 transfers, 118812 destinations | 48852 / 41599 | 42557 / 42557 |
+
+Both probes pass the existing offline schedule validator. The reduction improves
+by 36.2%, while the redistribution's optimized result gets 2.3% worse despite a
+better initial schedule. Thus removing the conservative release constraint is a
+real candidate improvement, but ordering and critical-predecessor accounting must
+be adapted too. The probe has not been hardware-tested and was reverted; production
+scheduling is unchanged. The source patch and probe executable are retained at
+`/tmp/exchange-route-pipeline-probe.patch` and `/tmp/exchange-bench-gap-probe`.
+Logs: `/tmp/gap-probe-{baseline,pipelined,reduce-baseline,reduce-pipelined}.log`.
+
+This complements the earlier address-shift experiment: fragmentation, avoidable
+route bubbles, placement-dependent SRAM conflicts and pre-exchange compute tails
+are distinct mechanisms. A universal per-transfer switchover charge or occupancy
+penalty would conflate them. Useful profile annotations would name the actual
+blocking endpoint, memory hazard, dependency or encoding restriction behind gaps.
