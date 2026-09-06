@@ -2933,7 +2933,7 @@ fn spans_share_effective_memory_element(
         })
 }
 
-fn effective_memory_elements(address: u32, words: u32) -> Vec<ExchangeMemoryElement> {
+pub(crate) fn effective_memory_elements(address: u32, words: u32) -> Vec<ExchangeMemoryElement> {
     let end = address.saturating_add(words.saturating_mul(4));
     let mut elements = Vec::new();
     let mut cursor = address;

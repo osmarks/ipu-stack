@@ -1,5 +1,8 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
+mod exchange;
+pub(crate) use exchange::ExchangeConflicts;
+
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::{BlockValueId, ShardDefinition};
@@ -82,6 +85,17 @@ pub(crate) fn place_with_standard_ranges(
     program: &LowProgram,
     standard_ranges: &[(u32, u32)],
 ) -> Result<Placement, PlacementError> {
+    place_with_offset(program, standard_ranges, 0)
+}
+
+pub(crate) fn place_with_offset(
+    program: &LowProgram,
+    standard_ranges: &[(u32, u32)],
+    interleaved_offset: u32,
+) -> Result<Placement, PlacementError> {
+    if interleaved_offset >= IPU21_INTERLEAVED_ELEMENT_SIZE {
+        return Err(PlacementError::Overflow);
+    }
     if standard_ranges.is_empty()
         || standard_ranges.iter().any(|&(start, end)| {
             start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
@@ -109,6 +123,7 @@ pub(crate) fn place_with_standard_ranges(
                 program,
                 u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
                 standard_ranges,
+                interleaved_offset,
                 &iterated,
                 &members,
                 &root_of_member,
@@ -196,6 +211,7 @@ fn place_tile(
     program: &LowProgram,
     tile: u16,
     standard_ranges: &[(u32, u32)],
+    interleaved_offset: u32,
     iterated: &[IteratedGroup],
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
@@ -220,7 +236,7 @@ fn place_tile(
     let mut addresses = BTreeMap::new();
     let mut interleaved = Arena::new(
         &[(
-            IPU21_INTERLEAVED_MEMORY_BASE,
+            IPU21_INTERLEAVED_MEMORY_BASE + interleaved_offset,
             IPU21_APPLICATION_MEMORY_LIMIT,
         )],
         true,
@@ -970,7 +986,12 @@ mod tests {
                 &crate::expand_tiles(&mid).unwrap(),
                 config.diagnostic_checkpoints,
             );
-            let placement = place(&low).unwrap();
+            let placement = place_with_offset(
+                &low,
+                &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)],
+                random.u32(0..8) * 4096,
+            )
+            .unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let resident = low
                 .shards

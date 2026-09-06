@@ -2,11 +2,12 @@
 
 use super::*;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ExchangeScheduleCache {
     phases: BTreeMap<ExchangePhaseId, ScheduleRecipe>,
 }
 
+#[derive(Clone)]
 struct ScheduleRecipe {
     widths: Vec<ExchangeItemWidth>,
     order: Vec<usize>,

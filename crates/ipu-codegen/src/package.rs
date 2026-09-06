@@ -1,3 +1,5 @@
+mod placement;
+
 use crate::ValueBlocks;
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
@@ -1053,6 +1055,21 @@ fn build_package_from_objects(
             },
             exchange_cache,
         )?)
+    })?;
+    let (placement, lowered_exchanges) = build_phase("optimize_exchange_placement", || {
+        placement::improve_exchange_placement(
+            program,
+            &standard_ranges,
+            &topology,
+            placement,
+            lowered_exchanges,
+            exchange_rows.as_ref().map_or(0, |storage| {
+                storage.reserved.end
+                    - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
+                    - storage.range.start
+            }),
+            exchange_cache,
+        )
     })?;
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
     let exchanges = lowered_exchanges.phases;
