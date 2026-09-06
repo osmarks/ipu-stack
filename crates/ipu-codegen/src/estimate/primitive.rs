@@ -74,6 +74,9 @@ pub(crate) fn kernel_cycles(
             );
         }
         TileKernelSpec::FillZero { bytes, .. } => u64::from(*bytes).div_ceil(48),
+        TileKernelSpec::Gelu if output.format.precision == Precision::F16 => {
+            return crate::kernel::cost::f16_gelu_cycles(elements);
+        }
         TileKernelSpec::Gelu | TileKernelSpec::AttentionSoftmax { .. } => {
             elements.saturating_mul(10)
         }

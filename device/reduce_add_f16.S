@@ -56,16 +56,22 @@ ipu_stack_reduce_sum_f16:
 	ld64step $a2:3, $mzero, $m3+=, 11
 	mov $m7, $m4
 	add $m10, $m4, 8
-	mov $m8, $m0
-.Lreduce_sum_partials:
+	// Preload one partial, then consume the old registers while fetching the
+	// next. A zero repeat count skips the body for a single remote partial.
+	sub $m8, $m0, 1
 	ld64step $a4:5, $mzero, $m4+=, $m1
 	ld64step $a6:7, $mzero, $m10+=, $m1
-	f16v4add $a0:1, $a0:1, $a4:5
-	f16v4add $a2:3, $a2:3, $a6:7
-	sub $m8, $m8, 1
-	brnz $m8, .Lreduce_sum_partials
-	add $m4, $m7, 96
-	st64step $a0:1, $mzero, $m2+=, 1
+	.p2align 3
+	{ rpt $m8, 1
+	  fnop }
+	{ ld64step $a4:5, $mzero, $m4+=, $m1
+	  f16v4add $a0:1, $a0:1, $a4:5 }
+	{ ld64step $a6:7, $mzero, $m10+=, $m1
+	  f16v4add $a2:3, $a2:3, $a6:7 }
+	{ add $m4, $m7, 96
+	  f16v4add $a0:1, $a0:1, $a4:5 }
+	{ st64step $a0:1, $mzero, $m2+=, 1
+	  f16v4add $a2:3, $a2:3, $a6:7 }
 	st64step $a2:3, $mzero, $m2+=, 11
 	brnzdec $m6, .Lreduce_sum_loop
 .Lreduce_sum_done:

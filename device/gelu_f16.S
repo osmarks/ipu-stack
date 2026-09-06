@@ -32,24 +32,16 @@
 	.endm
 
 	.macro GELU_TWO_PAIRS
-	f16v2mul $a2, $a0, $a0
-	f16v2mul $a3, $a1, $a1
-	f16v2mul $a2, $a2, $a0
-	f16v2mul $a3, $a3, $a1
-	f16v2mul $a2, $a4, $a2
-	f16v2mul $a3, $a4, $a3
-	f16v2add $a2, $a0, $a2
-	f16v2add $a3, $a1, $a3
-	f16v2mul $a2, $a5, $a2
-	f16v2mul $a3, $a5, $a3
+	f16v4mul $a2:3, $a0:1, $a0:1
+	f16v4mul $a2:3, $a2:3, $a0:1
+	f16v4mul $a2:3, $a4:BL, $a2:3
+	f16v4add $a2:3, $a0:1, $a2:3
+	f16v4mul $a2:3, $a5:BL, $a2:3
 	f16v2tanh $a2, $a2
 	f16v2tanh $a3, $a3
-	f16v2add $a2, $a6, $a2
-	f16v2add $a3, $a6, $a3
-	f16v2mul $a2, $a7, $a2
-	f16v2mul $a3, $a7, $a3
-	f16v2mul $a2, $a0, $a2
-	f16v2mul $a3, $a1, $a3
+	f16v4add $a2:3, $a6:BL, $a2:3
+	f16v4mul $a2:3, $a7:BL, $a2:3
+	f16v4mul $a2:3, $a0:1, $a2:3
 	.endm
 
 	.macro GELU_EIGHT_PAIRS
