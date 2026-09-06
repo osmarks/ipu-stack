@@ -1832,7 +1832,10 @@ impl<'a> TransferScheduler<'a> {
                 .max()
                 .unwrap_or(0);
             if candidate.earliest_start.0 == earliest_start {
-                return Some((index, earliest_start));
+                // Endpoint availability ranks the ready queue, but is not a
+                // dependency on payload arrival. The row builder pipelines
+                // source selection and delivery using their actual timings.
+                return Some((index, self.dependency_ready[index]));
             }
             self.push_ready(index, earliest_start);
         }
@@ -2038,10 +2041,10 @@ impl MaterializedSchedule {
         )
         .max_by_key(|&(tile, availability)| (availability, Reverse(tile)))
         .unwrap_or((transfer.source, 0));
-        let (blocking_tile, latest_availability) = if dependency_ready > latest_availability {
-            (transfer.source, dependency_ready)
+        let blocking_tile = if dependency_ready > latest_availability {
+            transfer.source
         } else {
-            (blocking_tile, latest_availability)
+            blocking_tile
         };
         let predecessor = if blocking_tile == transfer.source
             || transfer.reserved_source == Some(blocking_tile)
@@ -2062,7 +2065,10 @@ impl MaterializedSchedule {
                 source_elements: &transfer.source_elements,
                 words: transfer.words,
                 width: transfer.width,
-                schedule_offset: latest_availability,
+                // Only true data dependencies constrain the whole transfer.
+                // Endpoint, control-encoding and SRAM hazards are resolved at
+                // their respective event offsets by append_transfer.
+                schedule_offset: dependency_ready,
             },
             &mut self.builder,
             validate_encoding,
@@ -3070,6 +3076,47 @@ mod tests {
                 assert!(positions[before] < positions[after]);
             }
         }
+    }
+
+    #[test]
+    fn independent_sends_pipeline_before_previous_payload_arrives() {
+        let problem = ExchangeScheduleProblem {
+            phase: 0,
+            transfers: [0, 4]
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| ExchangeScheduleTransfer {
+                    source,
+                    source_addresses: vec![0x1_0000],
+                    destinations: vec![ExchangeScheduleDestination {
+                        tile: 2,
+                        address: 0x4_0000 + index as u32 * 0x100,
+                    }],
+                    words: 16,
+                    width: ExchangeItemWidth::Word32,
+                })
+                .collect(),
+        };
+        let run = schedule_exchange_problem(8, &problem).unwrap();
+        validate_exchange_schedule(8, &problem, &run.phase).unwrap();
+        let mut receives = run.phase.activities[2]
+            .iter()
+            .filter(|a| a.kind == ExchangeActivityKind::Receive)
+            .collect::<Vec<_>>();
+        receives.sort_by_key(|a| a.start_cycle);
+        assert_eq!(receives.len(), 2);
+        let second_send = run
+            .phase
+            .activities
+            .iter()
+            .flatten()
+            .find(|a| a.kind == ExchangeActivityKind::Send && a.transfer == receives[1].transfer)
+            .unwrap();
+        assert!(
+            second_send.start_cycle < receives[0].end_cycle,
+            "independent send should enter the route before the previous receive finishes"
+        );
+        assert!(receives[1].start_cycle >= receives[0].end_cycle);
     }
 
     #[test]
