@@ -2,6 +2,17 @@
 //! Inputs are physical local extents, not logical tensor sizes. No codegen is
 //! performed here; update these models when changing the corresponding loops.
 
+/// Word-pair transpose in unpack_transposed_amp_f16.S: six workers distribute
+/// row pairs, with about fifteen issue slots per two columns. Physical geometry
+/// does not retain logical tail masks, whose branches add some extra work.
+pub(crate) fn f16_transposed_unpack_cycles(matrices: u64, rows: u64, columns: u64) -> u64 {
+    300u64.saturating_add(
+        matrices
+            .saturating_mul(rows.div_ceil(12))
+            .saturating_mul(100u64.saturating_add(columns.div_ceil(2).saturating_mul(90))),
+    )
+}
+
 /// Interleaved F16 AMP K16/C16 group: four issue cycles per row plus retained
 /// worker/weight-feed overhead, calibrated against device/gemm_f16_amp.S.
 pub(crate) fn f16_gemm_microgroup_cycles(rows: u64) -> u64 {

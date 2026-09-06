@@ -28,9 +28,10 @@ using namespace poplar;
 #ifndef UNPACK_COLUMN_BLOCK
 #define UNPACK_COLUMN_BLOCK 16
 #endif
-static_assert(UNPACK_SOURCE_ORDER <= 3);
+// Transposed AMP (order 1) has a dedicated word-pair assembly transpose.
+static_assert(UNPACK_SOURCE_ORDER <= 3 && UNPACK_SOURCE_ORDER != 1);
 static_assert(UNPACK_SOURCE_ORDER == 0 || UNPACK_PHYSICAL_ROWS % 16 == 0);
-static_assert(UNPACK_PHYSICAL_COLUMNS % 16 == 0 || UNPACK_SOURCE_ORDER == 1);
+static_assert(UNPACK_PHYSICAL_COLUMNS % 16 == 0);
 static_assert(UNPACK_PHYSICAL_COLUMNS % 2 == 0);
 
 class UNPACK_VERTEX_NAME : public MultiVertex {
@@ -70,9 +71,6 @@ public:
             const unsigned physicalColumn = physicalPair * 2 + semanticColumn % 2;
             physical = (semanticColumn / 16) * physicalRowCount * 16 + row * 16 +
                        physicalColumn;
-#elif UNPACK_SOURCE_ORDER == 1
-            physical = (row / 16) * physicalColumnCount * 16 +
-                       semanticColumn * 16 + row % 16;
 #else
             constexpr bool transposed = UNPACK_SOURCE_ORDER == 3;
             const unsigned r = transposed ? semanticColumn : row;

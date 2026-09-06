@@ -104,7 +104,20 @@ pub(crate) fn kernel_cycles(
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }
         TileKernelSpec::Cast { .. } => elements.div_ceil(8),
-        TileKernelSpec::Rearrange { .. } => {
+        TileKernelSpec::Rearrange { from, .. } => {
+            if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)
+                && output.format.precision == Precision::F16
+                && output.format.layout.order == ElementOrder::RowMajor
+                && let [outer @ .., rows, columns] = output.shape.0.as_slice()
+            {
+                return crate::kernel::cost::f16_transposed_unpack_cycles(
+                    outer
+                        .iter()
+                        .fold(1u64, |count, &n| count.saturating_mul(u64::from(n))),
+                    u64::from(*rows),
+                    u64::from(*columns),
+                );
+            }
             return if output.format.layout.order == ElementOrder::RowMajor {
                 elements
                     .saturating_mul(10)

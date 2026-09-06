@@ -37,6 +37,31 @@ impl KernelBuildPlan {
         };
         let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
         let call = format!("ipu_stack_unpack_amp_to_row_major_f16_{suffix}");
+        if order_index == 1 {
+            self.compilations.push(KernelCompilation {
+                source: "unpack_transposed_amp_f16.S",
+                name: format!("unpack_transposed_amp_f16_{suffix}"),
+                flags: vec![
+                    format!("-DUNPACK_CALL_SYMBOL={call}"),
+                    format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
+                    format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
+                    format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
+                    format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
+                ],
+                retained_symbols: vec![call.clone()],
+            });
+            self.symbols.insert(
+                KernelSpecialization::Unpack((
+                    order,
+                    logical_rows,
+                    physical_rows,
+                    logical_columns,
+                    physical_columns,
+                )),
+                call,
+            );
+            return;
+        }
         self.compilations.push(KernelCompilation {
             source: "unpack_amp_f16.cpp",
             name: format!("unpack_amp_f16_codelet_{suffix}"),

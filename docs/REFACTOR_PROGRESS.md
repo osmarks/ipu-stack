@@ -617,6 +617,37 @@ than removal of the redundant representations addressed here.
   `artifacts/layout-sweep/attention-packed-balanced-{flash,materialized}`;
   additional calibration runs are `gemm-packed-{full-panels,panel-boundaries}`.
 
+## Transposed AMP unpacking (2026-09-06)
+
+- Replace the transposed-AMP C++ lane extraction loop with a six-worker 2x2
+  transpose using word loads, `sort4x16lo/hi`, and word stores. The new kernel
+  preserves raw FP16 bits and zeros logical padding, supports multiple matrices,
+  and requires only four-byte pointer alignment. Other source orders retain
+  their existing fallback; the obsolete transposed case is removed from C++.
+- A standalone `unpack_check --sdk SDK_DIRECTORY` hardware diagnostic covers
+  fourteen shape/memory combinations, including empty logical tensors, odd rows
+  and columns, multiple panels/matrices, standard/interleaved sources, random
+  16-bit patterns and destination guards. All 84,208 checked bytes match.
+- Typical full 16x116 shards take 10,896 cycles versus 18,318 before; the 9x114
+  tail takes 12,084 versus 18,390. The physical-geometry cost model now counts
+  row-pair worker iterations and column-pair loop work; logical tail branches
+  remain approximate.
+- Automatic attention improves from **388,188 to 373,980 renderer-cropped
+  cycles** (3.7%), passing all 839,808 constant-output checks. The package built
+  after updating costs is byte-identical to the measured package. Artifacts:
+  `attention-unpack-fixed` (profile) and `attention-unpack-final` (final build)
+  under `artifacts/layout-sweep`. Gaussian checkpoints pass in
+  `attention-unpack-gaussian`, with maximum attention error 0.000088. Codegen's
+  127 release tests and doctest pass; workspace Clippy passes.
+- Tracing confirms all three projection reductions use the same 460 physical
+  owner tiles. Q/K require rows-then-columns panels; their selected swapped
+  projection outputs are columns-then-rows, with 114/116-column shards crossing
+  head boundaries. Coordinate composition cannot transpose those stored lanes.
+  Existing normal-orientation packed alternatives are allowed; the packed
+  swapped store family retains the incompatible panel orientation. Independent
+  reduction-result placement and grouping preparation before shared exchanges
+  are separate future changes, not an asynchronous execution requirement.
+
 ## Multicast owner loopback (2026-09-06)
 
 - Materialization can add the source tile to an existing multicast instead of
