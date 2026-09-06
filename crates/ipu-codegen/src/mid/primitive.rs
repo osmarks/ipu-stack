@@ -71,6 +71,13 @@ impl CoordinateMapping {
                 })
                 .then_some(())
         }
+        // Inverse factor moves can still absorb a following window. Combining
+        // them with another view needs digit-order-aware composition.
+        if next.view.is_some_and(|v| v.reversed)
+            || (self.view.is_some_and(|v| v.reversed) && next.view.is_some())
+        {
+            return None;
+        }
         fits(self, source, intermediate)?;
         let next_shape = next.view.map_or_else(
             || Some(intermediate.clone()),

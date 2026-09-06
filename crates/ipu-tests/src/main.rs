@@ -716,7 +716,7 @@ fn main() -> Result<()> {
                     |body, args| {
                         let input = body.view(
                             args.carried[0],
-                            AxisFactorView::new(0, 2, arguments.attention_heads),
+                            AxisFactorView::new(2, 0, arguments.attention_heads).inverse(),
                         )?;
                         let query = body.gemm(input, args.iterated[0])?;
                         let key = body.gemm(input, args.iterated[1])?;

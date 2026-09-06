@@ -706,10 +706,16 @@ fn apply_view(input: &HostTensor, view: ipu_codegen::AxisFactorView) -> Result<H
         // Forward reference mapping, independent of the compiler's inverse
         // rectangular-slice mapping.
         let mut coordinates = decode_index(index, &input.shape);
-        let width = output_shape.0[view.split_axis];
-        let part = coordinates[view.split_axis] / width;
-        coordinates[view.split_axis] %= width;
-        coordinates[view.merge_axis] = coordinates[view.merge_axis] * view.factor + part;
+        if view.reversed {
+            let part = coordinates[view.merge_axis] % view.factor;
+            coordinates[view.merge_axis] /= view.factor;
+            coordinates[view.split_axis] += part * input.shape[view.split_axis];
+        } else {
+            let width = output_shape.0[view.split_axis];
+            let part = coordinates[view.split_axis] / width;
+            coordinates[view.split_axis] %= width;
+            coordinates[view.merge_axis] = coordinates[view.merge_axis] * view.factor + part;
+        }
         let target = coordinates
             .iter()
             .zip(&output_shape.0)

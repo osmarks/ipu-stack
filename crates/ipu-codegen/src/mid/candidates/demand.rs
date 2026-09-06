@@ -38,7 +38,8 @@ impl OutputDemand {
         // Factoring a matrix column into a batch axis leaves the within-panel
         // orientation unchanged, but introduces independently padded groups.
         // Other axis mappings need a richer output ABI; do not guess an order.
-        if view.split_axis != shape.0.len().checked_sub(1)?
+        if view.reversed
+            || view.split_axis != shape.0.len().checked_sub(1)?
             || view.merge_axis >= shape.0.len().checked_sub(2)?
         {
             return None;

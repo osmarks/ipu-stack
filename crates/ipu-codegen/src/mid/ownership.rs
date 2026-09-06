@@ -190,6 +190,7 @@ mod tests {
                             split_axis: 2,
                             merge_axis: 0,
                             factor: 1,
+                            reversed: false,
                         }),
                     },
                     reuse_local: false,

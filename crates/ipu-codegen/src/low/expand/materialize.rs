@@ -230,6 +230,66 @@ impl TileGraphBuilder {
             }
             let split = view.split_axis;
             let merge = view.merge_axis;
+            if view.reversed {
+                // A joined head is contiguous. Divide only at head boundaries,
+                // not at individual output columns as in the forward move.
+                let width = source_shape.0[split];
+                let split_extent = output_extents[split];
+                for stream in output_extents[merge].start..output_extents[merge].logical_end {
+                    let mut start = split_extent.start;
+                    while start < split_extent.logical_end {
+                        let base = start / width * width;
+                        let end = (base + width).min(split_extent.logical_end);
+                        let mut ranges = output_extents
+                            .iter()
+                            .map(|extent| (extent.start, extent.logical_end))
+                            .collect::<Vec<_>>();
+                        ranges[merge] = (stream, stream + 1);
+                        ranges[split] = (start, end);
+                        let target = view
+                            .map_slice(source_shape, &output_shape, &ranges)
+                            .ok_or(ExpansionError::InvalidOperatorPlan)?
+                            .into_iter()
+                            .enumerate()
+                            .map(|(axis, (start, end))| ShardExtent {
+                                axis: axis as u16,
+                                start,
+                                logical_end: end,
+                                physical_end: end,
+                            })
+                            .collect::<Vec<_>>();
+                        for (source_extents, source) in
+                            self.intersecting_shard_set(source_shards, &target, tile)
+                        {
+                            let mut destination_extents = source_extents.clone();
+                            destination_extents[merge].start = stream;
+                            destination_extents[merge].logical_end = stream + 1;
+                            destination_extents[merge].physical_end = stream + 1;
+                            destination_extents[split].start += base;
+                            destination_extents[split].logical_end += base;
+                            destination_extents[split].physical_end += base;
+                            for (axis, extent) in destination_extents.iter_mut().enumerate() {
+                                let offset = offsets.get(axis).copied().unwrap_or(0);
+                                extent.start -= offset;
+                                extent.logical_end -= offset;
+                                extent.physical_end -= offset;
+                            }
+                            mappings.push((
+                                ShardView {
+                                    shard: source,
+                                    extents: source_extents,
+                                },
+                                ShardView {
+                                    shard: output,
+                                    extents: destination_extents,
+                                },
+                            ));
+                        }
+                        start = end;
+                    }
+                }
+                continue;
+            }
             let part_width = output_shape.0[split];
             for stream in output_extents[merge].start..output_extents[merge].logical_end {
                 let mut stream_extents = output_extents.clone();

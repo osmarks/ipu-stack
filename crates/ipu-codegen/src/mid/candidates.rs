@@ -55,7 +55,7 @@ fn grouped_output_layout(
     let OperationKind::View(view) = consumer.kind else {
         return None;
     };
-    if view.split_axis != output.0.len().checked_sub(1)? || view.merge_axis != 0 {
+    if view.reversed || view.split_axis != output.0.len().checked_sub(1)? || view.merge_axis != 0 {
         return None;
     }
     let groups = u16::try_from(view.factor).ok()?;
@@ -135,6 +135,7 @@ pub(super) fn plans(
         .iter()
         .find(|constraint| constraint.source_operation == operation.id.index());
     if let OperationKind::View(view) = operation.kind
+        && !view.reversed
         && view.split_axis == 2
         && view.merge_axis == 0
         && let [input] = inputs

@@ -1706,7 +1706,7 @@ fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhas
 
 #[test]
 fn factor_copies_and_offset_windows_preserve_coordinates() {
-    for chain in 0..3 {
+    for chain in 0..5 {
         for offset in [0, 1] {
             for rank in 2..=5 {
                 for split in 0..rank {
@@ -1722,6 +1722,12 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                         match chain {
                             1 => views.push(AxisFactorView::new(split, merge, 2)),
                             2 => views.push(AxisFactorView::new(merge, split, 2)),
+                            3 => views.push(views[0].inverse()),
+                            4 => {
+                                // Exercise an inverse without its matching producer.
+                                // Both axes are divisible by three in this case.
+                                views = vec![AxisFactorView::new(merge, split, 3).inverse()];
+                            }
                             _ => {}
                         }
                         let mut output = input;
@@ -1738,7 +1744,10 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                         );
                         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
                         let mut mid = crate::mid::implementation::resolve(mid).unwrap();
-                        assert_eq!(mid.operations.len(), if chain == 2 { 2 } else { 1 });
+                        assert_eq!(
+                            mid.operations.len(),
+                            if chain == 2 || chain == 3 { 2 } else { 1 }
+                        );
                         let result = mid.outputs[0];
                         for width in &mut mid.values[result.index() as usize].tensor_type.shape.0 {
                             *width -= offset;
@@ -1819,12 +1828,20 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                             }
                             let mut current_shape = crate::TensorShape(shape.clone());
                             for &view in &views {
-                                current_shape = view.output_shape(&current_shape).unwrap();
-                                let width = current_shape.0[view.split_axis];
-                                let part = coordinates[view.split_axis] / width;
-                                coordinates[view.split_axis] %= width;
-                                coordinates[view.merge_axis] =
-                                    coordinates[view.merge_axis] * view.factor + part;
+                                if view.reversed {
+                                    let part = coordinates[view.merge_axis] % view.factor;
+                                    coordinates[view.merge_axis] /= view.factor;
+                                    coordinates[view.split_axis] +=
+                                        part * current_shape.0[view.split_axis];
+                                    current_shape = view.output_shape(&current_shape).unwrap();
+                                } else {
+                                    current_shape = view.output_shape(&current_shape).unwrap();
+                                    let width = current_shape.0[view.split_axis];
+                                    let part = coordinates[view.split_axis] / width;
+                                    coordinates[view.split_axis] %= width;
+                                    coordinates[view.merge_axis] =
+                                        coordinates[view.merge_axis] * view.factor + part;
+                                }
                             }
                             if coordinates.iter().any(|&coordinate| coordinate < offset) {
                                 continue;
