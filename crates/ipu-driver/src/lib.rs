@@ -705,6 +705,34 @@ impl Device {
         address: u32,
         value: u32,
     ) -> Result<(), DriverError> {
+        self.write_tile_word(physical_tile, context, address, value, false)
+    }
+
+    /// Diagnostic write through an inactive worker. The caller must ensure
+    /// the supervisor cannot activate that worker during the operation.
+    pub fn write_tile_word_from_inactive_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+        value: u32,
+    ) -> Result<(), DriverError> {
+        if context == 0 || context >= 7 {
+            return Err(DriverError::Invalid(
+                "inactive write requires a worker context".into(),
+            ));
+        }
+        self.write_tile_word(physical_tile, context, address, value, true)
+    }
+
+    fn write_tile_word(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        address: u32,
+        value: u32,
+        inactive_is_quiescent: bool,
+    ) -> Result<(), DriverError> {
         if address & 0b11 != 0
             || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
                 .contains(&address)
@@ -713,7 +741,7 @@ impl Device {
                 "tile memory write address is invalid".into(),
             ));
         }
-        self.with_stopped_tile_context(physical_tile, context, || {
+        self.with_tile_context(physical_tile, context, inactive_is_quiescent, || {
             let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
             let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
             self.write_tile_debug(physical_tile, TDI_DATA, address)?;
@@ -952,6 +980,58 @@ impl Device {
                 return Err(DriverError::Timeout("TDI instruction".into()));
             }
         }
+    }
+
+    /// Destructively zero tile SRAM using the IPU21 autoloader mechanism used
+    /// by gc-reset -m. Call after device reset and configuration, with no live
+    /// application. This resets memory, not the worker register files.
+    pub fn reset_tile_memory(&self, tile_count: usize) -> Result<(), DriverError> {
+        self.initialize_tile_memory(tile_count, &[0; 1024])
+    }
+
+    /// Replicate a boot prefix and clear the remaining SRAM on every tile.
+    fn initialize_tile_memory(&self, tile_count: usize, prefix: &[u8]) -> Result<(), DriverError> {
+        if tile_count == 0
+            || tile_count - 1 > pci::AUTOLD_CURRENT_TILE_MASK as usize
+            || prefix.is_empty()
+            || !prefix.len().is_multiple_of(1024)
+            || prefix.len() > DESCRIPTOR_AREA_SIZE
+        {
+            return Err(DriverError::Invalid(
+                "invalid autoloader memory initialization".into(),
+            ));
+        }
+        self.write_config(pci::AUTOLD_CSR, 0)?;
+        for (index, chunk) in prefix.chunks_exact(4).enumerate() {
+            let word = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            self.write_config(pci::AUTOLD_DATA, u32::from_le_bytes(word))?;
+            if index & 31 == 31 {
+                let _ = self.read_config(pci::AUTOLD_CSR)?;
+            }
+        }
+        let zone = 32 << pci::AUTOLD_ZONE_SHIFT;
+        let kib = (prefix.len() / 1024) as u32;
+        let load_pointer = (prefix.len() as u32 / 4 - 1) & pci::AUTOLD_LOAD_POINTER_MASK;
+        self.write_config(
+            pci::AUTOLD_TARGET,
+            zone | (kib << pci::AUTOLD_ADDRESS_SHIFT),
+        )?;
+        self.write_config(
+            pci::AUTOLD_CSR,
+            pci::AUTOLD_DATA_PRESENT | pci::AUTOLD_GO | load_pointer,
+        )?;
+        self.wait_autoloader(Duration::from_secs(2))?;
+        self.write_config(
+            pci::AUTOLD_TARGET,
+            zone | ((TILE_MEMORY_SIZE as u32 / 1024) << pci::AUTOLD_ADDRESS_SHIFT) | kib,
+        )?;
+        self.write_config(
+            pci::AUTOLD_CSR,
+            ((tile_count as u32 - 1) << pci::AUTOLD_CURRENT_TILE_SHIFT)
+                | pci::AUTOLD_GO
+                | load_pointer,
+        )?;
+        self.wait_autoloader(Duration::from_secs(2))
     }
 
     fn wait_autoloader(&self, timeout: Duration) -> Result<(), DriverError> {
@@ -1299,43 +1379,8 @@ impl<'a> Loader<'a> {
     }
 
     fn install_bootloader(&self, tile_count: usize) -> Result<(), DriverError> {
-        debug!(
-            tile_count,
-            bootloader_bytes = self.bootloader.len(),
-            "installing secondary bootloader"
-        );
-        self.device.write_config(pci::AUTOLD_CSR, 0)?;
-        for (index, chunk) in self.bootloader.chunks_exact(4).enumerate() {
-            let word = [chunk[0], chunk[1], chunk[2], chunk[3]];
-            self.device
-                .write_config(pci::AUTOLD_DATA, u32::from_le_bytes(word))?;
-            if index & 31 == 31 {
-                let _ = self.device.read_config(pci::AUTOLD_CSR)?;
-            }
-        }
-        let zone = 32 << pci::AUTOLD_ZONE_SHIFT;
-        let kib = (self.bootloader.len() / 1024) as u32;
-        let load_pointer = (self.bootloader.len() as u32 / 4 - 1) & pci::AUTOLD_LOAD_POINTER_MASK;
-        self.device.write_config(
-            pci::AUTOLD_TARGET,
-            zone | (kib << pci::AUTOLD_ADDRESS_SHIFT),
-        )?;
-        self.device.write_config(
-            pci::AUTOLD_CSR,
-            pci::AUTOLD_DATA_PRESENT | pci::AUTOLD_GO | load_pointer,
-        )?;
-        self.device.wait_autoloader(Duration::from_secs(2))?;
-        self.device.write_config(
-            pci::AUTOLD_TARGET,
-            zone | ((TILE_MEMORY_SIZE as u32 / 1024) << pci::AUTOLD_ADDRESS_SHIFT) | kib,
-        )?;
-        self.device.write_config(
-            pci::AUTOLD_CSR,
-            ((tile_count as u32 - 1) << pci::AUTOLD_CURRENT_TILE_SHIFT)
-                | pci::AUTOLD_GO
-                | load_pointer,
-        )?;
-        self.device.wait_autoloader(Duration::from_secs(2))
+        self.device
+            .initialize_tile_memory(tile_count, &self.bootloader)
     }
 }
 
