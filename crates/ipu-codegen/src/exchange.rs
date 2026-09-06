@@ -1987,6 +1987,7 @@ struct TileMemorySchedule {
 }
 
 struct MaterializedSchedule {
+    pipeline_routes: bool,
     builder: PhaseProgramBuilder,
     horizon: u32,
     tile_availability: Vec<TileAvailability>,
@@ -1998,8 +1999,15 @@ struct MaterializedSchedule {
 }
 
 impl MaterializedSchedule {
-    fn new(tile_count: u16, transfer_count: usize) -> Self {
+    fn new(tile_count: u16, transfers: &[PendingTransfer]) -> Self {
+        let transfer_count = transfers.len();
         Self {
+            // Hardware validates overlapped route setup for ordinary unicast.
+            // Multicast/paired row timing still relies on the outer receive
+            // release guard; removing it can stall a phase despite validation.
+            pipeline_routes: transfers.iter().all(|transfer| {
+                transfer.destinations.len() == 1 && transfer.width == ExchangeItemWidth::Word32
+            }),
             builder: PhaseProgramBuilder::new(tile_count),
             horizon: 0,
             tile_availability: vec![TileAvailability::default(); usize::from(tile_count)],
@@ -2065,10 +2073,14 @@ impl MaterializedSchedule {
                 source_elements: &transfer.source_elements,
                 words: transfer.words,
                 width: transfer.width,
-                // Only true data dependencies constrain the whole transfer.
-                // Endpoint, control-encoding and SRAM hazards are resolved at
-                // their respective event offsets by append_transfer.
-                schedule_offset: dependency_ready,
+                // Ordinary unicast can begin route setup before the previous
+                // payload arrives. Other phases retain the existing outer
+                // guard until their row timing model is corrected.
+                schedule_offset: if self.pipeline_routes {
+                    dependency_ready
+                } else {
+                    latest_availability.max(dependency_ready)
+                },
             },
             &mut self.builder,
             validate_encoding,
@@ -2201,7 +2213,7 @@ fn materialize_greedy_schedule_impl(
     tile_count: u16,
     validate_encoding: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
+    let mut schedule = MaterializedSchedule::new(tile_count, pending);
     let mut scheduler = TransferScheduler::new(pending, tile_count);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
     while let Some((index, dependency_ready)) = scheduler.next(&schedule.tile_availability) {
@@ -2233,7 +2245,7 @@ fn materialize_schedule_order(
     if order.len() != pending.len() {
         return Err(ExchangeLoweringError::Overflow);
     }
-    let mut schedule = MaterializedSchedule::new(tile_count, pending.len());
+    let mut schedule = MaterializedSchedule::new(tile_count, pending);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
     let dependencies = memory_dependencies(pending, tile_count);
     let mut predecessors = vec![Vec::new(); pending.len()];
@@ -3441,7 +3453,7 @@ mod tests {
                 );
             }
 
-            let mut incumbent = MaterializedSchedule::new(tile_count, transfers.len());
+            let mut incumbent = MaterializedSchedule::new(tile_count, &transfers);
             incumbent.order.extend(0..transfers.len());
             let mut last_transfer = vec![None; usize::from(tile_count)];
             for (index, transfer) in transfers.iter().enumerate() {
