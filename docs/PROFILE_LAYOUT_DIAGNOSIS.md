@@ -430,3 +430,63 @@ GEMM smoke, attention smoke, repeated MLP, projected attention, and forced
 materialized attention (839,808 checks, maximum error 0.000930). Logs are
 `/tmp/paired-portfolio-{tests,clippy}.log`, `/tmp/paired-final-validation-results.log`
 and `/tmp/paired-validated-*.log`.
+
+## Selective copy initialization (2026-09-06)
+
+Copy expansion now computes the union of destination byte spans and clears its
+complement. Summing copied element counts was insufficient: overlapping writes
+could conceal an unwritten tail. Semantic coverage excludes physical padding;
+physical copies include the bytes actually transferred. This stays in low tile
+expansion, outside whole-device mid plans and the planning beam.
+
+The existing eight-byte fill kernel accepts a byte offset and length. Holes are
+rounded outward because initialization precedes all copies. Nearby ranges are
+merged when clearing their intervening bytes costs less than another launch
+(using the existing launch and fill-throughput estimates). This matters on
+attention: issuing every hole separately increased fill samples from 1,984 to
+35,072 and regressed the cropped profile from 523,980 to 545,340 cycles, despite
+unchanged exchange schedules.
+
+Two local overwrite guarantees remove redundant initialization entirely:
+fully populated row-major staging needs no clear, and implemented destination
+packers write every physical output element, explicitly zeroing padding. Neither
+proof depends on the previous occupant of an SRAM allocation. Range bounds and
+ABI arguments have regression coverage, alongside randomized coverage checks,
+overlapping mappings and padded views into unpadded staging.
+
+For unused lanes still evaluated by GEMM, a non-NaN contract is insufficient:
+zero times infinity is NaN too. Reusing such lanes requires finiteness in the
+consumer's interpretation, or a proof the lanes cannot affect an observed
+result. Finite FP32/FP8 storage need not be finite when reinterpreted as FP16.
+This change uses definite writes, not a global assumption about numerical ranges
+or an allocation-history analysis. Producers may still overflow or evaluate
+undefined arithmetic outside their normal input domain.
+
+Final measurements with range merging:
+
+| Workload | Previous | Selective clears | Counter |
+| --- | ---: | ---: | --- |
+| Automatic full MLP | 222,408 | 214,890 | maximum tile cycles |
+| Historical-grid full MLP | 221,124 | 211,572 | maximum tile cycles |
+| Automatic full MLP | 221,742 | 214,224 | cropped profile span |
+| Historical-grid full MLP | 214,332 | 204,780 | cropped profile span |
+| Projected attention | 523,980 | 523,848 | cropped profile span |
+
+Both MLP results retain maximum error 0.011719. The historical-grid cropped span
+is now close to the old saved profile's 205,392 cycles. Attention's final fill
+sample count is 1,920, with aggregate fill work falling from 923,232 to 600,000
+tile-cycles; its total execution time is essentially unchanged. Projected
+attention passes all 839,808 numerical checks at maximum error 0.001230.
+
+Rendered profiles are `artifacts/profiles/mlp-selective-clears.html`,
+`artifacts/profiles/mlp-historical-selective-clears.html`, and
+`artifacts/profiles/attention-selective-clears.html`. The historical MLP renderer
+was checked in headless Chromium. All 161 workspace release tests pass; Clippy
+passes with the documented `too_many_arguments` and `type_complexity` allowances.
+The unqualified Clippy command still reports those existing lint violations.
+GEMM, batched GEMM, attention smoke, and repeated two-block MLP hardware checks
+also pass. Logs: `/tmp/selective-final-{tests,clippy}.log`,
+`/tmp/{automatic,historical}-selective-merged.log`, and
+`/tmp/merged-validated-*.log`.
+Forced materialized attention also passes all 839,808 checks, maximum error
+0.000930, after the final range-merging change.
