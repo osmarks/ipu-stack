@@ -160,10 +160,19 @@ Relevant code: `mid/candidates.rs::parallel_reduction_candidates_for_orientation
    weight-feed overhead, local gather work or reduction fan-in in many grids.
    It is not automatically a win just because one exchange disappears.
 
-These are hypotheses. The completed measurements and cost residuals should
-determine which merits implementation first.
+Post-sweep hardware experiments now cover mixed result factors, physical tile
+permutations, and bounded reduction batches. See
+[MLP_LAYOUT_ALTERNATIVES.md](MLP_LAYOUT_ALTERNATIVES.md): a mixed down result
+improves the upgraded-kernel control by 0.97%, or 1.70% combined with a mapping
+within 92-tile groups. Tested global mappings and smaller batches lose. Trees,
+finer K ownership, and general local storage maps remain unmeasured.
 
 ## ISA review
+
+The GELU vectorization and reduction load pipeline below have since been
+implemented and hardware-tested; see [KERNEL_LOOP_UPGRADE.md](KERNEL_LOOP_UPGRADE.md)
+for current formulas and measurements. The following review/calibration sections
+record the earlier sweep and its kernel versions.
 
 The IPU21 ISA manual (`~/gc-sdk/TileVertexISA-IPU21-1.3.1.pdf`) suggests
 three concrete experiments; these are not changes to the sweep kernels.

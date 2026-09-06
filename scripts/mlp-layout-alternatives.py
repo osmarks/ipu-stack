@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=16)
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--only", action="append", default=[])
+    parser.add_argument("--followup", action="store_true")
+    parser.add_argument("--confirm", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     lock = args.output / "device.lock"
@@ -50,6 +52,35 @@ def main():
         args.tile_mappings[name] = [(tile % width) * (1472 // width) + tile // width
                                     for tile in range(1472)]
         cases.append((name, up, down))
+    if args.followup:
+        mixed_down = dataclasses.replace(down, result_grid=(5, 3))
+        cases = [("mixed-control", up, mixed_down),
+                 ("mixed-repeat", up, mixed_down),
+                 ("both-mixed", dataclasses.replace(up, result_grid=(2, 2)), mixed_down)]
+        for rr, rc in [(2, 3), (3, 3), (4, 3), (6, 2), (7, 2)]:
+            cases.append((f"down-result-{rr}x{rc}", up,
+                          dataclasses.replace(down, result_grid=(rr, rc))))
+        # Preserve each GEMM compute-row group while changing its K/C embedding.
+        for block, width in [(368, 92), (368, 4), (360, 24), (360, 15), (92, 2)]:
+            mapping = []
+            for tile in range(1472):
+                base, local = divmod(tile, block)
+                mapping.append(base * block + ((local % width) * (block // width) + local // width
+                               if (base + 1) * block <= 1472 else local))
+            for label, selected_down in [("base", down), ("mixed", mixed_down)]:
+                name = f"mapping-block-{block}-{width}-{label}"
+                args.tile_mappings[name] = mapping
+                cases.append((name, up, selected_down))
+        for width in [4, 92]:
+            name = f"mapping-transpose-{width}-mixed"
+            args.tile_mappings[name] = args.tile_mappings[f"mapping-transpose-{width}"]
+            cases.append((name, up, mixed_down))
+    if args.confirm:
+        mixed_down = dataclasses.replace(down, result_grid=(5, 3))
+        cases = [("winner-repeat-1", up, mixed_down), ("winner-repeat-2", up, mixed_down)]
+        mapping = [(tile // 92) * 92 + (tile % 2) * 46 + (tile % 92) // 2
+                   for tile in range(1472)]
+        args.tile_mappings.update({name: mapping for name, _, _ in cases})
     cases = [case for case in cases if not args.only or case[0] in args.only]
     binary = args.output / "cohort-binary"
     digest = hashlib.file_digest(Path(args.binary).open("rb"), "sha256").hexdigest()
@@ -57,9 +88,13 @@ def main():
                     binary_sha256=digest, cases=[dict(name=n, up=dataclasses.asdict(u),
                     down=dataclasses.asdict(d), mapping=args.tile_mappings.get(n)) for n, u, d in cases])
     path = args.output / "manifest.json"
-    if path.exists() and json.loads(path.read_text()) != manifest:
-        raise RuntimeError("Changed experiment manifest; use a fresh output directory")
-    path.write_text(json.dumps(manifest, indent=2) + "\n")
+    manifest = json.loads(json.dumps(manifest))
+    if path.exists():
+        previous = json.loads(path.read_text())
+        if any(previous[key] != manifest[key] for key in ["binary_sha256", "cases"]):
+            raise RuntimeError("Changed experiment manifest; use a fresh output directory")
+    else:
+        path.write_text(json.dumps(manifest, indent=2) + "\n")
     if not binary.exists():
         shutil.copy2(args.binary, binary)
     args.binary = str(binary)
