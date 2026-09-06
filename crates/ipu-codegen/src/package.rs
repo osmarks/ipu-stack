@@ -478,7 +478,9 @@ fn build_package_from_objects(
                 alignment: 8,
                 bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 end_alignment: 8,
-                guard_after: 0,
+                // The supervisor can fetch beyond the final host row while
+                // exchange is active, including into the next SRAM element.
+                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
             })
         })
         .transpose()?;
