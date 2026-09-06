@@ -33,6 +33,9 @@ The output directory contains exact command lines, binary identities, logs,
 packages, raw profiles, kernel/operation summaries and exchange barrier
 measurements. The analyzer emits CSV, Markdown, JSON statistics, SVG/PNG cost
 plots and the existing profiler's geometry-indexed kernel measurements.
+Runtime is measured from the renderer’s default cut point (the latest tile’s
+initial profile entry) to the final profile sample. Full hardware-counter
+durations are retained separately as `cycles`; rankings use `renderer_cycles`.
 Calibration statistics exclude adaptive cross-products. Predictions and
 kernel implementations stay fixed throughout the sweep; fitting and judging
 a new model on the same samples would obscure ranking errors.

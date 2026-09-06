@@ -15,7 +15,7 @@ import numpy as np
 from scipy.stats import spearmanr
 
 
-def calibration(rows, key, actual="cycles"):
+def calibration(rows, key, actual="renderer_cycles"):
     samples = [r for r in rows if key in r and actual in r]
     predicted = np.array([r[key] for r in samples], dtype=float)
     measured = np.array([r[actual] for r in samples], dtype=float)
@@ -78,7 +78,16 @@ def main():
     parser.add_argument("directory", type=Path)
     parser.add_argument("--cli", default="target/release/ipu-stack")
     args = parser.parse_args()
-    records = [json.loads(path.read_text()) for path in sorted(args.directory.glob("*/result.json"))]
+    records = []
+    for path in sorted(args.directory.glob("*/result.json")):
+        record = json.loads(path.read_text())
+        records.append(record)
+        if record["hardware_pass"] and "renderer_cycles" not in record:
+            report = json.loads(subprocess.check_output([
+                args.cli, "profile-query", str(path.parent / "execution.ipuprofile"),
+                "--limit", "0", "--json"]))
+            record["renderer_cycles"] = report["profileSpanCycles"]
+            path.write_text(json.dumps(record, indent=2) + "\n")
     passed = [r for r in records if r["hardware_pass"]]
     if not passed:
         raise SystemExit("no passing runs yet")
@@ -88,19 +97,19 @@ def main():
     stats.update({key: calibration(initial, key, "scheduled_exchange")
                   for key in ["compact_exchange", "expanded_exchange"]})
     (args.directory / "calibration-summary.json").write_text(json.dumps(stats, indent=2) + "\n")
-    fields = ["name", "status", "cycles", "minimumTileCycles", *keys,
+    fields = ["name", "status", "renderer_cycles", "cycles", "minimumTileCycles", *keys,
               "compact_exchange", "expanded_exchange", "scheduled_exchange", "seconds"]
     with (args.directory / "summary.csv").open("w") as output:
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(sorted(records, key=lambda r: r.get("cycles", float("inf"))))
+        writer.writerows(sorted(records, key=lambda r: r.get("renderer_cycles", float("inf"))))
     colors = {"up": "#2977b8", "down": "#ce6728", "joint": "#874bb6",
               "cross": "#378449", "baseline": "#30343a"}
     figure, axes = plt.subplots(2, 2, figsize=(11, 9), constrained_layout=True)
     for axis, key, title in zip(axes.flat, keys + ["expanded_exchange"],
                                ["Compact plan", "Expanded plan", "Expanded + final exchange schedule",
                                 "Expanded exchange estimate"]):
-        actual = "scheduled_exchange" if key == "expanded_exchange" else "cycles"
+        actual = "scheduled_exchange" if key == "expanded_exchange" else "renderer_cycles"
         for family in colors:
             rows = [r for r in passed if r["name"].split("-")[0] == family
                     or (family == "baseline" and r["name"] in ["default", "historical"])]
@@ -112,21 +121,21 @@ def main():
         low, high = min(values) * .85, max(values) * 1.15
         axis.plot([low, high], [low, high], color="#666666", linewidth=1, linestyle="--")
         axis.set(xscale="log", yscale="log", xlim=(low, high), ylim=(low, high),
-                 title=title, xlabel="Measured cycles" if actual == "cycles" else "Scheduled event cycles",
+                 title=title, xlabel="Measured cycles" if actual == "renderer_cycles" else "Scheduled event cycles",
                  ylabel="Predicted cycles")
         axis.grid(alpha=.2)
     axes[0, 0].legend()
     figure.savefig(args.directory / "cost-calibration.svg")
     figure.savefig(args.directory / "cost-calibration.png", dpi=170)
     plt.close(figure)
-    best = sorted(passed, key=lambda r: r["cycles"])
+    best = sorted(passed, key=lambda r: r["renderer_cycles"])
     lines = ["# MLP layout sweep", "", f"{len(records)} completed; {len(passed)} hardware passes.", "",
              "Calibration statistics exclude adaptive cross-products; differences ≤24 cycles are ties.", "",
              "The third estimate replaces expanded exchange cost with the final placed schedule.",
              "It is not the earlier provisional score used for finalist selection.", "",
-             "| Plan | Cycles | Compact | Expanded | With final exchange |", "|---|---:|---:|---:|---:|"]
+             "Runtime starts at the renderer’s default cut: the latest tile’s initial profile entry.", "", "| Plan | Renderer cycles | Compact | Expanded | With final exchange |", "|---|---:|---:|---:|---:|"]
     for row in best[:15]:
-        lines.append(f"| {row['name']} | {row['cycles']:,} | {row.get('compact_cycles', 0):,} | "
+        lines.append(f"| {row['name']} | {row['renderer_cycles']:,} | {row.get('compact_cycles', 0):,} | "
                      f"{row.get('expanded_cycles', 0):,} | {row.get('refined_cycles', 0):,} |")
     lines += ["", "## Calibration", "", "| Estimate | Median predicted/measured | Rank correlation | Selection regret |",
               "|---|---:|---:|---:|"]
@@ -151,7 +160,7 @@ def main():
     database = json.loads((args.directory / "kernel-measurements.json").read_text())
     lines += instruction_model_report(database)
     (args.directory / "report.md").write_text("\n".join(lines) + "\n")
-    print(f"best={best[0]['name']} cycles={best[0]['cycles']} completed={len(records)} passes={len(passed)}")
+    print(f"best={best[0]['name']} cycles={best[0]['renderer_cycles']} completed={len(records)} passes={len(passed)}")
 
 
 if __name__ == "__main__":

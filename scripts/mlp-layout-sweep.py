@@ -136,6 +136,16 @@ def extract(log):
     return result
 
 
+def add_renderer_cycles(args, folder, result):
+    if result["hardware_pass"] and "renderer_cycles" not in result:
+        report = json.loads(subprocess.check_output([
+            args.cli, "profile-query", str(folder / "execution.ipuprofile"),
+            "--limit", "0", "--json"]))
+        result["renderer_cycles"] = report["profileSpanCycles"]
+        (folder / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
 def run_case(args, name, up, down):
     folder = args.output / name
     folder.mkdir(exist_ok=True)
@@ -145,7 +155,7 @@ def run_case(args, name, up, down):
         previous = json.loads(record_path.read_text())
         if previous["constraints"] != constraints:
             raise RuntimeError(f"stale manifest in {folder}")
-        return previous
+        return add_renderer_cycles(args, folder, previous)
     command = [args.binary, args.config, "--sdk", args.sdk,
                "--device-lock", str(args.output.resolve() / "device.lock"),
                "--workload", "siglip-mlp-benchmark", "--mlp-batch", "1",
@@ -197,7 +207,23 @@ def run_case(args, name, up, down):
     # Never silently continue a hardware correctness failure as a slow layout.
     if not result["hardware_pass"] and "application loaded" in log:
         raise RuntimeError(f"hardware failure: inspect {folder / 'build.log'}")
-    return result
+    return add_renderer_cycles(args, folder, result)
+
+
+def run_cases(args, cases, results):
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        # Bound in-flight work and stop submitting cases after a hardware error.
+        remaining = iter(cases)
+        pending = {pool.submit(run_case, args, *case)
+                   for case in itertools.islice(remaining, args.jobs)}
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                results.append(future.result())
+                (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            # Inspect every completed result before replacing finished work.
+            for case in itertools.islice(remaining, len(completed)):
+                pending.add(pool.submit(run_case, args, *case))
 
 
 def main():
@@ -226,33 +252,22 @@ def main():
     if args.dry_run:
         return
     results = []
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        # Bound in-flight work and stop submitting cases after a hardware error.
-        remaining = iter(cases)
-        pending = {pool.submit(run_case, args, *case)
-                   for case in itertools.islice(remaining, args.jobs)}
-        while pending:
-            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in completed:
-                results.append(future.result())
-                (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-            # Inspect every completed result before replacing finished work.
-            for case in itertools.islice(remaining, len(completed)):
-                pending.add(pool.submit(run_case, args, *case))
+    run_cases(args, cases, results)
     # Explore coupling: cross the three fastest independent alternatives on
     # each side. Preserve the initial stratified sample for calibration.
     winners = {}
     for side in ["up", "down"]:
         eligible = [r for r in results if r["hardware_pass"] and
                     (r["name"].startswith(side + "-") or r["name"] == "historical")]
-        winners[side] = [Plan(**r[side]) for r in sorted(eligible, key=lambda r: r["cycles"])[:3]]
+        winners[side] = [Plan(**r[side]) for r in sorted(eligible, key=lambda r: r["renderer_cycles"])[:3]]
     pairs = {(tuple(r["constraints"])) for r in results}
+    combinations = []
     for i, up in enumerate(winners["up"]):
         for j, down in enumerate(winners["down"]):
             if (up.constraint(0), down.constraint(2)) in pairs:
                 continue
-            results.append(run_case(args, f"cross-{i}-{j}", up, down))
-            (args.output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            combinations.append((f"cross-cropped-{i}-{j}", up, down))
+    run_cases(args, combinations, results)
 
 
 if __name__ == "__main__":
