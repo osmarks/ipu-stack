@@ -385,3 +385,38 @@ pub type LoweringResult<T> = std::result::Result<T, LoweringError>;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+#[ignore = "manual full-size planner timing; does not access hardware"]
+fn profile_mlp_finalist_expansion() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [1, 729, 1152]).unwrap();
+    let up = graph.parameter("up", [1, 1152, 4304]).unwrap();
+    let down = graph.parameter("down", [1, 4304, 1152]).unwrap();
+    let hidden = graph.gemm(input, up).unwrap();
+    let hidden = graph.gelu(hidden).unwrap();
+    let output = graph.gemm(hidden, down).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(1472)
+        .with_automatic_input(input, Precision::F16)
+        .with_automatic_input(up, Precision::F16)
+        .with_automatic_input(down, Precision::F16);
+    let start = std::time::Instant::now();
+    let finalists = lower_finalists(&graph, &config, &crate::Ipu21CostModel, 8).unwrap();
+    eprintln!(
+        "compact planning: {:?}, {} finalists",
+        start.elapsed(),
+        finalists.len()
+    );
+    for (index, mid) in finalists.into_iter().enumerate() {
+        let start = std::time::Instant::now();
+        let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
+        eprintln!(
+            "finalist {index}: expansion {:?}, estimated cycles {}, exchange {}",
+            start.elapsed(),
+            expanded.estimated_cycles,
+            expanded.estimated_exchange_cycles
+        );
+    }
+}
