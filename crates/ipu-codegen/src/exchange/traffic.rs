@@ -6,42 +6,6 @@ pub(crate) struct MappingTraffic {
     tile_count: usize,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn transfer(source: u16, destinations: &[u16], words: u32) -> PendingTransfer {
-        PendingTransfer {
-            source,
-            source_shard: BlockValueId::from_index(u32::from(source)),
-            source_offset: 0,
-            destinations: destinations.iter().map(|&tile| (tile, 0x50000)).collect(),
-            source_addresses: vec![0x40000],
-            source_elements: effective_memory_elements(0x40000, words),
-            words,
-            width: ExchangeItemWidth::Word32,
-            reserved_source: None,
-        }
-    }
-
-    #[test]
-    fn mapping_prices_shared_buses_and_preserves_paired_receive_opportunities() {
-        let traffic = MappingTraffic {
-            phases: vec![vec![transfer(0, &[2], 100), transfer(1, &[3], 100)]],
-            tile_count: 4,
-        };
-        assert_eq!(traffic.score(&[0, 1, 2, 3], &[1]).0, 200);
-        assert_eq!(traffic.score(&[0, 2, 1, 3], &[1]).0, 100);
-        assert_eq!(traffic.score(&[0, 2, 1, 3], &[3]).0, 300);
-        let multicast = MappingTraffic {
-            phases: vec![vec![transfer(0, &[2, 3], 128)]],
-            tile_count: 4,
-        };
-        assert_eq!(multicast.score(&[0, 1, 2, 3], &[1]).0, 64);
-        assert_eq!(multicast.score(&[0, 2, 1, 3], &[1]).0, 128);
-    }
-}
-
 impl MappingTraffic {
     pub(crate) fn new(
         program: &LowProgram,
@@ -164,5 +128,41 @@ impl MappingTraffic {
                 score(false).min(score(true))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transfer(source: u16, destinations: &[u16], words: u32) -> PendingTransfer {
+        PendingTransfer {
+            source,
+            source_shard: BlockValueId::from_index(u32::from(source)),
+            source_offset: 0,
+            destinations: destinations.iter().map(|&tile| (tile, 0x50000)).collect(),
+            source_addresses: vec![0x40000],
+            source_elements: effective_memory_elements(0x40000, words),
+            words,
+            width: ExchangeItemWidth::Word32,
+            reserved_source: None,
+        }
+    }
+
+    #[test]
+    fn mapping_prices_shared_buses_and_preserves_paired_receive_opportunities() {
+        let traffic = MappingTraffic {
+            phases: vec![vec![transfer(0, &[2], 100), transfer(1, &[3], 100)]],
+            tile_count: 4,
+        };
+        assert_eq!(traffic.score(&[0, 1, 2, 3], &[1]).0, 200);
+        assert_eq!(traffic.score(&[0, 2, 1, 3], &[1]).0, 100);
+        assert_eq!(traffic.score(&[0, 2, 1, 3], &[3]).0, 300);
+        let multicast = MappingTraffic {
+            phases: vec![vec![transfer(0, &[2, 3], 128)]],
+            tile_count: 4,
+        };
+        assert_eq!(multicast.score(&[0, 1, 2, 3], &[1]).0, 64);
+        assert_eq!(multicast.score(&[0, 2, 1, 3], &[1]).0, 128);
     }
 }

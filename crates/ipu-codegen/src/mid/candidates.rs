@@ -1417,11 +1417,20 @@ pub(super) fn retain_operator_candidates(
         if has_feasible && objective.standard_contiguous_overflow != 0 {
             continue;
         }
+        // Preserve K splits and distinct scatter directions before spending
+        // diversity slots on exact result factors or boundary grid extents.
         if represented.insert((
             compatibility.orientation,
             compatibility.inner_partitions,
-            compatibility.result_partitions,
-            &compatibility.output,
+            compatibility
+                .result_partitions
+                .map(|(rows, columns)| (rows > 1, columns > 1)),
+            compatibility.output.0,
+            compatibility.output.1,
+            compatibility
+                .inner_partitions
+                .is_none()
+                .then_some(&compatibility.output),
         )) {
             selected.insert(index);
         }
