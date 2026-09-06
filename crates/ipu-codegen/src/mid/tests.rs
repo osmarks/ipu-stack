@@ -1347,7 +1347,7 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
         &Ipu21CostModel,
         2,
     );
-    assert_eq!(selected.len(), 2);
+    assert!((2..=4).contains(&selected.len()));
 }
 
 #[test]
@@ -1530,4 +1530,89 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
     let expected = plans[0].clone();
     let selected = retain_operator_candidates(plans, &inputs, &output, &Ipu21CostModel, 1);
     assert_eq!(selected, vec![expected]);
+}
+
+#[test]
+fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [1, 729, 1152]).unwrap();
+    let up = graph.parameter("up", [1, 1152, 4304]).unwrap();
+    let down = graph.parameter("down", [1, 4304, 1152]).unwrap();
+    let hidden = graph.gemm(input, up).unwrap();
+    let hidden = graph.gelu(hidden).unwrap();
+    let output = graph.gemm(hidden, down).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let mut config = PipelineConfig::new(1472);
+    for tiles in shape_aware_active_tile_counts(1472, graph.value_shapes().values()) {
+        for candidate in operator_candidates_for_tile_count(tiles) {
+            if !config.operator_candidates.contains(&candidate) {
+                config.operator_candidates.push(candidate);
+            }
+        }
+    }
+    let costs = MemoizedCostModel::new(&Ipu21CostModel, 1472);
+    for (operation, inner, columns, grid) in
+        [(0, 1152, 4304, (4, 92, 4)), (2, 4304, 1152, (4, 24, 15))]
+    {
+        let inputs = [
+            TensorType::new([1, 729, inner], Precision::F16, Layout::row_sharded(1472)),
+            TensorType::new(
+                [1, inner, columns],
+                Precision::F16,
+                Layout::row_sharded(1472),
+            ),
+        ];
+        let shape = TensorShape::new([1, 729, columns]);
+        let generated = plans(
+            &graph.operations()[operation],
+            &inputs,
+            &[false, true],
+            &shape,
+            &config,
+            &costs,
+            true,
+            None,
+            &[],
+        );
+        let retained = retain_operator_candidates(
+            generated,
+            &inputs,
+            &shape,
+            &costs,
+            config.planning_beam_width,
+        );
+        for memory in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
+            let expected = GemmPlanConstraint {
+                source_operation: operation as u32,
+                orientation: GemmOrientation::Normal,
+                row_partitions: grid.0,
+                column_partitions: grid.1,
+                inner_partitions: grid.2,
+                result_row_partitions: grid.2,
+                result_column_partitions: 1,
+                output_column_block: 48,
+                weight_memory_class: memory,
+                reduction_staging: ReductionStaging::Complete,
+                local_weight_staging: LocalOperandStaging::Direct,
+            };
+            assert!(
+                retained.iter().any(|plan| gemm_plan_matches(
+                    &expected,
+                    &plan.dispatch,
+                    &plan.requirements.inputs
+                )),
+                "operation {operation}: lost {memory:?} historical geometry"
+            );
+        }
+        assert!(retained.len() <= 2 * config.planning_beam_width);
+        assert!(retained.iter().all(|plan| {
+            let (inputs, output) = plan.tensor_types(&inputs, &shape);
+            costs
+                .implementation(plan, &inputs, &output)
+                .unwrap()
+                .peak_memory
+                .standard_contiguous_overflow
+                == 0
+        }));
+    }
 }

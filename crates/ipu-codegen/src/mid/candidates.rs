@@ -1384,21 +1384,25 @@ pub(super) fn retain_operator_candidates(
     let mut ranked = frontier;
     ranked.sort_by_key(|(_, objective, _)| {
         (
+            objective.standard_contiguous_overflow,
             objective.cycles,
             objective.total,
             objective.interleaved,
             objective.exchange_rows,
         )
     });
+    let has_feasible = ranked
+        .iter()
+        .any(|(_, metrics, _)| metrics.standard_contiguous_overflow == 0);
     let mut selected = BTreeSet::new();
     let mut represented = BTreeSet::new();
-    for (index, (_, _, compatibility)) in ranked.iter().enumerate() {
+    for (index, (_, objective, compatibility)) in ranked.iter().enumerate() {
         if selected.len() >= width {
             break;
         }
-        // Reserve diversity for compute/reduction geometry and future output
-        // use, not multiple memory/staging variants of the same geometry.
-        // Remaining slots below retain those local memory tradeoffs by cost.
+        if has_feasible && objective.standard_contiguous_overflow != 0 {
+            continue;
+        }
         if represented.insert((
             compatibility.orientation,
             compatibility.inner_partitions,
@@ -1408,11 +1412,36 @@ pub(super) fn retain_operator_candidates(
             selected.insert(index);
         }
     }
-    for index in 0..ranked.len() {
+    for (index, (_, objective, _)) in ranked.iter().enumerate() {
         if selected.len() >= width {
             break;
         }
-        selected.insert(index);
+        if !has_feasible || objective.standard_contiguous_overflow == 0 {
+            selected.insert(index);
+        }
+    }
+    // Preserve one tied memory/staging alternative per selected implementation.
+    // Sharing its geometry slot avoids trading away a different useful grid.
+    // This bounds the local pool at 2 * width; the region beam remains width.
+    let representatives = selected.iter().copied().collect::<Vec<_>>();
+    for representative in representatives {
+        let (plan, metrics, compatibility) = &ranked[representative];
+        if let Some((index, _)) =
+            ranked
+                .iter()
+                .enumerate()
+                .find(|(_, (candidate, objective, signature))| {
+                    candidate.operator == plan.operator
+                        && candidate.dispatch == plan.dispatch
+                        && candidate.requirements.output == plan.requirements.output
+                        && signature.inputs != compatibility.inputs
+                        && objective.cycles == metrics.cycles
+                        && objective.standard_contiguous_overflow
+                            == metrics.standard_contiguous_overflow
+                })
+        {
+            selected.insert(index);
+        }
     }
     ranked
         .into_iter()
