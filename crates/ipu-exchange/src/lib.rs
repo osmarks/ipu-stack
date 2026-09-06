@@ -814,6 +814,7 @@ enum ReceiveEventKind {
     OrdinaryNeutral,
     PairedSource,
     PairedNeutral,
+    PairedPointer,
     Pointer,
     Format,
 }
@@ -827,7 +828,7 @@ impl ReceiveEventKind {
     }
 
     fn is_pic(self) -> bool {
-        matches!(self, Self::Pointer | Self::Format)
+        matches!(self, Self::Pointer | Self::PairedPointer | Self::Format)
     }
 }
 
@@ -845,7 +846,8 @@ struct ReceiveEvent {
 }
 
 fn receive_events_can_share_instruction(left: ReceiveEvent, right: ReceiveEvent) -> bool {
-    // Only ordinary pointer/mux controls are supported in SENDPICP. Combining
+    // Only ordinary pointer/mux controls are supported in SENDPICP. A paired
+    // pointer cannot share with an ordinary XPIC from a subsequent transfer. Combining
     // paired XPIC with an ordinary pointer also faults (not just format/XPIC),
     // including when the controls belong to different overlapping transfers.
     let ordinary_pair = |pic: ReceiveEventKind, xpic: ReceiveEventKind| {
@@ -994,6 +996,7 @@ fn scheduled_receive_window(
         .into_iter()
         .filter_map(|mut event| match event.kind {
             ReceiveEventKind::OrdinarySource => Some(event),
+            ReceiveEventKind::PairedPointer => Some(event),
             ReceiveEventKind::Pointer if !carries_pointer => Some(event),
             ReceiveEventKind::Pointer => None,
             ReceiveEventKind::OrdinaryNeutral => {
@@ -1136,7 +1139,7 @@ fn receive_row_timing(
                     return Err(ExchangeError::Schedule("multiple receive teardowns"));
                 }
             }
-            ReceiveEventKind::Pointer => {
+            ReceiveEventKind::Pointer | ReceiveEventKind::PairedPointer => {
                 pointer_cycles = Some(event.cycles);
                 if pointer_address
                     .replace((event.instruction & PIC_RECEIVE_ADDRESS_MASK) << 2)
@@ -1178,6 +1181,13 @@ fn receive_row_timing(
         }
         ReceiveMode::Ordinary
     };
+    if mode == ReceiveMode::Paired64 {
+        for event in &mut events {
+            if event.kind == ReceiveEventKind::Pointer {
+                event.kind = ReceiveEventKind::PairedPointer;
+            }
+        }
+    }
     Ok(ReceiveRowTiming {
         mode,
         events,
@@ -1562,7 +1572,7 @@ fn encode_send_control(count_minus_one: u32, event: ReceiveEvent) -> Result<u32,
         | ReceiveEventKind::PairedNeutral => {
             ((event.instruction >> 13) & 1, event.instruction & 0x1fff)
         }
-        ReceiveEventKind::Pointer | ReceiveEventKind::Format => (
+        ReceiveEventKind::Pointer | ReceiveEventKind::PairedPointer | ReceiveEventKind::Format => (
             2 + ((event.instruction >> 18) & 1),
             event.instruction & PIC_RECEIVE_ADDRESS_MASK,
         ),
@@ -2487,7 +2497,7 @@ impl Topology {
             ReceiveEvent {
                 cycles: format_start + 2,
                 instruction: delay_pic(0, 0, 0),
-                kind: ReceiveEventKind::Pointer,
+                kind: ReceiveEventKind::PairedPointer,
             },
             ReceiveEvent {
                 cycles: format_start + count,
@@ -3609,6 +3619,34 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_source_setup_does_not_merge_with_a_paired_pointer() {
+        // MLP redistribution: paired activation multicast followed by ordinary
+        // weights. Fusing their controls in SENDPICP loses activation words on
+        // hardware even though XPIC itself selects an ordinary source.
+        let topology = Topology::c600();
+        let mut schedule = TileProgramSchedule::default();
+        let receivers = (1206..1224).collect::<Vec<_>>();
+        let paired = topology
+            .paired_multicast(966, &receivers, 72)
+            .unwrap()
+            .receivers[10];
+        let previous = schedule.append_receiver_at(&paired, 0, 72).unwrap();
+        let ordinary = topology
+            .multicast(612, &[244, 730, 1216], 4148, 0)
+            .unwrap()
+            .receivers[2];
+        let offset = schedule
+            .earliest_receiver_offset(&ordinary, 4148, 0)
+            .unwrap();
+        let timing = receive_row_timing(&ordinary, offset).unwrap();
+        assert_ne!(timing.source_cycles, Some(previous.payload_start));
+        schedule
+            .append_receiver_at(&ordinary, offset, 4148)
+            .unwrap();
+        schedule.finish().unwrap();
+    }
+
+    #[test]
     fn consecutive_paired_receives_match_the_sdks_continuous_format_stream() {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
@@ -3630,7 +3668,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(cycles(ReceiveEventKind::PairedSource), [1, 177, 353, 529]);
-        assert_eq!(cycles(ReceiveEventKind::Pointer), [56, 232, 408, 584]);
+        assert_eq!(cycles(ReceiveEventKind::PairedPointer), [56, 232, 408, 584]);
         assert_eq!(cycles(ReceiveEventKind::Format), [54, 758]);
         assert_eq!(cycles(ReceiveEventKind::PairedNeutral), [705]);
         schedule.finish().unwrap();

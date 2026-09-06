@@ -336,7 +336,9 @@ pub(super) fn validate_tile_program(
         .iter()
         .map(|event| {
             let control = match event.kind {
-                ReceiveEventKind::Pointer | ReceiveEventKind::Format => IncomingControl {
+                ReceiveEventKind::Pointer
+                | ReceiveEventKind::PairedPointer
+                | ReceiveEventKind::Format => IncomingControl {
                     stream: IncomingControlStream::Pic,
                     value: (((event.instruction >> 18) & 1) << 18)
                         | (event.instruction & PIC_RECEIVE_ADDRESS_MASK),
