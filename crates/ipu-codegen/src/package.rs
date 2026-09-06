@@ -1,3 +1,5 @@
+mod bindings;
+use bindings::{PackageBindings, auxiliary_ranges};
 mod placement;
 mod profile;
 use profile::{instrument_profile, profile_binding, profile_step_count};
@@ -6,7 +8,6 @@ mod tile_program;
 use selection::{ScheduledPlan, select_scheduled_finalist};
 pub use tile_program::build_tile_program_package;
 
-use crate::ValueBlocks;
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::low::LowProgram;
@@ -434,66 +435,33 @@ fn build_package_from_objects(
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
-    let provisional_inputs = program
-        .inputs
-        .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Host)
-        .map(|input| input_binding(program, provisional_placement, &topology, input))
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    let provisional_weights = program
-        .inputs
-        .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .map(|input| input_binding(program, provisional_placement, &topology, input))
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut provisional_outputs = program
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(index, output)| {
-            output_binding(program, provisional_placement, &topology, output, index)
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    if let Some(storage) = &profile_storage {
-        provisional_outputs.push(cycle_binding(
-            "profile.start-cycle",
-            PROFILE_START_CYCLE,
-            program.tile_count,
-            &topology,
-        ));
-        provisional_outputs.push(profile_binding(
-            program,
-            &physical_to_logical,
-            storage.range.start,
-        )?);
-        provisional_outputs.push(cycle_binding(
-            "profile.end-cycle",
-            PROFILE_END_CYCLE,
-            program.tile_count,
-            &topology,
-        ));
-    }
+    let provisional_bindings = PackageBindings::new(
+        program,
+        provisional_placement,
+        &topology,
+        &physical_to_logical,
+        profile_storage.as_ref().map(|storage| storage.range.start),
+    )?;
     let sizing_host_base = memory.next_free(
         linked_end,
         TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
         4,
         "host programs",
     )?;
-    let mut provisional_auxiliary_ranges = vec![
-        vec![(
+    let provisional_auxiliary_ranges = auxiliary_ranges(
+        program,
+        provisional_placement,
+        &topology,
+        execution_tile_count,
+        &[(
             crate::IPU21_DATA_BASE,
             TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        )];
-        usize::from(execution_tile_count)
-    ];
-    for logical in 0..program.tile_count {
-        provisional_auxiliary_ranges[usize::from(topology.physical(logical)?)] =
-            provisional_placement.tile_auxiliary_ranges[usize::from(logical)].clone();
-    }
+        )],
+    )?;
     let provisional_host = host::plan(
-        &provisional_weights,
-        &provisional_inputs,
-        &provisional_outputs,
+        &provisional_bindings.weights,
+        &provisional_bindings.inputs,
+        &provisional_bindings.outputs,
         execution_tile_count,
         sizing_host_base,
         &provisional_auxiliary_ranges,
@@ -518,9 +486,9 @@ fn build_package_from_objects(
         .as_ref()
         .map_or(sizing_host_base, |code| code.range.start);
     let provisional_host = host::plan(
-        &provisional_weights,
-        &provisional_inputs,
-        &provisional_outputs,
+        &provisional_bindings.weights,
+        &provisional_bindings.inputs,
+        &provisional_bindings.outputs,
         execution_tile_count,
         host_code_base,
         &provisional_auxiliary_ranges,
@@ -652,47 +620,17 @@ fn build_package_from_objects(
     );
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
     let exchanges = lowered_exchanges.phases;
-    let inputs = program
-        .inputs
-        .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Host)
-        .map(|input| input_binding(program, &placement, &topology, input))
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    let weights = program
-        .inputs
-        .iter()
-        .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .map(|input| input_binding(program, &placement, &topology, input))
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut outputs = program
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(index, output)| output_binding(program, &placement, &topology, output, index))
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    if config.profiling {
-        outputs.push(cycle_binding(
-            "profile.start-cycle",
-            PROFILE_START_CYCLE,
-            program.tile_count,
-            &topology,
-        ));
-        outputs.push(profile_binding(
-            program,
-            &physical_to_logical,
-            profile_storage
-                .as_ref()
-                .expect("profiling storage is allocated when profiling is enabled")
-                .range
-                .start,
-        )?);
-        outputs.push(cycle_binding(
-            "profile.end-cycle",
-            PROFILE_END_CYCLE,
-            program.tile_count,
-            &topology,
-        ));
-    }
+    let PackageBindings {
+        inputs,
+        weights,
+        outputs,
+    } = PackageBindings::new(
+        program,
+        &placement,
+        &topology,
+        &physical_to_logical,
+        profile_storage.as_ref().map(|storage| storage.range.start),
+    )?;
     let mut inactive_auxiliary_ranges = standard_ranges.clone();
     inactive_auxiliary_ranges.push((
         ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
@@ -704,15 +642,13 @@ fn build_package_from_objects(
         &outputs,
         execution_tile_count,
         host_code_base,
-        &{
-            let mut ranges =
-                vec![inactive_auxiliary_ranges.clone(); usize::from(execution_tile_count)];
-            for logical in 0..program.tile_count {
-                ranges[usize::from(topology.physical(logical)?)] =
-                    placement.tile_auxiliary_ranges[usize::from(logical)].clone();
-            }
-            ranges
-        },
+        &auxiliary_ranges(
+            program,
+            &placement,
+            &topology,
+            execution_tile_count,
+            &inactive_auxiliary_ranges,
+        )?,
     )?;
     let final_host_code_bytes = host
         .end
@@ -1203,102 +1139,6 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
         symbols.push(crate::FILL_ZERO_U64_SYMBOL.into());
     }
     symbols
-}
-
-fn input_binding(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    input: &crate::ProgramInput,
-) -> PackageBuildResult<Binding> {
-    binding(
-        program,
-        placement,
-        topology,
-        input.name.clone(),
-        &input.shards,
-    )
-}
-
-fn output_binding(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    output: &ValueBlocks,
-    index: usize,
-) -> PackageBuildResult<Binding> {
-    binding(
-        program,
-        placement,
-        topology,
-        format!("output.{index}"),
-        &output.shards,
-    )
-}
-
-fn cycle_binding(name: &str, address: u32, tile_count: u16, topology: &Topology) -> Binding {
-    Binding {
-        name: name.into(),
-        dtype: "u32".into(),
-        shape: vec![u32::from(tile_count)],
-        slices: (0..tile_count)
-            .map(|tile| RegionSlice {
-                tile: u32::from(
-                    topology
-                        .physical(tile)
-                        .expect("active topology contains tile"),
-                ),
-                tile_address: address,
-                file_offset: u64::from(tile) * 4,
-                size: 4,
-            })
-            .collect(),
-    }
-}
-
-fn binding(
-    program: &LowProgram,
-    placement: &crate::Placement,
-    topology: &Topology,
-    name: String,
-    shards: &[crate::BlockValueId],
-) -> PackageBuildResult<Binding> {
-    let first = shards
-        .first()
-        .and_then(|id| program.shards.get(id.index() as usize))
-        .ok_or_else(|| invalid("binding has no shards"))?;
-    let dtype = match first.tensor_type.format.precision {
-        crate::Precision::F8F143 { .. } => "f8f143",
-        crate::Precision::F16 => "f16",
-        crate::Precision::F32 => "f32",
-    };
-    let mut file_offset = 0u64;
-    let slices = shards
-        .iter()
-        .map(|id| {
-            let shard = &program.shards[id.index() as usize];
-            let size = u64::from(shard_storage_bytes(shard)?);
-            let slice = RegionSlice {
-                tile: u32::from(topology.physical(shard.tile)?),
-                tile_address: *placement
-                    .shard_addresses
-                    .get(id)
-                    .ok_or_else(|| invalid("binding shard is not placed"))?,
-                file_offset,
-                size,
-            };
-            file_offset = file_offset
-                .checked_add(size)
-                .ok_or_else(|| invalid("binding file offset overflow"))?;
-            Ok(slice)
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    Ok(Binding {
-        name,
-        dtype: dtype.into(),
-        shape: first.tensor_type.shape.0.clone(),
-        slices,
-    })
 }
 
 fn runtime_symbols(
