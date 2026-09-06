@@ -111,6 +111,9 @@ pub(super) fn element_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
 }
 
 pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    if let TileKernelSpec::FillZero { bytes, .. } = run.kernel {
+        return Ok(bytes);
+    }
     let precision = run.requirements.output.format.precision;
     element_count(run)?
         .checked_mul(
@@ -126,7 +129,7 @@ pub fn tile_kernel_abi(
     let precision = requirements.output.format.precision;
     let (symbols, availability, inputs, scalars): (_, _, usize, &'static [ScalarValue]) =
         match kernel {
-            TileKernelSpec::FillZero => (
+            TileKernelSpec::FillZero { .. } => (
                 KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
                 KernelAvailability::Implemented,
                 0,
@@ -327,7 +330,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             });
         }
     }
-    if matches!(kernel, TileKernelSpec::FillZero) {
+    if matches!(kernel, TileKernelSpec::FillZero { .. }) {
         let bytes = output_byte_count(run)?;
         if !bytes.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {

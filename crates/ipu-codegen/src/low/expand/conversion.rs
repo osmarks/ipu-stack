@@ -237,9 +237,7 @@ impl TileGraphBuilder {
         }
         for (destination_shard, mut mappings) in grouped {
             let plan = self.copy_plan(&mappings, destination_shard, copy_order)?;
-            if plan.clear_padding {
-                self.append_fill_zero(tiles, destination_shard, provenance)?;
-            }
+            self.append_copy_clears(tiles, destination_shard, &plan.clear_ranges, provenance)?;
             let staging = if let Some(staging) = &plan.staging {
                 Some(self.push_shard(BlockValue {
                     id: BlockValueId(0),
@@ -251,10 +249,22 @@ impl TileGraphBuilder {
             } else {
                 None
             };
-            if plan.clear_padding
-                && let Some(staging) = staging
-            {
-                self.append_fill_zero(tiles, staging, provenance)?;
+            if let Some(staging) = staging {
+                let block = &self.shards[staging.index() as usize];
+                let coverage = mappings
+                    .iter()
+                    .map(|(source, destination)| crate::CopyMapping {
+                        source: self.shards[source.shard.index() as usize].storage(),
+                        source_extents: &source.extents,
+                        destination_extents: &destination.extents,
+                    })
+                    .collect::<Vec<_>>();
+                let ranges = crate::low::copy::uncovered_copy_bytes(
+                    block.storage(),
+                    &coverage,
+                    CopyOrder::Semantic,
+                )?;
+                self.append_copy_clears(tiles, staging, &ranges, provenance)?;
             }
             for (mut source, mut destination) in mappings.drain(..) {
                 if let Some(staging) = staging {

@@ -80,7 +80,20 @@ pub fn materialize_kernel_run(
         }
         add_address_offset(base, span.offset)
     };
-    let output_address = resolve(&run.output)?;
+    let mut output_address = resolve(&run.output)?;
+    if let TileKernelSpec::FillZero { offset, bytes } = run.kernel {
+        let output_spans =
+            view_byte_spans(&shards[run.output.shard.index() as usize], &run.output)?;
+        let allocation_bytes = output_spans[0].bytes;
+        if !offset.is_multiple_of(8)
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > allocation_bytes)
+        {
+            return Err(StorageError::InvalidView.into());
+        }
+        output_address = add_address_offset(output_address, offset)?;
+    }
     let input_addresses = run
         .inputs
         .iter()

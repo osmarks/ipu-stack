@@ -167,7 +167,7 @@ fn coalesce_copies<Buffer: Clone>(
     coalesced
 }
 
-use crate::storage::{TensorStorage, logical_byte_spans, storage_bytes};
+use crate::storage::{TensorStorage, logical_byte_spans, physical_byte_spans, storage_bytes};
 use crate::{
     AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, ShardExtent, TensorFormat,
     TensorTiling, TensorType, TileKernelSpec,
@@ -188,7 +188,7 @@ pub(crate) struct CopyStaging {
 /// Physical realization of a selected mid copy: direct movement or destination
 /// packing, plus initialization of storage the source does not populate.
 pub(crate) struct CopyPlan {
-    pub clear_padding: bool,
+    pub clear_ranges: Vec<ByteSpan>,
     pub staging: Option<CopyStaging>,
 }
 
@@ -199,27 +199,16 @@ impl CopyPlan {
         mappings: &[CopyMapping<'_>],
         order: CopyOrder,
     ) -> StorageResult<Self> {
-        let elements = |extents: &[ShardExtent], physical: bool| {
-            extents.iter().fold(1u64, |n, e| {
-                n.saturating_mul(u64::from(
-                    if physical {
-                        e.physical_end
-                    } else {
-                        e.logical_end
-                    } - e.start,
-                ))
-            })
-        };
-        let copied = mappings.iter().fold(0u64, |n, m| {
-            n.saturating_add(elements(
-                m.destination_extents,
-                order == CopyOrder::Physical,
-            ))
-        });
-        let uncovered = copied < elements(extents, true);
         if order == CopyOrder::Physical {
             return Ok(Self {
-                clear_padding: uncovered,
+                clear_ranges: uncovered_copy_bytes(
+                    TensorStorage {
+                        format: &destination.format,
+                        extents,
+                    },
+                    mappings,
+                    order,
+                )?,
                 staging: None,
             });
         }
@@ -303,10 +292,79 @@ impl CopyPlan {
             }
         });
         Ok(Self {
-            clear_padding: uncovered || (transform && direct_word_exchange && padding),
+            // Packing writes every physical output element, including zero
+            // padding. A semantic copy without a packer writes logical bytes.
+            clear_ranges: if staging
+                .as_ref()
+                .is_some_and(|staging| staging.kernel.is_some())
+            {
+                Vec::new()
+            } else {
+                uncovered_copy_bytes(storage, mappings, CopyOrder::Semantic)?
+            },
             staging,
         })
     }
+}
+
+/// Byte coverage, not summed volume: overlapping mappings cannot hide holes.
+/// Clears run before copies, so round holes outward to the fill kernel's eight
+/// byte granularity; neighboring logical bytes are subsequently overwritten.
+pub(crate) fn uncovered_copy_bytes(
+    storage: TensorStorage<'_>,
+    mappings: &[CopyMapping<'_>],
+    order: CopyOrder,
+) -> StorageResult<Vec<ByteSpan>> {
+    let bytes = storage_bytes(storage)?;
+    let mut covered = Vec::new();
+    for mapping in mappings {
+        covered.extend(match order {
+            CopyOrder::Physical => physical_byte_spans(storage, mapping.destination_extents)?,
+            CopyOrder::Semantic => {
+                let mut logical = mapping.destination_extents.to_vec();
+                for extent in &mut logical {
+                    extent.physical_end = extent.logical_end;
+                }
+                logical_byte_spans(storage, &logical)?
+            }
+        });
+    }
+    covered.sort_unstable_by_key(|span| span.offset);
+    let mut cursor = 0u32;
+    let mut holes: Vec<ByteSpan> = Vec::new();
+    for span in covered.into_iter().chain(std::iter::once(ByteSpan {
+        offset: bytes,
+        bytes: 0,
+    })) {
+        let end = span
+            .offset
+            .checked_add(span.bytes)
+            .ok_or(StorageError::Overflow)?;
+        if end > bytes {
+            return Err(StorageError::InvalidView);
+        }
+        if span.offset > cursor {
+            let start = cursor / 8 * 8;
+            let end = span
+                .offset
+                .div_ceil(8)
+                .checked_mul(8)
+                .ok_or(StorageError::Overflow)?
+                .min(bytes);
+            if let Some(previous) = holes.last_mut()
+                && previous.offset + previous.bytes >= start
+            {
+                previous.bytes = end - previous.offset;
+            } else {
+                holes.push(ByteSpan {
+                    offset: start,
+                    bytes: end - start,
+                });
+            }
+        }
+        cursor = cursor.max(end);
+    }
+    Ok(holes)
 }
 
 #[cfg(test)]
@@ -354,10 +412,163 @@ mod tests {
                     order,
                 )
                 .unwrap();
-                assert!(
-                    plan.clear_padding,
-                    "unwritten storage must start at zero, including a mapped view's undeclared tail"
+                let expected = vec![
+                    ByteSpan {
+                        offset: 96,
+                        bytes: 32,
+                    },
+                    ByteSpan {
+                        offset: 224,
+                        bytes: 32,
+                    },
+                ];
+                assert_eq!(plan.clear_ranges, expected);
+                // Counting copied elements would incorrectly classify these
+                // overlapping writes as covering the whole allocation.
+                assert_eq!(
+                    uncovered_copy_bytes(
+                        TensorStorage {
+                            format: &source.format,
+                            extents: &extents
+                        },
+                        &[mapping_ref(&mapping), mapping_ref(&mapping)],
+                        order,
+                    )
+                    .unwrap(),
+                    expected,
                 );
+            }
+        }
+    }
+
+    fn mapping_ref<'a>(mapping: &CopyMapping<'a>) -> CopyMapping<'a> {
+        CopyMapping {
+            source: mapping.source,
+            source_extents: mapping.source_extents,
+            destination_extents: mapping.destination_extents,
+        }
+    }
+
+    #[test]
+    fn semantic_staging_coverage_ignores_original_physical_padding() {
+        let tensor = TensorType::new(
+            [2, 50],
+            super::super::Precision::F16,
+            Layout::row_major(TensorTiling::replicated(1)),
+        );
+        let extents = [
+            ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: 2,
+                physical_end: 2,
+            },
+            ShardExtent {
+                axis: 1,
+                start: 0,
+                logical_end: 50,
+                physical_end: 50,
+            },
+        ];
+        let mut padded = extents;
+        padded[1].physical_end = 64;
+        let storage = TensorStorage {
+            format: &tensor.format,
+            extents: &extents,
+        };
+        let mapping = CopyMapping {
+            source: storage,
+            source_extents: &extents,
+            destination_extents: &padded,
+        };
+        assert!(
+            uncovered_copy_bytes(storage, &[mapping], CopyOrder::Semantic)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn randomized_copy_holes_match_byte_coverage() {
+        let mut random = fastrand::Rng::with_seed(0x686f_6c65);
+        for _ in 0..256 {
+            let rows = random.u32(1..=8);
+            let columns = random.u32(1..=8) * 4;
+            let tensor = TensorType::new(
+                [rows, columns],
+                super::super::Precision::F16,
+                Layout::row_major(TensorTiling::replicated(1)),
+            );
+            let extents = [
+                ShardExtent {
+                    axis: 0,
+                    start: 0,
+                    logical_end: rows,
+                    physical_end: rows,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: 0,
+                    logical_end: columns,
+                    physical_end: columns,
+                },
+            ];
+            let storage = TensorStorage {
+                format: &tensor.format,
+                extents: &extents,
+            };
+            let mut covered = vec![false; (rows * columns * 2) as usize];
+            let rectangles = (0..random.usize(0..=12))
+                .map(|_| {
+                    let row = random.u32(0..rows);
+                    let column = random.u32(0..columns);
+                    let end_row = random.u32(row + 1..=rows);
+                    let end_column = random.u32(column + 1..=columns);
+                    for r in row..end_row {
+                        for c in column..end_column {
+                            let byte = ((r * columns + c) * 2) as usize;
+                            covered[byte..byte + 2].fill(true);
+                        }
+                    }
+                    [
+                        ShardExtent {
+                            axis: 0,
+                            start: row,
+                            logical_end: end_row,
+                            physical_end: end_row,
+                        },
+                        ShardExtent {
+                            axis: 1,
+                            start: column,
+                            logical_end: end_column,
+                            physical_end: end_column,
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let mappings = rectangles
+                .iter()
+                .map(|rectangle| CopyMapping {
+                    source: storage,
+                    source_extents: rectangle,
+                    destination_extents: rectangle,
+                })
+                .collect::<Vec<_>>();
+            for order in [CopyOrder::Physical, CopyOrder::Semantic] {
+                let mut cleared = vec![false; covered.len()];
+                for range in uncovered_copy_bytes(storage, &mappings, order).unwrap() {
+                    assert_eq!(range.offset % 8, 0);
+                    assert_eq!(range.bytes % 8, 0);
+                    cleared[range.offset as usize..(range.offset + range.bytes) as usize]
+                        .fill(true);
+                }
+                for (written, initialized) in covered.chunks_exact(8).zip(cleared.chunks_exact(8)) {
+                    assert!(
+                        initialized
+                            .iter()
+                            .all(|&clear| clear == written.contains(&false))
+                    );
+                }
             }
         }
     }

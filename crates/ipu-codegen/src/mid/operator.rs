@@ -27,7 +27,11 @@ pub enum MidOperator {
 /// A tile-local callable selected by a whole-device operator plan.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileKernelSpec {
-    FillZero,
+    /// Physical byte range initialized during tile expansion.
+    FillZero {
+        offset: u32,
+        bytes: u32,
+    },
     Gemm {
         multiply: Precision,
         accumulate: AccumulationPrecision,

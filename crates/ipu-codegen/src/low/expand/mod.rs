@@ -322,14 +322,55 @@ impl TileGraphBuilder {
         shard: BlockValueId,
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
-        let shard_data = &self.shards[shard.index() as usize];
-        let tile = shard_data.tile;
+        let bytes = crate::shard_storage_bytes(&self.shards[shard.index() as usize])?;
+        self.append_zero_range(
+            tiles,
+            shard,
+            crate::ByteSpan { offset: 0, bytes },
+            provenance,
+        )
+    }
+
+    /// All these clears precede the copies. Overwriting a covered gap is safe
+    /// and cheaper than another launch when the gap is sufficiently small.
+    fn append_copy_clears(
+        &mut self,
+        tiles: &mut BlockRegion,
+        shard: BlockValueId,
+        ranges: &[crate::ByteSpan],
+        provenance: WorkProvenance,
+    ) -> ExpansionResult<()> {
+        let mut ranges = ranges.iter().copied().peekable();
+        let launch_bytes = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles * 48;
+        while let Some(mut range) = ranges.next() {
+            while let Some(next) = ranges.peek()
+                && u64::from(next.offset - (range.offset + range.bytes)) <= launch_bytes
+            {
+                range.bytes = next.offset + next.bytes - range.offset;
+                ranges.next();
+            }
+            self.append_zero_range(tiles, shard, range, provenance)?;
+        }
+        Ok(())
+    }
+
+    fn append_zero_range(
+        &mut self,
+        tiles: &mut BlockRegion,
+        shard: BlockValueId,
+        range: crate::ByteSpan,
+        provenance: WorkProvenance,
+    ) -> ExpansionResult<()> {
+        let tile = self.shards[shard.index() as usize].tile;
         self.append_kernel(
             tiles,
             tile,
             self.kernel_run(
                 provenance,
-                TileKernelSpec::FillZero,
+                TileKernelSpec::FillZero {
+                    offset: range.offset,
+                    bytes: range.bytes,
+                },
                 Vec::new(),
                 self.full_view(shard),
             )?,

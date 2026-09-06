@@ -417,3 +417,77 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
         );
     }
 }
+
+#[test]
+fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
+    let tensor_type = crate::TensorType::new(
+        [128],
+        Precision::F16,
+        Layout::row_major(TensorTiling::replicated(1)),
+    );
+    let shard = BlockValue {
+        id: BlockValueId::from_index(0),
+        tile: 0,
+        tensor_type: tensor_type.clone(),
+        extents: vec![ShardExtent {
+            axis: 0,
+            start: 0,
+            logical_end: 128,
+            physical_end: 128,
+        }],
+        definition: crate::ShardDefinition::Staging,
+    };
+    let run = KernelRun::new(
+        WorkProvenance {
+            operation: None,
+            value: None,
+            reason: WorkReason::LayoutRearrangement,
+        },
+        TileKernelSpec::FillZero {
+            offset: 16,
+            bytes: 56,
+        },
+        Vec::new(),
+        ShardView {
+            shard: shard.id,
+            extents: vec![ShardExtent {
+                axis: 0,
+                start: 16,
+                logical_end: 64,
+                physical_end: 64,
+            }],
+        },
+        KernelRequirements {
+            inputs: Vec::new(),
+            output: KernelAccess::new(tensor_type.format, 8),
+            distinct_elements: Vec::new(),
+        },
+    );
+    let addresses = BTreeMap::from([(shard.id, 0x60000)]);
+    let plan = KernelBuildPlan::default();
+    let materialize = |run: &KernelRun| {
+        materialize_kernel_run(
+            run,
+            std::slice::from_ref(&shard),
+            &addresses,
+            &plan,
+            &BTreeMap::new(),
+        )
+    };
+    let compute = materialize(&run).unwrap();
+    assert_eq!(
+        compute.output_address,
+        TileAddress::Absolute(0x60000 + 32 + 16)
+    );
+    assert_eq!(plan.call(&run).unwrap().arguments, vec![1, 1]);
+    for (offset, bytes) in [(48, 56), (1, 8), (0, 7), (u32::MAX - 7, 16)] {
+        let run = KernelRun::new(
+            run.provenance,
+            TileKernelSpec::FillZero { offset, bytes },
+            run.inputs.clone(),
+            run.output.clone(),
+            run.requirements.clone(),
+        );
+        assert!(materialize(&run).is_err(), "offset={offset} bytes={bytes}");
+    }
+}
