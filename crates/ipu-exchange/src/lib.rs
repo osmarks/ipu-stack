@@ -851,7 +851,12 @@ struct ReceiveEvent {
 }
 
 fn receive_events_can_share_instruction(left: ReceiveEvent, right: ReceiveEvent) -> bool {
-    left.cycles == right.cycles
+    // SENDPICP cannot safely combine paired format transitions with XPIC.
+    // The SDK emits these as separate instructions; hardware faults even
+    // when the transition belongs to the preceding transfer.
+    left.kind != ReceiveEventKind::Format
+        && right.kind != ReceiveEventKind::Format
+        && left.cycles == right.cycles
         && ((left.kind.is_pic() && right.kind.is_xpic())
             || (left.kind.is_xpic() && right.kind.is_pic()))
 }
@@ -2565,7 +2570,10 @@ impl Topology {
             receiver_row[5] = delay(count + 4);
             receiver_row[6] = RETURN_M10_INSTRUCTION;
         } else if count == 52 {
-            receiver_row[3] = delay_pic(50 + receiver_phase, 0, 0);
+            // Keep PIC at the first payload arrival, as in the other rows.
+            // Programming it early works alone but understates the write
+            // window when this primitive is composed with another receive.
+            receiver_row[3] = delay_pic(51 + receiver_phase, 0, 0);
             receiver_row[4] = delay_xpic(0, 0, TILE_MUX_EXCHANGE);
             receiver_row[5] = delay(56);
             receiver_row[6] = RETURN_M10_INSTRUCTION;
@@ -2665,7 +2673,7 @@ impl Topology {
                 row[4] = delay(count + 4);
                 row[5] = RETURN_M10_INSTRUCTION;
             } else if count == 52 {
-                row[2] = delay_pic(50 + receiver_phase, 0, 0) | 0x0001_4000;
+                row[2] = delay_pic(51 + receiver_phase, 0, 0) | 0x0001_4000;
                 row[3] = delay_xpic(0, 0, TILE_MUX_EXCHANGE);
                 row[4] = delay(56);
                 row[5] = RETURN_M10_INSTRUCTION;
@@ -3418,7 +3426,7 @@ mod tests {
                     0x41800003, 0x40a0003e, 0x7e600002, 0x43a00000, 0, 0, 0, 0, 0,
                 ],
                 [
-                    1, 0x41800003, 0x641c0000, 0x61d00000, 0x64000640, 0x40a00038, 0x43a00000, 0, 0,
+                    1, 0x41800003, 0x641c0000, 0x61d80000, 0x64000640, 0x40a00038, 0x43a00000, 0, 0,
                 ],
             ),
             (
@@ -3476,7 +3484,7 @@ mod tests {
         assert_eq!(plan.receivers[0][3], 0x61814000);
 
         let boundary = topology.multicast(736, &[100, 900], 52, 0).unwrap();
-        assert_eq!(boundary.receivers[0][2], 0x61d14000);
+        assert_eq!(boundary.receivers[0][2], 0x61d94000);
         assert_eq!(boundary.receivers[0][3], 0x64000640);
     }
 
@@ -3537,6 +3545,50 @@ mod tests {
                 }));
             }
         }
+    }
+
+    #[test]
+    fn ordinary_pointer_setup_matches_payload_arrival_at_count_boundaries() {
+        let topology = Topology::c600();
+        for receiver in [2, 46, 100, 736, 1286] {
+            for count in [1, 51, 52, 53, 64, 65, 4148] {
+                let plan = topology.multicast(0, &[receiver], count, 0).unwrap();
+                let timing = receive_row_timing(&plan.receivers[0], 0).unwrap();
+                assert_eq!(
+                    timing.pointer_cycles.unwrap() - timing.source_cycles.unwrap(),
+                    52 + 2 * u32::from(topology.physical(receiver).unwrap() >> 6),
+                    "receiver={receiver} count={count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_paired_receives_separate_format_teardown_from_next_source() {
+        let topology = Topology::c600();
+        let mut schedule = TileProgramSchedule::default();
+        for (index, source) in [0, 4].into_iter().enumerate() {
+            let mut row = topology
+                .paired_multicast(source, &[2, 3], 176)
+                .unwrap()
+                .receivers[0];
+            patch_receiver_address(&mut row, 0x90000 + index as u32 * 0x1000).unwrap();
+            let offset = schedule.earliest_receiver_offset(&row, 176, 0).unwrap();
+            schedule.append_receiver_at(&row, offset, 176).unwrap();
+        }
+        for format in schedule
+            .receive_events
+            .iter()
+            .filter(|event| event.kind == ReceiveEventKind::Format)
+        {
+            assert!(
+                !schedule
+                    .receive_events
+                    .iter()
+                    .any(|event| event.kind.is_xpic() && event.cycles == format.cycles)
+            );
+        }
+        schedule.finish().unwrap();
     }
 
     #[test]
