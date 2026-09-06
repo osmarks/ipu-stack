@@ -617,6 +617,29 @@ than removal of the redundant representations addressed here.
   `artifacts/layout-sweep/attention-packed-balanced-{flash,materialized}`;
   additional calibration runs are `gemm-packed-{full-panels,panel-boundaries}`.
 
+## Multicast owner loopback (2026-09-06)
+
+- Materialization can add the source tile to an existing multicast instead of
+  emitting its local copy. Eligibility requires standard-to-interleaved storage,
+  matching source view/order, word alignment, at least two remote receivers, and
+  no additional message boundaries. Other cases retain local kernels. This is a
+  conservative heuristic, not an exact search over both copy implementations.
+- Physical scheduling retains both TX and RX on the owner and checks memory
+  hazards; snapshot validation checks all repeated source addresses. Paired and
+  standalone loopback remain unsupported.
+- C600 attention passes constant-output validation (839,808 elements): automatic
+  planning improves from **411,030 to 388,188 renderer-cropped cycles** (5.6%);
+  the compatible-V diagnostic improves from **391,842 to 371,178** (5.3%). The
+  repeated K/V owner `copy_u64` calls disappear; preparation copies remain.
+- Profiles and logs: `artifacts/layout-sweep/attention-loopback-auto` and
+  `attention-loopback`. Both use `--workload siglip-attention-benchmark` with
+  default planning settings; the latter additionally fixes projection 2 with
+  `--gemm-plan-constraint 2:16x46x2:1x1:16:standard:swapped:complete:direct`.
+  An initial wider three-finalist build was stopped before hardware execution.
+- The final rule passes Gaussian checkpoints (`attention-loopback-gaussian`):
+  maximum errors Q 0.001495, K 0.001709, V 0.001465, attention 0.000089. Codegen
+  has 127 passing release tests plus its doctest; workspace Clippy passes.
+
 ## Consumer layout requests through views (2026-09-06)
 
 - A compact backward pass gathers consumer order requirements, deduplicates
