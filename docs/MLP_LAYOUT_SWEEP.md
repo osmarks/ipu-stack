@@ -146,3 +146,16 @@ The exporter now excludes merged samples unless metadata certifies identical
 symbols and scalar arguments, and new profiles record those arguments. Older
 profiles remain usable for single-call samples. This correction changes
 calibration metadata and export, not execution or timeline grouping.
+
+The report also checks instruction-count formulas independently of the frozen
+planner estimates. For F16 reduction with `P` partials and `n` physical
+output elements, the current worker loop predicts
+`282 + 6 * ceil(n/48) * (9 + 6*(P-1))`. For aligned GELU it predicts
+`300 + 558 * ceil(n/96)`; old profile metadata gives logical sizes, so padding
+can make that diagnostic undercount waves. Interleaved F16 GEMM is close to
+`294 + ceil(K/16) * ceil(C/16) * (4*M + 160)`, taking physical `M` from the
+selected symbol. This last expression already resembles candidate screening
+but differs from primitive costing's larger fixed per-group coefficient.
+These formulas are diagnostics, not a model fitted and evaluated on the same
+sweep. Tail paths, other precisions and standard weight storage require their
+own checks before changing planner prices.

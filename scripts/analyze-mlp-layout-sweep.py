@@ -3,6 +3,8 @@
 import argparse
 import csv
 import json
+import math
+import re
 from pathlib import Path
 import subprocess
 
@@ -34,6 +36,41 @@ def calibration(rows, key, actual="cycles"):
                 inversions=inversions, comparable_pairs=comparisons,
                 selected=selected["name"], selected_cycles=selected[actual],
                 regret_cycles=int(selected[actual] - measured.min()))
+
+
+def instruction_model_report(database):
+    """Offline checks against instruction counts; do not change planner prices."""
+    families = {}
+    for sample in database["measurements"]:
+        key = sample["key"]
+        dimensions = key["dimensions"]
+        spec = dimensions.get("kernelSpec", "")
+        n = int(dimensions.get("outputElements", 0))
+        gemm = re.search(r"gemm_f16_init_(small|large)_rows_interleaved_k(\d+)_c(\d+)_r(\d+)_r(\d+)", key["kernel"])
+        if spec == "Gelu":
+            family = "GELU (logical size; padding may add waves)"
+            predicted = 300 + 558 * math.ceil(n / 96)
+        elif spec.startswith("ReductionSum"):
+            family = "F16 reduction"
+            partials = int(re.search(r"partials: (\d+)", spec)[1])
+            predicted = 282 + 6 * math.ceil(n / 48) * (9 + 6 * (partials - 1))
+        elif gemm:
+            family = "Interleaved F16 GEMM"
+            size, inner, columns, small, large = gemm.groups()
+            rows = int(small if size == "small" else large)
+            predicted = 294 + math.ceil(int(inner) / 16) * math.ceil(int(columns) / 16) * (4 * rows + 160)
+        else:
+            continue
+        actual = sample["medianCycles"]
+        families.setdefault(family, []).append((abs(predicted - actual), abs(predicted / actual - 1)))
+    lines = ["", "## Instruction-count checks", "",
+             "Offline diagnostics only; these formulas were not used to select or cost the sweep.",
+             "Each row counts distinct exported kernel/metadata keys, not independent hardware runs.", "",
+             "| Kernel | Keys | Median absolute error (%) | Maximum error (cycles) |",
+             "|---|---:|---:|---:|"]
+    for family, errors in families.items():
+        lines.append(f"| {family} | {len(errors)} | {np.median([e[1] for e in errors]) * 100:.3f} | {max(e[0] for e in errors)} |")
+    return lines
 
 
 def main():
@@ -111,6 +148,9 @@ def main():
     subprocess.run([args.cli, "profile-calibrate", *[str(args.directory / r["name"] / "execution.ipuprofile")
                     for r in passed], "--build-id", build_id,
                     "--output", str(args.directory / "kernel-measurements.json")], check=True)
+    database = json.loads((args.directory / "kernel-measurements.json").read_text())
+    lines += instruction_model_report(database)
+    (args.directory / "report.md").write_text("\n".join(lines) + "\n")
     print(f"best={best[0]['name']} cycles={best[0]['cycles']} completed={len(records)} passes={len(passed)}")
 
 
