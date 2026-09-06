@@ -1,6 +1,7 @@
 //! Whole-device implementation selection, tensor primitives, and layouts.
 //! Tile enumeration occurs only after selection, in low expansion.
 
+mod copy;
 pub(crate) mod implementation;
 mod primitive;
 pub use primitive::*;

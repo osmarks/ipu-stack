@@ -278,7 +278,6 @@ fn resolve_region(
 ) -> Option<Vec<MidOperation>> {
     let mut result = Vec::new();
     let mut deferred = BTreeMap::<MidValueId, MidValueId>::new();
-    let mut views = BTreeMap::<MidValueId, (MidValueId, AxisFactorView)>::new();
     for operation in operations {
         match &operation.kind {
             MidOperationKind::Operator {
@@ -286,21 +285,6 @@ fn resolve_region(
                 implementation,
                 ..
             } => {
-                if let Some(offer) = plan.deferred_output
-                    && !operation.results.iter().any(|id| required.contains(id))
-                {
-                    views.insert(
-                        operation.results[0],
-                        (
-                            deferred
-                                .get(&operation.inputs[offer.source_input])
-                                .copied()
-                                .unwrap_or(operation.inputs[offer.source_input]),
-                            offer.transform,
-                        ),
-                    );
-                    continue;
-                }
                 let input_ids = operation
                     .inputs
                     .iter()
@@ -351,26 +335,12 @@ fn resolve_region(
                     for value in step.inputs.iter_mut().chain(&mut step.results) {
                         *value = ids[value.index() as usize]?;
                     }
-                    if let MidOperationKind::Primitive(Primitive::Copy {
-                        mapping,
-                        reuse_local,
-                    }) = &mut step.kind
-                        && mapping.view.is_none()
-                        && let Some(&(source, view)) = views.get(&step.inputs[0])
-                    {
-                        mapping.view = Some(view);
-                        *reuse_local = false;
-                        step.inputs[0] = source;
-                    }
                     if let MidOperationKind::Primitive(Primitive::Compute { operands, .. }) =
                         &step.kind
                     {
                         let offset = values[step.results[0].index() as usize].tile_offset;
                         for input in step.inputs.iter_mut().take(operands.len()) {
-                            let mapping = views.get(input).copied();
-                            if values[input.index() as usize].tile_offset != offset
-                                || mapping.is_some()
-                            {
+                            if values[input.index() as usize].tile_offset != offset {
                                 let mut value = values[input.index() as usize].clone();
                                 value.id = MidValueId(values.len() as u32);
                                 value.tile_offset = offset;
@@ -379,14 +349,11 @@ fn resolve_region(
                                 values.push(value);
                                 result.push(MidOperation {
                                     source: operation.source,
-                                    inputs: vec![mapping.map_or(*input, |(source, _)| source)],
+                                    inputs: vec![*input],
                                     results: vec![id],
                                     kind: MidOperationKind::Primitive(Primitive::Copy {
-                                        mapping: mapping.map_or_else(
-                                            CoordinateMapping::default,
-                                            |(_, view)| view.into(),
-                                        ),
-                                        reuse_local: mapping.is_none(),
+                                        mapping: CoordinateMapping::default(),
+                                        reuse_local: true,
                                     }),
                                     estimated_cycles: 0,
                                     estimated_exchange_cycles: 0,
@@ -426,6 +393,7 @@ fn resolve_region(
             MidOperationKind::Primitive(_) => result.push(operation.clone()),
         }
     }
+    super::copy::compose(&mut result, values, required);
     Some(result)
 }
 

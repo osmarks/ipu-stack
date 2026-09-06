@@ -1600,122 +1600,141 @@ fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhas
 
 #[test]
 fn factor_copies_and_offset_windows_preserve_coordinates() {
-    for offset in [0, 1] {
-        for rank in 2..=5 {
-            for split in 0..rank {
-                for merge in 0..rank {
-                    if split == merge {
-                        continue;
-                    }
-                    let mut shape = vec![2; rank];
-                    shape[split] = 6;
-                    let mut graph = ComputeGraph::new();
-                    let input = graph.host_input("input", shape.clone()).unwrap();
-                    let output = graph
-                        .view(input, AxisFactorView::new(split, merge, 3))
-                        .unwrap();
-                    graph.set_outputs([output]).unwrap();
-                    let config = PipelineConfig::new(1).with_input(
-                        input,
-                        TensorFormat {
-                            precision: Precision::F32,
-                            layout: Layout::row_major(TensorTiling::replicated(1)),
-                        },
-                    );
-                    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                    let mut mid = crate::mid::implementation::resolve(mid).unwrap();
-                    let result = mid.outputs[0];
-                    for width in &mut mid.values[result.index() as usize].tensor_type.shape.0 {
-                        *width -= offset;
-                    }
-                    let copy = mid
-                        .operations
-                        .iter_mut()
-                        .find(|operation| operation.results.contains(&result))
-                        .unwrap();
-                    let MidOperationKind::Primitive(crate::Primitive::Copy { mapping, .. }) =
-                        &mut copy.kind
-                    else {
-                        panic!("view must resolve to a copy");
-                    };
-                    mapping.offsets = vec![offset; rank];
-
-                    let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-                    let mut buffers = low
-                        .shards
-                        .iter()
-                        .map(|shard| {
-                            vec![u32::MAX; crate::shard_storage_bytes(shard).unwrap() as usize / 4]
-                        })
-                        .collect::<Vec<_>>();
-                    let input_shard = low.inputs[0].shards[0].index() as usize;
-                    buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
-                    for work in low.work(&low.tiles[0]) {
-                        let copy = match work {
-                            TileWorkRef::LocalCopy(copy) => copy,
-                            TileWorkRef::Exchange(phase) => {
-                                assert!(
-                                    low.exchange_phases[phase.index() as usize]
-                                        .transfers
-                                        .is_empty()
-                                );
-                                continue;
-                            }
-                            _ => panic!("row-major view should only require copies"),
-                        };
-                        let (rows, width, source_stride, destination_stride) = match copy.pattern {
-                            CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
-                            CopyPattern::Strided {
-                                rows,
-                                row_bytes,
-                                source_stride,
-                                destination_stride,
-                            } => (rows, row_bytes, source_stride, destination_stride),
-                        };
-                        for row in 0..rows {
-                            for byte in (0..width).step_by(4) {
-                                let value = buffers[copy.source.index() as usize][((copy
-                                    .source_offset
-                                    + row * source_stride
-                                    + byte)
-                                    / 4)
-                                    as usize];
-                                buffers[copy.destination.index() as usize][((copy
-                                    .destination_offset
-                                    + row * destination_stride
-                                    + byte)
-                                    / 4)
-                                    as usize] = value;
-                            }
-                        }
-                    }
-                    let output_shape = &graph.value_shape(output).unwrap().0;
-                    let window_shape = &mid.values[result.index() as usize].tensor_type.shape.0;
-                    let actual = &buffers[low.outputs[0].shards[0].index() as usize];
-                    for source in 0..shape.iter().product::<u32>() {
-                        let mut index = source;
-                        let mut coordinates = vec![0; rank];
-                        for axis in (0..rank).rev() {
-                            coordinates[axis] = index % shape[axis];
-                            index /= shape[axis];
-                        }
-                        let part = coordinates[split] / output_shape[split];
-                        coordinates[split] %= output_shape[split];
-                        coordinates[merge] = coordinates[merge] * 3 + part;
-                        if coordinates.iter().any(|&coordinate| coordinate < offset) {
+    for chain in 0..3 {
+        for offset in [0, 1] {
+            for rank in 2..=5 {
+                for split in 0..rank {
+                    for merge in 0..rank {
+                        if split == merge {
                             continue;
                         }
-                        for coordinate in &mut coordinates {
-                            *coordinate -= offset;
+                        let mut shape = vec![2; rank];
+                        shape[split] = 12;
+                        let mut graph = ComputeGraph::new();
+                        let input = graph.host_input("input", shape.clone()).unwrap();
+                        let mut views = vec![AxisFactorView::new(split, merge, 3)];
+                        match chain {
+                            1 => views.push(AxisFactorView::new(split, merge, 2)),
+                            2 => views.push(AxisFactorView::new(merge, split, 2)),
+                            _ => {}
                         }
-                        let target = coordinates
-                            .iter()
-                            .zip(window_shape)
-                            .fold(0, |index, (&coordinate, &width)| index * width + coordinate);
-                        assert_eq!(
-                            actual[target as usize], source,
-                            "rank {rank}, split {split}, merge {merge}, offset {offset}"
+                        let mut output = input;
+                        for &view in &views {
+                            output = graph.view(output, view).unwrap();
+                        }
+                        graph.set_outputs([output]).unwrap();
+                        let config = PipelineConfig::new(1).with_input(
+                            input,
+                            TensorFormat {
+                                precision: Precision::F32,
+                                layout: Layout::row_major(TensorTiling::replicated(1)),
+                            },
                         );
+                        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+                        let mut mid = crate::mid::implementation::resolve(mid).unwrap();
+                        assert_eq!(mid.operations.len(), if chain == 2 { 2 } else { 1 });
+                        let result = mid.outputs[0];
+                        for width in &mut mid.values[result.index() as usize].tensor_type.shape.0 {
+                            *width -= offset;
+                        }
+                        let copy = mid
+                            .operations
+                            .iter_mut()
+                            .find(|operation| operation.results.contains(&result))
+                            .unwrap();
+                        let MidOperationKind::Primitive(crate::Primitive::Copy { mapping, .. }) =
+                            &mut copy.kind
+                        else {
+                            panic!("view must resolve to a copy");
+                        };
+                        mapping.offsets = vec![offset; rank];
+
+                        let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
+                        let mut buffers = low
+                            .shards
+                            .iter()
+                            .map(|shard| {
+                                vec![
+                                    u32::MAX;
+                                    crate::shard_storage_bytes(shard).unwrap() as usize / 4
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        let input_shard = low.inputs[0].shards[0].index() as usize;
+                        buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
+                        for work in low.work(&low.tiles[0]) {
+                            let copy = match work {
+                                TileWorkRef::LocalCopy(copy) => copy,
+                                TileWorkRef::Exchange(phase) => {
+                                    assert!(
+                                        low.exchange_phases[phase.index() as usize]
+                                            .transfers
+                                            .is_empty()
+                                    );
+                                    continue;
+                                }
+                                _ => panic!("row-major view should only require copies"),
+                            };
+                            let (rows, width, source_stride, destination_stride) =
+                                match copy.pattern {
+                                    CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
+                                    CopyPattern::Strided {
+                                        rows,
+                                        row_bytes,
+                                        source_stride,
+                                        destination_stride,
+                                    } => (rows, row_bytes, source_stride, destination_stride),
+                                };
+                            for row in 0..rows {
+                                for byte in (0..width).step_by(4) {
+                                    let value = buffers[copy.source.index() as usize][((copy
+                                        .source_offset
+                                        + row * source_stride
+                                        + byte)
+                                        / 4)
+                                        as usize];
+                                    buffers[copy.destination.index() as usize][((copy
+                                        .destination_offset
+                                        + row * destination_stride
+                                        + byte)
+                                        / 4)
+                                        as usize] = value;
+                                }
+                            }
+                        }
+                        let window_shape = &mid.values[result.index() as usize].tensor_type.shape.0;
+                        let actual = &buffers[low.outputs[0].shards[0].index() as usize];
+                        for source in 0..shape.iter().product::<u32>() {
+                            let mut index = source;
+                            let mut coordinates = vec![0; rank];
+                            for axis in (0..rank).rev() {
+                                coordinates[axis] = index % shape[axis];
+                                index /= shape[axis];
+                            }
+                            let mut current_shape = crate::TensorShape(shape.clone());
+                            for &view in &views {
+                                current_shape = view.output_shape(&current_shape).unwrap();
+                                let width = current_shape.0[view.split_axis];
+                                let part = coordinates[view.split_axis] / width;
+                                coordinates[view.split_axis] %= width;
+                                coordinates[view.merge_axis] =
+                                    coordinates[view.merge_axis] * view.factor + part;
+                            }
+                            if coordinates.iter().any(|&coordinate| coordinate < offset) {
+                                continue;
+                            }
+                            for coordinate in &mut coordinates {
+                                *coordinate -= offset;
+                            }
+                            let target = coordinates
+                                .iter()
+                                .zip(window_shape)
+                                .fold(0, |index, (&coordinate, &width)| index * width + coordinate);
+                            assert_eq!(
+                                actual[target as usize], source,
+                                "rank {rank}, split {split}, merge {merge}, offset {offset}"
+                            );
+                        }
                     }
                 }
             }

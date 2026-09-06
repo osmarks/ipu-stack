@@ -555,3 +555,23 @@ General view/copy composition and consumer/producer layout negotiation remain
 separate architectural work, as previously requested. Broader layout search,
 exchange ordering models and new ISA kernels are performance/feature work rather
 than removal of the redundant representations addressed here.
+
+## Mid layout composition (2026-09-06)
+
+- Resolve views as ordinary copies and compose single-use materialization chains
+  in mid, replacing the resolver's separate deferred-view folding path. Window
+  offsets and compatible factor views compose without enumerating tiles.
+- Preserve shared results, repeat boundaries, pack-before-broadcast staging, and
+  logical zeros introduced by cropped/padded intermediates. Incompatible factor
+  chains remain explicit. Precision round trips may disappear; a remaining
+  precision change retains its conversion because byte copies cannot implement it.
+- Coordinate tests cover windows, compatible and incompatible view chains,
+  precision round trips, sharing and padding. Low-copy simulation checks values
+  across ranks 2–5. All 119 codegen release tests and the doctest pass (one manual
+  test ignored); Clippy passes with the existing argument/type-count allowances.
+- Final projected Flash and materialized attention packages are byte-identical
+  to the validated pre-change packages (411,030 and 406,218 renderer cycles).
+  Builds are under `artifacts/layout-sweep/attention-compose-final-{flash,materialized}`.
+  Their head views were already folded by the old special case: this generalizes
+  composition, but does not yet eliminate their packing kernels. Producer output
+  layout negotiation and distributing packing work remain separate improvements.
