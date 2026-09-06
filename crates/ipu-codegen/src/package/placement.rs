@@ -141,11 +141,7 @@ pub(super) fn improve_exchange_placement(
     };
     let mut cache = cache.clone();
     let candidate_exchanges = match crate::exchange::lower_exchanges_cached(
-        program,
-        &candidate,
-        topology,
-        crate::ExchangeLoweringOptions::default(),
-        &mut cache,
+        program, &candidate, topology, false, &mut cache,
     ) {
         Ok(exchanges) => exchanges,
         Err(error) => {

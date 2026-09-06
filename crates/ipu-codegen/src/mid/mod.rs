@@ -251,10 +251,6 @@ pub struct MidValue {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "keep selected plans inline during beam expansion"
-)]
 pub enum MidOperationKind {
     Primitive(Primitive),
     Operator {

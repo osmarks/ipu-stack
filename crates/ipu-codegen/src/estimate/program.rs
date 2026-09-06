@@ -9,6 +9,19 @@ pub(crate) struct ProgramCycles {
     pub exchange: u64,
 }
 
+/// Exact exchange horizons composed with the emitted compute/copy timeline.
+pub(crate) fn scheduled_program_cycles(
+    program: &TileGraph,
+    phases: &[crate::PhysicalExchangePhase],
+) -> ExpansionResult<ProgramCycles> {
+    let mut cycles = vec![0; program.exchange_phases.len()];
+    for phase in phases {
+        cycles[phase.id.index() as usize] =
+            u64::from(phase.event_cycles).saturating_add(TARGET.exchange_phase_cycles);
+    }
+    program_cycles(program, Some(&cycles))
+}
+
 /// Prefix and tail are tile-local. The middle starts at the first barrier and
 /// ends at the last one. This permits exact repeat composition without unrolling
 /// and without introducing a barrier at an operation or repeat boundary.

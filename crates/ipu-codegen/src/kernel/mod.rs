@@ -66,19 +66,18 @@ pub fn materialize_kernel_run(
                 spans: spans.len(),
             });
         };
-        let base = overrides.get(&view.shard).copied().unwrap_or_else(|| {
-            TileAddress::Absolute(
+        let base = overrides
+            .get(&view.shard)
+            .copied()
+            .or_else(|| {
                 shard_addresses
                     .get(&view.shard)
                     .copied()
-                    .unwrap_or_default(),
-            )
-        });
-        if !overrides.contains_key(&view.shard) && !shard_addresses.contains_key(&view.shard) {
-            return Err(KernelMaterializationError::UnplacedShard(
+                    .map(TileAddress::Absolute)
+            })
+            .ok_or(KernelMaterializationError::UnplacedShard(
                 view.shard.index(),
-            ));
-        }
+            ))?;
         add_address_offset(base, span.offset)
     };
     let mut output_address = resolve(&run.output)?;

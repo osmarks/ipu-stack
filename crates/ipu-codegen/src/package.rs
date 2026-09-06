@@ -374,7 +374,7 @@ fn build_package_from_objects(
             program,
             &provisional_placement,
             &topology,
-            crate::ExchangeLoweringOptions::default(),
+            false,
             exchange_cache,
         )?)
     })?
@@ -632,9 +632,7 @@ fn build_package_from_objects(
             program,
             &placement,
             &topology,
-            crate::ExchangeLoweringOptions {
-                diagnostics: config.exchange_diagnostics,
-            },
+            config.exchange_diagnostics,
             exchange_cache,
         )?)
     })?;
@@ -653,6 +651,13 @@ fn build_package_from_objects(
             exchange_cache,
         )
     })?;
+    let final_cost =
+        crate::estimate::scheduled_program_cycles(&program.program, &lowered_exchanges.phases)?;
+    tracing::info!(
+        final_cycles = final_cost.total,
+        final_exchange = final_cost.exchange,
+        "costed final placed program"
+    );
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
     let exchanges = lowered_exchanges.phases;
     let inputs = program

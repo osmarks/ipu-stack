@@ -84,11 +84,6 @@ pub struct ExchangeMemoryElement {
     pub index: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ExchangeLoweringOptions {
-    pub diagnostics: bool,
-}
-
 pub const EXCHANGE_SCHEDULE_SNAPSHOT_VERSION: u32 = 3;
 
 /// Address-resolved transfers captured immediately before physical scheduling.
@@ -193,13 +188,13 @@ pub(crate) fn lower_exchanges(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
-    options: ExchangeLoweringOptions,
+    enable_diagnostics: bool,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
     lower_exchanges_cached(
         program,
         placement,
         topology,
-        options,
+        enable_diagnostics,
         &mut ExchangeScheduleCache::default(),
     )
 }
@@ -208,7 +203,7 @@ pub(crate) fn lower_exchanges_cached(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
-    options: ExchangeLoweringOptions,
+    enable_diagnostics: bool,
     cache: &mut ExchangeScheduleCache,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<BlockValueId, Vec<BlockValueId>>::new();
@@ -289,7 +284,7 @@ pub(crate) fn lower_exchanges_cached(
                 selected_kind,
                 neighborhood_improvements,
             } = optimized;
-            if options.diagnostics {
+            if enable_diagnostics {
                 let repeat_iterations = pending
                     .iter()
                     .map(|transfer| transfer.source_addresses.len())
@@ -342,9 +337,8 @@ pub(crate) fn lower_exchanges_cached(
                 timings,
                 ..
             } = schedule;
-            let mut diagnostics = options
-                .diagnostics
-                .then(|| PhaseDiagnostics::new(program.tile_count));
+            let mut diagnostics =
+                enable_diagnostics.then(|| PhaseDiagnostics::new(program.tile_count));
             if let Some(diagnostics) = &mut diagnostics {
                 let mut endpoint_roles = vec![0usize; usize::from(program.tile_count)];
                 for tile in pending.iter().flat_map(PendingTransfer::tiles) {

@@ -539,13 +539,7 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
     let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();
-    let phases = lower_exchanges(
-        &low,
-        &placement,
-        &Topology::c600(),
-        ExchangeLoweringOptions::default(),
-    )
-    .unwrap();
+    let phases = lower_exchanges(&low, &placement, &Topology::c600(), false).unwrap();
     assert!(!phases.phases.is_empty());
 }
 
@@ -582,14 +576,9 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
             config.diagnostic_checkpoints,
         );
         let placement = place(&low).unwrap();
-        let phases = lower_exchanges(
-            &low,
-            &placement,
-            &Topology::c600(),
-            ExchangeLoweringOptions::default(),
-        )
-        .unwrap()
-        .phases;
+        let phases = lower_exchanges(&low, &placement, &Topology::c600(), false)
+            .unwrap()
+            .phases;
         assert_eq!(phases.len(), low.exchange_phases.len());
         for phase in phases {
             assert_eq!(phase.programs.len(), usize::from(tiles));

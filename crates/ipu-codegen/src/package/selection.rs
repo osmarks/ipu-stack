@@ -85,18 +85,10 @@ pub(super) fn select_scheduled_finalist(
                 let (low, placement) = candidate?;
                 let mut cache = crate::exchange::ExchangeScheduleCache::default();
                 let exchanges = crate::exchange::lower_exchanges_cached(
-                    &low,
-                    &placement,
-                    &topology,
-                    crate::ExchangeLoweringOptions::default(),
-                    &mut cache,
+                    &low, &placement, &topology, false, &mut cache,
                 )?;
-                let mut phase_cycles = vec![0; low.exchange_phases.len()];
-                for phase in &exchanges.phases {
-                    phase_cycles[phase.id.index() as usize] = u64::from(phase.event_cycles)
-                        .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles);
-                }
-                let refined = crate::estimate::program_cycles(&low.program, Some(&phase_cycles))?;
+                let refined =
+                    crate::estimate::scheduled_program_cycles(&low.program, &exchanges.phases)?;
                 tracing::info!(
                     finalist = index,
                     mapped,
@@ -133,4 +125,30 @@ pub(super) fn select_scheduled_finalist(
         "selected physically scheduled operator-plan finalist"
     );
     Ok((low, cache))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infeasible_extra_finalist_does_not_discard_a_valid_program() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [32, 16]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
+        let mut finalists = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
+        let expected = crate::low::expand::expand_tiles(&finalists[0]).unwrap();
+        finalists.insert(0, crate::MidProgram::default());
+        let (selected, _) = select_scheduled_finalist(finalists, &config, None).unwrap();
+        assert_eq!(selected, lower_to_tiles(&expected, false));
+        assert!(matches!(
+            select_scheduled_finalist(vec![crate::MidProgram::default()], &config, None),
+            Err(PackageBuildError::Low(
+                crate::ExpansionError::EmptyTileGroup
+            ))
+        ));
+        assert!(select_scheduled_finalist(vec![], &config, None).is_err());
+    }
 }
