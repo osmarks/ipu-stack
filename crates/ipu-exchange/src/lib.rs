@@ -246,6 +246,8 @@ struct TileProgramSchedule {
 #[derive(Clone, Debug)]
 struct ReceiveStream {
     mode: ReceiveMode,
+    paired_format: Option<u32>,
+    format_end_cycles: Option<u32>,
     source_end_cycles: u32,
     pointer_end_cycles: u32,
     next_address: Option<u32>,
@@ -680,12 +682,10 @@ impl TileProgramSchedule {
             {
                 offset = offset.max(stream.pointer_end_cycles.saturating_sub(format_start));
             }
-            if base.pointer_address != stream.next_address {
-                let pointer_cycles = base
-                    .pointer_cycles
-                    .ok_or(ExchangeError::Schedule("receive pointer event"))?;
-                offset = offset.max(stream.pointer_end_cycles.saturating_sub(pointer_cycles));
-            }
+            let pointer_cycles = base
+                .pointer_cycles
+                .ok_or(ExchangeError::Schedule("receive pointer event"))?;
+            offset = offset.max(stream.pointer_end_cycles.saturating_sub(pointer_cycles));
         }
         loop {
             let timing = scheduled_receive_window(
@@ -694,16 +694,12 @@ impl TileProgramSchedule {
                 received_words,
                 self.receive_stream.as_ref(),
             )?;
-            let replaces_neutral = self
-                .receive_stream
-                .as_ref()
-                .is_some_and(|stream| timing.source_start == stream.source_end_cycles);
             let collision = timing.events.iter().any(|new| {
                 self.receive_events.iter().any(|existing| {
                     new.cycles == existing.cycles
-                        && !(replaces_neutral
-                            && new.kind == ReceiveEventKind::OrdinarySource
-                            && existing.kind == ReceiveEventKind::OrdinaryNeutral)
+                        && !self.receive_stream.as_ref().is_some_and(|previous| {
+                            replaces_receive_event(*existing, base.mode, &timing, previous)
+                        })
                         && !receive_events_can_share_instruction(*new, *existing)
                 })
             });
@@ -785,22 +781,10 @@ impl TileProgramSchedule {
             {
                 return Err(ExchangeError::Schedule("overlapping receive streams"));
             }
-            if timing.source_start == stream.source_end_cycles {
-                let neutral = self
-                    .receive_events
-                    .iter()
-                    .rposition(|event| {
-                        event.kind == ReceiveEventKind::OrdinaryNeutral
-                            && event.cycles == stream.source_end_cycles
-                    })
-                    .filter(|_| {
-                        stream.mode == ReceiveMode::Ordinary && base.mode == ReceiveMode::Ordinary
-                    });
-                if let Some(neutral) = neutral {
-                    self.receive_events.remove(neutral);
-                }
-            }
+            self.receive_events
+                .retain(|event| !replaces_receive_event(*event, base.mode, &timing, stream));
         }
+
         // `earliest_receiver_offset` checked the new events against the full
         // existing stream, while `scheduled_receive_window` validated the new
         // group internally. Source and pointer controls are independent and
@@ -810,6 +794,8 @@ impl TileProgramSchedule {
         self.event_cycles = self.event_cycles.max(timing.horizon);
         self.receive_stream = Some(ReceiveStream {
             mode: base.mode,
+            paired_format: base.paired_format(),
+            format_end_cycles: base.format_end_cycles.map(|end| end + schedule_offset),
             source_end_cycles: timing.source_end,
             pointer_end_cycles: timing.payload_end,
             next_address,
@@ -901,6 +887,7 @@ struct ReceiveRowTiming {
 
 #[derive(Clone, Debug)]
 struct ScheduledReceiverWindow {
+    continues_format: bool,
     events: Vec<ReceiveEvent>,
     source_start: u32,
     source_end: u32,
@@ -908,6 +895,43 @@ struct ScheduledReceiverWindow {
     payload_end: u32,
     horizon: u32,
     pointer_address: Option<u32>,
+}
+
+impl ReceiveRowTiming {
+    fn paired_format(&self) -> Option<u32> {
+        self.events
+            .iter()
+            .find(|event| {
+                event.kind == ReceiveEventKind::Format
+                    && Some(event.cycles) == self.format_start_cycles
+            })
+            .map(|event| event.instruction & PIC_RECEIVE_ADDRESS_MASK)
+    }
+}
+
+fn replaces_receive_event(
+    event: ReceiveEvent,
+    mode: ReceiveMode,
+    timing: &ScheduledReceiverWindow,
+    previous: &ReceiveStream,
+) -> bool {
+    if timing.continues_format
+        && event.kind == ReceiveEventKind::Format
+        && Some(event.cycles) == previous.format_end_cycles
+    {
+        return true;
+    }
+    timing.source_start == previous.source_end_cycles
+        && event.cycles == previous.source_end_cycles
+        && match (previous.mode, mode, event.kind) {
+            (ReceiveMode::Ordinary, ReceiveMode::Ordinary, ReceiveEventKind::OrdinaryNeutral) => {
+                true
+            }
+            (ReceiveMode::Paired64, ReceiveMode::Paired64, ReceiveEventKind::PairedNeutral) => {
+                timing.continues_format
+            }
+            _ => false,
+        }
 }
 
 fn scheduled_receive_window(
@@ -921,30 +945,19 @@ fn scheduled_receive_window(
     // pointer stream has a physical-row phase of its own and must not extend
     // source ownership: SDK full-duplex rows switch XPIC at this boundary
     // while their PIC update and outgoing SEND stream continue independently.
-    let (source_start, source_end) = match timing.mode {
-        ReceiveMode::Ordinary => {
-            let start = timing
-                .source_cycles
-                .ok_or(ExchangeError::Schedule("receive source timing"))?;
-            let end = start
-                .checked_add(received_words)
-                .ok_or(ExchangeError::Schedule("receive source timing overflow"))?;
-            (start, end)
-        }
-        ReceiveMode::Paired64 => {
-            let format_start = timing
-                .format_start_cycles
-                .ok_or(ExchangeError::Schedule("paired receive format start"))?;
-            let format_end = timing
-                .format_end_cycles
-                .ok_or(ExchangeError::Schedule("paired receive format end"))?;
-            let source_start = timing
-                .source_cycles
-                .map_or(format_start, |source| source.min(format_start));
-            let source_end = timing.neutral_cycles.unwrap_or(format_end).max(format_end);
-            (source_start, source_end)
-        }
-    };
+    let source_start = timing
+        .source_cycles
+        .or(timing.format_start_cycles)
+        .ok_or(ExchangeError::Schedule("receive source timing"))?;
+    let source_end = source_start
+        .checked_add(received_words)
+        .ok_or(ExchangeError::Schedule("receive source timing overflow"))?;
+    let continues_format = timing.paired_format().is_some_and(|format| {
+        previous.is_some_and(|stream| {
+            stream.paired_format == Some(format)
+                && stream.format_end_cycles == timing.format_start_cycles
+        })
+    });
     let carries_pointer = timing.mode == ReceiveMode::Ordinary
         && previous.is_some_and(|stream| {
             stream.mode == ReceiveMode::Ordinary && timing.pointer_address == stream.next_address
@@ -964,31 +977,9 @@ fn scheduled_receive_window(
     // Their final delay preserves a small guard after both the remote source
     // window and the local SRAM write window have completed. Retain that
     // guard after the two streams are interleaved with other transfers.
-    let base_source_end = match base.mode {
-        ReceiveMode::Ordinary => base
-            .source_cycles
-            .ok_or(ExchangeError::Schedule("receive source timing"))?
-            .checked_add(received_words)
-            .ok_or(ExchangeError::Schedule("receive source timing overflow"))?,
-        ReceiveMode::Paired64 => base
-            .neutral_cycles
-            .unwrap_or(
-                base.format_end_cycles
-                    .ok_or(ExchangeError::Schedule("paired receive format end"))?,
-            )
-            .max(
-                base.format_end_cycles
-                    .ok_or(ExchangeError::Schedule("paired receive format end"))?,
-            ),
-    };
-    let base_payload_end = base
-        .pointer_cycles
-        .ok_or(ExchangeError::Schedule("receive pointer event"))?
-        .checked_add(received_words)
-        .ok_or(ExchangeError::Schedule("receive payload timing overflow"))?;
     let guard = base
         .horizon_cycles
-        .saturating_sub(base_source_end.max(base_payload_end));
+        .saturating_sub(source_end.max(payload_end) - schedule_offset);
     let horizon = source_end
         .max(payload_end)
         .checked_add(guard)
@@ -1005,6 +996,11 @@ fn scheduled_receive_window(
                 event.cycles = source_end;
                 Some(event)
             }
+            ReceiveEventKind::Format
+                if continues_format && Some(event.cycles) == timing.format_start_cycles =>
+            {
+                None
+            }
             ReceiveEventKind::PairedSource
             | ReceiveEventKind::PairedNeutral
             | ReceiveEventKind::Format => Some(event),
@@ -1013,6 +1009,7 @@ fn scheduled_receive_window(
     events.sort_by_key(|event| event.cycles);
     validate_receive_events(&events)?;
     Ok(ScheduledReceiverWindow {
+        continues_format,
         events,
         source_start,
         source_end,
@@ -3588,6 +3585,34 @@ mod tests {
             let timing = receive_row_timing(&row, offset).unwrap();
             assert!(timing.format_start_cycles.unwrap() >= previous.payload_end);
         }
+    }
+
+    #[test]
+    fn consecutive_paired_receives_match_the_sdks_continuous_format_stream() {
+        let topology = Topology::c600();
+        let mut schedule = TileProgramSchedule::default();
+        for (index, source) in [0, 4, 6, 8].into_iter().enumerate() {
+            let mut row = topology
+                .paired_multicast(source, &[2, 3], 176)
+                .unwrap()
+                .receivers[0];
+            patch_receiver_address(&mut row, 0x90000 + index as u32 * 0x1000).unwrap();
+            let offset = schedule.earliest_receiver_offset(&row, 176, 0).unwrap();
+            schedule.append_receiver_at(&row, offset, 176).unwrap();
+        }
+        let cycles = |kind| {
+            schedule
+                .receive_events
+                .iter()
+                .filter(|event| event.kind == kind)
+                .map(|event| event.cycles)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cycles(ReceiveEventKind::PairedSource), [1, 177, 353, 529]);
+        assert_eq!(cycles(ReceiveEventKind::Pointer), [56, 232, 408, 584]);
+        assert_eq!(cycles(ReceiveEventKind::Format), [54, 758]);
+        assert_eq!(cycles(ReceiveEventKind::PairedNeutral), [705]);
+        schedule.finish().unwrap();
     }
 
     #[test]
