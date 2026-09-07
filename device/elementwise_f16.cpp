@@ -61,6 +61,9 @@ public:
     return i;
   }
   bool compute(unsigned worker) {
+    // Short column shards should not wait for inactive contexts to wrap
+    // broadcast indices. Worker zero also owns a possible final halfword.
+    if (worker != 0 && worker >= elements / 2) return true;
     // The common dense and vector-broadcast paths use complete half2 words.
     // Keep wrap/gather handling out of their inner loops.
     if (!(elements & 1) && !(leftElements & 1) && !(rightElements & 1)) {
