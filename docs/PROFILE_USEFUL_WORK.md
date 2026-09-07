@@ -80,7 +80,8 @@ alone concealed. The copy figures use the dense-copy baseline, not AMP MFU.
 
 Artifacts: `artifacts/useful-work/attention/{execution.ipuprofile,profile.html,summary.json,kernel-work.png}`.
 Headless Chromium rendered all 22 groups with values matching `profile-query`;
-clicking a kernel correctly narrowed the table and timeline. The codegen test
+kernel selection now focuses the timeline while retaining the full comparison
+table. Clicking the selected kernel again clears focus without resetting zoom. The codegen test
 suite passed (131 tests plus the new attention FLOP regression; one pre-existing
 ignored test), all 11 profile tests passed, and Clippy passed for codegen,
 profile, and CLI.
@@ -97,3 +98,17 @@ Reproduce the MLP case with `ipu-trivial-test c600-init.ipucfg --workload
 siglip-mlp-benchmark --mlp-batch 1 --package model.ipuexe --profile-output
 execution.ipuprofile`; the attention case uses `--workload
 siglip-attention-benchmark --attention-strategy flash` instead.
+
+
+Materialized attention passed the same 839,808-element hardware check (maximum
+error 0.000930), taking 320,256 cropped cycles versus streaming's 355,320. The
+cycle-weighted QK and PV kernel groups achieved 11.9% and 12.1% MFU, respectively,
+with 85.4% useful lane occupancy. Softmax achieved 57.4% useful efficiency;
+projection and unpacking figures matched the streaming case. The GEMMs still
+assign only seven or eight query rows to each tile, so full score materialization
+does not resolve the short-row arithmetic efficiency problem.
+
+Artifacts are under `artifacts/useful-work/materialized/`. All three HTML profiles
+were regenerated with the selection fix. Chromium checks verified that selecting,
+switching, and deselecting kernels preserves all 21 materialized-attention table
+rows and the current zoom.

@@ -111,6 +111,7 @@ canvas {
 #kernelWork table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
 #kernelWork th, #kernelWork td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); }
 #kernelWork th:first-child, #kernelWork td:first-child { text-align: left; }
+#kernelWork tr.selected { background: #eaf2ff; }
 #kernelWork .low { color: #a62831; font-weight: bold; }
 #tooltip {
   position: fixed;
@@ -182,7 +183,7 @@ canvas {
     Lane occupancy excludes known padding. Coverage is the fraction of measured cycles with estimates;
     cut samples, legacy profiles, and unsupported kernels are unavailable. Values above 100% indicate model mismatch.
     Device useful includes idle tiles over the kernel’s interval union (a lower bound with partial coverage).
-    Sorted by total tile cycles; click a kernel to focus the profile.</p>
+    Sorted by total tile cycles; click a kernel to focus the profile, and click it again to clear focus.</p>
     <div id="kernelWork"></div>
   </section>
 </main>
@@ -469,10 +470,10 @@ function fullEnd() {
   return tiles.reduce((maxEnd, tile) => Math.max(maxEnd, ...tile.samples.map(sample => sample.offset + sample.duration)), 1);
 }
 state.viewEnd = fullEnd();
-function matches(sample) {
+function matches(sample, focus = state.focus) {
   if (state.kind !== "all" && sample.kind !== state.kind) return false;
   if (state.query && !sample.operation.toLowerCase().includes(state.query)) return false;
-  return sampleMatchesFocus(sample, state.focus);
+  return sampleMatchesFocus(sample, focus);
 }
 function activeAt(sample, time) {
   return time !== null && time >= sample.offset && time < sample.offset + sample.duration;
@@ -804,7 +805,7 @@ function workTooltip(sample) {
 function drawKernelWork() {
   const groups = new Map();
   for (const tile of tiles) for (const sample of tile.samples) {
-    if (sample.kind !== "compute" || !matches(sample) || sample.duration <= 0) continue;
+    if (sample.kind !== "compute" || !matches(sample, null) || sample.duration <= 0) continue;
     let group = groups.get(sample.kernel);
     if (!group) { group = { total: 0, covered: 0, useful: 0, physical: 0, intervals: [] }; groups.set(sample.kernel, group); }
     group.total += sample.duration;
@@ -820,7 +821,7 @@ function drawKernelWork() {
     return cycles;
   };
   const rows = [...groups].sort((a, b) => b[1].total - a[1].total).map(([kernel, g]) =>
-    `<tr><td><button class="detail-link" data-profile-focus="${escapeHtml(JSON.stringify({ kernel }))}">${escapeHtml(kernel)}</button></td>` +
+    `<tr class="${state.focus?.kernel === kernel ? "selected" : ""}"><td><button class="detail-link" aria-pressed="${state.focus?.kernel === kernel}" data-profile-focus="${escapeHtml(JSON.stringify({ kernel }))}">${escapeHtml(kernel)}</button></td>` +
     `<td>${formatCount(g.total)}</td><td class="${g.covered && g.useful / g.covered < 0.25 ? "low" : ""}">${percent(g.useful, g.covered)}</td>` +
     `<td>${percent(g.physical, g.covered)}</td><td>${percent(g.useful, g.physical)}</td><td>${percent(g.covered, g.total)}</td><td>${g.covered ? (g.covered < g.total ? "≥ " : "") + percent(g.useful, intervalCycles(g.intervals) * tiles.length) : "n/a"}</td></tr>`).join("");
   document.getElementById("kernelWork").innerHTML = `<table><thead><tr><th>Kernel</th><th>Tile cycles</th><th>Useful efficiency</th><th>Work cycles</th><th>Lane occupancy</th><th>Coverage</th><th>Device useful</th></tr></thead><tbody>${rows}</tbody></table>`;
@@ -1066,7 +1067,10 @@ document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 
 document.getElementById("reset").addEventListener("click", resetView);
 document.addEventListener("click", event => {
   const link = event.target.closest("[data-profile-focus]");
-  if (link) focusFlame(JSON.parse(link.dataset.profileFocus));
+  if (link) {
+    const focus = JSON.parse(link.dataset.profileFocus);
+    focusFlame(link.closest("#kernelWork") && sameFocus(state.focus, focus) ? null : focus);
+  }
 });
 timeline.addEventListener("mousemove", event => {
   if (drag?.suppressClick) {
