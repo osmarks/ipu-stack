@@ -178,12 +178,6 @@ canvas {
   </section>
   <section>
     <div class="section-head"><div class="section-title">Estimated useful work by kernel</div></div>
-    <p style="padding:0 12px">Useful efficiency = useful issue-cycle equivalents / measured tile cycles.
-    AMP uses peak FLOPs; other kernels use arithmetic instructions or dense-copy throughput.
-    Lane occupancy excludes known padding. Coverage is the fraction of measured cycles with estimates;
-    cut samples, legacy profiles, and unsupported kernels are unavailable. Values above 100% indicate model mismatch.
-    Device useful includes idle tiles over the kernel’s interval union (a lower bound with partial coverage).
-    Sorted by total tile cycles; click a kernel to focus the profile, and click it again to clear focus.</p>
     <div id="kernelWork"></div>
   </section>
 </main>
@@ -797,10 +791,10 @@ function workEstimate(sample) {
 }
 function workTooltip(sample) {
   const work = workEstimate(sample);
-  if (!work) return sample.kind === "compute" ? ["Useful-work estimate unavailable"] : [];
-  return [`Estimated useful efficiency ${(100 * work.useful / sample.duration).toFixed(1)}%`,
-    `Arithmetic / dense-copy equivalent ${(100 * work.physical / sample.duration).toFixed(1)}% of cycles`,
-    `Useful lane occupancy ${work.physical ? (100 * work.useful / work.physical).toFixed(1) + "%" : "n/a"}`];
+  if (!work) return sample.kind === "compute" ? [] : [];
+  return [`Useful efficiency ${(100 * work.useful / sample.duration).toFixed(1)}%`,
+    `Physical efficiency ${(100 * work.physical / sample.duration).toFixed(1)}% of cycles`,
+    `Lane efficiency ${work.physical ? (100 * work.useful / work.physical).toFixed(1) + "%" : "n/a"}`];
 }
 function drawKernelWork() {
   const groups = new Map();
