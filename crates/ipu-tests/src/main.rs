@@ -956,14 +956,12 @@ fn main() -> Result<()> {
                 scale,
             ));
         for input in graph.inputs() {
-            if input.kind == ipu_codegen::GraphInputKind::Parameter {
-                pipeline = pipeline.with_automatic_input(
-                    input.value,
-                    Precision::F8F143 {
-                        scale_exponent: scale,
-                    },
-                );
-            }
+            pipeline = pipeline.with_automatic_input(
+                input.value,
+                Precision::F8F143 {
+                    scale_exponent: scale,
+                },
+            );
         }
     }
     let package_config = PackageConfig {
@@ -1883,9 +1881,7 @@ fn verify_logical_output(
     tolerance: (f32, f32),
 ) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
-    if !matches!(tensor.precision, Precision::F16 | Precision::F32)
-        || expected.len() != usize::try_from(tensor.shape.elements())?
-    {
+    if expected.len() != usize::try_from(tensor.shape.elements())? {
         bail!("logical output metadata is inconsistent with its reference");
     }
     let mut covered = vec![false; expected.len()];
@@ -1903,18 +1899,16 @@ fn verify_logical_output(
             .context("output binding slice is missing")?;
         for (index, offset) in diagnostic::shard_elements(tensor, shard)? {
             let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
-            let width = if tensor.precision == Precision::F16 {
-                2
-            } else {
-                4
-            };
+            let width = tensor.precision.bytes() as usize;
             let raw = bytes
                 .get(start..start + width)
                 .context("logical output exceeds host output")?;
-            let actual = if tensor.precision == Precision::F16 {
-                half_to_f32(u16::from_le_bytes(raw.try_into().unwrap()))
-            } else {
-                f32::from_le_bytes(raw.try_into().unwrap())
+            let actual = match tensor.precision {
+                Precision::F16 => half_to_f32(u16::from_le_bytes(raw.try_into().unwrap())),
+                Precision::F32 => f32::from_le_bytes(raw.try_into().unwrap()),
+                Precision::F8F143 { scale_exponent } => {
+                    ipu_codegen::f143::f143_to_f32(raw[0], scale_exponent)
+                }
             };
             let reference = expected[index];
             let error = (actual - reference).abs();
