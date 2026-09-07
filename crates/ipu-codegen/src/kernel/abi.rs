@@ -38,6 +38,7 @@ pub enum ScalarValue {
     ScaleExponent,
     CastSourceScale,
     CastDestinationScale,
+    CastPanelRows,
     InitialBlock,
     FinalBlock,
     WordsPerWorker,
@@ -109,6 +110,33 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 }
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
+            ScalarValue::CastPanelRows => {
+                if matches!(
+                    run.kernel,
+                    TileKernelSpec::Cast {
+                        from: Precision::F16,
+                        to: Precision::F8F143 { .. }
+                    }
+                ) {
+                    let order = run.requirements.output.format.layout.order;
+                    if order.fp8_cast_panel_rows(1, 1) == 0 {
+                        return Ok(0);
+                    }
+                    let columns = matrix_extent(run, false, true)?;
+                    let rows = element_count(run)? / columns;
+                    u32::try_from(
+                        run.requirements
+                            .output
+                            .format
+                            .layout
+                            .order
+                            .fp8_cast_panel_rows(u64::from(rows), u64::from(columns)),
+                    )
+                    .map_err(|_| KernelAbiError::RequirementMismatch)
+                } else {
+                    Ok(0)
+                }
+            }
             ScalarValue::InitialBlock => match &run.kernel {
                 TileKernelSpec::AttentionMerge { initial, .. } => Ok(u32::from(*initial)),
                 _ => Err(KernelAbiError::RequirementMismatch),
@@ -291,6 +319,7 @@ pub fn tile_kernel_abi(
                         ScalarValue::ElementCount,
                         ScalarValue::CastSourceScale,
                         ScalarValue::CastDestinationScale,
+                        ScalarValue::CastPanelRows,
                     ]
                 } else {
                     &[ScalarValue::ElementCount]
@@ -366,6 +395,33 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         .position(|operand| operand.views.len() != 1)
     {
         return Err(KernelAbiError::FragmentedOperand(index));
+    }
+    if matches!(
+        kernel,
+        TileKernelSpec::Cast {
+            from: Precision::F16,
+            to: Precision::F8F143 { .. }
+        }
+    ) {
+        let panel_rows = scalar_values(run, &abi)?[3];
+        let input = &run.inputs[0].views[0];
+        if run.requirements.inputs[0].format.layout.order
+            != run.requirements.output.format.layout.order
+            || input.extents.len() != run.output.extents.len()
+            || input
+                .extents
+                .iter()
+                .zip(&run.output.extents)
+                .any(|(from, to)| from.physical_end - from.start != to.physical_end - to.start)
+            || (panel_rows != 0
+                && !element_count(run)?.is_multiple_of(
+                    panel_rows
+                        .checked_mul(32)
+                        .ok_or(KernelAbiError::ElementCountOverflow)?,
+                ))
+        {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
     }
     if matches!(kernel, TileKernelSpec::Gelu) {
         let KernelSymbols::Exact(symbol) = abi.symbols else {

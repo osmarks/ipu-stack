@@ -4,13 +4,22 @@
 use super::*;
 use crate::TileKernelSpec;
 
-pub(crate) fn cast_cycles(from: Precision, to: Precision, elements: u64) -> u64 {
+pub(crate) fn cast_cycles(from: Precision, to: Precision, elements: u64, panel_rows: u64) -> u64 {
     match (from, to) {
         (Precision::F16, Precision::F8F143 { .. }) => {
-            // Six workers convert eight values each: 72 issue cycles per
-            // worker round, including loads and stores. Checked against the
-            // 9,216- and 17,664-element hardware runs.
-            330 + elements.div_ceil(48).saturating_mul(72)
+            if panel_rows != 0 {
+                // Four vector conversions per row, in a 14-bundle repeat body.
+                // All workers visit each panel; include short-row imbalance and
+                // pointer/setup work between panels, without expanding tile IR.
+                let panels = elements.div_ceil(panel_rows.saturating_mul(32));
+                if panel_rows <= 32 && panels >= 6 {
+                    330 + panels.div_ceil(6).saturating_mul(120 + panel_rows * 84)
+                } else {
+                    330 + panels.saturating_mul(120 + panel_rows.div_ceil(6) * 84)
+                }
+            } else {
+                330 + elements.div_ceil(48).saturating_mul(24)
+            }
         }
         (Precision::F32, Precision::F16) => 330 + elements.div_ceil(12).saturating_mul(48),
         _ => {
@@ -121,7 +130,15 @@ pub(crate) fn kernel_cycles(
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }
-        TileKernelSpec::Cast { from, to } => return cast_cycles(*from, *to, elements),
+        TileKernelSpec::Cast { from, to } => {
+            let columns = u64::from(*output.shape.0.last().unwrap_or(&1));
+            let panel_rows = output
+                .format
+                .layout
+                .order
+                .fp8_cast_panel_rows(elements / columns, columns);
+            return cast_cycles(*from, *to, elements, panel_rows);
+        }
         TileKernelSpec::Rearrange { from, .. } => {
             if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)
                 && output.format.precision == Precision::F16

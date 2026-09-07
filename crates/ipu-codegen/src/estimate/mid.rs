@@ -305,6 +305,13 @@ fn operation_cost(
                     input.format.precision,
                     output.format.precision,
                     bytes.div_ceil(output.format.precision.bytes()),
+                    output.format.layout.order.fp8_cast_panel_rows(
+                        out.shape.0[..out.shape.0.len().saturating_sub(1)]
+                            .iter()
+                            .map(|&n| u64::from(n))
+                            .product(),
+                        u64::from(*out.shape.0.last().unwrap_or(&1)),
+                    ),
                 ));
             }
         }

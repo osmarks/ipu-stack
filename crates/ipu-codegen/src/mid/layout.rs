@@ -85,6 +85,21 @@ pub(crate) enum F16MicroPanelOrder {
 }
 
 impl ElementOrder {
+    /// Number of rows in each pair of F16 panels regrouped by an FP8 cast.
+    /// A zero result denotes an order whose linearization is precision-independent.
+    pub(crate) fn fp8_cast_panel_rows(self, rows: u64, columns: u64) -> u64 {
+        match self {
+            Self::Amp(AmpOrder::Left) => rows,
+            Self::Amp(AmpOrder::TransposedLeft) => columns,
+            Self::Amp(AmpOrder::TransposedRight) => 16,
+            Self::BlockMajor(
+                BlockMajorOrder::Matrix { column_block, .. }
+                | BlockMajorOrder::TransposedMatrix { column_block, .. },
+            ) => u64::from(column_block),
+            _ => 0,
+        }
+    }
+
     /// GEMM stores complete 16-row micro-panels in this column-group order.
     pub(crate) fn gemm_output_group(self) -> Option<u32> {
         match self {

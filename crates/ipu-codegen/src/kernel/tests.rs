@@ -44,12 +44,14 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     casts += 1;
                     assert_eq!(
                         run.requirements.inputs[0].format.layout.order,
-                        ElementOrder::RowMajor
+                        run.requirements.output.format.layout.order
                     );
-                    assert_eq!(
+                    assert_ne!(
                         run.requirements.output.format.layout.order,
                         ElementOrder::RowMajor
                     );
+                    let abi = validate_kernel_run(run).unwrap();
+                    assert!(scalar_values(run, &abi).unwrap()[3] > 0);
                 }
                 TileKernelSpec::Gemm {
                     multiply,

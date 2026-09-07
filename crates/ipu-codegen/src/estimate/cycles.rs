@@ -254,10 +254,29 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
 
 impl CostModel for Ipu21CostModel {
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
+        let elements = maximum_shard_bytes(input).div_ceil(input.format.precision.bytes());
+        let columns = input
+            .format
+            .layout
+            .resolve(&input.shape)
+            .ok()
+            .and_then(|resolved| {
+                resolved
+                    .axes()
+                    .and_then(|axes| axes.last())
+                    .map(|axis| u64::from(axis.maximum_extent()))
+            })
+            .unwrap_or(elements)
+            .max(1);
         super::primitive::cast_cycles(
             input.format.precision,
             to,
-            maximum_shard_bytes(input).div_ceil(input.format.precision.bytes()),
+            elements,
+            input
+                .format
+                .layout
+                .order
+                .fp8_cast_panel_rows(elements / columns, columns),
         )
     }
 

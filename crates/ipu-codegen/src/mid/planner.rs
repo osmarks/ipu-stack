@@ -1618,11 +1618,13 @@ pub(super) fn ensure_format(
     let fp8_cast = from != target.precision
         && (matches!(from, Precision::F8F143 { .. })
             || matches!(target.precision, Precision::F8F143 { .. }));
-    // AMP panel width changes with element precision. A flat cast of packed
-    // storage would silently reinterpret 16-element panels as 32-element ones.
-    // Keep both rearrangements explicit in mid until a fused cast supports them.
+    // The F16-to-FP8 kernel regroups pairs of 16-element panels directly
+    // into 32-element panels. Redistribute in the packed F16 order first;
+    // no row-major intermediate or subsequent byte-sized transpose is needed.
+    let packed_cast =
+        from == Precision::F16 && matches!(target.precision, Precision::F8F143 { .. });
     let mut initial_layout = target.layout.clone();
-    if fp8_cast {
+    if fp8_cast && !packed_cast {
         initial_layout.order = ElementOrder::RowMajor;
     }
     if state.retarget_automatic_input(value, initial_layout.clone())

@@ -799,6 +799,56 @@ mod tests {
     }
 
     #[test]
+    fn fp8_panel_regrouping_preserves_logical_coordinates() {
+        // Independently compare the device's two-pointer regrouping with the
+        // storage codecs, including multiple panels and rectangular matrices.
+        for (rows, columns) in [(32, 64), (96, 128), (128, 32)] {
+            for order in [
+                ElementOrder::Amp(AmpOrder::Left),
+                ElementOrder::Amp(AmpOrder::TransposedLeft),
+                ElementOrder::Amp(AmpOrder::TransposedRight),
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                    row_block: 32,
+                    column_block: 16,
+                }),
+                ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
+                    row_block: 32,
+                    column_block: 16,
+                }),
+            ] {
+                let group_rows = match order {
+                    ElementOrder::Amp(AmpOrder::Left) => rows,
+                    ElementOrder::Amp(AmpOrder::TransposedLeft) => columns,
+                    _ => 16,
+                };
+                let coordinates = |precision, linear| match order {
+                    ElementOrder::Amp(role) => {
+                        amp_matrix_coordinates(role, precision, rows, columns, linear).unwrap()
+                    }
+                    ElementOrder::BlockMajor(role) => {
+                        block_major_matrix_coordinates(role, precision, rows, columns, linear)
+                            .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                for destination in 0..rows * columns {
+                    let panel = destination / (group_rows * 32) * (group_rows * 32);
+                    let offset = destination - panel;
+                    let source = panel
+                        + (offset % 32 / 16) * group_rows * 16
+                        + (offset / 32) * 16
+                        + offset % 16;
+                    assert_eq!(
+                        coordinates(Precision::F16, source),
+                        coordinates(Precision::F8F143 { scale_exponent: -4 }, destination),
+                        "{order:?} {rows}x{columns} element {destination}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn partial_span_traversals_preserve_coordinates_in_every_storage_order() {
         let mut random = fastrand::Rng::with_seed(0x7370_616e);
         for precision in [
