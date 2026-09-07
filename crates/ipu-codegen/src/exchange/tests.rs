@@ -576,7 +576,7 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
     let mid = crate::mid::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
         .unwrap()
         .remove(0);
-    let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
+    let expanded = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();
     let phases = lower_exchanges(&low, &placement, &Topology::c600(), false).unwrap();

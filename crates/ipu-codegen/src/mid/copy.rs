@@ -2,31 +2,38 @@
 
 use super::*;
 
-/// Batch adjacent independent copies from the same semantic operation. Their
-/// local preparations precede one shared exchange; dependent copies and semantic
-/// checkpoint boundaries keep their original order.
-pub(crate) fn independent_copy_prefix(operations: &[MidOperation]) -> usize {
+/// Batch adjacent independent copies. Their local preparations precede one
+/// shared exchange. Diagnostic builds retain semantic checkpoint boundaries.
+pub(crate) fn independent_copy_prefix(
+    operations: &[MidOperation],
+    checkpoints: bool,
+    storage_groups: &[MidValueId],
+) -> usize {
+    let group = |id: &MidValueId| storage_groups[id.index() as usize];
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
     let source = operations.first().and_then(|operation| operation.source);
     operations
         .iter()
         .take_while(|operation| {
-            if operation.source != source
+            if (checkpoints && operation.source != source)
                 || !matches!(
                     operation.kind,
                     MidOperationKind::Primitive(crate::Primitive::Copy { .. })
                 )
-                || operation.inputs.iter().any(|id| outputs.contains(id))
+                || operation
+                    .inputs
+                    .iter()
+                    .any(|id| outputs.contains(&group(id)))
                 || operation
                     .results
                     .iter()
-                    .any(|id| inputs.contains(id) || outputs.contains(id))
+                    .any(|id| inputs.contains(&group(id)) || outputs.contains(&group(id)))
             {
                 return false;
             }
-            inputs.extend(operation.inputs.iter().copied());
-            outputs.extend(operation.results.iter().copied());
+            inputs.extend(operation.inputs.iter().map(group));
+            outputs.extend(operation.results.iter().map(group));
             true
         })
         .count()

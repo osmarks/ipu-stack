@@ -45,6 +45,10 @@ struct Arguments {
     /// and compare it with a host reference before resuming.
     #[arg(long, conflicts_with = "reuse_package")]
     diagnostic_run: bool,
+    /// Validate final outputs with Gaussian inputs and a host reference, retaining
+    /// the normal optimized schedule instead of inserting operator checkpoints.
+    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
+    reference_run: bool,
     /// Maximum number of logical elements checked per operator result.
     #[arg(long, default_value_t = 256)]
     diagnostic_samples: usize,
@@ -400,6 +404,14 @@ fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     ipu_runtime::init_tracing();
     let arguments = Arguments::parse();
+    if arguments.reference_run
+        && matches!(
+            arguments.workload,
+            Workload::Diagnostic | Workload::ExchangeStress
+        )
+    {
+        bail!("--reference-run requires a computational graph workload");
+    }
     if arguments.diagnostic_run && matches!(arguments.workload, Workload::Diagnostic) {
         bail!("--diagnostic-run requires a computational workload");
     }
@@ -992,7 +1004,25 @@ fn main() -> Result<()> {
                 Duration::from_secs(arguments.timeout_seconds),
             )?;
         } else if !matches!(arguments.workload, Workload::Diagnostic) {
-            if matches!(
+            if arguments.reference_run {
+                let (output, maximum_error) = run_reference(
+                    &runtime,
+                    &application,
+                    &graph,
+                    compiled_package
+                        .as_ref()
+                        .context("reference validation needs logical storage metadata")?,
+                    arguments.timeout_seconds,
+                    (arguments.diagnostic_atol, arguments.diagnostic_rtol),
+                )?;
+                write_profile(
+                    &application,
+                    &output,
+                    arguments.clock_hz,
+                    arguments.profile_output.as_deref(),
+                )?;
+                println!("referenceMaximumAbsoluteError={maximum_error:.6} numericalTest=PASS");
+            } else if matches!(
                 arguments.workload,
                 Workload::GemmSmoke | Workload::BatchedGemmSmoke
             ) {

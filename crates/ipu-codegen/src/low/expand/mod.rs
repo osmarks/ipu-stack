@@ -58,12 +58,15 @@ pub enum ExpansionError {
 
 pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
-pub(crate) fn expand_tiles(graph: &MidProgram) -> ExpansionResult<Arc<TileGraph>> {
+pub(crate) fn expand_tiles(
+    graph: &MidProgram,
+    checkpoints: bool,
+) -> ExpansionResult<Arc<TileGraph>> {
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
     let mut state = TileGraphBuilder::new(graph)?;
-    let body = state.build_region(&graph.operations, true)?;
+    let body = state.build_region(&graph.operations, checkpoints)?;
     let inputs = graph
         .inputs
         .iter()
@@ -143,6 +146,7 @@ type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<BlockValueId>)>;
 
 struct TileGraphBuilder {
     tile_count: u16,
+    storage_groups: Vec<MidValueId>,
     shards: Vec<BlockValue>,
     canonical: Vec<Vec<BlockValueId>>,
     phases: Vec<ExchangePhase>,
@@ -157,6 +161,11 @@ impl TileGraphBuilder {
         let tile_count = graph.tile_count;
         let mut state = Self {
             tile_count,
+            storage_groups: graph
+                .values
+                .iter()
+                .map(|value| value.storage_group)
+                .collect(),
             shards: Vec::new(),
             canonical: vec![Vec::new(); graph.values.len()],
             phases: Vec::new(),
@@ -270,7 +279,11 @@ impl TileGraphBuilder {
         while index < operations.len() {
             let operation = &operations[index];
             let started = Instant::now();
-            let group = crate::mid::independent_copy_prefix(&operations[index..]);
+            let group = crate::mid::independent_copy_prefix(
+                &operations[index..],
+                checkpoints,
+                &self.storage_groups,
+            );
             let lowered = if group > 1 {
                 let mut batch = conversion::MaterializationBatch::default();
                 for operation in &operations[index..index + group] {
@@ -291,6 +304,12 @@ impl TileGraphBuilder {
                 }
                 let mut provenance = operation_provenance(operation);
                 provenance.value = None;
+                if operations[index..index + group]
+                    .iter()
+                    .any(|next| next.source != operation.source)
+                {
+                    provenance.operation = None;
+                }
                 self.append_materialization(batch, provenance, &mut tiles)
             } else {
                 match &operation.kind {

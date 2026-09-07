@@ -29,7 +29,8 @@ pub(super) fn select_scheduled_finalist(
         .enumerate()
         .map(|(index, mid)| {
             let screen = || -> PackageBuildResult<_> {
-                let mut expanded = crate::low::expand::expand_tiles(&mid)?;
+                let mut expanded =
+                    crate::low::expand::expand_tiles(&mid, planning.diagnostic_checkpoints)?;
                 placement::map_tiles(&mut expanded, tile_mapping)?;
                 let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
                 let placement = place(&low)?;
@@ -162,7 +163,8 @@ mod tests {
         graph.set_outputs([output]).unwrap();
         let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
         let mut finalists = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
-        let expected = crate::low::expand::expand_tiles(&finalists[0]).unwrap();
+        let expected =
+            crate::low::expand::expand_tiles(&finalists[0], config.diagnostic_checkpoints).unwrap();
         finalists.insert(0, crate::MidProgram::default());
         let selected = select_scheduled_finalist(finalists, &config, None).unwrap();
         assert_eq!(selected.program, lower_to_tiles(&expected, false));

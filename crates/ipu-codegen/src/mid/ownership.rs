@@ -7,7 +7,12 @@ impl MidProgram {
     /// Offer independent reduction results on disjoint owner sets when their
     /// immediately grouped copies need local preparation. Keep this a candidate:
     /// moving the reduction roots can increase exchange or SRAM costs.
-    pub(super) fn with_disjoint_copy_sources(&self) -> Option<Self> {
+    pub(super) fn with_disjoint_copy_sources(&self, checkpoints: bool) -> Option<Self> {
+        let storage_groups = self
+            .values
+            .iter()
+            .map(|value| value.storage_group)
+            .collect::<Vec<_>>();
         let mut uses = vec![0; self.values.len()];
         let mut sums = BTreeSet::new();
         for operation in &self.operations {
@@ -30,7 +35,8 @@ impl MidProgram {
         let mut changed = false;
         let mut index = 0;
         while index < self.operations.len() {
-            let count = independent_copy_prefix(&self.operations[index..]);
+            let count =
+                independent_copy_prefix(&self.operations[index..], checkpoints, &storage_groups);
             let sources = self.operations[index..index + count]
                 .iter()
                 .filter_map(|operation| {
@@ -217,8 +223,12 @@ mod tests {
             copy(0, 2),
             copy(1, 3),
         ];
-        assert_eq!(independent_copy_prefix(&program.operations[2..]), 2);
-        let rotated = program.with_disjoint_copy_sources().unwrap();
+        let groups = (0..6).map(MidValueId).collect::<Vec<_>>();
+        assert_eq!(
+            independent_copy_prefix(&program.operations[2..], true, &groups),
+            2
+        );
+        let rotated = program.with_disjoint_copy_sources(true).unwrap();
         assert_eq!(
             rotated
                 .values
@@ -229,22 +239,48 @@ mod tests {
         );
         assert!(program.values.iter().all(|v| v.tile_offset == 0));
         program.outputs.push(MidValueId(1));
-        assert!(program.with_disjoint_copy_sources().is_none());
+        assert!(program.with_disjoint_copy_sources(true).is_none());
         program.outputs.clear();
         program.values[3].storage_group = MidValueId(1);
         program.outputs.push(MidValueId(3));
-        assert!(program.with_disjoint_copy_sources().is_none());
+        assert!(program.with_disjoint_copy_sources(true).is_none());
         program.outputs.clear();
         program.values[3].storage_group = MidValueId(3);
         program.operations.push(copy(1, 2));
-        assert!(program.with_disjoint_copy_sources().is_none());
-        assert_eq!(independent_copy_prefix(&[copy(0, 2), copy(2, 3)]), 1);
+        assert!(program.with_disjoint_copy_sources(true).is_none());
+        assert_eq!(
+            independent_copy_prefix(&[copy(0, 2), copy(2, 3)], false, &groups),
+            1
+        );
         let mut boundary = copy(1, 3);
         let mut graph = ComputeGraph::new();
         let input = graph.host_input("x", [16]).unwrap();
         graph.gelu(input).unwrap();
         boundary.source = Some(graph.operations()[0].id);
-        assert_eq!(independent_copy_prefix(&[copy(0, 2), boundary]), 1);
+        assert_eq!(
+            independent_copy_prefix(&[copy(0, 2), boundary.clone()], true, &groups),
+            1
+        );
+        assert_eq!(
+            independent_copy_prefix(&[copy(0, 2), boundary.clone()], false, &groups),
+            2
+        );
+        let mut aliases = groups.clone();
+        aliases[1] = MidValueId(2);
+        assert_eq!(
+            independent_copy_prefix(&[copy(0, 2), boundary.clone()], false, &aliases),
+            1
+        );
+        aliases = groups.clone();
+        aliases[3] = MidValueId(0);
+        assert_eq!(
+            independent_copy_prefix(&[copy(0, 2), boundary.clone()], false, &aliases),
+            1
+        );
+        program.operations.truncate(4);
+        program.operations[3] = boundary;
+        assert!(program.with_disjoint_copy_sources(true).is_none());
+        assert!(program.with_disjoint_copy_sources(false).is_some());
     }
 
     #[test]

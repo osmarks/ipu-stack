@@ -1369,7 +1369,7 @@ fn selected_mid_size_is_independent_of_tile_count() {
             .with_input(input, format(Precision::F16, Layout::row_sharded(tiles)));
         let recipe = lower(&graph, &config, &Ipu21CostModel).unwrap();
         assert!(
-            crate::low::expand::expand_tiles(&recipe).is_err(),
+            crate::low::expand::expand_tiles(&recipe, true).is_err(),
             "low must reject unresolved operator recipes"
         );
         let selected = implementation::resolve(recipe.clone()).unwrap();
@@ -1407,7 +1407,7 @@ fn uneven_mlp_products_preserve_global_coordinates() {
     let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
         .unwrap()
         .remove(0);
-    let tiles = crate::low::expand::expand_tiles(&mid).unwrap();
+    let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let useful: u64 = tiles
         .kernel_runs
         .iter()
@@ -1927,7 +1927,7 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
         let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
             .unwrap()
             .remove(0);
-        let tiles = crate::low::expand::expand_tiles(&mid).unwrap();
+        let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
         crate::KernelBuildPlan::from_program(&tiled).unwrap();
         for phase in &tiles.exchange_phases {

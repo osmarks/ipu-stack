@@ -71,7 +71,7 @@ pub(crate) fn lower_finalists(
         .collect::<LoweringResult<Vec<_>>>()?;
     let mut candidates = Vec::with_capacity(resolved.len() * 2);
     for program in resolved {
-        if let Some(rotated) = program.with_disjoint_copy_sources() {
+        if let Some(rotated) = program.with_disjoint_copy_sources(config.diagnostic_checkpoints) {
             candidates.push(rotated);
         }
         candidates.push(program);
@@ -84,7 +84,7 @@ pub(crate) fn expand_tiles(
 ) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
     let program = implementation::resolve(program.clone())
         .ok_or(crate::ExpansionError::InvalidOperatorPlan)?;
-    crate::low::expand::expand_tiles(&program)
+    crate::low::expand::expand_tiles(&program, true)
 }
 use planner::*;
 
@@ -498,7 +498,7 @@ fn profile_mlp_finalist_expansion() {
         }
         let mid = implementation::resolve(mid.clone()).unwrap();
         let start = std::time::Instant::now();
-        let expanded = crate::low::expand::expand_tiles(&mid).unwrap();
+        let expanded = crate::low::expand::expand_tiles(&mid, true).unwrap();
         eprintln!(
             "finalist {index}: expansion {:?}, estimated cycles {}, exchange {}",
             start.elapsed(),
