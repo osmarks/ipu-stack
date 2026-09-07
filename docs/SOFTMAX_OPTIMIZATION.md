@@ -16,7 +16,9 @@ program was timed once. The arithmetic-only comparison used the old planner
 binary with new assembly to isolate the kernel change. The final result uses
 updated costing and automatic materialized product selection. All 839,808
 constant-input model output checks passed (maximum error 0.000930); Gaussian
-operator diagnostics also passed, with final sampled error 0.000040.
+operator diagnostics also passed, with final sampled error 0.000040. Streaming
+attention, which shares this kernel and merges state across key blocks, passed
+a separate Gaussian diagnostic with final sampled error 0.000028.
 
 Profiles and logs are under `artifacts/softmax-upgrade/`:
 
@@ -26,6 +28,7 @@ Profiles and logs are under `artifacts/softmax-upgrade/`:
   Its package hash matches `final-attention/`, so hardware was not timed again:
   `1dad1834aaa1397f1c81e0f8f3cff29609bb152d13be71eeb252ddc77ce186bd`.
 - `guarded-diagnostic/`: final Gaussian checkpoint validation.
+- `flash-diagnostic/`: Gaussian streaming-attention regression check.
 
 ## Arithmetic
 
