@@ -6,6 +6,59 @@ use crate::{
 };
 
 #[test]
+fn grouped_unicast_ready_queue_preserves_exact_transfer_order() {
+    let mut random = fastrand::Rng::with_seed(0x7061697273);
+    for _ in 0..16 {
+        let tiles = 8;
+        let transfers = (0..1024)
+            .map(|index| {
+                let source = random.u16(0..tiles);
+                let destination = (source + random.u16(1..tiles)) % tiles;
+                let words = random.u32(1..=512);
+                PendingTransfer {
+                    source,
+                    source_shard: BlockValueId::from_index(u32::from(source)),
+                    source_offset: 0,
+                    source_addresses: vec![0],
+                    source_elements: effective_memory_elements(0, words),
+                    destinations: vec![(destination, 0x80000 + index * 4096)],
+                    words,
+                    width: ExchangeItemWidth::Word32,
+                    reserved_source: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut grouped = TransferScheduler::new(&transfers, tiles);
+        assert!(!grouped.ready_groups.is_empty() && grouped.ready_groups.len() <= 56);
+        let mut reference = TransferScheduler::new(&transfers, tiles);
+        reference.ready = std::mem::take(&mut reference.ready_groups)
+            .into_iter()
+            .flatten()
+            .collect();
+        reference.transfer_group.clear();
+        let mut availability = vec![TileAvailability::default(); usize::from(tiles)];
+        while let Some(actual) = grouped.next(&availability) {
+            assert_eq!(Some(actual), reference.next(&availability));
+            let (index, dependency) = actual;
+            let transfer = &transfers[index];
+            let source = usize::from(transfer.source);
+            let destination = usize::from(transfer.destinations[0].0);
+            let completion = availability[source]
+                .send
+                .max(availability[destination].receive)
+                .max(dependency)
+                + transfer.words;
+            availability[source].send = completion;
+            availability[destination].receive = completion;
+            grouped.complete(index, completion);
+            reference.complete(index, completion);
+        }
+        assert!(grouped.is_complete());
+        assert!(reference.is_complete());
+    }
+}
+
+#[test]
 fn multicast_loopback_schedules_both_roles_and_rejects_bank_aliases() {
     for words in [1, 52, 65, 512] {
         let mut problem = ExchangeScheduleProblem {

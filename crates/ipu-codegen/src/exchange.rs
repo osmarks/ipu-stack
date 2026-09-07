@@ -1512,6 +1512,8 @@ struct TransferScheduler<'a> {
     indegrees: Vec<usize>,
     dependency_ready: Vec<u32>,
     ready: BinaryHeap<ReadyTransfer>,
+    ready_groups: Vec<BinaryHeap<ReadyTransfer>>,
+    transfer_group: Vec<usize>,
     completed: usize,
 }
 
@@ -1544,12 +1546,46 @@ impl<'a> TransferScheduler<'a> {
             indegrees,
             dependency_ready: vec![0; transfers.len()],
             ready: BinaryHeap::new(),
+            ready_groups: Vec::new(),
+            transfer_group: Vec::new(),
             completed: 0,
         };
         for index in 0..transfers.len() {
             if scheduler.indegrees[index] == 0 {
                 scheduler.push_ready(index, 0);
             }
+        }
+        // With no dependencies or multicast pressure updates, transfers
+        // sharing endpoints have identical changing readiness. Keep only the
+        // best static-priority member of each pair in the global heap; lazy
+        // refresh otherwise revisits every queued transfer after each send.
+        if !scheduler.dynamic_word_pressure
+            && transfers
+                .iter()
+                .all(|t| t.destinations.len() == 1 && t.reserved_source.is_none())
+            && scheduler.indegrees.iter().all(|&n| n == 0)
+        {
+            let mut groups = BTreeMap::new();
+            scheduler.transfer_group.resize(transfers.len(), 0);
+            for candidate in std::mem::take(&mut scheduler.ready).into_vec() {
+                let index = candidate.index.0;
+                let transfer = &transfers[index];
+                let group = *groups
+                    .entry((transfer.source, transfer.destinations[0].0))
+                    .or_insert_with(|| {
+                        let group = scheduler.ready_groups.len();
+                        scheduler.ready_groups.push(BinaryHeap::new());
+                        group
+                    });
+                scheduler.transfer_group[index] = group;
+                scheduler.ready_groups[group].push(candidate);
+            }
+            scheduler.ready.extend(
+                scheduler
+                    .ready_groups
+                    .iter()
+                    .filter_map(|queue| queue.peek().copied()),
+            );
         }
         scheduler
     }
@@ -1597,6 +1633,15 @@ impl<'a> TransferScheduler<'a> {
                 // Endpoint availability ranks the ready queue, but is not a
                 // dependency on payload arrival. The row builder pipelines
                 // source selection and delivery using their actual timings.
+                if !self.ready_groups.is_empty() {
+                    let queue = &mut self.ready_groups[self.transfer_group[index]];
+                    let head = queue.pop().expect("nonempty ready pair");
+                    debug_assert_eq!(head.index.0, index);
+                    if let Some(mut next) = queue.peek().copied() {
+                        next.earliest_start = Reverse(earliest_start);
+                        self.ready.push(next);
+                    }
+                }
                 return Some((index, self.dependency_ready[index]));
             }
             self.push_ready(index, earliest_start);
