@@ -10,7 +10,12 @@ impl Builder {
         query_width: u32,
         value_width: u32,
         materialized: bool,
+        query_key_grid: Option<ProductGrid>,
+        probability_value_grid: Option<ProductGrid>,
     ) -> Option<MidValueId> {
+        if !materialized && (query_key_grid.is_some() || probability_value_grid.is_some()) {
+            return None;
+        }
         let product = |inner_block, output_columns| TileKernelSpec::Gemm {
             multiply: Precision::F16,
             accumulate: AccumulationPrecision::F32,
@@ -33,7 +38,11 @@ impl Builder {
         query_type.format.layout = output.format.layout.clone();
         query_type.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         query_type.shape.0[2] = query_width;
-        let query_buffer = self.copy(MidValueId(0), query_type, vec![]);
+        let query_buffer = if query_key_grid.is_some() {
+            MidValueId(0)
+        } else {
+            self.copy(MidValueId(0), query_type, vec![])
+        };
         let mut scores_type = output.clone();
         scores_type.format.precision = Precision::F16;
         scores_type.shape.0[2] = key_block;
@@ -104,22 +113,50 @@ impl Builder {
                 key_block_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
                 value_block_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
             }
-            let k = self.copy(key_panels, key_block_type, vec![0, start, 0]);
+            let k = if query_key_grid.is_some() {
+                key_panels
+            } else {
+                self.copy(key_panels, key_block_type, vec![0, start, 0])
+            };
             // Flash broadcasts K/V together. Full materialization keeps their
             // large resident matrices in disjoint lifetimes.
             let v = (!materialized)
                 .then(|| self.copy(value_panels, value_block_type.clone(), vec![0, start, 0]));
-            let scores = self.compute(
-                vec![query_buffer, k],
-                scores_type.clone(),
-                query_key.clone(),
-                Some(ProductAxes {
-                    valid_columns: Some(valid),
-                    ..qk_axes
-                }),
-                None,
-                vec![],
-            );
+            let scores = if let Some(grid) = query_key_grid {
+                // Softmax consumes a padded row but only its valid key prefix.
+                // Retain that logical bound so copies may transfer the shared
+                // zero padding instead of splitting an odd FP16 tail word.
+                let mut rows = scores_type.clone();
+                rows.shape.0[2] = valid;
+                for axis in &mut rows.format.layout.tiling.axes {
+                    if axis.axis.resolve(3).ok()? == 2 {
+                        axis.block_size = key_block;
+                        axis.padding_multiple = key_block;
+                    }
+                }
+                self.distributed_product(
+                    query_buffer,
+                    k,
+                    &rows,
+                    ProductAxes {
+                        valid_columns: Some(valid),
+                        ..qk_axes
+                    },
+                    grid,
+                )?
+            } else {
+                self.compute(
+                    vec![query_buffer, k],
+                    scores_type.clone(),
+                    query_key.clone(),
+                    Some(ProductAxes {
+                        valid_columns: Some(valid),
+                        ..qk_axes
+                    }),
+                    None,
+                    vec![],
+                )
+            };
             weights = Some(self.compute(
                 vec![scores],
                 weights_type.clone(),
@@ -133,22 +170,38 @@ impl Builder {
                 vec![],
             ));
             let weights_id = weights?;
-            let v =
-                v.unwrap_or_else(|| self.copy(value_panels, value_block_type, vec![0, start, 0]));
-            let product = self.compute(
-                vec![weights_id, v],
-                product_type.clone(),
-                probability_value.clone(),
-                Some(ProductAxes {
-                    valid_inner: Some(valid),
-                    ..pv_axes
-                }),
-                None,
-                vec![
-                    OperandWindow(vec![(2, 0, key_block)]),
-                    OperandWindow::default(),
-                ],
-            );
+            let v = if probability_value_grid.is_some() {
+                value_panels
+            } else {
+                v.unwrap_or_else(|| self.copy(value_panels, value_block_type, vec![0, start, 0]))
+            };
+            let product = if let Some(grid) = probability_value_grid {
+                self.distributed_product(
+                    weights_id,
+                    v,
+                    &product_type,
+                    ProductAxes {
+                        valid_inner: Some(valid),
+                        ..pv_axes
+                    },
+                    grid,
+                )?
+            } else {
+                self.compute(
+                    vec![weights_id, v],
+                    product_type.clone(),
+                    probability_value.clone(),
+                    Some(ProductAxes {
+                        valid_inner: Some(valid),
+                        ..pv_axes
+                    }),
+                    None,
+                    vec![
+                        OperandWindow(vec![(2, 0, key_block)]),
+                        OperandWindow::default(),
+                    ],
+                )
+            };
             result = Some(self.compute(
                 vec![product, weights_id],
                 output.clone(),

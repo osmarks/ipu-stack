@@ -2,11 +2,11 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
-    AmpOrder, AttentionStrategy, AxisFactorView, BlockMajorOrder, CompiledPackage, ComputeGraph,
-    DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout, LocalOperandStaging,
-    MemoryClass, MidOperator, PackageConfig, PipelineConfig, Precision, ReductionStaging,
-    TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
-    build_package,
+    AmpOrder, AttentionProducts, AttentionStrategy, AxisFactorView, BlockMajorOrder,
+    CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout,
+    LocalOperandStaging, MemoryClass, MidOperator, PackageConfig, PipelineConfig, Precision,
+    ReductionStaging, TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates,
+    build_diagnostic_package, build_package,
 };
 use ipu_driver::DriverError;
 use ipu_elf::Toolchain;
@@ -144,6 +144,9 @@ struct Arguments {
     /// Restrict attention planning for controlled strategy comparisons.
     #[arg(long, value_enum, default_value_t = AttentionMode::Auto)]
     attention_strategy: AttentionMode,
+    /// Compare shared row ownership with independent materialized QK/PV grids.
+    #[arg(long, value_enum, default_value = "auto")]
+    attention_products: AttentionProductMode,
     /// Compare native and packed GEMM stores, or force one for diagnostics.
     #[arg(long, value_parser = ["auto", "native", "packed"], default_value = "auto")]
     gemm_output_packing: String,
@@ -249,6 +252,26 @@ enum AttentionMode {
     Auto,
     Flash,
     Materialized,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AttentionProductMode {
+    Auto,
+    SharedRows,
+    QkOnly,
+    PvOnly,
+    Independent,
+}
+impl From<AttentionProductMode> for AttentionProducts {
+    fn from(value: AttentionProductMode) -> Self {
+        match value {
+            AttentionProductMode::Auto => Self::Automatic,
+            AttentionProductMode::SharedRows => Self::SharedRows,
+            AttentionProductMode::QkOnly => Self::QkOnly,
+            AttentionProductMode::PvOnly => Self::PvOnly,
+            AttentionProductMode::Independent => Self::Independent,
+        }
+    }
 }
 
 impl From<AttentionMode> for AttentionStrategy {
@@ -600,7 +623,9 @@ fn main() -> Result<()> {
         _ => ipu_codegen::GemmOutputPacking::Automatic,
     };
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
-    pipeline = pipeline.with_attention_strategy(arguments.attention_strategy.into());
+    pipeline = pipeline
+        .with_attention_strategy(arguments.attention_strategy.into())
+        .with_attention_products(arguments.attention_products.into());
     for constraint in &arguments.gemm_plan_constraint {
         pipeline = pipeline.with_gemm_plan_constraint(*constraint);
     }

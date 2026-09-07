@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod attention;
 mod demand;
 pub(super) use demand::{OutputDemand, OutputDemands};
 mod search;
@@ -279,12 +280,14 @@ pub(super) fn plans(
             for (materialized, key_block_rows) in
                 [(false, AMP_INNER_BLOCK), (true, padded_key_rows)]
             {
-                plans.push(OperatorPlan {
+                let plan = OperatorPlan {
                     operator: MidOperator::FlashAttention {
                         options,
                         accumulate: AccumulationPrecision::F32,
                     },
                     dispatch: OperatorDispatch::Attention {
+                        query_key: None,
+                        probability_value: None,
                         materialized,
                         key_block_rows,
                         padded_query_dimension,
@@ -303,7 +306,8 @@ pub(super) fn plans(
                         distinct_elements: Vec::new(),
                     },
                     deferred_output: None,
-                });
+                };
+                plans.extend(attention::product_variants(plan, inputs, config));
             }
         }
         match config.attention_strategy {

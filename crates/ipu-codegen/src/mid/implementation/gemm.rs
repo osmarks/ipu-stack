@@ -228,3 +228,150 @@ impl Builder {
         }
     }
 }
+
+impl Builder {
+    /// A batched F16 product with independent row/column/K ownership, followed by
+    /// redistribution (or a sum of explicit partials) into its consumer layout.
+    pub(super) fn distributed_product(
+        &mut self,
+        left: MidValueId,
+        right: MidValueId,
+        output: &TensorType,
+        axes: ProductAxes,
+        grid: ProductGrid,
+    ) -> Option<MidValueId> {
+        let mut l = self.tensor(left).clone();
+        let mut r = self.tensor(right).clone();
+        if l.shape.0.len() != 3
+            || r.shape.0.len() != 3
+            || output.shape.0.len() != 3
+            || output.format.precision != Precision::F16
+        {
+            return None;
+        }
+        let li = axes.left_inner.resolve(3).ok()?;
+        let ri = axes.right_inner.resolve(3).ok()?;
+        let rc = if ri == 2 { 1 } else { 2 };
+        if li != 2
+            || axes.output_column.resolve(3).ok()? != 2
+            || grid.rows == 0
+            || grid.columns == 0
+            || grid.inner == 0
+        {
+            return None;
+        }
+        let heads = u16::try_from(output.shape.0[0]).ok()?;
+        let col_stride = heads;
+        let inner_stride = heads.checked_mul(grid.columns)?;
+        let row_stride = inner_stride.checked_mul(grid.inner)?;
+        let tiles = row_stride.checked_mul(grid.rows)?;
+        let dim = |axis, partitions, grain, stride| {
+            AxisTiling::new(
+                TensorAxis::FromStart(axis),
+                partitions,
+                grain,
+                Padding::Zero,
+            )
+            .with_tile_stride(stride)
+        };
+        let head = dim(0, heads, 1, 1);
+        let rows = dim(1, grid.rows, 1, row_stride);
+        let inner = axes
+            .valid_inner
+            .unwrap_or(l.shape.0[li])
+            .min(l.shape.0[li])
+            .min(r.shape.0[ri]);
+        let columns = axes.valid_columns.unwrap_or(output.shape.0[2]);
+
+        r.shape.0[ri] = inner;
+        r.shape.0[rc] = columns;
+        let inner_width = inner.div_ceil(16).div_ceil(u32::from(grid.inner)) * 16;
+        let column_width = columns.div_ceil(16).div_ceil(u32::from(grid.columns)) * 16;
+        // The last K group must use the same coefficient block shape as the
+        // others. Keep the left padding addressable (softmax stores zero weights
+        // there), while the right operand retains the true logical K bound.
+        l.shape.0[li] = inner_width.checked_mul(u32::from(grid.inner))?;
+        l.format.precision = Precision::F16;
+        r.format.precision = Precision::F16;
+        l.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+        l.format.layout.tiling = TensorTiling {
+            tile_count: tiles,
+            replicas: grid.columns,
+            axes: vec![
+                head,
+                rows,
+                dim(li as u16, grid.inner, inner_width, inner_stride),
+            ],
+        };
+        r.format.layout.tiling = TensorTiling {
+            tile_count: tiles,
+            replicas: grid.rows,
+            axes: vec![
+                head,
+                dim(ri as u16, grid.inner, inner_width, inner_stride),
+                dim(rc as u16, grid.columns, 16, col_stride),
+            ],
+        };
+        r.format.layout.order = if ri == 2 {
+            ElementOrder::Amp(AmpOrder::TransposedRight)
+        } else {
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block: u16::try_from(inner_width).ok()?,
+                column_block: 16,
+            })
+        };
+        r.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+        let l = self.copy(left, l, vec![]);
+        let r = self.copy(right, r, vec![]);
+        let mut product = output.clone();
+        product.shape.0[2] = columns;
+        product.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+        product.format.layout.tiling = TensorTiling {
+            tile_count: tiles,
+            replicas: 1,
+            axes: vec![head, rows, dim(2, grid.columns, 16, col_stride)],
+        };
+        if grid.inner > 1 {
+            product.shape.0.insert(0, u32::from(grid.inner));
+            for axis in &mut product.format.layout.tiling.axes {
+                axis.axis = TensorAxis::FromStart(axis.axis.resolve(3).ok()? as u16 + 1);
+            }
+            product
+                .format
+                .layout
+                .tiling
+                .axes
+                .push(dim(0, grid.inner, 1, inner_stride));
+        }
+        let result = self.compute(
+            vec![l, r],
+            product,
+            TileKernelSpec::Gemm {
+                multiply: Precision::F16,
+                accumulate: AccumulationPrecision::F32,
+                mode: GemmKernelMode::Initialize,
+                weights: GemmWeightLoad::Interleaved,
+                inner_block: inner_width,
+                output_columns: column_width,
+            },
+            Some(axes),
+            None,
+            vec![],
+        );
+        if grid.inner > 1 {
+            let mut reduced = output.clone();
+            reduced.shape.0[2] = columns;
+            let sum = self.emit(
+                vec![result],
+                reduced,
+                Primitive::Sum {
+                    axis: 0,
+                    staging: ReductionStaging::Complete,
+                },
+            );
+            Some(self.copy(sum, output.clone(), vec![]))
+        } else {
+            Some(self.copy(result, output.clone(), vec![]))
+        }
+    }
+}

@@ -38,10 +38,10 @@ pub use low::{
 pub(crate) use memory::*;
 pub(crate) use mid::*;
 pub use mid::{
-    AMP_COLUMN_MICRO, AmpOrder, AttentionStrategy, BlockMajorOrder, ConversionStreamingPolicy,
-    GemmOrientation, GemmOutputPacking, GemmPlanConstraint, GridOrder, Layout, LocalOperandStaging,
-    MemoryClass, MidOperator, PipelineConfig, Precision, ReductionStaging, ShardExtent,
-    TensorFormat, TensorType,
+    AMP_COLUMN_MICRO, AmpOrder, AttentionProducts, AttentionStrategy, BlockMajorOrder,
+    ConversionStreamingPolicy, GemmOrientation, GemmOutputPacking, GemmPlanConstraint, GridOrder,
+    Layout, LocalOperandStaging, MemoryClass, MidOperator, PipelineConfig, Precision,
+    ReductionStaging, ShardExtent, TensorFormat, TensorType,
 };
 pub use package::{
     CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageConfig,

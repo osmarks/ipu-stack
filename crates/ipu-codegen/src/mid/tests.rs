@@ -1137,7 +1137,9 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
             .collect::<Vec<_>>();
         let output = graph.flash_attention(split[0], split[1], split[2]).unwrap();
         graph.set_outputs([output]).unwrap();
-        let mut config = PipelineConfig::new(tiles).with_automatic_input(input, Precision::F16);
+        let mut config = PipelineConfig::new(tiles)
+            .with_attention_products(AttentionProducts::SharedRows)
+            .with_automatic_input(input, Precision::F16);
         for parameter in parameters {
             config = config.with_automatic_input(parameter, Precision::F16);
         }
@@ -1449,6 +1451,7 @@ fn materialized_attention_packs_values_for_the_full_product() {
     graph.set_outputs([output]).unwrap();
     let config = PipelineConfig::new(64)
         .with_attention_strategy(AttentionStrategy::Materialized)
+        .with_attention_products(AttentionProducts::SharedRows)
         .with_automatic_input(query, Precision::F16)
         .with_automatic_input(key, Precision::F16)
         .with_automatic_input(value, Precision::F16);
@@ -1896,7 +1899,19 @@ fn automatic_repeat_state_keeps_an_unreplicated_boundary() {
 
 #[test]
 fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
-    for strategy in [AttentionStrategy::Flash, AttentionStrategy::Materialized] {
+    for (strategy, products) in [
+        (AttentionStrategy::Flash, AttentionProducts::SharedRows),
+        (
+            AttentionStrategy::Materialized,
+            AttentionProducts::SharedRows,
+        ),
+        (AttentionStrategy::Materialized, AttentionProducts::QkOnly),
+        (AttentionStrategy::Materialized, AttentionProducts::PvOnly),
+        (
+            AttentionStrategy::Materialized,
+            AttentionProducts::Independent,
+        ),
+    ] {
         let mut graph = ComputeGraph::new();
         let q = graph.host_input("q", [4, 17, 72]).unwrap();
         let k = graph.host_input("k", [4, 73, 72]).unwrap();
@@ -1905,6 +1920,7 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
         graph.set_outputs([result]).unwrap();
         let config = PipelineConfig::new(64)
             .with_attention_strategy(strategy)
+            .with_attention_products(products)
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
@@ -1912,13 +1928,31 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
             .unwrap()
             .remove(0);
         let tiles = crate::low::expand::expand_tiles(&mid).unwrap();
+        let tiled = crate::low::lower_to_tiles(&tiles, false);
+        crate::KernelBuildPlan::from_program(&tiled).unwrap();
+        for phase in &tiles.exchange_phases {
+            for transfer in &phase.transfers {
+                let source = &tiles.shards[transfer.source.shard.index() as usize];
+                let spans = match transfer.span_order(&tiles.shards) {
+                    crate::CopyOrder::Physical => crate::view_byte_spans(source, &transfer.source),
+                    crate::CopyOrder::Semantic => {
+                        crate::logical_view_byte_spans(source, &transfer.source)
+                    }
+                }
+                .unwrap();
+                assert!(
+                    spans.iter().all(|span| span.bytes.is_multiple_of(4)),
+                    "half-word transfer: {products:?} {transfer:?}"
+                );
+            }
+        }
         let mut total = [0u64; 2];
         for flops in tiles.kernel_runs.iter().filter_map(|run| run.product_flops) {
             assert!(flops[0] <= flops[1]);
             total[0] += flops[0];
             total[1] += flops[1];
         }
-        assert_eq!(total[0], 4 * 4 * 17 * 73 * 72, "{strategy:?}");
+        assert_eq!(total[0], 4 * 4 * 17 * 73 * 72, "{strategy:?}/{products:?}");
         assert!(total[0] < total[1]);
     }
 }

@@ -68,6 +68,8 @@ pub(crate) fn implement(
             *distribution,
         )?,
         OperatorDispatch::Attention {
+            query_key,
+            probability_value,
             materialized,
             key_block_rows,
             padded_query_dimension,
@@ -78,6 +80,8 @@ pub(crate) fn implement(
             *padded_query_dimension,
             *padded_value_dimension,
             *materialized,
+            *query_key,
+            *probability_value,
         )?,
     };
     b.program.outputs = vec![result];

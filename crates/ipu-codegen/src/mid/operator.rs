@@ -127,6 +127,8 @@ pub enum OperatorDispatch {
         distribution: GemmDistribution,
     },
     Attention {
+        query_key: Option<ProductGrid>,
+        probability_value: Option<ProductGrid>,
         /// Full-key materialization or online softmax over successive blocks.
         materialized: bool,
         key_block_rows: u32,
@@ -175,6 +177,15 @@ pub enum GemmDistribution {
         result_column_partitions: u16,
         reduction_staging: ReductionStaging,
     },
+}
+
+/// Per-batch product partition counts. Physical tile identities and local calls
+/// remain the responsibility of low expansion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProductGrid {
+    pub rows: u16,
+    pub columns: u16,
+    pub inner: u16,
 }
 
 /// Lifetime policy for partials reduced across a GEMM's K partitions.
@@ -779,6 +790,7 @@ impl OperatorPlan {
                     key_block_rows,
                     padded_query_dimension,
                     padded_value_dimension,
+                    ..
                 },
             ) => {
                 let [query, key, value] = inputs else {

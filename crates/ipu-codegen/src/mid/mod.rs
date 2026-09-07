@@ -47,6 +47,21 @@ pub(crate) fn lower_finalists(
             }
         }
     }
+    if config.attention_products == AttentionProducts::Automatic
+        && config.attention_strategy != AttentionStrategy::Flash
+        && graph
+            .operations()
+            .iter()
+            .any(|op| matches!(op.kind, OperationKind::FlashAttention(_)))
+    {
+        let mut baseline = config.clone();
+        baseline.attention_products = AttentionProducts::SharedRows;
+        for candidate in planner::plan_finalists(graph, &baseline, costs, count)? {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
     let resolved = candidates
         .into_iter()
         .map(|program| implementation::resolve(program).ok_or(LoweringError::InvalidImplementation))
@@ -152,6 +167,7 @@ pub struct PipelineConfig {
     /// Restricts attention planning to one execution strategy for controlled
     /// benchmarking; automatic planning retains both alternatives.
     pub attention_strategy: AttentionStrategy,
+    pub attention_products: AttentionProducts,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -175,6 +191,17 @@ pub enum AttentionStrategy {
     Materialized,
 }
 
+/// Restrict product-layout choices for controlled attention comparisons.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttentionProducts {
+    #[default]
+    Automatic,
+    SharedRows,
+    QkOnly,
+    PvOnly,
+    Independent,
+}
+
 impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
         Self {
@@ -196,6 +223,7 @@ impl PipelineConfig {
             exchange_diagnostics: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
             attention_strategy: AttentionStrategy::Automatic,
+            attention_products: AttentionProducts::Automatic,
         }
     }
 
@@ -218,6 +246,11 @@ impl PipelineConfig {
 
     pub fn with_exchange_schedule_finalists(mut self, finalists: usize) -> Self {
         self.exchange_schedule_finalists = finalists.max(1);
+        self
+    }
+
+    pub fn with_attention_products(mut self, products: AttentionProducts) -> Self {
+        self.attention_products = products;
         self
     }
 
