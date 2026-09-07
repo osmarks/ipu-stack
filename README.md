@@ -69,5 +69,9 @@ ipu-stack profile-query profile.capnp --group-by kernel
 ipu-stack host-run application.ipuexe bootloader.elf config.bin graph
 ```
 
+New profiles include [kernel useful-work estimates](docs/PROFILE_USEFUL_WORK.md)
+in the renderer and query output, separating arithmetic efficiency from padding
+and tile occupancy.
+
 The CLI intentionally excludes graph construction, allocation, model commands,
 diagnostic workload generation, and format-conversion experiments.

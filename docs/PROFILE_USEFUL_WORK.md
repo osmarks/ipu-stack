@@ -58,3 +58,42 @@ which makes rate/geometry mistakes visible instead of hiding them by clipping.
 The model is in `crates/ipu-codegen/src/package/profile_work.rs`. Adding a kernel
 requires a useful-work numerator and an explicit basis; it does not require
 running code generation during planning or changing the exchange scheduler.
+
+## Hardware check (2026-09-07)
+
+A fresh 1,472-tile SigLIP streaming-attention profile passed all 839,808 output
+checks and took 355,320 cycles after the renderer's initial-entry crop. Selected
+cycle-weighted kernel estimates:
+
+| Kernel group | Useful efficiency | Lane occupancy |
+| --- | ---: | ---: |
+| Large-row projection GEMM, K384/C16 | 72.4% | 99.0% |
+| Small-row attention QK, K80/C64 | 13.0% | 85.4% |
+| Small-row attention PV, K64/C80 | 12.9% | 85.4% |
+| Full-block softmax | 51.8% | 100.0% |
+| AMP unpack, full rows | 8.5% | 100.0% |
+| AMP unpack, padded row tail | 4.2% | 56.2% |
+
+The attention GEMMs' low efficiency is largely outside AMP arithmetic, rather
+than simply wasted lanes. This makes the distinction that active-tile occupancy
+alone concealed. The copy figures use the dense-copy baseline, not AMP MFU.
+
+Artifacts: `artifacts/useful-work/attention/{execution.ipuprofile,profile.html,summary.json,kernel-work.png}`.
+Headless Chromium rendered all 22 groups with values matching `profile-query`;
+clicking a kernel correctly narrowed the table and timeline. The codegen test
+suite passed (131 tests plus the new attention FLOP regression; one pre-existing
+ignored test), all 11 profile tests passed, and Clippy passed for codegen,
+profile, and CLI.
+
+The batch-1 MLP also passed hardware validation (maximum absolute error 0.001221)
+and took 175,578 cropped cycles. Its GEMM groups show 84.6–89.3% useful efficiency,
+GeLU 54.7%, and reductions 62.4%. Their useful lane occupancy is 99.2–100%.
+Artifacts are under `artifacts/useful-work/mlp/`. Both completed hardware workloads
+were measured once. An initial MLP build used the benchmark's batch-4 default and
+was stopped during CPU exchange-placement work; its log is retained under
+`artifacts/useful-work/mlp-b4-build/`.
+
+Reproduce the MLP case with `ipu-trivial-test c600-init.ipucfg --workload
+siglip-mlp-benchmark --mlp-batch 1 --package model.ipuexe --profile-output
+execution.ipuprofile`; the attention case uses `--workload
+siglip-attention-benchmark --attention-strategy flash` instead.
