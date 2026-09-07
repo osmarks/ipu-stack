@@ -29,7 +29,7 @@ pub(crate) fn lower_finalists(
     costs: &impl CostModel,
     count: usize,
 ) -> LoweringResult<Vec<MidProgram>> {
-    let mut candidates = planner::plan_finalists(graph, config, costs, count)?;
+    let mut configurations = vec![config.clone()];
     // New storage choices must not evict the native baseline from a bounded
     // beam before the complete implementations can be compared. This repeats
     // compact planning only; identical candidates share one tile expansion.
@@ -41,11 +41,7 @@ pub(crate) fn lower_finalists(
     {
         let mut native = config.clone();
         native.gemm_output_packing = GemmOutputPacking::Native;
-        for candidate in planner::plan_finalists(graph, &native, costs, count)? {
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
+        configurations.push(native);
     }
     if config.attention_products == AttentionProducts::Automatic
         && config.attention_strategy != AttentionStrategy::Flash
@@ -54,9 +50,16 @@ pub(crate) fn lower_finalists(
             .iter()
             .any(|op| matches!(op.kind, OperationKind::FlashAttention(_)))
     {
-        let mut baseline = config.clone();
-        baseline.attention_products = AttentionProducts::SharedRows;
-        for candidate in planner::plan_finalists(graph, &baseline, costs, count)? {
+        // Preserve the shared-row baseline with both projection-store choices.
+        for index in 0..configurations.len() {
+            let mut baseline = configurations[index].clone();
+            baseline.attention_products = AttentionProducts::SharedRows;
+            configurations.push(baseline);
+        }
+    }
+    let mut candidates = Vec::new();
+    for configuration in configurations {
+        for candidate in planner::plan_finalists(graph, &configuration, costs, count)? {
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);
             }
