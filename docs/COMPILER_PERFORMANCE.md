@@ -238,3 +238,22 @@ The next observed hotspots are the main `ReadyTransfer` queue, earliest feasible
 transfer search and row encoding. Updating the main heap root in place was also
 tried, but a million-refresh benchmark was effectively flat (161 ms pop/push,
 164 ms in-place), so that follow-up was discarded. It is not part of these gains.
+
+### Attention behavior check
+
+Rebuilt batch-one FP8 streaming attention with separate and fused QKV projections
+using grouped repair (`artifacts/grouped-repair/attention-{separate,fused}`). Both
+complete packages are byte-for-byte identical to their pre-grouping versions in
+`artifacts/joint-placement/attention-{b1,fused-b1}`. SHA-256: separate
+`e6690bf893b5422f45e5fb1cb28fdaf3cf44a233a1fe8b4c934fb584d758385a`, fused
+`5e9207af0986d1684053008332fac6375c4bf7344c9bc63efd31c1df01ff06f7`.
+The builds used `--inspect-exchanges` to stop before hardware execution; identical
+packages do not need repeated device timing.
+
+This is an observed equivalence for these workloads, not a general guarantee.
+Grouping chooses fresh within-group priorities, whereas the old per-transfer
+heap could retain stale receive-continuation priorities. Proposed orders may
+therefore differ. Dependencies remain unchanged and proposals are accepted only
+when the physical scheduler scores them better than the incumbent. That guard
+does not guarantee equivalence to, or improvement over, the old optimizer's final
+result on every input.
