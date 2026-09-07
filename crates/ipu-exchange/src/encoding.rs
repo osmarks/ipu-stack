@@ -101,7 +101,7 @@ pub(super) fn build_scheduled_program(
     let mut event_index = resume.events;
     for (sender_index, sender) in senders.iter().enumerate().skip(resume.senders) {
         let split = event_index
-            + events[event_index..].partition_point(|event| event.cycles < sender.start_cycles);
+            + events[event_index..].partition_point(|event| event.cycles <= sender.start_cycles);
         append_receive_events_record(
             &mut words,
             &mut event_cycles,
@@ -270,5 +270,29 @@ mod tests {
                 builder.finish().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn receive_control_at_send_start_is_issued_before_the_payload() {
+        // A 28-word multicast loopback from the FP8 MLP has its mux teardown
+        // at exactly the first outgoing word. The control is issued one cycle
+        // earlier, so it belongs to the preceding receive-only interval.
+        let mut schedule = TileProgramSchedule::default();
+        schedule.senders.push(ScheduledSenderRow {
+            row: [
+                1098907651, 1084227612, 2070642691, 1134559232, 0, 0, 0, 0, 0,
+            ],
+            start_cycles: 5354,
+            end_cycles: 5382,
+        });
+        schedule.receive_events.push(ReceiveEvent {
+            cycles: 5354,
+            instruction: 1678165568,
+            kind: ReceiveEventKind::OrdinaryNeutral,
+        });
+        schedule.event_cycles = 5382;
+        let words = schedule.finish().unwrap();
+        assert_eq!(plan_event_cycles(&words).unwrap(), 5382);
+        diagnostic::validate_tile_program(0, &schedule, &words).unwrap();
     }
 }
