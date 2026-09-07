@@ -1,0 +1,3 @@
+[build]
+# This workspace builds host tools locally; IPU kernels use their own toolchain.
+rustflags = ["-C", "target-cpu=native"]
