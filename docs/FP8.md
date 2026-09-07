@@ -14,9 +14,9 @@ The activation-aware reconstruction tool `tools/quantize_siglip_f143.py` was
 recovered unchanged from commit `66d71b6`. It supports block-diagonal GPTQ,
 sequential calibration, bounded LayerNorm equalization, and bias correction.
 It writes reconstructed floating-point SafeTensors, not device-ready bytes.
-Its default independently scaled 64x64 weight blocks still require a model
-import path carrying those scales into the chosen GEMM blocks; restoring the
-tool alone does not provide that integration.
+Its default independently scaled 64x64 weight blocks are not integrated.
+The runtime uses tensor-wide scales; per-block scale integration is not planned
+for this path.
 
 ## Compiler selection
 
@@ -30,13 +30,22 @@ not calibration for arbitrary model activations.
 
 The compiler represents casts and layout changes explicitly. AMP panel widths
 change from 16 elements in F16 to 32 in FP8, so a flat cast of packed F16 bytes
-is incorrect. The current path redistributes through row-major storage with
-the consumer's ownership before casting, then packs the FP8 operand. The
-common quantizer uses vector F16 loads and `f16v8tof8`; it writes FP8, while
-GEMMs and reductions still write F16. Packing and unpacking remain a meaningful
-performance and temporary-memory cost. Attention's QK/PV products stay F16.
+is incorrect. F16-to-FP8 conversion now redistributes into the consumer's
+**packed F16 order**, then quantizes while regrouping pairs of panels. Automatic
+host inputs are populated in that order directly. This removes the row-major
+unpack/cast/repack intermediate and its byte-sized permutation kernels.
 
-The same cast price is used by conversion insertion, compact mid costing,
+The regrouping is shared by AMP left, transposed left/right, and block-major
+operand formats. A row comprises two contiguous 16-half source spans; four
+`f16v8tof8` instructions produce one contiguous 32-byte FP8 row. A 14-bundle
+hardware repeat body combines vector conversion with loads/stores, without a
+software row loop. Workers share large panels by rows and handle whole small
+panels when at least six are available. Flat F16-to-FP8 casts use a four-bundle
+repeat body per eight values, with a masked tail. Other FP8 cast directions
+retain the row-major fallback. GEMMs, reductions, GELU, and attention's QK/PV
+products still write/use F16.
+
+The same panel-aware cast price is used by conversion insertion, compact mid costing,
 and expanded kernel costing. Native FP8 GEMM estimates use the retained
 instruction structure with 32-element K groups, including coefficient loads
 and launch overhead; they do not assume ideal AMP throughput.
@@ -79,3 +88,38 @@ Rendered profiles are `artifacts/fp8/mlp-b1-final/profile.html` and
 `artifacts/fp8/attention-b1-final/profile.html`. Batch-two/three-block MLP still
 fails the same arena estimate with the calibrated prices. Weight replication
 counts remain as reported above.
+
+## Packed conversion performance update
+
+After removing the row-major FP8 preparation path and replacing the quantizer
+loops, the final batch-one hardware results are:
+
+| Workload | Previous FP8 | Packed/vector FP8 | Reduction |
+| --- | ---: | ---: | ---: |
+| MLP, 729x1152x4304 | 215,166 | 151,998 | 29.4% |
+| Fused projected attention, 16 heads | 240,780 | 176,994 | 26.5% |
+
+These are renderer-cropped cycles. The retained F16 comparison profiles measure
+175,578 for MLP (`artifacts/useful-work/mlp/execution.ipuprofile`) and 195,096
+for fused projected attention (`artifacts/qkv-fusion/fused/execution.ipuprofile`).
+The new FP8 runs are respectively 13.4% and 9.3% faster than those profiles;
+these are end-to-end workloads, including operations that remain F16.
+
+The attention quantizer's maximum duration falls from 14,124 to 4,914 cycles,
+including its panel regrouping. The large FP8 `static_copy_u32` packing stage
+is removed. F16 Q/K unpacking and other attention preparation remain. The MLP
+planner now selects approximately **one resident copy of each weight matrix**:
+4,958,208 bytes up and 4,976,640 bytes down, including padding. QKV remains at
+46 resident copies (183,140,352 bytes). Automatic packed host-input bindings
+are replicated: MLP input storage is 50,457,600 bytes and attention input
+storage 27,131,904 bytes. This choice avoids device preparation for the external
+input; intermediate activations still require the planned device exchanges.
+
+Final rendered profiles are `artifacts/fp8-fast/mlp/profile.html` and
+`artifacts/fp8-fast/attention/profile.html`; their matching binaries and raw
+profiles are `model-panel.ipuexe` and `profile-panel.ipuprof` in each directory.
+Gaussian checks pass (MLP maximum absolute error 0.026241; attention 0.000910).
+Two-block uneven MLP and two-block four-head fused attention also pass (0.019749
+and 0.000170). The storage-coordinate regression checks every element of
+rectangular AMP and block-major matrices against the independent host codecs.
+142 codegen tests, four workload tests, the doctest, and Clippy pass.

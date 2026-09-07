@@ -9,8 +9,8 @@ pub(crate) fn cast_cycles(from: Precision, to: Precision, elements: u64, panel_r
         (Precision::F16, Precision::F8F143 { .. }) => {
             if panel_rows != 0 {
                 // Four vector conversions per row, in a 14-bundle repeat body.
-                // All workers visit each panel; include short-row imbalance and
-                // pointer/setup work between panels, without expanding tile IR.
+                // Match whole-panel versus row sharing, including imbalance and
+                // setup between panels, without expanding tile IR.
                 let panels = elements.div_ceil(panel_rows.saturating_mul(32));
                 if panel_rows <= 32 && panels >= 6 {
                     330 + panels.div_ceil(6).saturating_mul(120 + panel_rows * 84)
