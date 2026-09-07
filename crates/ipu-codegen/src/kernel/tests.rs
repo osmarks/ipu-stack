@@ -6,6 +6,40 @@ use crate::{
 };
 
 #[test]
+fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [8, 4, 32]).unwrap();
+    let bias = graph.host_input("bias", [1, 4, 32]).unwrap();
+    let output = graph.add(x, bias).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_major(TensorTiling::sharded(crate::TensorAxis::FromEnd(1), 4)),
+    };
+    let config = PipelineConfig::new(4)
+        .with_input(x, format.clone())
+        .with_input(bias, format);
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+    let build = KernelBuildPlan::from_program(&low).unwrap();
+    let addresses = low
+        .shards
+        .iter()
+        .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
+        .collect();
+    for run in &low.kernel_runs {
+        if matches!(run.kernel, TileKernelSpec::Add) {
+            materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new()).unwrap();
+            assert_eq!(
+                run.inputs[1].views[0].extents.last().unwrap().physical_end
+                    - run.inputs[1].views[0].extents.last().unwrap().start,
+                8
+            );
+        }
+    }
+}
+
+#[test]
 fn packed_add_keeps_padding_in_dense_operand_views() {
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [2, 3, 32]).unwrap();

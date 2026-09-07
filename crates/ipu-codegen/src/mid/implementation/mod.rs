@@ -18,11 +18,7 @@ pub(crate) fn implement(
             let mut operands = Vec::new();
             for (index, input) in inputs.iter().enumerate() {
                 let mut resident = input.clone();
-                resident.format.layout.tiling = if input.shape == output.shape {
-                    output.format.layout.tiling.clone()
-                } else {
-                    TensorTiling::replicated(output.format.layout.tiling.tile_count)
-                };
+                resident.format.layout.tiling = pointwise_input_tiling(input, output)?;
                 operands.push(b.copy(MidValueId(index as u32), resident, vec![]));
             }
             let reuse = match &plan.requirements.output_aliasing {
@@ -103,6 +99,37 @@ pub(crate) fn implement(
     b.program.estimated_exchange_cycles = cycles.exchange;
     b.program.peak_memory = peak;
     Some(Arc::new(b.program))
+}
+
+/// Project the output's ownership onto non-broadcast operand dimensions.
+/// Replicating a whole multi-row parameter and then selecting its columns
+/// leaves strided views; partition it before dispatch instead.
+fn pointwise_input_tiling(input: &TensorType, output: &TensorType) -> Option<TensorTiling> {
+    let tiling = &output.format.layout.tiling;
+    if input.shape == output.shape {
+        return Some(tiling.clone());
+    }
+    let offset = output.shape.0.len().checked_sub(input.shape.0.len())?;
+    let mut replicas = tiling.replicas;
+    let mut axes = Vec::new();
+    for (dim, stride) in tiling.axes.iter().zip(tiling.axis_strides().ok()?) {
+        let index = dim.axis.resolve(output.shape.0.len()).ok()?;
+        if let Some(input_axis) = index.checked_sub(offset)
+            && input.shape.0[input_axis] != 1
+        {
+            let mut dim = *dim;
+            dim.axis = TensorAxis::FromStart(input_axis as u16);
+            dim.tile_stride = Some(u16::try_from(stride).ok()?);
+            axes.push(dim);
+        } else {
+            replicas = replicas.checked_mul(dim.partitions)?;
+        }
+    }
+    Some(TensorTiling {
+        tile_count: tiling.tile_count,
+        replicas,
+        axes,
+    })
 }
 
 struct Builder {
