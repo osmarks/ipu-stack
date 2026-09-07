@@ -273,6 +273,78 @@ fn repair_ready(
     }
 }
 
+// Transfers with identical endpoint roles share availability and pressure.
+// Keep one global heap entry per group, rather than refreshing every transfer
+// whenever their common sender or receiver advances.
+#[derive(Default)]
+struct RepairGroup {
+    ready: BTreeSet<RepairReady>,
+    by_address: BTreeMap<(u16, u32), Vec<usize>>,
+    revision: usize,
+}
+
+fn repair_rank(
+    index: usize,
+    rank: &[usize],
+    epoch_width: usize,
+    neighborhood: &[bool],
+) -> RepairReady {
+    RepairReady {
+        earliest_start: Reverse(0),
+        epoch: Reverse(rank[index] / epoch_width),
+        contiguous_receivers: 0,
+        in_neighborhood: neighborhood[index],
+        endpoint_pressure: 0,
+        incumbent_rank: Reverse(rank[index]),
+        index: Reverse(index),
+    }
+}
+
+impl RepairGroup {
+    fn best(
+        &self,
+        pending: &[PendingTransfer],
+        availability: &[TileAvailability],
+        next_receive_address: &[Option<u32>],
+        word_pressure: &[u64],
+        rank: &[usize],
+        epoch_width: usize,
+        neighborhood: &[bool],
+    ) -> Option<RepairReady> {
+        let first = self.ready.last()?.index.0;
+        let price = |index| {
+            repair_ready(
+                index,
+                pending,
+                availability,
+                next_receive_address,
+                word_pressure,
+                rank,
+                epoch_width,
+                neighborhood,
+            )
+        };
+        let mut best = price(first);
+        // The static winner suffices unless another ready transfer continues
+        // a receive stream. Index those exceptions by address instead of
+        // rescanning all transfers in the group.
+        for &(tile, _) in &pending[first].destinations {
+            let Some(address) = next_receive_address[usize::from(tile)] else {
+                continue;
+            };
+            if let Some(indices) = self.by_address.get(&(tile, address)) {
+                for &index in indices {
+                    let key = repair_rank(index, rank, epoch_width, neighborhood);
+                    if key.epoch == best.epoch && self.ready.contains(&key) {
+                        best = best.max(price(index));
+                    }
+                }
+            }
+        }
+        Some(best)
+    }
+}
+
 pub(super) fn critical_neighborhood_order(
     pending: &[PendingTransfer],
     tile_count: u16,
@@ -343,26 +415,40 @@ pub(super) fn critical_neighborhood_order(
     }
     let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
     let mut next_receive_address = vec![None; usize::from(tile_count)];
-    let mut ready = BinaryHeap::new();
-    for (index, &indegree) in indegrees.iter().enumerate() {
-        if indegree == 0 {
-            ready.push(repair_ready(
-                index,
-                pending,
-                &availability,
-                &next_receive_address,
-                &word_pressure,
-                &rank,
-                epoch_width,
-                &neighborhood,
-            ));
+    let mut group_ids = BTreeMap::new();
+    let mut groups = Vec::<RepairGroup>::new();
+    let mut transfer_groups = Vec::with_capacity(pending.len());
+    for (index, transfer) in pending.iter().enumerate() {
+        let mut receivers = transfer
+            .destinations
+            .iter()
+            .map(|entry| entry.0)
+            .collect::<Vec<_>>();
+        receivers.sort_unstable();
+        let next = groups.len();
+        let group = *group_ids
+            .entry((transfer.source, transfer.reserved_source, receivers))
+            .or_insert(next);
+        if group == next {
+            groups.push(RepairGroup::default());
+        }
+        transfer_groups.push(group);
+        for &destination in &transfer.destinations {
+            groups[group]
+                .by_address
+                .entry(destination)
+                .or_default()
+                .push(index);
+        }
+        if indegrees[index] == 0 {
+            groups[group]
+                .ready
+                .insert(repair_rank(index, &rank, epoch_width, &neighborhood));
         }
     }
-    let mut order = Vec::with_capacity(pending.len());
-    while let Some(candidate) = ready.pop() {
-        let index = candidate.index.0;
-        let refreshed = repair_ready(
-            index,
+    let mut ready = BinaryHeap::new();
+    for (id, group) in groups.iter().enumerate() {
+        if let Some(best) = group.best(
             pending,
             &availability,
             &next_receive_address,
@@ -370,11 +456,34 @@ pub(super) fn critical_neighborhood_order(
             &rank,
             epoch_width,
             &neighborhood,
-        );
-        if refreshed != candidate {
-            ready.push(refreshed);
+        ) {
+            ready.push((best, id, group.revision));
+        }
+    }
+    let mut order = Vec::with_capacity(pending.len());
+    while let Some((candidate, group, revision)) = ready.pop() {
+        if revision != groups[group].revision {
             continue;
         }
+        let Some(refreshed) = groups[group].best(
+            pending,
+            &availability,
+            &next_receive_address,
+            &word_pressure,
+            &rank,
+            epoch_width,
+            &neighborhood,
+        ) else {
+            continue;
+        };
+        if refreshed != candidate {
+            ready.push((refreshed, group, revision));
+            continue;
+        }
+        let index = candidate.index.0;
+        groups[group]
+            .ready
+            .remove(&repair_rank(index, &rank, epoch_width, &neighborhood));
         let transfer = &pending[index];
         let start = candidate.earliest_start.0;
         let items = transfer.item_count().unwrap_or(transfer.words);
@@ -399,19 +508,31 @@ pub(super) fn critical_neighborhood_order(
                 word_pressure[usize::from(tile)].saturating_sub(u64::from(items));
         }
         order.push(index);
+        let mut changed = vec![group];
         for dependent in std::mem::take(&mut dependents[index]) {
             indegrees[dependent] -= 1;
             if indegrees[dependent] == 0 {
-                ready.push(repair_ready(
-                    dependent,
-                    pending,
-                    &availability,
-                    &next_receive_address,
-                    &word_pressure,
-                    &rank,
-                    epoch_width,
-                    &neighborhood,
-                ));
+                let id = transfer_groups[dependent];
+                groups[id]
+                    .ready
+                    .insert(repair_rank(dependent, &rank, epoch_width, &neighborhood));
+                changed.push(id);
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        for id in changed {
+            groups[id].revision += 1;
+            if let Some(best) = groups[id].best(
+                pending,
+                &availability,
+                &next_receive_address,
+                &word_pressure,
+                &rank,
+                epoch_width,
+                &neighborhood,
+            ) {
+                ready.push((best, id, groups[id].revision));
             }
         }
     }
@@ -419,5 +540,116 @@ pub(super) fn critical_neighborhood_order(
         order
     } else {
         incumbent.order.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transfers(count: usize) -> Vec<PendingTransfer> {
+        (0..count)
+            .map(|index| PendingTransfer {
+                source: 0,
+                reserved_source: None,
+                source_shard: BlockValueId::from_index(0),
+                source_offset: 0,
+                source_addresses: vec![0x40000],
+                source_elements: effective_memory_elements(0x40000, 1),
+                destinations: vec![(1, 0x80000 + index as u32 * 4)],
+                words: 1,
+                width: ExchangeItemWidth::Word32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_repair_priority_matches_exhaustive_ready_selection() {
+        let mut random = fastrand::Rng::with_seed(0x6772_6f75_705f_7265);
+        let mut pending = transfers(256);
+        for (index, transfer) in pending.iter_mut().enumerate() {
+            transfer.reserved_source = Some(3);
+            transfer
+                .destinations
+                .push((2, 0x90000 + (255 - index as u32) * 8));
+        }
+        let rank = (0..pending.len()).collect::<Vec<_>>();
+        for _ in 0..128 {
+            let neighborhood = (0..pending.len())
+                .map(|_| random.bool())
+                .collect::<Vec<_>>();
+            let mut group = RepairGroup::default();
+            for (index, transfer) in pending.iter().enumerate() {
+                for &address in &transfer.destinations {
+                    group.by_address.entry(address).or_default().push(index);
+                }
+                if random.bool() {
+                    group
+                        .ready
+                        .insert(repair_rank(index, &rank, 16, &neighborhood));
+                }
+            }
+            let next = [
+                None,
+                Some(0x80000 + random.u32(0..256) * 4),
+                Some(0x90000 + random.u32(0..256) * 8),
+                None,
+            ];
+            let availability = vec![TileAvailability::default(); 4];
+            let pressure = [13, 47, 31, 19];
+            let expected = group
+                .ready
+                .iter()
+                .map(|key| {
+                    repair_ready(
+                        key.index.0,
+                        &pending,
+                        &availability,
+                        &next,
+                        &pressure,
+                        &rank,
+                        16,
+                        &neighborhood,
+                    )
+                })
+                .max();
+            assert_eq!(
+                group.best(
+                    &pending,
+                    &availability,
+                    &next,
+                    &pressure,
+                    &rank,
+                    16,
+                    &neighborhood
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual repair-queue scaling benchmark"]
+    fn repair_queue_scaling() {
+        for count in [4096, 16384, 65536] {
+            let pending = transfers(count);
+            let mut incumbent = MaterializedSchedule::new(2, &pending);
+            incumbent.order = (0..count).collect();
+            for (index, timing) in incumbent.timings.iter_mut().enumerate() {
+                *timing = Some(MaterializedTiming {
+                    start: index as u32,
+                    end: index as u32 + 1,
+                    blocking_tile: 0,
+                    predecessor: index.checked_sub(1),
+                });
+            }
+            let start = std::time::Instant::now();
+            let result = critical_neighborhood_order(&pending, 2, &incumbent);
+            eprintln!(
+                "repair_queue transfers={count} elapsed={:?}",
+                start.elapsed()
+            );
+            assert_eq!(result, incumbent.order);
+        }
     }
 }
