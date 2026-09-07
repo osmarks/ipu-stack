@@ -63,64 +63,15 @@ pub(super) fn instrument_profile(
         if schedule.len() != tile_program.steps.len() {
             return Err(invalid("tile profile work does not match finalized steps"));
         }
-        let same_call = std::iter::once(false).chain(tile_program.steps.windows(2).map(|pair| {
-            matches!((&pair[0], &pair[1]), (crate::TileStep::Compute(a), crate::TileStep::Compute(b))
-                if a.symbol == b.symbol && a.arguments == b.arguments)
-        })).collect::<Vec<_>>();
-        for (index, (&work, step)) in schedule.iter().zip(&mut tile_program.steps).enumerate() {
-            if index != 0 && profile_work_can_merge(schedule[index - 1], work) {
-                continue;
-            }
-            let following = schedule[index + 1..].iter().find_map(|work| match work {
-                crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
-                crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
-                crate::TileWorkRef::Exchange(_)
-                | crate::TileWorkRef::LocalCopy(_)
-                | crate::TileWorkRef::Checkpoint(..) => None,
-            });
-            step_profile(step).before = Some(profile_address(address, plans.len())?);
-            let mut description = profile_step(
-                program,
-                exchanges,
-                logical_tile,
-                index,
-                work,
-                step,
-                following,
-            )?;
-            let invocations = schedule[index + 1..]
-                .iter()
-                .take_while(|&&next| profile_work_can_merge(work, next))
-                .count()
-                + 1;
-            super::profile_work::append_work_estimate(
-                &mut description.metadata,
-                &schedule[index..index + invocations],
-            );
-            description.metadata.push(ProfileMetadata {
-                name: "invocations".into(),
-                value: invocations.to_string(),
-            });
-            if let crate::TileStep::Compute(call) = step {
-                // Rendering may group calls with different sizes. Only groups
-                // with identical executable ABIs can be averaged for costing.
-                description.metadata.extend([
-                    ProfileMetadata {
-                        name: "uniformInvocations".into(),
-                        value: same_call[index + 1..index + invocations]
-                            .iter()
-                            .all(|same| *same)
-                            .to_string(),
-                    },
-                    ProfileMetadata {
-                        name: "arguments".into(),
-                        value: format!("{:?}", call.arguments),
-                    },
-                ]);
-            }
-            description.local_index = u32::try_from(plans.len())?;
-            plans.push(description);
-        }
+        instrument_active_steps(
+            program,
+            exchanges,
+            logical_tile,
+            &schedule,
+            &mut tile_program.steps,
+            address,
+            &mut plans,
+        )?;
     } else {
         let schedule = inactive_profile_work(program);
         if schedule.len() != tile_program.steps.len() {
@@ -173,6 +124,121 @@ pub(super) fn instrument_profile(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn instrument_active_steps(
+    program: &LowProgram,
+    exchanges: &[crate::PhysicalExchangePhase],
+    logical_tile: u16,
+    schedule: &[crate::TileWorkRef<'_>],
+    steps: &mut [crate::TileStep],
+    address: u32,
+    plans: &mut Vec<ProfileStep>,
+) -> PackageBuildResult<()> {
+    if schedule.len() != steps.len() {
+        return Err(invalid(
+            "repeat profile work does not match finalized steps",
+        ));
+    }
+    let same_call = std::iter::once(false).chain(steps.windows(2).map(|pair| {
+            matches!((&pair[0], &pair[1]), (crate::TileStep::Compute(a), crate::TileStep::Compute(b))
+                if a.symbol == b.symbol && a.arguments == b.arguments)
+        })).collect::<Vec<_>>();
+    for (index, (&work, step)) in schedule.iter().zip(steps.iter_mut()).enumerate() {
+        if let (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(finalized)) =
+            (work, &mut *step)
+        {
+            let first = plans.len();
+            let schedule = program.work(&repeat.body).collect::<Vec<_>>();
+            instrument_active_steps(
+                program,
+                exchanges,
+                logical_tile,
+                &schedule,
+                &mut finalized.body,
+                address,
+                plans,
+            )?;
+            let body = plans[first..].to_vec();
+            let epoch = plans[..first]
+                .iter()
+                .map(|plan| plan.epoch)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            for description in &mut plans[first..] {
+                description.epoch = epoch;
+            }
+            for iteration in 1..repeat.count {
+                for description in &body {
+                    let mut description = description.clone();
+                    description.local_index = u32::try_from(plans.len())?;
+                    description.epoch = epoch
+                        .checked_add(iteration)
+                        .ok_or_else(|| invalid("profile epoch overflow"))?;
+                    plans.push(description);
+                }
+            }
+            continue;
+        }
+        if index != 0 && profile_work_can_merge(schedule[index - 1], work) {
+            continue;
+        }
+        let following = schedule[index + 1..].iter().find_map(|work| match work {
+            crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
+            crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
+            crate::TileWorkRef::Exchange(_)
+            | crate::TileWorkRef::LocalCopy(_)
+            | crate::TileWorkRef::Checkpoint(..) => None,
+        });
+        step_profile(step).before = Some(profile_address(address, plans.len())?);
+        let mut description = profile_step(
+            program,
+            exchanges,
+            logical_tile,
+            index,
+            work,
+            step,
+            following,
+        )?;
+        let invocations = schedule[index + 1..]
+            .iter()
+            .take_while(|&&next| profile_work_can_merge(work, next))
+            .count()
+            + 1;
+        super::profile_work::append_work_estimate(
+            &mut description.metadata,
+            &schedule[index..index + invocations],
+        );
+        description.metadata.push(ProfileMetadata {
+            name: "invocations".into(),
+            value: invocations.to_string(),
+        });
+        if let crate::TileStep::Compute(call) = step {
+            // Rendering may group calls with different sizes. Only groups
+            // with identical executable ABIs can be averaged for costing.
+            description.metadata.extend([
+                ProfileMetadata {
+                    name: "uniformInvocations".into(),
+                    value: same_call[index + 1..index + invocations]
+                        .iter()
+                        .all(|same| *same)
+                        .to_string(),
+                },
+                ProfileMetadata {
+                    name: "arguments".into(),
+                    value: format!("{:?}", call.arguments),
+                },
+            ]);
+        }
+        description.local_index = u32::try_from(plans.len())?;
+        plans.push(description);
+    }
+    if let Some(last) = steps.last_mut() {
+        step_profile(last).after = Some(profile_address(address, plans.len())?);
+    }
+    Ok(())
+}
+
 fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
     program
         .tiles
@@ -195,7 +261,12 @@ pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkLis
     let mut count = 0;
     for work in program.work(tile) {
         if previous.is_none_or(|previous| !profile_work_can_merge(previous, work)) {
-            count += 1;
+            count += match work {
+                crate::TileWorkRef::Repeat(repeat) => {
+                    profile_step_count(program, &repeat.body) * repeat.count as usize
+                }
+                _ => 1,
+            };
         }
         previous = Some(work);
     }
@@ -459,4 +530,60 @@ fn profile_address(base: u32, index: usize) -> PackageBuildResult<u32> {
             .ok_or_else(|| invalid("profile address overflow"))?,
     )
     .ok_or_else(|| invalid("profile address overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeat_profiles_each_iteration_without_unrolling_executable_work() {
+        let mut graph = crate::ComputeGraph::new();
+        let input = graph.host_input("input", [8, 16]).unwrap();
+        let output = graph
+            .repeat(3, [input], [], [], |body, arguments| {
+                let first = body.gelu(arguments.carried[0])?;
+                Ok(vec![body.gelu(first)?])
+            })
+            .unwrap()[0];
+        graph.set_outputs([output]).unwrap();
+        let config = crate::PipelineConfig::new(1).with_input(
+            input,
+            crate::TensorFormat {
+                precision: crate::Precision::F16,
+                layout: crate::Layout::row_sharded(1),
+            },
+        );
+        let mid = crate::lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+        let placement = crate::place(&low).unwrap();
+        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
+        let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600(), false)
+            .unwrap()
+            .phases;
+        let lowering = crate::TileProgramLowering::new(
+            &low, &placement, &exchanges, &kernels, 0x60000, 1, false,
+        )
+        .unwrap();
+        let mut program = lowering.lower_tile(0).unwrap();
+        let count = profile_step_count(&low, &low.tiles[0]);
+        let base = 0x58000;
+        let profile = instrument_profile(&low, &exchanges, 0, 0, &mut program, base).unwrap();
+        assert_eq!(profile.steps.len(), count);
+        let epochs = profile
+            .steps
+            .iter()
+            .map(|step| step.epoch)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(epochs, [1, 2, 3].into_iter().collect());
+        let crate::TileStep::Repeat(repeat) = &program.steps[0] else {
+            panic!("loop was unrolled");
+        };
+        assert_eq!(repeat.count, 3);
+        let mut body = repeat.body.clone();
+        let body_end = step_profile(body.last_mut().unwrap()).after.unwrap();
+        assert_eq!(body_end, base + u32::try_from(count / 3 * 4).unwrap());
+        assert_eq!(repeat.profile.after, Some(base + count as u32 * 4));
+        assert!(profile.steps.iter().all(|step| step.kernel != "repeat"));
+    }
 }

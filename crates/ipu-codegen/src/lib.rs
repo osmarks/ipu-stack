@@ -315,6 +315,7 @@ pub fn emit(
         &mut exchange_rows,
         None,
         None,
+        None,
         options.code_address,
     )?;
 
@@ -363,6 +364,7 @@ fn emit_steps(
     exchange_rows: &mut Vec<PlacedExchangeRow>,
     repeat_pointer_count: Option<usize>,
     repeat_count: Option<u32>,
+    profile_base: Option<(u16, u32)>,
     code_address: u32,
 ) -> Result<()> {
     let mut index = 0;
@@ -373,7 +375,7 @@ fn emit_steps(
             && let Some((source, destination)) = absolute_u16_copy(compute)
         {
             if let Some(address) = compute.profile.before {
-                emit_cycle_sample(code, symbols, address)?;
+                emit_cycle_sample_at(code, symbols, address, profile_base)?;
             }
             let mut copies = vec![(source, destination)];
             let mut end = index + 1;
@@ -407,7 +409,7 @@ fn emit_steps(
                 code.instruction(destination);
             }
             if let Some(address) = step_compute_profile(&steps[end - 1]).and_then(|p| p.after) {
-                emit_cycle_sample(code, symbols, address)?;
+                emit_cycle_sample_at(code, symbols, address, profile_base)?;
             }
             index = end;
             continue;
@@ -415,7 +417,7 @@ fn emit_steps(
         match step {
             TileStep::Exchange(exchange) => {
                 if let Some(address) = exchange.profile.before {
-                    emit_cycle_sample(code, symbols, address)?;
+                    emit_cycle_sample_at(code, symbols, address, profile_base)?;
                 }
                 if let Some(patch) = &exchange.setup_patch {
                     emit_exchange_setup_patch(code, exchange, patch, symbols)?;
@@ -470,7 +472,7 @@ fn emit_steps(
                 }
                 code.call(exchange.program.address, 10)?;
                 if let Some(address) = exchange.profile.after {
-                    emit_cycle_sample(code, symbols, address)?;
+                    emit_cycle_sample_at(code, symbols, address, profile_base)?;
                 }
                 exchange_rows.push(exchange.program.clone());
                 if let Some(patch) = &exchange.setup_patch {
@@ -486,16 +488,16 @@ fn emit_steps(
             }
             TileStep::Compute(compute) => {
                 if let Some(address) = compute.profile.before {
-                    emit_cycle_sample(code, symbols, address)?;
+                    emit_cycle_sample_at(code, symbols, address, profile_base)?;
                 }
                 emit_compute(code, tile, compute, symbols, repeat_pointer_count)?;
                 if let Some(address) = compute.profile.after {
-                    emit_cycle_sample(code, symbols, address)?;
+                    emit_cycle_sample_at(code, symbols, address, profile_base)?;
                 }
             }
             TileStep::Repeat(repeat) => {
                 if let Some(address) = repeat.profile.before {
-                    emit_cycle_sample(code, symbols, address)?;
+                    emit_cycle_sample_at(code, symbols, address, profile_base)?;
                 }
                 emit_repeat(
                     code,
@@ -507,7 +509,7 @@ fn emit_steps(
                     code_address,
                 )?;
                 if let Some(address) = repeat.profile.after {
-                    emit_cycle_sample(code, symbols, address)?;
+                    emit_cycle_sample_at(code, symbols, address, profile_base)?;
                 }
             }
             TileStep::Checkpoint(checkpoint) => {
@@ -775,10 +777,26 @@ fn emit_repeat(
     exchange_rows: &mut Vec<PlacedExchangeRow>,
     code_address: u32,
 ) -> Result<()> {
+    let mut profile_addresses = repeat.body.iter().flat_map(|step| {
+        let profile = match step {
+            TileStep::Compute(step) => step.profile,
+            TileStep::Exchange(step) => step.profile,
+            TileStep::Repeat(step) => step.profile,
+            TileStep::Checkpoint(step) => step.profile,
+        };
+        [profile.before, profile.after].into_iter().flatten()
+    });
+    let bounds = profile_addresses.next().map(|first| {
+        profile_addresses.fold((first, first), |(min, max), address| {
+            (min.min(address), max.max(address))
+        })
+    });
+    let profile_slot = u16::try_from(repeat.iterated_pointers.len() + 1)
+        .map_err(|_| invalid("too many repeat pointers"))?;
     let words = repeat
         .iterated_pointers
         .len()
-        .checked_add(1)
+        .checked_add(1 + usize::from(bounds.is_some()))
         .ok_or_else(|| invalid("repeat frame size overflow"))?;
     let frame_bytes = i32::try_from((words * 4).next_multiple_of(8))
         .map_err(|_| invalid("repeat frame is too large"))?;
@@ -794,6 +812,10 @@ fn emit_repeat(
             u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?,
         )?;
     }
+    if let Some((base, _)) = bounds {
+        code.setzi(0, base)?;
+        code.st32(0, 11, 15, profile_slot)?;
+    }
     let loop_start = code.address(code_address)?;
     emit_steps(
         code,
@@ -804,6 +826,7 @@ fn emit_repeat(
         exchange_rows,
         Some(repeat.iterated_pointers.len()),
         Some(repeat.count),
+        bounds.map(|(base, _)| (profile_slot, base)),
         code_address,
     )?;
     for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
@@ -811,6 +834,11 @@ fn emit_repeat(
         code.ld32(0, 11, 15, slot)?;
         code.add_unsigned(0, pointer.stride_bytes)?;
         code.st32(0, 11, 15, slot)?;
+    }
+    if let Some((base, end)) = bounds {
+        code.ld32(0, 11, 15, profile_slot)?;
+        code.add_unsigned(0, end - base)?;
+        code.st32(0, 11, 15, profile_slot)?;
     }
     code.ld32(0, 11, 15, 0)?;
     code.add_immediate(0, 0, -1)?;
@@ -886,7 +914,26 @@ fn emit_cycle_sample(
     symbols: &BTreeMap<String, u32>,
     address: u32,
 ) -> Result<()> {
-    code.setzi(2, address)?;
+    emit_cycle_sample_at(code, symbols, address, None)
+}
+
+fn emit_cycle_sample_at(
+    code: &mut TileCode,
+    symbols: &BTreeMap<String, u32>,
+    address: u32,
+    profile_base: Option<(u16, u32)>,
+) -> Result<()> {
+    if let Some((slot, base)) = profile_base {
+        code.ld32(2, 11, 15, slot)?;
+        code.add_unsigned(
+            2,
+            address
+                .checked_sub(base)
+                .ok_or_else(|| invalid("profile sample precedes repeat base"))?,
+        )?;
+    } else {
+        code.setzi(2, address)?;
+    }
     code.call(symbol(symbols, SAMPLE_CYCLE_SYMBOL)?, 10)
 }
 
