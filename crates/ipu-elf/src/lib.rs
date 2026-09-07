@@ -153,8 +153,7 @@ impl Toolchain {
         digest.update(b"ipu-stack-kernel-cache-v1\0");
         digest.update(self.target.as_bytes());
         digest.update([0]);
-        digest.update(fs::read(source)?);
-        digest.update([0]);
+        hash_local_source(&mut digest, source, &mut HashSet::new())?;
         if !flags.iter().any(|flag| flag.starts_with("-O")) {
             digest.update(b"-O2\0");
         }
@@ -176,6 +175,38 @@ impl Toolchain {
             metadata: directory.join("kernel.json"),
         })
     }
+}
+
+// Quoted includes resolved relative to the source are part of its cache key.
+// SDK/system includes remain covered by the toolchain identity, as before.
+fn hash_local_source(
+    digest: &mut Sha256,
+    source: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), ElfError> {
+    if !visited.insert(source.canonicalize()?) {
+        return Ok(());
+    }
+    let bytes = fs::read(source)?;
+    digest.update(&bytes);
+    digest.update([0]);
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        let name = line
+            .trim()
+            .strip_prefix('#')
+            .and_then(|s| s.trim_start().strip_prefix("include"))
+            .and_then(|s| s.trim_start().strip_prefix('"'))
+            .and_then(|s| s.split_once('"').map(|(name, _)| name));
+        if let Some(name) = name {
+            let include = source.parent().unwrap_or_else(|| Path::new(".")).join(name);
+            if include.is_file() {
+                digest.update(name.as_bytes());
+                digest.update([0]);
+                hash_local_source(digest, &include, visited)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn kernel_cache_root() -> PathBuf {
@@ -795,6 +826,28 @@ fn write(image: &mut [u8], offset: usize, bytes: &[u8]) -> Result<(), ElfError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_include_changes_invalidate_kernel_sources() {
+        let root = std::env::temp_dir().join(format!("ipu-elf-includes-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.S");
+        let header = root.join("worker.inc");
+        std::fs::write(&source, "#include \"worker.inc\"\n").unwrap();
+        // Cyclic guarded includes must not recurse indefinitely.
+        std::fs::write(&header, "#include \"source.S\"\nfirst").unwrap();
+        let hash = || {
+            let mut digest = sha2::Sha256::new();
+            super::hash_local_source(&mut digest, &source, &mut std::collections::HashSet::new())
+                .unwrap();
+            digest.finalize()
+        };
+        let first = hash();
+        assert_eq!(first, hash());
+        std::fs::write(&header, "#include \"source.S\"\nsecond").unwrap();
+        assert_ne!(first, hash());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn applies_colossus_fields() {
