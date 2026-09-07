@@ -236,14 +236,24 @@ impl Builder {
             } else {
                 key_block
             };
+        // A short query (MAP pooling has one row) may use far fewer tiles than
+        // K/V preparation. Keep the input's distributed owner budget rather
+        // than concentrating the entire key sequence on the query owners.
+        let preparation_tiles = self
+            .tensor(input)
+            .format
+            .layout
+            .tiling
+            .tile_count
+            .max(resident.format.layout.tiling.tile_count);
         let heads = u16::try_from(resident.shape.0[0]).ok()?;
         let blocks = u16::try_from(resident.shape.0[1].div_ceil(preparation_rows))
             .ok()?
-            .min(resident.format.layout.tiling.tile_count / heads)
+            .min(preparation_tiles / heads)
             .max(1);
         let columns = u16::try_from(resident.shape.0[2].div_ceil(AMP_COLUMN_MICRO))
             .ok()?
-            .min(resident.format.layout.tiling.tile_count / heads / blocks)
+            .min(preparation_tiles / heads / blocks)
             .max(1);
         let mut packed = resident.clone();
         packed.format.layout.tiling.tile_count = heads.checked_mul(columns)?.checked_mul(blocks)?;
@@ -267,5 +277,29 @@ impl Builder {
             }
         }
         Some(self.copy(input, packed, vec![]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_query_keeps_distributed_key_preparation() {
+        let key = TensorType {
+            shape: TensorShape(vec![16, 729, 80]),
+            format: TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::attention_key(16, 12),
+            },
+        };
+        let mut resident = key.clone();
+        resident.format.layout = Layout::attention_output(16, 1);
+        resident.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
+        let mut b = Builder::new(&[key]);
+        let prepared = b
+            .prepare_attention_operand(MidValueId(0), &resident, 64)
+            .unwrap();
+        assert_eq!(b.tensor(prepared).format.layout.tiling.tile_count, 192);
     }
 }

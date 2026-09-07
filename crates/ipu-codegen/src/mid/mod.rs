@@ -58,12 +58,24 @@ pub(crate) fn lower_finalists(
         }
     }
     let mut candidates = Vec::new();
+    let mut failure = None;
     for configuration in configurations {
-        for candidate in planner::plan_finalists(graph, &configuration, costs, count)? {
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
+        match planner::plan_finalists(graph, &configuration, costs, count) {
+            Ok(plans) => {
+                for candidate in plans {
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::info!(%error, "skipped infeasible planner configuration");
+                failure = Some(error);
             }
         }
+    }
+    if candidates.is_empty() {
+        return Err(failure.unwrap_or(LoweringError::InvalidImplementation));
     }
     let resolved = candidates
         .into_iter()
