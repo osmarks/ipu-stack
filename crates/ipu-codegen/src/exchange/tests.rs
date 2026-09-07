@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[test]
-fn grouped_unicast_ready_queue_preserves_exact_transfer_order() {
+fn grouped_ready_queue_matches_eager_priority() {
     let mut random = fastrand::Rng::with_seed(0x7061697273);
     for case in 0..16 {
         let tiles = 8;
@@ -25,13 +25,20 @@ fn grouped_unicast_ready_queue_preserves_exact_transfer_order() {
                 } else {
                     0x80000 + random.u32(0..16) * 4096
                 };
+                let mut destinations = vec![(destination, destination_address)];
+                if case & 2 != 0 {
+                    let other = (destination + 1) % tiles;
+                    if other != source {
+                        destinations.push((other, destination_address));
+                    }
+                }
                 PendingTransfer {
                     source,
                     source_shard: BlockValueId::from_index(u32::from(source)),
                     source_offset: 0,
                     source_addresses: vec![source_address],
                     source_elements: effective_memory_elements(source_address, words),
-                    destinations: vec![(destination, destination_address)],
+                    destinations,
                     words,
                     width: ExchangeItemWidth::Word32,
                     reserved_source: None,
@@ -39,7 +46,7 @@ fn grouped_unicast_ready_queue_preserves_exact_transfer_order() {
             })
             .collect::<Vec<_>>();
         let mut grouped = TransferScheduler::new(&transfers, tiles);
-        assert!(!grouped.ready_groups.is_empty() && grouped.ready_groups.len() <= 56);
+        assert!(!grouped.ready_groups.is_empty() && grouped.ready_groups.len() <= 112);
         let mut reference = TransferScheduler::new(&transfers, tiles);
         reference.ready = std::mem::take(&mut reference.ready_groups)
             .into_iter()
@@ -48,18 +55,37 @@ fn grouped_unicast_ready_queue_preserves_exact_transfer_order() {
         reference.transfer_group.clear();
         let mut availability = vec![TileAvailability::default(); usize::from(tiles)];
         while let Some(actual) = grouped.next(&availability) {
-            assert_eq!(Some(actual), reference.next(&availability));
+            let expected = reference
+                .ready
+                .iter()
+                .map(|&entry| reference.refresh(entry, &availability))
+                .max()
+                .unwrap();
+            assert_eq!(
+                actual,
+                (
+                    expected.index.0,
+                    reference.dependency_ready[expected.index.0]
+                )
+            );
+            reference
+                .ready
+                .retain(|entry| entry.index != expected.index);
             let (index, dependency) = actual;
             let transfer = &transfers[index];
             let source = usize::from(transfer.source);
-            let destination = usize::from(transfer.destinations[0].0);
-            let completion = availability[source]
-                .send
-                .max(availability[destination].receive)
-                .max(dependency)
+            let completion = transfer
+                .destinations
+                .iter()
+                .map(|&(tile, _)| availability[usize::from(tile)].receive)
+                .chain([availability[source].send, dependency])
+                .max()
+                .unwrap()
                 + transfer.words;
             availability[source].send = completion;
-            availability[destination].receive = completion;
+            for &(tile, _) in &transfer.destinations {
+                availability[usize::from(tile)].receive = completion;
+            }
             grouped.complete(index, completion);
             reference.complete(index, completion);
         }

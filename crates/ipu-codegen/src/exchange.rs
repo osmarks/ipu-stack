@@ -1555,38 +1555,36 @@ impl<'a> TransferScheduler<'a> {
                 scheduler.push_ready(index, 0);
             }
         }
-        // Initially ready transfers without multicast pressure updates
-        // share changing readiness when their endpoints match. Keep only the
-        // best static-priority member of each pair in the global heap; lazy
-        // refresh otherwise revisits every queued transfer after each send.
-        // Transfers released by dependencies later use individual heap entries.
-        if !scheduler.dynamic_word_pressure
-            && transfers
+        // Initially ready transfers sharing the same endpoint roles have the
+        // same changing readiness and pressure. Their relative word/index
+        // priority is static, so only the best member needs a global entry.
+        // Later dependency releases remain individual entries.
+        let mut groups = BTreeMap::new();
+        scheduler.transfer_group.resize(transfers.len(), usize::MAX);
+        for candidate in std::mem::take(&mut scheduler.ready).into_vec() {
+            let index = candidate.index.0;
+            let transfer = &transfers[index];
+            let receivers = transfer
+                .destinations
                 .iter()
-                .all(|t| t.destinations.len() == 1 && t.reserved_source.is_none())
-        {
-            let mut groups = BTreeMap::new();
-            scheduler.transfer_group.resize(transfers.len(), usize::MAX);
-            for candidate in std::mem::take(&mut scheduler.ready).into_vec() {
-                let index = candidate.index.0;
-                let transfer = &transfers[index];
-                let group = *groups
-                    .entry((transfer.source, transfer.destinations[0].0))
-                    .or_insert_with(|| {
-                        let group = scheduler.ready_groups.len();
-                        scheduler.ready_groups.push(BinaryHeap::new());
-                        group
-                    });
-                scheduler.transfer_group[index] = group;
-                scheduler.ready_groups[group].push(candidate);
-            }
-            scheduler.ready.extend(
-                scheduler
-                    .ready_groups
-                    .iter()
-                    .filter_map(|queue| queue.peek().copied()),
-            );
+                .map(|&(tile, _)| tile)
+                .collect::<Vec<_>>();
+            let group = *groups
+                .entry((transfer.source, transfer.reserved_source, receivers))
+                .or_insert_with(|| {
+                    let group = scheduler.ready_groups.len();
+                    scheduler.ready_groups.push(BinaryHeap::new());
+                    group
+                });
+            scheduler.transfer_group[index] = group;
+            scheduler.ready_groups[group].push(candidate);
         }
+        scheduler.ready.extend(
+            scheduler
+                .ready_groups
+                .iter()
+                .filter_map(|queue| queue.peek().copied()),
+        );
         scheduler
     }
 
@@ -1608,32 +1606,52 @@ impl<'a> TransferScheduler<'a> {
         });
     }
 
-    fn next(&mut self, tile_availability: &[TileAvailability]) -> Option<(usize, u32)> {
-        loop {
-            let candidate = *self.ready.peek()?;
-            let index = candidate.index.0;
-            let transfer = &self.transfers[index];
-            let earliest_start = std::iter::once(self.dependency_ready[index])
+    fn refresh(
+        &self,
+        mut candidate: ReadyTransfer,
+        availability: &[TileAvailability],
+    ) -> ReadyTransfer {
+        let index = candidate.index.0;
+        let transfer = &self.transfers[index];
+        candidate.earliest_start = Reverse(
+            std::iter::once(self.dependency_ready[index])
                 .chain(std::iter::once(
-                    tile_availability[usize::from(transfer.source)].send,
+                    availability[usize::from(transfer.source)].send,
                 ))
-                .chain(transfer.reserved_source.into_iter().map(|tile| {
-                    let availability = tile_availability[usize::from(tile)];
-                    availability.send
-                }))
+                .chain(
+                    transfer
+                        .reserved_source
+                        .into_iter()
+                        .map(|tile| availability[usize::from(tile)].send),
+                )
                 .chain(
                     transfer
                         .destinations
                         .iter()
-                        .map(|&(tile, _)| tile_availability[usize::from(tile)].receive),
+                        .map(|&(tile, _)| availability[usize::from(tile)].receive),
                 )
                 .max()
-                .unwrap_or(0);
-            if candidate.earliest_start.0 == earliest_start {
+                .unwrap_or(0),
+        );
+        if self.dynamic_word_pressure {
+            candidate.endpoint_pressure = transfer
+                .tiles()
+                .map(|tile| self.word_pressure[usize::from(tile)])
+                .sum();
+        }
+        candidate
+    }
+
+    fn next(&mut self, tile_availability: &[TileAvailability]) -> Option<(usize, u32)> {
+        let mut repairs = 0;
+        loop {
+            let candidate = *self.ready.peek()?;
+            let current = self.refresh(candidate, tile_availability);
+            if candidate == current {
                 self.ready.pop();
-                // Endpoint availability ranks the ready queue, but is not a
-                // dependency on payload arrival. The row builder pipelines
-                // source selection and delivery using their actual timings.
+                let index = candidate.index.0;
+                // Readiness ranks the queue; payload dependencies alone gate
+                // the row builder, which pipelines source selection/delivery.
                 if let Some(group) = self
                     .transfer_group
                     .get(index)
@@ -1641,21 +1659,30 @@ impl<'a> TransferScheduler<'a> {
                     .filter(|&group| group != usize::MAX)
                 {
                     let queue = &mut self.ready_groups[group];
-                    let head = queue.pop().expect("nonempty ready pair");
+                    let head = queue.pop().expect("nonempty ready group");
                     debug_assert_eq!(head.index.0, index);
                     if let Some(mut next) = queue.peek().copied() {
-                        next.earliest_start = Reverse(earliest_start);
+                        next.earliest_start = current.earliest_start;
                         self.ready.push(next);
                     }
                 }
                 return Some((index, self.dependency_ready[index]));
             }
-            let mut head = self.ready.peek_mut().expect("ready head");
-            head.earliest_start = Reverse(earliest_start);
-            head.endpoint_pressure = transfer
-                .tiles()
-                .map(|tile| self.word_pressure[usize::from(tile)])
-                .sum();
+            repairs += 1;
+            // A wave can invalidate most keys. Once logarithmic root repairs
+            // cost a linear scan, refresh/reheapify once instead. Both readiness
+            // and pressure are monotone bounds, so this preserves eager priority.
+            if self.ready.len() >= 128
+                && repairs * self.ready.len().ilog2() as usize >= self.ready.len()
+            {
+                let mut entries = std::mem::take(&mut self.ready).into_vec();
+                for entry in &mut entries {
+                    *entry = self.refresh(*entry, tile_availability);
+                }
+                self.ready = BinaryHeap::from(entries);
+            } else {
+                *self.ready.peek_mut().expect("ready head") = current;
+            }
         }
     }
 
