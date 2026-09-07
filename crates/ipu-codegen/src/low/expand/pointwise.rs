@@ -22,6 +22,12 @@ impl TileGraphBuilder {
         output_extents: &[ShardExtent],
     ) -> Option<ShardView> {
         let source_view = self.full_view(source);
+        // Equal-shaped pointwise work consumes the complete physical layout,
+        // including padding between panels. Cropping to logical bounds would
+        // turn a dense packed operand into a fragmented broadcast view.
+        if source_view.extents == output_extents {
+            return Some(source_view);
+        }
         let source = source_view.shard;
         let source_shard = &self.shards[source.index() as usize];
         let output_shard = &self.shards[output.index() as usize];

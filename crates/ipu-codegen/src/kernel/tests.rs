@@ -6,6 +6,46 @@ use crate::{
 };
 
 #[test]
+fn packed_add_keeps_padding_in_dense_operand_views() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [2, 3, 32]).unwrap();
+    let y = graph.host_input("y", [2, 3, 32]).unwrap();
+    let output = graph.add(x, y).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let mut layout = Layout::amp_left(16, 2);
+    layout.tiling.axes[0] =
+        crate::AxisTiling::new(crate::TensorAxis::FromEnd(2), 2, 1, crate::Padding::Zero)
+            .with_shard_padding_multiple(4);
+    let format = TensorFormat {
+        precision: Precision::F16,
+        layout,
+    };
+    let config = PipelineConfig::new(2)
+        .with_input(x, format.clone())
+        .with_input(y, format);
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+    let build = KernelBuildPlan::from_program(&low).unwrap();
+    let addresses = low
+        .shards
+        .iter()
+        .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
+        .collect();
+    let mut packed_adds = 0;
+    for run in &low.kernel_runs {
+        if matches!(run.kernel, TileKernelSpec::Add) {
+            assert_eq!(
+                run.requirements.output.format.layout.order,
+                ElementOrder::Amp(AmpOrder::Left)
+            );
+            packed_adds += 1;
+            materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new()).unwrap();
+        }
+    }
+    assert_eq!(packed_adds, 2);
+}
+
+#[test]
 fn fp8_gemms_repack_casts_and_keep_half_outputs() {
     let fp8 = Precision::F8F143 { scale_exponent: -4 };
     let mut graph = ComputeGraph::new();

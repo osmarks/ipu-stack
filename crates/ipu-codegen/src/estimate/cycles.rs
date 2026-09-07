@@ -213,8 +213,6 @@ pub(super) fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases
 // its final coefficient permutation is performed by the GEMM's ld*putcs
 // sequence. Keep these costs separate from ideal memcpy bandwidth.
 const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
-// The unrolled six-worker panel pack measures about 2,364 cycles for the
-// 640-element attention shards, including launch and tail initialization.
 // Full AMP-left panels use four 64-bit load/store pairs, including pointer
 // updates. Allow the panel loop and row setup in the rounded per-element price.
 const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 1;
