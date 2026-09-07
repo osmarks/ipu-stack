@@ -40,13 +40,25 @@ model.
 
 ## Repeat iterations
 
-Repeated bodies are instrumented per kernel/exchange, with a distinct profile
-`epoch` for each iteration. The emitted loop keeps a profile-buffer cursor in its
-stack frame and advances it by one body's timestamp stride. Executable code and
-exchange rows remain shared; only timestamp storage and host profile metadata
-scale with iteration count. Inactive tiles retain an aggregate idle interval.
+Repeated bodies are instrumented per kernel/exchange on the first iteration
+only, with a distinct profile `epoch`. Subsequent iterations skip timestamp
+calls and appear as one `repeat-remainder` interval, whose `iterations` metadata
+records their count. This preserves the full-run cycle span without repeating
+identical kernel detail. Inactive tiles retain an aggregate idle interval.
 
-The detailed batch-two, three-block FP8 MLP profile is
+The emitted loop uses a stack-frame flag to disable sampling after its first
+iteration. Executable code and exchange rows remain shared, and timestamp
+storage and profile metadata no longer scale with iteration count. Later
+iterations still execute the small flag checks at sampling sites.
+
+First-iteration-only profiling was validated on a three-block FP8 MLP with
+batch 1, 129 tokens, dimension 128, hidden dimension 256 and 64 active tiles.
+`artifacts/repeat-first/small/profile.html` contains 2,848 samples versus 5,536
+with all iterations detailed. The remainder has `iterations=2`, and the full
+cropped span is 62,118 cycles. Hardware reference validation passes (maximum
+absolute error 0.015625).
+
+The earlier profile with every iteration detailed is
 `artifacts/grouped-repair/mlp-b2-n3/profile.html` (raw `profile.ipuprof`). It contains
 90,372 samples and spans 1,038,666 cropped cycles, about 346,222 per block. The
 previous aggregate-only run spanned 1,031,874 cycles; detailed instrumentation adds
@@ -54,7 +66,7 @@ about 0.7%. Both pass numerical validation (maximum absolute error 0.015625).
 The HTML was checked in headless Chromium and displays all three iterations.
 
 A smaller three-block workload also passes. Regression coverage checks timestamp
-count, iteration epochs, the emitted body's single-iteration address range and
+count, first-iteration detail and aggregate remainder, the emitted body's single-iteration address range and
 retention of structured Repeat. The full test run passes 149 codegen tests, four
 CLI tests and the doctest, with four manual/preexisting tests ignored; Clippy
 passes with the existing argument-count/type-complexity allowances.

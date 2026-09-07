@@ -158,7 +158,6 @@ fn instrument_active_steps(
                 address,
                 plans,
             )?;
-            let body = plans[first..].to_vec();
             let epoch = plans[..first]
                 .iter()
                 .map(|plan| plan.epoch)
@@ -168,15 +167,19 @@ fn instrument_active_steps(
             for description in &mut plans[first..] {
                 description.epoch = epoch;
             }
-            for iteration in 1..repeat.count {
-                for description in &body {
-                    let mut description = description.clone();
-                    description.local_index = u32::try_from(plans.len())?;
-                    description.epoch = epoch
-                        .checked_add(iteration)
-                        .ok_or_else(|| invalid("profile epoch overflow"))?;
-                    plans.push(description);
-                }
+            if repeat.count > 1 {
+                let mut remainder = profile_description(
+                    plans.len(),
+                    u32::try_from(index)?,
+                    &repeat.provenance,
+                    ProfileStepKind::Compute,
+                    "repeat-remainder",
+                )?;
+                remainder.metadata.push(ProfileMetadata {
+                    name: "iterations".into(),
+                    value: (repeat.count - 1).to_string(),
+                });
+                plans.push(remainder);
             }
             continue;
         }
@@ -263,7 +266,7 @@ pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkLis
         if previous.is_none_or(|previous| !profile_work_can_merge(previous, work)) {
             count += match work {
                 crate::TileWorkRef::Repeat(repeat) => {
-                    profile_step_count(program, &repeat.body) * repeat.count as usize
+                    profile_step_count(program, &repeat.body) + usize::from(repeat.count > 1)
                 }
                 _ => 1,
             };
@@ -537,7 +540,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeat_profiles_each_iteration_without_unrolling_executable_work() {
+    fn repeat_profiles_first_iteration_and_aggregates_remainder() {
         let mut graph = crate::ComputeGraph::new();
         let input = graph.host_input("input", [8, 16]).unwrap();
         let output = graph
@@ -575,15 +578,24 @@ mod tests {
             .iter()
             .map(|step| step.epoch)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(epochs, [1, 2, 3].into_iter().collect());
+        assert_eq!(epochs, [0, 1].into_iter().collect());
         let crate::TileStep::Repeat(repeat) = &program.steps[0] else {
             panic!("loop was unrolled");
         };
         assert_eq!(repeat.count, 3);
         let mut body = repeat.body.clone();
         let body_end = step_profile(body.last_mut().unwrap()).after.unwrap();
-        assert_eq!(body_end, base + u32::try_from(count / 3 * 4).unwrap());
+        assert_eq!(body_end, base + u32::try_from((count - 1) * 4).unwrap());
         assert_eq!(repeat.profile.after, Some(base + count as u32 * 4));
-        assert!(profile.steps.iter().all(|step| step.kernel != "repeat"));
+        assert_eq!(profile.steps.last().unwrap().kernel, "repeat-remainder");
+        assert!(
+            profile
+                .steps
+                .last()
+                .unwrap()
+                .metadata
+                .iter()
+                .any(|entry| entry.name == "iterations" && entry.value == "2")
+        );
     }
 }
