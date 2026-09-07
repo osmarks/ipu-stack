@@ -110,6 +110,36 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
     }
 }
 
+#[test]
+fn factor_mappings_resolve_locally_reused_source_storage() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [1, 4, 32]).unwrap();
+    graph.set_outputs([input]).unwrap();
+    let config = PipelineConfig::new(1).with_input(input, format(1));
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let mut builder = TileGraphBuilder::new(&mid).unwrap();
+    let source = builder.shards[0].id;
+    let mut placeholder = builder.shards[0].clone();
+    placeholder.definition = ShardDefinition::Unmaterialized;
+    let reused = builder.push_shard(placeholder).unwrap();
+    builder
+        .materialized_views
+        .insert(reused, builder.full_view(source));
+    let view = crate::AxisFactorView::new(2, 0, 2);
+    let mut destination = builder.shards[0].clone();
+    destination.tensor_type.shape = view.output_shape(&destination.tensor_type.shape).unwrap();
+    destination.extents[0].logical_end = 2;
+    destination.extents[0].physical_end = 2;
+    destination.extents[2].logical_end = 16;
+    destination.extents[2].physical_end = 16;
+    let output = builder.push_shard(destination).unwrap();
+    let mappings = builder
+        .window_view_mappings(&[reused], &[output], view, &[])
+        .unwrap();
+    assert_eq!(mappings.len(), 2);
+    assert!(mappings.iter().all(|(input, _)| input.shard == source));
+}
+
 fn format(tiles: u16) -> TensorFormat {
     TensorFormat {
         precision: Precision::F16,

@@ -59,8 +59,16 @@ pub(crate) fn lower_finalists(
     }
     let mut candidates = Vec::new();
     let mut failure = None;
-    for configuration in configurations {
-        match planner::plan_finalists(graph, &configuration, costs, count) {
+    let span = tracing::Span::current();
+    let searches = configurations
+        .into_par_iter()
+        .map(|configuration| {
+            let _entered = span.enter();
+            planner::plan_finalists(graph, &configuration, costs, count)
+        })
+        .collect::<Vec<_>>();
+    for search in searches {
+        match search {
             Ok(plans) => {
                 for candidate in plans {
                     if !candidates.contains(&candidate) {

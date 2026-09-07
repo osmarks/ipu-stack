@@ -276,7 +276,7 @@ impl TileGraphBuilder {
                             }
                             mappings.push((
                                 ShardView {
-                                    shard: source,
+                                    shard: self.full_view(source).shard,
                                     extents: source_extents,
                                 },
                                 ShardView {
@@ -330,7 +330,7 @@ impl TileGraphBuilder {
                         extent.physical_end -= offset;
                     }
                     let source_view = ShardView {
-                        shard: source,
+                        shard: self.full_view(source).shard,
                         extents: source_extents,
                     };
                     let destination_view = ShardView {
