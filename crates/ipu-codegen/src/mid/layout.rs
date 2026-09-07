@@ -75,11 +75,11 @@ pub enum ElementOrder {
     Amp(AmpOrder),
 }
 
-/// Physical traversal within one 16-by-16 F16 matrix micro-panel. Layouts
+/// Physical traversal within one 16-by-16 matrix fragment. Layouts
 /// with the same order can exchange whole panels while changing their outer
 /// ownership and panel sequence, without an intermediate rearrangement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum F16MicroPanelOrder {
+pub(crate) enum MicroPanelOrder {
     RowsThenColumns,
     ColumnsThenRows,
 }
@@ -148,15 +148,15 @@ impl ElementOrder {
         )
     }
 
-    pub(crate) const fn f16_micro_panel_order(self) -> Option<F16MicroPanelOrder> {
+    pub(crate) const fn micro_panel_order(self) -> Option<MicroPanelOrder> {
         match self {
             Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
             | Self::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
-                Some(F16MicroPanelOrder::RowsThenColumns)
+                Some(MicroPanelOrder::RowsThenColumns)
             }
             Self::Amp(AmpOrder::TransposedLeft)
             | Self::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
-                Some(F16MicroPanelOrder::ColumnsThenRows)
+                Some(MicroPanelOrder::ColumnsThenRows)
             }
             Self::RowMajor | Self::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => None,
         }
@@ -873,12 +873,11 @@ pub struct TensorFormat {
 }
 
 impl TensorFormat {
-    pub(crate) fn supports_f16_micro_panel_exchange(&self, destination: &Self) -> bool {
-        self.precision == Precision::F16
-            && destination.precision == Precision::F16
-            && self.layout.order.f16_micro_panel_order().is_some()
-            && self.layout.order.f16_micro_panel_order()
-                == destination.layout.order.f16_micro_panel_order()
+    pub(crate) fn supports_micro_panel_exchange(&self, destination: &Self) -> bool {
+        matches!(self.precision, Precision::F16 | Precision::F8F143 { .. })
+            && destination.precision == self.precision
+            && self.layout.order.micro_panel_order().is_some()
+            && self.layout.order.micro_panel_order() == destination.layout.order.micro_panel_order()
     }
 }
 
@@ -889,6 +888,57 @@ pub struct TensorType {
 }
 
 impl TensorType {
+    /// Keep producer ownership while completing FP8's 32-element panels.
+    pub(crate) fn fp8_cast_layout(&self) -> Option<Layout> {
+        let mut layout = self.format.layout.clone();
+        let axis_from_end = match layout.order {
+            ElementOrder::Amp(AmpOrder::Left) => {
+                if layout.resolve(&self.shape).ok().is_some_and(|resolved| {
+                    resolved
+                        .axes()
+                        .and_then(|axes| axes.last())
+                        .is_some_and(|axis| axis.extents_are_multiple_of(32))
+                }) {
+                    return Some(layout);
+                }
+                // A narrow final tail is harmless, but padding every producer
+                // panel would turn a bulk exchange into strided short packets.
+                if !layout.resolve(&self.shape).ok().is_some_and(|resolved| {
+                    resolved
+                        .axes()
+                        .and_then(|axes| axes.last())
+                        .is_some_and(|axis| axis.complete_panels_except_tail(32))
+                }) {
+                    return None;
+                }
+                let axis = layout.tiling.axes.iter_mut().find(|axis| {
+                    matches!(axis.axis, TensorAxis::FromEnd(1))
+                        || axis.axis == TensorAxis::FromStart((self.shape.0.len() - 1) as u16)
+                })?;
+                axis.shard_padding_multiple = axis.shard_padding_multiple.max(32);
+                return Some(layout);
+            }
+            ElementOrder::RowMajor
+            | ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => {
+                return Some(layout);
+            }
+            ElementOrder::Amp(AmpOrder::TransposedRight) => 1,
+            ElementOrder::Amp(AmpOrder::TransposedLeft) => 2,
+            ElementOrder::BlockMajor(
+                BlockMajorOrder::Matrix { row_block, .. }
+                | BlockMajorOrder::TransposedMatrix { row_block, .. },
+            ) => return row_block.is_multiple_of(32).then_some(layout),
+        };
+        let valid = layout.resolve(&self.shape).ok().is_some_and(|resolved| {
+            resolved.axes().is_some_and(|axes| {
+                axes.len()
+                    .checked_sub(axis_from_end)
+                    .is_some_and(|axis| axes[axis].extents_are_multiple_of(32))
+            })
+        });
+        valid.then_some(layout)
+    }
+
     pub fn new(shape: impl IntoIterator<Item = u32>, precision: Precision, layout: Layout) -> Self {
         Self {
             shape: TensorShape::new(shape),

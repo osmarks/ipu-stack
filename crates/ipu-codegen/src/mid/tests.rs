@@ -4,6 +4,78 @@ use super::*;
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn fp8_mlp_retains_quantization_before_replication() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [1, 729, 1152]).unwrap();
+    let w0 = graph.parameter("w0", [1, 1152, 4304]).unwrap();
+    let w1 = graph.parameter("w1", [1, 4304, 1152]).unwrap();
+    let h = graph.gemm(x, w0).unwrap();
+    let h = graph.gelu(h).unwrap();
+    let y = graph.gemm(h, w1).unwrap();
+    graph.set_outputs([y]).unwrap();
+    let fp8 = Precision::F8F143 { scale_exponent: -4 };
+    let mut config = PipelineConfig::new(1472)
+        .with_automatic_input(x, fp8)
+        .with_automatic_input(w0, fp8)
+        .with_automatic_input(w1, fp8);
+    config
+        .operator_candidates
+        .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+    config
+        .operator_candidates
+        .push(OperatorCandidate::fp8_gemm(1472, -4));
+    let finalists = lower_finalists(&graph, &config, &crate::Ipu21CostModel, 4).unwrap();
+    assert!(finalists.iter().any(|mid| {
+        mid.operations
+            .iter()
+            .filter_map(|op| op.conversion_plan())
+            .any(|plan| {
+                plan.input.format.precision == Precision::F16
+                    && plan.output.format.precision == fp8
+                    && plan.output.format.layout.tiling.replicas == 1
+            })
+    }));
+}
+
+#[test]
+fn fp8_conversion_precedes_operand_replication() {
+    let mut graph = ComputeGraph::new();
+    let host = graph.host_input("input", [512, 64]).unwrap();
+    graph.gelu(host).unwrap();
+    let mut state = planner::LoweringState::default();
+    let input_layout = Layout::amp_left(64, 64);
+    let input = state.value(
+        ValueId::from_index(0),
+        TensorType::new([512, 64], Precision::F16, input_layout.clone()),
+    );
+    let target = TensorFormat {
+        precision: Precision::F8F143 { scale_exponent: -4 },
+        layout: Layout {
+            tiling: TensorTiling::replicated(64),
+            ..input_layout.clone()
+        },
+    };
+    let mut operations = Vec::new();
+    planner::ensure_format(
+        input,
+        target.clone(),
+        OperandMaterialization::Complete,
+        graph.operations()[0].id,
+        &crate::Ipu21CostModel,
+        &mut state,
+        &mut operations,
+    );
+    assert_eq!(operations.len(), 2);
+    let cast = operations[0].conversion_plan().unwrap();
+    assert_eq!(cast.input.format.layout, input_layout);
+    assert_eq!(cast.output.format.layout, input_layout);
+    assert_eq!(cast.output.format.precision, target.precision);
+    let exchange = operations[1].conversion_plan().unwrap();
+    assert_eq!(exchange.input.format.precision, target.precision);
+    assert_eq!(exchange.output.format, target);
+}
+
+#[test]
 fn randomized_memory_peaks_reserve_disjoint_class_arenas() {
     let mut random = fastrand::Rng::with_seed(0x636c_6173_735f_7372);
     let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
@@ -1762,6 +1834,7 @@ fn value_projection_retains_head_grouped_swapped_output_from_packed_activations(
             column_block: 16,
         }),
         column_groups: 16,
+        inner_grain: 1,
     };
     assert!(
         candidates.iter().any(|plan| requested.matches(
@@ -1793,6 +1866,7 @@ fn beam_reserves_requested_formats_before_incidental_layout_diversity() {
     let requested = OutputDemand {
         order: compatible.order,
         column_groups: 4,
+        inner_grain: 1,
     };
     let shape = graph.value_shape(projection).unwrap();
     assert!(requested.matches(&compatible, shape));

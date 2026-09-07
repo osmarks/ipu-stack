@@ -39,6 +39,7 @@ pub enum ScalarValue {
     CastSourceScale,
     CastDestinationScale,
     CastPanelRows,
+    CastSourceElements,
     InitialBlock,
     FinalBlock,
     WordsPerWorker,
@@ -110,6 +111,15 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 }
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
+            ScalarValue::CastSourceElements => {
+                run.inputs[0].views[0]
+                    .extents
+                    .iter()
+                    .try_fold(1u32, |n, e| {
+                        n.checked_mul(e.physical_end - e.start)
+                            .ok_or(KernelAbiError::ElementCountOverflow)
+                    })
+            }
             ScalarValue::CastPanelRows => {
                 if matches!(
                     run.kernel,
@@ -320,6 +330,7 @@ pub fn tile_kernel_abi(
                         ScalarValue::CastSourceScale,
                         ScalarValue::CastDestinationScale,
                         ScalarValue::CastPanelRows,
+                        ScalarValue::CastSourceElements,
                     ]
                 } else {
                     &[ScalarValue::ElementCount]
@@ -412,7 +423,17 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                 .extents
                 .iter()
                 .zip(&run.output.extents)
-                .any(|(from, to)| from.physical_end - from.start != to.physical_end - to.start)
+                .enumerate()
+                .any(|(axis, (from, to))| {
+                    let width = from.physical_end - from.start;
+                    let target_width = to.physical_end - to.start;
+                    width != target_width
+                        && !(run.requirements.output.format.layout.order
+                            == ElementOrder::Amp(AmpOrder::Left)
+                            && axis + 1 == input.extents.len()
+                            && width.is_multiple_of(16)
+                            && target_width == width.next_multiple_of(32))
+                })
             || (panel_rows != 0
                 && !element_count(run)?.is_multiple_of(
                     panel_rows

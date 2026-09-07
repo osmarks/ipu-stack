@@ -30,6 +30,7 @@ public:
   int sourceScale;
   int destinationScale;
   unsigned panelRows;
+  unsigned sourceElements;
   bool compute(unsigned worker) {
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
     setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
@@ -48,6 +49,26 @@ public:
         const half *second = first + panelRows * 16;
         unsigned char *target = &destination[panel + row * 32];
         unsigned sourceOffset = 0, destinationOffset = 0;
+        if (panel + panelElements > sourceElements) {
+          // A producer may own only a 16-element tail. Populate the other
+          // half of the FP8 panel here, without a padded F16 staging copy.
+          asm volatile(
+              "{ rpt %[rows], 9; fnop }\n"
+              "{ ld64 $a0:1, %[first], %[src], 0; fnop }\n"
+              "{ ld64 $a2:3, %[first], %[src], 1; fnop }\n"
+              "{ ld64 $a0:1, %[first], %[src], 2; f16v8tof8 $a4:5, $a0:3 }\n"
+              "{ ld64 $a2:3, %[first], %[src], 3; fnop }\n"
+              "{ st64 $a4:5, %[out], %[dst], 0; f16v8tof8 $a6:7, $a0:3 }\n"
+              "{ st64 $a6:7, %[out], %[dst], 1; zero $a4:5 }\n"
+              "{ st64 $a4:5, %[out], %[dst], 2; fnop }\n"
+              "{ st64 $a4:5, %[out], %[dst], 3; fnop }\n"
+              "{ add %[src], %[src], %[stride]; fnop }\n"
+              "{ add %[dst], %[dst], %[stride]; fnop }\n"
+              : [src] "+&r"(sourceOffset), [dst] "+&r"(destinationOffset)
+              : [first] "r"(first), [out] "r"(target), [rows] "r"(rows), [stride] "r"(stride)
+              : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
+          continue;
+        }
         // Each repeat converts 32 values, without a software row loop.
         // Offsets advance to this worker's next row. Packing
         // needs two strided source panels and one contiguous destination row.

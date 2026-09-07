@@ -13,6 +13,19 @@ pub(crate) struct ResolvedAxis {
 }
 
 impl ResolvedAxis {
+    pub(crate) fn complete_panels_except_tail(&self, grain: u32) -> bool {
+        self.partitions
+            .iter()
+            .take(self.partitions.len().saturating_sub(1))
+            .all(|part| (part.physical_end - part.start).is_multiple_of(grain))
+    }
+
+    pub(crate) fn extents_are_multiple_of(&self, grain: u32) -> bool {
+        self.partitions
+            .iter()
+            .all(|part| (part.physical_end - part.start).is_multiple_of(grain))
+    }
+
     pub(crate) fn same_partitioning(&self, other: &Self) -> bool {
         self.partitions == other.partitions
             && (self.partitions.len() <= 1 || self.stride == other.stride)

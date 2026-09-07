@@ -140,6 +140,9 @@ pub(super) fn plans(
         && view.split_axis == 2
         && view.merge_axis == 0
         && let [input] = inputs
+        // These direct attention layouts use F16/F32 panel geometry. FP8
+        // views retain the general row-major path until an FP8 consumer exists.
+        && matches!(input.format.precision, Precision::F16 | Precision::F32)
         && output.0.len() == 3
         && let (Ok(streams), Ok(rows)) = (u16::try_from(output.0[0]), u16::try_from(output.0[1]))
         && streams != 0

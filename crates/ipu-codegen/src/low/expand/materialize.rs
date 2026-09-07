@@ -47,7 +47,7 @@ impl TileGraphBuilder {
             .order;
         let (mappings, order) = if let Some(view) = mapping.view {
             let mappings = self.window_view_mappings(&inputs, &outputs, view, &mapping.offsets)?;
-            if let Some(physical) = self.f16_micro_panel_mappings(mappings.clone())? {
+            if let Some(physical) = self.micro_panel_mappings(mappings.clone())? {
                 (physical, CopyOrder::Physical)
             } else if matches!(
                 source_order,
@@ -344,11 +344,11 @@ impl TileGraphBuilder {
         Ok(mappings)
     }
 
-    /// Splits corresponding views at each allocation's F16 micro-panel
+    /// Splits corresponding views at each allocation's 16-element micro-panel
     /// boundaries. Within every resulting rectangle the source and
     /// destination have identical physical traversal, even when their outer
     /// panel sequence and tile ownership differ.
-    pub(super) fn f16_micro_panel_mappings(
+    pub(super) fn micro_panel_mappings(
         &self,
         mappings: Vec<(ShardView, ShardView)>,
     ) -> ExpansionResult<Option<Vec<(ShardView, ShardView)>>> {
@@ -359,7 +359,7 @@ impl TileGraphBuilder {
             if !source_shard
                 .tensor_type
                 .format
-                .supports_f16_micro_panel_exchange(&destination_shard.tensor_type.format)
+                .supports_micro_panel_exchange(&destination_shard.tensor_type.format)
             {
                 return Ok(None);
             }

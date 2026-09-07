@@ -1,6 +1,6 @@
 //! Backward layout requests. These describe consumer-compatible storage families,
-//! not selected implementations or execution costs. Compute boundaries stop the
-//! propagation; the forward planner prices every resulting alternative.
+//! not selected implementations or execution costs. Views and layout-preserving
+//! GELU pass requests upstream; the forward planner prices every alternative.
 
 use super::*;
 
@@ -8,14 +8,34 @@ use super::*;
 pub(in crate::mid) struct OutputDemand {
     pub order: ElementOrder,
     pub column_groups: u16,
+    pub inner_grain: u32,
 }
 
 impl OutputDemand {
     pub(in crate::mid) fn matches(self, layout: &Layout, shape: &TensorShape) -> bool {
         let order_matches = layout.order == self.order
-            || layout.order.f16_micro_panel_order().is_some()
-                && layout.order.f16_micro_panel_order() == self.order.f16_micro_panel_order();
+            || layout.order.micro_panel_order().is_some()
+                && layout.order.micro_panel_order() == self.order.micro_panel_order();
+        let grain_matches = self.inner_grain == 1
+            || layout.resolve(shape).ok().is_some_and(|resolved| {
+                resolved.axes().is_some_and(|axes| {
+                    let from_end = if self.order.micro_panel_order()
+                        == Some(MicroPanelOrder::ColumnsThenRows)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    axes.len().checked_sub(from_end).is_some_and(|axis| {
+                        axes[axis].complete_panels_except_tail(self.inner_grain)
+                    }) && axes
+                        .len()
+                        .checked_sub(from_end)
+                        .is_some_and(|axis| axes[axis].maximum_extent() >= self.inner_grain)
+                })
+            });
         order_matches
+            && grain_matches
             && (self.column_groups == 1
                 || layout.tiling.axes.iter().any(|axis| {
                     axis.axis == TensorAxis::FromEnd(1)
@@ -65,6 +85,42 @@ impl OutputDemands {
     ) -> Self {
         let mut requests = Self::default();
         for operation in operations.iter().rev() {
+            if matches!(operation.kind, OperationKind::Gelu) {
+                if let ([input], [output]) =
+                    (operation.inputs.as_slice(), operation.results.as_slice())
+                {
+                    for demand in requests.get(*output).to_vec() {
+                        requests.insert(*input, demand);
+                    }
+                }
+                continue;
+            }
+            if matches!(operation.kind, OperationKind::Gemm(_))
+                && config.operator_candidates.iter().any(|candidate| {
+                    matches!(
+                        candidate.operator(),
+                        MidOperator::Gemm {
+                            multiply: Precision::F8F143 { .. },
+                            ..
+                        }
+                    )
+                })
+            {
+                for (index, &input) in operation.inputs.iter().enumerate() {
+                    requests.insert(
+                        input,
+                        OutputDemand {
+                            order: ElementOrder::Amp(if index == 0 {
+                                AmpOrder::Left
+                            } else {
+                                AmpOrder::TransposedLeft
+                            }),
+                            column_groups: 1,
+                            inner_grain: 32,
+                        },
+                    );
+                }
+            }
             if let OperationKind::View(view) = operation.kind {
                 if let ([input], [output]) =
                     (operation.inputs.as_slice(), operation.results.as_slice())
@@ -90,6 +146,7 @@ impl OutputDemands {
                         OutputDemand {
                             order: layout.order,
                             column_groups: 1,
+                            inner_grain: 1,
                         },
                     );
                 }
@@ -106,6 +163,7 @@ impl OutputDemands {
                             OutputDemand {
                                 order: requirement.format.layout.order,
                                 column_groups: 1,
+                                inner_grain: 1,
                             },
                         );
                     }
@@ -146,11 +204,11 @@ mod tests {
         let demands = OutputDemands::new(graph.operations(), graph.value_shapes(), &config);
         for (value, groups) in [(projection, 4), (two, 2), (four, 1)] {
             let requests = demands.get(value);
-            assert!(requests.iter().any(|d| d.order.f16_micro_panel_order()
-                == Some(F16MicroPanelOrder::RowsThenColumns)
+            assert!(requests.iter().any(|d| d.order.micro_panel_order()
+                == Some(MicroPanelOrder::RowsThenColumns)
                 && d.column_groups == groups));
-            assert!(requests.iter().any(|d| d.order.f16_micro_panel_order()
-                == Some(F16MicroPanelOrder::ColumnsThenRows)
+            assert!(requests.iter().any(|d| d.order.micro_panel_order()
+                == Some(MicroPanelOrder::ColumnsThenRows)
                 && d.column_groups == groups));
             assert_eq!(
                 requests.iter().collect::<BTreeSet<_>>().len(),
@@ -167,6 +225,7 @@ mod tests {
         let demand = OutputDemand {
             order: ElementOrder::Amp(AmpOrder::Left),
             column_groups: 1,
+            inner_grain: 1,
         };
         assert!(
             demand

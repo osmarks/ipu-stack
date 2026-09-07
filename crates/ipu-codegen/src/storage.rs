@@ -1245,10 +1245,16 @@ mod tests {
     }
 
     #[test]
-    fn randomized_compatible_f16_micro_panel_orders_preserve_coordinates() {
+    fn randomized_compatible_micro_panel_orders_preserve_coordinates() {
         let mut random = fastrand::Rng::with_seed(0x7061_6e65_6c21);
         for case in 0..128 {
-            let panels = random.u32(1..=8);
+            let precision = if case % 2 == 0 {
+                Precision::F16
+            } else {
+                Precision::F8F143 { scale_exponent: -4 }
+            };
+            let bytes = precision.bytes() as u32;
+            let panels = random.u32(1..=8) * 2;
             let selected = random.u32(0..panels);
             for (source_order, destination_order) in [
                 (
@@ -1268,14 +1274,13 @@ mod tests {
                     tiling: crate::TensorTiling::replicated(1),
                     memory_class: MemoryClass::Ipu21Standard,
                 };
-                let source = shard(
+                let mut source = shard(
                     layout(source_order),
                     &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
                 );
-                let destination = shard(
-                    layout(destination_order),
-                    &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
-                );
+                let mut destination = shard(layout(destination_order), &[AMP_INNER_BLOCK, 32]);
+                source.tensor_type.format.precision = precision;
+                destination.tensor_type.format.precision = precision;
                 let source_view = ShardView {
                     shard: source.id,
                     extents: vec![
@@ -1290,16 +1295,28 @@ mod tests {
                 };
                 let destination_view = ShardView {
                     shard: destination.id,
-                    extents: destination.extents.clone(),
+                    extents: vec![
+                        destination.extents[0],
+                        ShardExtent {
+                            axis: 1,
+                            start: 0,
+                            logical_end: AMP_COLUMN_MICRO,
+                            physical_end: AMP_COLUMN_MICRO,
+                        },
+                    ],
                 };
                 let source_offsets = view_byte_spans(&source, &source_view)
                     .unwrap()
                     .into_iter()
-                    .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
+                    .flat_map(|span| {
+                        (span.offset..span.offset + span.bytes).step_by(bytes as usize)
+                    });
                 let destination_offsets = view_byte_spans(&destination, &destination_view)
                     .unwrap()
                     .into_iter()
-                    .flat_map(|span| (span.offset..span.offset + span.bytes).step_by(2));
+                    .flat_map(|span| {
+                        (span.offset..span.offset + span.bytes).step_by(bytes as usize)
+                    });
                 let pairs = source_offsets.zip(destination_offsets).collect::<Vec<_>>();
                 assert_eq!(
                     pairs.len(),
@@ -1310,13 +1327,13 @@ mod tests {
                     let source_coordinates = physical_coordinates(
                         source.storage(),
                         &[AMP_INNER_BLOCK, panels * AMP_COLUMN_MICRO],
-                        u64::from(source_offset / 2),
+                        u64::from(source_offset / bytes),
                     )
                     .unwrap();
                     let destination_coordinates = physical_coordinates(
                         destination.storage(),
-                        &[AMP_INNER_BLOCK, AMP_COLUMN_MICRO],
-                        u64::from(destination_offset / 2),
+                        &[AMP_INNER_BLOCK, 32],
+                        u64::from(destination_offset / bytes),
                     )
                     .unwrap();
                     assert_eq!(source_coordinates[0], destination_coordinates[0]);

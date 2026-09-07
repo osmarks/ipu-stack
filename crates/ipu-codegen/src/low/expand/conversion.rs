@@ -230,7 +230,7 @@ impl TileGraphBuilder {
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         let physical = if copy_order == CopyOrder::Semantic {
-            self.f16_micro_panel_mappings(mappings.clone())?
+            self.micro_panel_mappings(mappings.clone())?
         } else {
             None
         };

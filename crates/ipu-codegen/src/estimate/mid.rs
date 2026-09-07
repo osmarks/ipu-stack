@@ -258,9 +258,12 @@ fn operation_cost(
         MidOperationKind::Primitive(Primitive::Copy { .. }) | MidOperationKind::Convert(_) => {
             let input = tensor(operation.inputs[0]);
             let bytes = maximum_shard_bytes(output);
-            let same_ownership = crate::mid::implementation::same_distribution(input, output)
-                && values[operation.inputs[0].index() as usize].tile_offset
-                    == values[operation.results[0].index() as usize].tile_offset;
+            let local_conversion = matches!(&operation.kind, MidOperationKind::Convert(plan)
+                if plan.strategy == crate::ConversionStrategy::LocalKernel);
+            let same_ownership = local_conversion
+                || (crate::mid::implementation::same_distribution(input, output)
+                    && values[operation.inputs[0].index() as usize].tile_offset
+                        == values[operation.results[0].index() as usize].tile_offset);
             if !same_ownership
                 || matches!(
                     operation.kind,
@@ -286,9 +289,7 @@ fn operation_cost(
                 .saturating_add(bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
                 .saturating_add(IPU21_TARGET_COSTS.local_copy_call_cycles);
             if input.format.layout.order != output.format.layout.order
-                && !input
-                    .format
-                    .supports_f16_micro_panel_exchange(&output.format)
+                && !input.format.supports_micro_panel_exchange(&output.format)
             {
                 scratch.standard = bytes;
                 let elements = bytes.div_ceil(output.format.precision.bytes());

@@ -1633,20 +1633,75 @@ pub(super) fn ensure_format(
         return value;
     }
     let mut cast_layout = state.get(value).tensor_type.format.layout.clone();
+    let mut early_cast = None;
     if fp8_cast {
         cast_layout = initial_layout;
-    }
-    let formats = [
-        TensorFormat {
-            precision: from,
-            layout: cast_layout.clone(),
-        },
-        TensorFormat {
+        let input = &state.get(value).tensor_type;
+        let producer_layout = input.fp8_cast_layout();
+        let quantized = TensorFormat {
             precision: target.precision,
-            layout: cast_layout,
-        },
-        target,
-    ];
+            layout: producer_layout
+                .clone()
+                .unwrap_or_else(|| input.format.layout.clone()),
+        };
+        // Quantize once on the producer's owners when the resulting panels
+        // can feed the consumer directly. Price both orders of operations.
+        if packed_cast
+            && producer_layout.is_some()
+            && (quantized.layout.order == target.layout.order
+                || quantized.supports_micro_panel_exchange(&target))
+        {
+            let movement = |precision, from: &Layout, to: &Layout| {
+                if from == to {
+                    0
+                } else {
+                    costs
+                        .rearrangement_cost(
+                            &input.shape,
+                            precision,
+                            layout_conversion_strategy(from, to),
+                            from,
+                            to,
+                        )
+                        .cycles
+                }
+            };
+            let before = costs
+                .cast_cycles(input, target.precision)
+                .saturating_add(movement(
+                    target.precision,
+                    &quantized.layout,
+                    &target.layout,
+                ));
+            let after_input = TensorType {
+                shape: input.shape.clone(),
+                format: TensorFormat {
+                    precision: from,
+                    layout: cast_layout.clone(),
+                },
+            };
+            let after = movement(from, &input.format.layout, &cast_layout)
+                .saturating_add(costs.cast_cycles(&after_input, target.precision));
+            if before <= after {
+                early_cast = Some(quantized);
+            }
+        }
+    }
+    let formats = if let Some(quantized) = early_cast {
+        vec![quantized, target]
+    } else {
+        vec![
+            TensorFormat {
+                precision: from,
+                layout: cast_layout.clone(),
+            },
+            TensorFormat {
+                precision: target.precision,
+                layout: cast_layout,
+            },
+            target,
+        ]
+    };
     for format in formats {
         let input = state.get(value).tensor_type.clone();
         if input.format == format {

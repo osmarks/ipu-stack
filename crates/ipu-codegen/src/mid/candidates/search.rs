@@ -183,7 +183,7 @@ impl<'a> CandidateSearch<'a> {
                             || (config.conversion_streaming != ConversionStreamingPolicy::Always
                                 && input
                                     .format
-                                    .supports_f16_micro_panel_exchange(&requirement.format))
+                                    .supports_micro_panel_exchange(&requirement.format))
                             || !requirement.format.layout.order.requires_direct_population()
                             || (current.order == ElementOrder::RowMajor
                                 && requirement
@@ -220,7 +220,7 @@ impl<'a> CandidateSearch<'a> {
                             && requirement.format.layout.order.requires_direct_population()
                             && input
                                 .format
-                                .supports_f16_micro_panel_exchange(&requirement.format)
+                                .supports_micro_panel_exchange(&requirement.format)
                     },
                 );
                 // Cross-order panel exchange is currently implemented for a
