@@ -85,6 +85,15 @@ pub struct GroupSummary {
     pub phase_ms: f64,
     pub work_cycles: u64,
     pub average_active_tiles: f64,
+    /// Sum of useful issue-cycle equivalents for covered, uncut samples.
+    pub useful_cycles: f64,
+    pub estimated_work_cycles: u64,
+    /// Fractions, not percentages; None when no samples have estimates.
+    pub useful_utilization: Option<f64>,
+    pub work_lane_occupancy: Option<f64>,
+    /// Includes idle tiles and gaps in the group interval union. Partial coverage
+    /// is a lower bound, reported alongside estimated_work_cycles.
+    pub device_useful_utilization: Option<f64>,
     pub mean_cycles: f64,
     pub p50_cycles: u32,
     pub p95_cycles: u32,
@@ -207,7 +216,13 @@ pub fn calibrate_profiles(
                     .filter(|entry| {
                         !matches!(
                             entry.name.as_str(),
-                            "reason" | "value" | "invocations" | "uniformInvocations"
+                            "reason"
+                                | "value"
+                                | "invocations"
+                                | "uniformInvocations"
+                                | "usefulCycles"
+                                | "physicalWorkCycles"
+                                | "workEstimateBasis"
                         )
                     })
                     .map(|entry| (entry.name.clone(), entry.value.clone()))
@@ -457,6 +472,9 @@ struct Accumulator {
     phases: BTreeSet<(u32, u32)>,
     intervals: Vec<(u64, u64)>,
     work_cycles: u64,
+    useful_cycles: f64,
+    physical_work_cycles: f64,
+    estimated_work_cycles: u64,
     first_offset: u64,
     last_offset: u64,
 }
@@ -466,6 +484,22 @@ struct Candidate<'a> {
     offset: u64,
     duration: u32,
     sample: &'a CycleSample,
+}
+
+/// Estimates are attached by codegen, never guessed from an executable name.
+fn useful_work(sample: &CycleSample) -> Option<(f64, f64)> {
+    let number = |name| {
+        sample
+            .step
+            .metadata
+            .iter()
+            .find(|entry| entry.name == name)
+            .and_then(|entry| entry.value.parse::<f64>().ok())
+            .filter(|n| n.is_finite() && *n >= 0.0)
+    };
+    let useful = number("usefulCycles")?;
+    let physical = number("physicalWorkCycles")?;
+    (useful <= physical).then_some((useful, physical))
 }
 
 pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
@@ -520,6 +554,13 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
                 .intervals
                 .push((offset, offset + u64::from(sample_duration)));
             accumulator.work_cycles += u64::from(sample_duration);
+            if sample_duration == duration(sample)
+                && let Some((useful, physical)) = useful_work(sample)
+            {
+                accumulator.useful_cycles += useful;
+                accumulator.physical_work_cycles += physical;
+                accumulator.estimated_work_cycles += u64::from(sample_duration);
+            }
             accumulator.first_offset = accumulator.first_offset.min(offset);
             accumulator.last_offset = accumulator
                 .last_offset
@@ -562,6 +603,18 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
                 } else {
                     accumulator.work_cycles as f64 / phase_cycles as f64
                 },
+                useful_cycles: accumulator.useful_cycles,
+                estimated_work_cycles: accumulator.estimated_work_cycles,
+                useful_utilization: (accumulator.estimated_work_cycles > 0)
+                    .then(|| accumulator.useful_cycles / accumulator.estimated_work_cycles as f64),
+                work_lane_occupancy: (accumulator.physical_work_cycles > 0.0)
+                    .then(|| accumulator.useful_cycles / accumulator.physical_work_cycles),
+                device_useful_utilization: (accumulator.estimated_work_cycles > 0
+                    && phase_cycles > 0)
+                    .then(|| {
+                        accumulator.useful_cycles
+                            / (phase_cycles as f64 * report.tiles.len() as f64)
+                    }),
                 mean_cycles,
                 p50_cycles: percentile(&accumulator.durations, 50),
                 p95_cycles: percentile(&accumulator.durations, 95),
@@ -848,6 +901,53 @@ mod tests {
         assert_eq!(summary.arrival_wait_cycles, 25);
         assert_eq!(summary.measured_phase_cycles, 50);
         assert_eq!(summary.phase_boundary_cycles, 10);
+    }
+
+    #[test]
+    fn useful_work_is_weighted_and_cut_samples_are_unavailable() {
+        let mut a = sample(0, ProfileStepKind::Compute, "gemm", 100, 120);
+        a.step.metadata.extend([
+            ipu_package::ProfileMetadata {
+                name: "usefulCycles".into(),
+                value: "5".into(),
+            },
+            ipu_package::ProfileMetadata {
+                name: "physicalWorkCycles".into(),
+                value: "10".into(),
+            },
+        ]);
+        let mut b = a.clone();
+        b.start_cycle = 110;
+        b.end_cycle = 150;
+        let report = ProfileReport {
+            clock_hz: 1_000_000_000,
+            tiles: vec![
+                TileProfile {
+                    physical_tile: 0,
+                    samples: vec![a],
+                },
+                TileProfile {
+                    physical_tile: 1,
+                    samples: vec![b],
+                },
+            ],
+        };
+        let full = query(
+            &report,
+            &Query {
+                shared_clock: true,
+                ..Query::default()
+            },
+        );
+        let g = &full.groups[0];
+        assert_eq!(g.useful_utilization, Some(10.0 / 60.0));
+        assert_eq!(g.work_lane_occupancy, Some(0.5));
+        assert_eq!(g.device_useful_utilization, Some(0.1));
+        let cropped = query(&report, &Query::default());
+        let g = &cropped.groups[0];
+        assert_eq!(g.estimated_work_cycles, 40);
+        assert_eq!(g.useful_cycles, 5.0);
+        assert_eq!(g.useful_utilization, Some(0.125));
     }
 
     #[test]

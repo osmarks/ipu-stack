@@ -37,6 +37,8 @@ impl Builder {
         let (right_inner, right_column) = orientation.matrix_axes(right_type.shape.0.len());
         let (output_row, output_column) = orientation.matrix_axes(output.shape.0.len());
         let axes = ProductAxes {
+            valid_inner: None,
+            valid_columns: None,
             left_inner: TensorAxis::FromStart(left_inner as u16),
             right_inner: TensorAxis::FromStart(right_inner as u16),
             output_column: TensorAxis::FromEnd(if orientation == GemmOrientation::Normal {

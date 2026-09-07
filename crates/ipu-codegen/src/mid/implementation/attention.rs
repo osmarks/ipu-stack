@@ -45,11 +45,15 @@ impl Builder {
         let mut product_type = scores_type.clone();
         product_type.shape.0[2] = value_width;
         let qk_axes = ProductAxes {
+            valid_inner: Some(query.shape.0[2]),
+            valid_columns: None,
             left_inner: TensorAxis::FromEnd(1),
             right_inner: TensorAxis::FromEnd(1),
             output_column: TensorAxis::FromEnd(1),
         };
         let pv_axes = ProductAxes {
+            valid_inner: None,
+            valid_columns: Some(output.shape.0[2]),
             left_inner: TensorAxis::FromEnd(1),
             right_inner: TensorAxis::FromEnd(2),
             output_column: TensorAxis::FromEnd(1),
@@ -109,7 +113,10 @@ impl Builder {
                 vec![query_buffer, k],
                 scores_type.clone(),
                 query_key.clone(),
-                Some(qk_axes),
+                Some(ProductAxes {
+                    valid_columns: Some(valid),
+                    ..qk_axes
+                }),
                 None,
                 vec![],
             );
@@ -132,7 +139,10 @@ impl Builder {
                 vec![weights_id, v],
                 product_type.clone(),
                 probability_value.clone(),
-                Some(pv_axes),
+                Some(ProductAxes {
+                    valid_inner: Some(valid),
+                    ..pv_axes
+                }),
                 None,
                 vec![
                     OperandWindow(vec![(2, 0, key_block)]),

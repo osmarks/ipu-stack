@@ -151,6 +151,8 @@ pub struct KernelRunMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRun {
+    /// Useful and physical product FLOPs, before axes are erased by the ABI.
+    pub product_flops: Option<[u64; 2]>,
     pub(crate) metadata: Arc<KernelRunMetadata>,
     pub inputs: Vec<KernelOperand>,
     pub output: ShardView,
@@ -165,6 +167,7 @@ impl KernelRun {
         requirements: KernelRequirements,
     ) -> Self {
         Self {
+            product_flops: None,
             metadata: Arc::new(KernelRunMetadata {
                 provenance,
                 kernel,

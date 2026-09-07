@@ -1406,6 +1406,13 @@ fn uneven_mlp_products_preserve_global_coordinates() {
         .unwrap()
         .remove(0);
     let tiles = crate::low::expand::expand_tiles(&mid).unwrap();
+    let useful: u64 = tiles
+        .kernel_runs
+        .iter()
+        .filter_map(|run| run.product_flops)
+        .map(|f| f[0])
+        .sum();
+    assert_eq!(useful, 4 * 729 * 1152 * 4304);
     for run in &tiles.kernel_runs {
         if !matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
             continue;
@@ -1885,4 +1892,33 @@ fn automatic_repeat_state_keeps_an_unreplicated_boundary() {
         );
     }
     crate::expand_tiles(&mid).unwrap();
+}
+
+#[test]
+fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
+    for strategy in [AttentionStrategy::Flash, AttentionStrategy::Materialized] {
+        let mut graph = ComputeGraph::new();
+        let q = graph.host_input("q", [4, 17, 72]).unwrap();
+        let k = graph.host_input("k", [4, 73, 72]).unwrap();
+        let v = graph.host_input("v", [4, 73, 72]).unwrap();
+        let result = graph.flash_attention(q, k, v).unwrap();
+        graph.set_outputs([result]).unwrap();
+        let config = PipelineConfig::new(64)
+            .with_attention_strategy(strategy)
+            .with_automatic_input(q, Precision::F16)
+            .with_automatic_input(k, Precision::F16)
+            .with_automatic_input(v, Precision::F16);
+        let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        let tiles = crate::low::expand::expand_tiles(&mid).unwrap();
+        let mut total = [0u64; 2];
+        for flops in tiles.kernel_runs.iter().filter_map(|run| run.product_flops) {
+            assert!(flops[0] <= flops[1]);
+            total[0] += flops[0];
+            total[1] += flops[1];
+        }
+        assert_eq!(total[0], 4 * 4 * 17 * 73 * 72, "{strategy:?}");
+        assert!(total[0] < total[1]);
+    }
 }

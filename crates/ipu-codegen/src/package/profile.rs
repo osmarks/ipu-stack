@@ -93,6 +93,10 @@ pub(super) fn instrument_profile(
                 .take_while(|&&next| profile_work_can_merge(work, next))
                 .count()
                 + 1;
+            super::profile_work::append_work_estimate(
+                &mut description.metadata,
+                &schedule[index..index + invocations],
+            );
             description.metadata.push(ProfileMetadata {
                 name: "invocations".into(),
                 value: invocations.to_string(),

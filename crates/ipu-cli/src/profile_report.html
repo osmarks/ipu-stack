@@ -107,6 +107,11 @@ canvas {
   text-decoration: underline;
   text-align: left;
 }
+#kernelWork { padding: 12px; overflow: auto; max-height: 420px; }
+#kernelWork table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+#kernelWork th, #kernelWork td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); }
+#kernelWork th:first-child, #kernelWork td:first-child { text-align: left; }
+#kernelWork .low { color: #a62831; font-weight: bold; }
 #tooltip {
   position: fixed;
   max-width: 360px;
@@ -169,6 +174,16 @@ canvas {
     <div class="overview-wrap"><canvas id="overview"></canvas></div>
     <div class="timeline-wrap"><canvas id="timeline"></canvas></div>
     <div id="details"></div>
+  </section>
+  <section>
+    <div class="section-head"><div class="section-title">Estimated useful work by kernel</div></div>
+    <p style="padding:0 12px">Useful efficiency = useful issue-cycle equivalents / measured tile cycles.
+    AMP uses peak FLOPs; other kernels use arithmetic instructions or dense-copy throughput.
+    Lane occupancy excludes known padding. Coverage is the fraction of measured cycles with estimates;
+    cut samples, legacy profiles, and unsupported kernels are unavailable. Values above 100% indicate model mismatch.
+    Device useful includes idle tiles over the kernel’s interval union (a lower bound with partial coverage).
+    Sorted by total tile cycles; click a kernel to focus the profile.</p>
+    <div id="kernelWork"></div>
   </section>
 </main>
 <div id="tooltip"></div>
@@ -769,7 +784,49 @@ function drawTimeline() {
     ctx.stroke();
   }
 }
+function workEstimate(sample) {
+  if (sample.duration !== sample.rawDuration || sample.duration <= 0) return null;
+  const number = name => {
+    const entry = sample.metadata.find(entry => entry.name === name);
+    return entry ? Number(entry.value) : NaN;
+  };
+  const useful = number("usefulCycles"), physical = number("physicalWorkCycles");
+  if (!Number.isFinite(useful) || !Number.isFinite(physical) || useful < 0 || physical < useful) return null;
+  return { useful, physical };
+}
+function workTooltip(sample) {
+  const work = workEstimate(sample);
+  if (!work) return sample.kind === "compute" ? ["Useful-work estimate unavailable"] : [];
+  return [`Estimated useful efficiency ${(100 * work.useful / sample.duration).toFixed(1)}%`,
+    `Arithmetic / dense-copy equivalent ${(100 * work.physical / sample.duration).toFixed(1)}% of cycles`,
+    `Useful lane occupancy ${work.physical ? (100 * work.useful / work.physical).toFixed(1) + "%" : "n/a"}`];
+}
+function drawKernelWork() {
+  const groups = new Map();
+  for (const tile of tiles) for (const sample of tile.samples) {
+    if (sample.kind !== "compute" || !matches(sample) || sample.duration <= 0) continue;
+    let group = groups.get(sample.kernel);
+    if (!group) { group = { total: 0, covered: 0, useful: 0, physical: 0, intervals: [] }; groups.set(sample.kernel, group); }
+    group.total += sample.duration;
+    group.intervals.push([sample.offset, sample.offset + sample.duration]);
+    const work = workEstimate(sample);
+    if (work) { group.covered += sample.duration; group.useful += work.useful; group.physical += work.physical; }
+  }
+  const percent = (n, d) => d ? (100 * n / d).toFixed(1) + "%" : "n/a";
+  const intervalCycles = intervals => {
+    intervals.sort((a, b) => a[0] - b[0]);
+    let end = 0, cycles = 0;
+    for (const [start, stop] of intervals) { cycles += Math.max(0, stop - Math.max(start, end)); end = Math.max(end, stop); }
+    return cycles;
+  };
+  const rows = [...groups].sort((a, b) => b[1].total - a[1].total).map(([kernel, g]) =>
+    `<tr><td><button class="detail-link" data-profile-focus="${escapeHtml(JSON.stringify({ kernel }))}">${escapeHtml(kernel)}</button></td>` +
+    `<td>${formatCount(g.total)}</td><td class="${g.covered && g.useful / g.covered < 0.25 ? "low" : ""}">${percent(g.useful, g.covered)}</td>` +
+    `<td>${percent(g.physical, g.covered)}</td><td>${percent(g.useful, g.physical)}</td><td>${percent(g.covered, g.total)}</td><td>${g.covered ? (g.covered < g.total ? "≥ " : "") + percent(g.useful, intervalCycles(g.intervals) * tiles.length) : "n/a"}</td></tr>`).join("");
+  document.getElementById("kernelWork").innerHTML = `<table><thead><tr><th>Kernel</th><th>Tile cycles</th><th>Useful efficiency</th><th>Work cycles</th><th>Lane occupancy</th><th>Coverage</th><th>Device useful</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
 function drawDetails() {
+  drawKernelWork();
   let selected = 0;
   let total = 0;
   let longest = null;
@@ -1007,7 +1064,7 @@ document.getElementById("timelineStart").addEventListener("change", render);
 document.getElementById("zoomIn").addEventListener("click", () => zoomView(1.35));
 document.getElementById("zoomOut").addEventListener("click", () => zoomView(1 / 1.35));
 document.getElementById("reset").addEventListener("click", resetView);
-details.addEventListener("click", event => {
+document.addEventListener("click", event => {
   const link = event.target.closest("[data-profile-focus]");
   if (link) focusFlame(JSON.parse(link.dataset.profileFocus));
 });
@@ -1023,6 +1080,7 @@ timeline.addEventListener("mousemove", event => {
     sampleTitle(hit.sample),
     `${hit.kind} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
     ...exchangeDetailsAt(hit.sample, hit.time),
+    ...workTooltip(hit.sample),
     `range ${formatRange(hit.sample)}`,
     formatMetadata(hit.sample),
   ]);

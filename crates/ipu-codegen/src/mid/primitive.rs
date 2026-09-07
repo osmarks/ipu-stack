@@ -14,6 +14,10 @@ pub struct ProductAxes {
     pub left_inner: TensorAxis,
     pub right_inner: TensorAxis,
     pub output_column: TensorAxis,
+    /// Valid contraction/output-column bounds when scratch shapes include padding.
+    /// These describe useful arithmetic; they do not change physical execution.
+    pub valid_inner: Option<u32>,
+    pub valid_columns: Option<u32>,
 }
 
 /// Map output coordinates back to the source: first add the window offsets,

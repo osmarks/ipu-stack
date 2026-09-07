@@ -412,7 +412,7 @@ fn main() -> Result<()> {
                 );
                 for group in result.groups {
                     println!(
-                        "name={:?} phases={} tiles={} samples={} timelineCycles={} workCycles={} range={}..{} p95={} max={}",
+                        "name={:?} phases={} tiles={} samples={} timelineCycles={} workCycles={} range={}..{} p95={} max={} useful={} coverage={:.1}%",
                         group.name,
                         group.phase_count,
                         group.tile_count,
@@ -422,7 +422,12 @@ fn main() -> Result<()> {
                         group.first_offset,
                         group.last_offset,
                         group.p95_cycles,
-                        group.maximum_cycles
+                        group.maximum_cycles,
+                        group
+                            .useful_utilization
+                            .map_or_else(|| "n/a".into(), |v| format!("{:.1}%", v * 100.0)),
+                        100.0 * group.estimated_work_cycles as f64
+                            / group.work_cycles.max(1) as f64
                     );
                 }
                 for sample in result.samples {

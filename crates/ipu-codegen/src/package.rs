@@ -2,6 +2,7 @@ mod bindings;
 use bindings::{PackageBindings, auxiliary_ranges};
 mod placement;
 mod profile;
+mod profile_work;
 use profile::{instrument_profile, profile_binding, profile_step_count};
 mod selection;
 mod tile_program;

@@ -229,7 +229,7 @@ impl TileGraphBuilder {
                         crate::GemmWeightLoad::Standard
                     };
                 }
-                let run = self.kernel_run(
+                let mut run = self.kernel_run(
                     provenance,
                     kernel,
                     vec![
@@ -238,6 +238,38 @@ impl TileGraphBuilder {
                     ],
                     destination,
                 )?;
+                let size = |e: ShardExtent, bound: Option<u32>| {
+                    u64::from(
+                        e.logical_end
+                            .min(bound.unwrap_or(u32::MAX))
+                            .saturating_sub(e.start),
+                    )
+                };
+                let rows: u64 = run
+                    .output
+                    .extents
+                    .iter()
+                    .enumerate()
+                    .filter(|(axis, _)| *axis != output_column)
+                    .map(|(_, &e)| size(e, None))
+                    .product();
+                let cols = size(run.output.extents[output_column], axes.valid_columns).min(size(
+                    run.inputs[1].views[0].extents[right_column],
+                    axes.valid_columns,
+                ));
+                let inner =
+                    size(run.inputs[0].views[0].extents[left_inner], axes.valid_inner).min(size(
+                        run.inputs[1].views[0].extents[right_inner],
+                        axes.valid_inner,
+                    ));
+                let physical: u64 = run
+                    .output
+                    .extents
+                    .iter()
+                    .map(|e| u64::from(e.physical_end - e.start))
+                    .product();
+                run.product_flops =
+                    Some([2 * rows * cols * inner, 2 * physical * u64::from(width)]);
                 self.append_kernel(body, tile, run)?;
             }
         }
