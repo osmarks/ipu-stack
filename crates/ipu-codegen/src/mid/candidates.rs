@@ -235,6 +235,36 @@ pub(super) fn plans(
             deferred_output: None,
         });
     }
+    if let OperationKind::Slice(slice) = operation.kind
+        && let [input] = inputs
+    {
+        let mut layouts = vec![input.format.layout.clone()];
+        layouts.push(Layout::row_sharded(
+            u16::try_from(output.0[output.0.len().saturating_sub(2)])
+                .unwrap_or(u16::MAX)
+                .min(config.tile_count)
+                .max(1),
+        ));
+        for layout in layouts {
+            plans.push(OperatorPlan {
+                operator: MidOperator::Slice(slice),
+                dispatch: OperatorDispatch::View,
+                requirements: StorageRequirements {
+                    inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
+                    output: OperandRequirement::new(
+                        TensorFormat {
+                            precision: input.format.precision,
+                            layout,
+                        },
+                        8,
+                    ),
+                    output_aliasing: OutputAliasing::Fresh,
+                    distinct_elements: Vec::new(),
+                },
+                deferred_output: None,
+            });
+        }
+    }
     if let OperationKind::FlashAttention(options) = operation.kind
         && !options.causal
         && let [query, key, value] = inputs
@@ -1628,6 +1658,7 @@ pub(super) fn operator_matches(operation: &OperationKind, operator: MidOperator)
         (OperationKind::Gelu, MidOperator::Gelu) => true,
         (OperationKind::Add, MidOperator::Add) => true,
         (OperationKind::View(expected), MidOperator::View(view)) => *expected == view,
+        (OperationKind::Slice(expected), MidOperator::Slice(slice)) => *expected == slice,
         (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
             *expected == options
         }

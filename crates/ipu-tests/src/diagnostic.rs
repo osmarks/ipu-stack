@@ -455,6 +455,26 @@ fn evaluate_operations(
             OperationKind::View(view) => {
                 vec![apply_view(&values[&operation.inputs[0]], *view)?]
             }
+            OperationKind::Slice(slice) => {
+                let input = &values[&operation.inputs[0]];
+                let stride = input.shape[slice.axis + 1..]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .product::<usize>();
+                let width = input.shape[slice.axis] as usize * stride;
+                let start = slice.start as usize * stride;
+                let length = slice.length as usize * stride;
+                let mut shape = input.shape.clone();
+                shape[slice.axis] = slice.length;
+                vec![HostTensor {
+                    shape,
+                    values: input
+                        .values
+                        .chunks_exact(width)
+                        .flat_map(|row| row[start..start + length].iter().copied())
+                        .collect(),
+                }]
+            }
             OperationKind::FlashAttention(options) => vec![attention(
                 &values[&operation.inputs[0]],
                 &values[&operation.inputs[1]],

@@ -18,6 +18,7 @@ pub enum MidOperator {
     Gelu,
     Add,
     View(AxisFactorView),
+    Slice(crate::graph::AxisSlice),
     FlashAttention {
         options: AttentionOptions,
         accumulate: AccumulationPrecision,
@@ -374,7 +375,7 @@ pub(super) fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
         MidOperator::Add => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Add,
         },
-        MidOperator::View(_) => OperatorDispatch::View,
+        MidOperator::View(_) | MidOperator::Slice(_) => OperatorDispatch::View,
         MidOperator::FlashAttention {
             options,
             accumulate,
@@ -842,6 +843,18 @@ impl OperatorPlan {
                     .any(|input| input.format.layout.tiling.tile_count != output_tiles)
                 {
                     Err(OperatorPlanError::IncompatibleTileGroups)
+                } else {
+                    Ok(())
+                }
+            }
+            (MidOperator::Slice(slice), OperatorDispatch::View) => {
+                let [input] = inputs else {
+                    return Err(OperatorPlanError::OperandArity);
+                };
+                if slice.output_shape(&input.shape).as_ref() != Some(&output.shape)
+                    || input.format.precision != output.format.precision
+                {
+                    Err(OperatorPlanError::InvalidBlocking)
                 } else {
                     Ok(())
                 }

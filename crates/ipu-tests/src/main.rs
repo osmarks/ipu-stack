@@ -154,6 +154,12 @@ struct Arguments {
     /// Compare native and packed GEMM stores, or force one for diagnostics.
     #[arg(long, value_parser = ["auto", "native", "packed"], default_value = "auto")]
     gemm_output_packing: String,
+    /// Offer batches of up to this many independent reductions (1 disables).
+    #[arg(long, default_value_t = 3)]
+    max_parallel_reductions: usize,
+    /// Use one concatenated QKV projection in the projected-attention workload.
+    #[arg(long)]
+    fuse_qkv: bool,
     #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
     attention_heads: u32,
     /// Defaults to SigLIP's 4304-wide intermediate for the canonical 1152D
@@ -629,6 +635,7 @@ fn main() -> Result<()> {
     }
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
+    pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
         "native" => ipu_codegen::GemmOutputPacking::Native,
         "packed" => ipu_codegen::GemmOutputPacking::Packed,
@@ -719,21 +726,40 @@ fn main() -> Result<()> {
             )?;
             let mut weights = [Vec::new(), Vec::new(), Vec::new()];
             for block in 0..arguments.attention_blocks {
-                for (name, weights) in ["query", "key", "value"].into_iter().zip(&mut weights) {
+                let names: &[&str] = if arguments.fuse_qkv {
+                    &["qkv"]
+                } else {
+                    &["query", "key", "value"]
+                };
+                for (name, weights) in names.iter().zip(&mut weights) {
                     let name = if arguments.attention_blocks == 1 {
                         format!("{name}.weight")
                     } else {
                         format!("{name}.{block}.weight")
                     };
-                    let weight = graph.parameter(name, [model_width, model_width])?;
+                    let columns = model_width
+                        .checked_mul(if arguments.fuse_qkv { 3 } else { 1 })
+                        .context("QKV width overflow")?;
+                    let weight = graph.parameter(name, [model_width, columns])?;
                     pipeline = pipeline.with_automatic_input(weight, Precision::F16);
                     weights.push(weight);
                 }
             }
             let output = if arguments.attention_blocks == 1 {
-                let query = graph.gemm(input, weights[0][0])?;
-                let key = graph.gemm(input, weights[1][0])?;
-                let value = graph.gemm(input, weights[2][0])?;
+                let [query, key, value] = if arguments.fuse_qkv {
+                    let qkv = graph.gemm(input, weights[0][0])?;
+                    [
+                        graph.slice(qkv, 2, 0, model_width)?,
+                        graph.slice(qkv, 2, model_width, model_width)?,
+                        graph.slice(qkv, 2, 2 * model_width, model_width)?,
+                    ]
+                } else {
+                    [
+                        graph.gemm(input, weights[0][0])?,
+                        graph.gemm(input, weights[1][0])?,
+                        graph.gemm(input, weights[2][0])?,
+                    ]
+                };
                 let query = graph.split_heads(query, arguments.attention_heads)?;
                 let key = graph.split_heads(key, arguments.attention_heads)?;
                 let value = graph.split_heads(value, arguments.attention_heads)?;
@@ -741,7 +767,11 @@ fn main() -> Result<()> {
             } else {
                 let initial = graph.split_heads(input, arguments.attention_heads)?;
                 let mut sequences = Vec::new();
-                for (index, weights) in weights.into_iter().enumerate() {
+                for (index, weights) in weights
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, weights)| !weights.is_empty())
+                {
                     sequences
                         .push(graph.value_sequence(format!("attention weights {index}"), weights)?);
                 }
@@ -755,9 +785,20 @@ fn main() -> Result<()> {
                             args.carried[0],
                             AxisFactorView::new(2, 0, arguments.attention_heads).inverse(),
                         )?;
-                        let query = body.gemm(input, args.iterated[0])?;
-                        let key = body.gemm(input, args.iterated[1])?;
-                        let value = body.gemm(input, args.iterated[2])?;
+                        let [query, key, value] = if arguments.fuse_qkv {
+                            let qkv = body.gemm(input, args.iterated[0])?;
+                            [
+                                body.slice(qkv, 2, 0, model_width)?,
+                                body.slice(qkv, 2, model_width, model_width)?,
+                                body.slice(qkv, 2, 2 * model_width, model_width)?,
+                            ]
+                        } else {
+                            [
+                                body.gemm(input, args.iterated[0])?,
+                                body.gemm(input, args.iterated[1])?,
+                                body.gemm(input, args.iterated[2])?,
+                            ]
+                        };
                         let query = body.split_heads(query, arguments.attention_heads)?;
                         let key = body.split_heads(key, arguments.attention_heads)?;
                         let value = body.split_heads(value, arguments.attention_heads)?;

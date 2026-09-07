@@ -53,7 +53,10 @@ impl<'a> CandidateSearch<'a> {
                                 })
                         }))
         });
-        let format_sensitive_indices = if matches!(operation.kind, OperationKind::View(_)) {
+        let format_sensitive_indices = if matches!(
+            operation.kind,
+            OperationKind::View(_) | OperationKind::Slice(_)
+        ) {
             (0..operation.inputs.len()).collect::<BTreeSet<_>>()
         } else {
             config

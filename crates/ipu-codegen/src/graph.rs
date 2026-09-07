@@ -126,8 +126,28 @@ pub enum OperationKind {
     Gelu,
     Add,
     View(AxisFactorView),
+    Slice(AxisSlice),
     FlashAttention(AttentionOptions),
     Repeat(Repeat),
+}
+
+/// A contiguous logical window along one tensor axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AxisSlice {
+    pub axis: usize,
+    pub start: u32,
+    pub length: u32,
+}
+
+impl AxisSlice {
+    pub fn output_shape(self, input: &TensorShape) -> Option<TensorShape> {
+        if self.length == 0 || self.start.checked_add(self.length)? > *input.0.get(self.axis)? {
+            return None;
+        }
+        let mut output = input.clone();
+        output.0[self.axis] = self.length;
+        Some(output)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -531,6 +551,9 @@ fn infer_shape(
         OperationKind::View(view) => view.output_shape(input(0)?).ok_or_else(|| {
             GraphError::InvalidShape("view axes, factor, or output dimensions are invalid".into())
         }),
+        OperationKind::Slice(slice) => slice
+            .output_shape(input(0)?)
+            .ok_or_else(|| GraphError::InvalidShape("slice lies outside its input".into())),
         OperationKind::FlashAttention(options) => {
             let (query, key, value) = (input(0)?, input(1)?, input(2)?);
             if query.0.len() < 2 || key.0.len() < 2 || value.0.len() < 2 {
@@ -619,6 +642,17 @@ fn nonempty(name: impl Into<String>) -> GraphResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slices_validate_bounds_and_preserve_other_axes() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("qkv", [2, 17, 144]).unwrap();
+        let key = graph.slice(input, 2, 48, 48).unwrap();
+        assert_eq!(graph.value_shape(key), Some(&TensorShape(vec![2, 17, 48])));
+        for (axis, start, length) in [(3, 0, 1), (2, 140, 8), (2, 0, 0), (2, u32::MAX, 2)] {
+            assert!(graph.slice(input, axis, start, length).is_err());
+        }
+    }
 
     const RANDOM_CASES: usize = 256;
 

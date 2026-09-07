@@ -29,6 +29,24 @@ macro_rules! graph_operations {
             self.inferred_result(OperationKind::View(view), [input])
         }
 
+        /// Select a logical window; physical materialization is planned normally.
+        pub fn slice(
+            &mut self,
+            input: ValueId,
+            axis: usize,
+            start: u32,
+            length: u32,
+        ) -> GraphResult<ValueId> {
+            self.inferred_result(
+                OperationKind::Slice(crate::graph::AxisSlice {
+                    axis,
+                    start,
+                    length,
+                }),
+                [input],
+            )
+        }
+
         /// Convert `[batch, rows, heads * channels]` into attention streams.
         pub fn split_heads(&mut self, input: ValueId, heads: u32) -> GraphResult<ValueId> {
             if self

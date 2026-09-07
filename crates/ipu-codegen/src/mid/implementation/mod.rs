@@ -42,14 +42,23 @@ pub(crate) fn implement(
             )
         }
         OperatorDispatch::View => {
-            let MidOperator::View(view) = plan.operator else {
-                return None;
+            let mapping = match plan.operator {
+                MidOperator::View(view) => view.into(),
+                MidOperator::Slice(slice) => {
+                    let mut offsets = vec![0; inputs[0].shape.0.len()];
+                    offsets[slice.axis] = slice.start;
+                    CoordinateMapping {
+                        offsets,
+                        view: None,
+                    }
+                }
+                _ => return None,
             };
             b.emit(
                 vec![MidValueId(0)],
                 output.clone(),
                 Primitive::Copy {
-                    mapping: view.into(),
+                    mapping,
                     reuse_local: false,
                 },
             )
