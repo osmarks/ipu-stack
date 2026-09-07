@@ -86,38 +86,47 @@ pub(super) fn select_scheduled_finalist(
             let placement = place(&low)?;
             Ok((low, placement))
         });
-        let mut feasible = false;
-        for (mapped, candidate) in std::iter::once((false, Ok((low, placement))))
+        let candidates = std::iter::once((false, Ok((low, placement))))
             .chain(mapped.map(|candidate| (true, candidate)))
-        {
-            let schedule = || -> PackageBuildResult<_> {
-                let (low, placement) = candidate?;
-                let mut cache = crate::exchange::ExchangeScheduleCache::default();
-                let exchanges = crate::exchange::lower_exchanges_cached(
-                    &low, &placement, &topology, false, &mut cache,
-                )?;
-                let refined =
-                    crate::estimate::scheduled_program_cycles(&low.program, &exchanges.phases)?;
-                tracing::info!(
-                    finalist = index,
-                    mapped,
-                    analytical_cycles = low.estimated_cycles,
-                    analytical_exchange_cycles = low.estimated_exchange_cycles,
-                    scheduled_exchange_cycles = refined.exchange,
-                    refined_cycles = refined.total,
-                    "scheduled operator-plan finalist"
-                );
-                Ok((
-                    (refined.total, index, mapped),
-                    ScheduledPlan {
-                        program: low,
-                        placement,
-                        phases: exchanges.phases,
-                        cache,
-                    },
-                ))
-            };
-            match schedule() {
+            .collect::<Vec<_>>();
+        let span = tracing::Span::current();
+        let results = candidates
+            .into_par_iter()
+            .map(|(mapped, candidate)| {
+                let _entered = span.enter();
+                let schedule = || -> PackageBuildResult<_> {
+                    let (low, placement) = candidate?;
+                    let mut cache = crate::exchange::ExchangeScheduleCache::default();
+                    let exchanges = crate::exchange::lower_exchanges_cached(
+                        &low, &placement, &topology, false, &mut cache,
+                    )?;
+                    let refined =
+                        crate::estimate::scheduled_program_cycles(&low.program, &exchanges.phases)?;
+                    tracing::info!(
+                        finalist = index,
+                        mapped,
+                        analytical_cycles = low.estimated_cycles,
+                        analytical_exchange_cycles = low.estimated_exchange_cycles,
+                        scheduled_exchange_cycles = refined.exchange,
+                        refined_cycles = refined.total,
+                        "scheduled operator-plan finalist"
+                    );
+                    Ok((
+                        (refined.total, index, mapped),
+                        ScheduledPlan {
+                            program: low,
+                            placement,
+                            phases: exchanges.phases,
+                            cache,
+                        },
+                    ))
+                };
+                (mapped, schedule())
+            })
+            .collect::<Vec<_>>();
+        let mut feasible = false;
+        for (mapped, result) in results {
+            match result {
                 Ok(candidate) => {
                     feasible = true;
                     if best.as_ref().is_none_or(|(score, _)| candidate.0 < *score) {

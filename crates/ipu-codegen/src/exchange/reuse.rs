@@ -19,7 +19,6 @@ fn normalized_rows(
 ) -> Result<Vec<Vec<u32>>, ExchangeLoweringError> {
     Ok(schedule
         .builder
-        .clone()
         .finish()?
         .programs
         .into_iter()
@@ -32,6 +31,21 @@ fn normalized_rows(
 }
 
 impl ExchangeScheduleCache {
+    pub(super) fn take_phase(&mut self, phase: ExchangePhaseId) -> Self {
+        Self {
+            phases: self
+                .phases
+                .remove(&phase)
+                .map(|recipe| (phase, recipe))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    pub(super) fn merge(&mut self, other: Self) {
+        self.phases.extend(other.phases);
+    }
+
     pub(super) fn select(
         &mut self,
         phase: ExchangePhaseId,

@@ -222,10 +222,20 @@ pub(crate) fn lower_exchanges_cached(
             }
         }
     }
-    program
+    // Each barrier-delimited phase has independent scheduling state. Keep its
+    // relocation recipe local to the worker, then restore the cache in order.
+    let mut phase_caches = program
         .exchange_phases
         .iter()
-        .map(|phase| {
+        .map(|phase| cache.take_phase(phase.id))
+        .collect::<Vec<_>>();
+    let span = tracing::Span::current();
+    let lowered = program
+        .exchange_phases
+        .par_iter()
+        .zip(phase_caches.par_iter_mut())
+        .map(|(phase, cache)| {
+            let _entered = span.enter();
             let pending = phase
                 .transfers
                 .par_iter()
@@ -455,18 +465,21 @@ pub(crate) fn lower_exchanges_cached(
                 schedule_problem,
             ))
         })
-        .collect::<Result<Vec<_>, ExchangeLoweringError>>()
-        .map(|lowered| {
-            let (phases, schedule_phases) = lowered.into_iter().unzip();
-            LoweredExchanges {
-                phases,
-                schedule_snapshot: ExchangeScheduleSnapshot {
-                    schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
-                    tile_count: program.tile_count,
-                    phases: schedule_phases,
-                },
-            }
-        })
+        .collect::<Result<Vec<_>, ExchangeLoweringError>>();
+    for phase_cache in phase_caches {
+        cache.merge(phase_cache);
+    }
+    lowered.map(|lowered| {
+        let (phases, schedule_phases) = lowered.into_iter().unzip();
+        LoweredExchanges {
+            phases,
+            schedule_snapshot: ExchangeScheduleSnapshot {
+                schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
+                tile_count: program.tile_count,
+                phases: schedule_phases,
+            },
+        }
+    })
 }
 
 fn prepare_transfer(
@@ -2036,7 +2049,7 @@ fn materialize_schedule_order(
 fn schedule_encoding_is_valid(
     schedule: &MaterializedSchedule,
 ) -> Result<bool, ExchangeLoweringError> {
-    match schedule.builder.clone().finish() {
+    match schedule.builder.finish() {
         Ok(_) => Ok(true),
         Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
         Err(error) => Err(error.into()),

@@ -582,12 +582,12 @@ impl PhaseProgramBuilder {
         })
     }
 
-    pub fn finish(self) -> Result<PhasePrograms, ExchangeError> {
+    pub fn finish(&self) -> Result<PhasePrograms, ExchangeError> {
         // `append_transfer_at` has already merged the authoritative
         // phase-wide schedule into these per-tile sender and receive-event
         // timelines. Encoding them directly avoids replaying every transfer
         // and performing the same conflict checks a second time.
-        let tile_states = self.tile_states;
+        let tile_states = &self.tile_states;
         let event_cycles = tile_states
             .iter()
             .map(|schedule| schedule.event_cycles)
