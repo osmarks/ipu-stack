@@ -93,6 +93,7 @@ pub(crate) fn place_with_offset(
     standard_ranges: &[(u32, u32)],
     interleaved_offset: u32,
 ) -> Result<Placement, PlacementError> {
+    let started = std::time::Instant::now();
     if interleaved_offset >= IPU21_INTERLEAVED_ELEMENT_SIZE {
         return Err(PlacementError::Overflow);
     }
@@ -149,6 +150,12 @@ pub(crate) fn place_with_offset(
         tile_auxiliary_ranges[usize::from(tile)] = unused;
     }
 
+    tracing::debug!(
+        tiles = program.tile_count,
+        shards = program.shards.len(),
+        elapsed_us = started.elapsed().as_micros(),
+        "placed tile storage"
+    );
     Ok(Placement {
         shard_addresses: addresses,
         tile_auxiliary_ranges,
@@ -259,56 +266,28 @@ fn place_tile(
         }
     }
 
-    // Region 1 is shared by ordinary and interleaved loads. Place the
-    // interleaved working set first, round its boundary to a paired memory
-    // element, then return every remaining byte to standard allocations.
+    // Both access classes share region 1. A single lifetime-ordered arena
+    // lets ordinary storage reuse dead interleaved buffers and vice versa.
     let mut addresses = BTreeMap::new();
-    let mut interleaved = Arena::new(
-        &[(
-            IPU21_INTERLEAVED_MEMORY_BASE + interleaved_offset,
-            IPU21_APPLICATION_MEMORY_LIMIT,
-        )],
-        true,
-    );
-    allocate_tile_class(
-        program,
-        tile,
-        MemoryClass::Ipu21Interleaved,
-        iterated,
-        &grouped,
-        members,
-        root_of_member,
-        root_requirements,
-        root_lifetimes,
-        &mut interleaved,
-        &mut addresses,
-    )?;
-    let interleaved_boundary =
-        align_up(interleaved.maximum_cursor(), IPU21_INTERLEAVED_ELEMENT_SIZE)?;
-    if interleaved_boundary > IPU21_APPLICATION_MEMORY_LIMIT {
-        return Err(PlacementError::OutOfMemory {
-            tile,
-            class: MemoryClass::Ipu21Interleaved,
-            bytes: interleaved_boundary - IPU21_INTERLEAVED_MEMORY_BASE,
-        });
-    }
     let mut ranges = standard_ranges.to_vec();
-    ranges.push((interleaved_boundary, IPU21_APPLICATION_MEMORY_LIMIT));
-    let mut standard = Arena::new(&ranges, false);
-    allocate_tile_class(
+    ranges.push((
+        IPU21_INTERLEAVED_MEMORY_BASE,
+        IPU21_APPLICATION_MEMORY_LIMIT,
+    ));
+    let mut arena = Arena::new(&ranges, interleaved_offset);
+    allocate_tile(
         program,
         tile,
-        MemoryClass::Ipu21Standard,
         iterated,
         &grouped,
         members,
         root_of_member,
         root_requirements,
         root_lifetimes,
-        &mut standard,
+        &mut arena,
         &mut addresses,
     )?;
-    Ok((tile, addresses, standard.unused_ranges()))
+    Ok((tile, addresses, arena.unused_ranges()))
 }
 
 fn shards_by_tile(
@@ -646,10 +625,9 @@ fn assign_members(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn allocate_tile_class(
+fn allocate_tile(
     program: &LowProgram,
     tile: u16,
-    class: MemoryClass,
     iterated: &[IteratedGroup],
     grouped: &BTreeSet<usize>,
     members: &BTreeMap<usize, Vec<usize>>,
@@ -671,9 +649,9 @@ fn allocate_tile_class(
             .format
             .layout
             .memory_class;
-        if group_class != class {
-            continue;
-        }
+        let distinct_element = roots
+            .iter()
+            .any(|root| root_requirements[root].distinct_element);
         let alignment = group.alignment.max(
             roots
                 .iter()
@@ -707,6 +685,11 @@ fn allocate_tile_class(
             ));
         }
         requests.push(AllocationRequest {
+            class: group_class,
+            region1_stride: distinct_element
+                .then(|| align_up(stride, IPU21_INTERLEAVED_ELEMENT_SIZE))
+                .transpose()?,
+            distinct_element,
             lifetime,
             bytes,
             alignment,
@@ -716,29 +699,33 @@ fn allocate_tile_class(
     for (&root, root_members) in members {
         let representative = &program.shards[root_members[0]];
         let lifetime = root_lifetimes.get(&root).copied().unwrap_or_default();
-        if representative.tensor_type.format.layout.memory_class != class
-            || grouped.contains(&root)
-            || !lifetime.seen
-        {
+        if grouped.contains(&root) || !lifetime.seen {
             continue;
         }
         let requirement = root_requirements.get(&root).copied().unwrap_or_default();
         let bytes = allocation_bytes(program, root_members, requirement)?;
         requests.push(AllocationRequest {
+            class: representative.tensor_type.format.layout.memory_class,
+            region1_stride: None,
+            distinct_element: requirement.distinct_element,
             lifetime,
             bytes,
             alignment: allocation_alignment(program, root_members, requirement).max(4),
             assignments: vec![(root, 0)],
         });
     }
-    requests.sort_by_key(|request| (request.lifetime.first, request.lifetime.last));
-    for request in requests {
-        let Some(base) = arena.allocate(
-            request.bytes,
-            request.alignment,
+    requests.sort_by_key(|request| {
+        (
             request.lifetime.first,
+            request.class != MemoryClass::Ipu21Interleaved,
+            std::cmp::Reverse(request.alignment),
+            std::cmp::Reverse(request.bytes),
             request.lifetime.last,
-        ) else {
+        )
+    });
+    for request in requests {
+        let class = request.class;
+        let Some(base) = arena.allocate(&request) else {
             let representative = &program.shards[members[&request.assignments[0].0][0]];
             tracing::error!(
                 tile,
@@ -758,7 +745,16 @@ fn allocate_tile_class(
                 bytes: request.bytes,
             });
         };
-        for (root, offset) in request.assignments {
+        for (index, (root, offset)) in request.assignments.into_iter().enumerate() {
+            let offset = if base >= IPU21_INTERLEAVED_MEMORY_BASE {
+                request.region1_stride.map_or(Ok(offset), |stride| {
+                    stride
+                        .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
+                        .ok_or(PlacementError::Overflow)
+                })?
+            } else {
+                offset
+            };
             let address = base.checked_add(offset).ok_or(PlacementError::Overflow)?;
             assign_members(addresses, &members[&root], address)?;
         }
@@ -767,6 +763,10 @@ fn allocate_tile_class(
 }
 
 struct AllocationRequest {
+    class: MemoryClass,
+    /// Iterated values need a wider physical stride if placed in region 1.
+    region1_stride: Option<u32>,
+    distinct_element: bool,
     lifetime: Lifetime,
     bytes: u32,
     alignment: u32,
@@ -786,23 +786,23 @@ struct Arena {
     free: Vec<(u32, u32)>,
     active: Vec<(u32, u32, u32)>,
     occupied: Vec<(u32, u32)>,
-    maximum: u32,
-    compact_low: bool,
+    interleaved_offset: u32,
 }
 
 impl Arena {
-    fn new(ranges: &[(u32, u32)], compact_low: bool) -> Self {
+    fn new(ranges: &[(u32, u32)], interleaved_offset: u32) -> Self {
         Self {
             ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
             occupied: Vec::new(),
-            maximum: ranges[0].0,
-            compact_low,
+            interleaved_offset,
         }
     }
 
-    fn allocate(&mut self, bytes: u32, alignment: u32, first: u32, last: u32) -> Option<u32> {
+    fn allocate(&mut self, request: &AllocationRequest) -> Option<u32> {
+        let first = request.lifetime.first;
+        let last = request.lifetime.last;
         let mut retained = Vec::with_capacity(self.active.len());
         let active = std::mem::take(&mut self.active);
         for (active_last, address, active_bytes) in active {
@@ -813,20 +813,54 @@ impl Arena {
             }
         }
         self.active = retained;
+        let interleaved_offset = self.interleaved_offset;
         let candidate = self
             .free
             .iter()
             .enumerate()
-            .filter_map(|(index, &(base, limit))| {
-                let start = align_up(base, alignment).ok()?;
-                let end = start.checked_add(bytes)?;
-                (end <= limit).then(|| {
-                    let key = if self.compact_low {
-                        (start, limit - end)
+            .flat_map(|(index, &(base, limit))| {
+                // Keep candidate spans within one address region even after free
+                // ranges coalesce across its boundary.
+                [false, true].into_iter().filter_map(move |region1| {
+                    let (base, limit) = if region1 {
+                        (
+                            base.max(
+                                IPU21_INTERLEAVED_MEMORY_BASE
+                                    + if request.class == MemoryClass::Ipu21Interleaved {
+                                        interleaved_offset
+                                    } else {
+                                        0
+                                    },
+                            ),
+                            limit,
+                        )
                     } else {
-                        (limit - end, start)
+                        if request.class == MemoryClass::Ipu21Interleaved {
+                            return None;
+                        }
+                        (base, limit.min(IPU21_INTERLEAVED_MEMORY_BASE))
                     };
-                    (key, index, start, end)
+                    let element = if region1 {
+                        IPU21_INTERLEAVED_ELEMENT_SIZE
+                    } else {
+                        TILE_MEMORY_ELEMENT_SIZE
+                    };
+                    let alignment =
+                        request
+                            .alignment
+                            .max(if request.distinct_element { element } else { 1 });
+                    let bytes = if region1 && let Some(stride) = request.region1_stride {
+                        stride.checked_mul(u32::try_from(request.assignments.len()).ok()?)?
+                    } else if request.distinct_element {
+                        align_up(request.bytes, element).ok()?
+                    } else {
+                        request.bytes
+                    };
+                    let start = align_up(base, alignment).ok()?;
+                    let end = start.checked_add(bytes)?;
+                    // Ordinary buffers prefer region 0; compact addresses within
+                    // each region leave long contiguous spans for later requests.
+                    (end <= limit).then_some(((region1, start), index, start, end))
                 })
             })
             .min_by_key(|candidate| (candidate.0, candidate.1));
@@ -840,9 +874,8 @@ impl Arena {
                 self.free.push((end, limit));
             }
             self.free.sort_unstable();
-            self.active.push((last, start, bytes));
+            self.active.push((last, start, end - start));
             self.occupied.push((start, end));
-            self.maximum = self.maximum.max(end);
             return Some(start);
         }
         None
@@ -859,10 +892,6 @@ impl Arena {
             }
         }
         self.free = merged;
-    }
-
-    fn maximum_cursor(&self) -> u32 {
-        self.maximum
     }
 
     fn unused_ranges(&self) -> Vec<(u32, u32)> {
@@ -944,6 +973,135 @@ mod tests {
         ComputeGraph, Ipu21CostModel, KernelBuildPlan, Layout, PipelineConfig, Precision,
         TensorFormat, lower, lower_to_tiles, materialize_kernel_run,
     };
+
+    fn request(
+        class: MemoryClass,
+        bytes: u32,
+        alignment: u32,
+        first: u32,
+        last: u32,
+    ) -> AllocationRequest {
+        AllocationRequest {
+            class,
+            region1_stride: None,
+            bytes,
+            alignment,
+            distinct_element: false,
+            lifetime: Lifetime {
+                first,
+                last,
+                seen: true,
+            },
+            assignments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn joint_arena_reuses_region_one_across_classes() {
+        let base = IPU21_INTERLEAVED_MEMORY_BASE;
+        let mut arena = Arena::new(&[(base, base + 320 * 1024)], 0);
+        let a = arena
+            .allocate(&request(MemoryClass::Ipu21Interleaved, 256 * 1024, 8, 0, 0))
+            .unwrap();
+        arena
+            .allocate(&request(MemoryClass::Ipu21Standard, 64 * 1024, 8, 0, 0))
+            .unwrap();
+        let b = arena
+            .allocate(&request(MemoryClass::Ipu21Standard, 256 * 1024, 8, 1, 1))
+            .unwrap();
+        arena
+            .allocate(&request(MemoryClass::Ipu21Interleaved, 64 * 1024, 8, 1, 1))
+            .unwrap();
+        assert_eq!(a, b);
+        assert!(arena.unused_ranges().is_empty());
+    }
+
+    #[test]
+    fn joint_arena_respects_region_and_element_constraints() {
+        let base = IPU21_INTERLEAVED_MEMORY_BASE;
+        let mut arena = Arena::new(&[(base - 64, base + 2 * IPU21_INTERLEAVED_ELEMENT_SIZE)], 0);
+        assert_eq!(
+            arena.allocate(&request(MemoryClass::Ipu21Standard, 64, 8, 0, 2)),
+            Some(base - 64)
+        );
+        let mut constrained = request(MemoryClass::Ipu21Standard, 8, 8, 0, 2);
+        constrained.distinct_element = true;
+        assert_eq!(arena.allocate(&constrained), Some(base));
+        constrained.class = MemoryClass::Ipu21Interleaved;
+        assert_eq!(
+            arena.allocate(&constrained),
+            Some(base + IPU21_INTERLEAVED_ELEMENT_SIZE)
+        );
+        assert!(
+            arena
+                .allocate(&request(MemoryClass::Ipu21Standard, 8, 8, 2, 2))
+                .is_none()
+        );
+        assert!(
+            arena
+                .allocate(&request(MemoryClass::Ipu21Interleaved, 64, 8, 3, 3))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn randomized_joint_allocations_do_not_overlap_live_storage() {
+        let mut random = fastrand::Rng::with_seed(0x6a6f_696e_745f_7372);
+        let boundary = IPU21_INTERLEAVED_MEMORY_BASE;
+        let ranges = [
+            (boundary - 65536, boundary - 32768),
+            (boundary - 16384, boundary),
+            (boundary, IPU21_APPLICATION_MEMORY_LIMIT),
+        ];
+        for _ in 0..128 {
+            let mut arena = Arena::new(&ranges, 256);
+            let mut placed = Vec::<(u32, u32, u32, u32)>::new();
+            for first in 0..32 {
+                for _ in 0..random.u32(1..=6) {
+                    let class = if random.bool() {
+                        MemoryClass::Ipu21Standard
+                    } else {
+                        MemoryClass::Ipu21Interleaved
+                    };
+                    let mut request = request(
+                        class,
+                        random.u32(1..=65536),
+                        1 << random.u32(2..=12),
+                        first,
+                        first + random.u32(0..=8),
+                    );
+                    request.distinct_element = random.bool();
+                    let Some(address) = arena.allocate(&request) else {
+                        continue;
+                    };
+                    let (_, _, bytes) = *arena.active.last().unwrap();
+                    let end = address + bytes;
+                    assert!(address.is_multiple_of(request.alignment));
+                    if class == MemoryClass::Ipu21Interleaved {
+                        assert!(address >= boundary + 256);
+                    }
+                    assert!(
+                        ranges
+                            .iter()
+                            .any(|&(base, limit)| base <= address && end <= limit)
+                    );
+                    for &(other, other_end, other_first, other_last) in &placed {
+                        if first <= other_last && other_first <= request.lifetime.last {
+                            assert!(end <= other || other_end <= address);
+                        }
+                    }
+                    placed.push((address, end, first, request.lifetime.last));
+                }
+            }
+            for (base, end) in arena.unused_ranges() {
+                assert!(
+                    placed
+                        .iter()
+                        .all(|&(other, other_end, _, _)| end <= other || other_end <= base)
+                );
+            }
+        }
+    }
 
     #[test]
     fn repeat_stride_includes_late_bank_separation_constraints() {
@@ -1228,8 +1386,16 @@ mod tests {
         for _ in 0..128 {
             let limit = 1 << 20;
             let persistent = random.u32(1..=4096);
-            let mut arena = Arena::new(&[(0, limit)], true);
-            arena.allocate(persistent, 4, 0, u32::MAX).unwrap();
+            let mut arena = Arena::new(&[(0, limit.min(IPU21_INTERLEAVED_MEMORY_BASE))], 0);
+            arena
+                .allocate(&request(
+                    MemoryClass::Ipu21Standard,
+                    persistent,
+                    4,
+                    0,
+                    u32::MAX,
+                ))
+                .unwrap();
             let mut bound = persistent;
             for phase in 1..=random.u32(2..=16) {
                 let mut cursor = persistent;
@@ -1237,11 +1403,19 @@ mod tests {
                     let alignment = 1 << random.u32(2..=10);
                     let bytes = random.u32(1..=16 * 1024);
                     cursor = align_up(cursor, alignment).unwrap() + bytes;
-                    arena.allocate(bytes, alignment, phase, phase).unwrap();
+                    arena
+                        .allocate(&request(
+                            MemoryClass::Ipu21Standard,
+                            bytes,
+                            alignment,
+                            phase,
+                            phase,
+                        ))
+                        .unwrap();
                 }
                 bound = bound.max(cursor);
             }
-            assert!(arena.maximum_cursor() <= bound);
+            assert!(arena.occupied.iter().map(|range| range.1).max().unwrap() <= bound);
         }
     }
 }

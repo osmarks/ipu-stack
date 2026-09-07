@@ -29,10 +29,9 @@ impl MemoryUsage {
     }
 }
 
-/// Independent class maxima and the maximum simultaneous total. The allocator
-/// fixes the interleaved arena boundary for the whole program, so feasibility
-/// uses the sum of the class maxima even when they occur in different phases.
-/// `total` remains useful for ranking the actual peak live working set.
+/// Independent class maxima and maximum simultaneous live storage. Region 1
+/// is shared by both classes; separate peaks need not coexist. These are cheap
+/// capacity screens, not a guarantee that aligned concrete placement succeeds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryPeaks {
     pub standard: u64,
@@ -72,24 +71,14 @@ impl MemoryPeaks {
         reserved_standard_bytes: u64,
         tile_memory_budget_bytes: u64,
     ) -> bool {
-        let partitioned_bytes = self
-            .standard
-            .saturating_add(self.aligned_interleaved_bytes())
-            .saturating_add(reserved_standard_bytes);
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && partitioned_bytes
+            && self.total.saturating_add(reserved_standard_bytes)
                 <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
             && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
     }
 
     pub(crate) fn standard_contiguous_overflow(self) -> u64 {
         self.contiguous_overflow(0)
-    }
-
-    fn aligned_interleaved_bytes(self) -> u64 {
-        self.interleaved
-            .div_ceil(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
-            .saturating_mul(u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE))
     }
 
     pub fn standard_contiguous_overflow_with_reservation(
@@ -100,9 +89,9 @@ impl MemoryPeaks {
     }
 
     fn contiguous_overflow(self, reserved: u64) -> u64 {
-        let interleaved_boundary = self.aligned_interleaved_bytes();
-        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            .saturating_sub(interleaved_boundary);
+        // A standard buffer can use all of region 1 when interleaved
+        // temporaries are dead. Do not subtract an unrelated class peak.
+        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
         let lower_standard =
             u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES).saturating_sub(reserved);
         self.maximum_standard_allocation

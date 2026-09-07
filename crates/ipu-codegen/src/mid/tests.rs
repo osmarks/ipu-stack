@@ -76,7 +76,7 @@ fn fp8_conversion_precedes_operand_replication() {
 }
 
 #[test]
-fn randomized_memory_peaks_reserve_disjoint_class_arenas() {
+fn randomized_memory_peaks_allow_noncoincident_classes() {
     let mut random = fastrand::Rng::with_seed(0x636c_6173_735f_7372);
     let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
     let interleaved_capacity = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
@@ -100,10 +100,10 @@ fn randomized_memory_peaks_reserve_disjoint_class_arenas() {
             .saturating_add(aligned_interleaved)
             .saturating_add(reservation);
         let fits = peaks.fits_ipu21_with_budget(reservation, capacity);
-        assert_eq!(fits, static_partition <= capacity);
+        assert_eq!(fits, simultaneous.saturating_add(reservation) <= capacity);
         if simultaneous.saturating_add(reservation) <= capacity && static_partition > capacity {
             rejected_noncoincident_peaks += 1;
-            assert!(!fits);
+            assert!(fits);
         }
     }
     assert!(rejected_noncoincident_peaks > 0);
