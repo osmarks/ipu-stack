@@ -179,8 +179,8 @@
 	.size \name, .-\name
 	.endm
 
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_init_common, 1
-	GEMM_SUPERVISOR ipu_stack_gemm_f32_accumulate_common, 0
+	GEMM_SUPERVISOR gemm_f32_init_common, 1
+	GEMM_SUPERVISOR gemm_f32_accumulate_common, 0
 
 	.macro GEMM_SPECIALIZATION name, rows, target
 	.section .text.\name,"ax",@progbits
@@ -197,10 +197,10 @@
 	.size \name, .-\name
 	.endm
 
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_init_small_rows, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_init_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_init_large_rows, GEMM_LARGE_ROWS, ipu_stack_gemm_f32_init_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_accumulate_small_rows, GEMM_SMALL_ROWS, ipu_stack_gemm_f32_accumulate_common
-	GEMM_SPECIALIZATION ipu_stack_gemm_f32_accumulate_large_rows, GEMM_LARGE_ROWS, ipu_stack_gemm_f32_accumulate_common
+	GEMM_SPECIALIZATION gemm_f32_init_small_rows, GEMM_SMALL_ROWS, gemm_f32_init_common
+	GEMM_SPECIALIZATION gemm_f32_init_large_rows, GEMM_LARGE_ROWS, gemm_f32_init_common
+	GEMM_SPECIALIZATION gemm_f32_accumulate_small_rows, GEMM_SMALL_ROWS, gemm_f32_accumulate_common
+	GEMM_SPECIALIZATION gemm_f32_accumulate_large_rows, GEMM_LARGE_ROWS, gemm_f32_accumulate_common
 
 	.worker
 	.p2align 3

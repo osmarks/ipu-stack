@@ -110,12 +110,12 @@ ipu_stack_static_worker_barrier_worker:
 	exitz $m15
 	.size ipu_stack_static_worker_barrier_worker, .-ipu_stack_static_worker_barrier_worker
 
-	.section .text.ipu_stack_static_copy_u32,"ax",@progbits
+	.section .text.static_copy_u32,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 word count, m10 return.
-	.globl ipu_stack_static_copy_u32
+	.globl static_copy_u32
 	.p2align 2
-	.type ipu_stack_static_copy_u32,@function
-ipu_stack_static_copy_u32:
+	.type static_copy_u32,@function
+static_copy_u32:
 	.supervisor
 	brz $m4, .Lcopy_u32_done
 .Lcopy_u32:
@@ -127,15 +127,15 @@ ipu_stack_static_copy_u32:
 	brnz $m4, .Lcopy_u32
 .Lcopy_u32_done:
 	br $m10
-	.size ipu_stack_static_copy_u32, .-ipu_stack_static_copy_u32
+	.size static_copy_u32, .-static_copy_u32
 
-	.section .text.ipu_stack_static_copy_u16,"ax",@progbits
+	.section .text.static_copy_u16,"ax",@progbits
 	// Runtime helper ABI: m4 entry count and m10 points to inline
 	// (source address, destination address) pairs. It returns past the table.
-	.globl ipu_stack_static_copy_u16
+	.globl static_copy_u16
 	.p2align 2
-	.type ipu_stack_static_copy_u16,@function
-ipu_stack_static_copy_u16:
+	.type static_copy_u16,@function
+static_copy_u16:
 	.supervisor
 	brz $m4, .Lcopy_u16_done
 .Lcopy_u16:
@@ -175,7 +175,7 @@ ipu_stack_static_copy_u16:
 	brnz $m4, .Lcopy_u16
 .Lcopy_u16_done:
 	br $m10
-	.size ipu_stack_static_copy_u16, .-ipu_stack_static_copy_u16
+	.size static_copy_u16, .-static_copy_u16
 
 	.section .text.ipu_stack_static_patch_word,"ax",@progbits
 	// Runtime helper ABI: m2 destination word, m3 value table, m4 remaining
@@ -216,13 +216,13 @@ ipu_stack_static_patch_row:
 	br $m9
 	.size ipu_stack_static_patch_row, .-ipu_stack_static_patch_row
 
-	.section .text.ipu_stack_copy_u64,"ax",@progbits
+	.section .text.copy_u64,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/worker, m5
 	// remainder workers, m10 return. This is not a layout-conversion kernel.
-	.globl ipu_stack_copy_u64
+	.globl copy_u64
 	.p2align 2
-	.type ipu_stack_copy_u64,@function
-ipu_stack_copy_u64:
+	.type copy_u64,@function
+copy_u64:
 	.supervisor
 	add $m11, $m11, -16
 	st32 $m2, $m11, $m15, 0
@@ -234,7 +234,7 @@ ipu_stack_copy_u64:
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 16
 	br $m10
-	.size ipu_stack_copy_u64, .-ipu_stack_copy_u64
+	.size copy_u64, .-copy_u64
 
 	.worker
 	.p2align 2
@@ -271,13 +271,13 @@ ipu_stack_copy_u64:
 .Lcopy_u64_worker_done:
 	exitz $m15
 
-	.section .text.ipu_stack_fill_zero_u64,"ax",@progbits
+	.section .text.fill_zero_u64,"ax",@progbits
 	// Tile-kernel ABI: m2 destination, m3 words/worker, m4 remainder workers,
 	// m10 return. The allocation must contain a whole number of 64-bit words.
-	.globl ipu_stack_fill_zero_u64
+	.globl fill_zero_u64
 	.p2align 2
-	.type ipu_stack_fill_zero_u64,@function
-ipu_stack_fill_zero_u64:
+	.type fill_zero_u64,@function
+fill_zero_u64:
 	.supervisor
 	add $m11, $m11, -12
 	st32 $m2, $m11, $m15, 0
@@ -288,7 +288,7 @@ ipu_stack_fill_zero_u64:
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 12
 	br $m10
-	.size ipu_stack_fill_zero_u64, .-ipu_stack_fill_zero_u64
+	.size fill_zero_u64, .-fill_zero_u64
 
 	.worker
 	.p2align 2
@@ -320,14 +320,14 @@ ipu_stack_fill_zero_u64:
 	exitz $m15
 
 	.macro strided_copy bits, shift
-	.section .text.ipu_stack_copy_strided_u\bits,"ax",@progbits
+	.section .text.copy_strided_u\bits,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/row, m5 rows,
 	// m6 source stride, m7 destination stride, m10 return. One call replaces
 	// the supervisor launch and return overhead of many short row copies.
-	.globl ipu_stack_copy_strided_u\bits
+	.globl copy_strided_u\bits
 	.p2align 2
-	.type ipu_stack_copy_strided_u\bits,@function
-ipu_stack_copy_strided_u\bits:
+	.type copy_strided_u\bits,@function
+copy_strided_u\bits:
 	.supervisor
 	add $m11, $m11, -24
 	st32 $m2, $m11, $m15, 0
@@ -341,7 +341,7 @@ ipu_stack_copy_strided_u\bits:
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 24
 	br $m10
-	.size ipu_stack_copy_strided_u\bits, .-ipu_stack_copy_strided_u\bits
+	.size copy_strided_u\bits, .-copy_strided_u\bits
 
 	.worker
 	.p2align 2
@@ -505,13 +505,13 @@ ipu_stack_static_sample_cycle_worker:
 	exitz $m15
 	.size ipu_stack_static_sample_cycle_worker, .-ipu_stack_static_sample_cycle_worker
 
-	.section .text.ipu_stack_static_assert_equal_u32,"ax",@progbits
+	.section .text.static_assert_equal_u32,"ax",@progbits
 	// Supervisor diagnostic helper: m3 actual, m4 expected, m5 word count.
 	// A mismatch intentionally remains observable as a device timeout.
-	.globl ipu_stack_static_assert_equal_u32
+	.globl static_assert_equal_u32
 	.p2align 2
-	.type ipu_stack_static_assert_equal_u32,@function
-ipu_stack_static_assert_equal_u32:
+	.type static_assert_equal_u32,@function
+static_assert_equal_u32:
 	.supervisor
 .Lassert_equal_u32_next:
 	ld32 $m0, $m3, $m15, 0
@@ -525,15 +525,15 @@ ipu_stack_static_assert_equal_u32:
 	br $m10
 .Lassert_equal_u32_failed:
 	bri .Lassert_equal_u32_failed
-	.size ipu_stack_static_assert_equal_u32, .-ipu_stack_static_assert_equal_u32
+	.size static_assert_equal_u32, .-static_assert_equal_u32
 
-	.section .text.ipu_stack_static_worker_delay,"ax",@progbits
+	.section .text.static_worker_delay,"ax",@progbits
 	// Diagnostic compute phase: m4 is the per-worker loop count. The generic
 	// compute ABI's output and input pointers in m2/m3 are intentionally unused.
-	.globl ipu_stack_static_worker_delay
+	.globl static_worker_delay
 	.p2align 2
-	.type ipu_stack_static_worker_delay,@function
-ipu_stack_static_worker_delay:
+	.type static_worker_delay,@function
+static_worker_delay:
 	.supervisor
 	add $m11, $m11, -8
 	st32 $m4, $m11, $m15, 0
@@ -542,7 +542,7 @@ ipu_stack_static_worker_delay:
 	.long OPCODE_SYNC | SYNC_COMPUTE_SET
 	add $m11, $m11, 8
 	br $m10
-	.size ipu_stack_static_worker_delay, .-ipu_stack_static_worker_delay
+	.size static_worker_delay, .-static_worker_delay
 
 	.worker
 	.p2align 2

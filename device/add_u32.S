@@ -7,24 +7,24 @@
 	// general Add ABI declared by ipu-codegen (which also carries element count
 	// and broadcast strides) and must not be selected for tensor Add plans.
 
-	.section .text.ipu_stack_add_u32,"ax",@progbits
-	.globl ipu_stack_add_u32
+	.section .text.add_u32,"ax",@progbits
+	.globl add_u32
 	.p2align 2
-	.type ipu_stack_add_u32,@function
-ipu_stack_add_u32:
+	.type add_u32,@function
+add_u32:
 	.supervisor
 	ld32 $m8, $m3, $m15, 0
 	ld32 $m9, $m4, $m15, 0
 	add $m8, $m8, $m9
 	st32 $m8, $m2, $m15, 0
 	br $m10
-	.size ipu_stack_add_u32, .-ipu_stack_add_u32
+	.size add_u32, .-add_u32
 
-	.section .text.ipu_stack_add,"ax",@progbits
-	.globl ipu_stack_add
+	.section .text.add,"ax",@progbits
+	.globl add
 	.p2align 2
-	.type ipu_stack_add,@function
-ipu_stack_add:
+	.type add,@function
+add:
 	.supervisor
 	add $m11, $m11, -16
 	st32 $m2, $m11, $m15, 0
@@ -35,7 +35,7 @@ ipu_stack_add:
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 16
 	br $m10
-	.size ipu_stack_add, .-ipu_stack_add
+	.size add, .-add
 
 	.worker
 	.p2align 3

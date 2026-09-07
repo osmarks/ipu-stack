@@ -14,7 +14,7 @@ impl KernelBuildPlan {
             shape.value_dimension,
             shape.scale_bits,
         );
-        let call_symbol = format!("ipu_stack_flash_attention_online_f16_{suffix}");
+        let call_symbol = format!("flash_attention_online_f16_{suffix}");
         let vertex = format!("FlashAttentionOnlineF16_{suffix}");
         let common_flags = vec![
             format!("-DATTENTION_MATRICES={}", shape.matrices),
@@ -55,7 +55,7 @@ impl KernelBuildPlan {
                         "attention_softmax_d{head}_p{padded}_{}",
                         if full { "full" } else { "tail" }
                     );
-                    let symbol = format!("ipu_stack_{name}_f16");
+                    let symbol = format!("{name}_f16");
                     let scale_bits = (1.0_f32 / (head as f32).sqrt()).to_bits();
                     let flags = vec![
                         format!("-DATTENTION_HEAD_DIMENSION={head}"),
@@ -68,7 +68,7 @@ impl KernelBuildPlan {
                 }
                 KernelSpecialization::Merge(values, padded, keys) => {
                     let name = format!("attention_merge_v{values}_p{padded}_k{keys}");
-                    let symbol = format!("ipu_stack_{name}_f16");
+                    let symbol = format!("{name}_f16");
                     let flags = vec![
                         format!("-DATTENTION_VALUE_DIMENSION={values}"),
                         format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded}"),

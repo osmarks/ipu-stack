@@ -50,7 +50,9 @@ fn main() -> Result<()> {
     for name in ["gelu_f16.S", "reduce_add_f16.S"] {
         // Namespace the reference's symbols, local labels and GELU macros.
         source += &fs::read_to_string(args.reference.join(name))?
-            .replace("ipu_stack_", "reference_ipu_stack_")
+            .replace("ipu_stack_", "")
+            .replace("gelu_tanh_approx_f16", "reference_gelu_tanh_approx_f16")
+            .replace("reduce_sum_f16", "reference_reduce_sum_f16")
             .replace(".L", ".Lreference_")
             .replace("GELU_", "REFERENCE_GELU_")
             .replace("LOAD_GELU_CONSTANTS", "LOAD_REFERENCE_GELU_CONSTANTS");
@@ -121,9 +123,9 @@ fn main() -> Result<()> {
         let new = append(&initial);
         output_addresses.push(new);
         let name = if *partials == 1 {
-            "ipu_stack_gelu_tanh_approx_f16"
+            "gelu_tanh_approx_f16"
         } else {
-            "ipu_stack_reduce_sum_f16"
+            "reduce_sum_f16"
         };
         let steps = &mut programs[index].steps;
         // Extreme finite GELU inputs overflow the existing polynomial. Compare
@@ -159,7 +161,7 @@ fn main() -> Result<()> {
         }
         if args.exact {
             steps.push(call(
-                "ipu_stack_static_assert_equal_u32",
+                "static_assert_equal_u32",
                 old,
                 &[old, new],
                 &[elements / 2],
@@ -167,7 +169,7 @@ fn main() -> Result<()> {
         }
         for output in [old, new] {
             steps.push(call(
-                "ipu_stack_static_assert_equal_u32",
+                "static_assert_equal_u32",
                 canary,
                 &[output + elements * 2, canary],
                 &[4],

@@ -1,7 +1,7 @@
 #include "arch/gc_tile_defines.h"
 
 #ifndef REARRANGE_CALL_SYMBOL
-#define REARRANGE_CALL_SYMBOL ipu_stack_rearrange_row_major_to_amp_left_f16
+#define REARRANGE_CALL_SYMBOL rearrange_row_major_to_amp_left_f16
 #endif
 #ifndef REARRANGE_LOGICAL_ROWS
 #define REARRANGE_LOGICAL_ROWS 1

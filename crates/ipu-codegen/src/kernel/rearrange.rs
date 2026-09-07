@@ -36,7 +36,7 @@ impl KernelBuildPlan {
             suffix
         };
         let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
-        let call = format!("ipu_stack_unpack_amp_to_row_major_f16_{suffix}");
+        let call = format!("unpack_amp_to_row_major_f16_{suffix}");
         if order_index == 1 {
             self.compilations.push(KernelCompilation {
                 source: "unpack_transposed_amp_f16.S",
@@ -125,7 +125,7 @@ impl KernelBuildPlan {
             _ => suffix,
         };
         let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
-        let call = format!("ipu_stack_rearrange_row_major_to_amp_f16_{suffix}");
+        let call = format!("rearrange_row_major_to_amp_f16_{suffix}");
         self.symbols.insert(
             KernelSpecialization::Rearrange((
                 order,

@@ -170,10 +170,10 @@ pub fn tile_kernel_abi(
                 (symbols.0, symbols.1, 2, scalars)
             }
             TileKernelSpec::Gelu => {
-                let symbol = gelu_symbol(requirements).unwrap_or("ipu_stack_unsupported_gelu");
+                let symbol = gelu_symbol(requirements).unwrap_or("unsupported_gelu");
                 (
                     KernelSymbols::Exact(symbol),
-                    if symbol == "ipu_stack_unsupported_gelu" {
+                    if symbol == "unsupported_gelu" {
                         KernelAvailability::Required
                     } else {
                         KernelAvailability::Implemented
@@ -187,14 +187,14 @@ pub fn tile_kernel_abi(
                     return Err(KernelAbiError::RequirementMismatch);
                 }
                 (
-                    KernelSymbols::Exact("ipu_stack_reduce_sum_f16"),
+                    KernelSymbols::Exact("reduce_sum_f16"),
                     KernelAvailability::Implemented,
                     2,
                     &[ScalarValue::NumPartials, ScalarValue::ElementCount],
                 )
             }
             TileKernelSpec::Add => (
-                exact_symbol(precision, "ipu_stack_add_f16", "ipu_stack_add_f32"),
+                exact_symbol(precision, "add_f16", "add_f32"),
                 KernelAvailability::Required,
                 2,
                 &[
@@ -289,7 +289,7 @@ pub fn tile_kernel_abi(
                 )
             }
             TileKernelSpec::Rearrange { .. } => (
-                KernelSymbols::Exact("ipu_stack_rearrange"),
+                KernelSymbols::Exact("rearrange"),
                 KernelAvailability::Required,
                 1,
                 &[],
@@ -337,7 +337,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         let count = element_count(run)?;
         if *partials < 2 || !count.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {
-                symbol: "ipu_stack_reduce_sum_f16",
+                symbol: "reduce_sum_f16",
                 count,
                 divisor: 8,
             });
@@ -367,7 +367,7 @@ pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static 
     }
     let input_layout = &input.format.layout;
     let output_layout = &requirements.output.format.layout;
-    (input_layout == output_layout).then_some("ipu_stack_gelu_tanh_approx_f16")
+    (input_layout == output_layout).then_some("gelu_tanh_approx_f16")
 }
 
 pub(super) fn gemm_symbols(
@@ -377,8 +377,8 @@ pub(super) fn gemm_symbols(
     if matches!(precision, Precision::F8F143 { .. }) {
         (
             KernelSymbols::Exact(match mode {
-                GemmKernelMode::Initialize => "ipu_stack_gemm_f8_init",
-                GemmKernelMode::Accumulate => "ipu_stack_gemm_f8_accumulate",
+                GemmKernelMode::Initialize => "gemm_f8_init",
+                GemmKernelMode::Accumulate => "gemm_f8_accumulate",
             }),
             KernelAvailability::Required,
         )
@@ -395,18 +395,18 @@ pub(super) fn exact_symbol(
     KernelSymbols::Exact(match precision {
         Precision::F16 => f16_symbol,
         Precision::F32 => f32_symbol,
-        Precision::F8F143 { .. } => "ipu_stack_unsupported_f8_kernel",
+        Precision::F8F143 { .. } => "unsupported_f8_kernel",
     })
 }
 
 pub(super) fn cast_symbol(from: Precision, to: Precision) -> &'static str {
     match (from, to) {
-        (Precision::F16, Precision::F32) => "ipu_stack_cast_f16_f32",
-        (Precision::F32, Precision::F16) => "ipu_stack_cast_f32_f16",
-        (Precision::F8F143 { .. }, Precision::F16) => "ipu_stack_cast_f8_f16",
-        (Precision::F8F143 { .. }, Precision::F32) => "ipu_stack_cast_f8_f32",
-        (Precision::F16, Precision::F8F143 { .. }) => "ipu_stack_cast_f16_f8",
-        (Precision::F32, Precision::F8F143 { .. }) => "ipu_stack_cast_f32_f8",
-        _ => "ipu_stack_cast_identity",
+        (Precision::F16, Precision::F32) => "cast_f16_f32",
+        (Precision::F32, Precision::F16) => "cast_f32_f16",
+        (Precision::F8F143 { .. }, Precision::F16) => "cast_f8_f16",
+        (Precision::F8F143 { .. }, Precision::F32) => "cast_f8_f32",
+        (Precision::F16, Precision::F8F143 { .. }) => "cast_f16_f8",
+        (Precision::F32, Precision::F8F143 { .. }) => "cast_f32_f8",
+        _ => "cast_identity",
     }
 }

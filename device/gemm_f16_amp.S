@@ -43,16 +43,16 @@
 // The SDK's IPU21 assembly header omits this adjacent supervisor CSR name.
 #define GEMM_FP_ISCL_INDEX (CSR_S_FP_INFMT__INDEX + 2)
 #ifndef GEMM_INIT_SMALL_SYMBOL
-#define GEMM_INIT_SMALL_SYMBOL ipu_stack_gemm_f16_init_small_rows
+#define GEMM_INIT_SMALL_SYMBOL gemm_f16_init_small_rows
 #endif
 #ifndef GEMM_INIT_LARGE_SYMBOL
-#define GEMM_INIT_LARGE_SYMBOL ipu_stack_gemm_f16_init_large_rows
+#define GEMM_INIT_LARGE_SYMBOL gemm_f16_init_large_rows
 #endif
 #ifndef GEMM_ACCUMULATE_SMALL_SYMBOL
-#define GEMM_ACCUMULATE_SMALL_SYMBOL ipu_stack_gemm_f16_accumulate_small_rows
+#define GEMM_ACCUMULATE_SMALL_SYMBOL gemm_f16_accumulate_small_rows
 #endif
 #ifndef GEMM_ACCUMULATE_LARGE_SYMBOL
-#define GEMM_ACCUMULATE_LARGE_SYMBOL ipu_stack_gemm_f16_accumulate_large_rows
+#define GEMM_ACCUMULATE_LARGE_SYMBOL gemm_f16_accumulate_large_rows
 #endif
 
 	.text

@@ -767,7 +767,7 @@ pub(crate) fn build(
                 programs[usize::from(tile)]
                     .steps
                     .push(TileStep::Compute(ComputeStep {
-                        symbol: "ipu_stack_static_assert_equal_u32".into(),
+                        symbol: "static_assert_equal_u32".into(),
                         output_address: TileAddress::Absolute(actual),
                         input_addresses: vec![
                             TileAddress::Absolute(actual),
@@ -780,7 +780,7 @@ pub(crate) fn build(
             programs[usize::from(tile)]
                 .steps
                 .push(TileStep::Compute(ComputeStep {
-                    symbol: "ipu_stack_static_worker_delay".into(),
+                    symbol: "static_worker_delay".into(),
                     output_address: TileAddress::Absolute(DATA_BASE),
                     input_addresses: vec![TileAddress::Absolute(DATA_BASE)],
                     arguments: vec![rng.u32(1..=maximum_compute_delay)],
@@ -920,7 +920,7 @@ fn build_physical_phase_replay(
                     // Cross one ordinary worker-call boundary before trapping;
                     // this occurs after the exchange epoch under test.
                     TileStep::Compute(ComputeStep {
-                        symbol: "ipu_stack_static_worker_delay".into(),
+                        symbol: "static_worker_delay".into(),
                         output_address: TileAddress::Absolute(DATA_BASE),
                         input_addresses: vec![TileAddress::Absolute(DATA_BASE)],
                         arguments: vec![1],

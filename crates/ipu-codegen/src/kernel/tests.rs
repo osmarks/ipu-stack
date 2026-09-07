@@ -248,10 +248,7 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
         assert_eq!(abi.availability, KernelAvailability::Implemented);
         assert_eq!(abi.inputs, 1);
         assert_eq!(abi.scalar_arguments, &[ScalarValue::ElementCount]);
-        assert_eq!(
-            abi.symbols,
-            KernelSymbols::Exact("ipu_stack_gelu_tanh_approx_f16")
-        );
+        assert_eq!(abi.symbols, KernelSymbols::Exact("gelu_tanh_approx_f16"));
     }
 }
 

@@ -47,7 +47,7 @@ impl KernelBuildPlan {
                 source: "gelu_f16.S",
                 name: "gelu_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec!["ipu_stack_gelu_tanh_approx_f16".into()],
+                retained_symbols: vec!["gelu_tanh_approx_f16".into()],
             });
         }
         if reduction_add {
@@ -55,7 +55,7 @@ impl KernelBuildPlan {
                 source: "reduce_add_f16.S",
                 name: "reduce_add_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec!["ipu_stack_reduce_sum_f16".into()],
+                retained_symbols: vec!["reduce_sum_f16".into()],
             });
         }
         if cast_f32_f16 {
@@ -67,7 +67,7 @@ impl KernelBuildPlan {
             });
             plan.add_worker_wrapper(
                 "cast_f32_f16_wrapper".into(),
-                "ipu_stack_cast_f32_f16",
+                "cast_f32_f16",
                 "CastF32ToF16",
                 &[3, 2, 4],
             );

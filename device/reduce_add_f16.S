@@ -7,11 +7,11 @@
 	// Callable supervisor ABI: m2 output, m3 initial partial, m4 packed remote
 	// partials, m5 remote-partial count, m6 physical half-element count, and
 	// m10 return. Each remote partial occupies one contiguous element-count row.
-	.section .text.ipu_stack_reduce_sum_f16,"ax",@progbits
-	.globl ipu_stack_reduce_sum_f16
+	.section .text.reduce_sum_f16,"ax",@progbits
+	.globl reduce_sum_f16
 	.p2align 2
-	.type ipu_stack_reduce_sum_f16,@function
-ipu_stack_reduce_sum_f16:
+	.type reduce_sum_f16,@function
+reduce_sum_f16:
 	.supervisor
 	add $m11, $m11, -24
 	st32 $m2, $m11, $m15, 0
@@ -24,7 +24,7 @@ ipu_stack_reduce_sum_f16:
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, 24
 	br $m10
-	.size ipu_stack_reduce_sum_f16, .-ipu_stack_reduce_sum_f16
+	.size reduce_sum_f16, .-reduce_sum_f16
 
 	.worker
 	.p2align 3

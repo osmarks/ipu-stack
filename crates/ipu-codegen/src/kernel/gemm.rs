@@ -17,7 +17,7 @@ pub(super) fn specialized_gemm_symbol(
         GemmKernelMode::Accumulate => "accumulate",
     };
     format!(
-        "ipu_stack_gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_k{inner_block}_c{output_columns}_r{small_rows}_r{large_rows}"
+        "gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_k{inner_block}_c{output_columns}_r{small_rows}_r{large_rows}"
     )
 }
 
