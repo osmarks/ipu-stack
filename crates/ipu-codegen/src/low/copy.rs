@@ -344,7 +344,7 @@ pub(crate) fn uncovered_copy_bytes(
             }
         });
     }
-    covered.sort_unstable_by_key(|span| span.offset);
+    crate::storage::sort_byte_spans(&mut covered);
     let mut cursor = 0u32;
     let mut holes: Vec<ByteSpan> = Vec::new();
     for span in covered.into_iter().chain(std::iter::once(ByteSpan {

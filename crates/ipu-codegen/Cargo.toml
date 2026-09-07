@@ -11,6 +11,7 @@ ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }
 rayon.workspace = true
+radsort.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

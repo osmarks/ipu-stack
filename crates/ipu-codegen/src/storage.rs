@@ -18,6 +18,16 @@ pub struct ByteSpan {
     pub bytes: u32,
 }
 
+pub(crate) fn sort_byte_spans(spans: &mut [ByteSpan]) {
+    // Packed-layout benchmarks cross over around 256 entries. Physical-order
+    // spans are often already sorted; preserve that linear-time fast path.
+    if spans.len() < 256 {
+        spans.sort_unstable_by_key(|span| span.offset);
+    } else if !spans.is_sorted_by_key(|span| span.offset) {
+        radsort::sort_by_key(spans, |span| span.offset);
+    }
+}
+
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StorageError {
     #[error("view does not refer to the supplied shard")]
@@ -35,6 +45,9 @@ pub enum StorageError {
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
+
+#[cfg(test)]
+mod sort_bench;
 
 /// Returns the physical allocation size of a shard.
 pub(crate) fn storage_bytes(shard: TensorStorage<'_>) -> StorageResult<u32> {
@@ -77,7 +90,7 @@ pub(crate) fn physical_byte_spans(
         return Ok(spans);
     }
     let mut logical = byte_spans(shard, view, true)?;
-    logical.sort_unstable_by_key(|span| span.offset);
+    sort_byte_spans(&mut logical);
     let mut spans = Vec::<ByteSpan>::new();
     for span in logical {
         match spans.last_mut() {
@@ -766,7 +779,7 @@ mod tests {
         shard_storage_bytes, view_byte_spans,
     };
 
-    fn shard(layout: Layout, dimensions: &[u32]) -> BlockValue {
+    pub(super) fn shard(layout: Layout, dimensions: &[u32]) -> BlockValue {
         BlockValue {
             id: BlockValueId::from_index(0),
             tile: 0,

@@ -30,6 +30,7 @@ hex = "0.4.3"
 libc = "0.2.180"
 object = { version = "0.39.1", features = ["read_core", "elf"] }
 rayon = "1.11.0"
+radsort = "0.1.1"
 rand_distr = "0.6.0"
 rand_xoshiro = "0.8.1"
 serde = { version = "1.0.228", features = ["derive", "rc"] }

@@ -88,3 +88,32 @@ perf report -i artifacts/compiler-perf/new/perf.data --stdio \
 `--inspect-exchanges` exits after package inspection without running the IPU.
 The default release build supplies function symbols for self-sample attribution;
 inlined caller attribution needs a build with debug information.
+
+## Byte-span radix sorting
+
+Benchmarked `radsort` 0.1.1 on the actual eight-byte `ByteSpan` records, with
+`span.offset` as the key, including AMP-output and block-major spans generated
+by the compiler. The benchmark alternates algorithms, excludes input copying,
+and reports the median of five batches. Its source and invocation are in
+`crates/ipu-codegen/src/storage/sort_bench.rs`; raw results are in
+`artifacts/compiler-perf/radix/sort-benchmark.csv`.
+
+| Input | Entries | Comparison sort | Radix sort | Speedup |
+|---|---:|---:|---:|---:|
+| AMP output | 256 | 3.34 µs | 2.63 µs | 1.27× |
+| AMP output | 1,024 | 14.98 µs | 8.75 µs | 1.71× |
+| AMP output | 16,384 | 441.54 µs | 212.43 µs | 2.08× |
+| Block major | 300 | 4.16 µs | 2.33 µs | 1.79× |
+| Block major | 1,024 | 15.46 µs | 6.92 µs | 2.24× |
+| Already sorted | 1,024 | 0.61 µs | 6.76 µs | 0.09× |
+
+The integration uses radix sorting at 256 entries and above, but first returns
+if the spans are already sorted. Small lists retain comparison sorting. The
+[upstream benchmark](https://github.com/JakubValtar/radsort/wiki/Benchmarks)
+is a useful starting point; it measures random scalar values, so these local
+measurements also cover field keying and the compiler's structured offsets.
+
+The isolated full build retained the identical package hash. Sorting's CPU
+sample share fell from about 9.6% to 5.3%; total sampled cycles fell about 3%.
+Whole-command wall time was 108 seconds versus the preceding 105-second run,
+so this single full-build measurement does not establish a wall-time gain.
