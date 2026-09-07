@@ -156,8 +156,9 @@ Actual resident `internalExchangeCode` for the entire model:
 Reuse of outlined bodies is important to these totals. Whole-tile allocated
 memory averages 487,748 / 550,544 bytes, with maxima 540,950 / 596,494 bytes.
 
-The useful lessons are fused QKV, broad output-stationary score grids, less inner
-padding where the ISA permits it, and reusable exchange code. The SDK's generic
+The useful lessons are fused QKV, broad output-stationary score grids and reusable exchange code. Our current
+attention score kernel already uses inner padding to 80, matching this SDK
+FP16 case; reducing that padding is not an explanation for the observed gap. The SDK's generic
 strided-copy preparation is an example to improve upon, not a uniformly better
 layout pipeline. Faster scheduling would help compilation but would not remove
 those device-side rearrangement costs.
@@ -176,3 +177,30 @@ The script requires the SDK's `pva`. It opens SQLite read-only and writes
 `summary.json`, an annotated full `steps.csv`, and `first-body.csv` under
 `artifacts/sdk-profile-analysis/<profile-directory>/`. The CSV adds semantic
 stage labels, kernel names, active tile counts, and maximum exchange code bytes.
+
+## Comparison with our current materialized path
+
+The `attention-panel-pack` profile identifies our score kernel as
+`ipu_stack_gemm_f16_init_large_rows_k80_c768_r7_r8`, taking 54,744 cycles
+(54,312 for the seven-row variant). Our attention candidate generator maximizes
+query-row partitions, then the implementation copies that ownership into scores,
+softmax weights, PV products and final output. For 16 heads this gives 92 tiles
+per head, partitioned only along query rows. It does not enumerate the SDK-like
+2D score grid.
+
+This geometry makes each tile compute roughly 8 × 768 scores instead of
+364/365 × 16. Both have similar output element counts, but our supervisor cycles
+through 48 column groups and five inner groups: 240 coefficient-load/worker-sync
+rounds, versus five for a 16-column, K80 product. Each worker receives only one or
+two query rows per round. The existing standard-memory kernel cost formula
+predicts approximately 8,899–8,919 cycles for 364/365 rows, K80, C16, although that
+specific specialization has not been hardware-tested here. The kernel generator
+already accepts those dimensions; no SDK-only instruction appears necessary.
+
+The actual restriction is the attention plan family, not general tensor-layout
+expressiveness. A separate score layout would need a mid redistribution into
+complete softmax rows, or distributed softmax with cross-tile reductions. The
+SDK chooses redistribution and pays heavily for it. Our row ownership avoids
+that intermediate redistribution but sacrifices GEMM coefficient reuse. A new
+candidate should cost the entire preparation/QK/softmax/PV sequence rather than
+assuming that the fastest isolated QK necessarily wins overall.
