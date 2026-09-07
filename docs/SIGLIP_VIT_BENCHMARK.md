@@ -84,3 +84,18 @@ shortlisted plans reach 540,544 tensor bytes plus 49,152 support bytes per tile
 at the encoder down-projection, or exhaust SRAM later at MAP preparation.
 This is a planner/layout limitation, not a requirement for FP32 arithmetic.
 The reduced F16 model passes on hardware.
+
+Full-size hardware validation (2026-09-07): native FP8 GEMMs, F16 exposed
+activations, 2,656,824 cropped profile cycles (1.771216 ms at 1.5 GHz).
+Maximum absolute reference error is 0.102051, using the explicit tolerance in
+the command above. The rendered profile is
+`artifacts/vit/so400m-fp8/profile.html`; raw samples and the run log are adjacent.
+The measurement includes embedding, one complete encoder block, final norm,
+and MAP pooling; host patch packing and parameter loading are outside it.
+
+Validation exposed and fixed three memory hazards: short AMP-left packing
+workers wrote beyond their row allocation; tensors could share instruction
+memory elements with linked kernels; final attention padding could contain
+FP32 values that faulted during the F16 cast. Final merge now clears just that
+padding. Mixed-class multicast loopbacks and late exchange-row setup calls
+also now receive the required placement and code-size reservations.
