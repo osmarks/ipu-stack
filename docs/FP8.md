@@ -160,6 +160,12 @@ resulting hardware execution is **127,872 cropped cycles**, versus 151,998 befor
 host FP8 loading (15.9% less). Full fused projected attention is **171,588 cycles**,
 versus 176,994 (3.1% less), with no activation cast before its QKV projection.
 
+The selected single-block MLP's host-populated input binding occupies
+251,353,600 bytes across tiles, including replication/padding; its two weight
+bindings occupy 5,509,120 and 4,976,640 bytes. The host path removes input
+preparation from device execution, so this timing must not be interpreted as
+the cost of preparing the same replicated operand from an on-device producer.
+
 Final Gaussian checks pass (MLP maximum absolute error 0.006378; attention
 0.000054). The reference now starts from the host-quantized FP8 activations,
 so these error figures are not directly comparable to the former F16-input
