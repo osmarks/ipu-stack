@@ -99,8 +99,10 @@
 	add $m4, $m4, $m2
 	ld32 $a1, $m4, $m15, 0
 	brz $m6, .Lattention_merge_update_state
+	brnz $m7, .Lattention_merge_initial_state_ready
 	st32 $a0, $m8, $m15, 0
 	st32 $a1, $m8, $m15, 1
+.Lattention_merge_initial_state_ready:
 	ldconst $a6, 0x3f800000
 	brz $m7, .Lattention_merge_initial_ready
 	f32oox $a6, $a1
@@ -131,8 +133,10 @@
 	f32mul $a3, $a3, $a5
 	f32mul $a1, $a1, $a6
 	f32add $a3, $a3, $a1
+	brnz $m7, .Lattention_merge_update_state_ready
 	st32 $a4, $m8, $m15, 0
 	st32 $a3, $m8, $m15, 1
+.Lattention_merge_update_state_ready:
 	// Normalize the final update through its coefficients, avoiding a second
 	// pass over the output. Persistent sums and coefficients remain FP32.
 	brz $m7, .Lattention_merge_update_ready
@@ -155,6 +159,19 @@
 	.endr
 
 .Lattention_merge_next_row:
+	// The following cast processes the physical row. Old SRAM contents in
+	// its unused columns may be NaN or overflow FP16 even with finite inputs.
+	// Final outputs no longer need persistent max/sum state in this padding.
+#if ATTENTION_PADDED_VALUE_DIMENSION > ATTENTION_VALUE_DIMENSION
+	brz $m7, .Lattention_merge_keep_state
+#if ATTENTION_VALUE_DIMENSION % 2
+	st32step $azero, $mzero, $m8+=, 1
+#endif
+	.rept (ATTENTION_PADDED_VALUE_DIMENSION - ATTENTION_VALUE_DIMENSION) / 2
+	st64step $azeros, $mzero, $m8+=, 1
+	.endr
+.Lattention_merge_keep_state:
+#endif
 	add $m9, $m9, 6
 	cmpult $m0, $m9, $m5
 	brnz $m0, .Lattention_merge_row
