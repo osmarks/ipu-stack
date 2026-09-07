@@ -1,3 +1,4 @@
+pub mod f143;
 use ipu_exchange::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
     encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
@@ -40,8 +41,8 @@ pub(crate) use mid::*;
 pub use mid::{
     AMP_COLUMN_MICRO, AmpOrder, AttentionProducts, AttentionStrategy, BlockMajorOrder,
     ConversionStreamingPolicy, GemmOrientation, GemmOutputPacking, GemmPlanConstraint, GridOrder,
-    Layout, LocalOperandStaging, MemoryClass, MidOperator, PipelineConfig, Precision,
-    ReductionStaging, ShardExtent, TensorFormat, TensorType,
+    Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorCandidate, PipelineConfig,
+    Precision, ReductionStaging, ShardExtent, TensorFormat, TensorType,
 };
 pub use package::{
     CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageConfig,

@@ -532,11 +532,12 @@ fn inspect_package(path: &PathBuf, bindings: bool, physical_tile: Option<u32>) -
         ] {
             for binding in group {
                 println!(
-                    "binding kind={kind} name={:?} dtype={} shape={:?} slices={}",
+                    "binding kind={kind} name={:?} dtype={} shape={:?} slices={} allocatedBytes={}",
                     binding.name,
                     binding.dtype,
                     binding.shape,
-                    binding.slices.len()
+                    binding.slices.len(),
+                    binding.slices.iter().map(|slice| slice.size).sum::<u64>()
                 );
             }
         }
