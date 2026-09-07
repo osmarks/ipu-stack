@@ -117,3 +117,55 @@ The isolated full build retained the identical package hash. Sorting's CPU
 sample share fell from about 9.6% to 5.3%; total sampled cycles fell about 3%.
 Whole-command wall time was 108 seconds versus the preceding 105-second run,
 so this single full-build measurement does not establish a wall-time gain.
+
+## Native CPU and incremental exchange encoding
+
+`.cargo/config.toml` now sets `-C target-cpu=native` for Rust host tools. The
+external IPU kernel toolchain is unaffected. These host binaries are built for
+the compiling machine's CPU features.
+
+The encoder now retains immutable encoded rows and checkpoints after complete
+sender messages and receive-control groups. A changed schedule finds the last
+checkpoint whose consumed senders and controls still match. Reuse also checks
+that a new sender/control does not overlap the prefix and that any SENDPICP
+lookahead towards the next control or gap boundary remains valid. The original
+emission routines encode the remaining suffix, retaining instruction parity.
+This handles earlier insertions and removal of old receive teardown controls;
+it does not assume every change is an append at the end of the row.
+
+Successful encodings are cached with the schedule; mutations invalidate the
+current result while retaining it as a candidate prefix. Speculative clones
+share the immutable cache. Input vectors are still sorted, compared, and copied;
+the whole operation is not proportional solely to the changed suffix.
+
+The first checkpoint implementation reduced CPU work but did not improve wall
+time. Assembly profiling exposed another bottleneck: each receive-control group
+was found by binary-searching the entire remaining event list. Valid groups have
+only one or two controls. Validation and emission now walk those groups linearly.
+
+| Version | Whole command | User CPU time | Final exchange lowering |
+|---|---:|---:|---:|
+| Prior parallel compiler | 105.0 s | 370.7 s | 27.49 s |
+| Radix only | 108.0 s | 363.5 s | 27.45 s |
+| Radix + native CPU | 92.3 s | 358.3 s | 20.61 s |
+| Also encoding checkpoints | 93.9 s | 337.9 s | 25.28 s |
+| Also linear control-group traversal | **87.2 s** | **311.9 s** | **13.66 s** |
+
+These remain single profiled runs with 16 Rayon threads; stage-to-stage wall-time
+variation is visible. The final run peaked at 3.27 GiB RSS, versus 3.05 GiB for
+the native-only run. All stages retained every screening/scheduling score and
+the original package hash. Full encoding's former hot loop dropped out of the
+top CPU consumers; `build_scheduled_program` itself accounts for 3.5% of final
+samples, with event sorting accounted separately.
+
+The isolated `benchmark_incremental_encoding` test compares full and resumed
+encoding after adding a receive to an existing stream. Across 32–2,048 prior
+transfers, median speedups were 1.85–2.69×, including sorting and prefix comparison.
+Run it with `cargo test --release -p ipu-exchange benchmark_incremental_encoding
+-- --ignored --nocapture`. Raw data is in `artifacts/compiler-perf/encoding-benchmark.csv`.
+
+Tests compare every exercised cached encoding against full encoding, including
+errors. Randomized mixed transfers cover ordinary, paired, multicast, and loopback
+traffic; dedicated tests check prefix reuse and receive cutovers. Final validation
+passes 133 codegen tests, 44 exchange tests, the doctest, and Clippy. Two manual
+benchmarks and one preexisting test are ignored in ordinary test runs.
