@@ -1666,6 +1666,7 @@ pub(super) fn resolved_output_aliasing(
 pub(super) fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
     match (operation, operator) {
         (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
+        (OperationKind::LayerNorm, MidOperator::LayerNorm) => true,
         (OperationKind::Gelu, MidOperator::Gelu) => true,
         (OperationKind::Add, MidOperator::Add) => true,
         (OperationKind::View(expected), MidOperator::View(view)) => *expected == view,

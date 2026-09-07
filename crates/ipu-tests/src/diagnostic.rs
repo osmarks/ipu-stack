@@ -345,7 +345,13 @@ pub(crate) fn prepare_inputs(
         };
         let seed = 0x4449_4147_4e4f_5354 ^ u64::from(input.value.index());
         let data = (0..input.shape.elements())
-            .map(|index| quantize(super::gaussian(seed, index) * scale, metadata.precision))
+            .map(|index| {
+                quantize(
+                    super::vit::random_input(input, seed, index)
+                        .unwrap_or_else(|| super::gaussian(seed, index) * scale),
+                    metadata.precision,
+                )
+            })
             .collect();
         values.insert(
             input.value,
@@ -448,6 +454,23 @@ fn evaluate_operations(
                 &values[&operation.inputs[1]],
                 *options,
             )?],
+            OperationKind::LayerNorm => {
+                let x = &values[&operation.inputs[0]];
+                let scale = &values[&operation.inputs[1]];
+                let bias = &values[&operation.inputs[2]];
+                let width = *x.shape.last().unwrap() as usize;
+                let mut y = x.clone();
+                for row in y.values.chunks_mut(width) {
+                    let mean = row.iter().sum::<f32>() / width as f32;
+                    let variance =
+                        row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / width as f32;
+                    let inverse = (variance + 1e-6).sqrt().recip();
+                    for (i, v) in row.iter_mut().enumerate() {
+                        *v = (*v - mean) * inverse * scale.values[i] + bias.values[i];
+                    }
+                }
+                vec![y]
+            }
             OperationKind::Gelu => vec![map_unary(
                 &values[&operation.inputs[0]],
                 super::gelu_reference,

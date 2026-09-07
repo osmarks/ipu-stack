@@ -311,6 +311,11 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
         }
     }
     candidates.extend([
+        pointwise_operator_candidate(
+            MidOperator::LayerNorm,
+            [rows_f16.clone(), rows_f16.clone(), rows_f16.clone()],
+            rows_f16.clone(),
+        ),
         format_preserving_unary_candidate(MidOperator::Gelu, amp_left_result_f16),
         format_preserving_unary_candidate(MidOperator::Gelu, rows_f16.clone()),
         format_preserving_unary_candidate(MidOperator::Gelu, rows_f32.clone()),

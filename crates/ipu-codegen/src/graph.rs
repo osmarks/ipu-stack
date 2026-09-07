@@ -124,6 +124,8 @@ pub enum OperationKind {
     Gemm(GemmOptions),
     /// Exact Gaussian error linear unit.
     Gelu,
+    /// Normalize the last axis with learned scale/bias and epsilon 1e-6.
+    LayerNorm,
     Add,
     View(AxisFactorView),
     Slice(AxisSlice),
@@ -545,6 +547,21 @@ fn infer_shape(
             output.push(left_rows);
             output.push(right_columns);
             Ok(TensorShape(output))
+        }
+        OperationKind::LayerNorm => {
+            let x = input(0)?;
+            let width =
+                *x.0.last()
+                    .ok_or_else(|| GraphError::InvalidShape("layernorm needs an axis".into()))?;
+            for index in [1, 2] {
+                let parameter = input(index)?;
+                if parameter.elements() != u64::from(width) || parameter.0.last() != Some(&width) {
+                    return Err(GraphError::InvalidShape(
+                        "layernorm scale/bias must be last-axis vectors".into(),
+                    ));
+                }
+            }
+            Ok(x.clone())
         }
         OperationKind::Gelu => Ok(input(0)?.clone()),
         OperationKind::Add => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),

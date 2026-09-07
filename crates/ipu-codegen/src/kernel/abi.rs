@@ -31,6 +31,7 @@ pub enum KernelAvailability {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarValue {
     ElementCount,
+    FlattenedRows,
     QueryRows,
     KeyRows,
     SplitSoftmaxRows,
@@ -68,6 +69,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
         .iter()
         .map(|argument| match argument {
             ScalarValue::ElementCount => Ok(count),
+            ScalarValue::FlattenedRows => Ok(count / matrix_extent(run, true, true)?),
             ScalarValue::QueryRows => gemm_rows(run),
             ScalarValue::KeyRows => match &run.kernel {
                 TileKernelSpec::AttentionSoftmax { key_columns, .. } => Ok(*key_columns),
@@ -172,7 +174,17 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::LeftBroadcastStride | ScalarValue::RightBroadcastStride => {
-                Err(KernelAbiError::RequirementMismatch)
+                let index = usize::from(*argument == ScalarValue::RightBroadcastStride);
+                run.inputs
+                    .get(index)
+                    .and_then(|input| input.views.first())
+                    .ok_or(KernelAbiError::RequirementMismatch)?
+                    .extents
+                    .iter()
+                    .try_fold(1u32, |n, axis| {
+                        n.checked_mul(axis.physical_end - axis.start)
+                            .ok_or(KernelAbiError::ElementCountOverflow)
+                    })
             }
         })
         .collect()
@@ -242,6 +254,16 @@ pub fn tile_kernel_abi(
                     scalars,
                 )
             }
+            TileKernelSpec::LayerNorm => (
+                KernelSymbols::Exact("layer_norm_f16"),
+                if precision == Precision::F16 {
+                    KernelAvailability::Implemented
+                } else {
+                    KernelAvailability::Required
+                },
+                3,
+                &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+            ),
             TileKernelSpec::Gelu => {
                 let symbol = gelu_symbol(requirements).unwrap_or("unsupported_gelu");
                 (
@@ -268,7 +290,11 @@ pub fn tile_kernel_abi(
             }
             TileKernelSpec::Add => (
                 exact_symbol(precision, "add_f16", "add_f32"),
-                KernelAvailability::Required,
+                if precision == Precision::F16 {
+                    KernelAvailability::Implemented
+                } else {
+                    KernelAvailability::Required
+                },
                 2,
                 &[
                     ScalarValue::ElementCount,
@@ -442,6 +468,42 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                 ))
         {
             return Err(KernelAbiError::RequirementMismatch);
+        }
+    }
+    if matches!(kernel, TileKernelSpec::LayerNorm) {
+        let width = matrix_extent(run, true, true)?;
+        if width == 0 || !width.is_multiple_of(2) || matrix_extent(run, false, true)? != width {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+        if run
+            .requirements
+            .inputs
+            .iter()
+            .any(|r| r.format.precision != Precision::F16)
+            || run.requirements.output.format.layout.order != ElementOrder::RowMajor
+        {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+    }
+    if matches!(kernel, TileKernelSpec::Add) {
+        for operand in &run.inputs {
+            let input = &operand.views[0].extents;
+            let output = &run.output.extents;
+            if input.len() > output.len() {
+                return Err(KernelAbiError::RequirementMismatch);
+            }
+            let mut suffix = false;
+            for (a, b) in input.iter().zip(&output[output.len() - input.len()..]) {
+                let n = a.physical_end - a.start;
+                let m = b.physical_end - b.start;
+                if n != 1 {
+                    suffix = true;
+                }
+                // The codelet repeats a contiguous suffix, not arbitrary strides.
+                if (suffix && n != m) || n == 0 {
+                    return Err(KernelAbiError::RequirementMismatch);
+                }
+            }
         }
     }
     if matches!(kernel, TileKernelSpec::Gelu) {

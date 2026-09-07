@@ -1270,6 +1270,13 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
                 })
                 .unwrap();
             assert_eq!(add.inputs[0].views[0].extents[0].logical_end, 1);
+            assert!(
+                !matches!(
+                    low.shards[add.inputs[0].views[0].shard.index() as usize].definition,
+                    ShardDefinition::Unmaterialized
+                ),
+                "broadcast must resolve locally reused input views"
+            );
             assert_eq!(
                 low.shards[add.inputs[0].views[0].shard.index() as usize].tile,
                 tile.tile

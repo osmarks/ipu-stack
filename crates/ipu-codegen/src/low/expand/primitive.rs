@@ -72,7 +72,12 @@ impl TileGraphBuilder {
                                         ) || self.broadcast_view(source, output).is_some())
                                 })
                                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                            self.window(source, window)
+                            if matches!(kernel, TileKernelSpec::Add) && window.0.is_empty() {
+                                self.broadcast_view(source, output)
+                                    .ok_or(ExpansionError::InvalidOperatorPlan)
+                            } else {
+                                self.window(source, window)
+                            }
                         })
                         .collect::<ExpansionResult<Vec<_>>>()?;
                     if let Some(axes) = product {

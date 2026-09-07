@@ -160,6 +160,8 @@ impl KernelSpecialization {
 pub(super) struct KernelInventory {
     pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
     pub(super) gelu: bool,
+    pub(super) normalization: bool,
+    pub(super) add: bool,
     pub(super) cast_f32_f16: bool,
     pub(super) fp8_casts: BTreeSet<(u64, u64)>,
     pub(super) reduction_add: bool,
@@ -197,6 +199,8 @@ impl KernelInventory {
                                 to: Precision::F16
                             }
                         );
+                        self.normalization |= matches!(kernel, TileKernelSpec::LayerNorm);
+                        self.add |= matches!(kernel, TileKernelSpec::Add);
                         self.gelu |= matches!(kernel, TileKernelSpec::Gelu);
                         self.reduction_add |= matches!(kernel, TileKernelSpec::ReductionSum { .. });
                         continue;

@@ -31,6 +31,8 @@ impl KernelBuildPlan {
         let KernelInventory {
             rows,
             gelu,
+            normalization,
+            add,
             cast_f32_f16,
             fp8_casts,
             reduction_add,
@@ -42,6 +44,25 @@ impl KernelBuildPlan {
         let mut plan = Self::default();
         for (configuration, rows) in rows {
             plan.add_gemm(configuration, rows);
+        }
+        for (enabled, symbol, vertex, registers) in [
+            (
+                normalization,
+                "layer_norm_f16",
+                "LayerNormF16",
+                &[3, 4, 5, 2, 6, 7][..],
+            ),
+            (add, "add_f16", "AddF16", &[3, 4, 2, 5, 6, 7][..]),
+        ] {
+            if enabled {
+                plan.compilations.push(KernelCompilation {
+                    source: "elementwise_f16.cpp",
+                    name: format!("{symbol}_codelet"),
+                    flags: vec!["-O2".into(), format!("-DVERTEX_{vertex}")],
+                    retained_symbols: vec![],
+                });
+                plan.add_worker_wrapper(format!("{symbol}_wrapper"), symbol, vertex, registers);
+            }
         }
         if gelu {
             plan.compilations.push(KernelCompilation {
@@ -73,7 +94,9 @@ impl KernelBuildPlan {
                 &[3, 2, 4],
             );
         }
-        let has_worker_codelets = cast_f32_f16
+        let has_worker_codelets = normalization
+            || add
+            || cast_f32_f16
             || !fp8_casts.is_empty()
             || !rearrangements.is_empty()
             || !unpacks.is_empty();

@@ -16,6 +16,7 @@ pub enum MidOperator {
         accumulate: AccumulationPrecision,
     },
     Gelu,
+    LayerNorm,
     Add,
     View(AxisFactorView),
     Slice(crate::graph::AxisSlice),
@@ -44,6 +45,7 @@ pub enum TileKernelSpec {
         output_columns: u32,
     },
     Gelu,
+    LayerNorm,
     ReductionSum {
         partials: u16,
     },
@@ -369,6 +371,9 @@ pub(super) fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> b
 pub(super) fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
     match operator {
         MidOperator::Gemm { .. } => blocked_gemm_dispatch(AMP_OUTPUT_COLUMN_BLOCK),
+        MidOperator::LayerNorm => OperatorDispatch::Pointwise {
+            kernel: TileKernelSpec::LayerNorm,
+        },
         MidOperator::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
         },
@@ -758,6 +763,12 @@ impl OperatorPlan {
                 Ok(())
             }
             (
+                MidOperator::LayerNorm,
+                OperatorDispatch::Pointwise {
+                    kernel: TileKernelSpec::LayerNorm,
+                },
+            )
+            | (
                 MidOperator::Gelu,
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::Gelu,

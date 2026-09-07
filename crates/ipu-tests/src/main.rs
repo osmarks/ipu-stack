@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 mod diagnostic;
 mod exchange_stress;
+mod vit;
 
 #[derive(Parser)]
 #[command(version, about = "Build, load, and diagnose the trivial IPU21 package")]
@@ -135,6 +136,8 @@ struct Arguments {
     workload: Workload,
     #[arg(long, default_value_t = SIGLIP_MLP_BATCH)]
     mlp_batch: u32,
+    #[command(flatten)]
+    vit: vit::Options,
     #[arg(long, default_value_t = SIGLIP_MLP_TOKENS)]
     mlp_tokens: u32,
     #[arg(long, default_value_t = SIGLIP_MLP_DIMENSION)]
@@ -242,6 +245,8 @@ enum Workload {
     GemmBenchmark,
     /// Profile the canonical batched SigLIP Dense-GeLU-Dense workload.
     SiglipMlpBenchmark,
+    /// One So400m/14 encoder layer, image embedding and MAP pooling.
+    SiglipVitBenchmark,
     /// Profile SigLIP self-attention (16 heads, 729 tokens, width 72).
     SiglipAttentionBenchmark,
     /// Run reproducible randomized small-group tile exchanges.
@@ -302,6 +307,7 @@ impl Workload {
         matches!(
             self,
             Self::GemmBenchmark
+                | Self::SiglipVitBenchmark
                 | Self::SiglipMlpBenchmark
                 | Self::SiglipAttentionBenchmark
                 | Self::AttentionSmoke
@@ -460,6 +466,7 @@ fn main() -> Result<()> {
                 | Workload::MlpSmoke
                 | Workload::GemmBenchmark
                 | Workload::SiglipAttentionBenchmark
+                | Workload::SiglipVitBenchmark
                 | Workload::SiglipMlpBenchmark
         )
     {
@@ -873,6 +880,12 @@ fn main() -> Result<()> {
             pipeline.conversion_streaming = ipu_codegen::ConversionStreamingPolicy::Never;
             pipeline.profiling = !arguments.no_profile;
         }
+    } else if matches!(arguments.workload, Workload::SiglipVitBenchmark) {
+        graph = vit::build(&arguments.vit)?;
+        pipeline.profiling = !arguments.no_profile;
+        for input in graph.inputs() {
+            pipeline = pipeline.with_automatic_input(input.value, Precision::F16);
+        }
     } else if matches!(arguments.workload, Workload::SiglipMlpBenchmark) {
         validate_mlp_benchmark_shape(
             arguments.mlp_batch,
@@ -956,6 +969,11 @@ fn main() -> Result<()> {
                 scale,
             ));
         for input in graph.inputs() {
+            if matches!(arguments.workload, Workload::SiglipVitBenchmark)
+                && !input.name.ends_with(".weight")
+            {
+                continue;
+            }
             pipeline = pipeline.with_automatic_input(
                 input.value,
                 Precision::F8F143 {
@@ -1070,7 +1088,8 @@ fn main() -> Result<()> {
                 Duration::from_secs(arguments.timeout_seconds),
             )?;
         } else if !matches!(arguments.workload, Workload::Diagnostic) {
-            if arguments.reference_run {
+            if arguments.reference_run || matches!(arguments.workload, Workload::SiglipVitBenchmark)
+            {
                 let (output, maximum_error) = run_reference(
                     &runtime,
                     &application,

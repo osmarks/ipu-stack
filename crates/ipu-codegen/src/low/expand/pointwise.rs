@@ -21,6 +21,8 @@ impl TileGraphBuilder {
         output: BlockValueId,
         output_extents: &[ShardExtent],
     ) -> Option<ShardView> {
+        let source_view = self.full_view(source);
+        let source = source_view.shard;
         let source_shard = &self.shards[source.index() as usize];
         let output_shard = &self.shards[output.index() as usize];
         let source_rank = source_shard.extents.len();
@@ -29,7 +31,7 @@ impl TileGraphBuilder {
             return None;
         }
         let offset = output_rank - source_rank;
-        let mut extents = source_shard.extents.clone();
+        let mut extents = source_view.extents;
         for (axis, extent) in extents.iter_mut().enumerate() {
             let dimension = source_shard.tensor_type.shape.0[axis];
             if dimension == 1 {

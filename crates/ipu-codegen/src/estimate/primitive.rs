@@ -126,7 +126,8 @@ pub(crate) fn kernel_cycles(
             );
         }
         TileKernelSpec::Gelu => elements.saturating_mul(10),
-        TileKernelSpec::Add => elements.div_ceil(16),
+        TileKernelSpec::Add => elements.saturating_mul(3),
+        TileKernelSpec::LayerNorm => elements.saturating_mul(14),
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }

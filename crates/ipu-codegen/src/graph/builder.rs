@@ -16,6 +16,15 @@ macro_rules! graph_operations {
             self.inferred_result(OperationKind::Gemm(options), [left, right])
         }
 
+        pub fn layer_norm(
+            &mut self,
+            input: ValueId,
+            scale: ValueId,
+            bias: ValueId,
+        ) -> GraphResult<ValueId> {
+            self.inferred_result(OperationKind::LayerNorm, [input, scale, bias])
+        }
+
         pub fn gelu(&mut self, input: ValueId) -> GraphResult<ValueId> {
             self.inferred_result(OperationKind::Gelu, [input])
         }
