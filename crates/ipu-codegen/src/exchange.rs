@@ -1555,18 +1555,18 @@ impl<'a> TransferScheduler<'a> {
                 scheduler.push_ready(index, 0);
             }
         }
-        // With no dependencies or multicast pressure updates, transfers
-        // sharing endpoints have identical changing readiness. Keep only the
+        // Initially ready transfers without multicast pressure updates
+        // share changing readiness when their endpoints match. Keep only the
         // best static-priority member of each pair in the global heap; lazy
         // refresh otherwise revisits every queued transfer after each send.
+        // Transfers released by dependencies later use individual heap entries.
         if !scheduler.dynamic_word_pressure
             && transfers
                 .iter()
                 .all(|t| t.destinations.len() == 1 && t.reserved_source.is_none())
-            && scheduler.indegrees.iter().all(|&n| n == 0)
         {
             let mut groups = BTreeMap::new();
-            scheduler.transfer_group.resize(transfers.len(), 0);
+            scheduler.transfer_group.resize(transfers.len(), usize::MAX);
             for candidate in std::mem::take(&mut scheduler.ready).into_vec() {
                 let index = candidate.index.0;
                 let transfer = &transfers[index];
@@ -1610,7 +1610,7 @@ impl<'a> TransferScheduler<'a> {
 
     fn next(&mut self, tile_availability: &[TileAvailability]) -> Option<(usize, u32)> {
         loop {
-            let candidate = self.ready.pop()?;
+            let candidate = *self.ready.peek()?;
             let index = candidate.index.0;
             let transfer = &self.transfers[index];
             let earliest_start = std::iter::once(self.dependency_ready[index])
@@ -1630,11 +1630,17 @@ impl<'a> TransferScheduler<'a> {
                 .max()
                 .unwrap_or(0);
             if candidate.earliest_start.0 == earliest_start {
+                self.ready.pop();
                 // Endpoint availability ranks the ready queue, but is not a
                 // dependency on payload arrival. The row builder pipelines
                 // source selection and delivery using their actual timings.
-                if !self.ready_groups.is_empty() {
-                    let queue = &mut self.ready_groups[self.transfer_group[index]];
+                if let Some(group) = self
+                    .transfer_group
+                    .get(index)
+                    .copied()
+                    .filter(|&group| group != usize::MAX)
+                {
+                    let queue = &mut self.ready_groups[group];
                     let head = queue.pop().expect("nonempty ready pair");
                     debug_assert_eq!(head.index.0, index);
                     if let Some(mut next) = queue.peek().copied() {
@@ -1644,7 +1650,12 @@ impl<'a> TransferScheduler<'a> {
                 }
                 return Some((index, self.dependency_ready[index]));
             }
-            self.push_ready(index, earliest_start);
+            let mut head = self.ready.peek_mut().expect("ready head");
+            head.earliest_start = Reverse(earliest_start);
+            head.endpoint_pressure = transfer
+                .tiles()
+                .map(|tile| self.word_pressure[usize::from(tile)])
+                .sum();
         }
     }
 

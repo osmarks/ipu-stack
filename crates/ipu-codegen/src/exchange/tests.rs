@@ -8,20 +8,30 @@ use crate::{
 #[test]
 fn grouped_unicast_ready_queue_preserves_exact_transfer_order() {
     let mut random = fastrand::Rng::with_seed(0x7061697273);
-    for _ in 0..16 {
+    for case in 0..16 {
         let tiles = 8;
         let transfers = (0..1024)
             .map(|index| {
                 let source = random.u16(0..tiles);
                 let destination = (source + random.u16(1..tiles)) % tiles;
                 let words = random.u32(1..=512);
+                let source_address = if case % 2 == 0 {
+                    0
+                } else {
+                    0x80000 + random.u32(0..16) * 4096
+                };
+                let destination_address = if case % 2 == 0 {
+                    0x80000 + index * 4096
+                } else {
+                    0x80000 + random.u32(0..16) * 4096
+                };
                 PendingTransfer {
                     source,
                     source_shard: BlockValueId::from_index(u32::from(source)),
                     source_offset: 0,
-                    source_addresses: vec![0],
-                    source_elements: effective_memory_elements(0, words),
-                    destinations: vec![(destination, 0x80000 + index * 4096)],
+                    source_addresses: vec![source_address],
+                    source_elements: effective_memory_elements(source_address, words),
+                    destinations: vec![(destination, destination_address)],
                     words,
                     width: ExchangeItemWidth::Word32,
                     reserved_source: None,
