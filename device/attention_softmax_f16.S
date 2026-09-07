@@ -57,12 +57,14 @@ ATTENTION_SOFTMAX_SYMBOL:
 	sub $m7, $m7, 1
 #endif
 .Lsoftmax_max_panel:
-	ld32step $a0, $mzero, $m3+=, 1
-	.rept 7
-	{ ld32step $a0, $mzero, $m3+=, 1
-	  f16v2max $a6, $a6, $a0 }
+	mov $a7, $a6
+	ld64step $a0:1, $mzero, $m3+=, 1
+	.rept 3
+	{ ld64step $a0:1, $mzero, $m3+=, 1
+	  f16v4max $a6:7, $a6:7, $a0:1 }
 	.endr
-	f16v2max $a6, $a6, $a0
+	f16v4max $a6:7, $a6:7, $a0:1
+	f16v2max $a6, $a6, $a7
 	add $m3, $m3, $m8
 	brnzdec $m7, .Lsoftmax_max_panel
 #if !ATTENTION_FULL_BLOCK
@@ -98,6 +100,7 @@ ATTENTION_SOFTMAX_SYMBOL:
 	add $m6, $m6, $m0
 	st32 $a7, $m6, $m15, 0
 	f32sub $a5, $azero, $a7
+	f32tof16 $a2, $a6
 	setzi $a6, 0
 	setzi $a7, 0
 	mov $m3, $m9
@@ -117,20 +120,46 @@ ATTENTION_SOFTMAX_SYMBOL:
 	{ st32step $a0, $mzero, $m2+=, 1
 	  f16v2tof32 $a2:3, $a0 }
 	.endm
+	// TAS holds +/- the half scale. MIX forms the difference in FP32,
+	// avoiding an overflowing intermediate FP16 subtraction.
+	mov $a0, $a4
+	f32sub $a1, $azero, $a4
+	f32v2tof16 $a0, $a0:1
+	uput $TAS, $a0
+	mov $a4, $a2
+	mov $a5, $a2
+	.macro SOFTMAX_STORE_QUAD
+	f16v2exp $a2, $a2
+	f16v2exp $a3, $a3
+	{ st32step $a2, $mzero, $m2+=, 1
+	  f16v2tof32 $a0:1, $a2 }
+	f32v2add $a6:7, $a6:7, $a0:1
+	{ st32step $a3, $mzero, $m2+=, 1
+	  f16v2tof32 $a0:1, $a3 }
+	f32v2add $a6:7, $a6:7, $a0:1
+	.endm
 .Lsoftmax_exp_panel:
-	ld32step $a0, $mzero, $m3+=, 1
-	.rept 7
-	SOFTMAX_EXP_PAIR
-	{ ld32step $a0, $mzero, $m3+=, 1
-	  f32v2add $a6:7, $a6:7, $a2:3 }
+	// Prime with zero accumulators so the discarded readout is finite.
+	// MIX then returns each preceding quad while starting the next one.
+	setzi $a0, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
+	uput $FP_CLR, $a0
+	ld64step $a0:1, $mzero, $m3+=, 1
+	f16v4mix $a2:3, $a0:1, $a4:5
+	.rept 3
+	ld64step $a0:1, $mzero, $m3+=, 1
+	f16v4mix $a2:3, $a0:1, $a4:5
+	SOFTMAX_STORE_QUAD
 	.endr
-	SOFTMAX_EXP_PAIR
-	f32v2add $a6:7, $a6:7, $a2:3
+	f16v4gacc $a2:3
+	SOFTMAX_STORE_QUAD
 	add $m3, $m3, $m8
 	add $m2, $m2, $m8
 	brnzdec $m7, .Lsoftmax_exp_panel
 #if !ATTENTION_FULL_BLOCK
 .Lsoftmax_exp_tail:
+	ldconst $a4, ATTENTION_SCALE_BITS
+	ld32 $a5, $m6, $m15, 0
+	f32sub $a5, $azero, $a5
 	and $m7, $m10, 15
 	shr $m7, $m7, 1
 	brz $m7, .Lsoftmax_exp_odd

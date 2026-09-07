@@ -78,3 +78,24 @@ ownership. Then measure whether split-row overhead is justified on the faster
 kernel. Update analytical costing and useful-work metadata with whichever
 instruction sequence is actually selected. No proposed kernel has yet been
 implemented or benchmarked on hardware.
+
+## Arithmetic implementation and hardware check (2026-09-07)
+
+Implemented four-wide maximum loads and pipelined `f16v4mix` affine preparation,
+with FP32 denominator accumulation and the existing masked pair tail. The inner
+full-panel cost falls from 71 to 47 issue groups. Cost and useful-work metadata
+now describe this sequence.
+
+The standalone `softmax_check` binary checks normalized probabilities, FP32
+maxima/sums, zero padding, and output guards against a host reference while timing
+both a supplied old source and the new one. The first sweep covered 80 shapes
+and passed; maximum probability error in the long-row random cases was below
+0.000004. Its buffers reserve full SRAM elements to prevent host-readback code
+from sharing an element with SEND data.
+
+With unchanged attention planning/costing for an isolated kernel comparison,
+materialized attention fell from 234,378 to 221,550 cropped cycles. Softmax fell
+from 40,326 to 27,498 cycles; all 839,808 model output checks passed. Artifacts:
+`artifacts/softmax-upgrade/arithmetic-attention/`. This comparison intentionally
+uses the original planner binary with the updated assembly, so its profile
+useful-work metadata still describes the old kernel.

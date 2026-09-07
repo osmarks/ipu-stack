@@ -60,7 +60,7 @@ pub(crate) fn f16_packed_gemm_cycles(
     )
 }
 
-/// Row-wise softmax: packed maxima and fused exponent/store/sum take 71
+/// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 47
 /// issue groups per full 16-key panel. Masked pairs and zero padding use short
 /// scalar loops; no tile program needs to be constructed to price them.
 pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
@@ -68,10 +68,12 @@ pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 
         return 0;
     }
     let full_panels = keys / 16;
-    let mut row = 31u64.saturating_add(full_panels.saturating_mul(71));
+    let mut row = 31u64.saturating_add(full_panels.saturating_mul(47));
     let launch = if keys == padded_keys {
+        row = row.saturating_add(7);
         216u64
     } else {
+        row = row.saturating_add(5 + 6 * u64::from(full_panels != 0));
         let pairs = (keys % 16) / 2;
         let zero_pairs = 8 - (keys % 16).div_ceil(2);
         let zero_panels = (padded_keys / 16).saturating_sub(full_panels.saturating_add(1));
@@ -166,8 +168,8 @@ mod tests {
     #[test]
     fn attention_row_models_match_hardware() {
         for rows in [7, 8] {
-            assert_eq!(f16_softmax_cycles(rows, 64, 64), 3996);
-            assert_eq!(f16_softmax_cycles(rows, 25, 64), 2838);
+            assert_eq!(f16_softmax_cycles(rows, 64, 64), 2928);
+            assert_eq!(f16_softmax_cycles(rows, 25, 64), 2682);
             assert_eq!(f16_attention_merge_cycles(rows, 72, true, false), 2430);
             assert_eq!(f16_attention_merge_cycles(rows, 72, false, false), 3378);
             assert_eq!(f16_attention_merge_cycles(rows, 72, false, true), 3438);
