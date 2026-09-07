@@ -1147,23 +1147,33 @@ mod tests {
             }
         }
         let low = lower_to_tiles(&std::sync::Arc::new(expanded), false);
-        let placement = place(&low).unwrap();
         let mut checked = 0;
-        for tile in &low.tiles {
-            for work in low.work(tile) {
-                let crate::TileWorkRef::Repeat(repeat) = work else {
-                    continue;
-                };
-                for input in &repeat.iterated {
-                    assert!(input.stride_bytes < TILE_MEMORY_ELEMENT_SIZE);
-                    for pair in input.inputs.windows(2) {
-                        assert_eq!(
-                            placement.shard_addresses[&pair[1]]
-                                - placement.shard_addresses[&pair[0]],
-                            TILE_MEMORY_ELEMENT_SIZE
-                        );
+        for placement in [
+            place(&low).unwrap(),
+            place_with_standard_ranges(&low, &[(IPU21_DATA_BASE, IPU21_DATA_BASE + 4)]).unwrap(),
+        ] {
+            for tile in &low.tiles {
+                for work in low.work(tile) {
+                    let crate::TileWorkRef::Repeat(repeat) = work else {
+                        continue;
+                    };
+                    for input in &repeat.iterated {
+                        assert!(input.stride_bytes < TILE_MEMORY_ELEMENT_SIZE);
+                        for pair in input.inputs.windows(2) {
+                            assert_eq!(
+                                placement.shard_addresses[&pair[1]]
+                                    - placement.shard_addresses[&pair[0]],
+                                if placement.shard_addresses[&pair[0]]
+                                    >= IPU21_INTERLEAVED_MEMORY_BASE
+                                {
+                                    IPU21_INTERLEAVED_ELEMENT_SIZE
+                                } else {
+                                    TILE_MEMORY_ELEMENT_SIZE
+                                }
+                            );
+                        }
+                        checked += 1;
                     }
-                    checked += 1;
                 }
             }
         }

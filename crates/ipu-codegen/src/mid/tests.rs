@@ -81,7 +81,7 @@ fn randomized_memory_peaks_allow_noncoincident_classes() {
     let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
     let interleaved_capacity = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
     let element = u64::from(ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE);
-    let mut rejected_noncoincident_peaks = 0;
+    let mut admitted_noncoincident_peaks = 0;
     for _ in 0..RANDOM_CASES * 16 {
         let standard = random.u64(0..=capacity);
         let interleaved = random.u64(0..=interleaved_capacity);
@@ -102,11 +102,11 @@ fn randomized_memory_peaks_allow_noncoincident_classes() {
         let fits = peaks.fits_ipu21_with_budget(reservation, capacity);
         assert_eq!(fits, simultaneous.saturating_add(reservation) <= capacity);
         if simultaneous.saturating_add(reservation) <= capacity && static_partition > capacity {
-            rejected_noncoincident_peaks += 1;
+            admitted_noncoincident_peaks += 1;
             assert!(fits);
         }
     }
-    assert!(rejected_noncoincident_peaks > 0);
+    assert!(admitted_noncoincident_peaks > 0);
 }
 
 fn dimension(random: &mut fastrand::Rng) -> u32 {
