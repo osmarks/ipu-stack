@@ -353,11 +353,19 @@ fn lower_repeat(
             .and_then(|input| placement.shard_addresses.get(input))
             .copied()
             .ok_or(TileLoweringError::InvalidRepeat)?;
+        let stride_bytes = if let Some(second) = iterated.inputs.get(1) {
+            placement
+                .shard_addresses
+                .get(second)
+                .and_then(|address| address.checked_sub(initial_address))
+                .ok_or(TileLoweringError::InvalidRepeat)?
+        } else {
+            iterated.stride_bytes
+        };
         for (iteration, input) in iterated.inputs.iter().enumerate() {
             let expected = initial_address
                 .checked_add(
-                    iterated
-                        .stride_bytes
+                    stride_bytes
                         .checked_mul(
                             u32::try_from(iteration).map_err(|_| TileLoweringError::Overflow)?,
                         )
@@ -370,13 +378,13 @@ fn lower_repeat(
         }
         let index = u16::try_from(index).map_err(|_| TileLoweringError::Overflow)?;
         let address = TileAddress::RepeatPointer { index, offset: 0 };
-        if !iterated.stride_bytes.is_multiple_of(4) {
+        if !stride_bytes.is_multiple_of(4) {
             return Err(TileLoweringError::InvalidRepeat);
         }
         overrides.insert(iterated.argument, address);
         pointers.push(RepeatPointer {
             initial_address,
-            stride_bytes: iterated.stride_bytes,
+            stride_bytes,
         });
     }
     let body = lower_work(

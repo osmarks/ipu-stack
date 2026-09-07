@@ -681,14 +681,18 @@ fn allocate_tile_class(
                 .max()
                 .unwrap_or(1),
         );
+        // Kernel access and loopback bank constraints are only complete after
+        // expansion. Derive the physical repeat stride from those requirements.
+        let mut stride = group.stride;
         for root in &roots {
-            let required = allocation_bytes(program, &members[root], root_requirements[root])?;
-            if required > group.stride {
-                return Err(PlacementError::IteratedStride);
-            }
+            stride = stride.max(allocation_bytes(
+                program,
+                &members[root],
+                root_requirements[root],
+            )?);
         }
-        let bytes = group
-            .stride
+        let stride = align_up(stride, alignment)?;
+        let bytes = stride
             .checked_mul(u32::try_from(roots.len()).map_err(|_| PlacementError::Overflow)?)
             .ok_or(PlacementError::Overflow)?;
         let mut lifetime = Lifetime::default();
@@ -697,8 +701,7 @@ fn allocate_tile_class(
             lifetime.include(root_lifetimes[&root]);
             assignments.push((
                 root,
-                group
-                    .stride
+                stride
                     .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
                     .ok_or(PlacementError::Overflow)?,
             ));
@@ -941,6 +944,73 @@ mod tests {
         ComputeGraph, Ipu21CostModel, KernelBuildPlan, Layout, PipelineConfig, Precision,
         TensorFormat, lower, lower_to_tiles, materialize_kernel_run,
     };
+
+    #[test]
+    fn repeat_stride_includes_late_bank_separation_constraints() {
+        let mut graph = ComputeGraph::new();
+        let carried = graph.host_input("carried", [8, 16]).unwrap();
+        let parameters = (0..3)
+            .map(|index| {
+                graph
+                    .parameter(format!("parameter.{index}"), [8, 16])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let sequence = graph
+            .value_sequence("parameters", parameters.clone())
+            .unwrap();
+        let output = graph
+            .repeat(3, [carried], [], [sequence], |body, arguments| {
+                Ok(vec![body.add(arguments.carried[0], arguments.iterated[0])?])
+            })
+            .unwrap()[0];
+        graph.set_outputs([output]).unwrap();
+        let format = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(4),
+        };
+        let mut config = PipelineConfig::new(4).with_input(carried, format.clone());
+        for parameter in parameters {
+            config.inputs.insert(parameter, format.clone());
+        }
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mut expanded = (*crate::expand_tiles(&mid).unwrap()).clone();
+        // Bank constraints may be introduced during expansion, after mid has
+        // selected the iterated values' shapes and minimum strides.
+        for run in &mut expanded.kernel_runs {
+            if run.inputs.len() == 2 {
+                std::sync::Arc::make_mut(&mut run.metadata)
+                    .requirements
+                    .distinct_elements
+                    .push(vec![
+                        crate::MemoryOperand::Output,
+                        crate::MemoryOperand::Input(1),
+                    ]);
+            }
+        }
+        let low = lower_to_tiles(&std::sync::Arc::new(expanded), false);
+        let placement = place(&low).unwrap();
+        let mut checked = 0;
+        for tile in &low.tiles {
+            for work in low.work(tile) {
+                let crate::TileWorkRef::Repeat(repeat) = work else {
+                    continue;
+                };
+                for input in &repeat.iterated {
+                    assert!(input.stride_bytes < TILE_MEMORY_ELEMENT_SIZE);
+                    for pair in input.inputs.windows(2) {
+                        assert_eq!(
+                            placement.shard_addresses[&pair[1]]
+                                - placement.shard_addresses[&pair[0]],
+                            TILE_MEMORY_ELEMENT_SIZE
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
 
     #[test]
     fn output_lifetimes_follow_ownership_not_output_list_order() {
