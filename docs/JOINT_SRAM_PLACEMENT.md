@@ -52,6 +52,7 @@ renderer-cropped profile span. Results live under `artifacts/joint-placement/`:
 | MLP batch 4, one block | mlp-single-b4 | 400,842 | 0.007324 |
 | Attention batch 1, separate QKV | attention-b1 | 170,958 | 0.000056 |
 | Attention batch 1, fused QKV | attention-fused-b1 | 172,206 | 0.000054 |
+| MLP batch 2, three blocks | mlp-b2-n3 | 1,031,874 | 0.015625 |
 
 The batch-four log embeds its original output directory name `mlp-b1`: the CLI
 batch default was four; the completed directory was renamed to match the actual
@@ -70,3 +71,13 @@ A smaller three-block Repeat (129 tokens, 128 channels, hidden width 256, 64
 active compute tiles) also passed hardware reference checking, maximum absolute
 error 0.015625, under `mlp-small-repeat`. The Repeat stride regression explicitly
 checks both ordinary-region placement and forced region-1 placement.
+
+For the full batch-two three-block MLP, schedule selection took 351.658 seconds,
+while final storage placement took 52 ms. The existing exchange-placement search
+then tried seven address offsets; each allocation took 39–49 ms. Exact exchange
+validation/rescheduling is separate and can take minutes on this workload. A
+10-second perf sample of initial scheduling attributed about 70% of sampled CPU
+time to `BinaryHeap<RepairReady>::pop` and 21% to `repair_ready`, rather than the
+allocator. The refactor does not change the limits on address challengers or
+exact scheduling attempts. Testing many placements for *memory feasibility* is
+cheap; exact exchange scoring of every placement would not be.
