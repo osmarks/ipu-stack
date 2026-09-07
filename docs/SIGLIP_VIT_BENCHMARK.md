@@ -42,6 +42,11 @@ embeddings use standard deviation `1/sqrt(width)`, layernorm scales are one,
 and biases are tiny Gaussian values. Each batch uses the same learned probe.
 These are performance/implementation tests, not pretrained accuracy evaluations.
 
+The default tensor precision is F16, including attention results, residuals,
+bias additions and GELU. F32 is retained for layernorm statistics and internal
+attention softmax/accumulation state; attention explicitly converts its result
+back to F16. Selecting FP8 GEMMs does not change this policy.
+
 Layernorm is a reusable graph operation with epsilon 1e-6 and affine parameters.
 Its initial F16 codelet uses F32 centered statistics and owns complete rows per
 worker. The current kernel requires even-width unpadded rows. Floating-point

@@ -2001,6 +2001,13 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
         let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
             .unwrap()
             .remove(0);
+        assert_eq!(
+            mid.values[mid.outputs[0].index() as usize]
+                .tensor_type
+                .format
+                .precision,
+            Precision::F16
+        );
         let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
         crate::KernelBuildPlan::from_program(&tiled).unwrap();

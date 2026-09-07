@@ -16,6 +16,12 @@ impl Builder {
         if !materialized && (query_key_grid.is_some() || probability_value_grid.is_some()) {
             return None;
         }
+        // Online softmax merging retains F32 state, but model activations use
+        // the selected output precision rather than inheriting that scratch type.
+        let final_output = output;
+        let mut accumulator = output.clone();
+        accumulator.format.precision = Precision::F32;
+        let output = &accumulator;
         let product = |inner_block, output_columns| TileKernelSpec::Gemm {
             multiply: Precision::F16,
             accumulate: AccumulationPrecision::F32,
@@ -217,7 +223,7 @@ impl Builder {
                 vec![],
             ));
         }
-        result
+        Some(self.cast(result?, final_output.format.precision))
     }
     /// Pack once on a small distributed owner grid, then broadcast native
     /// panels. Both materializations are ordinary mid values and copies.

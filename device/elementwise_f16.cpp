@@ -48,17 +48,18 @@ public:
     unsigned l = wrap(worker * 2, leftElements);
     unsigned r = wrap(worker * 2, rightElements);
     for (unsigned i = worker * 2; i + 1 < elements; i += 12) {
-      float2 result = {float(left[l]) + float(right[r]),
-                      float(left[wrap(l+1, leftElements)]) + float(right[wrap(r+1, rightElements)])};
-      *reinterpret_cast<half2 *>(&destination[i]) = __builtin_convertvector(result, half2);
+      const half2 a = {left[l], left[wrap(l+1, leftElements)]};
+      const half2 b = {right[r], right[wrap(r+1, rightElements)]};
+      *reinterpret_cast<half2 *>(&destination[i]) = a + b;
       l = wrap(l + 12, leftElements);
       r = wrap(r + 12, rightElements);
     }
     if (worker == 0 && (elements & 1)) {
       const unsigned i = elements - 1;
       union { half2 lanes; unsigned word; } tail;
-      const float2 value = {float(left[wrap(i, leftElements)]) + float(right[wrap(i, rightElements)]), 0.0f};
-      tail.lanes = __builtin_convertvector(value, half2);
+      const half2 a = {left[wrap(i, leftElements)], half(0)};
+      const half2 b = {right[wrap(i, rightElements)], half(0)};
+      tail.lanes = a + b;
       auto *words = reinterpret_cast<volatile unsigned *>(&destination[0]);
       words[i / 2] = (words[i / 2] & 0xffff0000u) | (tail.word & 0xffffu);
     }

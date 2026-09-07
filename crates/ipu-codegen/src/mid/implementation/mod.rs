@@ -32,14 +32,12 @@ pub(crate) fn implement(
                 }),
                 OutputAliasing::Fresh => None,
             };
-            b.compute(
-                operands,
-                output.clone(),
-                kernel.clone(),
-                None,
-                reuse,
-                vec![],
-            )
+            let mut kernel_output = output.clone();
+            if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
+                kernel_output.format.precision = Precision::F32;
+            }
+            let result = b.compute(operands, kernel_output, kernel.clone(), None, reuse, vec![]);
+            b.cast(result, output.format.precision)
         }
         OperatorDispatch::View => {
             let mapping = match plan.operator {
@@ -159,6 +157,26 @@ impl Builder {
             estimated_exchange_cycles: 0,
         });
         result
+    }
+
+    fn cast(&mut self, input: MidValueId, precision: Precision) -> MidValueId {
+        let mut output = self.tensor(input).clone();
+        let from = output.format.precision;
+        if from == precision {
+            return input;
+        }
+        output.format.precision = precision;
+        self.compute(
+            vec![input],
+            output,
+            TileKernelSpec::Cast {
+                from,
+                to: precision,
+            },
+            None,
+            None,
+            vec![],
+        )
     }
 
     fn copy(&mut self, input: MidValueId, output: TensorType, offsets: Vec<u32>) -> MidValueId {

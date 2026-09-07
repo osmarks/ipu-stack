@@ -307,7 +307,7 @@ pub(super) fn plans(
                 layout: Layout::attention_block_major_key_value(heads, key_partitions),
             };
             let output_format = TensorFormat {
-                precision: Precision::F32,
+                precision: Precision::F16,
                 layout: Layout::attention_output(heads, query_partitions),
             };
             for (materialized, key_block_rows) in
