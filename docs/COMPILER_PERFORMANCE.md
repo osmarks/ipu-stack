@@ -194,3 +194,47 @@ cargo test --release -p ipu-codegen compare_ready_heaps -- --ignored --nocapture
 Raw results: `artifacts/compiler-perf/{minmax,minmax-min,binary-recheck}` and
 `artifacts/compiler-perf/heap-benchmark.log`. The crate API is documented at
 <https://docs.rs/min-max-heap/1.3.0/min_max_heap/struct.MinMaxHeap.html>.
+
+## Grouped repair priorities (2026-09-07)
+
+The batch-two, three-block FP8 MLP exposed repeated lazy priority refreshes in
+`critical_neighborhood_order`. A ten-second sample attributed 70% of sampled CPU
+time to `BinaryHeap<RepairReady>::pop` and 21% to `repair_ready`. Transfers sharing
+endpoint roles became stale together, but were individually removed/refreshed.
+
+The repair queue now groups transfers by sender, reserved paired sender and
+receiver set. One global entry represents each group's shared availability and
+pressure. A static ordered ready set selects within a group; an address index
+finds transfers that can continue the current receive streams. Dependency
+readiness is still tracked per transfer, including overlapping-memory hazards.
+Newly ready transfers invalidate their group's cached entry with a revision.
+The selected order is still evaluated by the existing physical scheduler; only
+an improved complete schedule replaces the incumbent.
+
+With 16 Rayon threads, the same full MLP workload measured:
+
+| Compiler phase | Before | Grouped repair |
+|---|---:|---:|
+| Expanded finalist selection/scheduling | 351.658 s | 225.854 s |
+| Relocated exchange lowering | 115.229 s | 88.121 s |
+| Exchange placement search | 103.411 s | 102.675 s |
+| These three phases combined | 570.298 s | 416.650 s |
+
+Selection is 36% faster; the combined exchange-related phases are 27% faster.
+These are individual build observations, not repeated timing trials. The new
+build also enables per-iteration profiling, which affects final code addresses.
+The initial selected schedule is unchanged: 1,151,718 modeled total cycles,
+358,023 exchange cycles. Full numerical validation passes. Logs are under
+`artifacts/joint-placement/mlp-b2-n3` (before) and
+`artifacts/grouped-repair/mlp-b2-n3` (after).
+
+The manual `repair_queue_scaling` test covers 4,096 / 16,384 / 65,536 independent
+transfers sharing endpoints: 7.9 / 33.4 / 171.7 ms. A randomized test checks grouped
+selection against exhaustive ready-set priorities, including paired senders,
+multicast and receive-address continuity. Existing randomized scheduling tests
+check hazards and unique transfer emission.
+
+The next observed hotspots are the main `ReadyTransfer` queue, earliest feasible
+transfer search and row encoding. Updating the main heap root in place was also
+tried, but a million-refresh benchmark was effectively flat (161 ms pop/push,
+164 ms in-place), so that follow-up was discarded. It is not part of these gains.
