@@ -4,6 +4,24 @@
 use super::*;
 use crate::TileKernelSpec;
 
+pub(crate) fn cast_cycles(from: Precision, to: Precision, elements: u64) -> u64 {
+    match (from, to) {
+        (Precision::F16, Precision::F8F143 { .. }) => {
+            // Six workers convert eight values each: 72 issue cycles per
+            // worker round, including loads and stores. Checked against the
+            // 9,216- and 17,664-element hardware runs.
+            330 + elements.div_ceil(48).saturating_mul(72)
+        }
+        (Precision::F32, Precision::F16) => 330 + elements.div_ceil(12).saturating_mul(48),
+        _ => {
+            IPU21_TARGET_COSTS.kernel_launch_cycles
+                + elements
+                    .saturating_mul(from.bytes() + to.bytes())
+                    .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
+        }
+    }
+}
+
 pub(crate) fn kernel_cycles(
     kernel: &TileKernelSpec,
     inputs: &[TensorType],
@@ -40,7 +58,14 @@ pub(crate) fn kernel_cycles(
                 .filter(|(axis, _)| *axis != column_axis)
                 .fold(1u64, |n, (_, &width)| n.saturating_mul(u64::from(width)));
             let columns = u64::from(*output_columns);
-            let inner = u64::from(*inner_block);
+            // Native FP8 uses the same instruction sequence for 32 K
+            // elements that the F16 kernel uses for 16.
+            let inner =
+                u64::from(*inner_block).div_ceil(if matches!(multiply, Precision::F8F143 { .. }) {
+                    2
+                } else {
+                    1
+                });
             let interleaved = inputs.get(1).is_some_and(|input| {
                 input.format.layout.memory_class == MemoryClass::Ipu21Interleaved
             });
@@ -54,20 +79,13 @@ pub(crate) fn kernel_cycles(
                     interleaved,
                 );
             }
-            if *multiply == Precision::F16 && interleaved {
+            if *multiply != Precision::F32 && interleaved {
                 return crate::kernel::cost::interleaved_f16_gemm_cycles(rows, inner, columns);
             }
             let (row_cycles, group_cycles) = match multiply {
                 Precision::F16 => (rows, 1063),
                 Precision::F32 => (rows.saturating_mul(4), 2126),
-                Precision::F8F143 { .. } => {
-                    return rows
-                        .saturating_mul(columns)
-                        .saturating_mul(inner)
-                        .saturating_mul(2)
-                        .div_ceil(256)
-                        .saturating_add(target.kernel_launch_cycles);
-                }
+                Precision::F8F143 { .. } => (rows, 1063),
             };
             return 294u64.saturating_add(
                 inner.div_ceil(16).saturating_mul(
@@ -103,15 +121,7 @@ pub(crate) fn kernel_cycles(
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }
-        TileKernelSpec::Cast {
-            from: Precision::F32,
-            to: Precision::F16,
-        } => {
-            // Six workers convert one pair per iteration, including loop and
-            // address updates. Include wrapper startup and the scalar tail.
-            return 330 + elements.div_ceil(12).saturating_mul(48);
-        }
-        TileKernelSpec::Cast { .. } => elements.div_ceil(8),
+        TileKernelSpec::Cast { from, to } => return cast_cycles(*from, *to, elements),
         TileKernelSpec::Rearrange { from, .. } => {
             if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)
                 && output.format.precision == Precision::F16

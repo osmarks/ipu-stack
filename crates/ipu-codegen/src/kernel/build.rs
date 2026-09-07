@@ -32,6 +32,7 @@ impl KernelBuildPlan {
             rows,
             gelu,
             cast_f32_f16,
+            fp8_casts,
             reduction_add,
             rearrangements,
             unpacks,
@@ -72,7 +73,36 @@ impl KernelBuildPlan {
                 &[3, 2, 4],
             );
         }
-        let has_worker_codelets = cast_f32_f16 || !rearrangements.is_empty() || !unpacks.is_empty();
+        let has_worker_codelets = cast_f32_f16
+            || !fp8_casts.is_empty()
+            || !rearrangements.is_empty()
+            || !unpacks.is_empty();
+        for (from, to) in fp8_casts {
+            let name = |bytes| match bytes {
+                1 => "f8",
+                2 => "f16",
+                _ => "f32",
+            };
+            let symbol = format!("cast_{}_{}", name(from), name(to));
+            let vertex = format!("Cast{from}To{to}");
+            plan.compilations.push(KernelCompilation {
+                source: "cast_f8.cpp",
+                name: format!("{symbol}_codelet"),
+                flags: vec![
+                    "-O2".into(),
+                    format!("-DINPUT_BYTES={from}"),
+                    format!("-DOUTPUT_BYTES={to}"),
+                    format!("-DCAST_VERTEX={vertex}"),
+                ],
+                retained_symbols: Vec::new(),
+            });
+            plan.add_worker_wrapper(
+                format!("{symbol}_wrapper"),
+                &symbol,
+                &vertex,
+                &[3, 2, 4, 5, 6],
+            );
+        }
         for shape in unpacks {
             plan.add_unpack(shape);
         }

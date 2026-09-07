@@ -8,9 +8,10 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OperatorCandidate {
     Concrete(ConcreteOperatorCandidate),
-    /// F16 GEMMs with independently distributed K partials and a reduction.
+    /// GEMMs with independently distributed K partials and a reduction.
     ParallelGemm {
         tile_count: u16,
+        multiply: Precision,
         options: GemmOptions,
         accumulate: AccumulationPrecision,
     },
@@ -35,8 +36,18 @@ impl OperatorCandidate {
     pub fn parallel_gemm(tile_count: u16) -> Self {
         Self::ParallelGemm {
             tile_count,
+            multiply: Precision::F16,
             options: GemmOptions::default(),
             accumulate: gemm_accumulation_precision(Precision::F16),
+        }
+    }
+
+    pub fn fp8_gemm(tile_count: u16, scale_exponent: i8) -> Self {
+        Self::ParallelGemm {
+            tile_count,
+            multiply: Precision::F8F143 { scale_exponent },
+            options: GemmOptions::default(),
+            accumulate: AccumulationPrecision::F16,
         }
     }
 
@@ -52,11 +63,12 @@ impl OperatorCandidate {
             Self::Concrete(candidate) => candidate.plan.operator,
             Self::ParallelGemm {
                 options,
+                multiply,
                 accumulate,
                 ..
             } => MidOperator::Gemm {
                 options: *options,
-                multiply: Precision::F16,
+                multiply: *multiply,
                 accumulate: *accumulate,
             },
         }
@@ -389,7 +401,17 @@ pub(super) fn gemm_plan(
         dispatch,
         requirements: StorageRequirements {
             inputs,
-            output: operand(output),
+            output: OperandRequirement::new(
+                TensorFormat {
+                    precision: if matches!(precision, Precision::F8F143 { .. }) {
+                        Precision::F16
+                    } else {
+                        precision
+                    },
+                    layout: output,
+                },
+                32,
+            ),
             output_aliasing: OutputAliasing::Fresh,
             distinct_elements: vec![vec![
                 MemoryOperand::Output,

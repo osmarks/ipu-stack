@@ -62,6 +62,8 @@ impl KernelRequirements {
 pub enum KernelAbiError {
     #[error("kernel requirements do not match the tile-kernel family")]
     RequirementMismatch,
+    #[error("FP8 hardware scale {0} is outside -32..=31")]
+    Fp8Scale(i32),
     #[error("kernel run has {actual} pointer operands, ABI requires {expected}")]
     PointerArity { expected: usize, actual: usize },
     #[error("kernel operand {0} is fragmented into multiple views")]

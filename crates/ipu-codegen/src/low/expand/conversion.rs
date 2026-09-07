@@ -153,7 +153,16 @@ impl TileGraphBuilder {
         let [result] = operation.results.as_slice() else {
             return Err(ExpansionError::ResultArity);
         };
-        let inputs = self.value_shards(*input)?.to_vec();
+        // Reuse the same source unpacking as mapped copies. A transposed
+        // panel cannot be redistributed in logical order as halfword sends.
+        let inputs = if plan.strategy == ConversionStrategy::StageLogicalThenTransform
+            && plan.output.format.layout.order == ElementOrder::RowMajor
+        {
+            self.unpack_amp_to_row_major(*input, operation_provenance(operation), tiles)?
+                .unwrap_or(self.value_shards(*input)?.to_vec())
+        } else {
+            self.value_shards(*input)?.to_vec()
+        };
         let outputs = self.value_shards(*result)?.to_vec();
         let copy_order = match plan.strategy {
             ConversionStrategy::DirectRetile => CopyOrder::Physical,

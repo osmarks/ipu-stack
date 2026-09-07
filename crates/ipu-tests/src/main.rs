@@ -160,6 +160,9 @@ struct Arguments {
     /// Use one concatenated QKV projection in the projected-attention workload.
     #[arg(long)]
     fuse_qkv: bool,
+    /// Native F143 GEMMs with a shared operand scale (value = F143 * 2^scale).
+    #[arg(long, allow_hyphen_values = true)]
+    fp8_scale: Option<i8>,
     #[arg(long, default_value_t = SIGLIP_ATTENTION_HEADS)]
     attention_heads: u32,
     /// Defaults to SigLIP's 4304-wide intermediate for the canonical 1152D
@@ -938,6 +941,30 @@ fn main() -> Result<()> {
         pipeline = pipeline
             .with_automatic_input(left, Precision::F16)
             .with_automatic_input(right, Precision::F16);
+    }
+    if let Some(scale) = arguments.fp8_scale {
+        if !(-16..=15).contains(&scale) {
+            bail!("FP8 operand scale must be in -16..=15 so the product scale fits the ISA");
+        }
+        pipeline
+            .operator_candidates
+            .retain(|candidate| !matches!(candidate.operator(), MidOperator::Gemm { .. }));
+        pipeline
+            .operator_candidates
+            .push(ipu_codegen::OperatorCandidate::fp8_gemm(
+                active_tiles,
+                scale,
+            ));
+        for input in graph.inputs() {
+            if input.kind == ipu_codegen::GraphInputKind::Parameter {
+                pipeline = pipeline.with_automatic_input(
+                    input.value,
+                    Precision::F8F143 {
+                        scale_exponent: scale,
+                    },
+                );
+            }
+        }
     }
     let package_config = PackageConfig {
         tile_mapping: arguments

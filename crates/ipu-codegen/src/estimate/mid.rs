@@ -301,10 +301,11 @@ fn operation_cost(
                 );
             }
             if input.format.precision != output.format.precision {
-                price.total = price
-                    .total
-                    .saturating_add(bytes.div_ceil(output.format.precision.bytes()).div_ceil(8))
-                    .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles);
+                price.total = price.exchange.saturating_add(super::primitive::cast_cycles(
+                    input.format.precision,
+                    output.format.precision,
+                    bytes.div_ceil(output.format.precision.bytes()),
+                ));
             }
         }
         MidOperationKind::Operator { .. } => return None,

@@ -254,14 +254,11 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
 
 impl CostModel for Ipu21CostModel {
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
-        let input_bytes = maximum_shard_bytes(input);
-        let output_bytes = input_bytes
-            .div_ceil(input.format.precision.bytes())
-            .saturating_mul(to.bytes());
-        input_bytes
-            .saturating_add(output_bytes)
-            .div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle)
-            .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
+        super::primitive::cast_cycles(
+            input.format.precision,
+            to,
+            maximum_shard_bytes(input).div_ceil(input.format.precision.bytes()),
+        )
     }
 
     fn rearrangement_cost(

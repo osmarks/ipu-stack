@@ -829,6 +829,14 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     grouped_output: Option<GroupedOutputLayout>,
     output_demands: &[OutputDemand],
 ) -> Vec<OperatorPlan> {
+    let MidOperator::Gemm { multiply, .. } = operator else {
+        return Vec::new();
+    };
+    let inner_micro = if matches!(multiply, Precision::F8F143 { .. }) {
+        32
+    } else {
+        16
+    };
     let [left, right] = inputs else {
         return Vec::new();
     };
@@ -849,7 +857,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     };
     // Each grid determines its own padded K/C extents and operand layouts.
     let column_groups = columns.div_ceil(AMP_COLUMN_MICRO);
-    let inner_groups = inner.div_ceil(AMP_COLUMN_MICRO);
+    let inner_groups = inner.div_ceil(inner_micro);
     let Ok(inner_groups) = u16::try_from(inner_groups) else {
         return Vec::new();
     };
@@ -946,13 +954,13 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                 let left_bytes = outer_rows
                     .saturating_mul(u64::from(local_rows))
                     .saturating_mul(u64::from(local_inner))
-                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(Precision::F16.bytes());
+                    .saturating_mul(u64::from(inner_micro))
+                    .saturating_mul(multiply.bytes());
                 let right_bytes = u64::from(local_columns)
                     .saturating_mul(u64::from(AMP_COLUMN_MICRO))
                     .saturating_mul(u64::from(local_inner))
-                    .saturating_mul(u64::from(AMP_COLUMN_MICRO))
-                    .saturating_mul(Precision::F16.bytes());
+                    .saturating_mul(u64::from(inner_micro))
+                    .saturating_mul(multiply.bytes());
                 let partial_bytes = outer_rows
                     .saturating_mul(u64::from(local_rows))
                     .saturating_mul(u64::from(local_columns))
@@ -1051,7 +1059,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             .saturating_mul(inner_partitions);
         let kernel_inner_block = u32::from(inner_groups)
             .div_ceil(u32::from(inner_partitions))
-            .saturating_mul(AMP_COLUMN_MICRO);
+            .saturating_mul(inner_micro);
         let kernel_output_columns = u32::from(physical_column_groups)
             .div_ceil(u32::from(column_partitions))
             .saturating_mul(AMP_COLUMN_MICRO);

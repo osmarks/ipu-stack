@@ -161,6 +161,7 @@ pub(super) struct KernelInventory {
     pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
     pub(super) gelu: bool,
     pub(super) cast_f32_f16: bool,
+    pub(super) fp8_casts: BTreeSet<(u64, u64)>,
     pub(super) reduction_add: bool,
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     pub(super) unpacks: BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
@@ -183,6 +184,12 @@ impl KernelInventory {
                         return Err(KernelAbiError::Unavailable(kernel.clone()));
                     }
                     if matches!(abi.symbols, KernelSymbols::Exact(_)) {
+                        if let TileKernelSpec::Cast { from, to } = kernel
+                            && (matches!(from, Precision::F8F143 { .. })
+                                || matches!(to, Precision::F8F143 { .. }))
+                        {
+                            self.fp8_casts.insert((from.bytes(), to.bytes()));
+                        }
                         self.cast_f32_f16 |= matches!(
                             kernel,
                             TileKernelSpec::Cast {

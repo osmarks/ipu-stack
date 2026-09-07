@@ -81,6 +81,24 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         {
             (logical, physical, 0.5, "one vector conversion / 2 elements")
         }
+        TileKernelSpec::Cast {
+            from: Precision::F16,
+            to: Precision::F8F143 { .. },
+        } => (
+            logical,
+            physical,
+            0.125,
+            "one vector conversion / 8 elements",
+        ),
+        TileKernelSpec::Cast {
+            from: Precision::F8F143 { .. },
+            to: Precision::F16,
+        } => (
+            logical,
+            physical,
+            0.25,
+            "one vector conversion / 4 elements",
+        ),
         TileKernelSpec::FillZero {
             padding_only: true, ..
         } => return Some((0.0, 0.0, "padding initialization: no useful tensor work")),

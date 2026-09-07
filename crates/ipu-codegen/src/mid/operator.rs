@@ -590,7 +590,7 @@ impl OperatorPlan {
                                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                             )
                             && (output.format.layout.order
-                                == ElementOrder::Amp(if *multiply == Precision::F16 {
+                                == ElementOrder::Amp(if *multiply != Precision::F32 {
                                     AmpOrder::Left
                                 } else {
                                     AmpOrder::Output
@@ -606,7 +606,7 @@ impl OperatorPlan {
                         ) && right.format.layout.order
                             == ElementOrder::Amp(AmpOrder::TransposedLeft)
                             && (output.format.layout.order
-                                == ElementOrder::Amp(if *multiply == Precision::F16 {
+                                == ElementOrder::Amp(if *multiply != Precision::F32 {
                                     AmpOrder::TransposedLeft
                                 } else {
                                     AmpOrder::TransposedOutput

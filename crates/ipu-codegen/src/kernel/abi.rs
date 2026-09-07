@@ -8,6 +8,14 @@ pub const FIRST_INPUT_REGISTER: u8 = 3;
 
 pub const RETURN_REGISTER: u8 = 10;
 
+fn fp8_scale_argument(scale: i32) -> Result<u32, KernelAbiError> {
+    if (-32..=31).contains(&scale) {
+        Ok(u32::from_ne_bytes(scale.to_ne_bytes()))
+    } else {
+        Err(KernelAbiError::Fp8Scale(scale))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KernelSymbols {
     Exact(&'static str),
@@ -28,6 +36,8 @@ pub enum ScalarValue {
     SplitSoftmaxRows,
     NumPartials,
     ScaleExponent,
+    CastSourceScale,
+    CastDestinationScale,
     InitialBlock,
     FinalBlock,
     WordsPerWorker,
@@ -81,7 +91,22 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 TileKernelSpec::Gemm {
                     multiply: Precision::F8F143 { scale_exponent },
                     ..
-                } => Ok(u32::from_ne_bytes(i32::from(*scale_exponent).to_ne_bytes())),
+                } => fp8_scale_argument(2 * i32::from(*scale_exponent)),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            ScalarValue::CastSourceScale | ScalarValue::CastDestinationScale => match run.kernel {
+                TileKernelSpec::Cast { from, to } => {
+                    let precision = if *argument == ScalarValue::CastSourceScale {
+                        from
+                    } else {
+                        to
+                    };
+                    let scale = match precision {
+                        Precision::F8F143 { scale_exponent } => i32::from(scale_exponent),
+                        _ => 0,
+                    };
+                    fp8_scale_argument(scale)
+                }
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::InitialBlock => match &run.kernel {
@@ -150,24 +175,34 @@ pub fn tile_kernel_abi(
             ),
             TileKernelSpec::Gemm {
                 multiply,
-                mode,
+                accumulate,
                 weights,
                 ..
             } => {
                 if requirements.inputs.len() != 2 {
                     return Err(KernelAbiError::RequirementMismatch);
                 }
-                if *weights == GemmWeightLoad::Interleaved && *multiply != Precision::F16 {
+                if *weights == GemmWeightLoad::Interleaved && *multiply == Precision::F32 {
                     return Err(KernelAbiError::RequirementMismatch);
                 }
-                let symbols = gemm_symbols(*multiply, *mode);
+                if matches!(multiply, Precision::F8F143 { .. })
+                    && (*accumulate != crate::AccumulationPrecision::F16
+                        || precision != Precision::F16)
+                {
+                    return Err(KernelAbiError::RequirementMismatch);
+                }
                 let scalars: &'static [ScalarValue] =
                     if matches!(multiply, Precision::F8F143 { .. }) {
                         &[ScalarValue::ScaleExponent]
                     } else {
                         &[]
                     };
-                (symbols.0, symbols.1, 2, scalars)
+                (
+                    KernelSymbols::Specialized,
+                    KernelAvailability::Implemented,
+                    2,
+                    scalars,
+                )
             }
             TileKernelSpec::Gelu => {
                 let symbol = gelu_symbol(requirements).unwrap_or("unsupported_gelu");
@@ -240,13 +275,26 @@ pub fn tile_kernel_abi(
             ),
             TileKernelSpec::Cast { from, to } => (
                 KernelSymbols::Exact(cast_symbol(*from, *to)),
-                if (*from, *to) == (Precision::F32, Precision::F16) {
+                if (*from, *to) == (Precision::F32, Precision::F16)
+                    || matches!(from, Precision::F8F143 { .. })
+                    || matches!(to, Precision::F8F143 { .. })
+                {
                     KernelAvailability::Implemented
                 } else {
                     KernelAvailability::Required
                 },
                 1,
-                &[ScalarValue::ElementCount],
+                if matches!(from, Precision::F8F143 { .. })
+                    || matches!(to, Precision::F8F143 { .. })
+                {
+                    &[
+                        ScalarValue::ElementCount,
+                        ScalarValue::CastSourceScale,
+                        ScalarValue::CastDestinationScale,
+                    ]
+                } else {
+                    &[ScalarValue::ElementCount]
+                },
             ),
             TileKernelSpec::Rearrange { from, to }
                 if precision == Precision::F16
@@ -370,23 +418,6 @@ pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static 
     (input_layout == output_layout).then_some("gelu_tanh_approx_f16")
 }
 
-pub(super) fn gemm_symbols(
-    precision: Precision,
-    mode: GemmKernelMode,
-) -> (KernelSymbols, KernelAvailability) {
-    if matches!(precision, Precision::F8F143 { .. }) {
-        (
-            KernelSymbols::Exact(match mode {
-                GemmKernelMode::Initialize => "gemm_f8_init",
-                GemmKernelMode::Accumulate => "gemm_f8_accumulate",
-            }),
-            KernelAvailability::Required,
-        )
-    } else {
-        (KernelSymbols::Specialized, KernelAvailability::Implemented)
-    }
-}
-
 pub(super) fn exact_symbol(
     precision: Precision,
     f16_symbol: &'static str,
@@ -407,6 +438,7 @@ pub(super) fn cast_symbol(from: Precision, to: Precision) -> &'static str {
         (Precision::F8F143 { .. }, Precision::F32) => "cast_f8_f32",
         (Precision::F16, Precision::F8F143 { .. }) => "cast_f16_f8",
         (Precision::F32, Precision::F8F143 { .. }) => "cast_f32_f8",
+        (Precision::F8F143 { .. }, Precision::F8F143 { .. }) => "cast_f8_f8",
         _ => "cast_identity",
     }
 }

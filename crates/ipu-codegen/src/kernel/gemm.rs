@@ -37,7 +37,7 @@ impl KernelBuildPlan {
         let (source, prefix) = match precision {
             Precision::F16 => ("gemm_f16_amp.S", "f16"),
             Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
-            Precision::F8F143 { .. } => return,
+            Precision::F8F143 { .. } => ("gemm_f16_amp.S", "f8"),
         };
         let weight_suffix = if weights == GemmWeightLoad::Interleaved {
             "_interleaved"
@@ -117,6 +117,9 @@ impl KernelBuildPlan {
                 format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
                 format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
             ];
+            if matches!(precision, Precision::F8F143 { .. }) {
+                flags.push("-DGEMM_NATIVE_FP8=1".into());
+            }
             if single_rows {
                 flags.push("-DGEMM_SINGLE_ROWS=1".into());
             }

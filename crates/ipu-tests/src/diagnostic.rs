@@ -317,7 +317,9 @@ fn decode_word(word: u32, byte: u32, precision: Precision) -> Result<f32> {
         Precision::F16 => super::half_to_f32(((word >> (byte * 8)) & 0xffff) as u16),
         Precision::F32 if byte == 0 => f32::from_bits(word),
         Precision::F32 => bail!("unaligned F32 diagnostic value"),
-        Precision::F8F143 { .. } => bail!("F8 diagnostic decoding is not implemented"),
+        Precision::F8F143 { scale_exponent } => {
+            ipu_codegen::f143::f143_to_f32((word >> (byte * 8)) as u8, scale_exponent)
+        }
     })
 }
 
@@ -417,7 +419,9 @@ fn encode_value(bytes: &mut [u8], offset: usize, value: f32, precision: Precisio
             bytes[offset..offset + 2].copy_from_slice(&super::f32_to_half(value).to_le_bytes())
         }
         Precision::F32 => bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes()),
-        Precision::F8F143 { .. } => bail!("F8 diagnostic encoding is not implemented"),
+        Precision::F8F143 { scale_exponent } => {
+            bytes[offset] = ipu_codegen::f143::f143_from_f32(value, scale_exponent)
+        }
     }
     Ok(())
 }
@@ -884,7 +888,10 @@ fn quantize(value: f32, precision: Precision) -> f32 {
     match precision {
         Precision::F16 => super::half_to_f32(super::f32_to_half(value)),
         Precision::F32 => value,
-        Precision::F8F143 { .. } => value,
+        Precision::F8F143 { scale_exponent } => ipu_codegen::f143::f143_to_f32(
+            ipu_codegen::f143::f143_from_f32(value, scale_exponent),
+            scale_exponent,
+        ),
     }
 }
 

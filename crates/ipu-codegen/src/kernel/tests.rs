@@ -6,6 +6,73 @@ use crate::{
 };
 
 #[test]
+fn fp8_gemms_repack_casts_and_keep_half_outputs() {
+    let fp8 = Precision::F8F143 { scale_exponent: -4 };
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [129, 128]).unwrap();
+    let weights = graph.parameter("weights", [128, 64]).unwrap();
+    let output = graph.gemm(input, weights).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let mut config = PipelineConfig::new(64)
+        .with_input(
+            input,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::amp_left(64, 64),
+            },
+        )
+        .with_automatic_input(weights, fp8);
+    config.operator_candidates = vec![crate::OperatorCandidate::fp8_gemm(64, -4)];
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+    let plan = KernelBuildPlan::from_program(&low).unwrap();
+    assert!(plan.compilations.iter().any(|compilation| {
+        compilation
+            .flags
+            .iter()
+            .any(|flag| flag == "-DGEMM_NATIVE_FP8=1")
+    }));
+    let mut casts = 0;
+    let mut gemms = 0;
+    for tile in &low.tiles {
+        for work in low.work(tile) {
+            let TileWorkRef::Kernel(run) = work else {
+                continue;
+            };
+            match run.kernel {
+                TileKernelSpec::Cast { to, .. } if to == fp8 => {
+                    casts += 1;
+                    assert_eq!(
+                        run.requirements.inputs[0].format.layout.order,
+                        ElementOrder::RowMajor
+                    );
+                    assert_eq!(
+                        run.requirements.output.format.layout.order,
+                        ElementOrder::RowMajor
+                    );
+                }
+                TileKernelSpec::Gemm {
+                    multiply,
+                    accumulate,
+                    ..
+                } => {
+                    gemms += 1;
+                    assert_eq!(multiply, fp8);
+                    assert_eq!(accumulate, AccumulationPrecision::F16);
+                    assert_eq!(run.requirements.output.format.precision, Precision::F16);
+                    assert_eq!(
+                        scalar_values(run, &validate_kernel_run(run).unwrap()).unwrap(),
+                        vec![(-8i32) as u32]
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(casts > 0 && gemms > 0);
+}
+
+#[test]
 fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
     let mut random = fastrand::Rng::with_seed(0x726f_7773_6f72_6465);
     for case in 0..256 {

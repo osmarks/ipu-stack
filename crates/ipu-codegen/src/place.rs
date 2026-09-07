@@ -1182,10 +1182,20 @@ mod tests {
                 precision: Precision::F16,
                 layout: Layout::row_sharded(tiles),
             };
-            let config = PipelineConfig::new(tiles)
+            let mut config = PipelineConfig::new(tiles)
                 .with_input(left, format.clone())
                 .with_input(right, format);
+            // This is an in-place allocation fixture, independent of whether
+            // the cost model prefers another precision or inserts conversions.
+            config.operator_candidates.retain(|candidate| {
+                candidate.concrete().is_some_and(|candidate| {
+                    let format = &candidate.plan.requirements.output.format;
+                    format.precision == Precision::F16
+                        && format.layout.order == crate::ElementOrder::RowMajor
+                })
+            });
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            assert_eq!(mid.operations.len(), 2);
             let sum = mid.operations[0].results[0];
             let output = mid.operations[1].results[0];
             let low = lower_to_tiles(

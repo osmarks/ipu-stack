@@ -1614,16 +1614,38 @@ pub(super) fn ensure_format(
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
 ) -> MidValueId {
-    if state.retarget_automatic_input(value, target.layout.clone())
+    let from = state.get(value).tensor_type.format.precision;
+    let fp8_cast = from != target.precision
+        && (matches!(from, Precision::F8F143 { .. })
+            || matches!(target.precision, Precision::F8F143 { .. }));
+    // AMP panel width changes with element precision. A flat cast of packed
+    // storage would silently reinterpret 16-element panels as 32-element ones.
+    // Keep both rearrangements explicit in mid until a fused cast supports them.
+    let mut initial_layout = target.layout.clone();
+    if fp8_cast {
+        initial_layout.order = ElementOrder::RowMajor;
+    }
+    if state.retarget_automatic_input(value, initial_layout.clone())
         && state.get(value).tensor_type.format.precision == target.precision
     {
         return value;
     }
-    let cast_format = TensorFormat {
-        precision: target.precision,
-        layout: state.get(value).tensor_type.format.layout.clone(),
-    };
-    for format in [cast_format, target] {
+    let mut cast_layout = state.get(value).tensor_type.format.layout.clone();
+    if fp8_cast {
+        cast_layout = initial_layout;
+    }
+    let formats = [
+        TensorFormat {
+            precision: from,
+            layout: cast_layout.clone(),
+        },
+        TensorFormat {
+            precision: target.precision,
+            layout: cast_layout,
+        },
+        target,
+    ];
+    for format in formats {
         let input = state.get(value).tensor_type.clone();
         if input.format == format {
             continue;
