@@ -4,6 +4,49 @@ use super::*;
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn single_row_add_can_keep_column_ownership() {
+    let tiles = 16;
+    let layout = Layout::row_major(TensorTiling {
+        tile_count: tiles,
+        replicas: 1,
+        axes: vec![AxisTiling::new(
+            TensorAxis::FromEnd(1),
+            tiles,
+            4,
+            Padding::Reject,
+        )],
+    });
+    for broadcast in [false, true] {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [1, 128]).unwrap();
+        let y = graph
+            .host_input("y", if broadcast { vec![128] } else { vec![1, 128] })
+            .unwrap();
+        let out = graph.add(x, y).unwrap();
+        graph.set_outputs([out]).unwrap();
+        let format = TensorFormat {
+            precision: Precision::F16,
+            layout: layout.clone(),
+        };
+        let config = PipelineConfig::new(tiles)
+            .with_input(x, format.clone())
+            .with_input(y, format);
+        let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let output = &mid.values[mid.outputs[0].index() as usize].tensor_type;
+        assert_eq!(output.format.layout, layout);
+        assert_eq!(
+            output
+                .format
+                .layout
+                .shard_extents(&output.shape)
+                .unwrap()
+                .len(),
+            usize::from(tiles)
+        );
+    }
+}
+
+#[test]
 fn fp8_mlp_retains_quantization_before_replication() {
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [1, 729, 1152]).unwrap();

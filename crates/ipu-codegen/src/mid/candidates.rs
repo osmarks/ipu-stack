@@ -523,6 +523,20 @@ pub(super) fn plans(
                     }
                     requirement.format.layout = actual.format.layout.clone();
                     candidate.requirements.output.format.layout = actual.format.layout.clone();
+                    if candidate.operator == MidOperator::Add {
+                        // Packed elementwise addition is layout transparent only
+                        // for equal shapes. Suffix broadcasts require row-major
+                        // traversal; their parameters are sliced during expansion.
+                        if actual.shape != *output
+                            || (actual.format.layout.order != ElementOrder::RowMajor
+                                && inputs.iter().any(|input| input.shape != *output))
+                        {
+                            continue;
+                        }
+                        for requirement in &mut candidate.requirements.inputs {
+                            requirement.format.layout = actual.format.layout.clone();
+                        }
+                    }
                 }
                 vec![candidate]
             }

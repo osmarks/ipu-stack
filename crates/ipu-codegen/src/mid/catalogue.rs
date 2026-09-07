@@ -302,6 +302,38 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             ));
         }
     }
+    let columns_f16 = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_major(TensorTiling {
+            tile_count,
+            replicas: 1,
+            axes: vec![AxisTiling::new(
+                TensorAxis::FromEnd(1),
+                tile_count,
+                4,
+                Padding::Reject,
+            )],
+        }),
+    };
+    for input in [0, 1] {
+        candidates.push(
+            pointwise_operator_candidate(
+                MidOperator::Add,
+                [rows_f16.clone(), rows_f16.clone()],
+                rows_f16.clone(),
+            )
+            .with_preserved_input_layout(input)
+            .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
+        );
+    }
+    candidates.push(
+        pointwise_operator_candidate(
+            MidOperator::Add,
+            [columns_f16.clone(), columns_f16.clone()],
+            columns_f16,
+        )
+        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
+    );
     candidates.extend([
         pointwise_operator_candidate(
             MidOperator::LayerNorm,
