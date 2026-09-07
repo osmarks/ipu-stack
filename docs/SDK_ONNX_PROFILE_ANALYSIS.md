@@ -204,3 +204,41 @@ SDK chooses redistribution and pays heavily for it. Our row ownership avoids
 that intermediate redistribution but sacrifices GEMM coefficient reuse. A new
 candidate should cost the entire preparation/QK/softmax/PV sequence rather than
 assuming that the fastest isolated QK necessarily wins overall.
+
+## FP8 cast comparison after packed-cast optimization
+
+In the full-FP8 recording, the first shared body's casts have the following
+maximum tile durations. Output sizes come from `vars_info` joined to
+`vars_string_table`, selecting each cast's `cast#` allocations (excluding
+exchange-message allocations). FP8 uses one byte per value.
+
+| Cast | Step | Active tiles | Maximum output bytes/tile | Cast cycles |
+| --- | ---: | ---: | ---: | ---: |
+| QKV activation | 95 | 1440 | 592 | 548 |
+| Q, K, V, each | 121, 127, 116 | 491–492 | 1712 | 824 |
+| Probabilities before PV | 155 | 1458 | 5832 | 3343 |
+| MLP up activation | 240 | 1440 | 592 | 548 |
+| MLP down activation | 273 | 1464 | 2144 | 932 |
+
+The 1D cases use `popops::Cast1D<half,quarter>`; probabilities use
+`Cast2D<half,quarter>`. The profile labels these vertices C++, which does not
+identify their generated instruction sequence. These durations exclude exchange,
+rearrangement, and sync and must not be interpreted as complete conversion cost.
+
+The SDK QKV input cast writes exactly 839,808 bytes across all tiles: one copy
+of the logical 729x1152 activation. Our packed QKV cast writes 13,565,952 bytes
+(9,216 per tile) and takes 4,914 cycles. Its much greater total work comes from
+casting the replicated GEMM operand. SDK casts before replication/exchange.
+Likewise SDK's MLP-up cast writes one logical copy, whereas our external input
+has already been replicated into the selected consumer ownership. Quantization
+before fan-out is therefore a useful candidate even with the improved kernel;
+for externally populated inputs it would add a device exchange that our current
+host-populated layout avoids. For intermediate tensors it can also reduce
+exchange payload width. This comparison does not establish which complete plan
+wins without modelling the changed exchange and packing.
+
+The SDK's layout handling is not uniformly cheaper: the probability cast has
+1,772-cycle pre-arrangement and 52,333- and 547-cycle post-arrangement compute
+sets. MLP-down cast is followed by an 887-cycle exchange and a 3,123-cycle local
+copy set before its GEMM input exchange. These are separate maximum-tile
+measurements, not additive barrier-adjusted spans.
