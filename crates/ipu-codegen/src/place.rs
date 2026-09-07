@@ -188,8 +188,8 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
     for tile in &program.tiles {
         collect_requirements(program, tile, &mut requirements);
     }
-    // Loopback reads and receives simultaneously. Same-class endpoints must
-    // occupy separate elements, just like simultaneous kernel operands.
+    // Loopback reads and receives simultaneously. Both access classes share
+    // physical memory, so all local endpoints must occupy separate elements.
     for transfer in program
         .exchange_phases
         .iter()
@@ -198,10 +198,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         let source = &program.shards[transfer.source.shard.index() as usize];
         for destination in &transfer.destinations {
             let destination = &program.shards[destination.shard.index() as usize];
-            if source.tile == destination.tile
-                && source.tensor_type.format.layout.memory_class
-                    == destination.tensor_type.format.layout.memory_class
-            {
+            if source.tile == destination.tile {
                 requirements[source.id.index() as usize].distinct_element = true;
                 requirements[destination.id.index() as usize].distinct_element = true;
             }

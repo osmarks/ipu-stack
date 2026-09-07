@@ -83,7 +83,15 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             graph.kernel_runs = builder.kernel_runs;
             graph.body = region;
             let low = crate::low::lower_to_tiles(&Arc::new(graph), false);
-            let placement = crate::place(&low).unwrap();
+            // Force standard storage into the shared upper region as well.
+            let placement = crate::place::place_with_standard_ranges(
+                &low,
+                &[(
+                    crate::memory::IPU21_DATA_BASE,
+                    crate::memory::IPU21_DATA_BASE + 4,
+                )],
+            )
+            .unwrap();
             for transfer in low.exchange_phases.iter().flat_map(|p| &p.transfers) {
                 let source = placement.shard_addresses[&transfer.source.shard];
                 let source_elements = crate::exchange::effective_memory_elements(source, 128);

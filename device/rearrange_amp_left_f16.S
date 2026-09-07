@@ -61,6 +61,12 @@ REARRANGE_CALL_SYMBOL:
 	ld32 $m1, $mvertex_base, $m15, 1
 	get $m6, $WSR
 	and $m6, $m6, CSR_W_WSR__CTXTID_M1__MASK
+#if REARRANGE_PHYSICAL_ROWS < 6
+	// Inactive workers must not zero nonexistent rows past the allocation.
+	setzi $m2, REARRANGE_PHYSICAL_ROWS
+	cmpult $m2, $m6, $m2
+	brz $m2, .Lrearrange_amp_left_f16_exit
+#endif
 .Lrearrange_amp_left_f16_row:
 	// Source rows are contiguous; destination rows advance through 16-column
 	// panels with physicalRows * 32 bytes between panel starts.
