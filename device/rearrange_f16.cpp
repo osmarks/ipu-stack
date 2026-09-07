@@ -42,6 +42,7 @@ public:
   unsigned targetOrder;
   unsigned logicalColumns;
   unsigned physicalColumns;
+  unsigned matrices;
 
   bool compute(unsigned worker) {
     constexpr unsigned inner = REARRANGE_INNER_DIMENSION;
@@ -69,6 +70,7 @@ public:
 #endif
     const unsigned *sourceWords = reinterpret_cast<const unsigned *>(&source[0]);
     unsigned *destinationWords = reinterpret_cast<unsigned *>(&destination[0]);
+    for (unsigned matrix = 0; matrix < matrices; ++matrix) {
 #if REARRANGE_TARGET_ORDER < 2
       for (unsigned row = worker; row < physicalRowCount; row += 6) {
 #if REARRANGE_TARGET_ORDER == 1
@@ -100,22 +102,14 @@ public:
             low = sourceWords[sourceElement / 2] & 0xffff;
             high = sourceWords[sourceElement / 2] >> 16;
           }
-          unsigned physical;
-#if REARRANGE_TARGET_ORDER == 0
-            physical = (column / inner) * physicalRowCount * inner + row * inner +
-                       column % inner;
-#else
-            const unsigned panel =
-                (row / columnBlock) * (physicalColumnCount / inner) +
-                column / inner;
-            physical = panel * inner * columnBlock + loadChannel * inner +
-                       column % inner;
-#endif
+          // AMP-left panels contain the rows of every batch matrix.
+          const unsigned physical =
+              (column / inner) * physicalRowCount * inner * matrices +
+              row * inner + column % inner;
           destinationWords[physical / 2] = low | (high << 16);
         }
 #endif
       }
-      return true;
 #else
     const unsigned rowPairs = (physicalRowCount + 1) / 2;
     for (unsigned rowPair = worker; rowPair < rowPairs; rowPair += 6) {
@@ -149,7 +143,14 @@ public:
             packedOdd;
       }
     }
-    return true;
 #endif
+      sourceWords += logicalRowCount * logicalColumnCount / 2;
+#if REARRANGE_TARGET_ORDER == 0
+      destinationWords += physicalRowCount * inner / 2;
+#else
+      destinationWords += physicalRowCount * physicalColumnCount / 2;
+#endif
+    }
+    return true;
   }
 };

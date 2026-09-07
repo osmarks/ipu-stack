@@ -15,11 +15,20 @@
 REARRANGE_CALL_SYMBOL:
 	.supervisor
 	add $m11, $m11, -16
+.Lrearrange_matrix:
 	st32 $m3, $m11, $m15, 0
 	st32 $m2, $m11, $m15, 1
 	setzi $m0, .Lrearrange_transposed_right_f16_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
+	mul $m0, $m4, $m7
+	shl $m0, $m0, 1
+	add $m3, $m3, $m0
+	mul $m0, $m5, $m8
+	shl $m0, $m0, 1
+	add $m2, $m2, $m0
+	sub $m9, $m9, 1
+	brnz $m9, .Lrearrange_matrix
 	add $m11, $m11, 16
 	br $m10
 	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL

@@ -82,7 +82,7 @@ impl KernelBuildPlan {
             format!("unpack_amp_f16_wrapper_{suffix}"),
             &call,
             &vertex,
-            &[3, 2, 4, 5, 6, 7, 8],
+            &[3, 2, 4, 5, 6, 7, 8, 9],
         );
         self.symbols.insert(
             KernelSpecialization::Unpack((
@@ -209,7 +209,7 @@ impl KernelBuildPlan {
             format!("rearrange_f16_wrapper_{suffix}"),
             &call,
             &vertex,
-            &[3, 2, 4, 5, 6, 7, 8],
+            &[3, 2, 4, 5, 6, 7, 8, 9],
         );
     }
 }

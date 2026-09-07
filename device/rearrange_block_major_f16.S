@@ -22,8 +22,9 @@ REARRANGE_CALL_SYMBOL:
 	.supervisor
 	// Kernel ABI: m2 destination, m3 source, m4 logical rows,
 	// m5 physical rows, m6 target order, m7 logical columns,
-	// m8 physical columns, m10 return address.
+	// m8 physical columns, m9 matrices, m10 return address.
 	add $m11, $m11, -16
+.Lrearrange_matrix:
 	st32 $m3, $m11, $m15, 0
 	st32 $m2, $m11, $m15, 1
 	st32 $m4, $m11, $m15, 2
@@ -31,6 +32,14 @@ REARRANGE_CALL_SYMBOL:
 	setzi $m0, .Lrearrange_block_major_f16_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
+	mul $m0, $m4, $m7
+	shl $m0, $m0, 1
+	add $m3, $m3, $m0
+	mul $m0, $m5, $m8
+	shl $m0, $m0, 1
+	add $m2, $m2, $m0
+	sub $m9, $m9, 1
+	brnz $m9, .Lrearrange_matrix
 	add $m11, $m11, 16
 	br $m10
 	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL

@@ -399,6 +399,7 @@ pub fn tile_kernel_abi(
                         ScalarValue::TargetOrder,
                         ScalarValue::LogicalColumns,
                         ScalarValue::PhysicalColumns,
+                        ScalarValue::Matrices,
                     ],
                 )
             }

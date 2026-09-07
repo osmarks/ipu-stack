@@ -29,7 +29,6 @@
 #define REARRANGE_TAIL_COLUMNS (REARRANGE_LOGICAL_COLUMNS % 16)
 #define REARRANGE_USED_PANELS ((REARRANGE_LOGICAL_COLUMNS + 15) / 16)
 #define REARRANGE_ZERO_PANELS ((REARRANGE_PHYSICAL_COLUMNS / 16) - REARRANGE_USED_PANELS)
-#define REARRANGE_PANEL_ROW_ADVANCE ((REARRANGE_PHYSICAL_ROWS - 1) * 32)
 
 	.text
 	.allow_optimizations
@@ -42,23 +41,36 @@
 REARRANGE_CALL_SYMBOL:
 	.supervisor
 	add $m11, $m11, -16
+	st32 $m9, $m11, $m15, 2
+.Lrearrange_matrix:
 	st32 $m3, $m11, $m15, 0
 	st32 $m2, $m11, $m15, 1
 	setzi $m0, .Lrearrange_amp_left_f16_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
+	mul $m0, $m4, $m7
+	shl $m0, $m0, 1
+	add $m3, $m3, $m0
+	shl $m0, $m5, 5
+	add $m2, $m2, $m0
+	sub $m9, $m9, 1
+	brnz $m9, .Lrearrange_matrix
 	add $m11, $m11, 16
 	br $m10
 	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL
 
 	// AMP-left storage consists of row-major 16-column panels. Assign rows to
 	// workers so every panel is written by all six contexts in bank-friendly
-	// order. Complete pairs of F16 values move as one 32-bit word.
+	// order. Aligned rows move four F16 values per load/store pair.
 	.worker
 	.p2align 3
 .Lrearrange_amp_left_f16_worker:
 	ld32 $m0, $mvertex_base, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 1
+	ld32 $m4, $mvertex_base, $m15, 2
+	setzi $m5, REARRANGE_PHYSICAL_ROWS * 32
+	mul $m4, $m4, $m5
+	sub $m4, $m4, 32
 	get $m6, $WSR
 	and $m6, $m6, CSR_W_WSR__CTXTID_M1__MASK
 #if REARRANGE_PHYSICAL_ROWS < 6
@@ -69,7 +81,7 @@ REARRANGE_CALL_SYMBOL:
 #endif
 .Lrearrange_amp_left_f16_row:
 	// Source rows are contiguous; destination rows advance through 16-column
-	// panels with physicalRows * 32 bytes between panel starts.
+	// panels with matrices * physicalRows * 32 bytes between panel starts.
 	setzi $m2, REARRANGE_LOGICAL_COLUMNS
 	mul $m9, $m6, $m2
 	shl $m9, $m9, 1
@@ -96,7 +108,7 @@ REARRANGE_CALL_SYMBOL:
 	st32step $a0, $mzero, $m10+=, 1
 	.endr
 #endif
-	add $m10, $m10, REARRANGE_PANEL_ROW_ADVANCE
+	add $m10, $m10, $m4
 	sub $m7, $m7, 1
 	brnz $m7, .Lrearrange_amp_left_f16_full_panel
 #endif
@@ -113,7 +125,7 @@ REARRANGE_CALL_SYMBOL:
 	st32 $a0, $m10, $m15, 0
 	add $m10, $m10, 4
 	.endr
-	add $m10, $m10, REARRANGE_PANEL_ROW_ADVANCE
+	add $m10, $m10, $m4
 #endif
 
 #if REARRANGE_ZERO_PANELS > 0
@@ -124,7 +136,7 @@ REARRANGE_CALL_SYMBOL:
 	st32 $a0, $m10, $m15, 0
 	add $m10, $m10, 4
 	.endr
-	add $m10, $m10, REARRANGE_PANEL_ROW_ADVANCE
+	add $m10, $m10, $m4
 	sub $m7, $m7, 1
 	brnz $m7, .Lrearrange_amp_left_f16_zero_tail_panel
 #endif
@@ -138,7 +150,7 @@ REARRANGE_CALL_SYMBOL:
 	st32 $a0, $m10, $m15, 0
 	add $m10, $m10, 4
 	.endr
-	add $m10, $m10, REARRANGE_PANEL_ROW_ADVANCE
+	add $m10, $m10, $m4
 	sub $m7, $m7, 1
 	brnz $m7, .Lrearrange_amp_left_f16_zero_row_panel
 
