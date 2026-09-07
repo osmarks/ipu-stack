@@ -138,6 +138,15 @@ The release tests pass (158 codegen tests, six benchmark/CLI tests and the
 graph doctest), as does Clippy with the repository's existing complexity
 allowances.
 
+A separate four-token diagnostic retains the full 1,152/4,304 channel widths
+and 16 heads. It passes FP8 hardware/reference validation (maximum absolute
+error 0.145020). Its 1,152-wide LN takes 15,558 cycles per row, versus 138,678
+in the original full-size profile. Its final Add uses 288 tiles and spans 456
+compute cycles (378 per tile), versus the original single tile's 26,850 cycles.
+The complete diagnostic is 224,718 cropped cycles; this is **not** the
+729-token model's runtime. Its profile and the diagnostic binary's exact shape
+override are under `artifacts/vit/full-width-four-token-diagnostic/`.
+
 Remaining structural limitations include standalone projection bias additions
 (which require row-major traversal), separate Q/K/V GEMMs in this benchmark, and
 large coefficient-layout packing operations with sparse ownership. The single-row
