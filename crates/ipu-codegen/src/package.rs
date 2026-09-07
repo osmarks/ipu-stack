@@ -1241,6 +1241,18 @@ fn reserve_linked_image(
             .ok_or_else(|| invalid("linked runtime segment range overflow"))?;
         memory.reserve(name, segment.address..end)?;
     }
+    // Instruction fetch conflicts with writes to the same memory element.
+    // Linked sections may leave small holes and a partial final element; none
+    // of those bytes can be handed to tensor or host-command storage.
+    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    for segment in &linked.segments {
+        let start = (segment.address / element * element).max(RUNTIME_EXECUTABLE_START);
+        let end = segment.address + u32::try_from(segment.size)?;
+        let end = end.div_ceil(element) * element;
+        for (start, end) in memory.free_ranges(start..end) {
+            memory.reserve("linked executable memory elements", start..end)?;
+        }
+    }
     Ok(())
 }
 
@@ -1249,8 +1261,47 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
 }
 
 #[cfg(test)]
-mod precision_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn linked_sections_protect_their_complete_memory_elements() {
+        let base = RUNTIME_EXECUTABLE_START;
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let linked = LinkedImage {
+            base,
+            entry: base,
+            bytes: vec![],
+            segments: vec![
+                ipu_elf::LinkedSegment {
+                    address: base,
+                    offset: 0,
+                    size: 128,
+                },
+                ipu_elf::LinkedSegment {
+                    address: base + 256,
+                    offset: 128,
+                    size: 128,
+                },
+                ipu_elf::LinkedSegment {
+                    address: base + element,
+                    offset: 256,
+                    size: 128,
+                },
+            ],
+            symbols: BTreeMap::new(),
+        };
+        let mut memory = TileMemoryMap::new();
+        reserve_linked_image(&mut memory, &linked, "test code").unwrap();
+        assert_eq!(
+            memory.free_ranges(base..base + 3 * element),
+            vec![(base + 2 * element, base + 3 * element)]
+        );
+        // Rounding executable sections does not consume permanent runtime state.
+        memory
+            .reserve("runtime state", RUNTIME_STATE_BASE..base)
+            .unwrap();
+    }
 
     #[test]
     fn attention_scratch_does_not_override_result_precision() {

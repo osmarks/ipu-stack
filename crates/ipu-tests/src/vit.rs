@@ -13,7 +13,8 @@ pub(crate) struct Options {
 
 pub(crate) fn build(options: &Options) -> Result<ComputeGraph> {
     let (image, patch, width, hidden, heads) = if options.vit_small {
-        (28, 14, 128, 256, 2)
+        // Retain So400m's 72-wide heads, including their packed-layout tails.
+        (28, 14, 144, 288, 2)
     } else {
         (378, 14, 1152, 4304, 16)
     };

@@ -2416,7 +2416,16 @@ fn device_failure_diagnostics(runtime: &Runtime, application: &Application) -> S
                             runtime
                                 .device()
                                 .read_tile_program_counter(physical, context)
-                                .map(|pc| (pc, application.symbolize_pc(u32::from(physical), pc))),
+                                .map(|pc| {
+                                    (
+                                        pc,
+                                        application.symbolize_pc(u32::from(physical), pc),
+                                        runtime
+                                            .device()
+                                            .read_tile_context_status(physical, context)
+                                            .map(ipu_driver::TileException::from_status),
+                                    )
+                                }),
                         )
                     })
                     .collect::<Vec<_>>()

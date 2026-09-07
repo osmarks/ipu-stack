@@ -65,16 +65,22 @@ RAYON_NUM_THREADS=24 target/release/ipu-trivial-test c600-init.ipucfg \
   --profile-output artifacts/vit/so400m-fp8/profile.ipuprof
 ```
 
-Omit `--fp8-scale` for F16 GEMMs. Unlike the older isolated benchmarks, this
+Omit `--fp8-scale` and the tolerance flags for F16 GEMMs. Unlike the older isolated benchmarks, this
 benchmark retains non-weight inputs in F16 when selecting FP8 GEMMs; the planner
 inserts activation casts where required. All final outputs are checked against
 the host reference automatically. `--vit-small --tiles 64` uses a 28×28 image,
-width 128, two heads and MLP width 256 while preserving the whole graph.
+width 144, two 72-wide heads and MLP width 288 while preserving the whole graph.
 `--vit-batch` sets the batch size (default one).
 
 The FP8 example explicitly loosens the comparison tolerance. Small upstream
 rounding differences can cross activation-quantization thresholds and accumulate
 through the 13 GEMMs; the host reference quantizes operands at each selected
 GEMM but does not reproduce the hardware's intermediate rounding exactly.
-The small complete graph has maximum absolute error 0.0049 with F16 GEMMs and
-0.1531 with FP8 GEMMs. This comparison does not establish pretrained accuracy.
+The small complete graph has maximum absolute error 0.00293 with F16 GEMMs and
+0.12988 with FP8 GEMMs. This comparison does not establish pretrained accuracy.
+
+The current full-size F16 search is rejected by memory accounting: its
+shortlisted plans reach 540,544 tensor bytes plus 49,152 support bytes per tile
+at the encoder down-projection, or exhaust SRAM later at MAP preparation.
+This is a planner/layout limitation, not a requirement for FP32 arithmetic.
+The reduced F16 model passes on hardware.
