@@ -169,3 +169,28 @@ errors. Randomized mixed transfers cover ordinary, paired, multicast, and loopba
 traffic; dedicated tests check prefix reuse and receive cutovers. Final validation
 passes 133 codegen tests, 44 exchange tests, the doctest, and Clippy. Two manual
 benchmarks and one preexisting test are ignored in ordinary test runs.
+
+## Min-max heaps (2026-09-07)
+
+Tried `min-max-heap` 1.3.0 in both exchange ready queues, first using `pop_max`,
+then reversed keys and `pop_min`. All three builds produced identical packages.
+A fresh binary-heap comparison used 313.6 CPU seconds; min-max variants used
+330.4 and 333.4 seconds. Wall times (113.7, 115.0, 90.7 seconds respectively)
+were variable and did not establish a speedup relative to the earlier 87-second
+binary-heap run. Samples still spent about 12% in heap removal.
+
+The retained manual benchmark uses the real `ReadyTransfer` key, repeated lazy
+priority refreshes and shrinking queues. At 1K/10K/100K entries, median times
+were 0.50/8.14/176 ms for binary heaps, 1.26/18.05/305 ms for min-max maximum
+removal, and 1.22/17.41/299 ms for reversed minimum removal. Output checksums
+match. This synthetic workload is not an exact trace of the compiler, but agrees
+with the lack of a CPU improvement in the whole build. Production retains the
+binary heaps; the comparison dependency is test-only.
+
+```
+cargo test --release -p ipu-codegen compare_ready_heaps -- --ignored --nocapture
+```
+
+Raw results: `artifacts/compiler-perf/{minmax,minmax-min,binary-recheck}` and
+`artifacts/compiler-perf/heap-benchmark.log`. The crate API is documented at
+<https://docs.rs/min-max-heap/1.3.0/min_max_heap/struct.MinMaxHeap.html>.

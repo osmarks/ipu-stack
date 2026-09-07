@@ -2323,3 +2323,6 @@ pub fn inactive_exchange_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod heap_bench;
