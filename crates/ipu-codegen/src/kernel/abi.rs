@@ -25,6 +25,7 @@ pub enum ScalarValue {
     ElementCount,
     QueryRows,
     KeyRows,
+    SplitSoftmaxRows,
     NumPartials,
     ScaleExponent,
     InitialBlock,
@@ -58,6 +59,18 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
             ScalarValue::QueryRows => gemm_rows(run),
             ScalarValue::KeyRows => match &run.kernel {
                 TileKernelSpec::AttentionSoftmax { key_columns, .. } => Ok(*key_columns),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            ScalarValue::SplitSoftmaxRows => match &run.kernel {
+                TileKernelSpec::AttentionSoftmax {
+                    key_columns,
+                    padded_key_columns,
+                    ..
+                } => Ok(u32::from(cost::f16_softmax_split_rows(
+                    u64::from(gemm_rows(run)?),
+                    u64::from(*key_columns),
+                    u64::from(*padded_key_columns),
+                ))),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::NumPartials => match &run.kernel {
@@ -209,7 +222,11 @@ pub fn tile_kernel_abi(
                 KernelSymbols::Specialized,
                 KernelAvailability::Implemented,
                 1,
-                &[ScalarValue::QueryRows, ScalarValue::KeyRows],
+                &[
+                    ScalarValue::QueryRows,
+                    ScalarValue::KeyRows,
+                    ScalarValue::SplitSoftmaxRows,
+                ],
             ),
             TileKernelSpec::AttentionMerge { .. } => (
                 KernelSymbols::Specialized,

@@ -94,15 +94,24 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             // The narrow tail retains the original eight-slot pair sequence.
             let rows = logical / u64::from(padded_key_columns + 16);
             let physical_rows = physical / u64::from(padded_key_columns + 16);
+            let row_reductions = if crate::kernel::cost::f16_softmax_split_rows(
+                physical_rows,
+                u64::from(key_columns),
+                u64::from(padded_key_columns),
+            ) {
+                15.0
+            } else {
+                5.0
+            };
             return Some((
                 rows as f64
                     * (34.0 * f64::from(key_columns / 16)
                         + 4.0 * f64::from(key_columns % 16)
-                        + 5.0),
+                        + row_reductions),
                 physical_rows as f64
                     * (34.0 * f64::from(key_columns / 16)
                         + 8.0 * f64::from((key_columns % 16).div_ceil(2))
-                        + 5.0),
+                        + row_reductions),
                 "softmax: arithmetic/conversion issue slots, excluding loads and row addressing",
             ));
         }

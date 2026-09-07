@@ -13,6 +13,11 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         .shards
         .iter()
         .any(|shard| shard.tensor_type.format.precision != Precision::F16)
+        // Attention row-state storage contains FP32 words inside its packed
+        // F16 allocation. Its bits do not preserve the arena-wide invariant.
+        || program.kernel_runs.iter().any(|run| matches!(run.kernel,
+            TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. }
+        ))
     {
         return;
     }
@@ -301,6 +306,22 @@ mod tests {
             }],
             repeat_runs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn embedded_fp32_attention_state_prevents_f16_arena_reuse() {
+        let mut program = fixture();
+        let graph = Arc::make_mut(&mut program.program);
+        let mut state_writer = graph.kernel_runs[1].clone();
+        state_writer.inputs.clear();
+        Arc::make_mut(&mut state_writer.metadata).kernel = TileKernelSpec::AttentionSoftmax {
+            head_dimension: 72,
+            key_columns: 729,
+            padded_key_columns: 768,
+        };
+        graph.kernel_runs.push(state_writer);
+        reuse_finite_padding(&mut program);
+        assert_eq!(program.tiles[0].work.len(), 2);
     }
 
     #[test]

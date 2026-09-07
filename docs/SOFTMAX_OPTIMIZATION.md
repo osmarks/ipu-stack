@@ -1,101 +1,103 @@
-# Materialized attention softmax investigation
+# Materialized attention softmax improvements
 
-The batch-one independent-product profile in
-`artifacts/attention-product-grids/independent/summary.json` measures 40,326
-cycles per softmax invocation on all 1,472 tiles. The phase spans 42,666 cycles
-including start skew, out of 234,378 cycles for the cropped workload. This is
-not primarily an imbalance between tiles.
+## Hardware results (2026-09-07)
 
-`device/attention_softmax_f16.S` scans each row for its maximum, then writes
-unnormalized FP16 exponentials and FP32 maxima/denominators. Normalization is
-already folded into the final attention merge. There is no separate division
-pass to eliminate.
+Batch-one SigLIP attention: 16 heads, 729 tokens, head dimension 72, FP16 products
+and FP32 accumulation. Whole-model timings use the profile renderer's entry crop.
 
-## First experiment: packed affine transformation
+| Implementation | Softmax kernel cycles | Whole-model cycles |
+| --- | ---: | ---: |
+| Original | 40,326 | 234,378 |
+| Four-wide maximum and MIX pipeline | 27,498 | 221,550 |
+| MIX plus selected split-row execution | 21,780 | 215,832 |
 
-For every two scores, the current exponential pass converts to FP32, multiplies
-by the scale, adds the negative scaled maximum, converts back to FP16, computes
-FP16 exponentials, converts those to FP32, and accumulates their sum. Stores and
-subsequent loads overlap some arithmetic. The analytical model counts 71 issue
-groups per complete 16-key panel, including the maximum scan.
+This reduces softmax time by 46.0% and whole-model time by 7.9%. Each distinct
+program was timed once. The arithmetic-only comparison used the old planner
+binary with new assembly to isolate the kernel change. The final result uses
+updated costing and automatic materialized product selection. All 839,808
+constant-input model output checks passed (maximum error 0.000930); Gaussian
+operator diagnostics also passed, with final sampled error 0.000040.
 
-IPU21 ISA 1.3.1 section 3.7.3.3.24 documents `f16v4mix`: four half inputs from
-each source, two half coefficients in TAS, FP32 dot-product intermediates, and
-simultaneous readout of the previous accumulator result as four halves. Set
-the coefficients to `scale` and `-scale`, and broadcast the row maximum as the
-second source. This computes `scale * (score - maximum)` without first rounding
-the difference to FP16. A pipeline can potentially replace eight preparation
-instructions per four scores with one mix instruction, plus warmup/drain and
-any register-management overhead. Eight writable arithmetic registers make the
-actual schedule important; instruction savings are not yet measured speedups.
+Profiles and logs are under `artifacts/softmax-upgrade/`:
 
-The scale becomes FP16 (relative error about 0.0000658 at head dimension 72).
-A host check using 2,048 Gaussian rows of 729 FP16 scores at each standard
-deviation 1, 8, 32, and 128 gave maximum absolute normalized-probability changes
-of approximately 0.00000114, 0.0000171, 0.000206, and 0.000282 respectively.
-This used NumPy exponentiation rounded to FP16, not the IPU exponential or its
-rounding controls; it is a plausibility check, not device validation. Preserve
-consistent stored maxima for the merge, and test odd keys and overflow modes.
+- `arithmetic-attention/`: arithmetic-only package, profile, and HTML.
+- `final-attention/`: combined package, profile, HTML, and query summary.
+- `guarded-attention/`: final source rebuild after the padding-safety guard.
+  Its package hash matches `final-attention/`, so hardware was not timed again:
+  `1dad1834aaa1397f1c81e0f8f3cff29609bb152d13be71eeb252ddc77ce186bd`.
+- `guarded-diagnostic/`: final Gaussian checkpoint validation.
 
-A simpler fallback uses packed multiply/add instructions. Removing just two
-issue groups per pair saves 16 per full panel: about 8,640 cycles for two row
-rounds and 45 full panels, before changed setup/tail costs. That suggests roughly
-31,700 rather than 40,326 cycles, but is an instruction-count estimate only.
+## Arithmetic
 
-## Alternative: direct accumulation of exponentials
+The kernel still scans for a row maximum, then writes unnormalized FP16
+exponentials and FP32 maxima/denominators. Normalization remains folded into the
+attention merge.
 
-Section 3.7.3.4.2 documents `f16v8acc`, which adds eight half values into eight
-FP32 accumulators. It could replace per-pair conversion and sum instructions,
-with one final accumulator read/reduction. Some current operations overlap
-loads/stores, so auxiliary instruction counts overstate cycle savings.
-It also overwrites accumulator lanes used by `f16v4mix`; these should initially
-be evaluated as alternative designs, not combined savings.
+`attention_softmax_panels.inc` supplies common arithmetic to both row schedules.
+The maximum pass uses interleaved 64-bit loads and `f16v4max`. `f16v4mix` computes
+four `scale * (score - maximum)` values with FP32 intermediates and simultaneously
+returns the preceding four results as halves. Stores overlap conversion of the
+exponentials to FP32; denominator sums remain FP32. The full-panel body drops
+from 71 to 47 issue groups. The narrow masked tail retains its previous sequence.
 
-The maximum scan can separately use `ld64` and `f16v4max` on its interleaved
-input. This requires suitable alignment and a correct narrow tail, but no new
-layout. The current loop processes only two halves at a time.
+MIX uses a half-precision scale (relative error about 0.0000658 at head dimension
+72). It avoids an intermediate half-precision subtraction, which could overflow
+before scaling. Device tests cover random scores, equal scores, and opposing
+maximum finite FP16 values with overflow trapping enabled. Random long-row
+probability error against the host reference was below 0.000004. These are ML
+numerical checks, not bitwise-equivalence requirements.
 
-## Second experiment: split rows among workers
+`f16v8acc` remains an alternative summation design: it shares accumulator lanes
+with MIX, so it is not an additional free optimization of this pipeline.
 
-There are 11,664 logical rows (16 heads times 729 queries), approximately eight
-per tile. The kernel assigns whole rows round-robin to six workers. Seven and
-eight rows both require two worker rounds, matching the flat measured duration.
-For eight rows, only two workers have a second row: useful row-slot occupancy
-is 8/12. The profiler's near-100% lane-occupancy estimate measures logical
-padding, not this worker imbalance. The ISA hardware-context section specifies
-that workers cannot claim the execution slots of exited workers.
+## Worker scheduling
 
-Splitting each row into three panel-aligned segments produces 24 tasks for an
-eight-row tile, four per worker. This needs local partial maxima and sums plus
-local synchronization/relaunches; it does not require a global exchange or a
-change to the whole-device operation. The ideal work-balancing bound is about
-two-thirds of the current row work, before those costs. Seven-row tiles and
-tails require explicit accounting. Merely assigning 12 whole rows to fewer
-tiles still takes two row rounds and does not improve the critical path.
+Whole-row execution assigns rows round-robin to six workers. Seven or eight rows
+need two rounds, leaving several worker slots unused. Split-row execution assigns
+three contiguous, panel-aligned segments per row to workers and runs three local
+stages: partial maxima, exponentials/partial sums, then final sums. There are two
+additional local barriers, no new global phase or exchange, and no new allocation.
 
-Prioritize the arithmetic kernel first: it changes neither planning nor
-ownership. Then measure whether split-row overhead is justified on the faster
-kernel. Update analytical costing and useful-work metadata with whichever
-instruction sequence is actually selected. No proposed kernel has yet been
-implemented or benchmarked on hardware.
+The existing extra 16 halves per row hold exactly the required state: two FP32
+row values, three FP32 partial maxima, and three FP32 partial sums. Maximum and
+sum scratch occupy separate ranges so workers cannot overwrite a maximum while
+another worker still reads it. The worker stack pointer is preserved.
 
-## Arithmetic implementation and hardware check (2026-09-07)
+Splitting is not always worthwhile. On uniform 128-key inputs, an eight-row
+kernel would grow from roughly 5,184 to 7,116 cycles. One shared analytical
+selector in `kernel/cost.rs` prices both schedules, including launches, worker
+rounding, and partial reductions. The selected mode becomes a scalar kernel-call
+argument; mid remains a whole-device softmax operation. At 729 keys the measured
+seven/eight-row split durations are 21,762/21,780 cycles; the model uses 21,780.
+Costing is approximate, particularly for other input distributions and tails.
+Profile useful-work metadata describes the new arithmetic and row reductions.
 
-Implemented four-wide maximum loads and pipelined `f16v4mix` affine preparation,
-with FP32 denominator accumulation and the existing masked pair tail. The inner
-full-panel cost falls from 71 to 47 issue groups. Cost and useful-work metadata
-now describe this sequence.
+## Safety and validation
 
-The standalone `softmax_check` binary checks normalized probabilities, FP32
-maxima/sums, zero padding, and output guards against a host reference while timing
-both a supplied old source and the new one. The first sweep covered 80 shapes
-and passed; maximum probability error in the long-row random cases was below
-0.000004. Its buffers reserve full SRAM elements to prevent host-readback code
-from sharing an element with SEND data.
+The padding-reuse pass now recognizes attention's embedded FP32 state. An arena
+containing that state is not an all-FP16 arena: finite FP32 words can encode FP16
+NaNs when reused as activation padding. The guard preserves required clears; it
+did not change the measured attention package.
 
-With unchanged attention planning/costing for an isolated kernel comparison,
-materialized attention fell from 234,378 to 221,550 cropped cycles. Softmax fell
-from 40,326 to 27,498 cycles; all 839,808 model output checks passed. Artifacts:
-`artifacts/softmax-upgrade/arithmetic-attention/`. This comparison intentionally
-uses the original planner binary with the updated assembly, so its profile
-useful-work metadata still describes the old kernel.
+The kernel compilation cache now hashes recursive local quoted includes. Editing
+the common assembly or split-worker include therefore invalidates the cached
+object. A regression test covers include changes and cycles.
+
+`softmax_check` verifies probabilities, FP32 row state, zero padding, and output
+guards while timing a supplied reference kernel and the current kernel. It
+reserves whole SRAM elements for output buffers so host-readback code cannot
+share an element with SEND data. Example after sourcing the SDK:
+
+```bash
+git show d4f7629^:device/attention_softmax_f16.S > /tmp/reference-softmax.S
+cargo run --release -p ipu-tests --bin softmax_check -- \
+  --sdk "$POPLAR_SDK_ENABLED" --reference /tmp/reference-softmax.S \
+  --keys 128,129,729,768 --split-rows --pattern extreme
+```
+
+Omit `--split-rows` to check whole-row execution; use `--pattern random` or
+`constant` for the other input sets. Host regression tests cover schedule
+selection and retention of padding initialization with embedded FP32 state.
+Final checks: 135 codegen tests, four ELF tests, and the codegen doctest pass.
+Clippy passes with the existing `too_many_arguments` and `type_complexity` lints
+allowed; unrestricted `-D warnings` still reports those pre-existing warnings.

@@ -1,7 +1,8 @@
 #include "arch/gc_tile_defines.h"
+#include "attention_softmax_panels.inc"
 
 // AMP-left panel order; FP16 probabilities with FP32 maxima and sums.
-// m2 weights, m3 scores, m4 query rows, m5 valid keys.
+// m2 weights, m3 scores, m4 query rows, m5 valid keys, m6 split-row flag.
 #if ATTENTION_FULL_BLOCK
 #define SOFTMAX_FRAME_BYTES 12
 #else
@@ -12,6 +13,26 @@
 	.p2align 2
 	.type ATTENTION_SOFTMAX_SYMBOL,@function
 ATTENTION_SOFTMAX_SYMBOL:
+	.supervisor
+	// m6 selects the cheaper row schedule, as priced by the host cost model.
+	brz $m6, .Lsoftmax_whole
+	add $m11, $m11, -16
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m4, $m11, $m15, 2
+	st32 $m5, $m11, $m15, 3
+	setzi $m0, .Lsoftmax_split_max
+	runall $m0, $m11, 0
+	sync TEXCH_SYNCZONE_LOCAL
+	setzi $m0, .Lsoftmax_split_exp
+	runall $m0, $m11, 0
+	sync TEXCH_SYNCZONE_LOCAL
+	setzi $m0, .Lsoftmax_split_sum
+	runall $m0, $m11, 0
+	sync TEXCH_SYNCZONE_LOCAL
+	add $m11, $m11, 16
+	br $m10
+.Lsoftmax_whole:
 	.supervisor
 	add $m11, $m11, -SOFTMAX_FRAME_BYTES
 	st32 $m2, $m11, $m15, 0
@@ -57,14 +78,7 @@ ATTENTION_SOFTMAX_SYMBOL:
 	sub $m7, $m7, 1
 #endif
 .Lsoftmax_max_panel:
-	mov $a7, $a6
-	ld64step $a0:1, $mzero, $m3+=, 1
-	.rept 3
-	{ ld64step $a0:1, $mzero, $m3+=, 1
-	  f16v4max $a6:7, $a6:7, $a0:1 }
-	.endr
-	f16v4max $a6:7, $a6:7, $a0:1
-	f16v2max $a6, $a6, $a7
+	SOFTMAX_MAX_PANEL
 	add $m3, $m3, $m8
 	brnzdec $m7, .Lsoftmax_max_panel
 #if !ATTENTION_FULL_BLOCK
@@ -111,15 +125,6 @@ ATTENTION_SOFTMAX_SYMBOL:
 	brz $m7, .Lsoftmax_exp_tail
 	sub $m7, $m7, 1
 #endif
-	.macro SOFTMAX_EXP_PAIR
-	f16v2tof32 $a0:1, $a0
-	f32v2mul $a0:1, $a4:B, $a0:1
-	f32v2add $a0:1, $a5:B, $a0:1
-	f32v2tof16 $a0, $a0:1
-	f16v2exp $a0, $a0
-	{ st32step $a0, $mzero, $m2+=, 1
-	  f16v2tof32 $a2:3, $a0 }
-	.endm
 	// TAS holds +/- the half scale. MIX forms the difference in FP32,
 	// avoiding an overflowing intermediate FP16 subtraction.
 	mov $a0, $a4
@@ -128,30 +133,8 @@ ATTENTION_SOFTMAX_SYMBOL:
 	uput $TAS, $a0
 	mov $a4, $a2
 	mov $a5, $a2
-	.macro SOFTMAX_STORE_QUAD
-	f16v2exp $a2, $a2
-	f16v2exp $a3, $a3
-	{ st32step $a2, $mzero, $m2+=, 1
-	  f16v2tof32 $a0:1, $a2 }
-	f32v2add $a6:7, $a6:7, $a0:1
-	{ st32step $a3, $mzero, $m2+=, 1
-	  f16v2tof32 $a0:1, $a3 }
-	f32v2add $a6:7, $a6:7, $a0:1
-	.endm
 .Lsoftmax_exp_panel:
-	// Prime with zero accumulators so the discarded readout is finite.
-	// MIX then returns each preceding quad while starting the next one.
-	setzi $a0, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
-	uput $FP_CLR, $a0
-	ld64step $a0:1, $mzero, $m3+=, 1
-	f16v4mix $a2:3, $a0:1, $a4:5
-	.rept 3
-	ld64step $a0:1, $mzero, $m3+=, 1
-	f16v4mix $a2:3, $a0:1, $a4:5
-	SOFTMAX_STORE_QUAD
-	.endr
-	f16v4gacc $a2:3
-	SOFTMAX_STORE_QUAD
+	SOFTMAX_EXP_PANEL
 	add $m3, $m3, $m8
 	add $m2, $m2, $m8
 	brnzdec $m7, .Lsoftmax_exp_panel
@@ -218,3 +201,5 @@ ATTENTION_SOFTMAX_SYMBOL:
 	brnz $m0, .Lsoftmax_row
 .Lsoftmax_done:
 	exitz $m15
+
+#include "attention_softmax_split.inc"

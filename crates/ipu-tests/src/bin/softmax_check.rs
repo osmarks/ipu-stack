@@ -12,6 +12,8 @@ use ipu_runtime::Runtime;
 use std::{fs, path::PathBuf};
 #[derive(Parser)]
 struct Arguments {
+    #[arg(long)]
+    split_rows: bool,
     #[arg(long, default_value = "random", value_parser = ["random", "constant", "extreme"])]
     pattern: String,
     #[arg(long, value_delimiter = ',', default_value = "1,2,5,6,7,8,12,17")]
@@ -35,9 +37,34 @@ struct Arguments {
     #[arg(long, default_value = "artifacts/layout-sweep/device.lock")]
     device_lock: PathBuf,
 }
+fn softmax_source(path: &std::path::Path) -> Result<String> {
+    let mut source = String::new();
+    for line in fs::read_to_string(path)?.lines() {
+        if let Some(name) = line
+            .strip_prefix("#include \"attention_softmax_")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            source += &softmax_source(
+                &path
+                    .parent()
+                    .unwrap()
+                    .join(format!("attention_softmax_{name}")),
+            )?;
+        } else {
+            source.push_str(line);
+            source.push('\n');
+        }
+    }
+    Ok(source)
+}
+
 fn main() -> Result<()> {
     ipu_runtime::init_tracing();
     let args = Arguments::parse();
+    ensure!(
+        args.keys.len().saturating_mul(args.rows.len()) <= 1472,
+        "one tile is needed per test case"
+    );
     fs::create_dir_all(&args.output)?;
     let device = PathBuf::from("device").canonicalize()?;
     let mut source = format!(
@@ -74,7 +101,7 @@ fn main() -> Result<()> {
                 source += &format!("#undef ATTENTION_{name}\n#define ATTENTION_{name} {value}\n");
             }
             source += "#undef SOFTMAX_FRAME_BYTES\n";
-            source += &fs::read_to_string(path)?
+            source += &softmax_source(path)?
                 .replace(".Lsoftmax_", &format!(".L{tag}_{keys}_"))
                 .replace("SOFTMAX_MAX_PANEL", &format!("MAXP_{tag}_{keys}"))
                 .replace("SOFTMAX_EXP_PANEL", &format!("EXPP_{tag}_{keys}"))
@@ -126,7 +153,7 @@ fn main() -> Result<()> {
                         symbol: format!("softmax_{tag}_{keys}"),
                         output_address: TileAddress::Absolute(address),
                         input_addresses: vec![TileAddress::Absolute(0x88000)],
-                        arguments: vec![rows, keys],
+                        arguments: vec![rows, keys, u32::from(args.split_rows && keys >= 128)],
                         profile: StepProfile {
                             before: Some(0x7f000 + index as u32 * 8),
                             after: Some(0x7f004 + index as u32 * 8),
@@ -195,15 +222,14 @@ fn main() -> Result<()> {
                     .filter(|s| s.name == ipu_codegen::COMPLETED_SYMBOL)
                     .collect::<Vec<_>>()
             );
-            for logical in 0..cases.len() {
+            for (logical, (rows, keys, _, _)) in cases.iter().enumerate() {
                 let tile = ipu_exchange::c600_logical_to_physical(logical as u16);
                 for context in 0..=6 {
                     let state = runtime.device().tile_context_state(tile, context)?;
                     if state == 3 {
                         let pc = runtime.device().read_tile_program_counter(tile, context)?;
                         eprintln!(
-                            "case={:?} tile={tile} context={context} status={:x} pc={pc:x} {:?}",
-                            &cases[logical].0..=&cases[logical].1,
+                            "rows={rows} keys={keys} tile={tile} context={context} status={:x} pc={pc:x} {:?}",
                             runtime.device().read_tile_context_status(tile, context)?,
                             application.symbolize_pc(u32::from(tile), pc)
                         );

@@ -63,7 +63,7 @@ pub(crate) fn f16_packed_gemm_cycles(
 /// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 47
 /// issue groups per full 16-key panel. Masked pairs and zero padding use short
 /// scalar loops; no tile program needs to be constructed to price them.
-pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
+fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
     if rows == 0 {
         return 0;
     }
@@ -88,6 +88,37 @@ pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 
         234
     };
     launch.saturating_add(rows.div_ceil(6).saturating_mul(6).saturating_mul(row))
+}
+
+// Three local stages: partial maxima, exponentials/partial sums, final sums.
+// A segment has ceil(padded_keys / 48) panels. 128 groups account for each
+// segment's setup, row-state reductions, and address calculations; 408 cycles
+// cover the launches and 21 groups per final worker wave reduce the sums.
+fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
+    if keys < 128 || rows == 0 {
+        return u64::MAX;
+    }
+    let segment = padded_keys
+        .div_ceil(48)
+        .saturating_mul(47)
+        .saturating_add(128);
+    408u64
+        .saturating_add(rows.div_ceil(2).saturating_mul(6).saturating_mul(segment))
+        .saturating_add(rows.div_ceil(6).saturating_mul(126))
+}
+
+/// The ABI and the planner use the same choice; no tile program is built here.
+pub(crate) fn f16_softmax_split_rows(rows: u64, keys: u64, padded_keys: u64) -> bool {
+    f16_softmax_split_cycles(rows, keys, padded_keys)
+        < f16_softmax_whole_rows(rows, keys, padded_keys)
+}
+
+pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
+    f16_softmax_whole_rows(rows, keys, padded_keys).min(f16_softmax_split_cycles(
+        rows,
+        keys,
+        padded_keys,
+    ))
 }
 
 /// Merge preserves FP32 state. Pair loops issue four groups for initialization
@@ -180,6 +211,19 @@ mod tests {
             f16_attention_merge_cycles(u64::MAX, u64::MAX, false, true),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn softmax_segmentation_prices_launches_and_worker_rounding() {
+        assert!(f16_softmax_split_rows(1, 128, 128));
+        assert!(!f16_softmax_split_rows(7, 128, 128));
+        assert!(!f16_softmax_split_rows(8, 128, 128));
+        assert!(!f16_softmax_split_rows(6, 729, 768));
+        for rows in [7, 8] {
+            assert!(f16_softmax_split_rows(rows, 729, 768));
+            // Uniform-input device measurements: 21,762 / 21,780 cycles.
+            assert_eq!(f16_softmax_cycles(rows, 729, 768), 21_780);
+        }
     }
 
     #[test]
