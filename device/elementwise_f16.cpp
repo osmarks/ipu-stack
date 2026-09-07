@@ -9,25 +9,41 @@ public:
   Input<Vector<half, VectorLayout::ONE_PTR>> source, scale, bias;
   Output<Vector<half, VectorLayout::ONE_PTR>> destination;
   unsigned rows, width;
+  InOut<Vector<float, VectorLayout::ONE_PTR>> scratch;
+  unsigned stage;
   bool compute(unsigned worker) {
-    // Complete even-width rows avoid halfword read/modify/write races.
-    for (unsigned row = worker; row < rows; row += 6) {
-      const unsigned base = row * width;
-      float sum = 0;
-      for (unsigned i = 0; i < width; ++i) sum += float(source[base + i]);
-      const float mean = sum / width;
-      float variance = 0;
-      for (unsigned i = 0; i < width; ++i) {
-        const float d = float(source[base + i]) - mean;
+    auto *partials = reinterpret_cast<float2 *>(&scratch[0]);
+    const auto *x = reinterpret_cast<const half2 *>(&source[0]);
+    if (stage == 0) {
+      float2 sum = {0, 0};
+      for (unsigned i = worker; i < width / 2; i += 6)
+        sum += __builtin_convertvector(x[i], float2);
+      partials[worker] = sum;
+      return true;
+    }
+    float2 sum = {0, 0};
+    for (unsigned i = 0; i < 6; ++i) sum += partials[i];
+    const float mean = (sum[0] + sum[1]) / width;
+    if (stage == 1) {
+      float2 variance = {0, 0};
+      for (unsigned i = worker; i < width / 2; i += 6) {
+        const float2 d = __builtin_convertvector(x[i], float2) - mean;
         variance += d * d;
       }
-      const float inverse = 1.0f / std::sqrt(variance / width + 1e-6f);
-      for (unsigned i = 0; i < width; i += 2) {
-        float2 result = {
-          (float(source[base+i]) - mean) * inverse * float(scale[i]) + float(bias[i]),
-          (float(source[base+i+1]) - mean) * inverse * float(scale[i+1]) + float(bias[i+1])};
-        *reinterpret_cast<half2 *>(&destination[base+i]) = __builtin_convertvector(result, half2);
-      }
+      partials[6 + worker] = variance;
+      return true;
+    }
+    float2 variance = {0, 0};
+    for (unsigned i = 6; i < 12; ++i) variance += partials[i];
+    const float inverse = 1.0f / std::sqrt((variance[0] + variance[1]) / width + 1e-6f);
+    const auto *gamma = reinterpret_cast<const half2 *>(&scale[0]);
+    const auto *beta = reinterpret_cast<const half2 *>(&bias[0]);
+    auto *y = reinterpret_cast<half2 *>(&destination[0]);
+    for (unsigned i = worker; i < width / 2; i += 6) {
+      const float2 normalized = (__builtin_convertvector(x[i], float2) - mean) * inverse;
+      const float2 result = normalized * __builtin_convertvector(gamma[i], float2)
+                            + __builtin_convertvector(beta[i], float2);
+      y[i] = __builtin_convertvector(result, half2);
     }
     return true;
   }
@@ -45,6 +61,26 @@ public:
     return i;
   }
   bool compute(unsigned worker) {
+    // The common dense and vector-broadcast paths use complete half2 words.
+    // Keep wrap/gather handling out of their inner loops.
+    if (!(elements & 1) && !(leftElements & 1) && !(rightElements & 1)) {
+      const auto *a = reinterpret_cast<const half2 *>(&left[0]);
+      const auto *b = reinterpret_cast<const half2 *>(&right[0]);
+      auto *out = reinterpret_cast<half2 *>(&destination[0]);
+      if (leftElements == elements && rightElements == elements) {
+        for (unsigned i = worker; i < elements / 2; i += 6)
+          out[i] = a[i] + b[i];
+      } else {
+        unsigned l = wrap(worker, leftElements / 2);
+        unsigned r = wrap(worker, rightElements / 2);
+        for (unsigned i = worker; i < elements / 2; i += 6) {
+          out[i] = a[l] + b[r];
+          l = wrap(l + 6, leftElements / 2);
+          r = wrap(r + 6, rightElements / 2);
+        }
+      }
+      return true;
+    }
     unsigned l = wrap(worker * 2, leftElements);
     unsigned r = wrap(worker * 2, rightElements);
     for (unsigned i = worker * 2; i + 1 < elements; i += 12) {

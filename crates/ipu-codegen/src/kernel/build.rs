@@ -61,7 +61,16 @@ impl KernelBuildPlan {
                     flags: vec!["-O2".into(), format!("-DVERTEX_{vertex}")],
                     retained_symbols: vec![],
                 });
-                plan.add_worker_wrapper(format!("{symbol}_wrapper"), symbol, vertex, registers);
+                if symbol == "layer_norm_f16" {
+                    plan.compilations.push(KernelCompilation {
+                        source: "layer_norm_f16.S",
+                        name: "layer_norm_f16_wrapper".into(),
+                        flags: vec![],
+                        retained_symbols: vec![symbol.into()],
+                    });
+                } else {
+                    plan.add_worker_wrapper(format!("{symbol}_wrapper"), symbol, vertex, registers);
+                }
             }
         }
         if gelu {

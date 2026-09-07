@@ -44,6 +44,12 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             3.0,
             "GeLU: 12 arithmetic issue slots / 4 elements",
         ),
+        TileKernelSpec::LayerNorm => (
+            logical,
+            physical,
+            4.0,
+            "layernorm: F32 vector sum, centered variance, and affine arithmetic",
+        ),
         TileKernelSpec::Add => (
             logical,
             physical,

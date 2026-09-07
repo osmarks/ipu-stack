@@ -85,12 +85,17 @@ REARRANGE_CALL_SYMBOL:
 #if REARRANGE_FULL_PANELS > 0
 	setzi $m7, REARRANGE_FULL_PANELS
 .Lrearrange_amp_left_f16_full_panel:
-	.rept 8
-	ld32 $a0, $m9, $m15, 0
-	st32 $a0, $m10, $m15, 0
-	add $m9, $m9, 4
-	add $m10, $m10, 4
+#if REARRANGE_LOGICAL_COLUMNS % 4 == 0
+	.rept 4
+	ld64step $a0:1, $mzero, $m9+=, 1
+	st64step $a0:1, $mzero, $m10+=, 1
 	.endr
+#else
+	.rept 8
+	ld32step $a0, $mzero, $m9+=, 1
+	st32step $a0, $mzero, $m10+=, 1
+	.endr
+#endif
 	add $m10, $m10, REARRANGE_PANEL_ROW_ADVANCE
 	sub $m7, $m7, 1
 	brnz $m7, .Lrearrange_amp_left_f16_full_panel
