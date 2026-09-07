@@ -48,10 +48,14 @@ attention softmax/accumulation state; attention explicitly converts its result
 back to F16. Selecting FP8 GEMMs does not change this policy.
 
 Layernorm is a reusable graph operation with epsilon 1e-6 and affine parameters.
-Its initial F16 codelet uses F32 centered statistics and owns complete rows per
-worker. The current kernel requires even-width unpadded rows. Floating-point
+Its F16 codelet shares each row across all six workers, using separate local
+sum, centered-variance and affine passes. Statistics stay F32, with 96 bytes of
+shared scratch and local synchronization between passes. The kernel requires
+even-width unpadded rows. Floating-point
 addition supports equal shapes and contiguous suffix broadcasting, covering
-residuals, bias vectors and positional embeddings. Neither operation silently
+residuals, bias vectors and positional embeddings. Add offers column sharding
+and preserves compatible input layouts, including packed equal-shape residuals,
+rather than always gathering complete rows. Neither operation silently
 interprets unsupported storage as a compatible layout.
 
 Example (native FP8 weights, F16 normalization and residuals):
@@ -79,13 +83,13 @@ GEMM but does not reproduce the hardware's intermediate rounding exactly.
 The small complete graph has maximum absolute error 0.00293 with F16 GEMMs and
 0.12988 with FP8 GEMMs. This comparison does not establish pretrained accuracy.
 
-The current full-size F16 search is rejected by memory accounting: its
+The initial full-size F16 search was rejected by memory accounting: its
 shortlisted plans reach 540,544 tensor bytes plus 49,152 support bytes per tile
 at the encoder down-projection, or exhaust SRAM later at MAP preparation.
 This is a planner/layout limitation, not a requirement for FP32 arithmetic.
 The reduced F16 model passes on hardware.
 
-Full-size hardware validation (2026-09-07): native FP8 GEMMs, F16 exposed
+Initial full-size hardware validation (2026-09-07): native FP8 GEMMs, F16 exposed
 activations, 2,656,824 cropped profile cycles (1.771216 ms at 1.5 GHz).
 Maximum absolute reference error is 0.102051, using the explicit tolerance in
 the command above. The rendered profile is
@@ -99,3 +103,43 @@ memory elements with linked kernels; final attention padding could contain
 FP32 values that faulted during the F16 cast. Final merge now clears just that
 padding. Mixed-class multicast loopbacks and late exchange-row setup calls
 also now receive the required placement and code-size reservations.
+
+## Performance follow-up
+
+The initial profile exposed scalar Add indexing, scalar single-worker layernorm,
+and four separate instructions per 32-bit AMP-left packing word. Add now has
+native half2 dense paths and column/layout-preserving planning choices. LN shares
+a row across six workers and retains centered F32 statistics. Aligned AMP-left
+packing uses 64-bit loads/stores with built-in address updates. LN now has an
+arithmetic-work estimate in profile metadata instead of reporting N/A.
+
+Broadcast operands are partitioned along the output's matching dimensions,
+replicating only dimensions being broadcast. Equal-shaped packed operands retain
+their physical padding. Batch validation also exposed missing matrix iteration
+in row-major packing. Packing now follows the storage representation: AMP-left
+panels flatten batch and row, while coefficient formats retain separate matrices.
+Both F16 and FP8 two-image small models pass all 40 operator checkpoints; final
+maximum absolute errors are 0.004395 and 0.130188, respectively.
+
+The larger plans exposed excessive lazy heap refreshes in exchange scheduling.
+Initially ready transfers with identical endpoint roles share one global heap
+entry; later dependency releases remain individual entries. Multicast pressure
+is now refreshed even when readiness has not changed, avoiding history-dependent
+stale-pressure choices. Stale keys update in place, with a linear refresh/rebuild
+when individual heap repairs would cost more. Randomized comparison with eager
+priority selection covers unicast, multicast and memory hazards.
+
+With the same 64-tile planning budget, the small FP8 model decreased from
+255,804 to 137,268 cropped cycles. Its rendered profile is
+`artifacts/vit/optimized-small-fp8/profile.html`. This is a kernel/planning
+regression check, not a substitute for the full-size measurement: the full
+model selects substantially different shard sizes and exchange patterns.
+The release tests pass (158 codegen tests, six benchmark/CLI tests and the
+graph doctest), as does Clippy with the repository's existing complexity
+allowances.
+
+Remaining structural limitations include standalone projection bias additions
+(which require row-major traversal), separate Q/K/V GEMMs in this benchmark, and
+large coefficient-layout packing operations with sparse ownership. The single-row
+MAP normalization still resides on one tile, using all six workers; cross-tile
+statistics would require a different normalization implementation.
