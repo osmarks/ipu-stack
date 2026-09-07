@@ -372,20 +372,16 @@ copy_strided_u\bits:
 	shl $m9, $m9, 1
 	sub $m1, $m9, $m1
 .Lcopy_strided_u\bits\()_row:
-	.if \bits == 64
-	add $m9, $m5, 0
-.Lcopy_strided_u\bits\()_word:
-	ld64 $a0:1, $m3, $m15, 0
-	st64 $a0:1, $m2, $m15, 0
-	add $m3, $m3, 8
-	add $m2, $m2, 8
-	sub $m9, $m9, 1
-	brnz $m9, .Lcopy_strided_u\bits\()_word
-	.else
-	// Hardware repetition and post-incrementing addresses keep the 32-bit
-	// fallback to one load and one store per word.
+	// Hardware repetition and post-incrementing addresses leave only a
+	// load and store per word, for both word widths.
 	{ rpt $m5, 1
 	  fnop }
+	.if \bits == 64
+	{ ld64step $a0:1, $mzero, $m3+=, 1
+	  fnop }
+	{ st64step $a0:1, $mzero, $m2+=, 1
+	  fnop }
+	.else
 	{ ld32step $a0, $mzero, $m3+=, 1
 	  fnop }
 	{ st32step $a0, $mzero, $m2+=, 1

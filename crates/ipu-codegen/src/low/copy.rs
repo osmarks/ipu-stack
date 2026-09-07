@@ -33,13 +33,14 @@ pub enum CopyPattern {
     },
 }
 
-impl<Buffer: Clone> CopyOperation<Buffer> {
+impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
     pub(crate) fn from_spans(
         source: Buffer,
         destination: Buffer,
         source_spans: &[ByteSpan],
         destination_spans: &[ByteSpan],
     ) -> StorageResult<Vec<Self>> {
+        let can_reorder = source != destination;
         let mut copies = Vec::new();
         for_each_copy_span(
             source_spans,
@@ -56,7 +57,28 @@ impl<Buffer: Clone> CopyOperation<Buffer> {
                 Ok(())
             },
         )?;
-        Ok(coalesce_copies(copies))
+        let original = coalesce_copies(copies.clone());
+        if !can_reorder || original.len() < 2 {
+            return Ok(original);
+        }
+        // Local copies read one live allocation and write another. Traversing
+        // disjoint destination spans in physical order can turn a blocked
+        // transpose's many short launches into a few long strided copies.
+        copies.sort_by_key(|copy| (copy.destination_offset, copy.source_offset));
+        if copies.windows(2).any(|pair| {
+            pair[0]
+                .destination_offset
+                .checked_add(pair[0].bytes)
+                .is_none_or(|end| end > pair[1].destination_offset)
+        }) {
+            return Ok(original);
+        }
+        let reordered = coalesce_copies(copies);
+        Ok(if reordered.len() < original.len() {
+            reordered
+        } else {
+            original
+        })
     }
 }
 
@@ -145,9 +167,9 @@ fn coalesce_copies<Buffer: Clone>(
             end += 1;
         }
         let rows = u32::try_from(end - index).unwrap_or(u32::MAX);
-        // Preserve the size limit for rows served by the parallel u64 helper.
-        // Four-byte-only alignment otherwise falls back to serial supervisor
-        // copies, so batching those rows remains useful above this limit.
+        // Very wide copies with too few rows underuse the workers. Retain
+        // ordinary parallel row copies there; longer row lists use all six
+        // workers and should not be split just because total bytes exceed 512.
         let aligned_u64 = [
             first.bytes,
             first.source_offset,
@@ -157,7 +179,10 @@ fn coalesce_copies<Buffer: Clone>(
         ]
         .into_iter()
         .all(|n| n.is_multiple_of(8));
-        if aligned_u64 && first.bytes.saturating_mul(rows) > PARALLEL_STRIDED_COPY_MAX_BYTES {
+        if aligned_u64
+            && rows < 6
+            && first.bytes.saturating_mul(rows) > PARALLEL_STRIDED_COPY_MAX_BYTES
+        {
             coalesced.extend(copies[index..end].iter().cloned());
             index = end;
             continue;
@@ -589,6 +614,44 @@ mod tests {
     }
 
     #[test]
+    fn packed_block_transpose_uses_long_rows_instead_of_tiny_launches() {
+        let source = [ByteSpan {
+            offset: 0,
+            bytes: 164 * 6 * 32,
+        }];
+        let destination = (0..164)
+            .flat_map(|column| {
+                (0..6).map(move |row| ByteSpan {
+                    offset: (row * 164 + column) * 32,
+                    bytes: 32,
+                })
+            })
+            .collect::<Vec<_>>();
+        let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
+        assert_eq!(copies.len(), 6);
+        for (row, copy) in copies.iter().enumerate() {
+            assert_eq!(copy.source_offset, row as u32 * 32);
+            assert_eq!(copy.destination_offset, row as u32 * 164 * 32);
+            assert_eq!(
+                copy.pattern,
+                CopyPattern::Strided {
+                    rows: 164,
+                    row_bytes: 32,
+                    source_stride: 192,
+                    destination_stride: 32,
+                }
+            );
+        }
+        // Do not reorder a request that explicitly aliases its source.
+        assert_eq!(
+            CopyOperation::from_spans(0, 0, &source, &destination)
+                .unwrap()
+                .len(),
+            164
+        );
+    }
+
+    #[test]
     fn copy_runs_preserve_byte_mapping_across_span_boundaries() {
         let mut random = fastrand::Rng::with_seed(0x636f_7079);
         for _ in 0..1000 {
@@ -616,12 +679,12 @@ mod tests {
                     .flat_map(|span| span.offset..span.offset + span.bytes)
                     .collect::<Vec<_>>()
             };
-            let expected = flatten(&source)
+            let mut expected = flatten(&source)
                 .into_iter()
                 .zip(flatten(&destination))
                 .collect::<Vec<_>>();
             let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
-            let actual = copies
+            let mut actual = copies
                 .into_iter()
                 .flat_map(|copy| {
                     let (rows, width, source_stride, destination_stride) = match copy.pattern {
@@ -643,6 +706,8 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
+            actual.sort_unstable();
+            expected.sort_unstable();
             assert_eq!(actual, expected);
         }
         assert!(
@@ -713,8 +778,8 @@ mod tests {
     }
 
     #[test]
-    fn copy_runs_respect_worker_striding_limit() {
-        for rows in [2, 64, 65] {
+    fn long_strided_copies_keep_all_rows_in_one_launch() {
+        for rows in [2, 64, 65, 164] {
             let source = (0..rows)
                 .map(|row| ByteSpan {
                     offset: row * 16,
@@ -728,25 +793,43 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
-            if rows <= 64 {
-                assert_eq!(copies.len(), 1);
-                assert_eq!(
-                    copies[0].pattern,
-                    CopyPattern::Strided {
-                        rows,
-                        row_bytes: 8,
-                        source_stride: 16,
-                        destination_stride: 24
-                    }
-                );
-            } else {
-                assert_eq!(copies.len(), rows as usize);
-                assert!(
-                    copies
-                        .iter()
-                        .all(|copy| copy.pattern == CopyPattern::Contiguous)
-                );
-            }
+            assert_eq!(copies.len(), 1);
+            assert_eq!(
+                copies[0].pattern,
+                CopyPattern::Strided {
+                    rows,
+                    row_bytes: 8,
+                    source_stride: 16,
+                    destination_stride: 24,
+                }
+            );
         }
+        let source = [
+            ByteSpan {
+                offset: 0,
+                bytes: 1024,
+            },
+            ByteSpan {
+                offset: 2048,
+                bytes: 1024,
+            },
+        ];
+        let destination = [
+            ByteSpan {
+                offset: 0,
+                bytes: 1024,
+            },
+            ByteSpan {
+                offset: 4096,
+                bytes: 1024,
+            },
+        ];
+        let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
+        assert_eq!(copies.len(), 2);
+        assert!(
+            copies
+                .iter()
+                .all(|copy| copy.pattern == CopyPattern::Contiguous)
+        );
     }
 }
