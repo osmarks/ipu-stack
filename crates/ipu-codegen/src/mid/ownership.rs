@@ -92,6 +92,125 @@ impl MidProgram {
         changed.then_some(result)
     }
 
+    /// Delay independent sums until their producers have all run. Only move
+    /// results consumed through explicit copies: direct compute operands retain
+    /// the owner alignment selected by their implementation.
+    pub(super) fn with_overlapped_reductions(&self, limit: usize) -> Option<Self> {
+        let groups = self
+            .values
+            .iter()
+            .map(|v| v.storage_group)
+            .collect::<Vec<_>>();
+        let accesses = |ids: &[MidValueId]| {
+            ids.iter()
+                .map(|id| groups[id.index() as usize])
+                .collect::<BTreeSet<_>>()
+        };
+        let conflicts = |a: &MidOperation, b: &MidOperation| {
+            let ar = accesses(&a.inputs);
+            let aw = accesses(&a.results);
+            let br = accesses(&b.inputs);
+            let bw = accesses(&b.results);
+            !aw.is_disjoint(&br) || !aw.is_disjoint(&bw) || !ar.is_disjoint(&bw)
+        };
+        let eligible = |op: &MidOperation| {
+            let [output] = op.results.as_slice() else {
+                return false;
+            };
+            if !matches!(op.kind, MidOperationKind::Primitive(Primitive::Sum { .. })) {
+                return false;
+            }
+            let group = groups[output.index() as usize];
+            if self
+                .outputs
+                .iter()
+                .any(|id| groups[id.index() as usize] == group)
+            {
+                return false;
+            }
+            let mut used = false;
+            for consumer in &self.operations {
+                if consumer
+                    .inputs
+                    .iter()
+                    .any(|id| groups[id.index() as usize] == group)
+                {
+                    used = true;
+                    if !matches!(
+                        consumer.kind,
+                        MidOperationKind::Primitive(Primitive::Copy { .. })
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            used
+        };
+        let mut result = self.clone();
+        let mut changed = false;
+        let mut start = 0;
+        while start < result.operations.len() {
+            if !eligible(&result.operations[start]) {
+                start += 1;
+                continue;
+            }
+            let mut selected = vec![start];
+            let owners = |op: &MidOperation| {
+                u32::from(
+                    self.values[op.results[0].index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .tiling
+                        .tile_count,
+                )
+            };
+            let mut total = owners(&result.operations[start]);
+            for next in start + 1..result.operations.len() {
+                let operation = &result.operations[next];
+                if selected.len() >= limit
+                    || !matches!(operation.kind, MidOperationKind::Primitive(_))
+                    || selected
+                        .iter()
+                        .any(|&index| conflicts(&result.operations[index], operation))
+                {
+                    break;
+                }
+                if eligible(operation) {
+                    total += owners(operation);
+                    if total > u32::from(self.tile_count) {
+                        break;
+                    }
+                    selected.push(next);
+                }
+            }
+            if selected.len() < 2 {
+                start += 1;
+                continue;
+            }
+            let insertion = selected.last().copied().unwrap() + 1 - selected.len();
+            let mut sums = Vec::new();
+            for index in selected.into_iter().rev() {
+                sums.push(result.operations.remove(index));
+            }
+            sums.reverse();
+            let mut offset = self.values[sums[0].results[0].index() as usize].tile_offset;
+            for sum in &sums {
+                let group = groups[sum.results[0].index() as usize];
+                for value in &mut result.values {
+                    if value.storage_group == group {
+                        value.tile_offset = offset;
+                    }
+                }
+                offset = ((u32::from(offset) + owners(sum)) % u32::from(self.tile_count)) as u16;
+            }
+            start = insertion + sums.len();
+            result.operations.splice(insertion..insertion, sums);
+            changed = true;
+        }
+        changed.then_some(result)
+    }
+
     pub(super) fn assign_parameter_tiles(&mut self) -> LoweringResult<()> {
         let parameter_origins = self
             .inputs
@@ -238,6 +357,17 @@ mod tests {
             [0, 4, 0, 0, 0, 0]
         );
         assert!(program.values.iter().all(|v| v.tile_offset == 0));
+        let mut delayed = program.clone();
+        delayed.operations.insert(1, copy(4, 5));
+        let overlapped = delayed.with_overlapped_reductions(2).unwrap();
+        assert_eq!(overlapped.operations[0].results, [MidValueId(5)]);
+        assert_eq!(overlapped.operations[1].results, [MidValueId(0)]);
+        assert_eq!(overlapped.operations[2].results, [MidValueId(1)]);
+        assert_eq!(overlapped.values[1].tile_offset, 4);
+        assert!(delayed.with_overlapped_reductions(1).is_none());
+        delayed.operations[1] = copy(5, 4); // Would overwrite a delayed partial.
+        assert!(delayed.with_overlapped_reductions(2).is_none());
+
         program.outputs.push(MidValueId(1));
         assert!(program.with_disjoint_copy_sources(true).is_none());
         program.outputs.clear();

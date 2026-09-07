@@ -279,12 +279,37 @@ impl TileGraphBuilder {
         while index < operations.len() {
             let operation = &operations[index];
             let started = Instant::now();
-            let group = crate::mid::independent_copy_prefix(
+            let copies = crate::mid::independent_copy_prefix(
                 &operations[index..],
                 checkpoints,
                 &self.storage_groups,
             );
-            let lowered = if group > 1 {
+            let sums = crate::mid::independent_sum_prefix(
+                &operations[index..],
+                checkpoints,
+                &self.storage_groups,
+            );
+            let group = copies.max(sums);
+            let lowered = if sums > 1 {
+                let mut batch = reduce::SumBatch::default();
+                for operation in &operations[index..index + sums] {
+                    let MidOperationKind::Primitive(crate::Primitive::Sum { axis, staging }) =
+                        operation.kind
+                    else {
+                        unreachable!()
+                    };
+                    self.prepare_sum(operation, usize::from(axis), staging, &mut batch)?;
+                }
+                self.append_sum_batch(
+                    batch,
+                    WorkProvenance {
+                        operation: None,
+                        value: None,
+                        reason: WorkReason::OperatorKernel,
+                    },
+                    &mut tiles,
+                )
+            } else if copies > 1 {
                 let mut batch = conversion::MaterializationBatch::default();
                 for operation in &operations[index..index + group] {
                     let MidOperationKind::Primitive(crate::Primitive::Copy {

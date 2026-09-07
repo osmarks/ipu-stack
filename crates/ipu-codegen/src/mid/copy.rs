@@ -9,6 +9,27 @@ pub(crate) fn independent_copy_prefix(
     checkpoints: bool,
     storage_groups: &[MidValueId],
 ) -> usize {
+    independent_prefix(operations, checkpoints, storage_groups, |kind| {
+        matches!(kind, MidOperationKind::Primitive(Primitive::Copy { .. }))
+    })
+}
+
+pub(crate) fn independent_sum_prefix(
+    operations: &[MidOperation],
+    checkpoints: bool,
+    storage_groups: &[MidValueId],
+) -> usize {
+    independent_prefix(operations, checkpoints, storage_groups, |kind| {
+        matches!(kind, MidOperationKind::Primitive(Primitive::Sum { .. }))
+    })
+}
+
+fn independent_prefix(
+    operations: &[MidOperation],
+    checkpoints: bool,
+    storage_groups: &[MidValueId],
+    eligible: impl Fn(&MidOperationKind) -> bool,
+) -> usize {
     let group = |id: &MidValueId| storage_groups[id.index() as usize];
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
@@ -17,10 +38,7 @@ pub(crate) fn independent_copy_prefix(
         .iter()
         .take_while(|operation| {
             if (checkpoints && operation.source != source)
-                || !matches!(
-                    operation.kind,
-                    MidOperationKind::Primitive(crate::Primitive::Copy { .. })
-                )
+                || !eligible(&operation.kind)
                 || operation
                     .inputs
                     .iter()

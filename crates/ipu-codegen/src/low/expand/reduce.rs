@@ -4,19 +4,29 @@
 
 use super::*;
 
+#[derive(Default)]
+pub(super) struct SumBatch {
+    transfers: Vec<BTreeMap<ShardView, Vec<ShardView>>>,
+    seeds: Vec<(u16, LocalCopy)>,
+    runs: Vec<Vec<(u16, KernelRun)>>,
+    results: Vec<(u16, LocalCopy)>,
+}
+
 impl TileGraphBuilder {
-    pub(super) fn append_sum_partials(
+    pub(super) fn prepare_sum_partials(
         &mut self,
         groups: impl IntoIterator<Item = Vec<ShardView>>,
         outputs: &[BlockValueId],
         staging: crate::ReductionStaging,
         provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
+        batch: &mut SumBatch,
     ) -> ExpansionResult<()> {
-        let mut reduction_transfers = Vec::<BTreeMap<ShardView, Vec<ShardView>>>::new();
-        let mut seed_copies = Vec::<(u16, LocalCopy)>::new();
-        let mut reduction_runs = Vec::<Vec<(u16, KernelRun)>>::new();
-        let mut result_copies = Vec::<(u16, LocalCopy)>::new();
+        let SumBatch {
+            transfers: reduction_transfers,
+            seeds: seed_copies,
+            runs: reduction_runs,
+            results: result_copies,
+        } = batch;
         let mut reduction_roots = 0usize;
         for contributors in groups {
             let Some(complete) = contributors.first() else {
@@ -92,7 +102,7 @@ impl TileGraphBuilder {
                             &source,
                             &destination,
                             owner.tile,
-                            &mut result_copies,
+                            result_copies,
                             CopyOrder::Physical,
                         )?;
                     } else {
@@ -146,7 +156,7 @@ impl TileGraphBuilder {
                         &seed_source,
                         &self.full_view(initial),
                         owner.tile,
-                        &mut seed_copies,
+                        seed_copies,
                         CopyOrder::Physical,
                     )?;
                 } else {
@@ -225,7 +235,7 @@ impl TileGraphBuilder {
                         extents: intersection,
                     },
                     owner.tile,
-                    &mut result_copies,
+                    result_copies,
                     CopyOrder::Physical,
                 )?;
                 reduction_roots += 1;
@@ -234,6 +244,22 @@ impl TileGraphBuilder {
                 return Err(ExpansionError::InvalidOperatorPlan);
             }
         }
+        tracing::debug!(reduction_roots, "materialized packed parallel reduction");
+        Ok(())
+    }
+
+    pub(super) fn append_sum_batch(
+        &mut self,
+        batch: SumBatch,
+        provenance: WorkProvenance,
+        tiles: &mut BlockRegion,
+    ) -> ExpansionResult<()> {
+        let SumBatch {
+            transfers: reduction_transfers,
+            seeds: mut seed_copies,
+            runs: reduction_runs,
+            results: result_copies,
+        } = batch;
         for (stage, (transfers, runs)) in reduction_transfers
             .into_iter()
             .zip(reduction_runs)
@@ -259,7 +285,6 @@ impl TileGraphBuilder {
         for (tile, copy) in result_copies {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        tracing::debug!(reduction_roots, "materialized packed parallel reduction");
         Ok(())
     }
 }
@@ -325,11 +350,25 @@ mod tests {
                 );
             }
             let mut region = BlockRegion::default();
+            let mut batch = SumBatch::default();
+            for (group, output) in groups.into_iter().zip(&outputs) {
+                builder
+                    .prepare_sum_partials(
+                        [group],
+                        &[*output],
+                        staging,
+                        WorkProvenance {
+                            operation: None,
+                            value: None,
+                            reason: WorkReason::OperatorKernel,
+                        },
+                        &mut batch,
+                    )
+                    .unwrap();
+            }
             builder
-                .append_sum_partials(
-                    groups,
-                    &outputs,
-                    staging,
+                .append_sum_batch(
+                    batch,
                     WorkProvenance {
                         operation: None,
                         value: None,

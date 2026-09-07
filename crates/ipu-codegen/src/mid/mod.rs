@@ -2,7 +2,7 @@
 //! Tile enumeration occurs only after selection, in low expansion.
 
 mod copy;
-pub(crate) use copy::independent_copy_prefix;
+pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 mod primitive;
 pub use primitive::*;
@@ -71,6 +71,15 @@ pub(crate) fn lower_finalists(
         .collect::<LoweringResult<Vec<_>>>()?;
     let mut candidates = Vec::with_capacity(resolved.len() * 2);
     for program in resolved {
+        if !config.diagnostic_checkpoints {
+            for limit in 2..=config.max_parallel_reductions {
+                if let Some(overlapped) = program.with_overlapped_reductions(limit)
+                    && !candidates.contains(&overlapped)
+                {
+                    candidates.push(overlapped);
+                }
+            }
+        }
         if let Some(rotated) = program.with_disjoint_copy_sources(config.diagnostic_checkpoints) {
             candidates.push(rotated);
         }
@@ -151,6 +160,8 @@ pub struct PipelineConfig {
     pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
     /// Compare native output with panel-packed projection output, or force a mode for diagnostics.
     pub gemm_output_packing: GemmOutputPacking,
+    /// Maximum independent sums offered as one spatially distributed batch.
+    pub max_parallel_reductions: usize,
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
@@ -217,6 +228,7 @@ impl PipelineConfig {
             exchange_schedule_finalists: 1,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,
+            max_parallel_reductions: 3,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),

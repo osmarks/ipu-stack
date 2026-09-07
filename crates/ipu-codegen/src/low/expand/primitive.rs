@@ -17,7 +17,9 @@ impl TileGraphBuilder {
                 reuse_local,
             } => self.copy_tensor(operation, mapping, *reuse_local, body),
             Primitive::Sum { axis, staging } => {
-                self.sum_tensor(operation, usize::from(*axis), *staging, body)
+                let mut batch = reduce::SumBatch::default();
+                self.prepare_sum(operation, usize::from(*axis), *staging, &mut batch)?;
+                self.append_sum_batch(batch, operation_provenance(operation), body)
             }
             Primitive::Compute {
                 kernel,
@@ -276,12 +278,12 @@ impl TileGraphBuilder {
         Ok(())
     }
 
-    fn sum_tensor(
+    pub(super) fn prepare_sum(
         &mut self,
         operation: &MidOperation,
         axis: usize,
         staging: crate::ReductionStaging,
-        body: &mut BlockRegion,
+        batch: &mut reduce::SumBatch,
     ) -> ExpansionResult<()> {
         let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
         else {
@@ -311,12 +313,12 @@ impl TileGraphBuilder {
                 .or_default()
                 .push(self.full_view(alias));
         }
-        self.append_sum_partials(
+        self.prepare_sum_partials(
             groups.into_values(),
             &outputs,
             staging,
             operation_provenance(operation),
-            body,
+            batch,
         )
     }
 }
