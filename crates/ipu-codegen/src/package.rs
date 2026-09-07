@@ -114,6 +114,8 @@ pub struct CompiledPackage {
     pub inputs: Vec<DiagnosticTensor>,
     pub outputs: Vec<DiagnosticTensor>,
     pub precisions: BTreeMap<ValueId, Precision>,
+    /// Selected operand precision of each semantic product (before accumulation).
+    pub multiply_precisions: BTreeMap<crate::OperationId, Precision>,
     /// Exact physical exchange schedules retained for low-level diagnostics.
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
@@ -131,6 +133,8 @@ pub struct DiagnosticPackage {
     pub inputs: Vec<DiagnosticTensor>,
     pub checkpoints: Vec<DiagnosticCheckpoint>,
     pub precisions: BTreeMap<ValueId, Precision>,
+    /// Selected operand precision of each semantic product (before accumulation).
+    pub multiply_precisions: BTreeMap<crate::OperationId, Precision>,
     /// Exact physical exchange schedules retained for low-level diagnostics.
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
@@ -205,6 +209,7 @@ pub fn build_package(
         inputs,
         outputs,
         precisions,
+        multiply_precisions: package_multiply_precisions(&low),
         exchange_phases: built.exchange_phases,
         exchange_schedule: built.exchange_schedule,
         exchange_code_base: built.exchange_code_base,
@@ -258,17 +263,35 @@ pub fn build_diagnostic_package(
         inputs,
         checkpoints,
         precisions: package_precisions(&low),
+        multiply_precisions: package_multiply_precisions(&low),
         exchange_phases: built.exchange_phases,
         exchange_schedule: built.exchange_schedule,
         exchange_code_base: built.exchange_code_base,
     })
 }
 
-fn package_precisions(mid: &TileGraph) -> BTreeMap<ValueId, Precision> {
-    mid.logical_values
+fn package_multiply_precisions(low: &TileGraph) -> BTreeMap<crate::OperationId, Precision> {
+    low.kernel_runs
         .iter()
-        .map(|value| (value.origin, value.tensor_type.format.precision))
+        .filter_map(|run| {
+            let crate::TileKernelSpec::Gemm { multiply, .. } = run.kernel else {
+                return None;
+            };
+            Some((run.provenance.operation?, multiply))
+        })
         .collect()
+}
+
+fn package_precisions(mid: &TileGraph) -> BTreeMap<ValueId, Precision> {
+    let mut precisions = BTreeMap::new();
+    // Canonical values precede implementation-local staging and accumulator
+    // values, which share their producer's origin for profiling purposes.
+    for value in &mid.logical_values {
+        precisions
+            .entry(value.origin)
+            .or_insert(value.tensor_type.format.precision);
+    }
+    precisions
 }
 
 fn package_inputs(
@@ -533,6 +556,9 @@ fn build_package_from_objects(
                         storage.range.start,
                     )?;
                 }
+                // Row sharing can change after final placement. Reserve its
+                // optional setup call through the same emitter used below.
+                reserve_exchange_setup(&mut tile_program.steps);
                 let generated = emit(
                     &tile_program,
                     &symbols,
@@ -738,9 +764,9 @@ fn build_package_from_objects(
         Ok::<_, PackageBuildError>(maximum.max(u32::try_from(program.bytes.len())?))
     })?;
     if actual_code_bytes > generated_code_bytes {
-        return Err(invalid(
-            "generated tile code exceeded its planned allocation",
-        ));
+        return Err(invalid(format!(
+            "generated tile code requires {actual_code_bytes} bytes; reserved {generated_code_bytes}"
+        )));
     }
     let profile_tiles = prepared
         .into_iter()
@@ -823,6 +849,32 @@ fn build_package_from_objects(
         exchange_schedule,
         exchange_code_base,
     })
+}
+
+/// Sizing-only patches account for exchange rows which become structurally
+/// shareable after addresses and schedules change. All addresses/counts fit
+/// one SETZI; the payload itself is already covered by exchange-row sizing.
+fn reserve_exchange_setup(steps: &mut [crate::TileStep]) {
+    for step in steps {
+        match step {
+            crate::TileStep::Exchange(exchange)
+                if exchange.active && exchange.setup_patch.is_none() =>
+            {
+                exchange.setup_patch = Some(crate::ExchangeSetupPatch {
+                    offsets: crate::PlacedExchangeRow {
+                        address: 0,
+                        words: vec![0],
+                    },
+                    values: crate::PlacedExchangeRow {
+                        address: 4,
+                        words: vec![0],
+                    },
+                });
+            }
+            crate::TileStep::Repeat(repeat) => reserve_exchange_setup(&mut repeat.body),
+            _ => {}
+        }
+    }
 }
 
 fn diagnostic_tensor(
@@ -1194,4 +1246,34 @@ fn reserve_linked_image(
 
 pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
     PackageBuildError::Invalid(message.into())
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    #[test]
+    fn attention_scratch_does_not_override_result_precision() {
+        let mut graph = ComputeGraph::new();
+        let q = graph.host_input("q", [2, 4, 16]).unwrap();
+        let k = graph.host_input("k", [2, 4, 16]).unwrap();
+        let v = graph.host_input("v", [2, 4, 16]).unwrap();
+        let y = graph.flash_attention(q, k, v).unwrap();
+        graph.set_outputs([y]).unwrap();
+        let config = PipelineConfig::new(8)
+            .with_automatic_input(q, Precision::F16)
+            .with_automatic_input(k, Precision::F16)
+            .with_automatic_input(v, Precision::F16);
+        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
+        assert!(
+            low.logical_values
+                .iter()
+                .any(|value| value.origin == y
+                    && value.tensor_type.format.precision == Precision::F32)
+        );
+        assert_eq!(package_precisions(&low)[&y], Precision::F16);
+    }
 }

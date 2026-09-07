@@ -882,6 +882,7 @@ fn main() -> Result<()> {
         }
     } else if matches!(arguments.workload, Workload::SiglipVitBenchmark) {
         graph = vit::build(&arguments.vit)?;
+
         pipeline.profiling = !arguments.no_profile;
         for input in graph.inputs() {
             pipeline = pipeline.with_automatic_input(input.value, Precision::F16);
@@ -1376,7 +1377,12 @@ fn run_reference(
 ) -> Result<(Vec<u8>, f32)> {
     let (host_inputs, weights, inputs) =
         diagnostic::prepare_inputs(graph, application, &package.inputs)?;
-    let references = diagnostic::evaluate(graph, host_inputs, &package.precisions)?;
+    let references = diagnostic::evaluate(
+        graph,
+        host_inputs,
+        &package.precisions,
+        &package.multiply_precisions,
+    )?;
     let output = run_initialized_program(runtime, application, &weights, &inputs, timeout_seconds)?;
     let tensor = package
         .outputs

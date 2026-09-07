@@ -59,6 +59,7 @@ Example (native FP8 weights, F16 normalization and residuals):
 ```sh
 RAYON_NUM_THREADS=24 target/release/ipu-trivial-test c600-init.ipucfg \
   --workload siglip-vit-benchmark --fp8-scale=-4 \
+  --diagnostic-atol 0.2 --diagnostic-rtol 0.05 \
   --device-lock artifacts/layout-sweep/device.lock \
   --package artifacts/vit/so400m-fp8/model.ipuexe \
   --profile-output artifacts/vit/so400m-fp8/profile.ipuprof
@@ -70,3 +71,10 @@ inserts activation casts where required. All final outputs are checked against
 the host reference automatically. `--vit-small --tiles 64` uses a 28×28 image,
 width 128, two heads and MLP width 256 while preserving the whole graph.
 `--vit-batch` sets the batch size (default one).
+
+The FP8 example explicitly loosens the comparison tolerance. Small upstream
+rounding differences can cross activation-quantization thresholds and accumulate
+through the 13 GEMMs; the host reference quantizes operands at each selected
+GEMM but does not reproduce the hardware's intermediate rounding exactly.
+The small complete graph has maximum absolute error 0.0049 with F16 GEMMs and
+0.1531 with FP8 GEMMs. This comparison does not establish pretrained accuracy.

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use ipu_codegen::{
     AttentionScale, ComputeGraph, DiagnosticPackage, DiagnosticTensor, GemmOptions, Operation,
-    OperationKind, Precision, Region, Repeat, ShardExtent, ShardView, ValueId,
+    OperationId, OperationKind, Precision, Region, Repeat, ShardExtent, ShardView, ValueId,
     logical_view_byte_spans,
 };
 use ipu_driver::{Device, DriverError, TileException};
@@ -35,7 +35,12 @@ pub fn run(
     timeout: Duration,
 ) -> Result<()> {
     let (values, weights, inputs) = prepare_inputs(graph, &package.application, &package.inputs)?;
-    let references = evaluate(graph, values, &package.precisions)?;
+    let references = evaluate(
+        graph,
+        values,
+        &package.precisions,
+        &package.multiply_precisions,
+    )?;
     let mut session = runtime.host_session(&package.application)?;
     session.start()?;
     if !package.application.weights.is_empty() {
@@ -436,8 +441,15 @@ pub(crate) fn evaluate(
     graph: &ComputeGraph,
     mut values: BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
+    multiply_precisions: &BTreeMap<OperationId, Precision>,
 ) -> Result<BTreeMap<ValueId, HostTensor>> {
-    evaluate_operations(graph.operations(), graph, &mut values, precisions)?;
+    evaluate_operations(
+        graph.operations(),
+        graph,
+        &mut values,
+        precisions,
+        multiply_precisions,
+    )?;
     Ok(values)
 }
 
@@ -446,14 +458,26 @@ fn evaluate_operations(
     graph: &ComputeGraph,
     values: &mut BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
+    multiply_precisions: &BTreeMap<OperationId, Precision>,
 ) -> Result<()> {
     for operation in operations {
         let results = match &operation.kind {
-            OperationKind::Gemm(options) => vec![gemm(
-                &values[&operation.inputs[0]],
-                &values[&operation.inputs[1]],
-                *options,
-            )?],
+            OperationKind::Gemm(options) => {
+                let left = &values[&operation.inputs[0]];
+                let right = &values[&operation.inputs[1]];
+                let operands = multiply_precisions.get(&operation.id).map(|&precision| {
+                    [left, right].map(|input| HostTensor {
+                        shape: input.shape.clone(),
+                        values: input
+                            .values
+                            .iter()
+                            .map(|&v| quantize(v, precision))
+                            .collect(),
+                    })
+                });
+                let (left, right) = operands.as_ref().map_or((left, right), |a| (&a[0], &a[1]));
+                vec![gemm(left, right, *options)?]
+            }
             OperationKind::LayerNorm => {
                 let x = &values[&operation.inputs[0]];
                 let scale = &values[&operation.inputs[1]];
@@ -508,9 +532,14 @@ fn evaluate_operations(
                 &values[&operation.inputs[2]],
                 *options,
             )?],
-            OperationKind::Repeat(repeat) => {
-                repeat_values(operation, repeat, graph, values, precisions)?
-            }
+            OperationKind::Repeat(repeat) => repeat_values(
+                operation,
+                repeat,
+                graph,
+                values,
+                precisions,
+                multiply_precisions,
+            )?,
         };
         for (&id, mut tensor) in operation.results.iter().zip(results) {
             if let Some(&precision) = precisions.get(&id) {
@@ -530,6 +559,7 @@ fn repeat_values(
     graph: &ComputeGraph,
     values: &BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
+    multiply_precisions: &BTreeMap<OperationId, Precision>,
 ) -> Result<Vec<HostTensor>> {
     let mut carried = operation.inputs[..repeat.carried_inputs]
         .iter()
@@ -571,7 +601,13 @@ fn repeat_values(
             let sequence = &graph.sequences()[sequence.index() as usize];
             local.insert(*argument, values[&sequence.values[iteration]].clone());
         }
-        evaluate_region(&repeat.body, graph, &mut local, precisions)?;
+        evaluate_region(
+            &repeat.body,
+            graph,
+            &mut local,
+            precisions,
+            multiply_precisions,
+        )?;
         carried = repeat
             .body
             .yields
@@ -587,8 +623,15 @@ fn evaluate_region(
     graph: &ComputeGraph,
     values: &mut BTreeMap<ValueId, HostTensor>,
     precisions: &BTreeMap<ValueId, Precision>,
+    multiply_precisions: &BTreeMap<OperationId, Precision>,
 ) -> Result<()> {
-    evaluate_operations(&region.operations, graph, values, precisions)
+    evaluate_operations(
+        &region.operations,
+        graph,
+        values,
+        precisions,
+        multiply_precisions,
+    )
 }
 
 fn gemm(left: &HostTensor, right: &HostTensor, options: GemmOptions) -> Result<HostTensor> {
@@ -922,6 +965,48 @@ fn quantize(value: f32, precision: Precision) -> f32 {
 mod tests {
     use super::*;
     use ipu_codegen::{AmpOrder, amp_matrix_coordinates};
+
+    #[test]
+    fn reference_quantizes_gemm_operands_without_changing_residuals() -> Result<()> {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [1, 2])?;
+        let w = graph.parameter("w", [2, 2])?;
+        let product = graph.gemm(x, w)?;
+        let result = graph.add(x, product)?;
+        graph.set_outputs([result])?;
+        let precision = Precision::F8F143 { scale_exponent: -4 };
+        let values = BTreeMap::from([
+            (
+                x,
+                HostTensor {
+                    shape: vec![1, 2],
+                    values: vec![0.12345, -0.34567],
+                },
+            ),
+            (
+                w,
+                HostTensor {
+                    shape: vec![2, 2],
+                    values: vec![1.0, 0.0, 0.0, 1.0],
+                },
+            ),
+        ]);
+        let reference = evaluate(
+            &graph,
+            values,
+            &BTreeMap::new(),
+            &BTreeMap::from([(graph.operations()[0].id, precision)]),
+        )?;
+        for i in 0..2 {
+            let original = reference[&x].values[i];
+            assert_eq!(
+                reference[&result].values[i],
+                original + quantize(original, precision)
+            );
+            assert_ne!(original, quantize(original, precision));
+        }
+        Ok(())
+    }
 
     #[test]
     fn randomized_blas_gemm_matches_scalar_reference() -> Result<()> {
