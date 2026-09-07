@@ -116,6 +116,16 @@ pub(crate) fn place_with_offset(
         root_lifetimes,
     } = analyze_allocations(program)?;
 
+    // Alias groups cannot cross tiles. Partition once rather than walking all
+    // device allocations for each tile and memory class.
+    let mut tile_members = vec![BTreeMap::new(); usize::from(program.tile_count)];
+    for (root, members) in members {
+        tile_members[usize::from(program.shards[members[0]].tile)].insert(root, members);
+    }
+    let mut tile_iterated = vec![Vec::new(); usize::from(program.tile_count)];
+    for group in iterated {
+        tile_iterated[usize::from(group.tile)].push(group);
+    }
     let tile_placements = (0..usize::from(program.tile_count))
         .into_par_iter()
         .map(|tile| {
@@ -124,8 +134,8 @@ pub(crate) fn place_with_offset(
                 u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
                 standard_ranges,
                 interleaved_offset,
-                &iterated,
-                &members,
+                &tile_iterated[tile],
+                &tile_members[tile],
                 &root_of_member,
                 &root_requirements,
                 &root_lifetimes,
@@ -238,7 +248,7 @@ fn place_tile(
     root_lifetimes: &BTreeMap<usize, Lifetime>,
 ) -> Result<(u16, BTreeMap<BlockValueId, u32>, Vec<(u32, u32)>), PlacementError> {
     let mut grouped = BTreeSet::<usize>::new();
-    for group in iterated.iter().filter(|group| group.tile == tile) {
+    for group in iterated {
         let roots = group
             .shards
             .iter()
@@ -650,7 +660,7 @@ fn allocate_tile_class(
     addresses: &mut BTreeMap<BlockValueId, u32>,
 ) -> Result<(), PlacementError> {
     let mut requests = Vec::<AllocationRequest>::new();
-    for group in iterated.iter().filter(|group| group.tile == tile) {
+    for group in iterated {
         let roots = group
             .shards
             .iter()
@@ -703,8 +713,7 @@ fn allocate_tile_class(
     for (&root, root_members) in members {
         let representative = &program.shards[root_members[0]];
         let lifetime = root_lifetimes.get(&root).copied().unwrap_or_default();
-        if representative.tile != tile
-            || representative.tensor_type.format.layout.memory_class != class
+        if representative.tensor_type.format.layout.memory_class != class
             || grouped.contains(&root)
             || !lifetime.seen
         {
