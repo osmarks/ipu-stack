@@ -123,3 +123,55 @@ Two-block uneven MLP and two-block four-head fused attention also pass (0.019749
 and 0.000170). The storage-coordinate regression checks every element of
 rectangular AMP and block-major matrices against the independent host codecs.
 142 codegen tests, four workload tests, the doctest, and Clippy pass.
+
+## Host FP8 and quantization before replication
+
+`--fp8-scale` now applies to host activations as well as parameters. The host
+encoder writes F143 directly into the selected input binding, removing device
+input casts. The output checker also decodes FP8, including Repeat-carried
+results. Generic FP8 views use the row-major view path; the specialized attention
+view layouts describe F16/F32 storage and must not be reused blindly for FP8.
+
+Mid conversion insertion prices quantization on the producer's owners against
+quantization after redistribution. FP8 panel exchange shares the same physical
+fragment mapping as F16. Consumer requests preserve 32-element inner groups
+through GELU, so suitable producer formats survive shortlisting. Casts can
+complete a final half-panel directly with FP8 zeros; no F16 padding copy is
+needed. Compact costing treats such a local cast as local even when its physical
+padding changes.
+
+Padding *every* 16-column producer shard into a 32-column FP8 panel is not a good
+way to enable early quantization. It introduces holes between useful rows and
+fragments the following exchange into short packets. The first full-size build
+using that approach was stopped during expensive scheduling. Early quantization
+therefore requires complete producer panels, allowing a narrow final tail;
+other layouts retain the later cast. Both conversion orders are priced.
+
+A 128x128x512 MLP on 64 tiles validates the early path: its cast processes 1,024
+values on each tile, exactly 65,536 values (one logical intermediate), before the
+GEMM exchange. Maximum cast duration is 1,260 cycles; Gaussian maximum absolute
+error is 0.005798. See `artifacts/fp8-before-fanout/small-early/profile.html`.
+
+For canonical batch-one MLP, exact scheduling of four retained finalists gives
+refined estimates 126,413, 135,606, 136,572, and 148,626 cycles. The first remains
+best and retains quantization after redistribution; early quantization's compute
+savings do not compensate for the other available plans' exchange costs. The
+resulting hardware execution is **127,872 cropped cycles**, versus 151,998 before
+host FP8 loading (15.9% less). Full fused projected attention is **171,588 cycles**,
+versus 176,994 (3.1% less), with no activation cast before its QKV projection.
+
+Final Gaussian checks pass (MLP maximum absolute error 0.006378; attention
+0.000054). The reference now starts from the host-quantized FP8 activations,
+so these error figures are not directly comparable to the former F16-input
+reference. Two-block uneven MLP and four-head attention also pass (0.031250 and
+0.000977). A width-80 intermediate passes as well. A width-16 intermediate remains
+outside the current native FP8 GEMM candidate catalogue.
+
+Profiles and matching packages:
+
+- `artifacts/fp8-before-fanout/mlp-ranked/profile.html` and `model.ipuexe`
+- `artifacts/fp8-before-fanout/attention-final/profile.html` and `model.ipuexe`
+
+144 codegen tests, four workload tests, the doctest, and Clippy pass. Tests cover
+FP8 physical panel correspondence, preservation of early-cast finalists, and
+conversion before replication.
