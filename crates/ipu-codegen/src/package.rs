@@ -332,34 +332,38 @@ fn build_package_artifacts(
             planning.exchange_schedule_finalists.max(4),
         )?)
     })?;
-    let mut selected = build_phase("select_finalist", || {
-        select_scheduled_finalist(finalists, &planning, config.tile_mapping.as_deref())
-    })?;
-    let low = &selected.program;
-    tracing::info!(
-        logical_shards = low.shards.len(),
-        exchange_phases = low.exchange_phases.len(),
-        "lowered graph for package construction"
-    );
     let runtime_artifact = build_phase("compile_runtime", || {
         Ok(config
             .toolchain
             .compile(&config.runtime_source, "static_runtime", &[])?)
     })?;
-    let kernel_plan = build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(low)?))?;
-    let objects = build_phase("compile_kernels", || {
-        let mut objects = vec![fs::read(&runtime_artifact.object)?];
-        for compilation in &kernel_plan.compilations {
-            let artifact = config.toolchain.compile(
-                config.kernel_source_directory.join(compilation.source),
-                &compilation.name,
-                &compilation.flags,
-            )?;
-            objects.push(fs::read(&artifact.object)?);
-        }
-        Ok(objects)
+    let (selected, built) = build_phase("select_finalist", || {
+        select_scheduled_finalist(
+            finalists,
+            &planning,
+            config.tile_mapping.as_deref(),
+            |selected| {
+                let low = &selected.program;
+                let kernel_plan =
+                    build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(low)?))?;
+                let objects = build_phase("compile_kernels", || {
+                    let mut objects = vec![fs::read(&runtime_artifact.object)?];
+                    for compilation in &kernel_plan.compilations {
+                        let artifact = config.toolchain.compile(
+                            config.kernel_source_directory.join(compilation.source),
+                            &compilation.name,
+                            &compilation.flags,
+                        )?;
+                        objects.push(fs::read(&artifact.object)?);
+                    }
+                    Ok(objects)
+                })?;
+                let built =
+                    build_package_from_objects(selected, &planning, &objects, &kernel_plan)?;
+                Ok(built)
+            },
+        )
     })?;
-    let built = build_package_from_objects(&mut selected, &planning, &objects, &kernel_plan)?;
     Ok((built, selected.program))
 }
 

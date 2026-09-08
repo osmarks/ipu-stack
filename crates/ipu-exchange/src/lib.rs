@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 mod encoding;
@@ -270,6 +271,7 @@ struct ScheduledSenderRow {
 #[derive(Clone, Debug)]
 pub struct PhaseProgramBuilder {
     tile_states: Vec<TileProgramSchedule>,
+    validation_budget: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -294,7 +296,16 @@ impl PhaseProgramBuilder {
     pub fn new(tile_count: u16) -> Self {
         Self {
             tile_states: vec![TileProgramSchedule::default(); usize::from(tile_count)],
+            validation_budget: None,
         }
+    }
+
+    /// Bound speculative encoding work by accumulated endpoint-history entries.
+    /// This is a compiler effort limit, not a transfer-count or validity limit.
+    /// Clones share the remaining budget. Final encoding is not charged.
+    pub fn with_validation_budget(mut self, entries: u64) -> Self {
+        self.validation_budget = Some(Arc::new(AtomicU64::new(entries)));
+        self
     }
 
     pub fn tile_count(&self) -> u16 {
@@ -437,6 +448,25 @@ impl PhaseProgramBuilder {
         schedule_offset: u32,
         words: u32,
     ) -> Result<(), ExchangeError> {
+        if let Some(budget) = &self.validation_budget {
+            let work =
+                std::iter::once(&source)
+                    .chain(receivers)
+                    .try_fold(0u64, |work, &tile| {
+                        let state = self
+                            .tile_states
+                            .get(usize::from(tile))
+                            .ok_or(ExchangeError::Tile(tile))?;
+                        Ok::<_, ExchangeError>(work.saturating_add(
+                            1 + state.senders.len() as u64 + state.receive_events.len() as u64,
+                        ))
+                    })?;
+            budget
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(work)
+                })
+                .map_err(|_| ExchangeError::ValidationBudgetExceeded)?;
+        }
         let source_state = self
             .tile_states
             .get(usize::from(source))
@@ -2034,6 +2064,8 @@ pub struct Topology {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExchangeError {
+    #[error("exchange incremental-encoding work budget exhausted")]
+    ValidationBudgetExceeded,
     #[error("logical tile {0} is out of range")]
     Tile(u16),
     #[error("exchange endpoints must be distinct")]

@@ -169,6 +169,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_budget_limits_effort_without_invalidating_the_schedule() {
+        let topology = Topology::c600();
+        let receivers = [2];
+        let plan = topology.multicast(0, &receivers, 64, 0).unwrap();
+        let mut builder = PhaseProgramBuilder::new(4).with_validation_budget(2);
+        let offset = builder
+            .earliest_transfer_offset(0, &[], &receivers, &plan, 64, 0)
+            .unwrap();
+        builder
+            .append_transfer_at(0, &[], &receivers, &plan, offset, 64)
+            .unwrap();
+        assert_eq!(
+            builder.earliest_transfer_offset(0, &[], &receivers, &plan, 64, 0),
+            Err(ExchangeError::ValidationBudgetExceeded)
+        );
+        let offset = builder
+            .earliest_transfer_offset_deferred(0, &[], &receivers, &plan, 64, 0)
+            .unwrap();
+        builder
+            .append_transfer_at(0, &[], &receivers, &plan, offset, 64)
+            .unwrap();
+        builder.finish().unwrap();
+    }
+
+    #[test]
     #[ignore = "manual CPU benchmark"]
     fn benchmark_receive_validation() {
         let topology = Topology::c600();
