@@ -147,6 +147,23 @@ The complete diagnostic is 224,718 cropped cycles; this is **not** the
 729-token model's runtime. Its profile and the diagnostic binary's exact shape
 override are under `artifacts/vit/full-width-four-token-diagnostic/`.
 
+The subsequent full-size build did not reach hardware: exact scheduling took
+7,290 seconds, then package assembly failed to find a contiguous executable
+range for a 142,056-byte compact exchange-table reservation. Phase 33 contained
+784,404 transfers and dominated the compiler tail. Its selected schedule's
+1,176,310-cycle estimate is not a measured speedup. The failure log remains at
+`artifacts/vit/optimized-so400m-fp8/run.log`.
+
+Receive controls now remain stably sorted as they are inserted, and conflict
+checks use timestamp lookups. A mixed ordinary/paired sequence with 4,096
+incremental validations decreased from 847 ms to 358 ms with unchanged encoded
+word counts and checksums (`benchmark_receive_validation`, an ignored CPU
+benchmark in ipu-exchange). This does not eliminate quadratic copying of encoded
+prefixes. Slow instruction-alignment retries now log their start and duration.
+Row-table feasibility still needs to participate in finalist selection, using
+the linked image's available executable ranges; a raw transfer-count limit is
+not an equivalent memory check.
+
 Remaining structural limitations include standalone projection bias additions
 (which require row-major traversal), separate Q/K/V GEMMs in this benchmark, and
 large coefficient-layout packing operations with sparse ownership. The single-row

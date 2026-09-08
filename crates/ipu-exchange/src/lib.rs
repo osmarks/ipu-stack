@@ -242,6 +242,7 @@ struct TileProgramSchedule {
     senders: Vec<ScheduledSenderRow>,
     /// Borrowed transmit lane; no instruction or SRAM access on this tile.
     reserved_sender_end: u32,
+    // Chronological, with stable ordering among controls at the same cycle.
     receive_events: Vec<ReceiveEvent>,
     event_cycles: u32,
     receive_stream: Option<ReceiveStream>,
@@ -636,6 +637,23 @@ impl TileProgramSchedule {
         self.event_cycles
     }
 
+    fn receive_events_at(&self, cycles: u32) -> &[ReceiveEvent] {
+        let start = self
+            .receive_events
+            .partition_point(|event| event.cycles < cycles);
+        let count = self.receive_events[start..].partition_point(|event| event.cycles == cycles);
+        &self.receive_events[start..start + count]
+    }
+
+    fn receive_control_at_send_start(&self, start: u32) -> bool {
+        let index = self
+            .receive_events
+            .partition_point(|event| event.cycles < start);
+        self.receive_events
+            .get(index)
+            .is_some_and(|event| event.cycles <= start.saturating_add(1))
+    }
+
     /// Advances a requested transfer offset until its outgoing message does
     /// not overlap another outgoing message on this tile. Receive controls may
     /// be represented by the ISA's composite send/control encodings; this is a
@@ -666,11 +684,7 @@ impl TileProgramSchedule {
             // A receive control cannot be encoded before the first outgoing
             // word. Leave at least one continuation word so SENDPIC can carry
             // a control at the following event.
-            if self
-                .receive_events
-                .iter()
-                .any(|event| event.cycles == start || event.cycles == start.saturating_add(1))
-            {
+            if self.receive_control_at_send_start(start) {
                 offset = offset
                     .checked_add(1)
                     .ok_or(ExchangeError::Schedule("send offset overflow"))?;
@@ -717,12 +731,10 @@ impl TileProgramSchedule {
                 self.receive_stream.as_ref(),
             )?;
             let collision = timing.events.iter().any(|new| {
-                self.receive_events.iter().any(|existing| {
-                    new.cycles == existing.cycles
-                        && !self.receive_stream.as_ref().is_some_and(|previous| {
-                            replaces_receive_event(*existing, base.mode, &timing, previous)
-                        })
-                        && !receive_events_can_share_instruction(*new, *existing)
+                self.receive_events_at(new.cycles).iter().any(|existing| {
+                    !self.receive_stream.as_ref().is_some_and(|previous| {
+                        replaces_receive_event(*existing, base.mode, &timing, previous)
+                    }) && !receive_events_can_share_instruction(*new, *existing)
                 })
             });
             let sender_boundary = timing.events.iter().any(|event| {
@@ -753,10 +765,7 @@ impl TileProgramSchedule {
         }) {
             return Err(ExchangeError::Schedule("overlapping outgoing messages"));
         }
-        if self.receive_events.iter().any(|event| {
-            event.cycles == timing.start_cycles
-                || event.cycles == timing.start_cycles.saturating_add(1)
-        }) {
+        if self.receive_control_at_send_start(timing.start_cycles) {
             return Err(ExchangeError::Schedule("unencodable initial send control"));
         }
         self.invalidate_encoding();
@@ -811,10 +820,15 @@ impl TileProgramSchedule {
 
         // `earliest_receiver_offset` checked the new events against the full
         // existing stream, while `scheduled_receive_window` validated the new
-        // group internally. Source and pointer controls are independent and
-        // may be inserted on opposite sides of an older teardown event, so
-        // keep insertion order here and sort once when encoding the row.
-        self.receive_events.extend(timing.events.iter().copied());
+        // group internally. Controls may precede an older teardown. Insert
+        // them stably here instead of repeatedly sorting the entire history
+        // during speculative row encoding.
+        for event in &timing.events {
+            let index = self
+                .receive_events
+                .partition_point(|old| old.cycles <= event.cycles);
+            self.receive_events.insert(index, *event);
+        }
         self.event_cycles = self.event_cycles.max(timing.horizon);
         self.receive_stream = Some(ReceiveStream {
             mode: base.mode,

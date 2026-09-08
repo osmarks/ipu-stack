@@ -170,6 +170,47 @@ mod tests {
 
     #[test]
     #[ignore = "manual CPU benchmark"]
+    fn benchmark_receive_validation() {
+        let topology = Topology::c600();
+        println!("transfers,elapsed_us,words,checksum");
+        for count in [256, 1024, 4096] {
+            let started = std::time::Instant::now();
+            let mut schedule = TileProgramSchedule::default();
+            let mut prefix = None;
+            for index in 0..count {
+                let plan = if index % 8 < 4 {
+                    topology.paired_multicast(0, &[2, 3], 64).unwrap()
+                } else {
+                    topology.multicast(0, &[2], 64, 0).unwrap()
+                };
+                let mut row = plan.receivers[0];
+                patch_receiver_address(&mut row, 0x50000 + index % 128 * 512).unwrap();
+                let offset = schedule.earliest_receiver_offset(&row, 64, 0).unwrap();
+                schedule.append_receiver_at(&row, offset, 64).unwrap();
+                prefix = Some(
+                    build_scheduled_program(
+                        &schedule.senders,
+                        &schedule.receive_events,
+                        schedule.event_cycles,
+                        prefix.as_ref(),
+                    )
+                    .unwrap(),
+                );
+            }
+            let encoded = prefix.unwrap();
+            let checksum = encoded.words.iter().fold(0u64, |hash, &word| {
+                hash.wrapping_mul(31).wrapping_add(u64::from(word))
+            });
+            println!(
+                "{count},{},{},{checksum}",
+                started.elapsed().as_micros(),
+                encoded.words.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual CPU benchmark"]
     fn benchmark_incremental_encoding() {
         use std::{hint::black_box, time::Instant};
         let topology = Topology::c600();

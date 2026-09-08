@@ -2031,18 +2031,26 @@ fn materialize_greedy_schedule(
     if schedule_encoding_is_valid(&schedule)? {
         return Ok(schedule);
     }
-    tracing::debug!(
+    tracing::info!(
         transfers = pending.len(),
         "retrying exchange schedule with incremental instruction-alignment validation"
     );
-    materialize_greedy_schedule_impl(
+    let started = std::time::Instant::now();
+    let result = materialize_greedy_schedule_impl(
         topology,
         pending,
         incoming_bases,
         receive_counts,
         tile_count,
         true,
-    )
+    );
+    tracing::info!(
+        transfers = pending.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        success = result.is_ok(),
+        "finished incremental instruction-alignment validation"
+    );
+    result
 }
 
 fn materialize_greedy_schedule_impl(
