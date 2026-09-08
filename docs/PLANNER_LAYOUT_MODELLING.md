@@ -177,3 +177,23 @@ with ordinary planner settings and serialized device access.
   repeating the earlier long rejection sequence; remaining finalists and
   stronger-penalty retries were not exhausted. There is no new B2 package or
   hardware result. Logs and command are in `artifacts/vit/cast-orders-b2-fp8/`.
+
+
+Scheduling admission (2026-09-08): expanded finalists now retain the same
+exchange-storage penalty used by the mid search. Previously expansion ranked
+only execution cycles, undoing the preference for smaller exchange plans on a
+penalty retry. Ranking uses the existing geometry footprint rather than expanding
+or encoding a schedule; this estimate remains a ranking price, not a byte bound.
+
+Physical scheduling admits the configured finalist count plus one minimum-
+fragment alternative if absent from that shortlist. Package rejection no longer
+walks every expanded candidate. With the default count of one, each search pass
+admits at most two layouts (each may have an ordinary and mapped placement).
+Existing stronger-penalty retries can then surface simpler complete plans.
+Regression tests cover twenty rejected equivalent plans causing only one
+finalization attempt and retention of a slower, substantially smaller alternative.
+
+This is a bounded search policy, not proof that every excluded layout is
+unplaceable. The exact fragment limit still rejects before placement/scheduling;
+compact encoded byte acceptance remains after scheduling. No new full B1/B2
+ViT build has been run for this change, so current B2 feasibility is still unknown.

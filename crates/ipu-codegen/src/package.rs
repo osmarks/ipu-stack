@@ -1283,7 +1283,7 @@ pub fn capture_exchange_finalist(
     let mid = finalists
         .get(finalist)
         .ok_or_else(|| invalid("exchange capture finalist out of range"))?;
-    let (low, placement) =
+    let (low, placement, _) =
         selection::expand_and_place(mid, planning, config.tile_mapping.as_deref())?;
     Ok(crate::exchange::capture_exchange_schedule(
         &low, &placement,

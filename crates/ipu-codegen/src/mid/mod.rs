@@ -181,8 +181,9 @@ pub struct PipelineConfig {
     /// Maximum number of partial format assignments retained after each
     /// operation in a straight-line region.
     pub planning_beam_width: usize,
-    /// Number of complete beam finalists to materialize and rank with the
-    /// physical exchange scheduler. One retains analytical-only selection.
+    /// Number of complete finalists admitted to physical exchange scheduling.
+    /// Failed attempts count too; one additional minimum-fragment candidate
+    /// is retained if the admitted shortlist omits it.
     pub exchange_schedule_finalists: usize,
     /// Hard limit on actual compact encoded exchange tables per tile.
     /// Set to u64::MAX to disable this limit.

@@ -3,7 +3,8 @@ use super::*;
 
 struct ModelledPlan {
     index: usize,
-    cycles: u64,
+    score: u64,
+    fragments: u64,
     low: LowProgram,
     placement: crate::Placement,
     challenger: Option<Vec<u16>>,
@@ -66,7 +67,7 @@ pub(super) fn select_scheduled_finalist<T>(
         .enumerate()
         .map(|(index, mid)| {
             let screen = || -> PackageBuildResult<_> {
-                let (low, placement) = expand_and_place(&mid, planning, tile_mapping)?;
+                let (low, placement, footprint) = expand_and_place(&mid, planning, tile_mapping)?;
                 let (cycles, challenger) =
                     placement::model_mapping(&low, &placement, tile_mapping.is_none())?;
                 tracing::info!(
@@ -78,7 +79,15 @@ pub(super) fn select_scheduled_finalist<T>(
                 );
                 Ok(ModelledPlan {
                     index,
-                    cycles,
+                    // Preserve the search's storage preference after expansion.
+                    // Otherwise a penalty retry simply reselects the fast,
+                    // exchange-heavy plans that the retry was meant to avoid.
+                    score: cycles.saturating_add(
+                        footprint
+                            .estimated_row_bytes()
+                            .saturating_mul(planning.exchange_table_cost_per_byte),
+                    ),
+                    fragments: footprint.maximum_transfer_chunks_per_tile,
                     low,
                     placement,
                     challenger,
@@ -98,7 +107,7 @@ pub(super) fn select_scheduled_finalist<T>(
             }
         }
     }
-    modelled.sort_by_key(|plan| (plan.cycles, plan.index));
+    let modelled = admit_scheduling_candidates(modelled, planning);
     let mut best = None;
     let mut scheduled = 0;
     // Preserve compatible phase recipes when a finalist fails late package
@@ -108,7 +117,7 @@ pub(super) fn select_scheduled_finalist<T>(
         crate::ExchangeScheduleCache::default(),
     ];
     for plan in modelled {
-        // An infeasible schedule does not consume the bounded finalist budget.
+        // The admission shortlist above bounds failed attempts too.
         if scheduled >= planning.exchange_schedule_finalists.max(1) {
             break;
         }
@@ -206,13 +215,47 @@ pub(super) fn select_scheduled_finalist<T>(
     Ok((plan, artifact))
 }
 
+fn admit_scheduling_candidates(
+    mut modelled: Vec<ModelledPlan>,
+    planning: &PipelineConfig,
+) -> Vec<ModelledPlan> {
+    modelled.sort_by_key(|plan| (plan.score, plan.index));
+    let limit = planning.exchange_schedule_finalists.max(1);
+    // Keep one genuinely smaller alternative outside the performance shortlist.
+    // All other candidates are rejected before physical scheduling, including
+    // when the admitted candidates fail package acceptance.
+    let compact = modelled
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, plan)| (plan.fragments, plan.score, plan.index))
+        .map(|(position, _)| position);
+    let expanded_candidates = modelled.len();
+    let mut position = 0;
+    modelled.retain(|_| {
+        let keep = position < limit || Some(position) == compact;
+        position += 1;
+        keep
+    });
+    tracing::info!(
+        expanded_candidates,
+        admitted_candidates = modelled.len(),
+        "bounded physical exchange scheduling shortlist"
+    );
+    modelled
+}
+
 pub(super) fn expand_and_place(
     mid: &crate::MidProgram,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
-) -> PackageBuildResult<(LowProgram, crate::Placement)> {
+) -> PackageBuildResult<(
+    LowProgram,
+    crate::Placement,
+    crate::estimate::ExchangeFootprint,
+)> {
     let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
-    let fragments = crate::estimate::program_footprint(&expanded)?.maximum_transfer_chunks_per_tile;
+    let footprint = crate::estimate::program_footprint(&expanded)?;
+    let fragments = footprint.maximum_transfer_chunks_per_tile;
     tracing::info!(
         heuristic_row_bytes = mid.peak_memory.exchange_rows,
         geometry_fragments_per_tile = fragments,
@@ -228,7 +271,7 @@ pub(super) fn expand_and_place(
     placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
     let placement = place(&low)?;
-    Ok((low, placement))
+    Ok((low, placement, footprint))
 }
 
 pub(super) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> PackageBuildResult<()> {
@@ -290,7 +333,37 @@ mod tests {
     }
 
     #[test]
-    fn package_rejection_does_not_consume_finalist_budget() {
+    fn scheduling_admission_retains_a_compact_alternative() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [32, 16]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
+        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        let (low, placement, _) = expand_and_place(&mid, &config, None).unwrap();
+        let candidates = [(100, 10_000), (101, 10_000), (200, 1_000)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (score, fragments))| ModelledPlan {
+                index,
+                score,
+                fragments,
+                low: low.clone(),
+                placement: placement.clone(),
+                challenger: None,
+            })
+            .collect();
+        let admitted = admit_scheduling_candidates(candidates, &config);
+        assert_eq!(
+            admitted.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+            [0, 2]
+        );
+    }
+
+    #[test]
+    fn package_rejection_cannot_schedule_the_entire_shortlist() {
         let mut graph = ComputeGraph::new();
         let input = graph.host_input("input", [32, 16]).unwrap();
         let output = graph.gelu(input).unwrap();
@@ -301,17 +374,18 @@ mod tests {
             .unwrap()
             .remove(0);
         let mut attempts = 0;
-        let (_, accepted) =
-            select_scheduled_finalist(vec![mid.clone(), mid], &config, None, |_| {
-                attempts += 1;
-                if attempts == 1 {
-                    Err(invalid("exchange row tables do not fit"))
-                } else {
-                    Ok(attempts)
-                }
+        let result = select_scheduled_finalist(vec![mid; 20], &config, None, |_| {
+            attempts += 1;
+            Err::<(), _>(PackageBuildError::ExchangeBudgetExceeded {
+                bytes: 100 * 1024,
+                budget: 64 * 1024,
             })
-            .unwrap();
-        assert_eq!(accepted, 2);
+        });
+        assert!(matches!(
+            result,
+            Err(PackageBuildError::ExchangeBudgetExceeded { .. })
+        ));
+        assert_eq!(attempts, 1);
     }
 
     #[test]
