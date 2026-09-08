@@ -9,7 +9,7 @@ use crate::{
 fn grouped_ready_queue_matches_eager_priority() {
     let mut random = fastrand::Rng::with_seed(0x7061697273);
     for case in 0..16 {
-        let tiles = 8;
+        let tiles = if case & 4 == 0 { 8 } else { 32 };
         let transfers = (0..1024)
             .map(|index| {
                 let source = random.u16(0..tiles);
@@ -47,7 +47,8 @@ fn grouped_ready_queue_matches_eager_priority() {
             .collect::<Vec<_>>();
         let problem = SchedulingProblem::new(&transfers, tiles);
         let mut grouped = TransferScheduler::new(&problem);
-        assert!(!grouped.ready_groups.is_empty() && grouped.ready_groups.len() <= 112);
+        assert!(!grouped.ready_groups.is_empty());
+        assert!(grouped.ready_groups.len() <= 2 * usize::from(tiles * (tiles - 1)));
         let mut reference = TransferScheduler::new(&problem);
         reference.ready = std::mem::take(&mut reference.ready_groups)
             .into_iter()

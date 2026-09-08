@@ -1752,10 +1752,13 @@ impl<'a> TransferScheduler<'a> {
             }
             repairs += 1;
             // A wave can invalidate most keys. Once logarithmic root repairs
-            // cost a linear scan, refresh/reheapify once instead. Both readiness
+            // cost a linear scan, refresh/reheapify once instead. Charge heap
+            // traversal four times the contiguous scan: the large ViT captures
+            // benefit from refreshing sooner than comparison counts suggest.
+            // Both readiness
             // and pressure are monotone bounds, so this preserves eager priority.
             if self.ready.len() >= 128
-                && repairs * self.ready.len().ilog2() as usize >= self.ready.len()
+                && 4 * repairs * self.ready.len().ilog2() as usize >= self.ready.len()
             {
                 let mut entries = std::mem::take(&mut self.ready).into_vec();
                 for entry in &mut entries {
