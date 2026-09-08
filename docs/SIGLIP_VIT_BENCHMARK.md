@@ -160,9 +160,21 @@ incremental validations decreased from 847 ms to 358 ms with unchanged encoded
 word counts and checksums (`benchmark_receive_validation`, an ignored CPU
 benchmark in ipu-exchange). This does not eliminate quadratic copying of encoded
 prefixes. Slow instruction-alignment retries now log their start and duration.
-Row-table feasibility still needs to participate in finalist selection, using
-the linked image's available executable ranges; a raw transfer-count limit is
-not an equivalent memory check.
+Package construction now participates in finalist acceptance: failure to place
+the linked image, row tables or tensors rejects that candidate without consuming
+the successful-finalist budget. The next shortlisted candidate is then tried.
+Incremental alignment retries are limited to 64 Mi accumulated endpoint-history
+entries per schedule attempt. This deterministic compilation-effort policy
+leaves ordinary deferred scheduling unrestricted and reports budget exhaustion
+separately from invalid exchange instructions. It does not claim the rejected
+layout is physically impossible.
+
+The two-image small FP8 model passes hardware/reference validation with this
+acceptance path (maximum absolute error 0.130188), under
+`artifacts/vit/bounded-small-b2-fp8/`. Regression tests cover package rejection
+followed by successful selection and budget exhaustion with a still-valid
+exchange schedule. The full-size rerun is recorded under
+`artifacts/vit/bounded-so400m-fp8/`.
 
 Remaining structural limitations include standalone projection bias additions
 (which require row-major traversal), separate Q/K/V GEMMs in this benchmark, and
