@@ -18,24 +18,36 @@ pub(super) fn grid_fragments(input: &TensorType, output: &TensorType) -> Option<
     }
     let axes = |tensor: &TensorType| -> Option<Vec<Bounds>> {
         let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
-        let mut axes = resolved
-            .axes()?
-            .iter()
-            .map(|axis| {
-                axis.partitions()
-                    .iter()
-                    .map(|extent: &ShardExtent| (extent.start, extent.physical_end))
-                    .collect::<Bounds>()
-            })
-            .collect::<Vec<_>>();
-        match tensor.format.layout.order {
+        Some(
+            resolved
+                .axes()?
+                .iter()
+                .map(|axis| {
+                    axis.partitions()
+                        .iter()
+                        .map(|extent: &ShardExtent| (extent.start, extent.physical_end))
+                        .collect::<Bounds>()
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    let mut source = axes(input)?;
+    let mut destination = axes(output)?;
+    let bytes = input.format.precision.bytes();
+    // Whole-shard broadcasts are contiguous in every encoding. Only a change
+    // of partition bounds needs the physical axis factorization below.
+    if source == destination {
+        return Some(endpoint_fragments(&source, &destination, bytes));
+    }
+    for axes in [&mut source, &mut destination] {
+        match input.format.layout.order {
             ElementOrder::RowMajor => {}
             ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output) => {
-                let grain = tensor
+                let grain = input
                     .format
                     .layout
                     .order
-                    .retained_linear_column_grain(tensor.format.precision)?;
+                    .retained_linear_column_grain(input.format.precision)?;
                 let columns = axes.pop()?;
                 if columns
                     .iter()
@@ -54,11 +66,7 @@ pub(super) fn grid_fragments(input: &TensorType, output: &TensorType) -> Option<
             }
             _ => return None,
         }
-        Some(axes)
-    };
-    let source = axes(input)?;
-    let destination = axes(output)?;
-    let bytes = input.format.precision.bytes();
+    }
     Some(
         endpoint_fragments(&source, &destination, bytes).max(endpoint_fragments(
             &destination,
@@ -269,6 +277,41 @@ mod tests {
         output.format.layout.tiling.tile_count *= 24;
         output.format.layout.tiling.replicas = 24;
         assert_eq!(grid_fragments(&input, &output), Some(888));
+    }
+
+    #[test]
+    fn whole_block_major_shards_remain_contiguous_when_replicated() {
+        let input = tensor(
+            ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                row_block: 16,
+                column_block: 32,
+            }),
+            2,
+            2,
+        );
+        let mut output = input.clone();
+        output.format.layout.tiling.tile_count *= 8;
+        output.format.layout.tiling.replicas = 8;
+        assert_eq!(grid_fragments(&input, &output), Some(1));
+        let shard = input
+            .format
+            .layout
+            .shard_extents(&input.shape)
+            .unwrap()
+            .remove(0)
+            .1;
+        assert_eq!(
+            physical_byte_spans(
+                TensorStorage {
+                    format: &input.format,
+                    extents: &shard
+                },
+                &shard
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[test]

@@ -353,13 +353,13 @@ fn movement_fragment_bytes(input: &TensorType, output: &TensorType) -> u64 {
 }
 
 fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
-    if bytes == 0 || phases == 0 {
-        return (0, 0);
-    }
     exchange_fragment_price(bytes, phases, bytes.div_ceil(fragment_bytes.max(1)))
 }
 
 fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -> (u64, u64) {
+    if bytes == 0 || phases == 0 {
+        return (0, 0);
+    }
     let fragments = fragments.max(phases);
     let cycles = bytes
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
