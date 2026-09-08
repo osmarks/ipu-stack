@@ -152,3 +152,49 @@ historical evidence, not validation of current automatic B2 selection. Further
 work needs to trace why the known compact complete plan is absent or loses
 selection, and avoid repeating substantially equivalent failed work across
 penalty retries. Increasing penalties alone did not solve this run.
+
+## Wider shortlist experiment
+
+Commit `063465d` separates three admission limits:
+
+- `expanded_plan_finalists` / `--expanded-plan-finalists`: 16 complete plans per
+  planning configuration, before packing variants and deduplication (previously 4).
+- `placement_finalists` / `--placement-finalists`: 4 expanded candidates admitted
+  to placement and mapping, plus a minimum-storage alternative if needed.
+- `exchange_schedule_finalists`: the existing scheduling limit, default 1, with
+  its minimum-storage alternative retained independently.
+
+Both admission stages use the same budget-aware ranking. Geometry screening
+precedes placement; widening the expansion shortlist therefore does not widen
+placement or scheduling implicitly. Capture export uses the same expanded-plan
+count as package selection. The beam remains 64 wide.
+
+The B2 initial-search experiment is in
+`artifacts/vit/wide-shortlist-b2-fp8/{command.sh,run.log,stop-reason.txt}`. It screened
+62 complete expanded candidates, compared with 14 previously. None was predicted
+to fit; the minimum remained exactly 95,696 bytes. Four candidates were placed
+and mapped, then one was scheduled. Its encoded table remained exactly 77,584
+bytes, exceeding the unchanged 65,536-byte limit. No package or hardware profile
+was produced. The experiment was stopped after this first rejection; stronger
+storage-penalty retries with the wider shortlist were deliberately not tested.
+
+Timing on this run:
+
+- Mid search: 239.708 seconds (previous initial run: 239.373 seconds).
+- Mid completion to placement admission: 73.723 seconds for 62 candidates.
+- Individual expansion wall times under parallel load: 23.836–36.819 seconds,
+  median 28.880 seconds.
+- Additional footprint pass: 1.875–4.377 seconds, median 2.623 seconds. This
+  includes span matching, unlike snapshot-only model timings above.
+- Placement/mapping admission to scheduling admission: 7.857 seconds.
+- Scheduling admission to encoded-table rejection: 107.277 seconds.
+
+The broader initial shortlist did not recover a compact plan. This rules out a
+simple increase from four to sixteen returned plans as a sufficient fix for this
+initial search; it does not establish that all possible beam candidates or
+stronger-penalty searches fail. Candidate generation and earlier beam retention
+remain the next places to trace against the older successful B2 plan.
+
+Validation: 186 codegen tests and the doctest passed (4 ignored), and Clippy
+passed for codegen and tests. The selection regression tests cover preservation
+of compact alternatives and bounded work after package rejection.
