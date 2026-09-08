@@ -4,7 +4,7 @@
 mod cycles;
 mod exchange_storage;
 use exchange_storage::ExchangeStoragePhase;
-pub use exchange_storage::estimate_exchange_phase_storage;
+pub use exchange_storage::{ExchangeStorageEstimator, estimate_exchange_phase_storage};
 mod memory;
 mod mid;
 mod primitive;

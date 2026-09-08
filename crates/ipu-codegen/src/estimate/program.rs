@@ -218,6 +218,13 @@ fn geometry_traffic(
                         while remaining != 0 {
                             let chunk = remaining.min(max_bytes);
                             long_fragments += u64::from(chunk > 256);
+                            storage.connection(
+                                source.tile,
+                                target.tile,
+                                chunk,
+                                false,
+                                transfer.destinations.len(),
+                            );
                             storage.receive(target.tile, address, chunk);
                             address += chunk;
                             remaining -= chunk;
@@ -285,13 +292,33 @@ pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<Exchange
     // Sum each tile across static phases before taking the maximum; Repeat
     // execution counts do not multiply its stored table.
     let mut chunks = vec![0u64; usize::from(program.tile_count)];
-    let mut row_bytes = vec![0u64; usize::from(program.tile_count)];
+    fn iterated_sources(region: &BlockRegion, sources: &mut HashSet<crate::BlockValueId>) {
+        for operation in &region.operations {
+            if let BlockOperation::Repeat(repeat) = operation {
+                sources.extend(
+                    repeat
+                        .bindings
+                        .iter()
+                        .flat_map(|binding| &binding.iterated)
+                        .map(|binding| binding.argument),
+                );
+                iterated_sources(&repeat.body, sources);
+            }
+        }
+    }
+    let mut iterated = HashSet::new();
+    iterated_sources(&program.body, &mut iterated);
+    let mut table = ExchangeStorageEstimator::new(program.tile_count);
     for phase in &program.exchange_phases {
         let mut storage = ExchangeStoragePhase::new(program.tile_count);
         let traffic = geometry_traffic(program, phase, false, Some(&mut storage))?;
-        for (total, phase_bytes) in row_bytes.iter_mut().zip(storage.finish()) {
-            *total = total.saturating_add(phase_bytes);
+        for transfer in &phase.transfers {
+            if iterated.contains(&transfer.source.shard) {
+                storage
+                    .disable_sharing(program.shards[transfer.source.shard.index() as usize].tile);
+            }
         }
+        table.add(storage);
         for (tile, load) in traffic
             .outgoing_lanes
             .iter()
@@ -305,7 +332,7 @@ pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<Exchange
     Ok(ExchangeFootprint {
         phases: program.exchange_phases.len() as u64,
         maximum_transfer_chunks_per_tile: chunks.into_iter().max().unwrap_or(0),
-        encoded_row_bytes: Some(row_bytes.into_iter().max().unwrap_or(0)),
+        encoded_row_bytes: Some(table.maximum_bytes()),
     })
 }
 

@@ -101,9 +101,10 @@ fn main() -> Result<()> {
 
     let total_start = Instant::now();
     let mut estimated_totals = vec![0u64; usize::from(snapshot.tile_count)];
+    let mut storage = ipu_codegen::ExchangeStorageEstimator::new(snapshot.tile_count);
     for captured in problems {
         let start = Instant::now();
-        let estimate = ipu_codegen::estimate_exchange_phase_storage(snapshot.tile_count, captured);
+        let estimate = storage.add_phase(captured);
         let estimate_time = start.elapsed();
         for (total, bytes) in estimated_totals.iter_mut().zip(&estimate) {
             *total += bytes;
@@ -253,7 +254,8 @@ fn main() -> Result<()> {
         }
     }
     println!(
-        "estimatedMaximumTableBytes={}",
+        "estimatedMaximumTableBytes={} unsharedMaximumTableBytes={}",
+        storage.maximum_bytes(),
         estimated_totals.iter().max().unwrap_or(&0)
     );
     println!("totalMs={:.3}", milliseconds(total_start.elapsed()));

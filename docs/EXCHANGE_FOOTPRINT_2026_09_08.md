@@ -22,8 +22,8 @@ has not changed: this refinement applies once concrete span geometry is availabl
 
 This is a ranking model, not an upper or lower bound. Capture order can differ
 from scheduled order; scheduling changes pointer reuse, delays, bidirectional
-instruction combinations and paired modes. Cross-phase normalized-row sharing
-is not predicted. The public capture estimator treats transfers as ordinary
+instruction combinations and paired modes. Cross-phase normalized-row sharing was not predicted in the initial revision;
+the structural sharing extension below now estimates it. The public capture estimator treats transfers as ordinary
 Word32 equivalents, matching the pre-width-selection geometry model.
 
 ## Validation
@@ -86,3 +86,40 @@ Tests cover pointer continuity versus distinct allocations, per-tile phase
 accumulation, Repeat storage reuse, priority for predicted-fit candidates, and
 retaining an attempt when every estimate exceeds the budget. Full ViT builds
 were not repeated for this change.
+
+
+## Structural sharing extension
+
+Each tile now hashes its ordered transfer routes, receiver fanout, payload lengths,
+paired/ordinary mode and receive-pointer continuation decisions. Absolute memory
+addresses are omitted. The planner uses the same accumulator on concrete spans;
+the replay benchmark uses captured transfers. Encoded size and estimated patch
+count also form part of the sharing key. These are per-tile signatures, allowing
+unchanged rows to share even when other tiles have different work.
+
+A repeated signature stores the estimated row once. On the second occurrence the
+estimate adds shared patch offsets and address values for both invocations;
+subsequent occurrences add only their address values. This also allows the model
+to account for patch overhead exceeding the savings on short rows. Inactive rows
+share without patch data. Sender rows with iterated source pointers are excluded,
+matching the emitter's phase-specific treatment of Repeat patches.
+
+Signature matches are predictions, not permission to share actual executable
+code: placement, memory dependencies and global scheduling can change timing and
+break sharing. The emitter still compares normalized encoded words exactly.
+Hash collisions therefore affect only a heuristic estimate, never correctness.
+
+On the retained captures, the updated model predicts:
+
+| Capture | Without sharing | With sharing |
+| --- | ---: | ---: |
+| B2 finalist 0 | 75,456 bytes | 72,800 bytes |
+| B4 finalist 7 | 96,368 bytes | 85,552 bytes |
+
+Complete estimation with hashing took approximately 0.51 seconds per capture
+(excluding snapshot parsing and validation). Results are in
+`artifacts/exchange-footprint/{b2,b4}-sharing.log`. These are predicted savings;
+no full package was rebuilt to measure actual savings for these captures.
+
+Regression tests cover relocated compatible rows, address-value/offset storage,
+inactive rows, changed routes and payloads, and exclusion of iterated senders.

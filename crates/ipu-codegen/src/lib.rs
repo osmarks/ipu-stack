@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 mod estimate;
-pub use estimate::estimate_exchange_phase_storage;
+pub use estimate::{ExchangeStorageEstimator, estimate_exchange_phase_storage};
 mod exchange;
 pub mod graph;
 mod host;
