@@ -169,6 +169,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejected_receive_preserves_stream_and_encoding() {
+        let row = Topology::c600().multicast(0, &[2], 64, 0).unwrap().receivers[0];
+        let mut schedule = TileProgramSchedule::default();
+        schedule.append_receiver_at(&row, 0, 64).unwrap();
+        let encoded = schedule.encoded().unwrap().clone();
+        let next = schedule.earliest_receiver_offset(&row, 64, 0).unwrap();
+        assert!(schedule.append_receiver_at(&row, 0, 64).is_err());
+        assert!(Arc::ptr_eq(&encoded, schedule.encoded().unwrap()));
+        assert_eq!(schedule.earliest_receiver_offset(&row, 64, 0).unwrap(), next);
+        schedule.append_receiver_at(&row, next, 64).unwrap();
+        schedule.finish().unwrap();
+    }
+
+    #[test]
+    fn sender_insertion_checks_both_neighbors_without_changing_failed_history() {
+        let row = Topology::c600().multicast(0, &[2], 64, 0).unwrap().sender;
+        let mut schedule = TileProgramSchedule::default();
+        for offset in [3000, 1000, 2000] {
+            schedule.append_sender_at(&row, offset).unwrap();
+        }
+        let before = schedule.finish().unwrap();
+        for offset in [1999, 2000, 2001] {
+            assert!(schedule.append_sender_at(&row, offset).is_err());
+            assert_eq!(schedule.finish().unwrap(), before);
+        }
+        let mut ordered = TileProgramSchedule::default();
+        for offset in [1000, 2000, 3000] {
+            ordered.append_sender_at(&row, offset).unwrap();
+        }
+        assert_eq!(ordered.finish().unwrap(), before);
+    }
+
+    #[test]
     fn validation_budget_limits_effort_without_invalidating_the_schedule() {
         let topology = Topology::c600();
         let receivers = [2];

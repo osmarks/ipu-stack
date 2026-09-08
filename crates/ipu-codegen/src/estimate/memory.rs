@@ -88,7 +88,7 @@ impl MemoryPeaks {
         self,
         reserved_standard_bytes: u64,
     ) -> u64 {
-        self.contiguous_overflow(reserved_standard_bytes.saturating_add(self.exchange_rows))
+        self.contiguous_overflow(reserved_standard_bytes)
     }
 
     fn contiguous_overflow(self, reserved: u64) -> u64 {

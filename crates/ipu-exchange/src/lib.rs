@@ -790,9 +790,18 @@ impl TileProgramSchedule {
         schedule_offset: u32,
     ) -> Result<(), ExchangeError> {
         let timing = sender_row_timing(row, schedule_offset)?;
-        if self.senders.iter().any(|sender| {
-            timing.start_cycles < sender.end_cycles && sender.start_cycles < timing.end_cycles
-        }) {
+        let index = self
+            .senders
+            .partition_point(|sender| sender.start_cycles < timing.start_cycles);
+        if self
+            .senders
+            .get(index.wrapping_sub(1))
+            .is_some_and(|sender| sender.end_cycles > timing.start_cycles)
+            || self
+                .senders
+                .get(index)
+                .is_some_and(|sender| sender.start_cycles < timing.end_cycles)
+        {
             return Err(ExchangeError::Schedule("overlapping outgoing messages"));
         }
         if self.receive_control_at_send_start(timing.start_cycles) {
@@ -800,11 +809,14 @@ impl TileProgramSchedule {
         }
         self.invalidate_encoding();
         self.event_cycles = self.event_cycles.max(timing.horizon_cycles);
-        self.senders.push(ScheduledSenderRow {
-            row: *row,
-            start_cycles: timing.start_cycles,
-            end_cycles: timing.end_cycles,
-        });
+        self.senders.insert(
+            index,
+            ScheduledSenderRow {
+                row: *row,
+                start_cycles: timing.start_cycles,
+                end_cycles: timing.end_cycles,
+            },
+        );
         Ok(())
     }
 
@@ -836,14 +848,14 @@ impl TileProgramSchedule {
                     .ok_or(ExchangeError::Schedule("receive address overflow"))
             })
             .transpose()?;
+        if let Some(stream) = &self.receive_stream
+            && (timing.source_start < stream.source_end_cycles
+                || timing.payload_start < stream.pointer_end_cycles)
+        {
+            return Err(ExchangeError::Schedule("overlapping receive streams"));
+        }
         self.invalidate_encoding();
-        let previous = self.receive_stream.take();
-        if let Some(stream) = &previous {
-            if timing.source_start < stream.source_end_cycles
-                || timing.payload_start < stream.pointer_end_cycles
-            {
-                return Err(ExchangeError::Schedule("overlapping receive streams"));
-            }
+        if let Some(stream) = &self.receive_stream {
             self.receive_events
                 .retain(|event| !replaces_receive_event(*event, base.mode, &timing, stream));
         }

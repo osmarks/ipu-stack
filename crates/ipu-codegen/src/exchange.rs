@@ -993,12 +993,17 @@ fn select_transfer_widths(
         .zip(alternatives)
         .map(|(ordinary, paired)| paired.unwrap_or_else(|| ordinary.clone()))
         .collect();
-    let ordinary = optimize_owned_pending(topology, pending, tile_count)?;
-    let paired = match optimize_owned_pending(topology, paired, tile_count) {
-        Ok(paired) => paired,
-        Err(error) => {
+    let ordinary = optimize_owned_pending(topology, pending, tile_count);
+    let paired = optimize_owned_pending(topology, paired, tile_count);
+    let (ordinary, paired) = match (ordinary, paired) {
+        (Ok(ordinary), Ok(paired)) => (ordinary, paired),
+        (ordinary, Err(error)) => {
             tracing::debug!(phase, %error, "paired exchange candidate is not encodable");
-            return Ok(ordinary);
+            return ordinary;
+        }
+        (Err(error), Ok(paired)) => {
+            tracing::debug!(phase, %error, "ordinary exchange candidate is not encodable");
+            return Ok(paired);
         }
     };
     let ordinary_horizon = ordinary.optimized.schedule.horizon;

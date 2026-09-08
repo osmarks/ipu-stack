@@ -55,7 +55,7 @@ impl TileGraphBuilder {
                     | ElementOrder::BlockMajor(_)
             ) {
                 let mut provenance = operation_provenance(operation);
-                provenance.reason = WorkReason::OperatorKernel;
+                provenance.reason = WorkReason::LayoutRearrangement;
                 let unpacked = self
                     .unpack_amp_to_row_major(*input, provenance, body)?
                     .ok_or(ExpansionError::InvalidOperatorPlan)?;
