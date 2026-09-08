@@ -1278,7 +1278,9 @@ pub fn capture_exchange_finalist(
         graph,
         planning,
         &Ipu21CostModel,
-        planning.exchange_schedule_finalists.max(4),
+        planning
+            .expanded_plan_finalists
+            .max(planning.exchange_schedule_finalists),
     )?;
     let mid = finalists
         .get(finalist)

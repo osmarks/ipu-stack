@@ -1,6 +1,12 @@
 //! Expand a bounded shortlist, model placement, then schedule its best candidates.
 use super::*;
 
+struct ExpandedPlan {
+    index: usize,
+    low: LowProgram,
+    footprint: crate::estimate::ExchangeFootprint,
+}
+
 struct ModelledPlan {
     index: usize,
     score: u64,
@@ -39,7 +45,9 @@ pub(super) fn select_graph_finalist<T>(
                 graph,
                 &search,
                 &costs,
-                search.exchange_schedule_finalists.max(4),
+                search
+                    .expanded_plan_finalists
+                    .max(search.exchange_schedule_finalists),
             )?)
         })?;
         result = select_scheduled_finalist(finalists, &search, tile_mapping, &mut finalize);
@@ -66,23 +74,61 @@ pub(super) fn select_scheduled_finalist<T>(
         .into_par_iter()
         .enumerate()
         .map(|(index, mid)| {
-            let screen = || -> PackageBuildResult<_> {
-                let (low, placement, footprint) = expand_and_place(&mid, planning, tile_mapping)?;
+            let span = tracing::info_span!("screen_finalist", finalist = index);
+            let _entered = span.enter();
+            let result = expand_and_screen(&mid, planning, tile_mapping).map(|(low, footprint)| {
+                ExpandedPlan {
+                    index,
+                    low,
+                    footprint,
+                }
+            });
+            (index, result)
+        })
+        .collect();
+    let mut failure = invalid("no operator-plan finalists");
+    let expanded = feasible_candidates(screened, &mut failure);
+    let expanded = admit_candidates(
+        expanded,
+        planning
+            .placement_finalists
+            .max(planning.exchange_schedule_finalists),
+        planning.exchange_table_budget_bytes,
+        |plan| {
+            (
+                plan.footprint.estimated_row_bytes(),
+                plan.low.estimated_cycles.saturating_add(
+                    plan.footprint
+                        .estimated_row_bytes()
+                        .saturating_mul(planning.exchange_table_cost_per_byte),
+                ),
+                plan.index,
+            )
+        },
+        "placement",
+    );
+    let placed = expanded
+        .into_par_iter()
+        .map(|plan| {
+            let ExpandedPlan {
+                index,
+                low,
+                footprint,
+            } = plan;
+            let result = (|| -> PackageBuildResult<_> {
+                let start = Instant::now();
+                let placement = place(&low)?;
                 let (cycles, challenger) =
                     placement::model_mapping(&low, &placement, tile_mapping.is_none())?;
                 tracing::info!(
                     finalist = index,
+                    elapsed_ms = start.elapsed().as_millis(),
                     modelled_cycles = cycles,
                     estimated_row_bytes = footprint.estimated_row_bytes(),
-                    estimated_cycles = low.estimated_cycles,
-                    estimated_exchange_cycles = low.estimated_exchange_cycles,
                     "modelled expanded operator plan"
                 );
                 Ok(ModelledPlan {
                     index,
-                    // Preserve the search's storage preference after expansion.
-                    // Otherwise a penalty retry simply reselects the fast,
-                    // exchange-heavy plans that the retry was meant to avoid.
                     score: cycles.saturating_add(
                         footprint
                             .estimated_row_bytes()
@@ -93,21 +139,11 @@ pub(super) fn select_scheduled_finalist<T>(
                     placement,
                     challenger,
                 })
-            };
-            (index, screen())
+            })();
+            (index, result)
         })
-        .collect::<Vec<_>>();
-    let mut modelled = Vec::new();
-    let mut failure = invalid("no operator-plan finalists");
-    for (index, result) in screened {
-        match result {
-            Ok(plan) => modelled.push(plan),
-            Err(error) => {
-                tracing::info!(finalist=index, %error, "rejected infeasible operator-plan finalist");
-                failure = error;
-            }
-        }
-    }
+        .collect();
+    let modelled = feasible_candidates(placed, &mut failure);
     let modelled = admit_scheduling_candidates(modelled, planning);
     let mut best = None;
     let mut scheduled = 0;
@@ -216,40 +252,65 @@ pub(super) fn select_scheduled_finalist<T>(
     Ok((plan, artifact))
 }
 
+fn feasible_candidates<T>(
+    candidates: Vec<(usize, PackageBuildResult<T>)>,
+    failure: &mut PackageBuildError,
+) -> Vec<T> {
+    candidates.into_iter().filter_map(|(index, result)| match result {
+        Ok(plan) => Some(plan),
+        Err(error) => {
+            tracing::info!(finalist=index, %error, "rejected infeasible operator-plan finalist");
+            *failure = error;
+            None
+        }
+    }).collect()
+}
+
 fn admit_scheduling_candidates(
-    mut modelled: Vec<ModelledPlan>,
+    modelled: Vec<ModelledPlan>,
     planning: &PipelineConfig,
 ) -> Vec<ModelledPlan> {
-    modelled.sort_by_key(|plan| {
-        (
-            plan.row_bytes
-                .saturating_sub(planning.exchange_table_budget_bytes),
-            plan.score,
-            plan.index,
-        )
+    admit_candidates(
+        modelled,
+        planning.exchange_schedule_finalists,
+        planning.exchange_table_budget_bytes,
+        |plan| (plan.row_bytes, plan.score, plan.index),
+        "scheduling",
+    )
+}
+
+// Both admission boundaries preserve a minimum-storage alternative. Expanding
+// more candidates does not implicitly authorize more placement or scheduling.
+fn admit_candidates<T>(
+    mut plans: Vec<T>,
+    limit: usize,
+    budget: u64,
+    metrics: impl Fn(&T) -> (u64, u64, usize),
+    stage: &'static str,
+) -> Vec<T> {
+    plans.sort_by_key(|plan| {
+        let (bytes, score, index) = metrics(plan);
+        (bytes.saturating_sub(budget), score, index)
     });
-    let limit = planning.exchange_schedule_finalists.max(1);
-    // Keep one genuinely smaller alternative outside the performance shortlist.
-    // All other candidates are rejected before physical scheduling, including
-    // when the admitted candidates fail package acceptance.
-    let compact = modelled
+    let compact = plans
         .iter()
         .enumerate()
-        .min_by_key(|(_, plan)| (plan.row_bytes, plan.score, plan.index))
-        .map(|(position, _)| position);
-    let expanded_candidates = modelled.len();
+        .min_by_key(|(_, plan)| metrics(plan))
+        .map(|(index, _)| index);
+    let candidates = plans.len();
     let mut position = 0;
-    modelled.retain(|_| {
-        let keep = position < limit || Some(position) == compact;
+    plans.retain(|_| {
+        let keep = position < limit.max(1) || Some(position) == compact;
         position += 1;
         keep
     });
     tracing::info!(
-        expanded_candidates,
-        admitted_candidates = modelled.len(),
-        "bounded physical exchange scheduling shortlist"
+        stage,
+        candidates,
+        admitted_candidates = plans.len(),
+        "bounded finalist shortlist"
     );
-    modelled
+    plans
 }
 
 pub(super) fn expand_and_place(
@@ -261,10 +322,25 @@ pub(super) fn expand_and_place(
     crate::Placement,
     crate::estimate::ExchangeFootprint,
 )> {
+    let (low, footprint) = expand_and_screen(mid, planning, tile_mapping)?;
+    let placement = place(&low)?;
+    Ok((low, placement, footprint))
+}
+
+fn expand_and_screen(
+    mid: &crate::MidProgram,
+    planning: &PipelineConfig,
+    tile_mapping: Option<&[u16]>,
+) -> PackageBuildResult<(LowProgram, crate::estimate::ExchangeFootprint)> {
+    let start = Instant::now();
     let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
+    let expansion_ms = start.elapsed().as_millis();
     let footprint = crate::estimate::program_footprint(&expanded)?;
     let fragments = footprint.maximum_transfer_chunks_per_tile;
     tracing::info!(
+        expansion_ms,
+        expansion_and_footprint_ms = start.elapsed().as_millis(),
+        estimated_row_bytes = footprint.estimated_row_bytes(),
         heuristic_row_bytes = mid.peak_memory.exchange_rows,
         geometry_fragments_per_tile = fragments,
         fragment_limit = planning.exchange_transfer_limit_per_tile,
@@ -278,8 +354,7 @@ pub(super) fn expand_and_place(
     }
     placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
-    let placement = place(&low)?;
-    Ok((low, placement, footprint))
+    Ok((low, footprint))
 }
 
 pub(super) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> PackageBuildResult<()> {

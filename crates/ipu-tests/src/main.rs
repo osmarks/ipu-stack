@@ -124,6 +124,12 @@ struct Arguments {
     /// Cap geometry-derived static transfer fragments per tile (default 16384).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_transfer_limit_per_tile: Option<u64>,
+    /// Complete plans per configuration to expand and estimate.
+    #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
+    expanded_plan_finalists: usize,
+    /// Expanded plans admitted to placement/mapping, plus a compact alternative.
+    #[arg(long, default_value_t = 4, conflicts_with = "reuse_package")]
+    placement_finalists: usize,
     /// Rank this many complete planner finalists with physical exchange scheduling.
     #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
     exchange_schedule_finalists: usize,
@@ -674,6 +680,8 @@ fn main() -> Result<()> {
         _ => ipu_codegen::GemmOutputPacking::Automatic,
     };
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
+    pipeline.expanded_plan_finalists = arguments.expanded_plan_finalists.max(1);
+    pipeline.placement_finalists = arguments.placement_finalists.max(1);
     pipeline = pipeline
         .with_attention_strategy(arguments.attention_strategy.into())
         .with_attention_products(arguments.attention_products.into());

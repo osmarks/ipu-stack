@@ -181,6 +181,11 @@ pub struct PipelineConfig {
     /// Maximum number of partial format assignments retained after each
     /// operation in a straight-line region.
     pub planning_beam_width: usize,
+    /// Complete plans returned per planning configuration for geometry screening.
+    pub expanded_plan_finalists: usize,
+    /// Expanded candidates admitted to placement/mapping, plus the smallest
+    /// estimated-storage alternative if absent. Independent of scheduling count.
+    pub placement_finalists: usize,
     /// Number of complete finalists admitted to physical exchange scheduling.
     /// Failed attempts count too; one additional minimum-estimated-storage candidate
     /// is retained if the admitted shortlist omits it.
@@ -266,6 +271,8 @@ impl PipelineConfig {
             operator_candidates: default_operator_candidates(tile_count),
             shape_aware_active_tile_counts: true,
             planning_beam_width: 64,
+            expanded_plan_finalists: 16,
+            placement_finalists: 4,
             exchange_schedule_finalists: 1,
             exchange_table_budget_bytes: 64 * 1024,
             exchange_transfer_limit_per_tile: 16_384,
