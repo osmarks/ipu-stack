@@ -2,20 +2,39 @@
 use super::*;
 
 impl MidProgram {
-    pub(super) fn with_distributed_packing(&self) -> Option<Self> {
-        let mut result = self.clone();
-        if !distribute_region(&mut result.operations, &mut result.values, self.tile_count) {
-            return None;
+    pub(super) fn distributed_packing_candidates(&self) -> Vec<Self> {
+        let mut candidates = Vec::<Self>::new();
+        let metrics = |p: &Self| planner::PlanMetrics {
+            cycles: p.estimated_cycles,
+            memory: p.peak_memory,
+        };
+        for rows in [32, 64, 128, 256] {
+            let mut result = self.clone();
+            if !distribute_region(
+                &mut result.operations,
+                &mut result.values,
+                self.tile_count,
+                rows,
+            ) {
+                continue;
+            }
+            let Some((cycles, peak)) = crate::estimate::analyze_mid(&result, &BTreeMap::new())
+            else {
+                continue;
+            };
+            result.estimated_cycles = cycles.total;
+            result.estimated_exchange_cycles = cycles.exchange;
+            result.peak_memory = peak;
+            if candidates
+                .iter()
+                .any(|p| p == &result || metrics(p).dominates(metrics(&result)))
+            {
+                continue;
+            }
+            candidates.retain(|p| !metrics(&result).dominates(metrics(p)));
+            candidates.push(result);
         }
-        let (before, _) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
-        let (after, peak) = crate::estimate::analyze_mid(&result, &BTreeMap::new())?;
-        if after.total >= before.total {
-            return None;
-        }
-        result.estimated_cycles = after.total;
-        result.estimated_exchange_cycles = after.exchange;
-        result.peak_memory = peak;
-        Some(result)
+        candidates
     }
 }
 
@@ -78,12 +97,13 @@ fn distribute_region(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     capacity: u16,
+    rows: u16,
 ) -> bool {
     let mut result = Vec::new();
     let mut changed = false;
     for mut operation in std::mem::take(operations) {
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
-            changed |= distribute_region(&mut repeat.body.operations, values, capacity);
+            changed |= distribute_region(&mut repeat.body.operations, values, capacity, rows);
         }
         let mut best = None;
         if let MidOperationKind::Primitive(Primitive::Copy { .. }) = &operation.kind
@@ -98,69 +118,54 @@ fn distribute_region(
             && values[output.index() as usize].tensor_type.format.precision == Precision::F16
         {
             let target = values[output.index() as usize].clone();
-            if let Some((old, _, _)) = crate::estimate::operation_cost(&operation, values) {
-                let mut best_cycles = old.total;
-                for rows in [32, 64, 128, 256] {
-                    let Some(layout) = packing_layout(&target.tensor_type, capacity, rows) else {
-                        continue;
-                    };
-                    let start = values.len();
-                    let packed = MidValueId(start as u32 + 1);
-                    let logical = MidValueId(start as u32);
-                    let mut tensor = target.tensor_type.clone();
-                    tensor.format.layout = layout.clone();
-                    let mut row_major = tensor.clone();
-                    row_major.format.layout.order = ElementOrder::RowMajor;
-                    for (id, tensor_type) in [(logical, row_major.clone()), (packed, tensor)] {
-                        values.push(MidValue {
-                            id,
-                            tensor_type,
-                            storage_group: id,
-                            ..target.clone()
-                        });
-                    }
-                    let mut gather = operation.clone();
-                    gather.results = vec![logical];
-                    let pack = MidOperation {
-                        inputs: vec![logical],
-                        results: vec![packed],
-                        source: operation.source,
-                        kind: MidOperationKind::Primitive(Primitive::Compute {
-                            kernel: TileKernelSpec::Rearrange {
-                                from: row_major.format.layout,
-                                to: layout,
-                            },
-                            operands: vec![OperandWindow::default()],
-                            product: None,
-                            reuse_input: None,
-                        }),
-                        estimated_cycles: 0,
-                        estimated_exchange_cycles: 0,
-                    };
-                    let transfer = MidOperation {
-                        inputs: vec![packed],
-                        results: vec![*output],
-                        source: operation.source,
-                        kind: MidOperationKind::Primitive(Primitive::Copy {
-                            mapping: CoordinateMapping::default(),
-                            reuse_local: true,
-                        }),
-                        estimated_cycles: 0,
-                        estimated_exchange_cycles: 0,
-                    };
-                    let steps = vec![gather, pack, transfer];
-                    let price = steps.iter().try_fold(0u64, |sum, op| {
-                        crate::estimate::operation_cost(op, values)
-                            .map(|(cost, _, _)| sum.saturating_add(cost.total))
+            if let Some(layout) = packing_layout(&target.tensor_type, capacity, rows) {
+                let start = values.len();
+                let packed = MidValueId(start as u32 + 1);
+                let logical = MidValueId(start as u32);
+                let mut tensor = target.tensor_type.clone();
+                tensor.format.layout = layout.clone();
+                let mut row_major = tensor.clone();
+                row_major.format.layout.order = ElementOrder::RowMajor;
+                for (id, tensor_type) in [(logical, row_major.clone()), (packed, tensor)] {
+                    values.push(MidValue {
+                        id,
+                        tensor_type,
+                        storage_group: id,
+                        ..target.clone()
                     });
-                    if let Some(price) = price
-                        && price < best_cycles
-                    {
-                        best_cycles = price;
-                        best = Some((steps, values[start..].to_vec()));
-                    }
-                    values.truncate(start);
                 }
+                let mut gather = operation.clone();
+                gather.results = vec![logical];
+                let pack = MidOperation {
+                    inputs: vec![logical],
+                    results: vec![packed],
+                    source: operation.source,
+                    kind: MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Rearrange {
+                            from: row_major.format.layout,
+                            to: layout,
+                        },
+                        operands: vec![OperandWindow::default()],
+                        product: None,
+                        reuse_input: None,
+                    }),
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                };
+                let transfer = MidOperation {
+                    inputs: vec![packed],
+                    results: vec![*output],
+                    source: operation.source,
+                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                        mapping: CoordinateMapping::default(),
+                        reuse_local: true,
+                    }),
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                };
+                let steps = vec![gather, pack, transfer];
+                best = Some((steps, values[start..].to_vec()));
+                values.truncate(start);
             }
         }
         if let Some((steps, temporaries)) = best {
@@ -252,29 +257,30 @@ mod tests {
                 }],
                 ..MidProgram::default()
             };
-            let packed = program
-                .with_distributed_packing()
-                .expect("parallel packing is cheaper");
-            let low = crate::lower_to_tiles(
-                &crate::low::expand::expand_tiles(&packed, false).unwrap(),
-                false,
-            );
-            let mut packs = 0;
-            for run in &low.kernel_runs {
-                if let TileKernelSpec::Rearrange { from, to } = &run.kernel {
-                    assert_eq!(from.order, ElementOrder::RowMajor);
-                    assert!(matches!(
-                        to.order,
-                        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                            row_block: 32..=256,
-                            ..
-                        })
-                    ));
-                    crate::validate_kernel_run(run).unwrap();
-                    packs += 1;
+            let candidates = program.distributed_packing_candidates();
+            assert!(!candidates.is_empty() && candidates.len() <= 4);
+            for packed in candidates {
+                let low = crate::lower_to_tiles(
+                    &crate::low::expand::expand_tiles(&packed, false).unwrap(),
+                    false,
+                );
+                let mut packs = 0;
+                for run in &low.kernel_runs {
+                    if let TileKernelSpec::Rearrange { from, to } = &run.kernel {
+                        assert_eq!(from.order, ElementOrder::RowMajor);
+                        assert!(matches!(
+                            to.order,
+                            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                                row_block: 32..=256,
+                                ..
+                            })
+                        ));
+                        crate::validate_kernel_run(run).unwrap();
+                        packs += 1;
+                    }
                 }
+                assert!(packs > 10 && packs <= 64);
             }
-            assert!(packs > 10 && packs <= 64);
         }
     }
 }

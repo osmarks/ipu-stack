@@ -144,3 +144,21 @@ geometry-derived endpoint fragments on the busiest tile, above the former
 it does not establish that another finalist or retry fits both limits.
 Regression coverage includes a contiguous 8 KiB span, disjoint phase owners,
 Repeat reuse, fragment-limit boundaries, and independent encoded-byte checks.
+
+## Cast ordering and packing alternatives
+
+Eligible FP16-to-FP8 operator inputs offer both orders of casting and
+redistribution before the existing region-beam prune. Choices are independent
+between inputs and operations; automatic host bindings avoid duplicate choices
+when the host can supply the requested physical layout directly. Prescribed
+Repeat boundary conversions use redistribution followed by casting. Available
+reusable quantizations participate in beam equivalence; reuse itself remains
+unchanged. No new global policy or retry was added for cast ordering.
+
+The distributed packing pass now constructs the four supported panel-size
+variants (32, 64, 128, 256 rows) and retains their non-dominated whole-program
+cycle/memory tradeoffs using the same `PlanMetrics` as the beam. Each variant
+uses its chosen size for eligible packing operations; the original program is
+also retained. The old local winner selection and cycles-only acceptance gate
+are removed. This bounds the additions at four programs per original rather
+than enumerating a Cartesian product across every packing operation.

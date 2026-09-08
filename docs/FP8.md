@@ -186,10 +186,13 @@ conversion before replication.
 ## Row-major producer casting and pipelined casts (2026-09-08)
 
 Row-major F16 producers can now cast directly into FP8 AMP-left panels on their
-existing owners. The mid planner compares this local cast/pack followed by FP8
-redistribution with the existing F16 redistribution followed by casting. It
-retains the latter when cheaper. Exact local quantizations are reused within a region, so compatible projection
-consumers share early quantization. Replicated consumer operands are materialized
+existing owners. Eligible operator inputs offer both local cast/pack followed
+by FP8 redistribution and F16 redistribution followed by casting to the ordinary
+region beam. Inputs choose independently, so one graph can mix the two orders;
+there is no local winner selection or extra whole-graph cast-policy retry.
+Exact local quantizations are reused within a region, so compatible projection
+consumers share early quantization. Their availability is part of the beam's
+future-state key, since it changes the cost of later consumers. Replicated consumer operands are materialized
 separately to avoid extending their much larger allocations across consumers.
 
 The producer must own complete 32-column groups. This deliberately does not pad

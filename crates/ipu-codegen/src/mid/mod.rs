@@ -100,9 +100,7 @@ pub(crate) fn lower_finalists(
             program.with_elementwise_fusions().unwrap_or(program)
         };
         if !config.diagnostic_checkpoints {
-            if let Some(packed) = program.with_distributed_packing() {
-                candidates.push(packed);
-            }
+            candidates.extend(program.distributed_packing_candidates());
             for limit in 2..=config.max_parallel_reductions {
                 if let Some(overlapped) = program.with_overlapped_reductions(limit)
                     && !candidates.contains(&overlapped)

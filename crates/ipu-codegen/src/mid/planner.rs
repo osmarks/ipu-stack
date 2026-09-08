@@ -327,6 +327,7 @@ pub(super) struct FutureDeferredState {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct FutureBeamState {
+    pub(super) quantized: Vec<(ValueId, TensorType)>,
     pub(super) values: Vec<FutureValueState>,
     pub(super) deferred: Vec<FutureDeferredState>,
     pub(super) equal_formats_satisfied: Vec<(ValueId, ValueId, bool)>,
@@ -580,39 +581,65 @@ pub(super) fn lower_operation_candidates(
             saw_candidate |= !candidate_plans.is_empty();
             let evaluated = candidate_plans
                 .into_par_iter()
-                .map(|plan| {
-                    let mut next = branch.clone();
-                    next.analysis.take();
-                    apply_selected_plan(
-                        operation,
-                        output_shape.clone(),
-                        plan,
-                        &operation
+                .flat_map_iter(|plan| {
+                    let mut orders = vec![Vec::new()];
+                    for (&input, requirement) in input_ids.iter().zip(&plan.requirements.inputs) {
+                        let tensor = &branch.state.get(input).tensor_type;
+                        let alternatives = !branch.state.automatic_inputs.contains(&input)
+                            && early_cast_format(tensor, &requirement.format).is_some()
+                            && tensor.format.layout != requirement.format.layout;
+                        orders = orders
+                            .into_iter()
+                            .flat_map(|order| {
+                                [false, true]
+                                    .into_iter()
+                                    .take(if alternatives { 2 } else { 1 })
+                                    .map(move |early| {
+                                        let mut next = order.clone();
+                                        next.push(early);
+                                        next
+                                    })
+                            })
+                            .collect();
+                    }
+                    let branch = &branch;
+                    let output_shape = &output_shape;
+                    let value_uses = &value_uses;
+                    orders.into_iter().map(move |cast_orders| {
+                        let mut next = branch.clone();
+                        next.analysis.take();
+                        apply_selected_plan(
+                            operation,
+                            (*output_shape).clone(),
+                            plan.clone(),
+                            &cast_orders,
+                            &operation
+                                .inputs
+                                .iter()
+                                .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
+                                .collect::<Vec<_>>(),
+                            costs,
+                            &mut next.values,
+                            &mut next.state,
+                            &mut next.operations,
+                        );
+                        let boundary = next.operations.last().unwrap();
+                        let tensors = boundary
                             .inputs
                             .iter()
-                            .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
-                            .collect::<Vec<_>>(),
-                        costs,
-                        &mut next.values,
-                        &mut next.state,
-                        &mut next.operations,
-                    );
-                    let boundary = next.operations.last().unwrap();
-                    let tensors = boundary
-                        .inputs
-                        .iter()
-                        .chain(&boundary.results)
-                        .map(|id| &next.state.get(*id).tensor_type);
-                    let mut usage = MemoryUsage::default();
-                    let mut maximum_standard = 0;
-                    for tensor in tensors {
-                        let memory = crate::estimate::tensor_memory(tensor);
-                        usage = usage.saturating_add(memory);
-                        maximum_standard = maximum_standard.max(memory.standard);
-                    }
-                    next.peak_memory.observe(usage, maximum_standard);
-                    refresh_exchange_rows(&mut next, costs);
-                    next
+                            .chain(&boundary.results)
+                            .map(|id| &next.state.get(*id).tensor_type);
+                        let mut usage = MemoryUsage::default();
+                        let mut maximum_standard = 0;
+                        for tensor in tensors {
+                            let memory = crate::estimate::tensor_memory(tensor);
+                            usage = usage.saturating_add(memory);
+                            maximum_standard = maximum_standard.max(memory.standard);
+                        }
+                        next.peak_memory.observe(usage, maximum_standard);
+                        refresh_exchange_rows(&mut next, costs);
+                        next
+                    })
                 })
                 .collect::<Vec<_>>();
             expanded.extend(evaluated);
@@ -1028,10 +1055,16 @@ pub(super) fn future_beam_state(
     };
     let mut values = Vec::new();
     let mut deferred_sources = Vec::new();
+    let mut quantized = Vec::new();
     for &origin in future_origins {
         let Some(&id) = branch.values.get(&origin) else {
             continue;
         };
+        for operation in &branch.operations {
+            if let Some(value) = reusable_cast(operation, id) {
+                quantized.push((origin, branch.state.get(value).tensor_type.clone()));
+            }
+        }
         values.push(FutureValueState {
             origin,
             tensor_type: branch.state.get(id).tensor_type.clone(),
@@ -1090,7 +1123,10 @@ pub(super) fn future_beam_state(
             (left, right, satisfied)
         })
         .collect();
+    quantized.sort();
+    quantized.dedup();
     FutureBeamState {
+        quantized,
         values,
         deferred,
         equal_formats_satisfied,
@@ -1205,6 +1241,7 @@ pub(super) fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,
     mut plan: OperatorPlan,
+    cast_orders: &[bool],
     single_use_inputs: &[bool],
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
@@ -1219,12 +1256,17 @@ pub(super) fn apply_selected_plan(
     let original_input_ids = input_ids.clone();
     let mut source_types = Vec::with_capacity(input_ids.len());
     let mut converted = Vec::with_capacity(input_ids.len());
-    for (value, requirement) in input_ids.into_iter().zip(&plan.requirements.inputs) {
+    for ((value, requirement), &cast_before) in input_ids
+        .into_iter()
+        .zip(&plan.requirements.inputs)
+        .zip(cast_orders)
+    {
         let conversion_start = operations.len();
         let converted_value = ensure_format(
             value,
             requirement.format.clone(),
             requirement.materialization,
+            cast_before,
             operation.id,
             costs,
             state,
@@ -1643,6 +1685,7 @@ pub(super) fn lower_repeat(
                         value,
                         target.clone(),
                         OperandMaterialization::Complete,
+                        false,
                         operation.id,
                         costs,
                         state,
@@ -1660,6 +1703,7 @@ pub(super) fn lower_repeat(
             value,
             target,
             OperandMaterialization::Complete,
+            false,
             operation.id,
             costs,
             state,
@@ -1718,10 +1762,37 @@ pub(super) fn lower_repeat(
     Ok(())
 }
 
+fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValueId> {
+    (operation.inputs.as_slice() == [input]
+        && operation.conversion_plan().is_some_and(|plan| {
+            plan.strategy == ConversionStrategy::LocalKernel
+                && plan.input.format.precision != plan.output.format.precision
+                && plan.output.materialization == OperandMaterialization::Complete
+        }))
+    .then(|| operation.results[0])
+}
+
+// Eligibility only: the region beam compares complete conversion sequences.
+fn early_cast_format(input: &TensorType, target: &TensorFormat) -> Option<TensorFormat> {
+    if input.format.precision != Precision::F16
+        || !matches!(target.precision, Precision::F8F143 { .. })
+    {
+        return None;
+    }
+    let quantized = TensorFormat {
+        precision: target.precision,
+        layout: input.fp8_producer_layout(target)?,
+    };
+    (quantized.layout.order == target.layout.order
+        || quantized.supports_micro_panel_exchange(target))
+    .then_some(quantized)
+}
+
 pub(super) fn ensure_format(
     mut value: MidValueId,
     target: TensorFormat,
     materialization: OperandMaterialization,
+    cast_before: bool,
     source: OperationId,
     costs: &impl CostModel,
     state: &mut LoweringState,
@@ -1745,61 +1816,14 @@ pub(super) fn ensure_format(
     {
         return value;
     }
-    let mut cast_layout = state.get(value).tensor_type.format.layout.clone();
-    let mut early_cast = None;
-    if fp8_cast {
-        cast_layout = initial_layout;
-        let input = &state.get(value).tensor_type;
-        let producer_layout = input.fp8_producer_layout(&target);
-        let quantized = TensorFormat {
-            precision: target.precision,
-            layout: producer_layout
-                .clone()
-                .unwrap_or_else(|| input.format.layout.clone()),
-        };
-        // Quantize once on the producer's owners when the resulting panels
-        // can feed the consumer directly. Price both orders of operations.
-        if packed_cast
-            && producer_layout.is_some()
-            && (quantized.layout.order == target.layout.order
-                || quantized.supports_micro_panel_exchange(&target))
-        {
-            let movement = |precision, from: &Layout, to: &Layout| {
-                if from == to {
-                    0
-                } else {
-                    costs
-                        .rearrangement_cost(
-                            &input.shape,
-                            precision,
-                            layout_conversion_strategy(from, to),
-                            from,
-                            to,
-                        )
-                        .cycles
-                }
-            };
-            let before = costs
-                .cast_format_cycles(input, &quantized)
-                .saturating_add(movement(
-                    target.precision,
-                    &quantized.layout,
-                    &target.layout,
-                ));
-            let after_input = TensorType {
-                shape: input.shape.clone(),
-                format: TensorFormat {
-                    precision: from,
-                    layout: cast_layout.clone(),
-                },
-            };
-            let after = movement(from, &input.format.layout, &cast_layout)
-                .saturating_add(costs.cast_format_cycles(&after_input, &target));
-            if before <= after {
-                early_cast = Some(quantized);
-            }
-        }
-    }
+    let cast_layout = if fp8_cast {
+        initial_layout
+    } else {
+        state.get(value).tensor_type.format.layout.clone()
+    };
+    let early_cast = cast_before
+        .then(|| early_cast_format(&state.get(value).tensor_type, &target))
+        .flatten();
     let formats = if let Some(quantized) = early_cast {
         vec![quantized, target]
     } else {
@@ -1826,16 +1850,13 @@ pub(super) fn ensure_format(
         };
         // Share quantization on the producer's owners, not the much larger
         // replicated consumer operands whose lifetimes should remain local.
-        if let Some(existing) = operations.iter().rev().find(|operation| {
-            operation.inputs.as_slice() == [value]
-                && operation.conversion_plan().is_some_and(|plan| {
-                    plan.strategy == ConversionStrategy::LocalKernel
-                        && plan.input.format.precision != plan.output.format.precision
-                        && plan.output.materialization == OperandMaterialization::Complete
-                        && plan.output.format == output.format
-                })
-        }) {
-            value = existing.results[0];
+        if let Some(existing) = operations
+            .iter()
+            .rev()
+            .filter_map(|operation| reusable_cast(operation, value))
+            .find(|&id| state.get(id).tensor_type.format == output.format)
+        {
+            value = existing;
             continue;
         }
         let cast = input.format.precision != output.format.precision;
@@ -1966,4 +1987,78 @@ fn exchange_pressure_preserves_slower_prefix_without_changing_cycle_estimates() 
             expected_cycles
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cast_orders_expand_to_different_traffic_and_future_reuse_states() {
+    let mut graph = ComputeGraph::new();
+    let origin = graph.host_input("x", [32, 128]).unwrap();
+    graph.gelu(origin).unwrap();
+    let mut state = LoweringState::default();
+    let input = state.value(
+        origin,
+        TensorType::new([32, 128], Precision::F16, Layout::row_sharded(1)),
+    );
+    let target = TensorFormat {
+        precision: Precision::F8F143 { scale_exponent: -4 },
+        layout: Layout {
+            tiling: TensorTiling::replicated(4),
+            ..Layout::amp_left(1, 1)
+        },
+    };
+    let mut signatures = Vec::new();
+    for early in [false, true] {
+        let mut branch = BeamBranch {
+            values: BTreeMap::from([(origin, input)]),
+            state: state.clone(),
+            operations: Vec::new(),
+            peak_memory: MemoryPeaks::default(),
+            analysis: std::sync::OnceLock::new(),
+        };
+        let output = ensure_format(
+            input,
+            target.clone(),
+            OperandMaterialization::Complete,
+            early,
+            graph.operations()[0].id,
+            &Ipu21CostModel,
+            &mut branch.state,
+            &mut branch.operations,
+        );
+        let copy = branch
+            .operations
+            .iter()
+            .filter_map(MidOperation::conversion_plan)
+            .find(|p| p.strategy != ConversionStrategy::LocalKernel)
+            .unwrap();
+        assert_eq!(
+            copy.input.format.precision,
+            if early {
+                target.precision
+            } else {
+                Precision::F16
+            }
+        );
+        signatures.push(future_beam_state(
+            &branch,
+            &BTreeSet::from([origin]),
+            &RegionPlanningConstraints::default(),
+        ));
+        let program = MidProgram {
+            tile_count: 4,
+            values: branch.state.values,
+            operations: branch.operations,
+            inputs: vec![MidInput {
+                name: "x".into(),
+                kind: GraphInputKind::Host,
+                value: input,
+            }],
+            outputs: vec![output],
+            ..Default::default()
+        };
+        let low = crate::lower_to_tiles(&crate::expand_tiles(&program).unwrap(), false);
+        crate::KernelBuildPlan::from_program(&low).unwrap();
+    }
+    assert_ne!(signatures[0], signatures[1]);
 }
