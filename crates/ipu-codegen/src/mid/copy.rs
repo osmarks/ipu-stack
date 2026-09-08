@@ -76,17 +76,10 @@ pub(super) fn compose(
     let mut uses = vec![0usize; values.len()];
     for input in operations
         .iter()
-        .flat_map(|operation| &operation.inputs)
+        .flat_map(MidOperation::read_values)
         .chain(required)
     {
         uses[input.index() as usize] += 1;
-    }
-    for operation in operations.iter() {
-        if let MidOperationKind::Repeat(repeat) = &operation.kind {
-            for input in repeat.iterated_inputs.iter().flatten() {
-                uses[input.index() as usize] += 1;
-            }
-        }
     }
     let mut producers = BTreeMap::<MidValueId, usize>::new();
     let mut removed = BTreeSet::new();

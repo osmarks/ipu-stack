@@ -3,16 +3,8 @@
 use super::*;
 
 impl KernelBuildPlan {
-    pub(super) fn add_unpack(
-        &mut self,
-        (order, logical_rows, physical_rows, logical_columns, physical_columns): (
-            UnpackSource,
-            u32,
-            u32,
-            u32,
-            u32,
-        ),
-    ) {
+    pub(super) fn add_unpack(&mut self, shape: (UnpackSource, u32, u32, u32, u32)) {
+        let (order, logical_rows, physical_rows, logical_columns, physical_columns) = shape;
         let order_index = order.codelet_index();
         let (row_block, column_block) = match order {
             UnpackSource::Blocked(
@@ -37,75 +29,42 @@ impl KernelBuildPlan {
         };
         let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
         let call = format!("unpack_amp_to_row_major_f16_{suffix}");
+        self.symbols
+            .insert(KernelSpecialization::Unpack(shape), call.clone());
+        let mut flags = vec![
+            format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
+            format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
+            format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
+            format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
+        ];
         if order_index == 1 {
+            flags.push(format!("-DUNPACK_CALL_SYMBOL={call}"));
             self.compilations.push(KernelCompilation {
                 source: "unpack_transposed_amp_f16.S",
                 name: format!("unpack_transposed_amp_f16_{suffix}"),
-                flags: vec![
-                    format!("-DUNPACK_CALL_SYMBOL={call}"),
-                    format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
-                    format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
-                    format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
-                    format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
-                ],
-                retained_symbols: vec![call.clone()],
+                flags,
+                retained_symbols: vec![call],
             });
-            self.symbols.insert(
-                KernelSpecialization::Unpack((
-                    order,
-                    logical_rows,
-                    physical_rows,
-                    logical_columns,
-                    physical_columns,
-                )),
-                call,
-            );
-            return;
-        }
-        self.compilations.push(KernelCompilation {
-            source: "unpack_amp_f16.cpp",
-            name: format!("unpack_amp_f16_codelet_{suffix}"),
-            flags: vec![
+        } else {
+            flags.extend([
                 "-O2".into(),
                 format!("-DUNPACK_SOURCE_ORDER={order_index}"),
                 format!("-DUNPACK_ROW_BLOCK={row_block}"),
                 format!("-DUNPACK_COLUMN_BLOCK={column_block}"),
-                format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
-                format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
-                format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
-                format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
                 format!("-DUNPACK_VERTEX_NAME={vertex}"),
-            ],
-            retained_symbols: Vec::new(),
-        });
-        self.add_worker_wrapper(
-            format!("unpack_amp_f16_wrapper_{suffix}"),
-            &call,
-            &vertex,
-            &[3, 2, 4, 5, 6, 7, 8, 9],
-        );
-        self.symbols.insert(
-            KernelSpecialization::Unpack((
-                order,
-                logical_rows,
-                physical_rows,
-                logical_columns,
-                physical_columns,
-            )),
-            call,
-        );
+            ]);
+            self.add_vertex(
+                "unpack_amp_f16.cpp",
+                &call,
+                &vertex,
+                flags,
+                &[3, 2, 4, 5, 6, 7, 8, 9],
+            );
+        }
     }
 
-    pub(super) fn add_rearrangement(
-        &mut self,
-        (order, logical_rows, physical_rows, logical_columns, physical_columns): (
-            RearrangeTarget,
-            u32,
-            u32,
-            u32,
-            u32,
-        ),
-    ) {
+    pub(super) fn add_rearrangement(&mut self, shape: (RearrangeTarget, u32, u32, u32, u32)) {
+        let (order, logical_rows, physical_rows, logical_columns, physical_columns) = shape;
         let order_index = order.codelet_index();
         let (row_block, column_block) = match order {
             RearrangeTarget::BlockMajor {
@@ -126,16 +85,8 @@ impl KernelBuildPlan {
         };
         let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
         let call = format!("rearrange_row_major_to_amp_f16_{suffix}");
-        self.symbols.insert(
-            KernelSpecialization::Rearrange((
-                order,
-                logical_rows,
-                physical_rows,
-                logical_columns,
-                physical_columns,
-            )),
-            call.clone(),
-        );
+        self.symbols
+            .insert(KernelSpecialization::Rearrange(shape), call.clone());
         let assembly = if order == RearrangeTarget::AmpLeft
             && logical_columns.is_multiple_of(2)
             && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
@@ -177,20 +128,21 @@ impl KernelBuildPlan {
                 format!("-DREARRANGE_VERTEX_NAME={vertex}"),
             ]);
         }
-        self.compilations.push(KernelCompilation {
-            source: assembly.unwrap_or("rearrange_f16.cpp"),
-            name: format!("rearrange_f16_codelet_{suffix}"),
-            flags,
-            retained_symbols: assembly.map(|_| vec![call.clone()]).unwrap_or_default(),
-        });
-        if assembly.is_some() {
-            return;
+        if let Some(source) = assembly {
+            self.compilations.push(KernelCompilation {
+                source,
+                name: format!("rearrange_f16_codelet_{suffix}"),
+                flags,
+                retained_symbols: vec![call],
+            });
+        } else {
+            self.add_vertex(
+                "rearrange_f16.cpp",
+                &call,
+                &vertex,
+                flags,
+                &[3, 2, 4, 5, 6, 7, 8, 9],
+            );
         }
-        self.add_worker_wrapper(
-            format!("rearrange_f16_wrapper_{suffix}"),
-            &call,
-            &vertex,
-            &[3, 2, 4, 5, 6, 7, 8, 9],
-        );
     }
 }

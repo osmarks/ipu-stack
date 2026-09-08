@@ -16,26 +16,20 @@ impl KernelBuildPlan {
         );
         let call_symbol = format!("flash_attention_online_f16_{suffix}");
         let vertex = format!("FlashAttentionOnlineF16_{suffix}");
-        let common_flags = vec![
+        let flags = vec![
             format!("-DATTENTION_MATRICES={}", shape.matrices),
             format!("-DATTENTION_QUERY_ROWS={}", shape.query_rows),
             format!("-DATTENTION_KEY_ROWS={}", shape.key_rows),
             format!("-DATTENTION_QUERY_DIMENSION={}", shape.query_dimension),
             format!("-DATTENTION_VALUE_DIMENSION={}", shape.value_dimension),
             format!("-DATTENTION_SCALE={}", f32::from_bits(shape.scale_bits)),
+            format!("-DATTENTION_VERTEX_NAME={vertex}"),
         ];
-        let mut codelet_flags = common_flags;
-        codelet_flags.push(format!("-DATTENTION_VERTEX_NAME={vertex}"));
-        self.compilations.push(KernelCompilation {
-            source: "flash_attention_online_f16.cpp",
-            name: format!("flash_attention_codelet_{suffix}"),
-            flags: codelet_flags,
-            retained_symbols: Vec::new(),
-        });
-        self.add_worker_wrapper(
-            format!("flash_attention_wrapper_{suffix}"),
+        self.add_vertex(
+            "flash_attention_online_f16.cpp",
             &call_symbol,
             &vertex,
+            flags,
             &[3, 4, 5, 2],
         );
         self.symbols

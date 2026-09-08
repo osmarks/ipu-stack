@@ -158,13 +158,9 @@ impl KernelSpecialization {
 
 #[derive(Default)]
 pub(super) struct KernelInventory {
+    pub(super) exact_symbols: BTreeSet<&'static str>,
     pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
-    pub(super) gelu: bool,
-    pub(super) normalization: bool,
-    pub(super) add: bool,
-    pub(super) cast_f32_f16: bool,
     pub(super) fp8_casts: BTreeSet<(u64, u64)>,
-    pub(super) reduction_add: bool,
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     pub(super) unpacks: BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
     pub(super) attention: BTreeSet<AttentionKernelShape>,
@@ -185,24 +181,14 @@ impl KernelInventory {
                     if abi.availability != KernelAvailability::Implemented {
                         return Err(KernelAbiError::Unavailable(kernel.clone()));
                     }
-                    if matches!(abi.symbols, KernelSymbols::Exact(_)) {
+                    if let KernelSymbols::Exact(symbol) = abi.symbols {
+                        self.exact_symbols.insert(symbol);
                         if let TileKernelSpec::Cast { from, to } = kernel
                             && (matches!(from, Precision::F8F143 { .. })
                                 || matches!(to, Precision::F8F143 { .. }))
                         {
                             self.fp8_casts.insert((from.bytes(), to.bytes()));
                         }
-                        self.cast_f32_f16 |= matches!(
-                            kernel,
-                            TileKernelSpec::Cast {
-                                from: Precision::F32,
-                                to: Precision::F16
-                            }
-                        );
-                        self.normalization |= matches!(kernel, TileKernelSpec::LayerNorm);
-                        self.add |= matches!(kernel, TileKernelSpec::Add);
-                        self.gelu |= matches!(kernel, TileKernelSpec::Gelu);
-                        self.reduction_add |= matches!(kernel, TileKernelSpec::ReductionSum { .. });
                         continue;
                     }
                     match KernelSpecialization::from_run(run)? {

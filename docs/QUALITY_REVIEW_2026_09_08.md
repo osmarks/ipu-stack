@@ -131,3 +131,21 @@ new rejected-receive/out-of-order-send regressions. Clippy passed for both crate
 and all targets. No new hardware timing or whole-ViT compiler speedup is claimed
 for these review corrections. The larger timeline/cache/frontier changes above
 are proposals, not implemented changes.
+
+## Follow-up production-code cleanup
+
+The next pass removes 90 non-test production lines relative to `b649899`
+(150 added, 240 removed, excluding `kernel/tests.rs`). C++ vertex compilation
+and supervisor wrappers now have one assembly path; unpack recipes share shape
+flags and symbol registration. Fixed-kernel inventory records the ABI-selected
+symbols rather than maintaining a second classification through five booleans.
+Ownership passes share alias-group rotation, and copy/use analysis shares
+`MidOperation::read_values`, including Repeat parameter sequences.
+
+Validation: 164 codegen tests, its doctest and Clippy pass. A small batch-two FP8
+ViT with 64 active compute tiles was compiled before and after. All 1,472 loaded
+tile images, input/weight/output bindings and profile plans are identical.
+Artifacts and the comparison are in `artifacts/cleanup-20260908/`. Intermediate
+codelet object names are now consistently derived from their public call symbol;
+the linked kernel ABI and program bytes did not change in this comparison.
+Exchange scheduling was not changed in this cleanup pass.

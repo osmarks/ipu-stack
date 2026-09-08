@@ -380,6 +380,15 @@ pub struct MidOperation {
 }
 
 impl MidOperation {
+    /// Values read in the enclosing region, including a repeat's parameter sequences.
+    pub(crate) fn read_values(&self) -> impl Iterator<Item = &MidValueId> {
+        let sequences = match &self.kind {
+            MidOperationKind::Repeat(repeat) => repeat.iterated_inputs.as_slice(),
+            _ => &[],
+        };
+        self.inputs.iter().chain(sequences.iter().flatten())
+    }
+
     pub fn operator_plan(&self) -> Option<&OperatorPlan> {
         match &self.kind {
             MidOperationKind::Operator { plan, .. } => Some(plan),

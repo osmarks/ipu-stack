@@ -16,13 +16,8 @@ impl MidProgram {
         let mut uses = vec![0; self.values.len()];
         let mut sums = BTreeSet::new();
         for operation in &self.operations {
-            for input in &operation.inputs {
-                uses[self.values[input.index() as usize].storage_group.index() as usize] += 1;
-            }
-            if let MidOperationKind::Repeat(repeat) = &operation.kind {
-                for input in repeat.iterated_inputs.iter().flatten() {
-                    uses[self.values[input.index() as usize].storage_group.index() as usize] += 1;
-                }
+            for input in operation.read_values() {
+                uses[storage_groups[input.index() as usize].index() as usize] += 1;
             }
             if matches!(
                 operation.kind,
@@ -59,33 +54,12 @@ impl MidProgram {
                     .then_some(input)
                 })
                 .collect::<Vec<_>>();
-            let total = sources
-                .iter()
-                .map(|id| {
-                    u32::from(
-                        self.values[id.index() as usize]
-                            .tensor_type
-                            .format
-                            .layout
-                            .tiling
-                            .tile_count,
-                    )
-                })
-                .sum::<u32>();
+            let total = sources.iter().map(|&id| self.owner_count(id)).sum::<u32>();
             if sources.len() > 1 && total <= u32::from(self.tile_count) {
-                let mut offset = self.values[sources[0].index() as usize].tile_offset;
-                for source in sources {
-                    let value = &self.values[source.index() as usize];
-                    for alias in &mut result.values {
-                        if alias.storage_group == value.storage_group {
-                            changed |= alias.tile_offset != offset;
-                            alias.tile_offset = offset;
-                        }
-                    }
-                    offset = ((u32::from(offset)
-                        + u32::from(value.tensor_type.format.layout.tiling.tile_count))
-                        % u32::from(self.tile_count)) as u16;
-                }
+                changed |= result.rotate_owners(
+                    &sources,
+                    self.values[sources[0].index() as usize].tile_offset,
+                );
             }
             index += count.max(1);
         }
@@ -131,8 +105,7 @@ impl MidProgram {
             let mut used = false;
             for consumer in &self.operations {
                 if consumer
-                    .inputs
-                    .iter()
+                    .read_values()
                     .any(|id| groups[id.index() as usize] == group)
                 {
                     used = true;
@@ -155,16 +128,7 @@ impl MidProgram {
                 continue;
             }
             let mut selected = vec![start];
-            let owners = |op: &MidOperation| {
-                u32::from(
-                    self.values[op.results[0].index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .tiling
-                        .tile_count,
-                )
-            };
+            let owners = |op: &MidOperation| self.owner_count(op.results[0]);
             let mut total = owners(&result.operations[start]);
             for next in start + 1..result.operations.len() {
                 let operation = &result.operations[next];
@@ -205,21 +169,43 @@ impl MidProgram {
                 sums.push(result.operations.remove(index));
             }
             sums.reverse();
-            let mut offset = self.values[sums[0].results[0].index() as usize].tile_offset;
-            for sum in &sums {
-                let group = groups[sum.results[0].index() as usize];
-                for value in &mut result.values {
-                    if value.storage_group == group {
-                        value.tile_offset = offset;
-                    }
-                }
-                offset = ((u32::from(offset) + owners(sum)) % u32::from(self.tile_count)) as u16;
-            }
+            result.rotate_owners(
+                &sums.iter().map(|sum| sum.results[0]).collect::<Vec<_>>(),
+                self.values[sums[0].results[0].index() as usize].tile_offset,
+            );
             start = insertion + sums.len();
             result.operations.splice(insertion..insertion, sums);
             changed = true;
         }
         changed.then_some(result)
+    }
+
+    fn owner_count(&self, value: MidValueId) -> u32 {
+        u32::from(
+            self.values[value.index() as usize]
+                .tensor_type
+                .format
+                .layout
+                .tiling
+                .tile_count,
+        )
+    }
+
+    /// Rotate complete alias groups together; callers check the combined owner count.
+    fn rotate_owners(&mut self, sources: &[MidValueId], mut offset: u16) -> bool {
+        let mut changed = false;
+        for &source in sources {
+            let group = self.values[source.index() as usize].storage_group;
+            for alias in &mut self.values {
+                if alias.storage_group == group {
+                    changed |= alias.tile_offset != offset;
+                    alias.tile_offset = offset;
+                }
+            }
+            offset = ((u32::from(offset) + self.owner_count(source)) % u32::from(self.tile_count))
+                as u16;
+        }
+        changed
     }
 
     pub(super) fn assign_parameter_tiles(&mut self) -> LoweringResult<()> {

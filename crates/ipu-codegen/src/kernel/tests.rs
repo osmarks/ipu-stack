@@ -530,10 +530,7 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
             .compilations
             .iter()
             .find(|object| {
-                object.source == "rearrange_f16.cpp"
-                    && object
-                        .name
-                        .ends_with(&format!("_b{row_block}x{column_block}"))
+                object.source == "rearrange_f16.cpp" && object.name == format!("{symbol}_codelet")
             })
             .unwrap();
         assert!(
@@ -692,7 +689,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
 #[test]
 fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
     let plan = KernelBuildPlan::from_inventory(KernelInventory {
-        cast_f32_f16: true,
+        exact_symbols: BTreeSet::from(["cast_f32_f16"]),
         ..KernelInventory::default()
     })
     .unwrap();

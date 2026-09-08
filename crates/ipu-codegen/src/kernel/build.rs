@@ -29,13 +29,9 @@ impl KernelBuildPlan {
 
     pub(super) fn from_inventory(inventory: KernelInventory) -> Result<Self, KernelAbiError> {
         let KernelInventory {
+            exact_symbols,
             rows,
-            gelu,
-            normalization,
-            add,
-            cast_f32_f16,
             fp8_casts,
-            reduction_add,
             rearrangements,
             unpacks,
             attention,
@@ -45,35 +41,32 @@ impl KernelBuildPlan {
         for (configuration, rows) in rows {
             plan.add_gemm(configuration, rows);
         }
-        for (enabled, symbol, vertex, registers) in [
-            (
-                normalization,
-                "layer_norm_f16",
-                "LayerNormF16",
-                &[3, 4, 5, 2, 6, 7][..],
-            ),
-            (add, "add_f16", "AddF16", &[3, 4, 2, 5, 6, 7][..]),
-        ] {
-            if enabled {
-                plan.compilations.push(KernelCompilation {
+        if exact_symbols.contains("layer_norm_f16") {
+            plan.compilations.extend([
+                KernelCompilation {
                     source: "elementwise_f16.cpp",
-                    name: format!("{symbol}_codelet"),
-                    flags: vec!["-O2".into(), format!("-DVERTEX_{vertex}")],
+                    name: "layer_norm_f16_codelet".into(),
+                    flags: vec!["-O2".into(), "-DVERTEX_LayerNormF16".into()],
                     retained_symbols: vec![],
-                });
-                if symbol == "layer_norm_f16" {
-                    plan.compilations.push(KernelCompilation {
-                        source: "layer_norm_f16.S",
-                        name: "layer_norm_f16_wrapper".into(),
-                        flags: vec![],
-                        retained_symbols: vec![symbol.into()],
-                    });
-                } else {
-                    plan.add_worker_wrapper(format!("{symbol}_wrapper"), symbol, vertex, registers);
-                }
-            }
+                },
+                KernelCompilation {
+                    source: "layer_norm_f16.S",
+                    name: "layer_norm_f16_wrapper".into(),
+                    flags: vec![],
+                    retained_symbols: vec!["layer_norm_f16".into()],
+                },
+            ]);
         }
-        if gelu {
+        if exact_symbols.contains("add_f16") {
+            plan.add_vertex(
+                "elementwise_f16.cpp",
+                "add_f16",
+                "AddF16",
+                vec!["-O2".into(), "-DVERTEX_AddF16".into()],
+                &[3, 4, 2, 5, 6, 7],
+            );
+        }
+        if exact_symbols.contains("gelu_tanh_approx_f16") {
             plan.compilations.push(KernelCompilation {
                 source: "gelu_f16.S",
                 name: "gelu_f16".into(),
@@ -81,7 +74,7 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["gelu_tanh_approx_f16".into()],
             });
         }
-        if reduction_add {
+        if exact_symbols.contains("reduce_sum_f16") {
             plan.compilations.push(KernelCompilation {
                 source: "reduce_add_f16.S",
                 name: "reduce_add_f16".into(),
@@ -89,23 +82,18 @@ impl KernelBuildPlan {
                 retained_symbols: vec!["reduce_sum_f16".into()],
             });
         }
-        if cast_f32_f16 {
-            plan.compilations.push(KernelCompilation {
-                source: "cast_f32_f16.cpp",
-                name: "cast_f32_f16_codelet".into(),
-                flags: vec!["-O2".into()],
-                retained_symbols: Vec::new(),
-            });
-            plan.add_worker_wrapper(
-                "cast_f32_f16_wrapper".into(),
+        if exact_symbols.contains("cast_f32_f16") {
+            plan.add_vertex(
+                "cast_f32_f16.cpp",
                 "cast_f32_f16",
                 "CastF32ToF16",
+                vec!["-O2".into()],
                 &[3, 2, 4],
             );
         }
-        let has_worker_codelets = normalization
-            || add
-            || cast_f32_f16
+        let has_worker_codelets = ["layer_norm_f16", "add_f16", "cast_f32_f16"]
+            .iter()
+            .any(|symbol| exact_symbols.contains(symbol))
             || !fp8_casts.is_empty()
             || !rearrangements.is_empty()
             || !unpacks.is_empty();
@@ -117,21 +105,16 @@ impl KernelBuildPlan {
             };
             let symbol = format!("cast_{}_{}", name(from), name(to));
             let vertex = format!("Cast{from}To{to}");
-            plan.compilations.push(KernelCompilation {
-                source: "cast_f8.cpp",
-                name: format!("{symbol}_codelet"),
-                flags: vec![
+            plan.add_vertex(
+                "cast_f8.cpp",
+                &symbol,
+                &vertex,
+                vec![
                     "-O2".into(),
                     format!("-DINPUT_BYTES={from}"),
                     format!("-DOUTPUT_BYTES={to}"),
                     format!("-DCAST_VERTEX={vertex}"),
                 ],
-                retained_symbols: Vec::new(),
-            });
-            plan.add_worker_wrapper(
-                format!("{symbol}_wrapper"),
-                &symbol,
-                &vertex,
                 &[3, 2, 4, 5, 6, 7, 8],
             );
         }
@@ -156,15 +139,22 @@ impl KernelBuildPlan {
         Ok(plan)
     }
 
-    /// Marshal supervisor registers into the C++ vertex argument block.
+    /// Compile a C++ vertex and marshal supervisor registers into its argument block.
     /// The register order follows the vertex fields, independently of call ABI.
-    pub(super) fn add_worker_wrapper(
+    pub(super) fn add_vertex(
         &mut self,
-        name: String,
+        source: &'static str,
         symbol: &str,
         vertex: &str,
+        flags: Vec<String>,
         registers: &[u8],
     ) {
+        self.compilations.push(KernelCompilation {
+            source,
+            name: format!("{symbol}_codelet"),
+            flags,
+            retained_symbols: Vec::new(),
+        });
         let arguments = registers
             .iter()
             .map(|register| format!("$m{register}"))
@@ -173,7 +163,7 @@ impl KernelBuildPlan {
         let frame_bytes = (registers.len() * 4).next_multiple_of(16);
         self.compilations.push(KernelCompilation {
             source: "worker_call.S",
-            name,
+            name: format!("{symbol}_wrapper"),
             flags: vec![
                 format!("-DWORKER_CALL_SYMBOL={symbol}"),
                 format!("-DWORKER_CODELET_SYMBOL=__runCodelet_{vertex}"),
