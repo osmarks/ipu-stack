@@ -101,19 +101,10 @@ fn fuse_region(
         {
             continue;
         }
-        let compatible = match fused {
-            TileKernelSpec::BiasGelu => {
-                right.tensor_type.shape.0.last() == output_type.shape.0.last()
-                    && right.tensor_type.shape.0[..right.tensor_type.shape.0.len() - 1]
-                        .iter()
-                        .all(|&size| size == 1)
-            }
-            TileKernelSpec::AddLayerNorm => {
-                right.tensor_type == *output_type && right.tile_offset == output_value.tile_offset
-            }
-            _ => unreachable!(),
-        };
-        if !compatible {
+        if !compatible_fusion(&fused, &left.tensor_type, &right.tensor_type, output_type)
+            || (fused == TileKernelSpec::AddLayerNorm
+                && right.tile_offset != output_value.tile_offset)
+        {
             continue;
         }
         // Parameter copies may intervene. Delay the add only if none can
@@ -168,6 +159,33 @@ fn fuse_region(
         keep
     });
     changed
+}
+
+// Shared with the optimistic regional search: known fusion is not a missing kernel.
+pub(super) fn compatible_fusion(
+    kernel: &TileKernelSpec,
+    left: &TensorType,
+    right: &TensorType,
+    output: &TensorType,
+) -> bool {
+    if left != output
+        || output.format.precision != Precision::F16
+        || right.format.precision != Precision::F16
+        || output.format.layout.order != ElementOrder::RowMajor
+    {
+        return false;
+    }
+    match kernel {
+        TileKernelSpec::BiasGelu => {
+            right.shape.0.last() == output.shape.0.last()
+                && !right.shape.0.is_empty()
+                && right.shape.0[..right.shape.0.len() - 1]
+                    .iter()
+                    .all(|&size| size == 1)
+        }
+        TileKernelSpec::AddLayerNorm => right == output,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

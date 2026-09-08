@@ -13,6 +13,12 @@ pub(crate) struct ResolvedAxis {
 }
 
 impl ResolvedAxis {
+    pub(crate) fn extent_sizes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.partitions
+            .iter()
+            .map(|part| part.physical_end - part.start)
+    }
+
     pub(crate) fn complete_panels_except_tail(&self, grain: u32) -> bool {
         self.partitions
             .iter()

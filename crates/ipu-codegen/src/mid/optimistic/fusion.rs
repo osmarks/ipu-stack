@@ -89,11 +89,33 @@ pub(super) fn fuse(
         let savings = saved_bytes
             .div_ceil(8)
             .saturating_add((operations.len() as u64 - 1) * 330);
-        let assumptions = BTreeSet::from([Assumption::MissingKernel(format!(
-            "fused {:?} with {} live outputs",
-            operations.iter().map(|op| &op.kind).collect::<Vec<_>>(),
-            outputs.len()
-        ))]);
+        let known = known_fusion_cost(graph, &group, &operations, &outputs);
+        if known.is_some_and(|price| price >= original.conservative) {
+            steps.push(graph.steps[at].clone());
+            at += 1;
+            continue;
+        }
+        let (cycles, assumptions) = if let Some(price) = known {
+            (
+                CycleEstimate {
+                    optimistic: price,
+                    conservative: price,
+                },
+                BTreeSet::new(),
+            )
+        } else {
+            (
+                CycleEstimate {
+                    optimistic: original.optimistic.saturating_sub(savings).max(330),
+                    conservative: original.conservative,
+                },
+                BTreeSet::from([Assumption::MissingKernel(format!(
+                    "fused {:?} with {} live outputs",
+                    operations.iter().map(|op| &op.kind).collect::<Vec<_>>(),
+                    outputs.len()
+                ))]),
+            )
+        };
         steps.extend(
             lifted
                 .into_iter()
@@ -105,10 +127,7 @@ pub(super) fn fuse(
             inputs,
             outputs,
             kind: StepKind::FusedElementwise { operations },
-            cycles: CycleEstimate {
-                optimistic: original.optimistic.saturating_sub(savings).max(330),
-                conservative: original.conservative,
-            },
+            cycles,
             assumptions,
         });
         changed = true;
@@ -120,4 +139,66 @@ pub(super) fn fuse(
     result.steps = steps;
     refresh(&mut result);
     Some(result)
+}
+
+fn known_fusion_cost(
+    graph: &DiagnosticMidGraph,
+    group: &[&Step],
+    operations: &[Operation],
+    outputs: &[usize],
+) -> Option<u64> {
+    if group.len() != 2
+        || outputs.len() != 1
+        || operations[0].kind != OperationKind::Add
+        || group[1].inputs.first() != group[0].outputs.first()
+    {
+        return None;
+    }
+    let kernel = match operations[1].kind {
+        OperationKind::Gelu => TileKernelSpec::BiasGelu,
+        OperationKind::LayerNorm => TileKernelSpec::AddLayerNorm,
+        _ => return None,
+    };
+    if !super::super::elementwise::compatible_fusion(
+        &kernel,
+        &graph.values[group[0].inputs[0]].tensor,
+        &graph.values[group[0].inputs[1]].tensor,
+        &graph.values[outputs[0]].tensor,
+    ) {
+        return None;
+    }
+    let mut inputs = group[0].inputs.clone();
+    inputs.extend_from_slice(&group[1].inputs[1..]);
+    let values = graph
+        .values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            let id = MidValueId::from_index(i as u32);
+            MidValue {
+                id,
+                tensor_type: value.tensor.clone(),
+                origin: value.origin,
+                storage_group: id,
+                tile_offset: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let op = MidOperation {
+        source: None,
+        results: vec![MidValueId::from_index(outputs[0] as u32)],
+        kind: MidOperationKind::Primitive(Primitive::Compute {
+            kernel,
+            operands: vec![OperandWindow::default(); inputs.len()],
+            product: None,
+            reuse_input: None,
+        }),
+        inputs: inputs
+            .into_iter()
+            .map(|id| MidValueId::from_index(id as u32))
+            .collect(),
+        estimated_cycles: 0,
+        estimated_exchange_cycles: 0,
+    };
+    crate::estimate::operation_cost(&op, &values).map(|(cost, _, _)| cost.total)
 }

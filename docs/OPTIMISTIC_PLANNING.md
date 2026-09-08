@@ -47,7 +47,8 @@ attention decomposition; the diagnostic does not duplicate those generators.
 
 For each producer/consumer boundary, conversion nodes cross the two precisions,
 the two storage orders, and the two ownership/memory-class choices. Only valid
-resolved layouts survive. This exposes producer-local packing and casting,
+resolved layouts with legal packed matrix dimensions survive; a hypothetical
+kernel does not make an invalid encoding legal. This exposes producer-local packing and casting,
 late casting, and different packing/redistribution orders. It does not insert
 extra lossy precision round trips. Paths have one to four steps (default three).
 Local cast-and-pack can be hypothetical. Available local kernels are checked
@@ -65,7 +66,9 @@ A separate regional rewrite offers short fused Add/GELU/LN chains, including
 multiple live outputs. Independent parameter conversions can be moved before
 such a group; conversions that depend on its results stop the group. Original
 high operations are retained as the fused kernel's semantic definition. The
-original unfused candidate remains available.
+original unfused candidate remains available. Existing bias/GELU and
+add/layernorm fusions reuse the production eligibility contract and mid cost;
+only unsupported groups receive a missing-kernel assumption.
 
 ## Bounds, costs, and diagnostics
 
@@ -120,4 +123,17 @@ Regression coverage includes the missing early FP8 cast/pack route, preservation
 of a late-cast reference, single-row equivalence, an existing word-copy path
 validated through low expansion, shared conversions across branches, live
 residual preservation in fusion, fixed boundary validation, memory rejection,
-and bounded high-region FP8 search.
+known fusion recognition, packed-geometry validation, and bounded high-region
+FP8 search.
+
+## Example result
+
+The LN/two-projection example expanded 1,694 operator candidates in about nine
+seconds on the development host, retaining 17 plans including a supported
+reference. With the default bounded search (`truncated=true`), the reference
+cost was 19,663 cycles; the best hypothetical plan was 16,801 optimistic and
+20,923 conservative. Missing combined cast/pack kernels appear explicitly in
+its graph. Other retained plans also expose early-cast eligibility and single-row
+equivalence opportunities. The overlapping estimates warrant implementation or
+microbenchmark investigation, not a hardware speedup claim. These numbers include
+conversion of the example's F16 weights.

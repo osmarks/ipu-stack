@@ -163,8 +163,49 @@ fn invalid(message: impl Into<String>) -> SearchError {
     SearchError::InvalidRequest(message.into())
 }
 fn valid_tensor(t: &TensorType, tiles: u16) -> bool {
-    t.format.layout.tiling.tile_count <= tiles
-        && t.format.layout.tiling.tile_count > 0
-        && t.format.layout.resolve(&t.shape).is_ok()
-        && crate::estimate::maximum_shard_bytes(t) != u64::MAX
+    if t.format.layout.tiling.tile_count > tiles
+        || t.format.layout.tiling.tile_count == 0
+        || crate::estimate::maximum_shard_bytes(t) == u64::MAX
+    {
+        return false;
+    }
+    let Ok(resolved) = t.format.layout.resolve(&t.shape) else {
+        return false;
+    };
+    if t.format.layout.order == ElementOrder::RowMajor {
+        return true;
+    }
+    let Some(axes) = resolved.axes().filter(|axes| axes.len() >= 2) else {
+        return false;
+    };
+    // Check distinct matrix dimensions, not every tile or element. Ownership
+    // resolution alone does not validate the crossed storage order/precision.
+    let rows: BTreeSet<_> = axes[axes.len() - 2].extent_sizes().collect();
+    let columns: BTreeSet<_> = axes[axes.len() - 1].extent_sizes().collect();
+    rows.iter().all(|&rows| {
+        columns.iter().all(|&columns| {
+            if rows == 0 || columns == 0 {
+                return true;
+            }
+            match t.format.layout.order {
+                ElementOrder::Amp(order) => crate::storage::amp_matrix_coordinates(
+                    order,
+                    t.format.precision,
+                    rows,
+                    columns,
+                    0,
+                )
+                .is_ok(),
+                ElementOrder::BlockMajor(order) => crate::storage::block_major_matrix_coordinates(
+                    order,
+                    t.format.precision,
+                    rows,
+                    columns,
+                    0,
+                )
+                .is_ok(),
+                ElementOrder::RowMajor => unreachable!(),
+            }
+        })
+    })
 }

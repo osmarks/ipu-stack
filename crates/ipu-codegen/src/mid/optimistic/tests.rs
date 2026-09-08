@@ -251,3 +251,48 @@ fn high_region_finds_fp8_opportunities_without_losing_its_reference() {
         Err(SearchError::NoCandidates { .. })
     ));
 }
+
+#[test]
+fn implemented_fusion_uses_the_shared_contract_and_cost() {
+    let mut g = ComputeGraph::new();
+    let x = g.host_input("x", [2, 4, 384]).unwrap();
+    let b = g.parameter("b", [1, 1, 384]).unwrap();
+    let sum = g.add(x, b).unwrap();
+    let y = g.gelu(sum).unwrap();
+    g.set_outputs([y]).unwrap();
+    let config = PipelineConfig::new(4)
+        .with_input(x, format(Precision::F16, Layout::row_sharded(4)))
+        .with_input(
+            b,
+            format(
+                Precision::F16,
+                Layout::row_major(TensorTiling::replicated(4)),
+            ),
+        );
+    let report = plan_graph(
+        &g,
+        &config,
+        BTreeMap::from([(y, format(Precision::F16, Layout::row_sharded(4)))]),
+        &SearchOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        report.candidates.iter().any(|c| c
+            .steps
+            .iter()
+            .any(
+                |s| matches!(s.kind, StepKind::FusedElementwise { .. }) && s.assumptions.is_empty()
+            ))
+    );
+}
+
+#[test]
+fn hypothetical_kernels_do_not_make_invalid_packed_geometry_legal() {
+    let from = TensorType::new([4, 16], Precision::F16, Layout::row_sharded(1));
+    let mut to = from.clone();
+    to.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+    assert!(valid_tensor(&to, 1));
+    to.format.precision = Precision::F8F143 { scale_exponent: -4 };
+    assert!(!valid_tensor(&to, 1));
+    assert!(enumerate_conversions(&from, &to, 1, &SearchOptions::default()).is_err());
+}
