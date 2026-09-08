@@ -13,6 +13,23 @@ pub(crate) fn f16_transposed_unpack_cycles(matrices: u64, rows: u64, columns: u6
     )
 }
 
+/// Paired-row coefficient packing. Complete 16-column panels use an unrolled
+/// transpose; other aligned widths retain column indexing and bounds checks.
+/// Six worker contexts distribute pairs, including the physical zero-padding.
+pub(crate) fn f16_coefficient_pack_cycles(matrices: u64, rows: u64, columns: u64) -> u64 {
+    let pair = if columns == 16 {
+        60
+    } else {
+        12 + columns.div_ceil(16) * 4 * 35
+    };
+    300u64.saturating_add(
+        matrices
+            .saturating_mul(rows.div_ceil(12))
+            .saturating_mul(6)
+            .saturating_mul(pair),
+    )
+}
+
 /// Interleaved F16 AMP K16/C16 group: four issue cycles per row plus retained
 /// worker/weight-feed overhead, calibrated against device/gemm_f16_amp.S.
 pub(crate) fn f16_gemm_microgroup_cycles(rows: u64) -> u64 {

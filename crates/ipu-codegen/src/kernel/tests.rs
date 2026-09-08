@@ -735,3 +735,38 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
         assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
     }
 }
+
+#[test]
+fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
+    // 14 columns have a two-halfword tail: a 64-bit load would cross the row.
+    // Sharing kernels across row tails must not erase this distinction.
+    for columns in [14, 16] {
+        let shape = rearrangement_specialization(
+            RearrangeTarget::BlockMajor {
+                row_block: 64,
+                column_block: 16,
+            },
+            63,
+            64,
+            columns,
+            16,
+        );
+        let mut inventory = KernelInventory::default();
+        inventory.rearrangements.insert(shape);
+        let plan = KernelBuildPlan::from_inventory(inventory).unwrap();
+        let source = plan
+            .compilations
+            .iter()
+            .find(|object| object.source.starts_with("rearrange_"))
+            .unwrap()
+            .source;
+        assert_eq!(
+            source,
+            if columns == 14 {
+                "rearrange_f16.cpp"
+            } else {
+                "rearrange_block_major_f16.S"
+            }
+        );
+    }
+}

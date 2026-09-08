@@ -259,7 +259,9 @@ pub(super) fn rearrangement_specialization(
             RearrangeTarget::AmpTransposedRight | RearrangeTarget::BlockMajor { .. }
         )
     {
-        (order, 0, physical_rows, 0, physical_columns)
+        // Row tails share one worker, but column alignment selects wide loads.
+        // Erasing it could incorrectly admit a two-halfword tail to ld64.
+        (order, 0, physical_rows, logical_columns, physical_columns)
     } else {
         (
             order,

@@ -49,6 +49,25 @@ REARRANGE_CALL_SYMBOL:
 	// covers four adjacent columns from one row. sort4x16lo/hi pair the same
 	// column from two adjacent rows, which is the natural source order expected
 	// by the GEMM supervisor's ld*putcs coefficient routing.
+
+	// offset selects four columns (one 64-bit word) in each source row.
+	.macro pack_four_columns offset, second_row
+	ld64 $a0:1, $m6, $m15, \offset
+	.if \second_row
+	ld64 $a2:3, $m7, $m15, \offset
+	.else
+	mov $a2:3, $azeros
+	.endif
+	sort4x16lo $a4, $a0, $a2
+	sort4x16hi $a5, $a0, $a2
+	sort4x16lo $a6, $a1, $a3
+	sort4x16hi $a7, $a1, $a3
+	st32 $a4, $m10, $m15, \offset * 32
+	st32 $a5, $m10, $m15, \offset * 32 + 8
+	st32 $a6, $m10, $m15, \offset * 32 + 16
+	st32 $a7, $m10, $m15, \offset * 32 + 24
+	.endm
+
 	.worker
 	.p2align 3
 .Lrearrange_block_major_f16_worker:
@@ -70,6 +89,33 @@ REARRANGE_CALL_SYMBOL:
 	add $m5, $m4, 1
 	cmpult $m8, $m5, $m2
 
+#if REARRANGE_LOGICAL_COLUMNS == 16 && REARRANGE_PHYSICAL_COLUMNS == 16
+	// A complete 16-column panel needs no column indexing or per-word bounds
+	// checks. Keep the uncommon final single row and zero panels out of its loop.
+	shr $m5, $m4, 4
+	shl $m5, $m5, 9
+	add $m10, $m1, $m5
+	and $m5, $m4, 15
+	shl $m5, $m5, 1
+	add $m10, $m10, $m5
+	cmpult $m5, $m4, $m2
+	brz $m5, .Lrearrange_zero_panel
+	brz $m8, .Lrearrange_single_row
+	.irp offset, 0, 1, 2, 3
+	pack_four_columns \offset, 1
+	.endr
+	bri .Lrearrange_next_row
+.Lrearrange_single_row:
+	.irp offset, 0, 1, 2, 3
+	pack_four_columns \offset, 0
+	.endr
+	bri .Lrearrange_next_row
+.Lrearrange_zero_panel:
+	.irp column, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+	st32 $m15, $m10, $m15, \column * 8
+	.endr
+.Lrearrange_next_row:
+#else
 	zero $m9
 .Lrearrange_block_major_f16_columns:
 	// An Rx16 column block consists of R/16 coefficient panels.
@@ -118,6 +164,8 @@ REARRANGE_CALL_SYMBOL:
 	setzi $m5, REARRANGE_PHYSICAL_COLUMNS
 	cmpult $m5, $m9, $m5
 	brnz $m5, .Lrearrange_block_major_f16_columns
+
+#endif
 
 	add $m4, $m4, 12
 	setzi $m5, REARRANGE_PHYSICAL_ROWS

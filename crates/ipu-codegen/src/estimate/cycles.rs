@@ -217,12 +217,6 @@ const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
 // updates. Allow the panel loop and row setup in the rounded per-element price.
 const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 1;
 const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
-// The paired-row assembly pack has a roughly four-thousand-cycle fixed worker
-// cost, then sustains about four cycles per F16 element for both 64x16 and
-// 64x80 destinations.
-const IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES: u64 = 4_096;
-const IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT: u64 = 4;
-
 pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
     let cycles_per_element = match tensor.format.layout.order {
         ElementOrder::RowMajor => return 0,
@@ -233,12 +227,28 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
         ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
             row_block,
             column_block,
-        }) if u32::from(row_block) == crate::mid::AMP_INNER_BLOCK
-            && u32::from(column_block) == crate::mid::AMP_COLUMN_MICRO =>
+        }) if row_block.is_multiple_of(16)
+            && column_block == 16
+            && tensor
+                .shape
+                .0
+                .iter()
+                .rev()
+                .nth(1)
+                .is_some_and(|&rows| rows <= u32::from(row_block))
+            && tensor
+                .shape
+                .0
+                .last()
+                .is_some_and(|columns| columns.is_multiple_of(4)) =>
         {
-            return elements
-                .saturating_mul(IPU21_BLOCK_MAJOR_PACK_CYCLES_PER_ELEMENT)
-                .saturating_add(IPU21_BLOCK_MAJOR_PACK_STARTUP_CYCLES);
+            let columns = u64::from(*tensor.shape.0.last().unwrap());
+            let rows = u64::from(row_block);
+            return crate::kernel::cost::f16_coefficient_pack_cycles(
+                elements.div_ceil(rows * columns.div_ceil(16) * 16),
+                rows,
+                columns,
+            );
         }
         ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) | ElementOrder::Amp(_) => {
             IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT

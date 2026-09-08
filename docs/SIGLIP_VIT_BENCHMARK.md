@@ -235,3 +235,31 @@ packing uses the existing wide-load/sort assembly rather than scalar C++.
 0.096191. Its two large coefficient-packing occurrences each fall from 77,790
 to 58,314 cycles. Kernel-build setup for rearrangements was consolidated at the
 same time, removing repeated flag and compilation assembly.
+
+Complete 16-column coefficient panels now use an unrolled paired-row transpose,
+with odd-row and zero-padding paths outside the full-panel body. The same full
+model, with its existing layout selections, passes at **901,476 cropped cycles
+(0.600984 ms)** and maximum reference error 0.096191. Its large packer takes
+23,190 cycles, compared with 77,790 before these changes; the rendered profile
+is `artifacts/vit/panel-pack-so400m-fp8/profile.html`. The two-image small FP8
+model also passes (maximum error 0.130188) under
+`artifacts/vit/panel-small-b2-fp8/`.
+
+The compact estimator now counts these worker loops from local geometry; the
+768-by-16 estimate is 23,340 cycles. No tile expansion or assembler invocation
+is needed to price a candidate. Tail-kernel sharing retains logical column
+alignment so a two-halfword column tail cannot accidentally select 64-bit loads.
+
+A package-weight inventory is recorded in
+`artifacts/vit/wide-pack-so400m-fp8/weight-storage.txt`. Encoder GEMM weights are
+close to unreplicated (5,308,416 bytes for four 1152-by-1152 projections;
+4,958,208 and 4,976,640 bytes for the MLP matrices, including padding). The
+one-time 588-by-1152 input projection is an exception: 677,376 logical FP8 bytes
+occupy 33,914,880 physical bytes. This is a useful target for full-model memory
+pressure, although it does not grow once per encoder layer. These measurements
+are still for one encoder layer; they do not validate a 27-layer allocation.
+
+The rerun with the updated cost model retains the same selected layout and
+passes at the same 901,476 cycles; its profile is
+`artifacts/vit/costed-panel-so400m-fp8/profile.html`. All 162 codegen tests,
+six benchmark/CLI tests, the graph doctest, and Clippy pass.
