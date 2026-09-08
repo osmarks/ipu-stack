@@ -98,9 +98,8 @@ pub(crate) fn place_with_offset(
         return Err(PlacementError::Overflow);
     }
     if standard_ranges.iter().any(|&(start, end)| {
-            start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
-        })
-        || standard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
+        start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
+    }) || standard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
     {
         return Err(PlacementError::OutOfMemory {
             tile: 0,
@@ -566,7 +565,7 @@ fn allocation_bytes(
     members: &[usize],
     requirement: Requirement,
 ) -> Result<u32, PlacementError> {
-    let bytes = members
+    members
         .iter()
         .map(|&index| {
             shard_storage_bytes(&program.shards[index])?
@@ -576,12 +575,7 @@ fn allocation_bytes(
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .max()
-        .ok_or(PlacementError::Overflow)?;
-    if requirement.distinct_element {
-        align_up(bytes, memory_element_size(program, members))
-    } else {
-        Ok(bytes)
-    }
+        .ok_or(PlacementError::Overflow)
 }
 
 fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
@@ -853,7 +847,19 @@ impl Arena {
                         request.bytes
                     };
                     let start = align_up(base, alignment).ok()?;
-                    let end = start.checked_add(bytes)?;
+                    let mut end = start.checked_add(bytes)?;
+                    // The loader stops partway through the last SRAM element.
+                    // Reserve all its available bytes, but require only the
+                    // actual payload/access tail to fit below the loading limit.
+                    // Never truncate at an ordinary free gap: the remainder of
+                    // that element may belong to another live allocation.
+                    if limit == IPU21_APPLICATION_MEMORY_LIMIT
+                        && request.distinct_element
+                        && request.region1_stride.is_none()
+                        && start.checked_add(request.bytes)? <= limit
+                    {
+                        end = end.min(limit);
+                    }
                     // Ordinary buffers prefer region 0; compact addresses within
                     // each region leave long contiguous spans for later requests.
                     (end <= limit).then_some(((region1, start), index, start, end))
@@ -1038,6 +1044,34 @@ mod tests {
                 .allocate(&request(MemoryClass::Ipu21Interleaved, 64, 8, 3, 3))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn final_partial_element_accepts_payload_but_preserves_exclusivity() {
+        let limit = IPU21_APPLICATION_MEMORY_LIMIT;
+        let base = limit / IPU21_INTERLEAVED_ELEMENT_SIZE * IPU21_INTERLEAVED_ELEMENT_SIZE;
+        let mut arena = Arena::new(&[(base, limit)], 0);
+        let mut payload = request(MemoryClass::Ipu21Interleaved, limit - base, 8, 0, 1);
+        payload.distinct_element = true;
+        assert_eq!(arena.allocate(&payload), Some(base));
+        assert!(
+            arena
+                .allocate(&request(MemoryClass::Ipu21Standard, 4, 4, 0, 1))
+                .is_none()
+        );
+        payload.lifetime.first = 2;
+        payload.lifetime.last = 3;
+        assert_eq!(arena.allocate(&payload), Some(base));
+        payload.bytes += 1;
+        payload.lifetime.first = 4;
+        payload.lifetime.last = 5;
+        assert!(arena.allocate(&payload).is_none());
+
+        // The same partial free span elsewhere may border a live allocation.
+        let base = IPU21_INTERLEAVED_MEMORY_BASE;
+        let mut ordinary_gap = Arena::new(&[(base, base + 1024)], 0);
+        payload.bytes = 512;
+        assert!(ordinary_gap.allocate(&payload).is_none());
     }
 
     #[test]

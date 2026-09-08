@@ -140,3 +140,38 @@ Full command, log and machine-readable result are in
 Validation: 191 codegen tests and one doctest passed (four ignored); Clippy passed
 for `ipu-codegen` and `ipu-tests`, including all targets, with the repository's
 existing `too_many_arguments`/`type_complexity` allowances.
+
+## Package fallback and the final partial memory element
+
+The historical up-projection partial-output buffer was 52,480 payload bytes,
+rounded to a 64 KiB interleaved reservation (nine row partitions, 27 column
+partitions, six K partitions). The rejected newer choice has 71,040 payload
+bytes, rounded to 96 KiB (ten row partitions, 18 column partitions, eight K
+partitions). These are the same logical intermediate, not an added buffer.
+
+At `95fa345`, scheduling retains the remaining already-placed candidates after
+its preferred fast/compact choices. A successful package stops further attempts;
+failed attempts remain bounded by the placement shortlist. This preserves search,
+expansion, placement and compatible schedule cache entries. The B2 test in
+`artifacts/vit/placement-fallback-b2-fp8/` tried indices 2, 16, 22 and 28. All four
+failed package-aware SRAM placement. Candidate 28 got past up-projection but
+failed on a 64 KiB down-projection partial-output reservation. This is not proof
+that all 64 expanded candidates are infeasible.
+
+The detailed free ranges exposed a narrower allocator restriction. The SDK loader
+stops at `0xe7bb0`, 1,104 bytes before the architectural memory boundary
+`0xe8000`. The last interleaved element was therefore unavailable to any request
+requiring a whole-element reservation, even when its actual payload and access
+tail ended below the loading limit. Runtime stack state is reserved elsewhere.
+
+Placement now keeps payload size separate from reservation rounding. A standalone
+distinct-element allocation may reserve the available portion of the last element
+if its complete payload/access tail remains loadable. It keeps element alignment
+and exclusivity, never clips at ordinary free gaps, and leaves repeat-group
+strides unchanged. This does not introduce scattered buffers, change kernels, or
+allow a package segment beyond the SDK loader's range.
+
+Regression tests check the loading boundary, exclusive ownership while live,
+reuse after death, rejection of even one payload byte beyond the limit, and
+rejection of equivalent clipping at an ordinary free gap. All 193 codegen tests
+and the doctest passed (four ignored); Clippy passed.

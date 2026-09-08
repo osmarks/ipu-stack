@@ -188,7 +188,7 @@ pub struct PipelineConfig {
     pub placement_finalists: usize,
     /// Number of buildable finalists compared with physical exchange scheduling.
     /// A compact alternative is prioritized; late failures may try the remaining
-    /// placed candidates, bounded by placement_finalists (plus its compact alternative).
+    /// placed candidates, bounded by the placement shortlist.
     pub exchange_schedule_finalists: usize,
     /// Hard limit on actual compact encoded exchange tables per tile.
     /// Set to u64::MAX to disable this limit.
