@@ -176,6 +176,22 @@ followed by successful selection and budget exhaustion with a still-valid
 exchange schedule. The full-size rerun is recorded under
 `artifacts/vit/bounded-so400m-fp8/`.
 
+The four-column Add candidate was another source of fragmentation: 729 rows
+times 4,304/4 column strips gives 784,404 transfers. Its replacement fills a
+row/column grid using rows first, then the remaining column parallelism. The
+1,472-tile candidate uses 729 row partitions and two column partitions for that
+matrix; a single 1,152-wide row still uses 288 column owners. Existing input
+layouts can still be preserved.
+
+With this change, the largest logged phase in the full-size rerun has 195,844
+transfers. Scheduling rejects all eight finalists within the effort limit in
+335 seconds; it still does not produce a full-size package. Logs are under
+`artifacts/vit/row-grid-so400m-fp8/`. The two-image small FP8 model passes on
+hardware with the row-first grid (maximum absolute error 0.130188); its rendered
+profile is `artifacts/vit/row-grid-small-b2-fp8/profile.html`. The grid tests cover
+single-row, short-matrix and 729-by-4,304 broadcast additions, and all 160 codegen
+tests and Clippy pass. A better full-model shortlist remains necessary.
+
 Remaining structural limitations include standalone projection bias additions
 (which require row-major traversal), separate Q/K/V GEMMs in this benchmark, and
 large coefficient-layout packing operations with sparse ownership. The single-row
