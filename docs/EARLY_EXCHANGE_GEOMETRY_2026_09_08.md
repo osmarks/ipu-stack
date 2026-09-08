@@ -108,3 +108,35 @@ received bandwidth-only cycle scores from `CostModel::rearrangement_cost`, while
 Compatible direct retiles now use the same geometry and fragment-cycle price in
 both paths. That also affects the memoized conversion scores used before beam
 pruning. Other conversion strategies retain their existing cost behavior.
+
+## Full build with unified cycle scores
+
+At `2d08e93`, ran the full B2 FP8 ViT build with default automatic planning,
+reference checking requested, and detailed profiling requested. Results:
+
+- Mid search: **243,500 ms**, versus **239,708 ms** in the earlier wider-shortlist
+  build (about 1.6% longer, not a controlled isolated microbenchmark).
+- All **64** expanded finalists predict tables below 65,536 bytes; minimum
+  **36,808 bytes**. Previously none of 62 did, with minimum 95,696 bytes.
+- Four finalists were placed/modelled; two admitted finalists were scheduled.
+- Finalist 2: estimate **36,856 B**, actual encoded table **35,592 B**.
+- Finalist 16: estimate **36,808 B**, actual encoded table **35,436 B**.
+
+Both encoded tables satisfy the budget. Both packages then fail *post-link
+support placement*: tile 506 cannot allocate **98,304 bytes of interleaved SRAM**
+after reserving the linked code and package support. The attempt ended after
+427,617 ms of selection, with no exchange-budget penalty retry. It produced no
+finished package, hardware result, or profile. The other finalists have not been
+shown infeasible by this test.
+
+Thus early exchange ranking is substantially improved and the table-size failure
+is removed for the two attempted plans. **Automatic B2 ViT building is still not
+fixed overall**: the remaining demonstrated failure is package-aware SRAM
+placement, not exchange-row encoding. Do not treat the historical hardware
+profile as validation of these new selections.
+
+Full command, log and machine-readable result are in
+`artifacts/vit/early-geometry-full-b2-fp8/`.
+Validation: 191 codegen tests and one doctest passed (four ignored); Clippy passed
+for `ipu-codegen` and `ipu-tests`, including all targets, with the repository's
+existing `too_many_arguments`/`type_complexity` allowances.
