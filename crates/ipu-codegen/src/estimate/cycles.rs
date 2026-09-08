@@ -221,6 +221,24 @@ pub(super) fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
 }
 
+pub(super) fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -> (u64, u64) {
+    if bytes == 0 || phases == 0 {
+        return (0, 0);
+    }
+    let fragments = fragments.max(phases);
+    let cycles = bytes
+        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+        .max(fragments.saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES))
+        .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles));
+    let rows = ExchangeFootprint {
+        phases,
+        maximum_transfer_chunks_per_tile: fragments,
+        encoded_row_bytes: None,
+    }
+    .estimated_row_bytes();
+    (cycles, rows)
+}
+
 // Indexed F16 layout transforms execute scalar address arithmetic as well as
 // their loads and stores. The transposed-right panel is a contiguous copy:
 // its final coefficient permutation is performed by the GEMM's ld*putcs
@@ -340,7 +358,16 @@ impl CostModel for Ipu21CostModel {
         };
         let direct_retile = strategy == ConversionStrategy::DirectRetile;
         let endpoint_traffic = &traffic.exchange;
-        let exchange_cycles = exchange_endpoint_cycles(endpoint_traffic, 1);
+        let mut exchange_cycles = exchange_endpoint_cycles(endpoint_traffic, 1);
+        if direct_retile && !endpoint_traffic.is_empty() {
+            let input = TensorType::new(shape.0.clone(), precision, from.clone());
+            let output = TensorType::new(shape.0.clone(), precision, to.clone());
+            if let Some(fragments) = super::movement::grid_fragments(&input, &output) {
+                exchange_cycles =
+                    exchange_fragment_price(endpoint_traffic.maximum_payload_bytes(), 1, fragments)
+                        .0;
+            }
+        }
         let (local_bytes, local_calls) = if direct_retile {
             (
                 traffic.maximum_local_bytes,

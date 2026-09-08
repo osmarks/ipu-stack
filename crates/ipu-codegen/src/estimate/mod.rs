@@ -2,6 +2,7 @@
 //! memory evaluates allocations/liveness, and cycles applies IPU21 prices.
 
 mod cycles;
+use cycles::exchange_fragment_price;
 mod exchange_storage;
 use exchange_storage::ExchangeStoragePhase;
 pub use exchange_storage::{ExchangeStorageEstimator, estimate_exchange_phase_storage};

@@ -356,24 +356,6 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     exchange_fragment_price(bytes, phases, bytes.div_ceil(fragment_bytes.max(1)))
 }
 
-fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -> (u64, u64) {
-    if bytes == 0 || phases == 0 {
-        return (0, 0);
-    }
-    let fragments = fragments.max(phases);
-    let cycles = bytes
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
-        .max(fragments.saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES))
-        .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles));
-    let rows = ExchangeFootprint {
-        phases,
-        maximum_transfer_chunks_per_tile: fragments,
-        encoded_row_bytes: None,
-    }
-    .estimated_row_bytes();
-    (cycles, rows)
-}
-
 pub(crate) fn region_peak_memory(
     initial: &[MidValueId],
     operations: &[MidOperation],

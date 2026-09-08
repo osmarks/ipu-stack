@@ -273,6 +273,25 @@ mod tests {
         assert_eq!(expanded_maximum(&input, &output), 888);
         // The old payload-only heuristic priced this as 111 fragments.
         assert_eq!(maximum_shard_bytes(&output).div_ceil(256), 111);
+        let cost = Ipu21CostModel.rearrangement_cost(
+            &input.shape,
+            input.format.precision,
+            crate::ConversionStrategy::DirectRetile,
+            &input.format.layout,
+            &output.format.layout,
+        );
+        assert_eq!(
+            cost.exchange_cycles,
+            888 * IPU21_LOGICAL_FRAGMENT_CYCLES + IPU21_TARGET_COSTS.exchange_phase_cycles
+        );
+        let local = Ipu21CostModel.rearrangement_cost(
+            &input.shape,
+            input.format.precision,
+            crate::ConversionStrategy::DirectRetile,
+            &input.format.layout,
+            &input.format.layout,
+        );
+        assert_eq!(local.exchange_cycles, 0);
         // Replicating each consumer panel adds multicast recipients, not sends.
         output.format.layout.tiling.tile_count *= 24;
         output.format.layout.tiling.replicas = 24;

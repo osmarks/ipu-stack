@@ -78,3 +78,33 @@ mid dumps, comparison script/output, historical exchange snapshot and footprint
 log, and temporary diagnostic patches. The patches stop before scheduling and
 are not part of production code. The snapshots and dumps allow subsequent
 cost-model comparisons without another historical hardware run.
+
+## First complete shortlist comparison
+
+The first complete geometry run (fragment counts used by mid primitive costing
+and conversion storage refresh, before updating explicit conversion cycle
+scores) expanded 62 finalists. **Three** were below 64 KiB:
+
+| Finalist | Expanded footprint estimate |
+| --- | ---: |
+| 33 | 46,456 B |
+| 34 | 46,560 B |
+| 32 | 56,296 B |
+
+The previous 62-finalist run's minimum was 95,696 B and none fit. This is an
+expanded-geometry result, not an encoded-package or hardware result. Finalist
+33 is not a byte-identical resurrection of the historical plan.
+
+From diagnostic file timestamps, lowering through completed mid finalists took
+304.4 seconds, versus 239.7 seconds for the unmodified recent baseline. The new
+run's slowest concurrent expansion/footprint task took 44.0 seconds. These runs
+shared the host with development builds, so treat the wall-time comparison as
+indicative. A sample of the linear implementation no longer showed the fragment
+counter above 2% self time; layout-bound construction dominated.
+
+The comparison exposed a second estimate path: explicit conversion operations
+received bandwidth-only cycle scores from `CostModel::rearrangement_cost`, while
+`refresh_exchange_rows` updated their storage estimate through mid costing.
+Compatible direct retiles now use the same geometry and fragment-cycle price in
+both paths. That also affects the memoized conversion scores used before beam
+pruning. Other conversion strategies retain their existing cost behavior.
