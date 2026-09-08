@@ -154,7 +154,8 @@ pub(super) fn select_scheduled_finalist<T>(
         crate::ExchangeScheduleCache::default(),
     ];
     for plan in modelled {
-        // The admission shortlist above bounds failed attempts too.
+        // Stop after enough buildable packages. Failed attempts can use the
+        // remaining placed candidates without rerunning search or expansion.
         if scheduled >= planning.exchange_schedule_finalists.max(1) {
             break;
         }
@@ -270,24 +271,38 @@ fn admit_scheduling_candidates(
     modelled: Vec<ModelledPlan>,
     planning: &PipelineConfig,
 ) -> Vec<ModelledPlan> {
-    admit_candidates(
+    let (mut preferred, fallback) = partition_candidates(
         modelled,
         planning.exchange_schedule_finalists,
         planning.exchange_table_budget_bytes,
         |plan| (plan.row_bytes, plan.score, plan.index),
         "scheduling",
-    )
+    );
+    // These candidates have already paid for expansion and placement. Keep
+    // them in reserve for late package failures; success still stops the loop.
+    preferred.extend(fallback);
+    preferred
 }
 
-// Both admission boundaries preserve a minimum-storage alternative. Expanding
-// more candidates does not implicitly authorize more placement or scheduling.
+// Placement bounds total expensive attempts. Scheduling prioritizes a smaller
+// set (including a compact alternative), but package rejection may use the rest.
 fn admit_candidates<T>(
-    mut plans: Vec<T>,
+    plans: Vec<T>,
     limit: usize,
     budget: u64,
     metrics: impl Fn(&T) -> (u64, u64, usize),
     stage: &'static str,
 ) -> Vec<T> {
+    partition_candidates(plans, limit, budget, metrics, stage).0
+}
+
+fn partition_candidates<T>(
+    mut plans: Vec<T>,
+    limit: usize,
+    budget: u64,
+    metrics: impl Fn(&T) -> (u64, u64, usize),
+    stage: &'static str,
+) -> (Vec<T>, Vec<T>) {
     plans.sort_by_key(|plan| {
         let (bytes, score, index) = metrics(plan);
         (bytes.saturating_sub(budget), score, index)
@@ -298,19 +313,22 @@ fn admit_candidates<T>(
         .min_by_key(|(_, plan)| metrics(plan))
         .map(|(index, _)| index);
     let candidates = plans.len();
-    let mut position = 0;
-    plans.retain(|_| {
-        let keep = position < limit.max(1) || Some(position) == compact;
-        position += 1;
-        keep
-    });
+    let mut preferred = Vec::new();
+    let mut fallback = Vec::new();
+    for (position, plan) in plans.into_iter().enumerate() {
+        if position < limit.max(1) || Some(position) == compact {
+            preferred.push(plan);
+        } else {
+            fallback.push(plan);
+        }
+    }
     tracing::info!(
         stage,
         candidates,
-        admitted_candidates = plans.len(),
+        admitted_candidates = preferred.len(),
         "bounded finalist shortlist"
     );
-    plans
+    (preferred, fallback)
 }
 
 pub(super) fn expand_and_place(
@@ -426,7 +444,11 @@ mod tests {
             .unwrap()
             .remove(0);
         let (low, placement, _) = expand_and_place(&mid, &config, None).unwrap();
-        for (budget, expected) in [(u64::MAX, vec![0, 2]), (2_000, vec![2]), (500, vec![2])] {
+        for (budget, expected) in [
+            (u64::MAX, vec![0, 2, 1]),
+            (2_000, vec![2, 0, 1]),
+            (500, vec![2, 0, 1]),
+        ] {
             let mut config = config.clone();
             config.exchange_table_budget_bytes = budget;
             let candidates = [(100, 10_000), (101, 10_000), (200, 1_000)]
@@ -472,7 +494,38 @@ mod tests {
             result,
             Err(PackageBuildError::ExchangeBudgetExceeded { .. })
         ));
-        assert_eq!(attempts, 1);
+        assert_eq!(attempts, config.placement_finalists);
+    }
+
+    #[test]
+    fn package_placement_failure_tries_remaining_placed_candidates() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [32, 16]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
+        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        for rejected in [0, config.placement_finalists - 1] {
+            let mut attempts = 0;
+            let result = select_scheduled_finalist(vec![mid.clone(); 20], &config, None, |_| {
+                attempts += 1;
+                if attempts <= rejected {
+                    Err(PackageBuildError::Placement(
+                        crate::PlacementError::OutOfMemory {
+                            tile: 0,
+                            class: crate::MemoryClass::Ipu21Interleaved,
+                            bytes: 98304,
+                        },
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_ok());
+            assert_eq!(attempts, rejected + 1);
+        }
     }
 
     #[test]

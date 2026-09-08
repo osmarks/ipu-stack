@@ -185,13 +185,15 @@ only execution cycles, undoing the preference for smaller exchange plans on a
 penalty retry. Ranking uses the existing geometry footprint rather than expanding
 or encoding a schedule; this estimate remains a ranking price, not a byte bound.
 
-Physical scheduling admits the configured finalist count plus one minimum-
-fragment alternative if absent from that shortlist. Package rejection no longer
-walks every expanded candidate. With the default count of one, each search pass
-admits at most two layouts (each may have an ordinary and mapped placement).
-Existing stronger-penalty retries can then surface simpler complete plans.
-Regression tests cover twenty rejected equivalent plans causing only one
-finalization attempt and retention of a slower, substantially smaller alternative.
+Physical scheduling prioritizes the configured finalist count plus a minimum-
+storage alternative. A later package rejection now tries the remaining already-
+placed candidates in rank order. Successful packages consume the scheduling
+count; failures are bounded by the placement shortlist (four by default, plus a
+compact alternative if absent). It does not reopen all expanded candidates or
+rerun search. Existing stronger-penalty retries still apply to exchange-budget
+failures. Regression tests cover fallback after package placement failure,
+stopping at the first success, and bounding twenty rejected expanded plans by
+the placement shortlist.
 
 This is a bounded search policy, not proof that every excluded layout is
 unplaceable. The exact fragment limit still rejects before placement/scheduling;
