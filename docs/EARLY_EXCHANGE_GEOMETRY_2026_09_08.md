@@ -175,3 +175,24 @@ Regression tests check the loading boundary, exclusive ownership while live,
 reuse after death, rejection of even one payload byte beyond the limit, and
 rejection of equivalent clipping at an ordinary free gap. All 193 codegen tests
 and the doctest passed (four ignored); Clippy passed.
+
+### Hardware validation after the allocation fix
+
+The default B2 FP8 build at `15c3910` now succeeds without layout overrides.
+Artifacts, the exact command, log and rendered profile are in
+`artifacts/vit/partial-element-b2-fp8/`. All 64 expanded candidates passed
+footprint screening; finalist 2 (unmapped) completed package placement and was
+selected immediately. No fallback candidate was needed in this run.
+
+- Hardware and reference comparison: **PASS**, maximum absolute error **0.083496**.
+- Rendered execution span, with the usual leading-clock crop: **1,292,292 cycles**
+  (**0.861528 ms** at 1.5 GHz), versus the historical **1,296,198 cycles**.
+- Selected exchange placement: **36,264 B** encoded rows within **49,088 B**
+  reserved capacity, below the 64 KiB table budget.
+- Beam search: **219,210 ms**; complete finalist selection, including package
+  finalization: **410,382 ms**. Compile latency remains substantial.
+
+This validates the early exchange ranking and final-partial-element allocation
+together on hardware. It does not establish feasibility at larger batch sizes
+or for the complete 27-layer model. The separate fallback-only run above verifies
+that late package failures advance through the remaining placed candidates.
