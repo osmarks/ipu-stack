@@ -13,6 +13,10 @@ pub(crate) struct ResolvedAxis {
 }
 
 impl ResolvedAxis {
+    pub(crate) fn partitions(&self) -> &[ShardExtent] {
+        &self.partitions
+    }
+
     pub(crate) fn extent_sizes(&self) -> impl Iterator<Item = u32> + '_ {
         self.partitions
             .iter()

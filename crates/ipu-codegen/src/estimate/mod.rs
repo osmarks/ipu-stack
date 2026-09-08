@@ -16,6 +16,7 @@ pub(crate) use mid::{
 pub(crate) use program::{
     ProgramCycles, program_cycles, program_footprint, scheduled_program_cycles,
 };
+mod movement;
 mod tensor;
 mod traffic;
 

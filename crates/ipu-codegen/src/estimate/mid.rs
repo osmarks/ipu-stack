@@ -279,8 +279,17 @@ pub(crate) fn operation_cost(
                     .saturating_mul(destinations)
                     .div_ceil(sources)
                     .min(maximum_shard_bytes(input));
-                let (exchange, footprint) =
-                    exchange_price(bytes.max(sends), 1, movement_fragment_bytes(input, output));
+                let payload = bytes.max(sends);
+                let identity = !matches!(&operation.kind,
+                    MidOperationKind::Primitive(Primitive::Copy { mapping, .. })
+                    if *mapping != crate::CoordinateMapping::default());
+                let fragments = identity
+                    .then(|| super::movement::grid_fragments(input, output))
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        payload.div_ceil(movement_fragment_bytes(input, output).max(1))
+                    });
+                let (exchange, footprint) = exchange_fragment_price(payload, 1, fragments);
                 price.exchange = exchange;
                 rows = footprint;
             }
@@ -347,9 +356,11 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     if bytes == 0 || phases == 0 {
         return (0, 0);
     }
-    // Coarse useful-payload assumption for blocked tensor movement. Placement
-    // and physical scheduling later determine the actual fragmentation.
-    let fragments = bytes.div_ceil(fragment_bytes.max(1)).max(phases);
+    exchange_fragment_price(bytes, phases, bytes.div_ceil(fragment_bytes.max(1)))
+}
+
+fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -> (u64, u64) {
+    let fragments = fragments.max(phases);
     let cycles = bytes
         .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
         .max(fragments.saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES))
