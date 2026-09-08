@@ -100,6 +100,12 @@ struct Arguments {
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
+    /// Capture an expanded finalist before scheduling, linking, or hardware execution.
+    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule"])]
+    capture_exchange_schedule: Option<PathBuf>,
+    /// Planner finalist ordinal to capture (matches package diagnostics).
+    #[arg(long, default_value_t = 0, requires = "capture_exchange_schedule")]
+    capture_finalist: usize,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
@@ -1007,6 +1013,20 @@ fn main() -> Result<()> {
         runtime_source,
         pipeline,
     };
+    if let Some(path) = &arguments.capture_exchange_schedule {
+        let snapshot = ipu_codegen::capture_exchange_finalist(
+            &graph,
+            &package_config,
+            arguments.capture_finalist,
+        )?;
+        serde_json::to_writer(std::io::BufWriter::new(fs::File::create(path)?), &snapshot)?;
+        println!(
+            "Captured {} exchange phases to {}",
+            snapshot.phases.len(),
+            path.display()
+        );
+        return Ok(());
+    }
     let mut compiled_package = None;
     let diagnostic_package = if arguments.diagnostic_run {
         let package = build_diagnostic_package(&graph, &package_config)?;

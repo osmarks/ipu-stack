@@ -199,13 +199,9 @@ pub(crate) fn lower_exchanges(
     )
 }
 
-pub(crate) fn lower_exchanges_cached(
+fn repeat_inputs(
     program: &LowProgram,
-    placement: &Placement,
-    topology: &Topology,
-    enable_diagnostics: bool,
-    cache: &mut ExchangeScheduleCache,
-) -> Result<LoweredExchanges, ExchangeLoweringError> {
+) -> Result<BTreeMap<BlockValueId, Vec<BlockValueId>>, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<BlockValueId, Vec<BlockValueId>>::new();
     for repeat in &program.repeat_runs {
         for iterated in &repeat.iterated {
@@ -222,6 +218,71 @@ pub(crate) fn lower_exchanges_cached(
             }
         }
     }
+    Ok(repeat_inputs)
+}
+
+fn prepare_phase(
+    program: &LowProgram,
+    placement: &Placement,
+    phase: &crate::low::ExchangePhase,
+    repeat_inputs: &BTreeMap<BlockValueId, Vec<BlockValueId>>,
+) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
+    let pending = phase
+        .transfers
+        .par_iter()
+        .enumerate()
+        .map(|(index, transfer)| {
+            prepare_transfer(program, placement, transfer).inspect_err(|error| {
+                tracing::error!(
+                    phase = phase.id.index(),
+                    transfer = index,
+                    provenance = ?phase.provenance,
+                    source = ?transfer.source,
+                    destinations = ?transfer.destinations,
+                    ?error,
+                    "failed to prepare logical exchange transfer"
+                );
+            })
+        })
+        .collect::<Result<Vec<_>, ExchangeLoweringError>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut pending = coalesce_pending_transfers(pending);
+    attach_repeat_source_addresses(&mut pending, repeat_inputs, placement)?;
+    Ok(pending)
+}
+
+pub(crate) fn capture_exchange_schedule(
+    program: &LowProgram,
+    placement: &Placement,
+) -> Result<ExchangeScheduleSnapshot, ExchangeLoweringError> {
+    let repeat_inputs = repeat_inputs(program)?;
+    let phases = program
+        .exchange_phases
+        .par_iter()
+        .map(|phase| {
+            Ok(schedule_problem(
+                phase.id.index(),
+                &prepare_phase(program, placement, phase, &repeat_inputs)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+    Ok(ExchangeScheduleSnapshot {
+        schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
+        tile_count: program.tile_count,
+        phases,
+    })
+}
+
+pub(crate) fn lower_exchanges_cached(
+    program: &LowProgram,
+    placement: &Placement,
+    topology: &Topology,
+    enable_diagnostics: bool,
+    cache: &mut ExchangeScheduleCache,
+) -> Result<LoweredExchanges, ExchangeLoweringError> {
+    let repeat_inputs = repeat_inputs(program)?;
     // Each barrier-delimited phase has independent scheduling state. Keep its
     // relocation recipe local to the worker, then restore the cache in order.
     let mut phase_caches = program
@@ -236,29 +297,7 @@ pub(crate) fn lower_exchanges_cached(
         .zip(phase_caches.par_iter_mut())
         .map(|(phase, cache)| {
             let _entered = span.enter();
-            let pending = phase
-                .transfers
-                .par_iter()
-                .enumerate()
-                .map(|(index, transfer)| {
-                    prepare_transfer(program, placement, transfer).inspect_err(|error| {
-                        tracing::error!(
-                            phase = phase.id.index(),
-                            transfer = index,
-                            provenance = ?phase.provenance,
-                            source = ?transfer.source,
-                            destinations = ?transfer.destinations,
-                            ?error,
-                            "failed to prepare logical exchange transfer"
-                        );
-                    })
-                })
-                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-            let mut pending = coalesce_pending_transfers(pending);
-            attach_repeat_source_addresses(&mut pending, &repeat_inputs, placement)?;
+            let pending = prepare_phase(program, placement, phase, &repeat_inputs)?;
             let ScheduledPending {
                 pending,
                 receive_counts,

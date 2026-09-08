@@ -30,11 +30,7 @@ pub(super) fn select_scheduled_finalist<T>(
         .enumerate()
         .map(|(index, mid)| {
             let screen = || -> PackageBuildResult<_> {
-                let mut expanded =
-                    crate::low::expand::expand_tiles(&mid, planning.diagnostic_checkpoints)?;
-                placement::map_tiles(&mut expanded, tile_mapping)?;
-                let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
-                let placement = place(&low)?;
+                let (low, placement) = expand_and_place(&mid, planning, tile_mapping)?;
                 let (cycles, challenger) =
                     placement::model_mapping(&low, &placement, tile_mapping.is_none())?;
                 tracing::info!(
@@ -223,4 +219,16 @@ mod tests {
         ));
         assert!(select_scheduled_finalist(vec![], &config, None, |_| Ok(())).is_err());
     }
+}
+
+pub(super) fn expand_and_place(
+    mid: &crate::MidProgram,
+    planning: &PipelineConfig,
+    tile_mapping: Option<&[u16]>,
+) -> PackageBuildResult<(LowProgram, crate::Placement)> {
+    let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
+    placement::map_tiles(&mut expanded, tile_mapping)?;
+    let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
+    let placement = place(&low)?;
+    Ok((low, placement))
 }
