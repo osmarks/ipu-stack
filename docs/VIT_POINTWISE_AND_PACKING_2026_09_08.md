@@ -87,3 +87,27 @@ codegen doctest passed. Clippy passed for both crates/all targets with the
 repository's existing too-many-arguments and type-complexity allowances. Tests
 cover ownership, distributed statistics/ABI, live-sum fusion rejection, and
 packed-panel retile without unpacking, including a view mapping.
+
+## Batch 4 feasibility follow-up
+
+Build log: `artifacts/vit/fused-distributed-full-b4-fp8/run.log`.
+The new execution paths do not by themselves solve the retained candidates'
+placement constraints. Failures include 104,960-byte standard conversion buffers
+and executable-region exhaustion during host support assembly. The latter's
+`host programs (1 bytes)` diagnostic is a failed free-address probe, not a
+measurement of the actual host program size.
+
+A concrete fragmentation example is tile 92 in finalist 4's final placement:
+free ranges total 259,688 bytes, but the largest is 92,672 bytes. Its requested
+104,960-byte contiguous F16 conversion buffer cannot fit; another 131,072-byte
+allocation is live at that event. Other tiles fail 81,920-byte attention AMP-left
+allocations with 16-KiB alignment, or a 125,952-byte replicated GEMM input. These
+are constraints of this allocation/layout selection, not an aggregate device
+SRAM impossibility result.
+
+The run completed unsuccessfully after all 16 variants: eight failed the initial
+physical placement screen; of the eight fully scheduled variants, two failed
+104,960-byte standard allocations, two failed 65,536-byte interleaved allocations,
+and four exhausted executable-region space in host support assembly. Final
+selection took 1,110,091 ms (18.5 minutes). There is no new batch-4 hardware
+profile. No placement overrides or memory-budget relaxations were applied.
