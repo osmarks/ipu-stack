@@ -22,6 +22,52 @@ using Destination = half;
 #else
 using Destination = float;
 #endif
+#if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
+// Keep the pipeline's register pressure off the small/fallback cast paths.
+static __attribute__((noinline)) void castPackedRows(
+    const half *first, const half *second, unsigned char *target,
+    unsigned rows, unsigned stride, unsigned sourceStride) {
+  // Pipeline both 16-value source streams independently. Each pair
+  // of bundles stores one converted vector and loads the next one.
+  // The final row drains the pipeline without speculative reads.
+  const unsigned jump = sourceStride / 8 - 2;
+  const unsigned steps = jump | (2 << 10) | ((stride / 8 - 1) << 20);
+  const half *upperFirst = first;
+  const half *upperSecond = second;
+  asm volatile(
+      "ld64step $a0:1, $mzero, %[upperFirst]+=, 1\n"
+      "ld64step $a2:3, $mzero, %[upperFirst]+=, 2\n"
+      "ld64step $a4:5, $mzero, %[upperSecond]+=, 1\n"
+      "ld64step $a6:7, $mzero, %[upperSecond]+=, 2\n"
+      "sub $m0, %[upperFirst], 8\n"
+      "tapack $m0:1, $m0, $mzero, %[out]\n"
+      "sub $m2, %[upperSecond], 8\n"
+      "add $m3, %[out], 16\n"
+      "tapack $m2:3, $m2, $mzero, $m3\n"
+      "{ rpt %[rounds], 7; fnop }\n"
+      "{ ld64step $a2:3, $mzero, %[upperFirst]+=, %[jump]; f16v8tof8 $a0:1, $a0:3 }\n"
+      "{ ldst64pace $a0:1, $a0:1, $m0:1+=, %[steps], 1; fnop }\n"
+      "{ ld64step $a2:3, $mzero, %[upperFirst]+=, 2; f16v8tof8 $a0:1, $a0:3 }\n"
+      "{ ldst64pace $a0:1, $a0:1, $m0:1+=, %[steps], 14; fnop }\n"
+      "{ ld64step $a6:7, $mzero, %[upperSecond]+=, %[jump]; f16v8tof8 $a4:5, $a4:7 }\n"
+      "{ ldst64pace $a4:5, $a4:5, $m2:3+=, %[steps], 1; fnop }\n"
+      "{ ld64step $a6:7, $mzero, %[upperSecond]+=, 2; f16v8tof8 $a4:5, $a4:7 }\n"
+      "{ ldst64pace $a4:5, $a4:5, $m2:3+=, %[steps], 14; fnop }\n"
+      // Upper pointers now address the last row's second vector.
+      "{ ld64 $a2:3, %[upperFirst], $mzero, 0; f16v8tof8 $a0:1, $a0:3 }\n"
+      "{ ldst64pace $a0:1, $a0:1, $m0:1+=, %[steps], 1; fnop }\n"
+      "{ nop; f16v8tof8 $a2:3, $a0:3 }\n"
+      "{ ld64 $a6:7, %[upperSecond], $mzero, 0; f16v8tof8 $a4:5, $a4:7 }\n"
+      "{ ldst64pace $a4:5, $a4:5, $m2:3+=, %[steps], 1; fnop }\n"
+      "{ st64 $a2:3, %[lastOut], $mzero, 1; f16v8tof8 $a6:7, $a4:7 }\n"
+      "{ st64 $a6:7, %[lastOut], $mzero, 3; fnop }\n"
+      : [upperFirst] "+&r"(upperFirst), [upperSecond] "+&r"(upperSecond)
+      : [out] "r"(target),
+        [lastOut] "r"(target + (rows - 1) * stride), [rounds] "r"(rows - 1),
+        [jump] "r"(jump), [steps] "r"(steps)
+      : "$m0", "$m1", "$m2", "$m3", "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
+}
+#endif
 class CAST_VERTEX : public MultiVertex {
 public:
   Input<Vector<Source, VectorLayout::ONE_PTR>> source;
@@ -43,6 +89,13 @@ public:
     const unsigned rowMajorColumns = this->rowMajorColumns;
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
     setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
+    // Combined loads/stores require different memory elements. Group pairs
+    // of standard banks conservatively so this also covers interleaved SRAM.
+    const unsigned inStart = reinterpret_cast<unsigned>(source);
+    const unsigned outStart = reinterpret_cast<unsigned>(destination);
+    const bool separate = sourceElements && elements &&
+        (((inStart + sourceElements * 2 - 1) >> 15) < (outStart >> 15) ||
+         ((outStart + elements - 1) >> 15) < (inStart >> 15));
     if (panelRows) {
       const unsigned panelElements = panelRows * 32;
       // Small panels have too few rows to amortize six-worker setup. Give
@@ -80,27 +133,30 @@ public:
               : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
           continue;
         }
-        // Each repeat converts 32 values, without a software row loop.
-        // Offsets advance to this worker's next row. Packing
-        // needs two strided source panels and one contiguous destination row.
+        // Amortize the pipeline call/setup, and fit the signed 10-bit strides.
+        if (separate && rows >= 16 && sourceStride / 8 - 2 < 512) {
+          castPackedRows(first, second, target, rows, stride, sourceStride);
+          continue;
+        }
+        // Separate loads/stores also use post-increments: no per-row
+        // address arithmetic, and no memory-element separation requirement.
         asm volatile(
-            "{ rpt %[rows], 13; fnop }\n"
-            "{ ld64 $a0:1, %[first], %[src], 0; fnop }\n"
-            "{ ld64 $a2:3, %[first], %[src], 1; fnop }\n"
-            "{ ld64 $a0:1, %[first], %[src], 2; f16v8tof8 $a4:5, $a0:3 }\n"
-            "{ ld64 $a2:3, %[first], %[src], 3; fnop }\n"
-            "{ st64 $a4:5, %[out], %[dst], 0; f16v8tof8 $a6:7, $a0:3 }\n"
-            "{ ld64 $a0:1, %[second], %[src], 0; fnop }\n"
-            "{ ld64 $a2:3, %[second], %[src], 1; fnop }\n"
-            "{ st64 $a6:7, %[out], %[dst], 1; f16v8tof8 $a4:5, $a0:3 }\n"
-            "{ ld64 $a0:1, %[second], %[src], 2; fnop }\n"
-            "{ ld64 $a2:3, %[second], %[src], 3; fnop }\n"
-            "{ st64 $a4:5, %[out], %[dst], 2; f16v8tof8 $a6:7, $a0:3 }\n"
-            "{ st64 $a6:7, %[out], %[dst], 3; fnop }\n"
-            "{ add %[src], %[src], %[srcStride]; fnop }\n"
-            "{ add %[dst], %[dst], %[stride]; fnop }\n"
-            : [src] "+&r"(sourceOffset), [dst] "+&r"(destinationOffset)
-            : [first] "r"(first), [second] "r"(second), [out] "r"(target), [rows] "r"(rows), [stride] "r"(stride), [srcStride] "r"(sourceStride)
+            "{ rpt %[rows], 11; fnop }\n"
+            "{ ld64step $a0:1, $mzero, %[first]+=, 1; fnop }\n"
+            "{ ld64step $a2:3, $mzero, %[first]+=, 1; fnop }\n"
+            "{ ld64step $a0:1, $mzero, %[first]+=, 1; f16v8tof8 $a4:5, $a0:3 }\n"
+            "{ ld64step $a2:3, $mzero, %[first]+=, %[srcJump]; fnop }\n"
+            "{ st64step $a4:5, $mzero, %[out]+=, 1; f16v8tof8 $a6:7, $a0:3 }\n"
+            "{ ld64step $a0:1, $mzero, %[second]+=, 1; fnop }\n"
+            "{ ld64step $a2:3, $mzero, %[second]+=, 1; fnop }\n"
+            "{ st64step $a6:7, $mzero, %[out]+=, 1; f16v8tof8 $a4:5, $a0:3 }\n"
+            "{ ld64step $a0:1, $mzero, %[second]+=, 1; fnop }\n"
+            "{ ld64step $a2:3, $mzero, %[second]+=, %[srcJump]; fnop }\n"
+            "{ st64step $a4:5, $mzero, %[out]+=, 1; f16v8tof8 $a6:7, $a0:3 }\n"
+            "{ st64step $a6:7, $mzero, %[out]+=, %[dstJump]; fnop }\n"
+            : [first] "+&r"(first), [second] "+&r"(second), [out] "+&r"(target)
+            : [rows] "r"(rows), [srcJump] "r"(sourceStride / 8 - 3),
+              [dstJump] "r"(stride / 8 - 3)
             : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
       }
       return true;
@@ -110,15 +166,7 @@ public:
     const unsigned workerRounds = rounds;
     const half *input = &source[worker * 8];
     unsigned char *output = &destination[worker * 8];
-    // Conservatively treat each 32 KiB address group as one memory element.
-    // This covers both 16 KiB standard banks and two-bank interleaved groups,
-    // including Repeat's runtime pointers, without constraining placement.
-    const unsigned inStart = reinterpret_cast<unsigned>(&source[0]);
-    const unsigned outStart = reinterpret_cast<unsigned>(&destination[0]);
-    const bool separate = rounds >= 4 && sourceElements && elements &&
-        (((inStart + sourceElements * 2 - 1) >> 15) < (outStart >> 15) ||
-         ((outStart + elements - 1) >> 15) < (inStart >> 15));
-    if (separate) {
+    if (separate && rounds >= 4) {
       // Pipeline one conversion ahead, as in the SDK half-to-quarter loop.
       // The combined load/store reads the next lower half while storing the
       // previous result. Prologue/epilogue avoid reading past the last vector.

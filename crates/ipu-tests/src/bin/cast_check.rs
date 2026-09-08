@@ -79,6 +79,11 @@ fn main() -> Result<()> {
         (7, 64),
         (32, 192),
         (65, 128),
+        (95, 32), // Workers straddle the pipeline threshold.
+        (96, 48), // Pipelined full panel followed by a half-panel tail.
+        (97, 64),
+        (184, 96), // Largest cast in the full B1 ViT profile.
+        (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
         for mode in 0..3 {
             // dense, already packed, row-major -> packed
@@ -106,6 +111,12 @@ fn main() -> Result<()> {
                     let count = rows * output_columns;
                     let output_address = if placement == "shared-standard" && count <= 2048 {
                         0x62008
+                    } else {
+                        output_address
+                    };
+                    // Keep large inputs disjoint even in the shared-bank case.
+                    let output_address = if placement == "shared-standard" {
+                        output_address.max(input_address + source_count * 2 + 8)
                     } else {
                         output_address
                     };

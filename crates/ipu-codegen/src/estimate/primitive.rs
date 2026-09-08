@@ -8,14 +8,15 @@ pub(crate) fn cast_cycles(from: Precision, to: Precision, elements: u64, panel_r
     match (from, to) {
         (Precision::F16, Precision::F8F143 { .. }) => {
             if panel_rows != 0 {
-                // Four vector conversions per row, in a 14-bundle repeat body.
+                // Price the 12-bundle fallback; the eight-bundle pipeline
+                // additionally requires bank separation, unknown before placement.
                 // Match whole-panel versus row sharing, including imbalance and
                 // setup between panels, without expanding tile IR.
                 let panels = elements.div_ceil(panel_rows.saturating_mul(32));
                 if panel_rows <= 32 && panels >= 6 {
-                    330 + panels.div_ceil(6).saturating_mul(120 + panel_rows * 84)
+                    330 + panels.div_ceil(6).saturating_mul(120 + panel_rows * 72)
                 } else {
-                    330 + panels.saturating_mul(120 + panel_rows.div_ceil(6) * 84)
+                    330 + panels.saturating_mul(120 + panel_rows.div_ceil(6) * 72)
                 }
             } else {
                 330 + elements.div_ceil(48).saturating_mul(24)

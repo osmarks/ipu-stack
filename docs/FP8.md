@@ -37,11 +37,11 @@ unpack/cast/repack intermediate and its byte-sized permutation kernels.
 
 The regrouping is shared by AMP left, transposed left/right, and block-major
 operand formats. A row comprises two contiguous 16-half source spans; four
-`f16v8tof8` instructions produce one contiguous 32-byte FP8 row. A 14-bundle
-hardware repeat body combines vector conversion with loads/stores, without a
-software row loop. Workers share large panels by rows and handle whole small
-panels when at least six are available. Flat F16-to-FP8 casts use a four-bundle
-repeat body per eight values, with a masked tail. Other FP8 cast directions
+`f16v8tof8` instructions produce one contiguous 32-byte FP8 row. An eight-bundle
+pipeline combines vector conversion with simultaneous loads/stores when memory
+elements are separate; the general fallback uses twelve bundles. Workers share large panels by rows and handle whole small
+panels when at least six are available. Flat F16-to-FP8 casts use a two-bundle
+pipeline or four-bundle fallback per eight values, with a masked tail. Other FP8 cast directions
 retain the row-major fallback. GEMMs, reductions, GELU, and attention's QK/PV
 products still write/use F16.
 
@@ -226,10 +226,10 @@ these include launch/setup. Raw checks and integration profiles are under
 The checker reserves its timestamp storage and waits for the final deferred host
 exchange before reading it. Without that wait, the final timestamp batch could
 contain the preceding tensor chunk. All 315 current-kernel cases pass; the
-historical kernel passes its 252 applicable cases. Existing packed casts have a
+historical kernel passes its 252 applicable cases. At that revision, existing packed casts had a
 small setup cost increase (8,320 elements: 5,064 to 5,136 cycles); the two-bundle
-pipeline applies to linear casts and compatible single-row panels, not the
-multi-row packing loop.
+pipeline applied to linear casts and compatible single-row panels. The
+multi-row loop is now pipelined as described below.
 
 
 Integration validation: the final small ViT (`--vit-small --tiles 64 --fp8-scale=-4`)
@@ -245,3 +245,33 @@ exhausted: this is not proof that every batch-two layout is infeasible. An earli
 trial which also reused replicated consumer buffers is retained separately in
 `vit-b2-shared-consumer/`; that broader sharing policy was removed. No memory
 budget relaxation, forced layout, or arbitrary transfer-count cutoff was added.
+
+
+Packed cast pipeline (2026-09-08): both 16-half source streams now pipeline
+independently with `ld64step`/`ldst64pace`, issuing eight bundles per 32 outputs
+instead of fourteen. A prologue loads each stream's first vector; the final row
+drains both without reading a following row. This supports packed and row-major
+sources. Runtime eligibility requires disjoint 32-KiB address groups, at least
+16 rows per worker, and a source jump fitting the signed 10-bit packed stride.
+The pipeline is a separate non-inlined helper to keep its register pressure off
+small casts. The general fallback also uses post-increments, reducing its body
+to twelve bundles; half-panel zero padding keeps its existing loop. Mid/low cost
+estimates use the twelve-bundle price, since bank separation is unknown there.
+
+The hardware checker now covers 441 cases, including the full B1 ViT's 184x96
+local cast, pipeline threshold boundaries, a full panel followed by a padded
+half-panel, and a row stride too wide for the pipeline. All outputs and guards
+pass bitwise at scales -4, 0 and 3. Comparing the pre-change kernel with the final
+kernel (scale 0, complete invocation including setup):
+
+| Packed local shape | Placement | Before cycles | After cycles |
+| --- | --- | ---: | ---: |
+| 184x96 | Separate standard groups | 9,066 | 6,762 |
+| 184x96 | Interleaved, separate groups | 9,066 | 6,786 |
+| 184x96 | Shared standard groups | 9,066 | 8,172 |
+| 65x128 | Separate standard groups | 5,124 | 4,794 |
+
+Small cases can still pay extra setup (the 16-element padded case increases
+from 960 to 1,170 cycles). These are kernel measurements, not a rebuilt full ViT
+profile. Raw cases, assembly, packages and comparison logs are retained under
+`artifacts/fp8-cast/packed-pipeline/` and `artifacts/fp8-cast/packed-baseline/`.
