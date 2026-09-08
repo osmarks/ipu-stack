@@ -509,7 +509,10 @@ pub(super) fn plans(
                     plan: mut candidate,
                     format_policy,
                 } = concrete.clone();
-                if format_policy == OperatorFormatPolicy::RowMajorGrid {
+                if matches!(
+                    format_policy,
+                    OperatorFormatPolicy::RowMajorGrid | OperatorFormatPolicy::RowMajorRows
+                ) {
                     let capacity = candidate
                         .requirements
                         .output
@@ -520,43 +523,65 @@ pub(super) fn plans(
                     let Some(&columns) = output.0.last() else {
                         continue;
                     };
-                    let rows = output.0.iter().rev().nth(1).copied().unwrap_or(1);
-                    let grain = (8 / candidate.requirements.output.format.precision.bytes()) as u32;
-                    let row_parts = rows.min(u32::from(capacity));
-                    if row_parts == 0 || columns == 0 {
+                    if columns == 0 {
                         continue;
                     }
-                    let column_parts =
-                        (u32::from(capacity) / row_parts).min(columns.div_ceil(grain));
+                    let grain = (8 / candidate.requirements.output.format.precision.bytes()) as u32;
+                    let mut row_parts = 1u16;
                     let mut axes = Vec::new();
-                    if output.0.len() >= 2 {
+                    // Keep complete rows local before using spare tiles for columns.
+                    // Leading batch axes carry independent rows just like tokens.
+                    for (axis, &size) in output.0[..output.0.len() - 1].iter().enumerate().rev() {
+                        if size == 0 || (size == 1 && axis + 2 != output.0.len()) {
+                            continue;
+                        }
+                        let parts = size.min(u32::from(capacity / row_parts)) as u16;
                         axes.push(
                             AxisTiling::new(
-                                TensorAxis::FromEnd(2),
-                                row_parts as u16,
+                                TensorAxis::FromEnd((output.0.len() - axis) as u16),
+                                parts,
                                 1,
                                 Padding::Reject,
                             )
-                            .with_tile_stride(column_parts as u16),
+                            .with_tile_stride(row_parts),
                         );
+                        row_parts *= parts;
+                    }
+                    let column_parts = if format_policy == OperatorFormatPolicy::RowMajorGrid {
+                        (u32::from(capacity / row_parts)).min(columns.div_ceil(grain)) as u16
+                    } else {
+                        1
+                    };
+                    for axis in &mut axes {
+                        axis.tile_stride = axis.tile_stride.map(|stride| stride * column_parts);
                     }
                     axes.push(
                         AxisTiling::new(
                             TensorAxis::FromEnd(1),
-                            column_parts as u16,
+                            column_parts,
                             grain,
                             Padding::Reject,
                         )
                         .with_tile_stride(1),
                     );
                     let layout = Layout::row_major(TensorTiling {
-                        tile_count: (row_parts * column_parts) as u16,
+                        tile_count: row_parts * column_parts,
                         replicas: 1,
                         axes,
                     });
                     candidate.requirements.output.format.layout = layout.clone();
-                    for input in &mut candidate.requirements.inputs {
-                        input.format.layout = layout.clone();
+                    let output_type = TensorType {
+                        shape: output.clone(),
+                        format: candidate.requirements.output.format.clone(),
+                    };
+                    for (requirement, input) in candidate.requirements.inputs.iter_mut().zip(inputs)
+                    {
+                        requirement.format.layout = layout.clone();
+                        if let Some(tiling) =
+                            implementation::pointwise_input_tiling(input, &output_type)
+                        {
+                            requirement.format.layout.tiling = tiling;
+                        }
                     }
                 }
                 if let OperatorFormatPolicy::PreserveInputLayout(index) = format_policy {

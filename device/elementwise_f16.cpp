@@ -73,6 +73,16 @@ public:
       if (leftElements == elements && rightElements == elements) {
         for (unsigned i = worker; i < elements / 2; i += 6)
           out[i] = a[i] + b[i];
+      } else if ((leftElements == elements || rightElements == elements) &&
+                 wrap(elements, leftElements < rightElements ? leftElements : rightElements) == 0) {
+        const auto *dense = leftElements == elements ? a : b;
+        const auto *bias = leftElements == elements ? b : a;
+        const unsigned width = (leftElements == elements ? rightElements : leftElements) / 2;
+        // Broadcast a contiguous suffix. Reset its pointer once per row;
+        // both loads in the vector loop now advance linearly.
+        for (unsigned row = 0; row < elements / 2; row += width)
+          for (unsigned i = worker; i < width; i += 6)
+            out[row + i] = dense[row + i] + bias[i];
       } else {
         unsigned l = wrap(worker, leftElements / 2);
         unsigned r = wrap(worker, rightElements / 2);

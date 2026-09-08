@@ -64,7 +64,9 @@ impl<'a> CandidateSearch<'a> {
                 .iter()
                 .filter(|candidate| operator_matches(&operation.kind, candidate.operator()))
                 .filter_map(|candidate| match candidate.format_policy() {
-                    OperatorFormatPolicy::Concrete | OperatorFormatPolicy::RowMajorGrid => None,
+                    OperatorFormatPolicy::Concrete
+                    | OperatorFormatPolicy::RowMajorGrid
+                    | OperatorFormatPolicy::RowMajorRows => None,
                     OperatorFormatPolicy::PreserveInputLayout(index) => Some(usize::from(index)),
                 })
                 .collect()

@@ -29,6 +29,8 @@ pub enum OperatorFormatPolicy {
     Concrete,
     /// Fill a row-major row/column grid, using rows before splitting columns.
     RowMajorGrid,
+    /// Distribute complete rows over all leading axes, including batches.
+    RowMajorRows,
     /// Resolve both the selected input and output to the input value's full
     /// layout. This is the normal policy for layout-transparent unary work.
     PreserveInputLayout(u16),
@@ -322,6 +324,13 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
     );
     grid_add.format_policy = OperatorFormatPolicy::RowMajorGrid;
     candidates.push(grid_add.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])));
+    let mut norm = pointwise_operator_candidate(
+        MidOperator::LayerNorm,
+        [rows_f16.clone(), rows_f16.clone(), rows_f16.clone()],
+        rows_f16.clone(),
+    );
+    norm.format_policy = OperatorFormatPolicy::RowMajorRows;
+    candidates.push(norm);
     candidates.extend([
         pointwise_operator_candidate(
             MidOperator::LayerNorm,

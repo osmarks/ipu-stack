@@ -104,7 +104,10 @@ pub(crate) fn implement(
 /// Project the output's ownership onto non-broadcast operand dimensions.
 /// Replicating a whole multi-row parameter and then selecting its columns
 /// leaves strided views; partition it before dispatch instead.
-fn pointwise_input_tiling(input: &TensorType, output: &TensorType) -> Option<TensorTiling> {
+pub(super) fn pointwise_input_tiling(
+    input: &TensorType,
+    output: &TensorType,
+) -> Option<TensorTiling> {
     let tiling = &output.format.layout.tiling;
     if input.shape == output.shape {
         return Some(tiling.clone());

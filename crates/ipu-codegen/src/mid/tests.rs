@@ -4,6 +4,54 @@ use super::*;
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn layernorm_distributes_batch_rows_without_splitting_features() {
+    for (batch, rows, owners) in [(2, 729, 1458), (4, 729, 1458), (2, 1, 2)] {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [batch, rows, 1152]).unwrap();
+        let scale = graph.parameter("scale", [1152]).unwrap();
+        let bias = graph.parameter("bias", [1152]).unwrap();
+        let output = graph.layer_norm(x, scale, bias).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let mut config = PipelineConfig::new(1472)
+            .with_automatic_input(x, Precision::F16)
+            .with_automatic_input(scale, Precision::F16)
+            .with_automatic_input(bias, Precision::F16);
+        config.operator_candidates.retain(|candidate| {
+            candidate.format_policy() == OperatorFormatPolicy::RowMajorRows
+                && candidate
+                    .concrete()
+                    .unwrap()
+                    .plan
+                    .requirements
+                    .output
+                    .format
+                    .layout
+                    .tiling
+                    .tile_count
+                    == 1472
+        });
+        let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let value = &mid.values[mid.outputs[0].index() as usize].tensor_type;
+        let shards = value.format.layout.shard_extents(&value.shape).unwrap();
+        assert_eq!(shards.len(), owners);
+        assert_eq!(
+            shards
+                .iter()
+                .map(|(_, axes)| u64::from(axes[0].logical_end - axes[0].start)
+                    * u64::from(axes[1].logical_end - axes[1].start))
+                .sum::<u64>(),
+            u64::from(batch * rows)
+        );
+        assert!(
+            shards
+                .iter()
+                .all(|(_, axes)| axes[2].start == 0 && axes[2].logical_end == 1152)
+        );
+        crate::expand_tiles(&mid).unwrap();
+    }
+}
+
+#[test]
 fn add_grid_uses_rows_before_splitting_columns() {
     for (rows, columns, expected_columns) in [(1, 1152, 288), (4, 1152, 288), (729, 4304, 2)] {
         let mut graph = ComputeGraph::new();
