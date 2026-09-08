@@ -46,6 +46,12 @@ pub enum TileKernelSpec {
     },
     Gelu,
     LayerNorm,
+    /// FP32 mean and centered squared deviation for each feature shard.
+    LayerNormMoments,
+    /// Combine equal-width feature shards' moments and apply normalization.
+    LayerNormApply {
+        parts: u16,
+    },
     ReductionSum {
         partials: u16,
     },
@@ -120,6 +126,9 @@ impl GemmOrientation {
 /// and tile-kernel phases after concrete shards are known.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OperatorDispatch {
+    LayerNorm {
+        parts: u16,
+    },
     Pointwise {
         kernel: TileKernelSpec,
     },
@@ -290,7 +299,9 @@ impl OperatorDispatch {
         match self {
             Self::Pointwise { .. } => EmptyOutputShardPolicy::Skip,
             Self::View => EmptyOutputShardPolicy::Reject,
-            Self::BlockedGemm { .. } | Self::Attention { .. } => EmptyOutputShardPolicy::Reject,
+            Self::BlockedGemm { .. } | Self::Attention { .. } | Self::LayerNorm { .. } => {
+                EmptyOutputShardPolicy::Reject
+            }
         }
     }
 }
@@ -768,6 +779,7 @@ impl OperatorPlan {
                     kernel: TileKernelSpec::LayerNorm,
                 },
             )
+            | (MidOperator::LayerNorm, OperatorDispatch::LayerNorm { .. })
             | (
                 MidOperator::Gelu,
                 OperatorDispatch::Pointwise {

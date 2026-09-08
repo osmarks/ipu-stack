@@ -4,8 +4,47 @@ use super::*;
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn short_layernorm_selects_feature_shards_and_fp32_moments() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [2, 1, 1152]).unwrap();
+    let gamma = graph.parameter("gamma", [1152]).unwrap();
+    let beta = graph.parameter("beta", [1152]).unwrap();
+    let y = graph.layer_norm(x, gamma, beta).unwrap();
+    graph.set_outputs([y]).unwrap();
+    let config = PipelineConfig::new(64)
+        .with_automatic_input(x, Precision::F16)
+        .with_automatic_input(gamma, Precision::F16)
+        .with_automatic_input(beta, Precision::F16);
+    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let resolved = implementation::resolve(mid.clone()).unwrap();
+    assert!(resolved.operations.iter().any(|op| matches!(
+        op.kind,
+        MidOperationKind::Primitive(Primitive::Compute {
+            kernel: TileKernelSpec::LayerNormApply { .. },
+            ..
+        })
+    )));
+    let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+    let mut moments = 0;
+    let mut applies = 0;
+    for run in &low.kernel_runs {
+        if matches!(run.kernel, TileKernelSpec::LayerNormMoments) {
+            assert_eq!(run.requirements.output.format.precision, Precision::F32);
+            crate::validate_kernel_run(run).unwrap();
+            moments += 1;
+        }
+        if matches!(run.kernel, TileKernelSpec::LayerNormApply { .. }) {
+            crate::validate_kernel_run(run).unwrap();
+            applies += 1;
+        }
+    }
+    assert!(moments > 2);
+    assert_eq!(moments, applies);
+}
+
+#[test]
 fn layernorm_distributes_batch_rows_without_splitting_features() {
-    for (batch, rows, owners) in [(2, 729, 1458), (4, 729, 1458), (2, 1, 2)] {
+    for (batch, rows, owners) in [(2, 729, 1458), (4, 729, 1458)] {
         let mut graph = ComputeGraph::new();
         let x = graph.host_input("x", [batch, rows, 1152]).unwrap();
         let scale = graph.parameter("scale", [1152]).unwrap();

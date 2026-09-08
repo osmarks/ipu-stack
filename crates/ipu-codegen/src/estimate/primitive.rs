@@ -128,6 +128,14 @@ pub(crate) fn kernel_cycles(
         TileKernelSpec::Gelu => elements.saturating_mul(10),
         TileKernelSpec::Add => elements.saturating_mul(3),
         TileKernelSpec::LayerNorm => elements.saturating_mul(14),
+        TileKernelSpec::LayerNormMoments => inputs[0]
+            .shape
+            .0
+            .iter()
+            .fold(10u64, |n, &size| n.saturating_mul(u64::from(size))),
+        TileKernelSpec::LayerNormApply { parts } => elements
+            .saturating_mul(7)
+            .saturating_add(rows.saturating_mul(u64::from(*parts) * 18)),
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }

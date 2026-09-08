@@ -614,7 +614,56 @@ pub(super) fn plans(
                         }
                     }
                 }
-                vec![candidate]
+                let mut variants = vec![candidate];
+                if format_policy == OperatorFormatPolicy::RowMajorRows {
+                    let base = &variants[0];
+                    let width = *output.0.last().unwrap();
+                    let rows = base.requirements.output.format.layout.tiling.tile_count;
+                    let capacity = concrete
+                        .plan
+                        .requirements
+                        .output
+                        .format
+                        .layout
+                        .tiling
+                        .tile_count;
+                    let additions = [2u16, 4, 8, 16, 32]
+                        .into_iter()
+                        .filter_map(|parts| {
+                            if !width.is_multiple_of(u32::from(parts) * 4)
+                                || rows > capacity / parts
+                            {
+                                return None;
+                            }
+                            let mut variant = base.clone();
+                            variant.dispatch = OperatorDispatch::LayerNorm { parts };
+                            let tiling = &mut variant.requirements.output.format.layout.tiling;
+                            tiling.tile_count = rows * parts;
+                            for axis in &mut tiling.axes {
+                                if axis.axis.resolve(output.0.len()).ok()? + 1 == output.0.len() {
+                                    axis.partitions = parts;
+                                } else {
+                                    axis.tile_stride =
+                                        axis.tile_stride.map(|stride| stride * parts);
+                                }
+                            }
+                            let output_type = TensorType {
+                                shape: output.clone(),
+                                format: variant.requirements.output.format.clone(),
+                            };
+                            for (requirement, input) in
+                                variant.requirements.inputs.iter_mut().zip(inputs)
+                            {
+                                requirement.format.layout = output_type.format.layout.clone();
+                                requirement.format.layout.tiling =
+                                    implementation::pointwise_input_tiling(input, &output_type)?;
+                            }
+                            Some(variant)
+                        })
+                        .collect::<Vec<_>>();
+                    variants.extend(additions);
+                }
+                variants
             }
         };
         if config.gemm_output_packing != GemmOutputPacking::Native
@@ -766,6 +815,7 @@ pub(super) fn independent_parameter_storage(
         } => output_column_block,
         OperatorDispatch::Pointwise { .. }
         | OperatorDispatch::Attention { .. }
+        | OperatorDispatch::LayerNorm { .. }
         | OperatorDispatch::View => {
             return Vec::new();
         }

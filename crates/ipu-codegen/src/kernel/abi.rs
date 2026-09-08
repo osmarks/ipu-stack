@@ -36,6 +36,8 @@ pub enum ScalarValue {
     KeyRows,
     SplitSoftmaxRows,
     NumPartials,
+    FeaturePartitions,
+    InputColumns,
     ScaleExponent,
     CastSourceScale,
     CastDestinationScale,
@@ -85,6 +87,17 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                     u64::from(*key_columns),
                     u64::from(*padded_key_columns),
                 ))),
+                _ => Err(KernelAbiError::RequirementMismatch),
+            },
+            ScalarValue::InputColumns => {
+                let axis = run.inputs[0].views[0]
+                    .extents
+                    .last()
+                    .ok_or(KernelAbiError::RequirementMismatch)?;
+                Ok(axis.logical_end - axis.start)
+            }
+            ScalarValue::FeaturePartitions => match run.kernel {
+                TileKernelSpec::LayerNormApply { parts } => Ok(u32::from(parts)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
             ScalarValue::NumPartials => match &run.kernel {
@@ -254,6 +267,22 @@ pub fn tile_kernel_abi(
                     scalars,
                 )
             }
+            TileKernelSpec::LayerNormMoments => (
+                KernelSymbols::Exact("layer_norm_moments"),
+                KernelAvailability::Implemented,
+                1,
+                &[ScalarValue::FlattenedRows, ScalarValue::InputColumns],
+            ),
+            TileKernelSpec::LayerNormApply { .. } => (
+                KernelSymbols::Exact("layer_norm_apply"),
+                KernelAvailability::Implemented,
+                4,
+                &[
+                    ScalarValue::FlattenedRows,
+                    ScalarValue::LogicalColumns,
+                    ScalarValue::FeaturePartitions,
+                ],
+            ),
             TileKernelSpec::LayerNorm => (
                 KernelSymbols::Exact("layer_norm_f16"),
                 if precision == Precision::F16 {
@@ -468,6 +497,52 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                         .ok_or(KernelAbiError::ElementCountOverflow)?,
                 ))
         {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+    }
+    if matches!(
+        kernel,
+        TileKernelSpec::LayerNormMoments | TileKernelSpec::LayerNormApply { .. }
+    ) {
+        let extent = run.inputs[0].views[0]
+            .extents
+            .last()
+            .ok_or(KernelAbiError::RequirementMismatch)?;
+        let width = extent.logical_end - extent.start;
+        let source_count = run.inputs[0].views[0]
+            .extents
+            .iter()
+            .map(|e| e.logical_end - e.start)
+            .product::<u32>();
+        let rows = source_count
+            .checked_div(width)
+            .ok_or(KernelAbiError::RequirementMismatch)?;
+        let valid = width.is_multiple_of(4)
+            && extent.physical_end == extent.logical_end
+            && run.requirements.inputs[0].format.precision == Precision::F16
+            && run.requirements.output.format.layout.order == ElementOrder::RowMajor
+            && match kernel {
+                TileKernelSpec::LayerNormMoments => {
+                    run.requirements.output.format.precision == Precision::F32
+                        && element_count(run)? == rows * 2
+                }
+                TileKernelSpec::LayerNormApply { parts } => {
+                    *parts >= 2
+                        && run.requirements.output.format.precision == Precision::F16
+                        && run.requirements.inputs[1..3]
+                            .iter()
+                            .all(|input| input.format.precision == Precision::F16)
+                        && run.requirements.inputs[3].format.precision == Precision::F32
+                        && run.inputs[3].views[0]
+                            .extents
+                            .iter()
+                            .map(|e| e.logical_end - e.start)
+                            .product::<u32>()
+                            == rows * u32::from(*parts) * 2
+                }
+                _ => unreachable!(),
+            };
+        if !valid {
             return Err(KernelAbiError::RequirementMismatch);
         }
     }

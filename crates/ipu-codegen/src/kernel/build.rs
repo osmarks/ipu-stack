@@ -91,9 +91,38 @@ impl KernelBuildPlan {
                 &[3, 2, 4],
             );
         }
-        let has_worker_codelets = ["layer_norm_f16", "add_f16", "cast_f32_f16"]
-            .iter()
-            .any(|symbol| exact_symbols.contains(symbol))
+        if exact_symbols.contains("layer_norm_moments") {
+            plan.compilations.push(KernelCompilation {
+                source: "layer_norm_distributed.cpp",
+                name: "layer_norm_moments_codelet".into(),
+                flags: vec!["-O2".into(), "-DVERTEX_LayerNormMoments".into()],
+                retained_symbols: Vec::new(),
+            });
+            plan.compilations.push(KernelCompilation {
+                source: "layer_norm_moments.S",
+                name: "layer_norm_moments_wrapper".into(),
+                flags: Vec::new(),
+                retained_symbols: vec!["layer_norm_moments".into()],
+            });
+        }
+        if exact_symbols.contains("layer_norm_apply") {
+            plan.add_vertex(
+                "layer_norm_distributed.cpp",
+                "layer_norm_apply",
+                "LayerNormApply",
+                vec!["-O2".into(), "-DVERTEX_LayerNormApply".into()],
+                &[3, 4, 5, 6, 2, 7, 8, 9],
+            );
+        }
+        let has_worker_codelets = [
+            "layer_norm_f16",
+            "layer_norm_moments",
+            "layer_norm_apply",
+            "add_f16",
+            "cast_f32_f16",
+        ]
+        .iter()
+        .any(|symbol| exact_symbols.contains(symbol))
             || !fp8_casts.is_empty()
             || !rearrangements.is_empty()
             || !unpacks.is_empty();

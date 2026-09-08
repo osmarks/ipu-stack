@@ -44,6 +44,24 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             3.0,
             "GeLU: 12 arithmetic issue slots / 4 elements",
         ),
+        TileKernelSpec::LayerNormMoments => {
+            let elements: u64 = run.inputs[0].views[0]
+                .extents
+                .iter()
+                .map(|e| u64::from(e.logical_end - e.start))
+                .product();
+            return Some((
+                elements as f64 * 2.0,
+                elements as f64 * 2.0,
+                "layernorm: local FP32 mean and centered variance",
+            ));
+        }
+        TileKernelSpec::LayerNormApply { .. } => (
+            logical,
+            physical,
+            2.0,
+            "layernorm: normalization and affine arithmetic",
+        ),
         TileKernelSpec::LayerNorm => (
             logical,
             physical,

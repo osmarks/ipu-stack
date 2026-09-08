@@ -3,6 +3,7 @@
 
 mod attention;
 mod gemm;
+mod layernorm;
 
 use super::*;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub(crate) fn implement(
 ) -> Option<Arc<MidProgram>> {
     let mut b = Builder::new(inputs);
     let result = match &plan.dispatch {
+        OperatorDispatch::LayerNorm { parts } => b.layernorm(output, *parts)?,
         OperatorDispatch::Pointwise { kernel, .. } => {
             let mut operands = Vec::new();
             for (index, input) in inputs.iter().enumerate() {
