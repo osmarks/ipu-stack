@@ -226,3 +226,12 @@ Remaining structural limitations include standalone projection bias additions
 large coefficient-layout packing operations with sparse ownership. The single-row
 MAP normalization still resides on one tile, using all six workers; cross-tile
 statistics would require a different normalization implementation.
+
+The block-major coefficient packer now accepts full-height row blocks that are
+multiples of 16, instead of only 64-row blocks. The 729-to-768-row attention
+packing uses the existing wide-load/sort assembly rather than scalar C++.
+`artifacts/vit/wide-pack-so400m-fp8/profile.html` records the full model at
+971,724 cropped cycles (0.647816 ms), with unchanged maximum reference error
+0.096191. Its two large coefficient-packing occurrences each fall from 77,790
+to 58,314 cycles. Kernel-build setup for rearrangements was consolidated at the
+same time, removing repeated flag and compilation assembly.

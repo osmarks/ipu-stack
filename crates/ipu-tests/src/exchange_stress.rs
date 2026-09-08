@@ -72,6 +72,29 @@ pub(crate) struct PhaseReplayPackage {
     initial_origins: BTreeMap<u32, Vec<(u16, u32)>>,
 }
 
+mod delta;
+pub(crate) use delta::build as build_delta;
+
+fn readback_bindings(spans: &[ExpectedSpan], topology: &Topology) -> Result<Vec<Binding>> {
+    spans
+        .iter()
+        .enumerate()
+        .map(|(index, span)| -> Result<Binding> {
+            Ok(Binding {
+                name: format!("exchange-result-{index}"),
+                dtype: "u32".into(),
+                shape: vec![u32::try_from(span.words.len())?],
+                slices: vec![RegionSlice {
+                    tile: u32::from(topology.physical(span.tile)?),
+                    tile_address: span.address,
+                    file_offset: 0,
+                    size: u64::try_from(span.words.len() * 4)?,
+                }],
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn build_wide(
     active_tiles: u16,
     first_case: u32,
@@ -379,23 +402,7 @@ pub(crate) fn build_wide(
         row_address = (row_end + 7) & !7;
     }
 
-    let output_bindings = readbacks
-        .iter()
-        .enumerate()
-        .map(|(index, span)| -> Result<Binding> {
-            Ok(Binding {
-                name: format!("paired-result-{index}"),
-                dtype: "u32".into(),
-                shape: vec![u32::try_from(span.words.len())?],
-                slices: vec![RegionSlice {
-                    tile: u32::from(topology.physical(span.tile)?),
-                    tile_address: span.address,
-                    file_offset: 0,
-                    size: u64::try_from(span.words.len() * 4)?,
-                }],
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let output_bindings = readback_bindings(&readbacks, &topology)?;
     let application = build_tile_program_package(
         &programs,
         &data,
@@ -1419,7 +1426,7 @@ impl StressPackage {
             let bytes = span.words.len() * 4;
             let actual = output
                 .get(offset..offset + bytes)
-                .context("paired exchange host output is truncated")?
+                .context("exchange host output is truncated")?
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte word")))
                 .collect::<Vec<_>>();
@@ -1435,7 +1442,7 @@ impl StressPackage {
                 .collect::<Vec<_>>();
             if !differences.is_empty() {
                 bail!(
-                    "paired exchange corrupted logical tile {} at 0x{:x}: {differences:?}",
+                    "exchange corrupted logical tile {} at 0x{:x}: {differences:?}",
                     span.tile,
                     span.address,
                 );
@@ -1443,7 +1450,7 @@ impl StressPackage {
         }
         if !self.readbacks.is_empty() {
             eprintln!(
-                "exchangeWide hardwareReadback=PASS spans={} words={}",
+                "exchange hardwareReadback=PASS spans={} words={}",
                 self.readbacks.len(),
                 self.readbacks
                     .iter()

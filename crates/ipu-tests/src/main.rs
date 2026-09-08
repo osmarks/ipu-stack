@@ -255,6 +255,8 @@ enum Workload {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExchangeStressPattern {
+    /// Inspect exchange address deltas around a contiguous transfer.
+    Delta,
     /// Random small-group transfers, including repeated and chained payloads.
     Random,
     /// Controlled full-duplex cases with one tile sending and receiving.
@@ -526,7 +528,9 @@ fn main() -> Result<()> {
             );
         }
         let toolchain = Toolchain::from_sdk(&arguments.sdk);
-        let stress = if matches!(arguments.exchange_pattern, ExchangeStressPattern::Wide) {
+        let stress = if matches!(arguments.exchange_pattern, ExchangeStressPattern::Delta) {
+            exchange_stress::build_delta(&toolchain, &runtime_source)?
+        } else if matches!(arguments.exchange_pattern, ExchangeStressPattern::Wide) {
             exchange_stress::build_wide(
                 active_tiles,
                 arguments.exchange_wide_first_case,
@@ -593,13 +597,15 @@ fn main() -> Result<()> {
                 });
                 let result = (|| {
                     let call = session.invoke_streaming_deferred("run", &[0; 4])?;
-                    let output = session.collect(&call)?;
+                    runtime
+                        .device()
+                        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
                     diagnose_completion(
                         &runtime,
                         &stress.application,
                         Duration::from_secs(arguments.timeout_seconds),
                     )?;
-                    stress.validate_readbacks(&output)
+                    stress.validate_readbacks(&session.collect(&call)?)
                 })();
                 let _ = finished_tx.send(());
                 watchdog
@@ -613,7 +619,11 @@ fn main() -> Result<()> {
             "package={} seed={:#x} exchangeCases={} hardwareTest=PASS",
             arguments.package.display(),
             arguments.exchange_seed,
-            arguments.exchange_cases
+            if matches!(arguments.exchange_pattern, ExchangeStressPattern::Delta) {
+                1
+            } else {
+                arguments.exchange_cases
+            }
         );
         return Ok(());
     }

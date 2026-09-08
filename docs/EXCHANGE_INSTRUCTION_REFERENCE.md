@@ -81,6 +81,32 @@ element even though the fabric route itself is stateless. The compiler must
 therefore validate placement-dependent memory-element conflicts as well as
 endpoint timing.
 
+### Address deltas and possible stride controls
+
+The SDK architecture register inventory names `INCOMING_DELTA` (0xa2) and
+`OUTGOING_DELTA` (0xa8), each with an 18-bit address field shifted by two bits.
+A C600 diagnostic sets both to 8, snapshots them, transmits 16 consecutive words
+from 0x65000 to 0x60000 on two other tiles, and snapshots them again. The source's
+outgoing delta becomes 0x65040; each receiver's incoming delta becomes 0x60040.
+Unused deltas remain 8. The received words are contiguous. These registers are
+mutable address offsets/cursors, not configurable per-word increments in this
+mode. Snapshots happen inside the tile program before host exchange alters state.
+
+Run `ipu-trivial-test c600-init.ipucfg --workload exchange-stress
+--exchange-pattern delta --device-lock artifacts/layout-sweep/device.lock
+--package /tmp/exchange-delta.ipuexe`. The test checks both payload and CSR
+snapshots through host readback. Its source is
+`crates/ipu-tests/src/exchange_stress/delta.rs`; logs are in
+`artifacts/exchange-delta/`.
+
+The complete SDK supervisor register list has no explicitly named stride CSR.
+Other exchange registers include `INCOMING_SINIT`, `INCOMING_FORMAT`,
+`INCOMING_DCOUNT`, `ANS_DCOUNT`, and `EXCHANGE_ADJ` (four-bit `COFF`, one-bit
+`SEWS`). This inventory does not establish all their semantics or rule out an
+undocumented mode. The public IPU21 Tile Vertex ISA, section 2.13, omits the
+exchange interface details. No usable constant-stride exchange mode has been
+established; software currently describes separate contiguous bursts.
+
 ## Event time
 
 The fields called `delay` or `count` below contain `events - 1`. Thus a zero
