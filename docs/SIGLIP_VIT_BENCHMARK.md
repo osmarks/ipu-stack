@@ -295,3 +295,10 @@ Batch 8 still fails the planner's tensor-memory screen at the MLP up-projection
 (795,856 total estimated bytes, including 214,464 row bytes, with 385,024 bytes
 of peak interleaved storage). This is a failure of the available/planned
 candidates, not a measured hardware batch-size ceiling.
+
+Final placement also exposed an obsolete rejection of an empty lower-region
+free list. Ordinary and interleaved tensors already share upper-region storage;
+code and tables occupying the entire lower region therefore do not alone prove
+an allocation failure. The allocator now accepts that case and its repeat/bank
+separation regression exercises placement with no lower-region space. The
+ongoing scaled-budget runs predate this last correction.

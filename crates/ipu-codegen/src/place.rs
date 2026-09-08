@@ -97,8 +97,7 @@ pub(crate) fn place_with_offset(
     if interleaved_offset >= IPU21_INTERLEAVED_ELEMENT_SIZE {
         return Err(PlacementError::Overflow);
     }
-    if standard_ranges.is_empty()
-        || standard_ranges.iter().any(|&(start, end)| {
+    if standard_ranges.iter().any(|&(start, end)| {
             start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
         })
         || standard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
@@ -1148,6 +1147,7 @@ mod tests {
         for placement in [
             place(&low).unwrap(),
             place_with_standard_ranges(&low, &[(IPU21_DATA_BASE, IPU21_DATA_BASE + 4)]).unwrap(),
+            place_with_standard_ranges(&low, &[]).unwrap(),
         ] {
             for tile in &low.tiles {
                 for work in low.work(tile) {
