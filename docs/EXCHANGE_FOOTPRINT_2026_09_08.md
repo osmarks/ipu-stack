@@ -123,3 +123,32 @@ no full package was rebuilt to measure actual savings for these captures.
 
 Regression tests cover relocated compatible rows, address-value/offset storage,
 inactive rows, changed routes and payloads, and exclusion of iterated senders.
+
+## Full B2 build after structural sharing
+
+On commit `b23d46f`, the full one-layer FP8 B2 ViT build exhausted all configured
+storage-penalty retries and failed before hardware execution. Command and log:
+`artifacts/vit/footprint-sharing-b2-fp8/{command.sh,run.log}`. The build used the
+existing 64-KiB encoded-table budget and 16,384-fragment effort limit, with no
+layout or precision overrides beyond the benchmark's usual FP8 scale -4.
+
+| Storage penalty | Mid search ms | Expanded candidates | Admitted layouts | Encoded bytes |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 239,373 | 14 | 1 | 77,584 |
+| 16 | 222,683 | 12 | 1 | 77,584 |
+| 256 | 207,589 | 12 | 1 | 77,444 |
+
+The complete selection took 1,170,051 ms (19.5 minutes), including 669,645 ms
+(11.2 minutes) of repeated mid planning. Admission correctly avoided scheduling
+all 38 expanded candidates, but the three attempts still found nearly identical
+oversized tables and repeated a costly 52,812-transfer instruction-alignment
+retry. The first selected estimate was 95,696 bytes against 77,584 encoded bytes
+(23.3% high). The model recognized its storage risk; it did not recover a plan
+under budget.
+
+No new executable or hardware profile was produced. B1 was not rebuilt in this
+validation. The previous successful B1 and older successful B2 results remain
+historical evidence, not validation of current automatic B2 selection. Further
+work needs to trace why the known compact complete plan is absent or loses
+selection, and avoid repeating substantially equivalent failed work across
+penalty retries. Increasing penalties alone did not solve this run.
