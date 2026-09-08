@@ -2,14 +2,107 @@
 //! remain unchanged. Speculative transfers still run the ordinary row encoder.
 use super::*;
 
+// Trials share immutable chunks and copy at most the final partial chunk.
+// A flat chunk index keeps lookup/rollback bounded and avoids recursive drops.
+const CHUNK_ITEMS: usize = 128;
+
+#[derive(Clone, Debug)]
+struct Chunks<T> {
+    chunks: Vec<Arc<Vec<T>>>,
+    len: usize,
+}
+
+impl<T> Default for Chunks<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+}
+
+impl<T: Clone> Chunks<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get(&self, index: usize) -> &T {
+        &self.chunks[index / CHUNK_ITEMS][index % CHUNK_ITEMS]
+    }
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
+        self.chunks.iter().flat_map(|chunk| chunk.iter())
+    }
+    fn push(&mut self, value: T) {
+        if self.len.is_multiple_of(CHUNK_ITEMS) {
+            self.chunks.push(Arc::new(Vec::with_capacity(CHUNK_ITEMS)));
+        }
+        Arc::make_mut(self.chunks.last_mut().unwrap()).push(value);
+        self.len += 1;
+    }
+    fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len);
+        self.chunks.truncate(len.div_ceil(CHUNK_ITEMS));
+        if !len.is_multiple_of(CHUNK_ITEMS) {
+            Arc::make_mut(self.chunks.last_mut().unwrap()).truncate(len % CHUNK_ITEMS);
+        }
+        self.len = len;
+    }
+    fn to_vec(&self) -> Vec<T> {
+        self.iter().cloned().collect()
+    }
+}
+
+impl<T: Clone + PartialEq> PartialEq for Chunks<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+impl<T: Clone> Extend<T> for Chunks<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for value in iter {
+            self.push(value);
+        }
+    }
+}
+
+/// The row encoder needs only append and absolute word parity. Primitive rows
+/// use a Vec; speculative phase rows share chunks through the same encoder.
+pub(super) trait RowWords: Extend<u32> {
+    fn len(&self) -> usize;
+    fn push(&mut self, word: u32);
+}
+impl RowWords for Vec<u32> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn push(&mut self, word: u32) {
+        Vec::push(self, word);
+    }
+}
+impl RowWords for Chunks<u32> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn push(&mut self, word: u32) {
+        Chunks::push(self, word);
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct EncodedSchedule {
-    senders: Vec<ScheduledSenderRow>,
-    events: Vec<ReceiveEvent>,
-    checkpoints: Vec<Checkpoint>,
-    pub(super) words: Vec<u32>,
+    checkpoints: Chunks<Checkpoint>,
+    words: Chunks<u32>,
     #[cfg(test)]
     resumed_words: usize,
+}
+
+impl EncodedSchedule {
+    pub(super) fn words(&self) -> Vec<u32> {
+        self.words.to_vec()
+    }
+    #[cfg(test)]
+    pub(super) fn same_words(&self, other: &Self) -> bool {
+        self.words == other.words
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,50 +145,42 @@ pub(super) fn build_scheduled_program(
     senders: &[ScheduledSenderRow],
     receive_events: &[ReceiveEvent],
     horizon_cycles: u32,
-    prefix: Option<&EncodedSchedule>,
+    prefix: Option<(&EncodedSchedule, usize, usize)>,
 ) -> Result<EncodedSchedule, ExchangeError> {
-    let mut senders = senders.to_vec();
-    senders.sort_by_key(|sender| sender.start_cycles);
-    if senders
-        .windows(2)
-        .any(|pair| pair[0].end_cycles > pair[1].start_cycles)
-    {
-        return Err(ExchangeError::Schedule("overlapping outgoing messages"));
-    }
-    let mut events = receive_events.to_vec();
-    events.sort_by_key(|event| event.cycles);
-    validate_receive_events(&events)?;
-
-    let mut words = Vec::new();
-    let mut checkpoints = Vec::new();
-    let mut resume = Checkpoint::default();
-    if let Some(prefix) = prefix {
-        let same_senders = senders
-            .iter()
-            .zip(&prefix.senders)
-            .take_while(|(a, b)| a == b)
-            .count();
-        let same_events = events
-            .iter()
-            .zip(&prefix.events)
-            .take_while(|(a, b)| a == b)
-            .count();
-        if let Some((index, checkpoint)) =
-            prefix
-                .checkpoints
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, checkpoint)| {
-                    checkpoint.senders <= same_senders
-                        && checkpoint.events <= same_events
-                        && checkpoint.reusable(&senders, &events, horizon_cycles)
-                })
-        {
-            resume = *checkpoint;
-            words.extend_from_slice(&prefix.words[..resume.words]);
-            checkpoints.extend_from_slice(&prefix.checkpoints[..=index]);
+    debug_assert!(
+        senders
+            .windows(2)
+            .all(|pair| pair[0].end_cycles <= pair[1].start_cycles)
+    );
+    let events = receive_events;
+    // The prefix was validated already. Include the entire control group at
+    // the edit boundary because controls sharing a cycle encode together.
+    let mut changed = prefix.map_or(0, |(_, _, events)| events).min(events.len());
+    if changed < events.len() {
+        while changed > 0 && events[changed - 1].cycles == events[changed].cycles {
+            changed -= 1;
         }
+    }
+    validate_receive_events(&events[changed..])?;
+
+    let mut words = Chunks::default();
+    let mut checkpoints = Chunks::default();
+    let mut resume = Checkpoint::default();
+    if let Some((prefix, same_senders, same_events)) = prefix
+        && let Some((index, checkpoint)) = (0..prefix.checkpoints.len())
+            .rev()
+            .map(|index| (index, prefix.checkpoints.get(index)))
+            .find(|(_, checkpoint)| {
+                checkpoint.senders <= same_senders
+                    && checkpoint.events <= same_events
+                    && checkpoint.reusable(senders, events, horizon_cycles)
+            })
+    {
+        resume = *checkpoint;
+        words = prefix.words.clone();
+        words.truncate(resume.words);
+        checkpoints = prefix.checkpoints.clone();
+        checkpoints.truncate(index + 1);
     }
     let mut event_cycles = resume.cycles;
     let mut event_index = resume.events;
@@ -153,10 +238,8 @@ pub(super) fn build_scheduled_program(
         },
     )?;
     words.push(RETURN_M10_INSTRUCTION);
-    debug_assert_eq!(plan_event_cycles(&words)?, horizon_cycles);
+    debug_assert_eq!(plan_event_cycles(&words.to_vec())?, horizon_cycles);
     Ok(EncodedSchedule {
-        senders,
-        events,
         checkpoints,
         words,
         #[cfg(test)]
@@ -170,14 +253,20 @@ mod tests {
 
     #[test]
     fn rejected_receive_preserves_stream_and_encoding() {
-        let row = Topology::c600().multicast(0, &[2], 64, 0).unwrap().receivers[0];
+        let row = Topology::c600()
+            .multicast(0, &[2], 64, 0)
+            .unwrap()
+            .receivers[0];
         let mut schedule = TileProgramSchedule::default();
         schedule.append_receiver_at(&row, 0, 64).unwrap();
         let encoded = schedule.encoded().unwrap().clone();
         let next = schedule.earliest_receiver_offset(&row, 64, 0).unwrap();
         assert!(schedule.append_receiver_at(&row, 0, 64).is_err());
         assert!(Arc::ptr_eq(&encoded, schedule.encoded().unwrap()));
-        assert_eq!(schedule.earliest_receiver_offset(&row, 64, 0).unwrap(), next);
+        assert_eq!(
+            schedule.earliest_receiver_offset(&row, 64, 0).unwrap(),
+            next
+        );
         schedule.append_receiver_at(&row, next, 64).unwrap();
         schedule.finish().unwrap();
     }
@@ -245,15 +334,7 @@ mod tests {
                 patch_receiver_address(&mut row, 0x50000 + index % 128 * 512).unwrap();
                 let offset = schedule.earliest_receiver_offset(&row, 64, 0).unwrap();
                 schedule.append_receiver_at(&row, offset, 64).unwrap();
-                prefix = Some(
-                    build_scheduled_program(
-                        &schedule.senders,
-                        &schedule.receive_events,
-                        schedule.event_cycles,
-                        prefix.as_ref(),
-                    )
-                    .unwrap(),
-                );
+                prefix = Some(schedule.encoded().unwrap().clone());
             }
             let encoded = prefix.unwrap();
             let checksum = encoded.words.iter().fold(0u64, |hash, &word| {
@@ -290,7 +371,13 @@ mod tests {
                     &schedule.senders,
                     &schedule.receive_events,
                     schedule.event_cycles,
-                    if incremental { prefix.as_deref() } else { None },
+                    if incremental {
+                        prefix
+                            .as_deref()
+                            .map(|prefix| (prefix, schedule.dirty_senders, schedule.dirty_events))
+                    } else {
+                        None
+                    },
                 )
                 .unwrap()
             };

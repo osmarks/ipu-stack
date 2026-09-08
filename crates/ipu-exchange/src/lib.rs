@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 mod encoding;
-use encoding::{EncodedSchedule, build_scheduled_program};
+use encoding::{EncodedSchedule, RowWords, build_scheduled_program};
 use tracing::debug;
 
 pub mod diagnostic;
@@ -249,6 +249,10 @@ struct TileProgramSchedule {
     receive_stream: Option<ReceiveStream>,
     encoded: OnceLock<Arc<EncodedSchedule>>,
     encoding_prefix: Option<Arc<EncodedSchedule>>,
+    // Earliest changed input since encoding_prefix; insertion/removal maintains
+    // these directly instead of comparing two copies of the entire history.
+    dirty_senders: usize,
+    dirty_events: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -808,6 +812,7 @@ impl TileProgramSchedule {
             return Err(ExchangeError::Schedule("unencodable initial send control"));
         }
         self.invalidate_encoding();
+        self.dirty_senders = self.dirty_senders.min(index);
         self.event_cycles = self.event_cycles.max(timing.horizon_cycles);
         self.senders.insert(
             index,
@@ -856,8 +861,15 @@ impl TileProgramSchedule {
         }
         self.invalidate_encoding();
         if let Some(stream) = &self.receive_stream {
-            self.receive_events
-                .retain(|event| !replaces_receive_event(*event, base.mode, &timing, stream));
+            let mut index = 0;
+            self.receive_events.retain(|event| {
+                let remove = replaces_receive_event(*event, base.mode, &timing, stream);
+                if remove {
+                    self.dirty_events = self.dirty_events.min(index);
+                }
+                index += 1;
+                !remove
+            });
         }
 
         // `earliest_receiver_offset` checked the new events against the full
@@ -869,6 +881,7 @@ impl TileProgramSchedule {
             let index = self
                 .receive_events
                 .partition_point(|old| old.cycles <= event.cycles);
+            self.dirty_events = self.dirty_events.min(index);
             self.receive_events.insert(index, *event);
         }
         self.event_cycles = self.event_cycles.max(timing.horizon);
@@ -886,6 +899,8 @@ impl TileProgramSchedule {
     fn invalidate_encoding(&mut self) {
         if let Some(encoded) = self.encoded.take() {
             self.encoding_prefix = Some(encoded);
+            self.dirty_senders = self.senders.len();
+            self.dirty_events = self.receive_events.len();
         }
     }
 
@@ -897,7 +912,9 @@ impl TileProgramSchedule {
             &self.senders,
             &self.receive_events,
             self.event_cycles,
-            self.encoding_prefix.as_deref(),
+            self.encoding_prefix
+                .as_deref()
+                .map(|prefix| (prefix, self.dirty_senders, self.dirty_events)),
         );
         #[cfg(test)]
         if self.encoding_prefix.is_some() {
@@ -907,17 +924,17 @@ impl TileProgramSchedule {
                 self.event_cycles,
                 None,
             );
-            assert_eq!(
-                result.as_ref().map(|row| &row.words),
-                full.as_ref().map(|row| &row.words)
-            );
+            match (&result, &full) {
+                (Ok(incremental), Ok(full)) => assert!(incremental.same_words(full)),
+                _ => assert_eq!(result.as_ref().err(), full.as_ref().err()),
+            }
         }
         let _ = self.encoded.set(Arc::new(result?));
         Ok(self.encoded.get().expect("successful encoding was cached"))
     }
 
     pub fn finish(&self) -> Result<Vec<u32>, ExchangeError> {
-        Ok(self.encoded()?.words.clone())
+        Ok(self.encoded()?.words())
     }
 }
 
@@ -1435,7 +1452,7 @@ fn receive_row_timing_from_base(
 }
 
 fn append_sender_message(
-    words: &mut Vec<u32>,
+    words: &mut impl RowWords,
     event_cycles: &mut u32,
     sender: &ScheduledSenderRow,
     controls: &[ReceiveEvent],
@@ -1537,7 +1554,7 @@ fn append_sender_message(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_sender_words(
-    words: &mut Vec<u32>,
+    words: &mut impl RowWords,
     event_cycles: &mut u32,
     initial_instruction: u32,
     direction: u32,
@@ -1645,7 +1662,7 @@ fn encode_send_control(count_minus_one: u32, event: ReceiveEvent) -> Result<u32,
 }
 
 fn append_receive_events(
-    words: &mut Vec<u32>,
+    words: &mut impl RowWords,
     event_cycles: &mut u32,
     events: &[ReceiveEvent],
     horizon_cycles: u32,
@@ -1662,7 +1679,7 @@ fn append_receive_events(
 }
 
 fn append_receive_events_record(
-    words: &mut Vec<u32>,
+    words: &mut impl RowWords,
     event_cycles: &mut u32,
     events: &[ReceiveEvent],
     horizon_cycles: u32,
@@ -1774,7 +1791,7 @@ fn encode_send_control_pair(
 }
 
 fn append_plain_delay(
-    words: &mut Vec<u32>,
+    words: &mut impl RowWords,
     event_cycles: &mut u32,
     target_cycles: u32,
 ) -> Result<(), ExchangeError> {
@@ -1794,7 +1811,7 @@ fn append_plain_delay(
 /// two-word-instruction alignment. Exchange rows are placed at eight-byte
 /// boundaries, so `word_parity == 0` aligns a following SENDPICP and payload.
 fn append_plain_delay_aligned(
-    words: &mut Vec<u32>,
+    words: &mut impl RowWords,
     event_cycles: &mut u32,
     target_cycles: u32,
     word_parity: usize,
