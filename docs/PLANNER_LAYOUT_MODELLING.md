@@ -141,3 +141,12 @@ Retries share cached operator implementations. The API field
 `exchange_table_cost_per_byte` can set the initial penalty; automatic retries
 only increase it. This is a bounded heuristic, not proof that every feasible
 layout will be found, and does not invoke physical exchange scheduling.
+
+With these shortlist/retry fixes, the full FP8 B2 ViT capture advances from
+operation 15 to operation 19 under the unchanged 64 KiB conservative limit.
+All four automatic/native and attention-product configurations still reject;
+their final minimum estimates are 69,540 or 80,984 bytes. This is not evidence
+that no complete compact-table plan fits: the estimate remains conservative,
+and the bounded search is incomplete. No physical scheduling or hardware run
+was performed for this capture. Validation: 181 unit tests plus the doctest and
+Clippy pass.
