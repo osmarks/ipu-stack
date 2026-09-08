@@ -118,7 +118,7 @@ struct Arguments {
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
-    /// Cap conservative per-tile exchange table bytes before scheduling (default 64 KiB).
+    /// Cap geometry-derived per-tile exchange table bytes before scheduling (default 64 KiB).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_table_budget_kib: Option<u64>,
     /// Rank this many complete planner finalists with physical exchange scheduling.

@@ -18,6 +18,41 @@ pub(super) struct ScheduledPlan {
     pub cache: crate::exchange::ExchangeScheduleCache,
 }
 
+pub(super) fn select_graph_finalist<T>(
+    graph: &ComputeGraph,
+    planning: &PipelineConfig,
+    tile_mapping: Option<&[u16]>,
+    mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
+) -> PackageBuildResult<(ScheduledPlan, T)> {
+    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, planning.tile_count);
+    let mut search = planning.clone();
+    let mut result = Err(invalid("no operator-plan finalists"));
+    for penalty in std::iter::once(planning.exchange_table_cost_per_byte).chain(
+        [16, 256]
+            .into_iter()
+            .filter(|p| *p > planning.exchange_table_cost_per_byte),
+    ) {
+        search.exchange_table_cost_per_byte = penalty;
+        let finalists = build_phase("lower_mid", || {
+            Ok(lower_finalists(
+                graph,
+                &search,
+                &costs,
+                search.exchange_schedule_finalists.max(4),
+            )?)
+        })?;
+        result = select_scheduled_finalist(finalists, &search, tile_mapping, &mut finalize);
+        if !matches!(
+            result,
+            Err(PackageBuildError::ExchangeBudgetExceeded { .. })
+        ) {
+            break;
+        }
+        tracing::info!(penalty, "geometry or encoded exchange budget exhausted");
+    }
+    result
+}
+
 pub(super) fn select_scheduled_finalist<T>(
     finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
@@ -176,10 +211,14 @@ pub(super) fn expand_and_place(
     tile_mapping: Option<&[u16]>,
 ) -> PackageBuildResult<(LowProgram, crate::Placement)> {
     let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
-    check_exchange_budget(
-        crate::estimate::program_footprint(&expanded)?.estimated_row_bytes(),
-        planning,
-    )?;
+    let bytes = crate::estimate::program_footprint(&expanded)?.estimated_row_bytes();
+    tracing::info!(
+        heuristic_row_bytes = mid.peak_memory.exchange_rows,
+        geometry_row_bytes = bytes,
+        budget_bytes = planning.exchange_table_budget_bytes,
+        "screened exchange table geometry"
+    );
+    check_exchange_budget(bytes, planning)?;
     placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
     let placement = place(&low)?;
@@ -188,10 +227,10 @@ pub(super) fn expand_and_place(
 
 pub(super) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> PackageBuildResult<()> {
     if bytes > config.exchange_table_budget_bytes {
-        return Err(invalid(format!(
-            "exchange tables exceed per-tile budget: {bytes} bytes, limit {} bytes",
-            config.exchange_table_budget_bytes,
-        )));
+        return Err(PackageBuildError::ExchangeBudgetExceeded {
+            bytes,
+            budget: config.exchange_table_budget_bytes,
+        });
     }
     Ok(())
 }
@@ -233,17 +272,9 @@ mod tests {
                 .contains("exchange tables exceed per-tile budget")
         );
         config.exchange_table_budget_bytes = 0;
-        // Retain a simpler layout. Late expansion can still reveal traffic
-        // absent from the coarse mid estimate, so enforce both screens.
-        let simple = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
-        let simple_bytes =
-            crate::estimate::program_footprint(&crate::expand_tiles(&simple[0]).unwrap())
-                .unwrap()
-                .estimated_row_bytes();
-        assert!(simple_bytes < bytes);
-        assert!(expand_and_place(&simple[0], &config, None).is_err());
-        config.exchange_table_budget_bytes = simple_bytes;
-        assert!(expand_and_place(&simple[0], &config, None).is_ok());
+        // Heuristic row estimates must not reject mid candidates.
+        let still_planned = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
+        assert!(expand_and_place(&still_planned[0], &config, None).is_err());
         config.exchange_table_budget_bytes = u64::MAX;
         assert!(lower_finalists(&graph, &config, &Ipu21CostModel, 1).is_ok());
     }

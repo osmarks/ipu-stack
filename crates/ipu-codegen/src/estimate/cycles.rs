@@ -70,9 +70,9 @@ pub struct ExchangeFootprint {
 
 impl ExchangeFootprint {
     pub const fn estimated_row_bytes(self) -> u64 {
-        // Concrete span chunks already include fragmentation. Reserve each
-        // primitive row plus its address-table entries, without the old 6x
-        // multiplier used to guess fragmentation from whole tensor geometry.
+        // Charge row slots for the supplied fragment count. Mid costing
+        // supplies a heuristic count; only the geometry screen supplies
+        // concrete span chunks. Compact encoding may use fewer bytes.
         self.phases
             .saturating_add(
                 self.maximum_transfer_chunks_per_tile

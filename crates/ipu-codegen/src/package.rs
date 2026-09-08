@@ -6,7 +6,7 @@ mod profile_work;
 use profile::{instrument_profile, profile_binding, profile_step_count};
 mod selection;
 mod tile_program;
-use selection::{ScheduledPlan, select_scheduled_finalist};
+use selection::ScheduledPlan;
 pub use tile_program::build_tile_program_package;
 
 use crate::graph::{ComputeGraph, OperationId, ValueId};
@@ -49,6 +49,8 @@ const RUNTIME_EXECUTABLE_START: u32 =
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
+    #[error("exchange tables exceed per-tile budget: {bytes} bytes, limit {budget} bytes")]
+    ExchangeBudgetExceeded { bytes: u64, budget: u64 },
     #[error("code generation failed: {0}")]
     Codegen(#[from] crate::CodegenError),
     #[error("ELF processing failed: {0}")]
@@ -324,22 +326,14 @@ fn build_package_artifacts(
     if diagnostic_checkpoints {
         planning.profiling = false;
     }
-    let finalists = build_phase("lower_mid", || {
-        Ok(lower_finalists(
-            graph,
-            &planning,
-            &Ipu21CostModel,
-            planning.exchange_schedule_finalists.max(4),
-        )?)
-    })?;
     let runtime_artifact = build_phase("compile_runtime", || {
         Ok(config
             .toolchain
             .compile(&config.runtime_source, "static_runtime", &[])?)
     })?;
     let (selected, built) = build_phase("select_finalist", || {
-        select_scheduled_finalist(
-            finalists,
+        selection::select_graph_finalist(
+            graph,
             &planning,
             config.tile_mapping.as_deref(),
             |selected| {

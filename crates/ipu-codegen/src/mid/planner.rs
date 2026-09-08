@@ -42,23 +42,8 @@ pub(crate) fn plan_finalists(
         .as_ref()
         .map_err(|error| LoweringError::PlanningThreads(error.clone()))?;
     pool.install(|| {
-        let mut search = config.clone();
         let costs = MemoizedCostModel::new(costs, config.tile_count);
-        let mut result = plan_in_pool(graph, &search, &costs, finalist_count);
-        for penalty in [16, 256] {
-            if !matches!(result, Err(LoweringError::ExchangeBudgetExceeded { .. })) {
-                break;
-            }
-            if penalty <= search.exchange_table_cost_per_byte {
-                continue;
-            }
-            search.exchange_table_cost_per_byte = penalty;
-            if let Err(error) = &result {
-                tracing::info!(penalty, %error, "retrying planning with stronger exchange storage penalty");
-            }
-            result = plan_in_pool(graph, &search, &costs, finalist_count);
-        }
-        result
+        plan_in_pool(graph, config, &costs, finalist_count)
     })
 }
 
@@ -675,15 +660,7 @@ pub(super) fn lower_operation_candidates(
             })
             .collect::<Vec<_>>();
         let mut expanded = Vec::new();
-        let mut rejected_exchange = None::<u64>;
         for (branch, peak) in evaluated {
-            if peak.exchange_rows > config.exchange_table_budget_bytes {
-                rejected_exchange = Some(
-                    rejected_exchange
-                        .map_or(peak.exchange_rows, |bytes| bytes.min(peak.exchange_rows)),
-                );
-                continue;
-            }
             if peak.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
@@ -695,13 +672,6 @@ pub(super) fn lower_operation_candidates(
             }
         }
         if expanded.is_empty() {
-            if let Some(estimated_bytes) = rejected_exchange {
-                return Err(LoweringError::ExchangeBudgetExceeded {
-                    operation: operation.id,
-                    estimated_bytes,
-                    budget_bytes: config.exchange_table_budget_bytes,
-                });
-            }
             if saw_candidate
                 && let Some(peak) = rejected_memory
                     .into_iter()
@@ -747,7 +717,6 @@ pub(super) fn lower_operation_candidates(
         beam = expanded;
     }
     let final_operation = source.len().saturating_sub(1);
-    let mut rejected_exchange = None::<u64>;
     let beam = beam
         .into_iter()
         .filter_map(|mut branch| {
@@ -764,13 +733,6 @@ pub(super) fn lower_operation_candidates(
                 graph,
                 &constraints.allocation_copies,
             );
-            if peak.exchange_rows > config.exchange_table_budget_bytes {
-                rejected_exchange = Some(
-                    rejected_exchange
-                        .map_or(peak.exchange_rows, |bytes| bytes.min(peak.exchange_rows)),
-                );
-                return None;
-            }
             (peak.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
@@ -790,13 +752,6 @@ pub(super) fn lower_operation_candidates(
         ))
     });
     if beam.is_empty() {
-        if let Some(estimated_bytes) = rejected_exchange {
-            return Err(LoweringError::ExchangeBudgetExceeded {
-                operation: source[final_operation].id,
-                estimated_bytes,
-                budget_bytes: config.exchange_table_budget_bytes,
-            });
-        }
         return Err(LoweringError::NoCandidate(source[0].id));
     }
     Ok(beam)

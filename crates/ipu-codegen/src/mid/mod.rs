@@ -186,9 +186,9 @@ pub struct PipelineConfig {
     /// Number of complete beam finalists to materialize and rank with the
     /// physical exchange scheduler. One retains analytical-only selection.
     pub exchange_schedule_finalists: usize,
-    /// Per-tile exchange table budget, screened before scheduling using the
-    /// conservative sum of phase maxima (36 bytes per transfer fragment).
-    /// Repeat bodies count once. Exact compact tables must also fit this limit.
+    /// Per-tile exchange table budget, screened from concrete transfer spans
+    /// before scheduling and enforced on final compact encoded tables.
+    /// Mid-level row estimates only rank candidates. Repeat bodies count once.
     /// Set to u64::MAX to disable this policy screen.
     pub exchange_table_budget_bytes: u64,
     /// Search-only penalty per estimated exchange-table byte. Does not change
@@ -507,14 +507,6 @@ pub enum LoweringError {
         interleaved: u64,
         total: u64,
         standard_contiguous_overflow: u64,
-    },
-    #[error(
-        "operation {operation:?} exceeds the exchange table budget: smallest estimate {estimated_bytes} bytes, limit {budget_bytes} bytes per tile"
-    )]
-    ExchangeBudgetExceeded {
-        operation: OperationId,
-        estimated_bytes: u64,
-        budget_bytes: u64,
     },
     #[error(
         "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"

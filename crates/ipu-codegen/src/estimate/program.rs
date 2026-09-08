@@ -182,6 +182,14 @@ pub(super) fn phase_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
+    geometry_traffic(program, phase, true)
+}
+
+fn geometry_traffic(
+    program: &TileGraph,
+    phase: &crate::ExchangePhase,
+    shared_tx_lane: bool,
+) -> ExpansionResult<ExchangeEndpointTraffic> {
     let mut traffic = ExchangeEndpointTraffic::default();
     for transfer in &phase.transfers {
         let source = &program.shards[transfer.source.shard.index() as usize];
@@ -209,7 +217,15 @@ pub(super) fn phase_traffic(
             traffic.add_incoming(target.tile, bytes, fragments);
         }
         // A multicast source is sent once, rather than once per receiver.
-        traffic.add_outgoing(source.tile / 2, bytes, outgoing_fragments);
+        traffic.add_outgoing(
+            if shared_tx_lane {
+                source.tile / 2
+            } else {
+                source.tile
+            },
+            bytes,
+            outgoing_fragments,
+        );
     }
 
     Ok(traffic)
@@ -244,13 +260,26 @@ fn kernel_cycles(run: &KernelRun) -> u64 {
 }
 
 pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
-    let mut chunks = 0u64;
+    // Storage belongs to a tile, not to a shared transmit lane. Count both
+    // endpoint roles conservatively (bidi encoding may later combine them).
+    // Sum each tile across static phases before taking the maximum; Repeat
+    // execution counts do not multiply its stored table.
+    let mut chunks = vec![0u64; usize::from(program.tile_count)];
     for phase in &program.exchange_phases {
-        chunks = chunks.saturating_add(phase_traffic(program, phase)?.maximum_fragments());
+        let traffic = geometry_traffic(program, phase, false)?;
+        for (tile, load) in traffic
+            .outgoing_lanes
+            .iter()
+            .enumerate()
+            .chain(traffic.incoming_tiles.iter().enumerate())
+        {
+            let count = &mut chunks[tile];
+            *count = count.saturating_add(load.fragments);
+        }
     }
     Ok(ExchangeFootprint {
         phases: program.exchange_phases.len() as u64,
-        maximum_transfer_chunks_per_tile: chunks,
+        maximum_transfer_chunks_per_tile: chunks.into_iter().max().unwrap_or(0),
     })
 }
 
@@ -310,15 +339,15 @@ mod tests {
         let full = vec![ShardExtent {
             axis: 0,
             start: 0,
-            logical_end: 128,
-            physical_end: 128,
+            logical_end: 4096,
+            physical_end: 4096,
         }];
         program.shards = (0..2)
             .map(|tile| BlockValue {
                 id: BlockValueId::from_index(tile),
                 tile: tile as u16,
                 tensor_type: TensorType::new(
-                    [128],
+                    [4096],
                     Precision::F16,
                     Layout::row_major(TensorTiling::replicated(2)),
                 ),
@@ -339,6 +368,26 @@ mod tests {
         };
         program.exchange_phases[0].transfers = vec![transfer(full)];
         let footprint = program_footprint(&program).unwrap();
+        // A contiguous 8 KiB span needs one transfer, not the 32 fragments
+        // assumed by the mid cycle heuristic's 256-byte payload.
+        assert_eq!(footprint.maximum_transfer_chunks_per_tile, 1);
+        assert_eq!(footprint.estimated_row_bytes(), 40);
+        let mut distributed = program.clone();
+        distributed.tile_count = 4;
+        for tile in 2..4 {
+            let mut shard = distributed.shards[tile - 2].clone();
+            shard.id = BlockValueId::from_index(tile as u32);
+            shard.tile = tile as u16;
+            distributed.shards.push(shard);
+        }
+        let mut other = distributed.exchange_phases[0].clone();
+        other.id = ExchangePhaseId(1);
+        other.transfers[0].source.shard = BlockValueId::from_index(2);
+        other.transfers[0].destinations[0].shard = BlockValueId::from_index(3);
+        distributed.exchange_phases.push(other);
+        let distributed_rows = program_footprint(&distributed).unwrap();
+        assert_eq!(distributed_rows.maximum_transfer_chunks_per_tile, 1);
+        assert_eq!(distributed_rows.estimated_row_bytes(), 44);
         let BlockOperation::Repeat(repeat) = &mut program.body.operations[0] else {
             unreachable!()
         };

@@ -98,55 +98,36 @@ retained separately there; they are not the final planner's performance.
 ## Exchange table budget
 
 `PipelineConfig::exchange_table_budget_bytes` defaults to 64 KiB per tile.
-The beam rejects partial programs above this budget before retaining the next
-beam. Exchange storage remains a Pareto dimension, so lower-exchange alternatives
-compete alongside fast ones. Forced GEMM layouts do not bypass this limit.
+The mid estimator's 256-byte payload assumption is only a cycle/ranking
+heuristic; it never rejects a plan against this budget. Operator and beam
+shortlists preserve low-exchange candidates and refresh prefix estimates before
+pruning, including conversions and cached operator fragments.
 
-This is deliberately a conservative complexity policy, not a proof of memory
-infeasibility: the existing estimate sums phase maxima and charges 36 bytes per
-transfer fragment, plus phase headers. Thus the default permits roughly 1,820
-worst-tile fragments across a static program, fewer after headers. It can reject
-programs whose compact encoded tables would fit. It does not impose a global
-transfer-count cutoff that penalizes distributing work over more tiles.
+After tile expansion and before placement/mapping search or scheduling, the
+screen matches concrete source/destination byte spans and splits contiguous
+spans at the ISA transfer-size limit. It accumulates TX and RX fragments per
+tile across static phases, then takes the maximum. It does not sum maxima on
+unrelated tiles or combine neighboring tiles' transmit lanes for storage.
+Multicast counts the sender once and each receiver separately. Repeat execution
+counts do not multiply the stored body. For example, an aligned contiguous
+8 KiB transfer counts once, not as 32 synthetic 256-byte fragments.
 
-After tile expansion, the same footprint calculation uses concrete byte-span
-fragmentation and rejects excess before placement/mapping search and scheduling.
+The pre-scheduling policy charges 36 bytes per geometry-derived endpoint
+fragment plus phase headers. This is conservative: it does not predict compact
+row sharing, paired/bidirectional encoding, or placement-induced changes.
 Both provisional and final compact encoded tables must also fit the budget.
-Repeated execution counts the stored body once, not once per iteration.
+This is separate from the total tile SRAM budget and is not a global
+transfer-count cutoff that penalizes distributing work across more tiles.
+
+If package selection exhausts the exchange budget, it retries compact planning
+with search penalties of 16, then 256 cycles per heuristic table byte. The
+penalty changes prefix retention, not reported execution cycles or the hard
+cap. Retries share cached operator implementations. They now respond to
+geometry/encoded-size rejection, not the mid heuristic. This remains a bounded
+search and cannot prove no feasible layout exists.
 
 The benchmark exposes `--exchange-table-budget-kib N`; API callers can set the
-field to `u64::MAX` to disable the policy. This is separate from the total tile
-SRAM budget. Raising it allows more expensive exchange layouts and may bring
-back long scheduling attempts followed by package-placement failure.
-
-Validation (2026-09-08): the full FP8 batch-2 ViT capture command now rejects at
-mid operation 15: smallest surviving estimate 69,828 bytes versus the 65,536-byte
-budget, before any exchange scheduling. This prevents the previous 105,852- and
-119,756-byte table-placement failures, but does not establish a feasible B2 plan
-under the new default. Regression coverage checks a lower-exchange layernorm
-alternative, late fragmentation rejection, budget boundaries/override, and
-unchanged static footprint when increasing Repeat execution count.
-
-Exchange-aware shortlisting now refreshes row estimates before either early
-beam prune, including boundary conversions and cached operator implementations.
-It recomputes the prefix sum because fusion can remove earlier operations;
-Repeat contributes its body's static footprint once. The operator shortlist
-also reserves its minimum-row candidate before filling layout-diversity slots
-(when width is greater than one).
-
-When a search exhausts the exchange budget, it retries from the graph inputs
-with search penalties of 16, then 256 cycles per estimated table byte. This
-changes prefix retention, not reported execution cycles or the hard cap.
-Retries share cached operator implementations. The API field
-`exchange_table_cost_per_byte` can set the initial penalty; automatic retries
-only increase it. This is a bounded heuristic, not proof that every feasible
-layout will be found, and does not invoke physical exchange scheduling.
-
-With these shortlist/retry fixes, the full FP8 B2 ViT capture advances from
-operation 15 to operation 19 under the unchanged 64 KiB conservative limit.
-All four automatic/native and attention-product configurations still reject;
-their final minimum estimates are 69,540 or 80,984 bytes. This is not evidence
-that no complete compact-table plan fits: the estimate remains conservative,
-and the bounded search is incomplete. No physical scheduling or hardware run
-was performed for this capture. Validation: 181 unit tests plus the doctest and
-Clippy pass.
+budget to `u64::MAX` to disable the policy, and `exchange_table_cost_per_byte`
+to choose an initial ranking penalty. Capture examines the requested finalist
+without package selection's automatic retries. Logs report heuristic and
+geometry footprints separately.
