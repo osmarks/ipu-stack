@@ -188,8 +188,9 @@ conversion before replication.
 Row-major F16 producers can now cast directly into FP8 AMP-left panels on their
 existing owners. The mid planner compares this local cast/pack followed by FP8
 redistribution with the existing F16 redistribution followed by casting. It
-retains the latter when cheaper. Exact complete conversion results are reused
-within a region, so compatible projection consumers share early quantization.
+retains the latter when cheaper. Exact local quantizations are reused within a region, so compatible projection
+consumers share early quantization. Replicated consumer operands are materialized
+separately to avoid extending their much larger allocations across consumers.
 
 The producer must own complete 32-column groups. This deliberately does not pad
 every narrow producer shard to enable the path. A single physical row already
@@ -215,6 +216,14 @@ separation is unknown until placement.
 checks the actual device code against exactly representable FP8 values over
 multiple scales, worker tails, AMP half-panel padding, and memory arrangements.
 It checks output guards as well as all result bytes. The 8,320-element linear
-case took about 2,700 cycles with pipelining versus 4,734 with the fallback;
+case took about 2,706 cycles with pipelining versus 4,638 for the historical linear loop;
 these include launch/setup. Raw checks and integration profiles are under
 `artifacts/fp8-cast/`.
+
+The checker reserves its timestamp storage and waits for the final deferred host
+exchange before reading it. Without that wait, the final timestamp batch could
+contain the preceding tensor chunk. All 315 current-kernel cases pass; the
+historical kernel passes its 252 applicable cases. Existing packed casts have a
+small setup cost increase (8,320 elements: 5,064 to 5,136 cycles); the two-bundle
+pipeline applies to linear casts and compatible single-row panels, not the
+multi-row packing loop.

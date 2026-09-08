@@ -2286,12 +2286,13 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
                 &mut operations,
             ));
         }
-        assert_eq!(results[0], results[1]);
+        assert_ne!(results[0], results[1]);
         assert_eq!(
             operations.len(),
-            2,
-            "cast and shared exchange: {operations:#?}"
+            3,
+            "one shared cast and two consumer exchanges: {operations:#?}"
         );
+        assert_eq!(operations[1].inputs, operations[2].inputs);
         let cast = operations[0].conversion_plan().unwrap();
         assert_eq!(cast.input.format.layout.order, ElementOrder::RowMajor);
         assert_eq!(

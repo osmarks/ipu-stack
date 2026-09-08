@@ -33,6 +33,14 @@ public:
   unsigned sourceElements;
   unsigned rowMajorColumns;
   bool compute(unsigned worker) {
+    // Assembly writes cannot change the immutable call descriptor. Keep its
+    // fields in registers rather than reloading them after each memory clobber.
+    const Source *source = &this->source[0];
+    Destination *destination = &this->destination[0];
+    const unsigned elements = this->elements;
+    const unsigned panelRows = this->panelRows;
+    const unsigned sourceElements = this->sourceElements;
+    const unsigned rowMajorColumns = this->rowMajorColumns;
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
     setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
     if (panelRows) {

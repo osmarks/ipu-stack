@@ -14,6 +14,11 @@ use std::{fs, path::PathBuf};
 struct Arguments {
     #[arg(long)]
     sdk: PathBuf,
+    #[arg(long, default_value = "device/cast_f8.cpp")]
+    kernel: PathBuf,
+    /// Compare a historical kernel which cannot pack row-major input.
+    #[arg(long)]
+    existing_layouts_only: bool,
     #[arg(long, default_value = "c600-init.ipucfg")]
     configuration: PathBuf,
     #[arg(long, default_value = "artifacts/fp8-cast/check")]
@@ -38,7 +43,7 @@ fn main() -> Result<()> {
             "-DOUTPUT_BYTES=1",
             "-DCAST_VERTEX=Cast2To1",
         ])
-        .arg(device.join("cast_f8.cpp"))
+        .arg(&args.kernel)
         .arg("-o")
         .arg(&assembly)
         .status()?;
@@ -77,6 +82,9 @@ fn main() -> Result<()> {
     ] {
         for mode in 0..3 {
             // dense, already packed, row-major -> packed
+            if mode == 2 && args.existing_layouts_only {
+                continue;
+            }
             if (mode == 1 && !columns.is_multiple_of(16))
                 || (mode == 2 && !columns.is_multiple_of(32))
             {
@@ -151,6 +159,11 @@ fn main() -> Result<()> {
                         tile,
                         address: input_address,
                         data: bytes,
+                    });
+                    data.push(TileProgramData {
+                        tile,
+                        address: 0x7f000,
+                        data: vec![0; 8],
                     });
                     programs.push(TileProgram {
                         tile,
@@ -236,6 +249,35 @@ fn main() -> Result<()> {
     runtime
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    // The final streaming phase is deferred. Wait for every supervisor before
+    // reading its host page, otherwise the last batch can still contain the
+    // preceding tensor chunk rather than the timestamps.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    for tile in &application.tiles {
+        let physical = tile.physical_tile as u16;
+        loop {
+            let state = runtime.device().tile_context_state(physical, 0)?;
+            if state == 0 {
+                break;
+            }
+            if state == 3 {
+                let completed = application
+                    .debug_symbols
+                    .iter()
+                    .find(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
+                    .map(|symbol| symbol.address);
+                ensure!(
+                    Some(runtime.device().read_tile_program_counter(physical, 0)?) == completed,
+                    "tile {physical} failed before completion"
+                );
+                break;
+            }
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "tile {physical} did not finish"
+            );
+        }
+    }
     let actual = session.collect(&call)?;
     fs::write(args.output.join("output.bin"), &actual)?;
     ensure!(
@@ -246,7 +288,9 @@ fn main() -> Result<()> {
     for (case, times) in cases.iter().zip(actual[expected.len()..].chunks_exact(8)) {
         let before = u32::from_le_bytes(times[..4].try_into()?);
         let after = u32::from_le_bytes(times[4..].try_into()?);
-        println!("case={case:?} cycles={}", after.wrapping_sub(before));
+        let cycles = after.wrapping_sub(before);
+        ensure!(cycles < 100_000, "invalid timing for {case:?}: {cycles}");
+        println!("case={case:?} cycles={cycles}");
     }
     println!(
         "cases={} checkedBytes={} bitwiseTest=PASS",

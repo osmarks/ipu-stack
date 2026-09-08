@@ -1781,12 +1781,14 @@ pub(super) fn ensure_format(
             shape: input.shape.clone(),
             format,
         };
-        // Reuse exact, immutable materializations in this region. In particular,
-        // Q/K/V consumers can share quantization on the producer's owners.
+        // Share quantization on the producer's owners, not the much larger
+        // replicated consumer operands whose lifetimes should remain local.
         if let Some(existing) = operations.iter().rev().find(|operation| {
             operation.inputs.as_slice() == [value]
                 && operation.conversion_plan().is_some_and(|plan| {
-                    plan.output.materialization == OperandMaterialization::Complete
+                    plan.strategy == ConversionStrategy::LocalKernel
+                        && plan.input.format.precision != plan.output.format.precision
+                        && plan.output.materialization == OperandMaterialization::Complete
                         && plan.output.format == output.format
                 })
         }) {
