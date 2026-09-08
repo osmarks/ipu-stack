@@ -27,6 +27,8 @@ pub struct ConcreteOperatorCandidate {
 pub enum OperatorFormatPolicy {
     /// Use the candidate's concrete input and output formats.
     Concrete,
+    /// Fill a row-major row/column grid, using rows before splitting columns.
+    RowMajorGrid,
     /// Resolve both the selected input and output to the input value's full
     /// layout. This is the normal policy for layout-transparent unary work.
     PreserveInputLayout(u16),
@@ -302,19 +304,6 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             ));
         }
     }
-    let columns_f16 = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::row_major(TensorTiling {
-            tile_count,
-            replicas: 1,
-            axes: vec![AxisTiling::new(
-                TensorAxis::FromEnd(1),
-                tile_count,
-                4,
-                Padding::Reject,
-            )],
-        }),
-    };
     for input in [0, 1] {
         candidates.push(
             pointwise_operator_candidate(
@@ -326,14 +315,13 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
         );
     }
-    candidates.push(
-        pointwise_operator_candidate(
-            MidOperator::Add,
-            [columns_f16.clone(), columns_f16.clone()],
-            columns_f16,
-        )
-        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
+    let mut grid_add = pointwise_operator_candidate(
+        MidOperator::Add,
+        [rows_f16.clone(), rows_f16.clone()],
+        rows_f16.clone(),
     );
+    grid_add.format_policy = OperatorFormatPolicy::RowMajorGrid;
+    candidates.push(grid_add.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])));
     candidates.extend([
         pointwise_operator_candidate(
             MidOperator::LayerNorm,

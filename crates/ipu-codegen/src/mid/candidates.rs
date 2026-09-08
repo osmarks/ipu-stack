@@ -508,6 +508,56 @@ pub(super) fn plans(
                     plan: mut candidate,
                     format_policy,
                 } = concrete.clone();
+                if format_policy == OperatorFormatPolicy::RowMajorGrid {
+                    let capacity = candidate
+                        .requirements
+                        .output
+                        .format
+                        .layout
+                        .tiling
+                        .tile_count;
+                    let Some(&columns) = output.0.last() else {
+                        continue;
+                    };
+                    let rows = output.0.iter().rev().nth(1).copied().unwrap_or(1);
+                    let grain = (8 / candidate.requirements.output.format.precision.bytes()) as u32;
+                    let row_parts = rows.min(u32::from(capacity));
+                    if row_parts == 0 || columns == 0 {
+                        continue;
+                    }
+                    let column_parts =
+                        (u32::from(capacity) / row_parts).min(columns.div_ceil(grain));
+                    let mut axes = Vec::new();
+                    if output.0.len() >= 2 {
+                        axes.push(
+                            AxisTiling::new(
+                                TensorAxis::FromEnd(2),
+                                row_parts as u16,
+                                1,
+                                Padding::Reject,
+                            )
+                            .with_tile_stride(column_parts as u16),
+                        );
+                    }
+                    axes.push(
+                        AxisTiling::new(
+                            TensorAxis::FromEnd(1),
+                            column_parts as u16,
+                            grain,
+                            Padding::Reject,
+                        )
+                        .with_tile_stride(1),
+                    );
+                    let layout = Layout::row_major(TensorTiling {
+                        tile_count: (row_parts * column_parts) as u16,
+                        replicas: 1,
+                        axes,
+                    });
+                    candidate.requirements.output.format.layout = layout.clone();
+                    for input in &mut candidate.requirements.inputs {
+                        input.format.layout = layout.clone();
+                    }
+                }
                 if let OperatorFormatPolicy::PreserveInputLayout(index) = format_policy {
                     let Some((actual, requirement)) = inputs
                         .get(usize::from(index))

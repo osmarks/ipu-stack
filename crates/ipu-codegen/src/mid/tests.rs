@@ -4,6 +4,43 @@ use super::*;
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn add_grid_uses_rows_before_splitting_columns() {
+    for (rows, columns, expected_columns) in [(1, 1152, 288), (4, 1152, 288), (729, 4304, 2)] {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [1, rows, columns]).unwrap();
+        let bias = graph.host_input("bias", [1, 1, columns]).unwrap();
+        let output = graph.add(x, bias).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let mut config = PipelineConfig::new(1472)
+            .with_automatic_input(x, Precision::F16)
+            .with_automatic_input(bias, Precision::F16);
+        config.operator_candidates.retain(|candidate| {
+            candidate.format_policy() == OperatorFormatPolicy::RowMajorGrid
+                && candidate
+                    .concrete()
+                    .unwrap()
+                    .plan
+                    .requirements
+                    .output
+                    .format
+                    .layout
+                    .tiling
+                    .tile_count
+                    == 1472
+        });
+        let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let tiling = &mid.values[mid.outputs[0].index() as usize]
+            .tensor_type
+            .format
+            .layout
+            .tiling;
+        assert_eq!(tiling.axes[0].partitions, rows as u16);
+        assert_eq!(tiling.axes[1].partitions, expected_columns);
+        assert_eq!(tiling.tile_count, rows as u16 * expected_columns);
+    }
+}
+
+#[test]
 fn single_row_add_can_keep_column_ownership() {
     let tiles = 16;
     let layout = Layout::row_major(TensorTiling {
