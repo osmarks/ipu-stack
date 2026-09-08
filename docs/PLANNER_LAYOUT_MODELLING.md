@@ -162,3 +162,18 @@ uses its chosen size for eligible packing operations; the original program is
 also retained. The old local winner selection and cycles-only acceptance gate
 are removed. This bounds the additions at four programs per original rather
 than enumerating a Cartesian product across every packing operation.
+
+Validation after `f0b56ba` (2026-09-08): full one-layer SigLIP So400m/14,
+378x378 input, 1,472 tiles, FP8 scale -4. B1 and B2 compiled concurrently,
+with ordinary planner settings and serialized device access.
+
+- B1 built and passed its Gaussian reference/hardware check (maximum absolute
+  error 0.076660, tolerance 0.2 absolute plus 0.05 relative). Renderer-cropped
+  runtime is 696,942 cycles / 0.464628 ms. The accepted placement reported
+  54,716 bytes of compact exchange tables. Artifacts and command are in
+  `artifacts/vit/cast-orders-b1-fp8/`, including `profile.html`.
+- B2's first two scheduled candidates were rejected at 104,920 and 104,916 bytes
+  against the 65,536-byte encoded-table limit. The run was stopped to avoid
+  repeating the earlier long rejection sequence; remaining finalists and
+  stronger-penalty retries were not exhausted. There is no new B2 package or
+  hardware result. Logs and command are in `artifacts/vit/cast-orders-b2-fp8/`.
