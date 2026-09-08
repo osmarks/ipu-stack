@@ -2254,3 +2254,79 @@ fn estimated_exchange_rows_rank_plans_without_proving_tensor_overflow() {
     // Keep the table estimate in the resource objectives used by the beam.
     assert_eq!(peaks.objectives()[5], 187_196);
 }
+
+#[test]
+fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
+    for rows in [1, 5, 32] {
+        let mut graph = ComputeGraph::new();
+        let host = graph.host_input("x", [rows, 128]).unwrap();
+        graph.gelu(host).unwrap();
+        let mut state = planner::LoweringState::default();
+        let input = state.value(
+            host,
+            TensorType::new([rows, 128], Precision::F16, Layout::row_sharded(1)),
+        );
+        let mut layout = Layout::row_sharded(1);
+        layout.order = ElementOrder::Amp(AmpOrder::Left);
+        layout.tiling = TensorTiling::replicated(64);
+        let target = TensorFormat {
+            precision: Precision::F8F143 { scale_exponent: -4 },
+            layout,
+        };
+        let mut operations = Vec::new();
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.push(planner::ensure_format(
+                input,
+                target.clone(),
+                OperandMaterialization::Complete,
+                graph.operations()[0].id,
+                &crate::Ipu21CostModel,
+                &mut state,
+                &mut operations,
+            ));
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(
+            operations.len(),
+            2,
+            "cast and shared exchange: {operations:#?}"
+        );
+        let cast = operations[0].conversion_plan().unwrap();
+        assert_eq!(cast.input.format.layout.order, ElementOrder::RowMajor);
+        assert_eq!(
+            cast.output.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Left)
+        );
+        assert_eq!(cast.output.format.layout.tiling.tile_count, 1);
+        let mid = MidProgram {
+            tile_count: 64,
+            values: state.values,
+            operations,
+            inputs: vec![MidInput {
+                name: "x".into(),
+                kind: GraphInputKind::Host,
+                value: input,
+            }],
+            outputs: vec![results[0]],
+            ..MidProgram::default()
+        };
+        let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+        let build = crate::KernelBuildPlan::from_program(&low).unwrap();
+        let calls: Vec<_> = low
+            .kernel_runs
+            .iter()
+            .filter(|run| matches!(run.kernel, TileKernelSpec::Cast { .. }))
+            .collect();
+        assert_eq!(calls.len(), 1);
+        let arguments = build.call(calls[0]).unwrap().arguments;
+        assert_eq!(arguments[3], if rows == 1 { 0 } else { rows });
+        assert_eq!(arguments[5], 128);
+    }
+    let narrow = TensorType::new([4, 16], Precision::F16, Layout::row_sharded(1));
+    let target = TensorFormat {
+        precision: Precision::F8F143 { scale_exponent: -4 },
+        layout: Layout::amp_left(1, 32),
+    };
+    assert!(narrow.fp8_producer_layout(&target).is_none());
+}

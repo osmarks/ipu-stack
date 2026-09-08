@@ -181,3 +181,40 @@ Profiles and matching packages:
 144 codegen tests, four workload tests, the doctest, and Clippy pass. Tests cover
 FP8 physical panel correspondence, preservation of early-cast finalists, and
 conversion before replication.
+
+
+## Row-major producer casting and pipelined casts (2026-09-08)
+
+Row-major F16 producers can now cast directly into FP8 AMP-left panels on their
+existing owners. The mid planner compares this local cast/pack followed by FP8
+redistribution with the existing F16 redistribution followed by casting. It
+retains the latter when cheaper. Exact complete conversion results are reused
+within a region, so compatible projection consumers share early quantization.
+
+The producer must own complete 32-column groups. This deliberately does not pad
+every narrow producer shard to enable the path. A single physical row already
+has AMP-left's order: its cast uses the linear loop, with no packing pass. For
+multiple rows the existing panel cast loop takes separate source and destination
+row strides, combining row-major packing and conversion without an F16 staging
+allocation. The same primitive cost is used for conversion selection and compact
+mid costing; combined casting does not get charged a packing scratch buffer.
+Transposed AMP and block-major row-major cast/pack kernels are still separate
+missing capabilities, as shown by the optimistic diagnostic.
+
+The linear F16-to-FP8 loop now has the SDK's two-bundle software pipeline:
+`ld64step` paired with `f16v8tof8`, then `ldst64pace`. A prologue/epilogue handles
+the first and last vector. Small worker assignments use the four-bundle loop.
+A runtime range check enables combined load/store only when source and destination
+occupy disjoint 32-KiB address groups. This conservatively covers standard banks
+and interleaved bank pairs, handles Repeat pointers, and adds no placement
+constraint. The old loop remains available for other allocations. Planning
+currently retains the conservative four-bundle linear price because bank
+separation is unknown until placement.
+
+`cargo run --release -p ipu-tests --bin cast_check -- --sdk "$POPLAR_SDK_ENABLED"`
+checks the actual device code against exactly representable FP8 values over
+multiple scales, worker tails, AMP half-panel padding, and memory arrangements.
+It checks output guards as well as all result bytes. The 8,320-element linear
+case took about 2,700 cycles with pipelining versus 4,734 with the fallback;
+these include launch/setup. Raw checks and integration profiles are under
+`artifacts/fp8-cast/`.

@@ -1707,7 +1707,7 @@ pub(super) fn ensure_format(
     if fp8_cast {
         cast_layout = initial_layout;
         let input = &state.get(value).tensor_type;
-        let producer_layout = input.fp8_cast_layout();
+        let producer_layout = input.fp8_producer_layout(&target);
         let quantized = TensorFormat {
             precision: target.precision,
             layout: producer_layout
@@ -1737,7 +1737,7 @@ pub(super) fn ensure_format(
                 }
             };
             let before = costs
-                .cast_cycles(input, target.precision)
+                .cast_format_cycles(input, &quantized)
                 .saturating_add(movement(
                     target.precision,
                     &quantized.layout,
@@ -1751,7 +1751,7 @@ pub(super) fn ensure_format(
                 },
             };
             let after = movement(from, &input.format.layout, &cast_layout)
-                .saturating_add(costs.cast_cycles(&after_input, target.precision));
+                .saturating_add(costs.cast_format_cycles(&after_input, &target));
             if before <= after {
                 early_cast = Some(quantized);
             }
@@ -1781,6 +1781,18 @@ pub(super) fn ensure_format(
             shape: input.shape.clone(),
             format,
         };
+        // Reuse exact, immutable materializations in this region. In particular,
+        // Q/K/V consumers can share quantization on the producer's owners.
+        if let Some(existing) = operations.iter().rev().find(|operation| {
+            operation.inputs.as_slice() == [value]
+                && operation.conversion_plan().is_some_and(|plan| {
+                    plan.output.materialization == OperandMaterialization::Complete
+                        && plan.output.format == output.format
+                })
+        }) {
+            value = existing.results[0];
+            continue;
+        }
         let cast = input.format.precision != output.format.precision;
         let strategy = if cast {
             ConversionStrategy::LocalKernel
@@ -1789,7 +1801,7 @@ pub(super) fn ensure_format(
         };
         let cost = if cast {
             crate::estimate::RearrangementCost {
-                cycles: costs.cast_cycles(&input, output.format.precision),
+                cycles: costs.cast_format_cycles(&input, &output.format),
                 ..Default::default()
             }
         } else {

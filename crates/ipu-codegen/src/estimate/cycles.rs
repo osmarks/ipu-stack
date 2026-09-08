@@ -4,7 +4,7 @@ use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic, maximum_shard
 use crate::graph::TensorShape;
 use crate::{
     AmpOrder, BlockMajorOrder, ConversionStrategy, ElementOrder, Layout, OperatorPlan, Precision,
-    TensorType,
+    TensorFormat, TensorType,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
@@ -41,6 +41,11 @@ pub trait CostModel: Sync {
             })
     }
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
+    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
+        let mut packed = input.clone();
+        packed.format.layout.order = output.layout.order;
+        self.cast_cycles(&packed, output.precision)
+    }
     fn rearrangement_cost(
         &self,
         shape: &TensorShape,
@@ -131,6 +136,9 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
     }
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
         self.inner.cast_cycles(input, to)
+    }
+    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
+        self.inner.cast_format_cycles(input, output)
     }
 
     fn rearrangement_cost(
@@ -278,15 +286,23 @@ impl CostModel for Ipu21CostModel {
             })
             .unwrap_or(elements)
             .max(1);
+        let panel_rows = input
+            .format
+            .layout
+            .order
+            .fp8_cast_panel_rows(elements / columns, columns);
         super::primitive::cast_cycles(
             input.format.precision,
             to,
             elements,
-            input
-                .format
-                .layout
-                .order
-                .fp8_cast_panel_rows(elements / columns, columns),
+            if input.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
+                && panel_rows == 1
+                && columns.is_multiple_of(32)
+            {
+                0
+            } else {
+                panel_rows
+            },
         )
     }
 

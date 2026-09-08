@@ -288,7 +288,8 @@ pub(crate) fn operation_cost(
                 .exchange
                 .saturating_add(bytes.div_ceil(IPU21_TARGET_COSTS.local_copy_bytes_per_cycle))
                 .saturating_add(IPU21_TARGET_COSTS.local_copy_call_cycles);
-            if input.format.layout.order != output.format.layout.order
+            if input.format.precision == output.format.precision
+                && input.format.layout.order != output.format.layout.order
                 && !input.format.supports_micro_panel_exchange(&output.format)
             {
                 scratch.standard = bytes;
@@ -302,18 +303,9 @@ pub(crate) fn operation_cost(
                 );
             }
             if input.format.precision != output.format.precision {
-                price.total = price.exchange.saturating_add(super::primitive::cast_cycles(
-                    input.format.precision,
-                    output.format.precision,
-                    bytes.div_ceil(output.format.precision.bytes()),
-                    output.format.layout.order.fp8_cast_panel_rows(
-                        out.shape.0[..out.shape.0.len().saturating_sub(1)]
-                            .iter()
-                            .map(|&n| u64::from(n))
-                            .product(),
-                        u64::from(*out.shape.0.last().unwrap_or(&1)),
-                    ),
-                ));
+                price.total = price
+                    .exchange
+                    .saturating_add(Ipu21CostModel.cast_format_cycles(input, &output.format));
             }
         }
         MidOperationKind::Operator { .. } => return None,

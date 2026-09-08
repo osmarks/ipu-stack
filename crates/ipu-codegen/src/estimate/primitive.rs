@@ -157,7 +157,12 @@ pub(crate) fn kernel_cycles(
                 .layout
                 .order
                 .fp8_cast_panel_rows(elements / columns, columns);
-            return cast_cycles(*from, *to, elements, panel_rows);
+            let linear = output.format.layout.order == ElementOrder::Amp(crate::AmpOrder::Left)
+                && panel_rows == 1
+                && inputs
+                    .first()
+                    .is_some_and(|input| input.shape.elements() == elements);
+            return cast_cycles(*from, *to, elements, if linear { 0 } else { panel_rows });
         }
         TileKernelSpec::Rearrange { from, .. } => {
             if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)

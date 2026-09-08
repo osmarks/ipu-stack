@@ -889,6 +889,25 @@ pub struct TensorType {
 
 impl TensorType {
     /// Keep producer ownership while completing FP8's 32-element panels.
+    /// Producer-local FP8 panels available without an intermediate F16 pack.
+    pub(crate) fn fp8_producer_layout(&self, target: &TensorFormat) -> Option<Layout> {
+        let mut layout = self.fp8_cast_layout()?;
+        if layout.order == ElementOrder::RowMajor && target.layout.order != ElementOrder::RowMajor {
+            let resolved = layout.resolve(&self.shape).ok()?;
+            let axes = resolved.axes()?;
+            if axes.len() < 2 || !axes.last()?.extents_are_multiple_of(32) {
+                return None;
+            }
+            layout.order = ElementOrder::Amp(AmpOrder::Left);
+        }
+        let quantized = TensorFormat {
+            precision: target.precision,
+            layout: layout.clone(),
+        };
+        (layout.order == target.layout.order || quantized.supports_micro_panel_exchange(target))
+            .then_some(layout)
+    }
+
     pub(crate) fn fp8_cast_layout(&self) -> Option<Layout> {
         let mut layout = self.format.layout.clone();
         let axis_from_end = match layout.order {

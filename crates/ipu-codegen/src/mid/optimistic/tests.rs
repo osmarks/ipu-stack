@@ -29,19 +29,11 @@ fn conversion_search_exposes_early_cast_pack_and_keeps_late_baseline() {
                     && s.to.format.layout.tiling.replicas == 1)),
             "early path absent: {paths:#?}"
         );
-        if rows == 1 {
-            assert!(
-                paths
-                    .iter()
-                    .any(|p| p.assumptions.contains(&Assumption::MissingEquivalenceRule))
-            );
-        } else {
-            assert!(
-                paths
-                    .iter()
-                    .any(|p| p.steps.iter().any(|s| s.kind == TransformKind::CastAndPack))
-            );
-        }
+        assert!(
+            paths.iter().any(|p| p.assumptions.is_empty()
+                && p.steps.iter().any(|s| s.kind == TransformKind::CastAndPack)),
+            "implemented early pack absent: {paths:#?}"
+        );
     }
 }
 

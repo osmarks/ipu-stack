@@ -106,11 +106,7 @@ pub fn enumerate_conversions(
             && matches!(to.format.precision, Precision::F8F143 { .. })
             && from.format.layout.tiling != to.format.layout.tiling
         {
-            let mut quantized = from.format.clone();
-            quantized.precision = to.format.precision;
-            let ordinary_eligible = from.fp8_cast_layout().is_some()
-                && (quantized.layout.order == to.format.layout.order
-                    || quantized.supports_micro_panel_exchange(&to.format));
+            let ordinary_eligible = from.fp8_producer_layout(&to.format).is_some();
             if !ordinary_eligible {
                 path.steps[cast_index]
                     .assumptions
@@ -233,8 +229,8 @@ fn edge(a: &TensorType, b: &TensorType, alias: bool) -> Option<Transform> {
             )));
         }
         let work = local.max(330 + elements.div_ceil(8));
-        let conservative = if supported && same_order {
-            Ipu21CostModel.cast_cycles(a, b.format.precision).max(work)
+        let conservative = if supported && !same_precision {
+            Ipu21CostModel.cast_format_cycles(a, &b.format).max(work)
         } else if supported {
             Ipu21CostModel
                 .rearrangement_cost(
@@ -271,6 +267,18 @@ fn local_supported(a: &TensorType, b: &TensorType, kind: &TransformKind) -> bool
         return true;
     }
     let kernel = match kind {
+        TransformKind::CastAndPack
+            if a.format.precision == Precision::F16
+                && matches!(b.format.precision, Precision::F8F143 { .. })
+                && a.format.layout.order == ElementOrder::RowMajor
+                && b.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
+                && a.fp8_producer_layout(&b.format).as_ref() == Some(&b.format.layout) =>
+        {
+            TileKernelSpec::Cast {
+                from: a.format.precision,
+                to: b.format.precision,
+            }
+        }
         TransformKind::Cast => {
             let fp8 = matches!(a.format.precision, Precision::F8F143 { .. })
                 || matches!(b.format.precision, Precision::F8F143 { .. });

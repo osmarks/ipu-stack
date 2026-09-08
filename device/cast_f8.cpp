@@ -31,6 +31,7 @@ public:
   int destinationScale;
   unsigned panelRows;
   unsigned sourceElements;
+  unsigned rowMajorColumns;
   bool compute(unsigned worker) {
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
     setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
@@ -42,11 +43,13 @@ public:
       const unsigned row = wholePanels ? 0 : worker;
       const unsigned rows = wholePanels ? panelRows : (panelRows + 5 - worker) / 6;
       const unsigned stride = wholePanels ? 32 : 192;
+      const unsigned sourceStride = rowMajorColumns ? rowMajorColumns * 2 * (wholePanels ? 1 : 6) : stride;
       const unsigned panelStep = panelElements * (wholePanels ? 6 : 1);
+      unsigned column = wholePanels ? worker * 32 : 0;
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
-           panel < elements && row < panelRows; panel += panelStep) {
-        const half *first = &source[panel + row * 16];
-        const half *second = first + panelRows * 16;
+           panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
+        const half *first = &source[rowMajorColumns ? row * rowMajorColumns + column : panel + row * 16];
+        const half *second = first + (rowMajorColumns ? 16 : panelRows * 16);
         unsigned char *target = &destination[panel + row * 32];
         unsigned sourceOffset = 0, destinationOffset = 0;
         if (panel + panelElements > sourceElements) {
@@ -62,10 +65,10 @@ public:
               "{ st64 $a6:7, %[out], %[dst], 1; zero $a4:5 }\n"
               "{ st64 $a4:5, %[out], %[dst], 2; fnop }\n"
               "{ st64 $a4:5, %[out], %[dst], 3; fnop }\n"
-              "{ add %[src], %[src], %[stride]; fnop }\n"
+              "{ add %[src], %[src], %[srcStride]; fnop }\n"
               "{ add %[dst], %[dst], %[stride]; fnop }\n"
               : [src] "+&r"(sourceOffset), [dst] "+&r"(destinationOffset)
-              : [first] "r"(first), [out] "r"(target), [rows] "r"(rows), [stride] "r"(stride)
+              : [first] "r"(first), [out] "r"(target), [rows] "r"(rows), [stride] "r"(stride), [srcStride] "r"(sourceStride)
               : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
           continue;
         }
@@ -86,27 +89,59 @@ public:
             "{ ld64 $a2:3, %[second], %[src], 3; fnop }\n"
             "{ st64 $a4:5, %[out], %[dst], 2; f16v8tof8 $a6:7, $a0:3 }\n"
             "{ st64 $a6:7, %[out], %[dst], 3; fnop }\n"
-            "{ add %[src], %[src], %[stride]; fnop }\n"
+            "{ add %[src], %[src], %[srcStride]; fnop }\n"
             "{ add %[dst], %[dst], %[stride]; fnop }\n"
             : [src] "+&r"(sourceOffset), [dst] "+&r"(destinationOffset)
-            : [first] "r"(first), [second] "r"(second), [out] "r"(target), [rows] "r"(rows), [stride] "r"(stride)
+            : [first] "r"(first), [second] "r"(second), [out] "r"(target), [rows] "r"(rows), [stride] "r"(stride), [srcStride] "r"(sourceStride)
             : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
       }
       return true;
     }
     const unsigned vectors = elements / 8;
-    const unsigned rounds = (vectors + 5 - worker) / 6;
+    unsigned rounds = (vectors + 5 - worker) / 6;
+    const unsigned workerRounds = rounds;
     const half *input = &source[worker * 8];
     unsigned char *output = &destination[worker * 8];
-    asm volatile(
-        "{ rpt %[rounds], 3; fnop }\n"
-        "{ ld64step $a0:1, $mzero, %[in]+=, 1; fnop }\n"
-        "{ ld64step $a2:3, $mzero, %[in]+=, 11; fnop }\n"
-        "{ nop; f16v8tof8 $a4:5, $a0:3 }\n"
-        "{ st64step $a4:5, $mzero, %[out]+=, 6; fnop }\n"
-        : [in] "+&r"(input), [out] "+&r"(output) : [rounds] "r"(rounds)
-        : "$a0:1", "$a2:3", "$a4:5", "memory");
-    const unsigned base = worker * 8 + rounds * 48;
+    // Conservatively treat each 32 KiB address group as one memory element.
+    // This covers both 16 KiB standard banks and two-bank interleaved groups,
+    // including Repeat's runtime pointers, without constraining placement.
+    const unsigned inStart = reinterpret_cast<unsigned>(&source[0]);
+    const unsigned outStart = reinterpret_cast<unsigned>(&destination[0]);
+    const bool separate = rounds >= 4 && sourceElements && elements &&
+        (((inStart + sourceElements * 2 - 1) >> 15) < (outStart >> 15) ||
+         ((outStart + elements - 1) >> 15) < (inStart >> 15));
+    if (separate) {
+      // Pipeline one conversion ahead, as in the SDK half-to-quarter loop.
+      // The combined load/store reads the next lower half while storing the
+      // previous result. Prologue/epilogue avoid reading past the last vector.
+      --rounds;
+      asm volatile(
+          "ld64step $a0:1, $mzero, %[in]+=, 1\n"
+          "ld64step $a2:3, $mzero, %[in]+=, 11\n"
+          "tapack $m0:1, %[in], $mzero, %[out]\n"
+          "ld64step $azeros, $mzero, %[in]+=, 1\n"
+          "mul $m2, %[rounds], 48\n"
+          "add %[out], %[out], $m2\n"
+          "setzi $m2, (12<<10)|6\n"
+          "{ rpt %[rounds], 1; fnop }\n"
+          "{ ld64step $a2:3, $mzero, %[in]+=, 12; f16v8tof8 $a0:1, $a0:3 }\n"
+          "{ ldst64pace $a0:1, $a0:1, $m0:1+=, $m2, 6; fnop }\n"
+          "f16v8tof8 $a2:3, $a0:3\n"
+          "st64step $a2:3, $mzero, %[out]+=, 6\n"
+          : [in] "+&r"(input), [out] "+&r"(output)
+          : [rounds] "r"(rounds)
+          : "$m0", "$m1", "$m2", "$a0:1", "$a2:3", "memory");
+    } else {
+      asm volatile(
+          "{ rpt %[rounds], 3; fnop }\n"
+          "{ ld64step $a0:1, $mzero, %[in]+=, 1; fnop }\n"
+          "{ ld64step $a2:3, $mzero, %[in]+=, 11; fnop }\n"
+          "{ nop; f16v8tof8 $a4:5, $a0:3 }\n"
+          "{ st64step $a4:5, $mzero, %[out]+=, 6; fnop }\n"
+          : [in] "+&r"(input), [out] "+&r"(output) : [rounds] "r"(rounds)
+          : "$a0:1", "$a2:3", "$a4:5", "memory");
+    }
+    const unsigned base = worker * 8 + workerRounds * 48;
     if (base < elements) {
       half4 lower = {half(0), half(0), half(0), half(0)};
       half4 upper = lower;

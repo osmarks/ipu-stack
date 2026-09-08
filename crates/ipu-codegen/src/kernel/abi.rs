@@ -43,6 +43,7 @@ pub enum ScalarValue {
     CastDestinationScale,
     CastPanelRows,
     CastSourceElements,
+    CastRowMajorColumns,
     InitialBlock,
     FinalBlock,
     WordsPerWorker,
@@ -126,15 +127,17 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 }
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
-            ScalarValue::CastSourceElements => {
-                run.inputs[0].views[0]
-                    .extents
-                    .iter()
-                    .try_fold(1u32, |n, e| {
-                        n.checked_mul(e.physical_end - e.start)
-                            .ok_or(KernelAbiError::ElementCountOverflow)
-                    })
-            }
+            ScalarValue::CastRowMajorColumns => Ok(
+                if run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
+                    && run.requirements.output.format.layout.order
+                        == ElementOrder::Amp(AmpOrder::Left)
+                {
+                    matrix_extent(run, false, true)?
+                } else {
+                    0
+                },
+            ),
+            ScalarValue::CastSourceElements => scalar_source_elements(run),
             ScalarValue::CastPanelRows => {
                 if matches!(
                     run.kernel,
@@ -149,6 +152,12 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                     }
                     let columns = matrix_extent(run, false, true)?;
                     let rows = element_count(run)? / columns;
+                    if order == ElementOrder::Amp(AmpOrder::Left)
+                        && rows == 1
+                        && scalar_source_elements(run)? == element_count(run)?
+                    {
+                        return Ok(0);
+                    }
                     u32::try_from(
                         run.requirements
                             .output
@@ -398,6 +407,7 @@ pub fn tile_kernel_abi(
                         ScalarValue::CastDestinationScale,
                         ScalarValue::CastPanelRows,
                         ScalarValue::CastSourceElements,
+                        ScalarValue::CastRowMajorColumns,
                     ]
                 } else {
                     &[ScalarValue::ElementCount]
@@ -484,8 +494,11 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     ) {
         let panel_rows = scalar_values(run, &abi)?[3];
         let input = &run.inputs[0].views[0];
-        if run.requirements.inputs[0].format.layout.order
+        let row_pack = run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
+            && run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left);
+        if (run.requirements.inputs[0].format.layout.order
             != run.requirements.output.format.layout.order
+            && !row_pack)
             || input.extents.len() != run.output.extents.len()
             || input
                 .extents
@@ -498,10 +511,12 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                     width != target_width
                         && !(run.requirements.output.format.layout.order
                             == ElementOrder::Amp(AmpOrder::Left)
+                            && !row_pack
                             && axis + 1 == input.extents.len()
                             && width.is_multiple_of(16)
                             && target_width == width.next_multiple_of(32))
                 })
+            || (row_pack && !matrix_extent(run, false, true)?.is_multiple_of(32))
             || (panel_rows != 0
                 && !element_count(run)?.is_multiple_of(
                     panel_rows
@@ -703,4 +718,14 @@ pub(super) fn cast_symbol(from: Precision, to: Precision) -> &'static str {
         (Precision::F8F143 { .. }, Precision::F8F143 { .. }) => "cast_f8_f8",
         _ => "cast_identity",
     }
+}
+
+fn scalar_source_elements(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    run.inputs[0].views[0]
+        .extents
+        .iter()
+        .try_fold(1u32, |n, e| {
+            n.checked_mul(e.physical_end - e.start)
+                .ok_or(KernelAbiError::ElementCountOverflow)
+        })
 }
