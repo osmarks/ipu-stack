@@ -1,7 +1,7 @@
 #include "arch/gc_tile_defines.h"
 
 #ifndef REARRANGE_CALL_SYMBOL
-#define REARRANGE_CALL_SYMBOL rearrange_row_major_to_block_major_f16_64x16
+#define REARRANGE_CALL_SYMBOL rearrange_row_major_to_block_major_f16
 #endif
 #ifndef REARRANGE_PHYSICAL_COLUMNS
 #define REARRANGE_PHYSICAL_COLUMNS 16
@@ -44,8 +44,8 @@ REARRANGE_CALL_SYMBOL:
 	br $m10
 	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL
 
-	// Transpose each 2x2 F16 cell while converting a row-major 64xN matrix
-	// into 64x16-panel block-major coefficient order. Each 64-bit source load
+	// Transpose each 2x2 F16 cell while converting a row-major RxN matrix
+	// into Rx16-panel block-major coefficient order. Each 64-bit source load
 	// covers four adjacent columns from one row. sort4x16lo/hi pair the same
 	// column from two adjacent rows, which is the natural source order expected
 	// by the GEMM supervisor's ld*putcs coefficient routing.
@@ -72,11 +72,12 @@ REARRANGE_CALL_SYMBOL:
 
 	zero $m9
 .Lrearrange_block_major_f16_columns:
-	// A 64x16 column block consists of four 16x16 coefficient panels.
+	// An Rx16 column block consists of R/16 coefficient panels.
 	// Select the column block, the 16-row panel within it, and the row and
 	// column offsets within that panel.
 	shr $m5, $m9, 4
-	shl $m5, $m5, 11
+	setzi $m10, REARRANGE_PHYSICAL_ROWS * 32
+	mul $m5, $m5, $m10
 	add $m10, $m1, $m5
 	shr $m5, $m4, 4
 	shl $m5, $m5, 9

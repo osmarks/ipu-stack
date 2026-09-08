@@ -136,75 +136,56 @@ impl KernelBuildPlan {
             )),
             call.clone(),
         );
-        if order == RearrangeTarget::AmpLeft
+        let assembly = if order == RearrangeTarget::AmpLeft
             && logical_columns.is_multiple_of(2)
             && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
         {
-            self.compilations.push(KernelCompilation {
-                source: "rearrange_amp_left_f16.S",
-                name: format!("rearrange_amp_left_f16_{suffix}"),
-                flags: vec![
-                    format!("-DREARRANGE_CALL_SYMBOL={call}"),
-                    format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
-                    format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
-                    format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
-                    format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
-                ],
-                retained_symbols: vec![call.clone()],
-            });
-            return;
-        }
-        if order
-            == (RearrangeTarget::BlockMajor {
-                row_block: AMP_INNER_BLOCK as u16,
-                column_block: AMP_COLUMN_MICRO as u16,
-            })
-            && physical_rows == AMP_INNER_BLOCK
+            Some("rearrange_amp_left_f16.S")
+        } else if matches!(order, RearrangeTarget::BlockMajor { .. })
+            && u32::from(row_block) == physical_rows
+            && physical_rows.is_multiple_of(AMP_COLUMN_MICRO)
+            && u32::from(column_block) == AMP_COLUMN_MICRO
             && logical_columns.is_multiple_of(4)
             && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
         {
-            self.compilations.push(KernelCompilation {
-                source: "rearrange_block_major_f16.S",
-                name: format!("rearrange_block_major_f16_{suffix}"),
-                flags: vec![
-                    format!("-DREARRANGE_CALL_SYMBOL={call}"),
-                    format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
-                ],
-                retained_symbols: vec![call.clone()],
-            });
-            return;
-        }
-        if order == RearrangeTarget::AmpTransposedRight
+            Some("rearrange_block_major_f16.S")
+        } else if order == RearrangeTarget::AmpTransposedRight
             && logical_rows == 64
             && physical_rows == 64
             && logical_columns == 16
             && physical_columns == 16
         {
-            self.compilations.push(KernelCompilation {
-                source: "rearrange_transposed_right_f16.S",
-                name: format!("rearrange_transposed_right_f16_{suffix}"),
-                flags: vec![format!("-DREARRANGE_CALL_SYMBOL={call}")],
-                retained_symbols: vec![call.clone()],
-            });
-            return;
-        }
-        self.compilations.push(KernelCompilation {
-            source: "rearrange_f16.cpp",
-            name: format!("rearrange_f16_codelet_{suffix}"),
-            flags: vec![
+            Some("rearrange_transposed_right_f16.S")
+        } else {
+            None
+        };
+        let mut flags = vec![
+            format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
+            format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
+            format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
+            format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+        ];
+        if assembly.is_some() {
+            flags.push(format!("-DREARRANGE_CALL_SYMBOL={call}"));
+        } else {
+            flags.extend([
                 "-O2".into(),
                 format!("-DREARRANGE_TARGET_ORDER={order_index}"),
-                format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
-                format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
-                format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
-                format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
                 format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"),
                 format!("-DREARRANGE_ROW_BLOCK={row_block}"),
                 format!("-DREARRANGE_COLUMN_BLOCK={column_block}"),
                 format!("-DREARRANGE_VERTEX_NAME={vertex}"),
-            ],
-            retained_symbols: Vec::new(),
+            ]);
+        }
+        self.compilations.push(KernelCompilation {
+            source: assembly.unwrap_or("rearrange_f16.cpp"),
+            name: format!("rearrange_f16_codelet_{suffix}"),
+            flags,
+            retained_symbols: assembly.map(|_| vec![call.clone()]).unwrap_or_default(),
         });
+        if assembly.is_some() {
+            return;
+        }
         self.add_worker_wrapper(
             format!("rearrange_f16_wrapper_{suffix}"),
             &call,
