@@ -15,6 +15,7 @@ mod kernel;
 mod low;
 mod memory;
 mod mid;
+pub use mid::optimistic;
 mod package;
 mod place;
 mod storage;
