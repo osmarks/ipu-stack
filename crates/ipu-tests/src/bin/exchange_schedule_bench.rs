@@ -50,6 +50,9 @@ struct Arguments {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    if std::env::var_os("RUST_LOG").is_some() {
+        ipu_runtime::init_tracing();
+    }
     if arguments.iterations == 0 {
         bail!("--iterations must be nonzero");
     }

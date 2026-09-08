@@ -204,8 +204,9 @@ struct RepairReady {
     // Repair a bounded window of the incumbent before considering later work.
     // With time first, every endpoint advance repriced candidates throughout
     // the phase, turning a local improvement into another global search.
-    epoch: Reverse<usize>,
+    window: Reverse<usize>,
     earliest_start: Reverse<u32>,
+    epoch: Reverse<usize>,
     contiguous_receivers: usize,
     in_neighborhood: bool,
     endpoint_pressure: u64,
@@ -249,6 +250,7 @@ fn repair_ready(
         .map(|tile| word_pressure[usize::from(tile)])
         .sum();
     RepairReady {
+        window: Reverse(rank[index] / epoch_width),
         earliest_start: Reverse(earliest_start),
         epoch: Reverse(rank[index] / epoch_width),
         contiguous_receivers,
@@ -276,6 +278,7 @@ fn repair_rank(
     neighborhood: &[bool],
 ) -> RepairReady {
     RepairReady {
+        window: Reverse(rank[index] / epoch_width),
         earliest_start: Reverse(0),
         epoch: Reverse(rank[index] / epoch_width),
         contiguous_receivers: 0,
@@ -296,10 +299,11 @@ impl RepairGroup {
         rank: &[usize],
         epoch_width: usize,
         neighborhood: &[bool],
+        local: bool,
     ) -> Option<RepairReady> {
         let first = self.ready.last()?.index.0;
         let price = |index| {
-            repair_ready(
+            let mut candidate = repair_ready(
                 index,
                 pending,
                 availability,
@@ -308,7 +312,11 @@ impl RepairGroup {
                 rank,
                 epoch_width,
                 neighborhood,
-            )
+            );
+            if !local {
+                candidate.window = Reverse(0);
+            }
+            candidate
         };
         let mut best = price(first);
         // The static winner suffices unless another ready transfer continues
@@ -334,6 +342,7 @@ impl RepairGroup {
 pub(super) fn critical_neighborhood_order(
     problem: &SchedulingProblem<'_>,
     incumbent: &MaterializedSchedule,
+    local: bool,
 ) -> Vec<usize> {
     let pending = problem.transfers;
     let tile_count = problem.tile_count;
@@ -433,12 +442,30 @@ pub(super) fn critical_neighborhood_order(
             &rank,
             epoch_width,
             &neighborhood,
+            local,
         ) {
             ready.push((best, id, group.revision));
         }
     }
     let mut order = Vec::with_capacity(pending.len());
+    // Bound queue work rather than rejecting phases by transfer count. A
+    // broader search can recover cross-window opportunities in cheap cases.
+    let budget = if local {
+        usize::MAX
+    } else {
+        pending.len().saturating_mul(8).max(65_536)
+    };
+    let mut visits = 0usize;
     while let Some((candidate, group, revision)) = ready.pop() {
+        visits += 1;
+        if visits > budget {
+            tracing::debug!(
+                transfers = pending.len(),
+                visits,
+                "broader exchange repair reached its queue-work budget"
+            );
+            return incumbent.order.clone();
+        }
         if revision != groups[group].revision {
             continue;
         }
@@ -450,6 +477,7 @@ pub(super) fn critical_neighborhood_order(
             &rank,
             epoch_width,
             &neighborhood,
+            local,
         ) else {
             continue;
         };
@@ -508,11 +536,18 @@ pub(super) fn critical_neighborhood_order(
                 &rank,
                 epoch_width,
                 &neighborhood,
+                local,
             ) {
                 ready.push((best, id, groups[id].revision));
             }
         }
     }
+    tracing::debug!(
+        transfers = pending.len(),
+        visits,
+        local,
+        "finished exchange repair ordering"
+    );
     if order.len() == pending.len() {
         order
     } else {
@@ -722,7 +757,8 @@ mod tests {
                     &pressure,
                     &rank,
                     16,
-                    &neighborhood
+                    &neighborhood,
+                    true,
                 ),
                 expected
             );
@@ -746,7 +782,7 @@ mod tests {
             }
             let start = std::time::Instant::now();
             let result =
-                critical_neighborhood_order(&SchedulingProblem::new(&pending, 2), &incumbent);
+                critical_neighborhood_order(&SchedulingProblem::new(&pending, 2), &incumbent, true);
             eprintln!(
                 "repair_queue transfers={count} elapsed={:?}",
                 start.elapsed()

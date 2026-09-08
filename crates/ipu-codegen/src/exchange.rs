@@ -1110,28 +1110,30 @@ fn improve_pending_schedule(
             selected_kind = "matching-waves";
         }
     }
-    loop {
-        let repaired_order = critical_neighborhood_order(problem, &schedule);
-        if repaired_order == schedule.order {
-            break;
+    for local in [true, false] {
+        loop {
+            let repaired_order = critical_neighborhood_order(problem, &schedule, local);
+            if repaired_order == schedule.order {
+                break;
+            }
+            let repaired = materialize_schedule_order(
+                topology,
+                problem,
+                incoming_bases,
+                receive_counts,
+                &repaired_order,
+                false,
+            );
+            let Ok(repaired) = repaired else {
+                break;
+            };
+            if schedule_score(&repaired) >= schedule_score(&schedule) {
+                break;
+            }
+            schedule = repaired;
+            selected_kind = "critical-neighborhood";
+            neighborhood_improvements += 1;
         }
-        let repaired = materialize_schedule_order(
-            topology,
-            problem,
-            incoming_bases,
-            receive_counts,
-            &repaired_order,
-            false,
-        );
-        let Ok(repaired) = repaired else {
-            break;
-        };
-        if schedule_score(&repaired) >= schedule_score(&schedule) {
-            break;
-        }
-        schedule = repaired;
-        selected_kind = "critical-neighborhood";
-        neighborhood_improvements += 1;
     }
     Ok(OptimizedSchedule {
         schedule,

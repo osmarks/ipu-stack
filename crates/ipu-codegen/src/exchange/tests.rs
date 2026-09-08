@@ -643,6 +643,7 @@ fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
         let repaired = critical_neighborhood_order(
             &SchedulingProblem::new(&transfers, tile_count),
             &incumbent,
+            true,
         );
         let mut repaired_positions = vec![usize::MAX; transfers.len()];
         for (position, &index) in repaired.iter().enumerate() {
