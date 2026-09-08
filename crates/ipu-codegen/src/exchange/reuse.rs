@@ -1,17 +1,38 @@
 //! Reuse optimization choices across placement; rebuild and check physical rows.
 
 use super::*;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 #[derive(Clone, Default)]
-pub(crate) struct ExchangeScheduleCache {
-    phases: BTreeMap<ExchangePhaseId, ScheduleRecipe>,
+pub struct ExchangeScheduleCache {
+    phases: BTreeMap<ExchangePhaseId, Arc<ScheduleRecipe>>,
 }
 
 #[derive(Clone)]
 struct ScheduleRecipe {
+    structure: u64,
     widths: Vec<ExchangeItemWidth>,
     order: Vec<usize>,
     rows: Vec<Vec<u32>>,
+}
+
+// This is only a cheap rejection filter. Address-dependent dependencies and
+// timing are still rebuilt, validated, and compared against normalized rows.
+fn structure_fingerprint(pending: &[PendingTransfer], tile_count: u16) -> u64 {
+    let mut hash = std::hash::DefaultHasher::new();
+    tile_count.hash(&mut hash);
+    pending.len().hash(&mut hash);
+    for transfer in pending {
+        transfer.source.hash(&mut hash);
+        transfer.words.hash(&mut hash);
+        transfer.source_addresses.len().hash(&mut hash);
+        transfer.destinations.len().hash(&mut hash);
+        for &(tile, _) in &transfer.destinations {
+            tile.hash(&mut hash);
+        }
+    }
+    hash.finish()
 }
 
 fn normalized_rows(
@@ -31,6 +52,49 @@ fn normalized_rows(
 }
 
 impl ExchangeScheduleCache {
+    /// Select ordinary/paired transfers through the production path, retaining
+    /// the recipe for subsequent placement or benchmark replay.
+    pub fn schedule_problem(
+        &mut self,
+        tile_count: u16,
+        problem: &ExchangeScheduleProblem,
+    ) -> Result<(ExchangeScheduleProblem, ExchangeScheduleRun), ExchangeLoweringError> {
+        ExchangeScheduleSnapshot {
+            schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
+            tile_count,
+            phases: Vec::new(),
+        }
+        .validate()?;
+        let topology = Topology::new(
+            (0..tile_count)
+                .map(ipu_exchange::c600_logical_to_physical)
+                .collect(),
+        )?;
+        let pending = pending_from_problem(tile_count, problem)?;
+        if pending
+            .iter()
+            .any(|transfer| transfer.width != ExchangeItemWidth::Word32)
+        {
+            return Err(ExchangeLoweringError::InvalidSnapshot(
+                "width selection requires an ordinary-transfer capture".into(),
+            ));
+        }
+        let selected = self.select(
+            ExchangePhaseId::from_index(problem.phase),
+            &topology,
+            pending,
+            tile_count,
+        )?;
+        let problem = schedule_problem(problem.phase, &selected.pending);
+        let run = finish_exchange_run(
+            tile_count,
+            problem.phase,
+            selected.incoming_bases,
+            selected.optimized,
+        )?;
+        Ok((problem, run))
+    }
+
     pub(super) fn take_phase(&mut self, phase: ExchangePhaseId) -> Self {
         Self {
             phases: self
@@ -53,7 +117,10 @@ impl ExchangeScheduleCache {
         pending: Vec<PendingTransfer>,
         tile_count: u16,
     ) -> Result<ScheduledPending, ExchangeLoweringError> {
-        if let Some(recipe) = self.phases.get(&phase) {
+        let structure = structure_fingerprint(&pending, tile_count);
+        if let Some(recipe) = self.phases.get(&phase)
+            && recipe.structure == structure
+        {
             match recipe.replay(topology, &pending, tile_count) {
                 Ok(Some(schedule)) => {
                     tracing::info!(
@@ -71,7 +138,8 @@ impl ExchangeScheduleCache {
         let selected = select_transfer_widths(phase.index(), topology, pending, tile_count)?;
         self.phases.insert(
             phase,
-            ScheduleRecipe {
+            Arc::new(ScheduleRecipe {
+                structure,
                 widths: selected
                     .pending
                     .iter()
@@ -79,7 +147,7 @@ impl ExchangeScheduleCache {
                     .collect(),
                 order: selected.optimized.schedule.order.clone(),
                 rows: normalized_rows(&selected.optimized.schedule)?,
-            },
+            }),
         );
         Ok(selected)
     }
@@ -113,13 +181,13 @@ impl ScheduleRecipe {
         // repeat-source hazards, and instruction alignment at the final addresses.
         // The original greedy schedule may have needed incremental encoding
         // validation. Replay must use the same fallback before comparing rows.
+        let problem = SchedulingProblem::new(&pending, tile_count);
         let replay = |validate_encoding| {
             materialize_schedule_order(
                 topology,
-                &pending,
+                &problem,
                 &incoming_bases,
                 &receive_counts,
-                tile_count,
                 &self.order,
                 validate_encoding,
             )
@@ -210,8 +278,15 @@ mod tests {
         let mut pending = transfers();
         let (counts, bases) = receive_configuration(&pending, 4).unwrap();
         assert!(
-            materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &[1, 0], false)
-                .is_ok()
+            materialize_schedule_order(
+                &topology,
+                &SchedulingProblem::new(&pending, 4),
+                &bases,
+                &counts,
+                &[1, 0],
+                false
+            )
+            .is_ok()
         );
         // Transfer 1 now reads bytes written by transfer 0. The old order is
         // no longer legal even though transfer lengths and tile counts match.
@@ -220,13 +295,27 @@ mod tests {
         pending[1].refresh_source_elements();
         let (counts, bases) = receive_configuration(&pending, 4).unwrap();
         assert!(
-            materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &[0, 1], false)
-                .is_ok()
+            materialize_schedule_order(
+                &topology,
+                &SchedulingProblem::new(&pending, 4),
+                &bases,
+                &counts,
+                &[0, 1],
+                false
+            )
+            .is_ok()
         );
         for order in [[1, 0], [0, 0], [0, 2]] {
             assert!(
-                materialize_schedule_order(&topology, &pending, &bases, &counts, 4, &order, false)
-                    .is_err()
+                materialize_schedule_order(
+                    &topology,
+                    &SchedulingProblem::new(&pending, 4),
+                    &bases,
+                    &counts,
+                    &order,
+                    false
+                )
+                .is_err()
             );
         }
     }
@@ -268,20 +357,26 @@ mod tests {
         };
         let pending = pending_from_problem(8, &problem).unwrap();
         let (counts, bases) = receive_configuration(&pending, 8).unwrap();
-        let aligned = materialize_greedy_schedule(&topology, &pending, &bases, &counts, 8).unwrap();
+        let aligned = materialize_greedy_schedule(
+            &topology,
+            &SchedulingProblem::new(&pending, 8),
+            &bases,
+            &counts,
+        )
+        .unwrap();
         assert!(
             materialize_schedule_order(
                 &topology,
-                &pending,
+                &SchedulingProblem::new(&pending, 8),
                 &bases,
                 &counts,
-                8,
                 &aligned.order,
                 false
             )
             .is_err()
         );
         let recipe = ScheduleRecipe {
+            structure: structure_fingerprint(&pending, 8),
             widths: vec![ExchangeItemWidth::Word32; pending.len()],
             order: aligned.order.clone(),
             rows: normalized_rows(&aligned).unwrap(),

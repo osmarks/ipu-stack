@@ -65,6 +65,12 @@ pub(super) fn select_scheduled_finalist<T>(
     modelled.sort_by_key(|plan| (plan.cycles, plan.index));
     let mut best = None;
     let mut scheduled = 0;
+    // Preserve compatible phase recipes when a finalist fails late package
+    // acceptance. Ordinary and mapped placements keep independent caches.
+    let mut caches = [
+        crate::ExchangeScheduleCache::default(),
+        crate::ExchangeScheduleCache::default(),
+    ];
     for plan in modelled {
         // An infeasible schedule does not consume the bounded finalist budget.
         if scheduled >= planning.exchange_schedule_finalists.max(1) {
@@ -90,13 +96,13 @@ pub(super) fn select_scheduled_finalist<T>(
         let span = tracing::Span::current();
         let results = candidates
             .into_par_iter()
-            .map(|(mapped, candidate)| {
+            .zip(caches.par_iter_mut())
+            .map(|((mapped, candidate), cache)| {
                 let _entered = span.enter();
                 let schedule = || -> PackageBuildResult<_> {
                     let (low, placement) = candidate?;
-                    let mut cache = crate::exchange::ExchangeScheduleCache::default();
                     let exchanges = crate::exchange::lower_exchanges_cached(
-                        &low, &placement, &topology, false, &mut cache,
+                        &low, &placement, &topology, false, cache,
                     )?;
                     let refined =
                         crate::estimate::scheduled_program_cycles(&low.program, &exchanges.phases)?;
@@ -115,7 +121,7 @@ pub(super) fn select_scheduled_finalist<T>(
                             program: low,
                             placement,
                             phases: exchanges.phases,
-                            cache,
+                            cache: cache.clone(),
                         },
                     ))
                 };
@@ -129,7 +135,9 @@ pub(super) fn select_scheduled_finalist<T>(
                     // Exact support placement is part of acceptance. A fast
                     // but unplaceable package must not consume the budget or
                     // prevent another finalist from being attempted.
-                    match finalize(&mut plan) {
+                    let finalized = finalize(&mut plan);
+                    caches[usize::from(mapped)] = plan.cache.clone();
+                    match finalized {
                         Ok(artifact) => {
                             feasible = true;
                             if best
@@ -160,6 +168,18 @@ pub(super) fn select_scheduled_finalist<T>(
         "selected physically scheduled operator-plan finalist"
     );
     Ok((plan, artifact))
+}
+
+pub(super) fn expand_and_place(
+    mid: &crate::MidProgram,
+    planning: &PipelineConfig,
+    tile_mapping: Option<&[u16]>,
+) -> PackageBuildResult<(LowProgram, crate::Placement)> {
+    let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
+    placement::map_tiles(&mut expanded, tile_mapping)?;
+    let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
+    let placement = place(&low)?;
+    Ok((low, placement))
 }
 
 #[cfg(test)]
@@ -219,16 +239,4 @@ mod tests {
         ));
         assert!(select_scheduled_finalist(vec![], &config, None, |_| Ok(())).is_err());
     }
-}
-
-pub(super) fn expand_and_place(
-    mid: &crate::MidProgram,
-    planning: &PipelineConfig,
-    tile_mapping: Option<&[u16]>,
-) -> PackageBuildResult<(LowProgram, crate::Placement)> {
-    let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
-    placement::map_tiles(&mut expanded, tile_mapping)?;
-    let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
-    let placement = place(&low)?;
-    Ok((low, placement))
 }

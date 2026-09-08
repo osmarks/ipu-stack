@@ -2,10 +2,11 @@
 use super::*;
 
 pub(super) fn point_to_point_matching_wave_order(
-    pending: &[PendingTransfer],
-    tile_count: u16,
+    problem: &SchedulingProblem<'_>,
     incumbent_order: &[usize],
 ) -> Option<Vec<usize>> {
+    let pending = problem.transfers;
+    let tile_count = problem.tile_count;
     if pending.len() < 2
         || pending
             .iter()
@@ -46,12 +47,8 @@ pub(super) fn point_to_point_matching_wave_order(
     for (rank, &index) in incumbent_order.iter().enumerate() {
         incumbent_rank[index] = rank;
     }
-    let mut dependents = vec![Vec::new(); pending.len()];
-    let mut indegrees = vec![0usize; pending.len()];
-    for (before, after) in memory_dependencies(pending, tile_count as u16) {
-        dependents[before].push(after);
-        indegrees[after] += 1;
-    }
+    let dependents = &problem.dependents;
+    let mut indegrees = problem.indegrees();
     let mut remaining_send_words = vec![0u64; tile_count];
     let mut remaining_receive_words = vec![0u64; tile_count];
     for transfer in pending {
@@ -119,7 +116,7 @@ pub(super) fn point_to_point_matching_wave_order(
             let destination = usize::from(transfer.destinations[0].0);
             remaining_receive_words[destination] =
                 remaining_receive_words[destination].saturating_sub(words);
-            for dependent in std::mem::take(&mut dependents[index]) {
+            for &dependent in &dependents[index] {
                 indegrees[dependent] -= 1;
             }
         }
@@ -218,8 +215,11 @@ fn augment_ready_matching(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RepairReady {
-    earliest_start: Reverse<u32>,
+    // Repair a bounded window of the incumbent before considering later work.
+    // With time first, every endpoint advance repriced candidates throughout
+    // the phase, turning a local improvement into another global search.
     epoch: Reverse<usize>,
+    earliest_start: Reverse<u32>,
     contiguous_receivers: usize,
     in_neighborhood: bool,
     endpoint_pressure: u64,
@@ -346,10 +346,11 @@ impl RepairGroup {
 }
 
 pub(super) fn critical_neighborhood_order(
-    pending: &[PendingTransfer],
-    tile_count: u16,
+    problem: &SchedulingProblem<'_>,
     incumbent: &MaterializedSchedule,
 ) -> Vec<usize> {
+    let pending = problem.transfers;
+    let tile_count = problem.tile_count;
     if pending.len() < 2 {
         return incumbent.order.clone();
     }
@@ -395,24 +396,14 @@ pub(super) fn critical_neighborhood_order(
         return incumbent.order.clone();
     }
 
-    let mut dependents = vec![Vec::new(); pending.len()];
-    let mut indegrees = vec![0usize; pending.len()];
-    for (before, after) in memory_dependencies(pending, tile_count) {
-        dependents[before].push(after);
-        indegrees[after] += 1;
-    }
+    let dependents = &problem.dependents;
+    let mut indegrees = problem.indegrees();
     let mut rank = vec![0usize; pending.len()];
     for (position, &index) in incumbent.order.iter().enumerate() {
         rank[index] = position;
     }
     let epoch_width = pending.len().isqrt().max(1);
-    let mut word_pressure = vec![0u64; usize::from(tile_count)];
-    for transfer in pending {
-        let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
-        for tile in transfer.tiles() {
-            word_pressure[usize::from(tile)] += items;
-        }
-    }
+    let mut word_pressure = problem.word_pressure.clone();
     let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
     let mut next_receive_address = vec![None; usize::from(tile_count)];
     let mut group_ids = BTreeMap::new();
@@ -509,7 +500,7 @@ pub(super) fn critical_neighborhood_order(
         }
         order.push(index);
         let mut changed = vec![group];
-        for dependent in std::mem::take(&mut dependents[index]) {
+        for &dependent in &dependents[index] {
             indegrees[dependent] -= 1;
             if indegrees[dependent] == 0 {
                 let id = transfer_groups[dependent];
@@ -644,7 +635,8 @@ mod tests {
                 });
             }
             let start = std::time::Instant::now();
-            let result = critical_neighborhood_order(&pending, 2, &incumbent);
+            let result =
+                critical_neighborhood_order(&SchedulingProblem::new(&pending, 2), &incumbent);
             eprintln!(
                 "repair_queue transfers={count} elapsed={:?}",
                 start.elapsed()

@@ -22,8 +22,8 @@ mod tile;
 pub(crate) use exchange::*;
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityKind,
-    ExchangeScheduleSnapshot, PhysicalExchangePhase, inactive_exchange_program,
-    schedule_exchange_problem, validate_exchange_schedule,
+    ExchangeScheduleCache, ExchangeScheduleSnapshot, PhysicalExchangePhase,
+    inactive_exchange_program, schedule_exchange_problem, validate_exchange_schedule,
 };
 pub(crate) use graph::*;
 pub use graph::{

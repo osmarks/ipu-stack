@@ -1264,6 +1264,31 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
     PackageBuildError::Invalid(message.into())
 }
 
+/// Capture address-resolved ordinary transfers before scheduling or linking.
+/// Finalist indices match package-selection diagnostics; failed placements remain errors.
+pub fn capture_exchange_finalist(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+    finalist: usize,
+) -> PackageBuildResult<crate::ExchangeScheduleSnapshot> {
+    let planning = &config.pipeline;
+    validate_tile_count(u32::from(planning.tile_count))?;
+    let finalists = lower_finalists(
+        graph,
+        planning,
+        &Ipu21CostModel,
+        planning.exchange_schedule_finalists.max(4),
+    )?;
+    let mid = finalists
+        .get(finalist)
+        .ok_or_else(|| invalid("exchange capture finalist out of range"))?;
+    let (low, placement) =
+        selection::expand_and_place(mid, planning, config.tile_mapping.as_deref())?;
+    Ok(crate::exchange::capture_exchange_schedule(
+        &low, &placement,
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,29 +1356,4 @@ mod tests {
         );
         assert_eq!(package_precisions(&low)[&y], Precision::F16);
     }
-}
-
-/// Capture address-resolved ordinary transfers before scheduling or linking.
-/// Finalist indices match package-selection diagnostics; failed placements remain errors.
-pub fn capture_exchange_finalist(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-    finalist: usize,
-) -> PackageBuildResult<crate::ExchangeScheduleSnapshot> {
-    let planning = &config.pipeline;
-    validate_tile_count(u32::from(planning.tile_count))?;
-    let finalists = lower_finalists(
-        graph,
-        planning,
-        &Ipu21CostModel,
-        planning.exchange_schedule_finalists.max(4),
-    )?;
-    let mid = finalists
-        .get(finalist)
-        .ok_or_else(|| invalid("exchange capture finalist out of range"))?;
-    let (low, placement) =
-        selection::expand_and_place(mid, planning, config.tile_mapping.as_deref())?;
-    Ok(crate::exchange::capture_exchange_schedule(
-        &low, &placement,
-    )?)
 }

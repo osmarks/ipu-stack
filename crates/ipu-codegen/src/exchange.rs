@@ -7,7 +7,7 @@ pub use diagnostic::diagnose_exchange_tile;
 use order::{critical_neighborhood_order, point_to_point_matching_wave_order};
 mod reuse;
 mod traffic;
-pub(crate) use reuse::ExchangeScheduleCache;
+pub use reuse::ExchangeScheduleCache;
 pub(crate) use traffic::MappingTraffic;
 
 use crate::{
@@ -151,6 +151,7 @@ pub struct LoweredExchanges {
 
 #[derive(Clone, Debug)]
 pub struct ExchangeScheduleRun {
+    pub reused: bool,
     pub phase: PhysicalExchangePhase,
     pub initial_horizon: u32,
     pub endpoint_lower_bound: u32,
@@ -1066,19 +1067,13 @@ fn optimize_pending_schedule(
     receive_counts: &[usize],
     tile_count: u16,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
-    let schedule = materialize_greedy_schedule(
-        topology,
-        pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-    )?;
+    let problem = SchedulingProblem::new(pending, tile_count);
+    let schedule = materialize_greedy_schedule(topology, &problem, incoming_bases, receive_counts)?;
     improve_pending_schedule(
         topology,
-        pending,
+        &problem,
         incoming_bases,
         receive_counts,
-        tile_count,
         schedule,
         "full-duplex",
     )
@@ -1087,24 +1082,24 @@ fn optimize_pending_schedule(
 #[allow(clippy::too_many_arguments)]
 fn improve_pending_schedule(
     topology: &Topology,
-    pending: &[PendingTransfer],
+    problem: &SchedulingProblem<'_>,
     incoming_bases: &[u32],
     receive_counts: &[usize],
-    tile_count: u16,
     mut schedule: MaterializedSchedule,
     initial_kind: &'static str,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
+    let pending = problem.transfers;
+    let tile_count = problem.tile_count;
     let initial_horizon = schedule_score(&schedule);
     let endpoint_lower_bound = endpoint_work_lower_bound(pending, tile_count);
     let mut selected_kind = initial_kind;
     let mut neighborhood_improvements = 0usize;
-    if let Some(order) = point_to_point_matching_wave_order(pending, tile_count, &schedule.order) {
+    if let Some(order) = point_to_point_matching_wave_order(problem, &schedule.order) {
         let matching = materialize_schedule_order(
             topology,
-            pending,
+            problem,
             incoming_bases,
             receive_counts,
-            tile_count,
             &order,
             false,
         );
@@ -1116,16 +1111,15 @@ fn improve_pending_schedule(
         }
     }
     loop {
-        let repaired_order = critical_neighborhood_order(pending, tile_count, &schedule);
+        let repaired_order = critical_neighborhood_order(problem, &schedule);
         if repaired_order == schedule.order {
             break;
         }
         let repaired = materialize_schedule_order(
             topology,
-            pending,
+            problem,
             incoming_bases,
             receive_counts,
-            tile_count,
             &repaired_order,
             false,
         );
@@ -1194,19 +1188,29 @@ pub fn schedule_exchange_problem(
     )?;
     let pending = pending_from_problem(tile_count, problem)?;
     let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
-    let OptimizedSchedule {
-        schedule,
-        initial_horizon,
-        endpoint_lower_bound,
-        neighborhood_improvements,
-        ..
-    } = optimize_pending_schedule(
+    let optimized = optimize_pending_schedule(
         &topology,
         &pending,
         &incoming_bases,
         &receive_counts,
         tile_count,
     )?;
+    finish_exchange_run(tile_count, problem.phase, incoming_bases, optimized)
+}
+
+fn finish_exchange_run(
+    tile_count: u16,
+    phase_id: u32,
+    incoming_bases: Vec<u32>,
+    optimized: OptimizedSchedule,
+) -> Result<ExchangeScheduleRun, ExchangeLoweringError> {
+    let OptimizedSchedule {
+        schedule,
+        initial_horizon,
+        endpoint_lower_bound,
+        neighborhood_improvements,
+        selected_kind,
+    } = optimized;
     let MaterializedSchedule {
         builder,
         horizon,
@@ -1217,7 +1221,7 @@ pub fn schedule_exchange_problem(
     if phase_programs.event_cycles != horizon {
         return Err(ExchangeLoweringError::Invariant(format!(
             "phase {} row horizon {} differs from scheduled horizon {horizon}",
-            problem.phase, phase_programs.event_cycles
+            phase_id, phase_programs.event_cycles
         )));
     }
     let tile_event_cycles = phase_programs.tile_event_cycles;
@@ -1232,7 +1236,7 @@ pub fn schedule_exchange_problem(
         .map(|program| program.unwrap_or_else(inactive_exchange_program))
         .collect::<Vec<_>>();
     let phase = PhysicalExchangePhase {
-        id: ExchangePhaseId::from_index(problem.phase),
+        id: ExchangePhaseId::from_index(phase_id),
         active,
         programs,
         incoming_bases,
@@ -1246,6 +1250,7 @@ pub fn schedule_exchange_problem(
         initial_horizon,
         endpoint_lower_bound,
         neighborhood_improvements,
+        reused: selected_kind == "reused",
     })
 }
 
@@ -1545,6 +1550,43 @@ struct ReadyTransfer {
     index: Reverse<usize>,
 }
 
+/// Address/width-dependent facts shared by every trial for one physical phase.
+struct SchedulingProblem<'a> {
+    transfers: &'a [PendingTransfer],
+    tile_count: u16,
+    predecessors: Vec<Vec<usize>>,
+    dependents: Vec<Vec<usize>>,
+    word_pressure: Vec<u64>,
+}
+
+impl<'a> SchedulingProblem<'a> {
+    fn new(transfers: &'a [PendingTransfer], tile_count: u16) -> Self {
+        let mut predecessors = vec![Vec::new(); transfers.len()];
+        let mut dependents = vec![Vec::new(); transfers.len()];
+        for (before, after) in memory_dependencies(transfers, tile_count) {
+            predecessors[after].push(before);
+            dependents[before].push(after);
+        }
+        let mut word_pressure = vec![0; usize::from(tile_count)];
+        for transfer in transfers {
+            let words = u64::from(transfer.item_count().unwrap_or(transfer.words));
+            for tile in transfer.tiles() {
+                word_pressure[usize::from(tile)] += words;
+            }
+        }
+        Self {
+            transfers,
+            tile_count,
+            predecessors,
+            dependents,
+            word_pressure,
+        }
+    }
+    fn indegrees(&self) -> Vec<usize> {
+        self.predecessors.iter().map(Vec::len).collect()
+    }
+}
+
 /// Incrementally list-schedules dependency-ready multicast hyperedges. Heap
 /// keys are lower bounds on their start time and are refreshed lazily as
 /// shared endpoints become busy.
@@ -1552,7 +1594,7 @@ struct TransferScheduler<'a> {
     transfers: &'a [PendingTransfer],
     word_pressure: Vec<u64>,
     dynamic_word_pressure: bool,
-    dependents: Vec<Vec<usize>>,
+    dependents: &'a [Vec<usize>],
     indegrees: Vec<usize>,
     dependency_ready: Vec<u32>,
     ready: BinaryHeap<ReadyTransfer>,
@@ -1562,32 +1604,19 @@ struct TransferScheduler<'a> {
 }
 
 impl<'a> TransferScheduler<'a> {
-    fn new(transfers: &'a [PendingTransfer], tile_count: u16) -> Self {
-        let mut word_pressure = vec![0u64; usize::from(tile_count)];
-        for transfer in transfers {
-            let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
-            for tile in transfer.tiles() {
-                word_pressure[usize::from(tile)] += items;
-            }
-        }
-
-        let mut dependents = vec![Vec::new(); transfers.len()];
-        let mut indegrees = vec![0usize; transfers.len()];
-        for (before, after) in memory_dependencies(transfers, tile_count) {
-            dependents[before].push(after);
-            indegrees[after] += 1;
-        }
+    fn new(problem: &'a SchedulingProblem<'_>) -> Self {
+        let transfers = problem.transfers;
         let mut scheduler = Self {
             transfers,
-            word_pressure,
+            word_pressure: problem.word_pressure.clone(),
             // Multicast choices release several endpoint queues at once, so
             // their useful priority is the pressure which remains. Stable
             // pressure is a better matching tie-break for point-to-point work.
             dynamic_word_pressure: transfers
                 .iter()
                 .any(|transfer| transfer.destinations.len() > 1),
-            dependents,
-            indegrees,
+            dependents: &problem.dependents,
+            indegrees: problem.indegrees(),
             dependency_ready: vec![0; transfers.len()],
             ready: BinaryHeap::new(),
             ready_groups: Vec::new(),
@@ -1740,8 +1769,7 @@ impl<'a> TransferScheduler<'a> {
                     self.word_pressure[usize::from(tile)].saturating_sub(items);
             }
         }
-        let dependents = std::mem::take(&mut self.dependents[index]);
-        for dependent in dependents {
+        for &dependent in &self.dependents[index] {
             self.dependency_ready[dependent] = self.dependency_ready[dependent].max(completion);
             self.indegrees[dependent] -= 1;
             if self.indegrees[dependent] == 0 {
@@ -2075,19 +2103,13 @@ impl MaterializedSchedule {
 
 fn materialize_greedy_schedule(
     topology: &Topology,
-    pending: &[PendingTransfer],
+    problem: &SchedulingProblem<'_>,
     incoming_bases: &[u32],
     receive_counts: &[usize],
-    tile_count: u16,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let schedule = materialize_greedy_schedule_impl(
-        topology,
-        pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-        false,
-    )?;
+    let pending = problem.transfers;
+    let schedule =
+        materialize_greedy_schedule_impl(topology, problem, incoming_bases, receive_counts, false)?;
     if schedule_encoding_is_valid(&schedule)? {
         return Ok(schedule);
     }
@@ -2096,14 +2118,8 @@ fn materialize_greedy_schedule(
         "retrying exchange schedule with incremental instruction-alignment validation"
     );
     let started = std::time::Instant::now();
-    let result = materialize_greedy_schedule_impl(
-        topology,
-        pending,
-        incoming_bases,
-        receive_counts,
-        tile_count,
-        true,
-    );
+    let result =
+        materialize_greedy_schedule_impl(topology, problem, incoming_bases, receive_counts, true);
     tracing::info!(
         transfers = pending.len(),
         elapsed_ms = started.elapsed().as_millis(),
@@ -2115,14 +2131,15 @@ fn materialize_greedy_schedule(
 
 fn materialize_greedy_schedule_impl(
     topology: &Topology,
-    pending: &[PendingTransfer],
+    problem: &SchedulingProblem<'_>,
     incoming_bases: &[u32],
     receive_counts: &[usize],
-    tile_count: u16,
     validate_encoding: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
+    let pending = problem.transfers;
+    let tile_count = problem.tile_count;
     let mut schedule = MaterializedSchedule::new(tile_count, pending);
-    let mut scheduler = TransferScheduler::new(pending, tile_count);
+    let mut scheduler = TransferScheduler::new(problem);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
     while let Some((index, dependency_ready)) = scheduler.next(&schedule.tile_availability) {
         let completion = schedule.append(
@@ -2144,23 +2161,20 @@ fn materialize_greedy_schedule_impl(
 
 fn materialize_schedule_order(
     topology: &Topology,
-    pending: &[PendingTransfer],
+    problem: &SchedulingProblem<'_>,
     incoming_bases: &[u32],
     receive_counts: &[usize],
-    tile_count: u16,
     order: &[usize],
     validate_encoding: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
+    let pending = problem.transfers;
+    let tile_count = problem.tile_count;
     if order.len() != pending.len() {
         return Err(ExchangeLoweringError::Overflow);
     }
     let mut schedule = MaterializedSchedule::new(tile_count, pending);
     let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
-    let dependencies = memory_dependencies(pending, tile_count);
-    let mut predecessors = vec![Vec::new(); pending.len()];
-    for (before, after) in dependencies {
-        predecessors[after].push(before);
-    }
+    let predecessors = &problem.predecessors;
     let mut completion = vec![None; pending.len()];
     for &index in order {
         if index >= pending.len()

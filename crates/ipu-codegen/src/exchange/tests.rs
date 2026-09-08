@@ -45,9 +45,10 @@ fn grouped_ready_queue_matches_eager_priority() {
                 }
             })
             .collect::<Vec<_>>();
-        let mut grouped = TransferScheduler::new(&transfers, tiles);
+        let problem = SchedulingProblem::new(&transfers, tiles);
+        let mut grouped = TransferScheduler::new(&problem);
         assert!(!grouped.ready_groups.is_empty() && grouped.ready_groups.len() <= 112);
-        let mut reference = TransferScheduler::new(&transfers, tiles);
+        let mut reference = TransferScheduler::new(&problem);
         reference.ready = std::mem::take(&mut reference.ready_groups)
             .into_iter()
             .flatten()
@@ -230,8 +231,11 @@ fn randomized_matching_wave_orders_preserve_memory_dependencies() {
         };
         let pending = pending_from_problem(tile_count, &problem).unwrap();
         let incumbent = (0..pending.len()).collect::<Vec<_>>();
-        let order = point_to_point_matching_wave_order(&pending, tile_count, &incumbent)
-            .expect("balanced point-to-point phases have a matching-wave candidate");
+        let order = point_to_point_matching_wave_order(
+            &SchedulingProblem::new(&pending, tile_count),
+            &incumbent,
+        )
+        .expect("balanced point-to-point phases have a matching-wave candidate");
         let mut positions = vec![usize::MAX; pending.len()];
         for (position, &index) in order.iter().enumerate() {
             assert_eq!(positions[index], usize::MAX);
@@ -407,9 +411,15 @@ fn borrowed_transmit_lane_allows_receive_but_excludes_local_send() {
         let pending = pending_from_problem(64, &problem).unwrap();
         let (counts, bases) = receive_configuration(&pending, 64).unwrap();
         for order in [[0, 1, 2], [1, 0, 2]] {
-            let schedule =
-                materialize_schedule_order(&topology, &pending, &bases, &counts, 64, &order, false)
-                    .unwrap();
+            let schedule = materialize_schedule_order(
+                &topology,
+                &SchedulingProblem::new(&pending, 64),
+                &bases,
+                &counts,
+                &order,
+                false,
+            )
+            .unwrap();
             let activities = &schedule.activities[usize::from(partner)];
             let activity = |kind| activities.iter().find(|a| a.kind == kind).unwrap();
             let borrowed = activity(ExchangeActivityKind::PartnerBusy);
@@ -544,7 +554,8 @@ fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
             })
             .collect::<Vec<_>>();
         let dependencies = memory_dependencies(&transfers, tile_count);
-        let mut scheduler = TransferScheduler::new(&transfers, tile_count);
+        let problem = SchedulingProblem::new(&transfers, tile_count);
+        let mut scheduler = TransferScheduler::new(&problem);
         let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
         let mut occurrences = vec![0u8; transfers.len()];
         let mut intervals = vec![(0u32, 0u32); transfers.len()];
@@ -622,7 +633,10 @@ fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
                 predecessor,
             });
         }
-        let repaired = critical_neighborhood_order(&transfers, tile_count, &incumbent);
+        let repaired = critical_neighborhood_order(
+            &SchedulingProblem::new(&transfers, tile_count),
+            &incumbent,
+        );
         let mut repaired_positions = vec![usize::MAX; transfers.len()];
         for (position, &index) in repaired.iter().enumerate() {
             assert_eq!(repaired_positions[index], usize::MAX);

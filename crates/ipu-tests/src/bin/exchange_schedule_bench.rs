@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use ipu_codegen::{
-    ExchangeScheduleSnapshot, schedule_exchange_problem, validate_exchange_schedule,
+    ExchangeScheduleCache, ExchangeScheduleSnapshot, schedule_exchange_problem,
+    validate_exchange_schedule,
 };
 use ipu_exchange::diagnostic::diagnose_plan_program;
 use std::collections::BTreeSet;
@@ -33,6 +34,15 @@ struct Arguments {
     /// memory-element hazard checking.
     #[arg(long)]
     first_iteration_only: bool,
+    /// Include the production comparison of ordinary and paired transfers.
+    #[arg(long)]
+    select_widths: bool,
+    /// Populate the production recipe cache before timing, then measure replay.
+    #[arg(long, requires = "select_widths")]
+    replay_cache: bool,
+    /// Relocate every source/destination by this many bytes after cache warmup.
+    #[arg(long, default_value_t = 0, requires = "replay_cache")]
+    relocate_by: u32,
     /// Decode the generated exchange program for this logical tile.
     #[arg(long)]
     dump_tile: Option<usize>,
@@ -84,20 +94,57 @@ fn main() -> Result<()> {
     );
 
     let total_start = Instant::now();
-    for problem in problems {
+    for captured in problems {
+        let mut cache = ExchangeScheduleCache::default();
+        if arguments.replay_cache {
+            let (selected, run) = cache.schedule_problem(snapshot.tile_count, captured)?;
+            validate_exchange_schedule(snapshot.tile_count, &selected, &run.phase)?;
+        }
+        let mut relocated;
+        let captured = if arguments.relocate_by != 0 {
+            relocated = captured.clone();
+            for transfer in &mut relocated.transfers {
+                for address in transfer.source_addresses.iter_mut().chain(
+                    transfer
+                        .destinations
+                        .iter_mut()
+                        .map(|destination| &mut destination.address),
+                ) {
+                    *address = address
+                        .checked_add(arguments.relocate_by)
+                        .context("relocated address overflow")?;
+                }
+            }
+            &relocated
+        } else {
+            captured
+        };
+        let mut schedule = || {
+            if arguments.select_widths {
+                if !arguments.replay_cache {
+                    cache = ExchangeScheduleCache::default();
+                }
+                cache
+                    .schedule_problem(snapshot.tile_count, captured)
+                    .map(|(problem, run)| (std::borrow::Cow::Owned(problem), run))
+            } else {
+                schedule_exchange_problem(snapshot.tile_count, captured)
+                    .map(|run| (std::borrow::Cow::Borrowed(captured), run))
+            }
+        };
         for _ in 0..arguments.warmup {
-            let run = black_box(schedule_exchange_problem(snapshot.tile_count, problem)?);
-            validate_exchange_schedule(snapshot.tile_count, problem, &run.phase)?;
+            let (problem, run) = black_box(schedule()?);
+            validate_exchange_schedule(snapshot.tile_count, &problem, &run.phase)?;
         }
         let mut baseline = None;
         let mut durations = Vec::with_capacity(arguments.iterations);
         let mut validation_durations = Vec::with_capacity(arguments.iterations);
         for _ in 0..arguments.iterations {
             let start = Instant::now();
-            let run = black_box(schedule_exchange_problem(snapshot.tile_count, problem)?);
+            let (problem, run) = black_box(schedule()?);
             durations.push(start.elapsed());
             let validation_start = Instant::now();
-            validate_exchange_schedule(snapshot.tile_count, problem, &run.phase)?;
+            validate_exchange_schedule(snapshot.tile_count, &problem, &run.phase)?;
             validation_durations.push(validation_start.elapsed());
             if let Some(expected) = &baseline {
                 if &run.phase != expected {
@@ -154,7 +201,7 @@ fn main() -> Result<()> {
                 durations.sort_unstable();
                 validation_durations.sort_unstable();
                 println!(
-                    "phase={} transfers={} destinations={} initialHorizonCycles={} horizonCycles={} endpointLowerBoundCycles={} lowerBoundGapCycles={} neighborhoodImprovements={} rowWords={} maximumRowWords={} scheduleCodegenMinMs={:.3} scheduleCodegenMedianMs={:.3} scheduleCodegenP95Ms={:.3} scheduleCodegenMaxMs={:.3} validationMedianMs={:.3} invariants=PASS",
+                    "phase={} transfers={} destinations={} initialHorizonCycles={} horizonCycles={} endpointLowerBoundCycles={} lowerBoundGapCycles={} neighborhoodImprovements={} rowWords={} maximumRowWords={} scheduleCodegenMinMs={:.3} scheduleCodegenMedianMs={:.3} scheduleCodegenP95Ms={:.3} scheduleCodegenMaxMs={:.3} validationMedianMs={:.3} reused={} rowFingerprint={:016x} invariants=PASS",
                     problem.phase,
                     problem.transfers.len(),
                     destination_count,
@@ -172,6 +219,13 @@ fn main() -> Result<()> {
                     milliseconds(percentile(&durations, 95)),
                     milliseconds(*durations.last().expect("iterations is nonzero")),
                     milliseconds(percentile(&validation_durations, 50)),
+                    run.reused,
+                    {
+                        use std::hash::{Hash, Hasher};
+                        let mut hash = std::hash::DefaultHasher::new();
+                        run.phase.programs.hash(&mut hash);
+                        hash.finish()
+                    },
                 );
             }
         }
