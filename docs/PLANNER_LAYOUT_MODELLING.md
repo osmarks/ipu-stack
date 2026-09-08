@@ -197,3 +197,10 @@ This is a bounded search policy, not proof that every excluded layout is
 unplaceable. The exact fragment limit still rejects before placement/scheduling;
 compact encoded byte acceptance remains after scheduling. No new full B1/B2
 ViT build has been run for this change, so current B2 feasibility is still unknown.
+
+
+The subsequent [exchange footprint model](EXCHANGE_FOOTPRINT_2026_09_08.md)
+replaces the expanded fragment-slot byte price with endpoint/control estimates.
+Admission now prioritizes predicted-fit candidates and retains minimum estimated
+storage, rather than minimum fragments. This is a soft admission preference;
+encoded byte acceptance and the explicit fragment effort limit remain hard checks.

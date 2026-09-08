@@ -23,6 +23,9 @@ struct Arguments {
     /// Restrict the benchmark to these physical exchange phase IDs.
     #[arg(long = "phase")]
     phases: Vec<u32>,
+    /// Report storage estimates without running the scheduler.
+    #[arg(long)]
+    footprint_only: bool,
     /// Untimed scheduler/codegen runs before measurement.
     #[arg(long, default_value_t = 0)]
     warmup: usize,
@@ -97,7 +100,23 @@ fn main() -> Result<()> {
     );
 
     let total_start = Instant::now();
+    let mut estimated_totals = vec![0u64; usize::from(snapshot.tile_count)];
     for captured in problems {
+        let start = Instant::now();
+        let estimate = ipu_codegen::estimate_exchange_phase_storage(snapshot.tile_count, captured);
+        let estimate_time = start.elapsed();
+        for (total, bytes) in estimated_totals.iter_mut().zip(&estimate) {
+            *total += bytes;
+        }
+        println!(
+            "phase={} estimatedMaximumRowBytes={} footprintMs={:.3}",
+            captured.phase,
+            estimate.iter().max().unwrap_or(&0),
+            milliseconds(estimate_time)
+        );
+        if arguments.footprint_only {
+            continue;
+        }
         let mut cache = ExchangeScheduleCache::default();
         if arguments.replay_cache {
             let (selected, run) = cache.schedule_problem(snapshot.tile_count, captured)?;
@@ -233,6 +252,10 @@ fn main() -> Result<()> {
             }
         }
     }
+    println!(
+        "estimatedMaximumTableBytes={}",
+        estimated_totals.iter().max().unwrap_or(&0)
+    );
     println!("totalMs={:.3}", milliseconds(total_start.elapsed()));
     Ok(())
 }

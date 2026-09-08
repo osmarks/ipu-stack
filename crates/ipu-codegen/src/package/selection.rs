@@ -4,7 +4,7 @@ use super::*;
 struct ModelledPlan {
     index: usize,
     score: u64,
-    fragments: u64,
+    row_bytes: u64,
     low: LowProgram,
     placement: crate::Placement,
     challenger: Option<Vec<u16>>,
@@ -73,6 +73,7 @@ pub(super) fn select_scheduled_finalist<T>(
                 tracing::info!(
                     finalist = index,
                     modelled_cycles = cycles,
+                    estimated_row_bytes = footprint.estimated_row_bytes(),
                     estimated_cycles = low.estimated_cycles,
                     estimated_exchange_cycles = low.estimated_exchange_cycles,
                     "modelled expanded operator plan"
@@ -87,7 +88,7 @@ pub(super) fn select_scheduled_finalist<T>(
                             .estimated_row_bytes()
                             .saturating_mul(planning.exchange_table_cost_per_byte),
                     ),
-                    fragments: footprint.maximum_transfer_chunks_per_tile,
+                    row_bytes: footprint.estimated_row_bytes(),
                     low,
                     placement,
                     challenger,
@@ -219,7 +220,14 @@ fn admit_scheduling_candidates(
     mut modelled: Vec<ModelledPlan>,
     planning: &PipelineConfig,
 ) -> Vec<ModelledPlan> {
-    modelled.sort_by_key(|plan| (plan.score, plan.index));
+    modelled.sort_by_key(|plan| {
+        (
+            plan.row_bytes
+                .saturating_sub(planning.exchange_table_budget_bytes),
+            plan.score,
+            plan.index,
+        )
+    });
     let limit = planning.exchange_schedule_finalists.max(1);
     // Keep one genuinely smaller alternative outside the performance shortlist.
     // All other candidates are rejected before physical scheduling, including
@@ -227,7 +235,7 @@ fn admit_scheduling_candidates(
     let compact = modelled
         .iter()
         .enumerate()
-        .min_by_key(|(_, plan)| (plan.fragments, plan.score, plan.index))
+        .min_by_key(|(_, plan)| (plan.row_bytes, plan.score, plan.index))
         .map(|(position, _)| position);
     let expanded_candidates = modelled.len();
     let mut position = 0;
@@ -343,23 +351,27 @@ mod tests {
             .unwrap()
             .remove(0);
         let (low, placement, _) = expand_and_place(&mid, &config, None).unwrap();
-        let candidates = [(100, 10_000), (101, 10_000), (200, 1_000)]
-            .into_iter()
-            .enumerate()
-            .map(|(index, (score, fragments))| ModelledPlan {
-                index,
-                score,
-                fragments,
-                low: low.clone(),
-                placement: placement.clone(),
-                challenger: None,
-            })
-            .collect();
-        let admitted = admit_scheduling_candidates(candidates, &config);
-        assert_eq!(
-            admitted.iter().map(|plan| plan.index).collect::<Vec<_>>(),
-            [0, 2]
-        );
+        for (budget, expected) in [(u64::MAX, vec![0, 2]), (2_000, vec![2]), (500, vec![2])] {
+            let mut config = config.clone();
+            config.exchange_table_budget_bytes = budget;
+            let candidates = [(100, 10_000), (101, 10_000), (200, 1_000)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (score, row_bytes))| ModelledPlan {
+                    index,
+                    score,
+                    row_bytes,
+                    low: low.clone(),
+                    placement: placement.clone(),
+                    challenger: None,
+                })
+                .collect();
+            let admitted = admit_scheduling_candidates(candidates, &config);
+            assert_eq!(
+                admitted.iter().map(|plan| plan.index).collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     #[test]

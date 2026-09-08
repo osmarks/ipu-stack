@@ -66,10 +66,15 @@ pub struct RearrangementCost {
 pub struct ExchangeFootprint {
     pub phases: u64,
     pub maximum_transfer_chunks_per_tile: u64,
+    /// Detailed endpoint estimate, when concrete span geometry is available.
+    pub encoded_row_bytes: Option<u64>,
 }
 
 impl ExchangeFootprint {
     pub const fn estimated_row_bytes(self) -> u64 {
+        if let Some(bytes) = self.encoded_row_bytes {
+            return bytes;
+        }
         // Charge row slots for the supplied fragment count. Mid costing
         // supplies a heuristic count; only the geometry screen supplies
         // concrete span chunks. Compact encoding may use fewer bytes.

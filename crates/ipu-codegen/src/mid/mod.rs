@@ -182,7 +182,7 @@ pub struct PipelineConfig {
     /// operation in a straight-line region.
     pub planning_beam_width: usize,
     /// Number of complete finalists admitted to physical exchange scheduling.
-    /// Failed attempts count too; one additional minimum-fragment candidate
+    /// Failed attempts count too; one additional minimum-estimated-storage candidate
     /// is retained if the admitted shortlist omits it.
     pub exchange_schedule_finalists: usize,
     /// Hard limit on actual compact encoded exchange tables per tile.

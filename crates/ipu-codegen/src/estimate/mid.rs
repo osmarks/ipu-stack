@@ -357,6 +357,7 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     let rows = ExchangeFootprint {
         phases,
         maximum_transfer_chunks_per_tile: fragments,
+        encoded_row_bytes: None,
     }
     .estimated_row_bytes();
     (cycles, rows)

@@ -182,13 +182,14 @@ pub(super) fn phase_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
-    geometry_traffic(program, phase, true)
+    geometry_traffic(program, phase, true, None)
 }
 
 fn geometry_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
     shared_tx_lane: bool,
+    mut storage: Option<&mut ExchangeStoragePhase>,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
     let mut traffic = ExchangeEndpointTraffic::default();
     for transfer in &phase.transfers {
@@ -200,13 +201,28 @@ fn geometry_traffic(
         let source_spans = spans(source, &transfer.source)?;
         let bytes = source_spans.iter().map(|span| u64::from(span.bytes)).sum();
         let mut outgoing_fragments = 0;
+        let mut outgoing_long_fragments = 0;
         for destination in &transfer.destinations {
             let target = &program.shards[destination.shard.index() as usize];
             let mut fragments = 0u64;
+            let mut long_fragments = 0u64;
             crate::for_each_copy_span(
                 &source_spans,
                 &spans(target, destination)?,
-                |_, _, bytes| {
+                |_, offset, bytes| {
+                    if let Some(storage) = storage.as_deref_mut() {
+                        let max_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+                        let mut remaining = u64::from(bytes);
+                        let mut address =
+                            (u64::from(destination.shard.index()) << 32) + u64::from(offset);
+                        while remaining != 0 {
+                            let chunk = remaining.min(max_bytes);
+                            long_fragments += u64::from(chunk > 256);
+                            storage.receive(target.tile, address, chunk);
+                            address += chunk;
+                            remaining -= chunk;
+                        }
+                    }
                     fragments = fragments.saturating_add(
                         u64::from(bytes).div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
                     );
@@ -214,7 +230,11 @@ fn geometry_traffic(
                 },
             )?;
             outgoing_fragments = outgoing_fragments.max(fragments);
+            outgoing_long_fragments = outgoing_long_fragments.max(long_fragments);
             traffic.add_incoming(target.tile, bytes, fragments);
+        }
+        if let Some(storage) = storage.as_deref_mut() {
+            storage.send(source.tile, outgoing_fragments, outgoing_long_fragments);
         }
         // A multicast source is sent once, rather than once per receiver.
         traffic.add_outgoing(
@@ -265,8 +285,13 @@ pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<Exchange
     // Sum each tile across static phases before taking the maximum; Repeat
     // execution counts do not multiply its stored table.
     let mut chunks = vec![0u64; usize::from(program.tile_count)];
+    let mut row_bytes = vec![0u64; usize::from(program.tile_count)];
     for phase in &program.exchange_phases {
-        let traffic = geometry_traffic(program, phase, false)?;
+        let mut storage = ExchangeStoragePhase::new(program.tile_count);
+        let traffic = geometry_traffic(program, phase, false, Some(&mut storage))?;
+        for (total, phase_bytes) in row_bytes.iter_mut().zip(storage.finish()) {
+            *total = total.saturating_add(phase_bytes);
+        }
         for (tile, load) in traffic
             .outgoing_lanes
             .iter()
@@ -280,6 +305,7 @@ pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<Exchange
     Ok(ExchangeFootprint {
         phases: program.exchange_phases.len() as u64,
         maximum_transfer_chunks_per_tile: chunks.into_iter().max().unwrap_or(0),
+        encoded_row_bytes: Some(row_bytes.into_iter().max().unwrap_or(0)),
     })
 }
 
@@ -371,7 +397,7 @@ mod tests {
         // A contiguous 8 KiB span needs one transfer, not the 32 fragments
         // assumed by the mid cycle heuristic's 256-byte payload.
         assert_eq!(footprint.maximum_transfer_chunks_per_tile, 1);
-        assert_eq!(footprint.estimated_row_bytes(), 40);
+        assert_eq!(footprint.estimated_row_bytes(), 24);
         let mut distributed = program.clone();
         distributed.tile_count = 4;
         for tile in 2..4 {
@@ -387,7 +413,7 @@ mod tests {
         distributed.exchange_phases.push(other);
         let distributed_rows = program_footprint(&distributed).unwrap();
         assert_eq!(distributed_rows.maximum_transfer_chunks_per_tile, 1);
-        assert_eq!(distributed_rows.estimated_row_bytes(), 44);
+        assert_eq!(distributed_rows.estimated_row_bytes(), 32);
         let BlockOperation::Repeat(repeat) = &mut program.body.operations[0] else {
             unreachable!()
         };
