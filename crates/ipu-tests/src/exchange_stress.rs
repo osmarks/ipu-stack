@@ -251,11 +251,12 @@ pub(crate) fn build_wide(
         }
         let mut builder = PhaseProgramBuilder::new(execution_tiles);
         let paired_source = topology.paired_logical(source)?;
+        let prepared = plan.prepare()?;
         let schedule_offset = builder.earliest_transfer_offset(
             source,
             &[paired_source],
             &destinations,
-            &plan,
+            &prepared,
             items,
             0,
         )?;
@@ -263,7 +264,7 @@ pub(crate) fn build_wide(
             source,
             &[paired_source],
             &destinations,
-            &plan,
+            &prepared,
             schedule_offset,
             items,
         )?;
@@ -660,17 +661,18 @@ pub(crate) fn build(
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
                 patch_receiver_address(row, address)?;
             }
+            let prepared = plan.prepare()?;
             let requested_schedule_offset = schedule_offset.unwrap_or(0);
             let schedule_offset = builder.earliest_transfer_offset(
                 source,
                 &[],
                 &destinations,
-                &plan,
+                &prepared,
                 words,
                 requested_schedule_offset,
             )?;
             let timing = builder
-                .append_transfer_at(source, &[], &destinations, &plan, schedule_offset, words)
+                .append_transfer_at(source, &[], &destinations, &prepared, schedule_offset, words)
                 .with_context(|| {
                     format!(
                         "case {case} cannot encode transfer {source} -> {destinations:?} at schedule offset {schedule_offset}"
@@ -1659,9 +1661,15 @@ fn overlap_specs(
     let incoming = point_plan(topology, incoming_source, pivot, words)?;
     let outgoing = point_plan(topology, pivot, outgoing_destination, words)?;
     let empty = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
-    let incoming_base = empty.transfer_timing_at(incoming_source, &[pivot], &incoming, 0, words)?;
-    let outgoing_base =
-        empty.transfer_timing_at(pivot, &[outgoing_destination], &outgoing, 0, words)?;
+    let incoming_base =
+        empty.transfer_timing_at(incoming_source, &[pivot], &incoming.prepare()?, 0, words)?;
+    let outgoing_base = empty.transfer_timing_at(
+        pivot,
+        &[outgoing_destination],
+        &outgoing.prepare()?,
+        0,
+        words,
+    )?;
     let incoming_start = incoming_base.receiver_payload_starts[0];
     let outgoing_start = outgoing_base.payload_start;
     let anchor = incoming_start.max(outgoing_start);

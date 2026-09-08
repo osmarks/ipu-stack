@@ -1,6 +1,8 @@
 //! Physical exchange programs generated from logical shard transfers.
 
 mod diagnostic;
+mod hazards;
+use hazards::MemoryHistory;
 mod order;
 use diagnostic::PhaseDiagnostics;
 pub use diagnostic::diagnose_exchange_tile;
@@ -1548,7 +1550,7 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
 struct ReadyTransfer {
     earliest_start: Reverse<u32>,
     endpoint_pressure: u64,
-    fanout: usize,
+    fanout: u16,
     words: u32,
     source: Reverse<u16>,
     index: Reverse<usize>,
@@ -1676,7 +1678,7 @@ impl<'a> TransferScheduler<'a> {
         self.ready.push(ReadyTransfer {
             earliest_start: Reverse(earliest_start),
             endpoint_pressure,
-            fanout: transfer.destinations.len(),
+            fanout: u16::try_from(transfer.destinations.len()).expect("receivers fit tile count"),
             words: transfer.item_count().unwrap_or(transfer.words),
             source: Reverse(transfer.source),
             index: Reverse(index),
@@ -1725,7 +1727,6 @@ impl<'a> TransferScheduler<'a> {
             let candidate = *self.ready.peek()?;
             let current = self.refresh(candidate, tile_availability);
             if candidate == current {
-                self.ready.pop();
                 let index = candidate.index.0;
                 // Readiness ranks the queue; payload dependencies alone gate
                 // the row builder, which pipelines source selection/delivery.
@@ -1740,8 +1741,12 @@ impl<'a> TransferScheduler<'a> {
                     debug_assert_eq!(head.index.0, index);
                     if let Some(mut next) = queue.peek().copied() {
                         next.earliest_start = current.earliest_start;
-                        self.ready.push(next);
+                        *self.ready.peek_mut().expect("ready head") = next;
+                    } else {
+                        self.ready.pop();
                     }
+                } else {
+                    self.ready.pop();
                 }
                 return Some((index, self.dependency_ready[index]));
             }
@@ -1894,17 +1899,10 @@ struct MaterializedTiming {
     predecessor: Option<usize>,
 }
 
-#[derive(Clone, Debug)]
-struct MemoryAccess {
-    start: u32,
-    end: u32,
-    elements: Vec<ExchangeMemoryElement>,
-}
-
 #[derive(Clone, Debug, Default)]
 struct TileMemorySchedule {
-    sends: Vec<MemoryAccess>,
-    receives: Vec<MemoryAccess>,
+    sends: MemoryHistory,
+    receives: MemoryHistory,
 }
 
 struct MaterializedSchedule {
@@ -2014,24 +2012,22 @@ impl MaterializedSchedule {
         let payload_end = timing.sender_end;
         self.memory_accesses[usize::from(transfer.source)]
             .sends
-            .push(MemoryAccess {
-                start: timing.start,
-                end: timing.sender_memory_end,
-                elements: transfer.source_elements.clone(),
-            });
+            .record(
+                &transfer.source_elements,
+                timing.start,
+                timing.sender_memory_end,
+            );
         for ((&(tile, address), &start), &memory_end) in transfer
             .destinations
             .iter()
             .zip(&timing.receiver_starts)
             .zip(&timing.receiver_memory_ends)
         {
-            self.memory_accesses[usize::from(tile)]
-                .receives
-                .push(MemoryAccess {
-                    start,
-                    end: memory_end,
-                    elements: effective_memory_elements(address, transfer.words),
-                });
+            self.memory_accesses[usize::from(tile)].receives.record(
+                &effective_memory_elements(address, transfer.words),
+                start,
+                memory_end,
+            );
         }
         self.scheduled_sends[usize::from(transfer.source)]
             .push((transfer.source_shard, transfer.source_offset));
@@ -2320,6 +2316,7 @@ fn append_transfer(
             patch_receiver_address(row, *address)?;
         }
     }
+    let plan = plan.prepare()?;
     let mut schedule_offset = requested_offset;
     loop {
         let previous = schedule_offset;
@@ -2402,32 +2399,19 @@ fn memory_safe_transfer_offset(
     schedule_offset: u32,
 ) -> Result<u32, ExchangeLoweringError> {
     let mut safe_offset = schedule_offset;
-    let source_clash = memory_accesses[usize::from(source)]
-        .receives
-        .iter()
-        .filter(|access| payload_start < access.end && access.start < payload_end)
-        .filter(|access| {
-            access
-                .elements
-                .iter()
-                .any(|element| source_elements.binary_search(element).is_ok())
-        })
-        .map(|access| access.end)
-        .max();
+    let source_clash = memory_accesses[usize::from(source)].receives.conflict_end(
+        source_elements,
+        payload_start,
+        payload_end,
+    );
     let receiver_clash = destinations
         .iter()
         .zip(receiver_intervals)
-        .flat_map(|(&(tile, address), &(receive_start, receive_end))| {
+        .filter_map(|(&(tile, address), &(start, end))| {
             memory_accesses[usize::from(tile)]
                 .sends
-                .iter()
-                .filter(move |access| receive_start < access.end && access.start < receive_end)
-                .filter(move |access| {
-                    effective_memory_elements(address, words)
-                        .iter()
-                        .any(|element| access.elements.contains(element))
-                })
-                .map(move |access| access.end.saturating_sub(receive_start))
+                .conflict_end(&effective_memory_elements(address, words), start, end)
+                .map(|conflict| conflict.saturating_sub(start))
         })
         .max();
     let source_delay = source_clash.map(|end| end.saturating_sub(payload_start));

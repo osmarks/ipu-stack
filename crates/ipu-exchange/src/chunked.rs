@@ -1,4 +1,5 @@
 //! Shared chunks for speculative timelines and encoded prefixes.
+use std::borrow::Cow;
 use std::ops::{Index, Range};
 use std::sync::Arc;
 
@@ -35,8 +36,16 @@ impl<T: Clone> Chunked<T> {
         assert!(range.start <= range.end && range.end <= self.len);
         range.map(|index| &self[index])
     }
-    pub(super) fn slice(&self, range: Range<usize>) -> Vec<T> {
-        self.range(range).cloned().collect()
+    pub(super) fn slice(&self, range: Range<usize>) -> Cow<'_, [T]> {
+        assert!(range.start <= range.end && range.end <= self.len);
+        if range.is_empty() {
+            Cow::Borrowed(&[])
+        } else if range.start / CHUNK_ITEMS == (range.end - 1) / CHUNK_ITEMS {
+            let start = range.start % CHUNK_ITEMS;
+            Cow::Borrowed(&self.chunks[range.start / CHUNK_ITEMS][start..start + range.len()])
+        } else {
+            Cow::Owned(self.range(range).cloned().collect())
+        }
     }
     pub(super) fn partition_point(&self, mut predicate: impl FnMut(&T) -> bool) -> usize {
         let mut start = 0;
@@ -171,6 +180,12 @@ mod tests {
             values.extend(0..len);
             for split in 0..=len {
                 assert_eq!(values.partition_point(|value| *value < split), split);
+                for end in split..=len {
+                    assert_eq!(
+                        &*values.slice(split..end),
+                        &(split..end).collect::<Vec<_>>()
+                    );
+                }
             }
         }
     }

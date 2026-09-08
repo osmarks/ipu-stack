@@ -12,6 +12,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
     for row in &mut plan.receivers {
         patch_receiver_address(row, DATA_BASE)?;
     }
+    let plan = plan.prepare()?;
     let mut builder = PhaseProgramBuilder::new(tiles);
     let offset = builder.earliest_transfer_offset(0, &[], &[1, 2], &plan, words, 0)?;
     builder.append_transfer_at(0, &[], &[1, 2], &plan, offset, words)?;

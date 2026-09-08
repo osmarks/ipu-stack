@@ -12,7 +12,7 @@ fn compare_ready_heaps() {
             .map(|index| ReadyTransfer {
                 earliest_start: Reverse(0),
                 endpoint_pressure: rng.u64(1..100_000),
-                fanout: rng.usize(1..8),
+                fanout: rng.u16(1..8),
                 words: rng.u32(1..512),
                 source: Reverse(rng.u16(0..1472)),
                 index: Reverse(index),

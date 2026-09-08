@@ -274,6 +274,28 @@ struct ScheduledSenderRow {
     end_cycles: u32,
 }
 
+/// A primitive transfer decoded once for offset search, hazard checks and insertion.
+/// Borrowing the rows prevents address patches from invalidating the timing.
+pub struct PreparedTransfer<'a> {
+    rows: &'a MulticastPlan,
+    sender: SenderRowTiming,
+    receivers: Vec<ReceiveRowTiming>,
+}
+
+impl MulticastPlan {
+    pub fn prepare(&self) -> Result<PreparedTransfer<'_>, ExchangeError> {
+        Ok(PreparedTransfer {
+            rows: self,
+            sender: sender_row_timing(&self.sender, 0)?,
+            receivers: self
+                .receivers
+                .iter()
+                .map(|row| receive_row_timing(row, 0))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PhaseProgramBuilder {
     tile_states: Vec<TileProgramSchedule>,
@@ -377,7 +399,7 @@ impl PhaseProgramBuilder {
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         words: u32,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
@@ -401,7 +423,7 @@ impl PhaseProgramBuilder {
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         words: u32,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
@@ -422,7 +444,7 @@ impl PhaseProgramBuilder {
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         words: u32,
         requested: u32,
         validate_encoding: bool,
@@ -480,15 +502,13 @@ impl PhaseProgramBuilder {
         &mut self,
         source: u16,
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         schedule_offset: u32,
         words: u32,
     ) -> Result<(), ExchangeError> {
-        if self
-            .staged
-            .as_ref()
-            .is_some_and(|trial| trial.matches(source, receivers, plan, schedule_offset, words))
-        {
+        if self.staged.as_ref().is_some_and(|trial| {
+            trial.matches(source, receivers, plan.rows, schedule_offset, words)
+        }) {
             return Ok(());
         }
         if let Some(budget) = &self.validation_budget {
@@ -516,7 +536,7 @@ impl PhaseProgramBuilder {
         self.staged = Some(StagedTransfer {
             source,
             receivers: receivers.to_vec(),
-            plan: plan.clone(),
+            plan: plan.rows.clone(),
             offset: schedule_offset,
             words,
             updates,
@@ -528,7 +548,7 @@ impl PhaseProgramBuilder {
         &self,
         source: u16,
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         offset: u32,
         words: u32,
         validate: bool,
@@ -546,7 +566,7 @@ impl PhaseProgramBuilder {
             let _ = source_state.encoded();
         }
         let mut source_schedule = source_state.clone();
-        source_schedule.append_sender_at(&plan.sender, offset)?;
+        source_schedule.append_sender_at(&plan.rows.sender, &plan.sender, offset)?;
         if validate {
             source_schedule.encoded()?;
         }
@@ -587,14 +607,16 @@ impl PhaseProgramBuilder {
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         schedule_offset: u32,
         words: u32,
     ) -> Result<PhaseTransferTiming, ExchangeError> {
         let transfer_timing =
             self.transfer_timing_at(source, receivers, plan, schedule_offset, words)?;
         let mut updates = match self.staged.take() {
-            Some(staged) if staged.matches(source, receivers, plan, schedule_offset, words) => {
+            Some(staged)
+                if staged.matches(source, receivers, plan.rows, schedule_offset, words) =>
+            {
                 staged.updates
             }
             _ => {
@@ -632,7 +654,7 @@ impl PhaseProgramBuilder {
         &self,
         source: u16,
         receivers: &[u16],
-        plan: &MulticastPlan,
+        plan: &PreparedTransfer<'_>,
         schedule_offset: u32,
         words: u32,
     ) -> Result<PhaseTransferTiming, ExchangeError> {
@@ -642,7 +664,7 @@ impl PhaseProgramBuilder {
         self.tile_states
             .get(usize::from(source))
             .ok_or(ExchangeError::Tile(source))?;
-        let sender = scheduled_sender_timing(&plan.sender, schedule_offset)?;
+        let sender = plan.sender.at(schedule_offset)?;
         let receiver_timings = receivers
             .iter()
             .zip(&plan.receivers)
@@ -651,9 +673,8 @@ impl PhaseProgramBuilder {
                     .tile_states
                     .get(usize::from(receiver))
                     .ok_or(ExchangeError::Tile(receiver))?;
-                let base = receive_row_timing(row, 0)?;
                 scheduled_receive_window(
-                    &base,
+                    row,
                     schedule_offset,
                     words,
                     schedule.receive_stream.as_ref(),
@@ -663,13 +684,13 @@ impl PhaseProgramBuilder {
         let horizon = receiver_timings
             .iter()
             .map(|timing| timing.horizon)
-            .chain(std::iter::once(sender.horizon))
+            .chain(std::iter::once(sender.horizon_cycles))
             .max()
             .unwrap_or(schedule_offset);
         Ok(PhaseTransferTiming {
-            payload_start: sender.payload_start,
-            payload_end: sender.payload_end,
-            sender_horizon: sender.horizon,
+            payload_start: sender.start_cycles,
+            payload_end: sender.end_cycles,
+            sender_horizon: sender.horizon_cycles,
             receiver_payload_starts: receiver_timings
                 .iter()
                 .map(|timing| timing.payload_start)
@@ -750,8 +771,11 @@ impl TileProgramSchedule {
     /// not overlap another outgoing message on this tile. Receive controls may
     /// be represented by the ISA's composite send/control encodings; this is a
     /// single supervisor instruction, not dual issue from independent lanes.
-    fn earliest_sender_offset(&self, row: &PlanRow, requested: u32) -> Result<u32, ExchangeError> {
-        let base = sender_row_timing(row, 0)?;
+    fn earliest_sender_offset(
+        &self,
+        base: &SenderRowTiming,
+        requested: u32,
+    ) -> Result<u32, ExchangeError> {
         let mut offset = requested.max(self.reserved_sender_end.saturating_sub(base.start_cycles));
         loop {
             let start = base
@@ -793,11 +817,10 @@ impl TileProgramSchedule {
     /// source-selection and local receive-address streams.
     fn earliest_receiver_offset(
         &self,
-        row: &PlanRow,
+        base: &ReceiveRowTiming,
         received_words: u32,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
-        let base = receive_row_timing(row, 0)?;
         let mut offset = requested;
         if let Some(stream) = &self.receive_stream {
             let source_cycles = base
@@ -820,7 +843,7 @@ impl TileProgramSchedule {
         }
         loop {
             let timing = scheduled_receive_window(
-                &base,
+                base,
                 offset,
                 received_words,
                 self.receive_stream.as_ref(),
@@ -855,9 +878,10 @@ impl TileProgramSchedule {
     fn append_sender_at(
         &mut self,
         row: &PlanRow,
+        base: &SenderRowTiming,
         schedule_offset: u32,
     ) -> Result<(), ExchangeError> {
-        let timing = sender_row_timing(row, schedule_offset)?;
+        let timing = base.at(schedule_offset)?;
         let index = self
             .senders
             .partition_point(|sender| sender.start_cycles < timing.start_cycles);
@@ -894,13 +918,12 @@ impl TileProgramSchedule {
     /// mux selection with a direct source cutover.
     fn append_receiver_at(
         &mut self,
-        row: &PlanRow,
+        base: &ReceiveRowTiming,
         schedule_offset: u32,
         received_words: u32,
     ) -> Result<ScheduledReceiverWindow, ExchangeError> {
-        let base = receive_row_timing(row, 0)?;
         let timing = scheduled_receive_window(
-            &base,
+            base,
             schedule_offset,
             received_words,
             self.receive_stream.as_ref(),
@@ -1407,6 +1430,20 @@ struct SenderRowTiming {
     start_cycles: u32,
     end_cycles: u32,
     horizon_cycles: u32,
+}
+
+impl SenderRowTiming {
+    fn at(&self, offset: u32) -> Result<Self, ExchangeError> {
+        let horizon_cycles = self
+            .horizon_cycles
+            .checked_add(offset)
+            .ok_or(ExchangeError::Schedule("sender event horizon overflow"))?;
+        Ok(Self {
+            start_cycles: self.start_cycles + offset,
+            end_cycles: self.end_cycles + offset,
+            horizon_cycles,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3446,10 +3483,24 @@ mod tests {
             let mut builder = PhaseProgramBuilder::new(1472);
             let source_pair = topology.paired_logical(source).unwrap();
             let offset = builder
-                .earliest_transfer_offset(source, &[source_pair], &receivers, &plan, 64, 0)
+                .earliest_transfer_offset(
+                    source,
+                    &[source_pair],
+                    &receivers,
+                    &plan.prepare().unwrap(),
+                    64,
+                    0,
+                )
                 .unwrap();
             builder
-                .append_transfer_at(source, &[source_pair], &receivers, &plan, offset, 64)
+                .append_transfer_at(
+                    source,
+                    &[source_pair],
+                    &receivers,
+                    &plan.prepare().unwrap(),
+                    offset,
+                    64,
+                )
                 .unwrap();
             let programs = builder.finish().unwrap();
             assert!(programs.programs[usize::from(source)].is_some());
@@ -3684,16 +3735,26 @@ mod tests {
             }
             let mut builder = PhaseProgramBuilder::new(1472);
             let offset = builder
-                .earliest_transfer_offset(0, &[], &receivers, &plan, words, 0)
+                .earliest_transfer_offset(0, &[], &receivers, &plan.prepare().unwrap(), words, 0)
                 .unwrap();
             builder
-                .append_transfer_at(0, &[], &receivers, &plan, offset, words)
+                .append_transfer_at(0, &[], &receivers, &plan.prepare().unwrap(), offset, words)
                 .unwrap();
             let programs = builder.finish().unwrap();
             let mut combined = TileProgramSchedule::default();
-            combined.append_sender_at(&plan.sender, offset).unwrap();
             combined
-                .append_receiver_at(&plan.receivers[0], offset, words)
+                .append_sender_at(
+                    &plan.sender,
+                    &sender_row_timing(&plan.sender, 0).unwrap(),
+                    offset,
+                )
+                .unwrap();
+            combined
+                .append_receiver_at(
+                    &receive_row_timing(&plan.receivers[0], 0).unwrap(),
+                    offset,
+                    words,
+                )
                 .unwrap();
             assert_eq!(
                 programs.programs[0].as_ref().unwrap(),
@@ -3813,11 +3874,15 @@ mod tests {
                 .multicast(0, &[receiver], 972, 0)
                 .unwrap()
                 .receivers[0];
-            let previous = schedule.append_receiver_at(&ordinary, 0, 972).unwrap();
+            let previous = schedule
+                .append_receiver_at(&receive_row_timing(&ordinary, 0).unwrap(), 0, 972)
+                .unwrap();
             let pair = [receiver & !1, receiver | 1];
             let row = topology.paired_multicast(4, &pair, 176).unwrap().receivers
                 [usize::from(receiver & 1)];
-            let offset = schedule.earliest_receiver_offset(&row, 176, 0).unwrap();
+            let offset = schedule
+                .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), 176, 0)
+                .unwrap();
             let timing = receive_row_timing(&row, offset).unwrap();
             assert!(timing.format_start_cycles.unwrap() >= previous.payload_end);
         }
@@ -3828,15 +3893,21 @@ mod tests {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
         let ordinary = topology.multicast(0, &[2], 53, 0).unwrap().receivers[0];
-        schedule.append_receiver_at(&ordinary, 0, 53).unwrap();
+        schedule
+            .append_receiver_at(&receive_row_timing(&ordinary, 0).unwrap(), 0, 53)
+            .unwrap();
         let paired = topology
             .paired_multicast(4, &[2, 3], 176)
             .unwrap()
             .receivers[0];
-        let offset = schedule.earliest_receiver_offset(&paired, 176, 0).unwrap();
+        let offset = schedule
+            .earliest_receiver_offset(&receive_row_timing(&paired, 0).unwrap(), 176, 0)
+            .unwrap();
         let timing = receive_row_timing(&paired, offset).unwrap();
         assert_eq!(timing.source_cycles, Some(56));
-        schedule.append_receiver_at(&paired, offset, 176).unwrap();
+        schedule
+            .append_receiver_at(&receive_row_timing(&paired, 0).unwrap(), offset, 176)
+            .unwrap();
         schedule.finish().unwrap();
     }
 
@@ -3852,18 +3923,20 @@ mod tests {
             .paired_multicast(966, &receivers, 72)
             .unwrap()
             .receivers[10];
-        let previous = schedule.append_receiver_at(&paired, 0, 72).unwrap();
+        let previous = schedule
+            .append_receiver_at(&receive_row_timing(&paired, 0).unwrap(), 0, 72)
+            .unwrap();
         let ordinary = topology
             .multicast(612, &[244, 730, 1216], 4148, 0)
             .unwrap()
             .receivers[2];
         let offset = schedule
-            .earliest_receiver_offset(&ordinary, 4148, 0)
+            .earliest_receiver_offset(&receive_row_timing(&ordinary, 0).unwrap(), 4148, 0)
             .unwrap();
         let timing = receive_row_timing(&ordinary, offset).unwrap();
         assert_ne!(timing.source_cycles, Some(previous.payload_start));
         schedule
-            .append_receiver_at(&ordinary, offset, 4148)
+            .append_receiver_at(&receive_row_timing(&ordinary, 0).unwrap(), offset, 4148)
             .unwrap();
         schedule.finish().unwrap();
     }
@@ -3878,8 +3951,12 @@ mod tests {
                 .unwrap()
                 .receivers[0];
             patch_receiver_address(&mut row, 0x90000 + index as u32 * 0x1000).unwrap();
-            let offset = schedule.earliest_receiver_offset(&row, 176, 0).unwrap();
-            schedule.append_receiver_at(&row, offset, 176).unwrap();
+            let offset = schedule
+                .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), 176, 0)
+                .unwrap();
+            schedule
+                .append_receiver_at(&receive_row_timing(&row, 0).unwrap(), offset, 176)
+                .unwrap();
         }
         let cycles = |kind| {
             schedule
@@ -3906,8 +3983,12 @@ mod tests {
                 .unwrap()
                 .receivers[0];
             patch_receiver_address(&mut row, 0x90000 + index as u32 * 0x1000).unwrap();
-            let offset = schedule.earliest_receiver_offset(&row, 176, 0).unwrap();
-            schedule.append_receiver_at(&row, offset, 176).unwrap();
+            let offset = schedule
+                .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), 176, 0)
+                .unwrap();
+            schedule
+                .append_receiver_at(&receive_row_timing(&row, 0).unwrap(), offset, 176)
+                .unwrap();
         }
         for format in schedule
             .receive_events
@@ -3952,8 +4033,12 @@ mod tests {
                     .unwrap()
                     .receivers[0];
                 patch_receiver_address(&mut row, address).unwrap();
-                let offset = builder.earliest_receiver_offset(&row, words, 0).unwrap();
-                builder.append_receiver_at(&row, offset, words).unwrap();
+                let offset = builder
+                    .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), words, 0)
+                    .unwrap();
+                builder
+                    .append_receiver_at(&receive_row_timing(&row, 0).unwrap(), offset, words)
+                    .unwrap();
                 builder.finish().unwrap();
                 address += words * 4;
             }
@@ -4015,10 +4100,20 @@ mod tests {
                 .sender;
 
             let mut builder = TileProgramSchedule::default();
-            builder.append_receiver_at(&incoming, 0, words).unwrap();
+            builder
+                .append_receiver_at(&receive_row_timing(&incoming, 0).unwrap(), 0, words)
+                .unwrap();
             let _ = builder.finish();
-            let sender_offset = builder.earliest_sender_offset(&outgoing, 0).unwrap();
-            builder.append_sender_at(&outgoing, sender_offset).unwrap();
+            let sender_offset = builder
+                .earliest_sender_offset(&sender_row_timing(&outgoing, 0).unwrap(), 0)
+                .unwrap();
+            builder
+                .append_sender_at(
+                    &outgoing,
+                    &sender_row_timing(&outgoing, 0).unwrap(),
+                    sender_offset,
+                )
+                .unwrap();
             let expected_horizon = builder.event_cycles();
             let program = builder.finish().unwrap();
             assert_eq!(plan_event_cycles(&program).unwrap(), expected_horizon);
@@ -4170,10 +4265,18 @@ mod tests {
 
         let mut relay = TileProgramSchedule::default();
         relay
-            .append_receiver_at(&first.receivers[0], 0, 64)
+            .append_receiver_at(&receive_row_timing(&first.receivers[0], 0).unwrap(), 0, 64)
             .unwrap();
-        let offset = relay.earliest_sender_offset(&second.sender, 0).unwrap();
-        relay.append_sender_at(&second.sender, offset).unwrap();
+        let offset = relay
+            .earliest_sender_offset(&sender_row_timing(&second.sender, 0).unwrap(), 0)
+            .unwrap();
+        relay
+            .append_sender_at(
+                &second.sender,
+                &sender_row_timing(&second.sender, 0).unwrap(),
+                offset,
+            )
+            .unwrap();
         let relay_horizon = relay.event_cycles();
         let relay = relay.finish().unwrap();
 
