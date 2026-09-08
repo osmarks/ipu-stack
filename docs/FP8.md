@@ -227,3 +227,18 @@ historical kernel passes its 252 applicable cases. Existing packed casts have a
 small setup cost increase (8,320 elements: 5,064 to 5,136 cycles); the two-bundle
 pipeline applies to linear casts and compatible single-row panels, not the
 multi-row packing loop.
+
+
+Integration validation: the final small ViT (`--vit-small --tiles 64 --fp8-scale=-4`)
+passes with maximum absolute error 0.129395 under the benchmark's documented
+FP8 tolerance (`--diagnostic-atol 0.2 --diagnostic-rtol 0.05`). Its cropped profile
+is 124,524 cycles, under `artifacts/fp8-cast/vit-small/profile.html`.
+
+The full batch-two trial was stopped during final placement, without a hardware
+run or new full-size profile. On the final sharing policy, finalists 6 and 4
+failed contiguous exchange-table allocations of 119,756 and 105,852 bytes.
+`artifacts/fp8-cast/vit-b2/run.log` retains that trial. Other finalists were not
+exhausted: this is not proof that every batch-two layout is infeasible. An earlier
+trial which also reused replicated consumer buffers is retained separately in
+`vit-b2-shared-consumer/`; that broader sharing policy was removed. No memory
+budget relaxation, forced layout, or arbitrary transfer-count cutoff was added.
