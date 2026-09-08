@@ -186,11 +186,13 @@ pub struct PipelineConfig {
     /// Number of complete beam finalists to materialize and rank with the
     /// physical exchange scheduler. One retains analytical-only selection.
     pub exchange_schedule_finalists: usize,
-    /// Per-tile exchange table budget, screened from concrete transfer spans
-    /// before scheduling and enforced on final compact encoded tables.
-    /// Mid-level row estimates only rank candidates. Repeat bodies count once.
-    /// Set to u64::MAX to disable this policy screen.
+    /// Hard limit on actual compact encoded exchange tables per tile.
+    /// Set to u64::MAX to disable this limit.
     pub exchange_table_budget_bytes: u64,
+    /// Static TX/RX fragments per tile, counted from concrete spans before
+    /// scheduling. Repeat bodies count once. Independent of encoded bytes.
+    /// Set to u64::MAX to disable this complexity limit.
+    pub exchange_transfer_limit_per_tile: u64,
     /// Search-only penalty per estimated exchange-table byte. Does not change
     /// reported execution cycles. Budget failures automatically retry with
     /// stronger penalties to preserve simpler prefixes earlier in the graph.
@@ -267,6 +269,7 @@ impl PipelineConfig {
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
             exchange_table_budget_bytes: 64 * 1024,
+            exchange_transfer_limit_per_tile: 8192,
             exchange_table_cost_per_byte: 0,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,

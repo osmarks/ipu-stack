@@ -97,9 +97,12 @@ retained separately there; they are not the final planner's performance.
 
 ## Exchange table budget
 
-`PipelineConfig::exchange_table_budget_bytes` defaults to 64 KiB per tile.
+Two independent limits apply: `exchange_transfer_limit_per_tile` defaults to
+8,192 static endpoint fragments per tile before scheduling;
+`exchange_table_budget_bytes` defaults to 64 KiB of actual encoded tables per
+tile. Neither converts a heuristic byte estimate into a transfer count.
 The mid estimator's 256-byte payload assumption is only a cycle/ranking
-heuristic; it never rejects a plan against this budget. Operator and beam
+heuristic; it never rejects a plan against either limit. Operator and beam
 shortlists preserve low-exchange candidates and refresh prefix estimates before
 pruning, including conversions and cached operator fragments.
 
@@ -112,10 +115,11 @@ Multicast counts the sender once and each receiver separately. Repeat execution
 counts do not multiply the stored body. For example, an aligned contiguous
 8 KiB transfer counts once, not as 32 synthetic 256-byte fragments.
 
-The pre-scheduling policy charges 36 bytes per geometry-derived endpoint
-fragment plus phase headers. This is conservative: it does not predict compact
-row sharing, paired/bidirectional encoding, or placement-induced changes.
-Both provisional and final compact encoded tables must also fit the budget.
+The pre-scheduling count is conservative: coalescing and paired/bidirectional
+encoding can combine fragments. It is a complexity limit, not a byte estimate.
+In particular, the old 36-byte uncompressed row allowance does not participate
+in acceptance. Both provisional and final compact encoded tables must fit the
+separate byte budget.
 This is separate from the total tile SRAM budget and is not a global
 transfer-count cutoff that penalizes distributing work across more tiles.
 
@@ -126,8 +130,17 @@ cap. Retries share cached operator implementations. They now respond to
 geometry/encoded-size rejection, not the mid heuristic. This remains a bounded
 search and cannot prove no feasible layout exists.
 
-The benchmark exposes `--exchange-table-budget-kib N`; API callers can set the
-budget to `u64::MAX` to disable the policy, and `exchange_table_cost_per_byte`
+The benchmark exposes `--exchange-table-budget-kib N` and
+`--exchange-transfer-limit-per-tile N`. API callers can set either limit to
+`u64::MAX` to disable it, and `exchange_table_cost_per_byte`
 to choose an initial ranking penalty. Capture examines the requested finalist
 without package selection's automatic retries. Logs report heuristic and
 geometry footprints separately.
+
+Validation: full FP8 B2 ViT now completes mid planning, where it previously
+stopped at operation 19. Its captured first finalist has approximately 12,500
+geometry-derived endpoint fragments on the busiest tile, still above the new
+8,192-fragment default. This run did not schedule exchanges or execute hardware;
+it does not establish that another finalist or retry fits both limits.
+Regression coverage includes a contiguous 8 KiB span, disjoint phase owners,
+Repeat reuse, fragment-limit boundaries, and independent encoded-byte checks.

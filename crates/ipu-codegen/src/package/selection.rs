@@ -44,7 +44,8 @@ pub(super) fn select_graph_finalist<T>(
         result = select_scheduled_finalist(finalists, &search, tile_mapping, &mut finalize);
         if !matches!(
             result,
-            Err(PackageBuildError::ExchangeBudgetExceeded { .. })
+            Err(PackageBuildError::ExchangeBudgetExceeded { .. }
+                | PackageBuildError::ExchangeTransferLimitExceeded { .. })
         ) {
             break;
         }
@@ -211,14 +212,19 @@ pub(super) fn expand_and_place(
     tile_mapping: Option<&[u16]>,
 ) -> PackageBuildResult<(LowProgram, crate::Placement)> {
     let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
-    let bytes = crate::estimate::program_footprint(&expanded)?.estimated_row_bytes();
+    let fragments = crate::estimate::program_footprint(&expanded)?.maximum_transfer_chunks_per_tile;
     tracing::info!(
         heuristic_row_bytes = mid.peak_memory.exchange_rows,
-        geometry_row_bytes = bytes,
-        budget_bytes = planning.exchange_table_budget_bytes,
+        geometry_fragments_per_tile = fragments,
+        fragment_limit = planning.exchange_transfer_limit_per_tile,
         "screened exchange table geometry"
     );
-    check_exchange_budget(bytes, planning)?;
+    if fragments > planning.exchange_transfer_limit_per_tile {
+        return Err(PackageBuildError::ExchangeTransferLimitExceeded {
+            transfers: fragments,
+            limit: planning.exchange_transfer_limit_per_tile,
+        });
+    }
     placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
     let placement = place(&low)?;
@@ -253,30 +259,34 @@ mod tests {
             .with_automatic_input(beta, Precision::F16);
         let finalists = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
         let expanded = crate::expand_tiles(&finalists[0]).unwrap();
-        let bytes = crate::estimate::program_footprint(&expanded)
+        let fragments = crate::estimate::program_footprint(&expanded)
             .unwrap()
-            .estimated_row_bytes();
-        assert!(bytes > 0);
-        config.exchange_table_budget_bytes = bytes;
+            .maximum_transfer_chunks_per_tile;
+        assert!(fragments > 0);
+        config.exchange_transfer_limit_per_tile = fragments;
+        config.exchange_table_budget_bytes = 0;
+        // Encoded storage is checked only once encoded; mid heuristics and
+        // uncompressed row slots cannot veto this geometry-feasible plan.
         assert!(expand_and_place(&finalists[0], &config, None).is_ok());
-        config.exchange_table_budget_bytes = bytes - 1;
+        assert!(check_exchange_budget(1, &config).is_err());
+        config.exchange_table_budget_bytes = 1;
+        assert!(check_exchange_budget(1, &config).is_ok());
+        config.exchange_transfer_limit_per_tile = fragments - 1;
         let error =
             select_scheduled_finalist(finalists, &config, None, |_| -> PackageBuildResult<()> {
-                panic!("over-budget plan reached package finalization")
+                panic!("over-limit plan reached package finalization")
             })
             .err()
             .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("exchange tables exceed per-tile budget")
-        );
-        config.exchange_table_budget_bytes = 0;
-        // Heuristic row estimates must not reject mid candidates.
+        assert!(matches!(
+            error,
+            PackageBuildError::ExchangeTransferLimitExceeded { .. }
+        ));
+        config.exchange_transfer_limit_per_tile = 0;
         let still_planned = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
         assert!(expand_and_place(&still_planned[0], &config, None).is_err());
-        config.exchange_table_budget_bytes = u64::MAX;
-        assert!(lower_finalists(&graph, &config, &Ipu21CostModel, 1).is_ok());
+        config.exchange_transfer_limit_per_tile = u64::MAX;
+        assert!(expand_and_place(&still_planned[0], &config, None).is_ok());
     }
 
     #[test]

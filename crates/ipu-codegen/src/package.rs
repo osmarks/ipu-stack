@@ -49,6 +49,8 @@ const RUNTIME_EXECUTABLE_START: u32 =
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
+    #[error("exchange transfer count exceeds per-tile limit: {transfers} fragments, limit {limit}")]
+    ExchangeTransferLimitExceeded { transfers: u64, limit: u64 },
     #[error("exchange tables exceed per-tile budget: {bytes} bytes, limit {budget} bytes")]
     ExchangeBudgetExceeded { bytes: u64, budget: u64 },
     #[error("code generation failed: {0}")]

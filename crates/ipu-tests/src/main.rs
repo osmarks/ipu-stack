@@ -118,9 +118,12 @@ struct Arguments {
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
-    /// Cap geometry-derived per-tile exchange table bytes before scheduling (default 64 KiB).
+    /// Cap actual encoded exchange table storage per tile (default 64 KiB).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_table_budget_kib: Option<u64>,
+    /// Cap geometry-derived static transfer fragments per tile (default 8192).
+    #[arg(long, conflicts_with = "reuse_package")]
+    exchange_transfer_limit_per_tile: Option<u64>,
     /// Rank this many complete planner finalists with physical exchange scheduling.
     #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
     exchange_schedule_finalists: usize,
@@ -685,6 +688,9 @@ fn main() -> Result<()> {
         pipeline.exchange_table_budget_bytes = kib
             .checked_mul(1024)
             .context("exchange table budget overflow")?;
+    }
+    if let Some(limit) = arguments.exchange_transfer_limit_per_tile {
+        pipeline.exchange_transfer_limit_per_tile = limit;
     }
     pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.stream_conversions {
