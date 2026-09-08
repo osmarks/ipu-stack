@@ -378,7 +378,7 @@ pub(super) fn validate_tile_program(
         return Err(ExchangeError::Schedule("encoded incoming-control mismatch"));
     }
 
-    for expected in &schedule.senders {
+    for expected in schedule.senders.iter() {
         let covering = actual_sends
             .iter()
             .filter(|(start, end, _)| *start < expected.end_cycles && expected.start_cycles < *end)

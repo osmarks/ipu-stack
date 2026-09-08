@@ -2,68 +2,6 @@
 //! remain unchanged. Speculative transfers still run the ordinary row encoder.
 use super::*;
 
-// Trials share immutable chunks and copy at most the final partial chunk.
-// A flat chunk index keeps lookup/rollback bounded and avoids recursive drops.
-const CHUNK_ITEMS: usize = 128;
-
-#[derive(Clone, Debug)]
-struct Chunks<T> {
-    chunks: Vec<Arc<Vec<T>>>,
-    len: usize,
-}
-
-impl<T> Default for Chunks<T> {
-    fn default() -> Self {
-        Self {
-            chunks: Vec::new(),
-            len: 0,
-        }
-    }
-}
-
-impl<T: Clone> Chunks<T> {
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn get(&self, index: usize) -> &T {
-        &self.chunks[index / CHUNK_ITEMS][index % CHUNK_ITEMS]
-    }
-    fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
-        self.chunks.iter().flat_map(|chunk| chunk.iter())
-    }
-    fn push(&mut self, value: T) {
-        if self.len.is_multiple_of(CHUNK_ITEMS) {
-            self.chunks.push(Arc::new(Vec::with_capacity(CHUNK_ITEMS)));
-        }
-        Arc::make_mut(self.chunks.last_mut().unwrap()).push(value);
-        self.len += 1;
-    }
-    fn truncate(&mut self, len: usize) {
-        assert!(len <= self.len);
-        self.chunks.truncate(len.div_ceil(CHUNK_ITEMS));
-        if !len.is_multiple_of(CHUNK_ITEMS) {
-            Arc::make_mut(self.chunks.last_mut().unwrap()).truncate(len % CHUNK_ITEMS);
-        }
-        self.len = len;
-    }
-    fn to_vec(&self) -> Vec<T> {
-        self.iter().cloned().collect()
-    }
-}
-
-impl<T: Clone + PartialEq> PartialEq for Chunks<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.len == other.len && self.iter().eq(other.iter())
-    }
-}
-impl<T: Clone> Extend<T> for Chunks<T> {
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        for value in iter {
-            self.push(value);
-        }
-    }
-}
-
 /// The row encoder needs only append and absolute word parity. Primitive rows
 /// use a Vec; speculative phase rows share chunks through the same encoder.
 pub(super) trait RowWords: Extend<u32> {
@@ -78,19 +16,19 @@ impl RowWords for Vec<u32> {
         Vec::push(self, word);
     }
 }
-impl RowWords for Chunks<u32> {
+impl RowWords for Chunked<u32> {
     fn len(&self) -> usize {
-        self.len
+        Chunked::len(self)
     }
     fn push(&mut self, word: u32) {
-        Chunks::push(self, word);
+        Chunked::push(self, word);
     }
 }
 
 #[derive(Debug)]
 pub(super) struct EncodedSchedule {
-    checkpoints: Chunks<Checkpoint>,
-    words: Chunks<u32>,
+    checkpoints: Chunked<Checkpoint>,
+    words: Chunked<u32>,
     #[cfg(test)]
     resumed_words: usize,
 }
@@ -119,8 +57,8 @@ struct Checkpoint {
 impl Checkpoint {
     fn reusable(
         &self,
-        senders: &[ScheduledSenderRow],
-        events: &[ReceiveEvent],
+        senders: &Chunked<ScheduledSenderRow>,
+        events: &Chunked<ReceiveEvent>,
         horizon: u32,
     ) -> bool {
         let sender_start = senders
@@ -142,15 +80,14 @@ impl Checkpoint {
 }
 
 pub(super) fn build_scheduled_program(
-    senders: &[ScheduledSenderRow],
-    receive_events: &[ReceiveEvent],
+    senders: &Chunked<ScheduledSenderRow>,
+    receive_events: &Chunked<ReceiveEvent>,
     horizon_cycles: u32,
     prefix: Option<(&EncodedSchedule, usize, usize)>,
 ) -> Result<EncodedSchedule, ExchangeError> {
     debug_assert!(
-        senders
-            .windows(2)
-            .all(|pair| pair[0].end_cycles <= pair[1].start_cycles)
+        (1..senders.len())
+            .all(|index| senders[index - 1].end_cycles <= senders[index].start_cycles)
     );
     let events = receive_events;
     // The prefix was validated already. Include the entire control group at
@@ -161,15 +98,15 @@ pub(super) fn build_scheduled_program(
             changed -= 1;
         }
     }
-    validate_receive_events(&events[changed..])?;
+    validate_receive_events(&events.slice(changed..events.len()))?;
 
-    let mut words = Chunks::default();
-    let mut checkpoints = Chunks::default();
+    let mut words = Chunked::default();
+    let mut checkpoints = Chunked::default();
     let mut resume = Checkpoint::default();
     if let Some((prefix, same_senders, same_events)) = prefix
         && let Some((index, checkpoint)) = (0..prefix.checkpoints.len())
             .rev()
-            .map(|index| (index, prefix.checkpoints.get(index)))
+            .map(|index| (index, prefix.checkpoints.get(index).unwrap()))
             .find(|(_, checkpoint)| {
                 checkpoint.senders <= same_senders
                     && checkpoint.events <= same_events
@@ -184,13 +121,13 @@ pub(super) fn build_scheduled_program(
     }
     let mut event_cycles = resume.cycles;
     let mut event_index = resume.events;
-    for (sender_index, sender) in senders.iter().enumerate().skip(resume.senders) {
-        let split = event_index
-            + events[event_index..].partition_point(|event| event.cycles <= sender.start_cycles);
+    for sender_index in resume.senders..senders.len() {
+        let sender = &senders[sender_index];
+        let split = events.partition_point(|event| event.cycles <= sender.start_cycles);
         append_receive_events_record(
             &mut words,
             &mut event_cycles,
-            &events[event_index..split],
+            &events.slice(event_index..split),
             sender.start_cycles,
             true,
             |consumed, words, cycles, lookahead| {
@@ -204,13 +141,12 @@ pub(super) fn build_scheduled_program(
             },
         )?;
         event_index = split;
-        let split = event_index
-            + events[event_index..].partition_point(|event| event.cycles <= sender.end_cycles);
+        let split = events.partition_point(|event| event.cycles <= sender.end_cycles);
         append_sender_message(
             &mut words,
             &mut event_cycles,
             sender,
-            &events[event_index..split],
+            &events.slice(event_index..split),
         )?;
         event_index = split;
         checkpoints.push(Checkpoint {
@@ -224,7 +160,7 @@ pub(super) fn build_scheduled_program(
     append_receive_events_record(
         &mut words,
         &mut event_cycles,
-        &events[event_index..],
+        &events.slice(event_index..events.len()),
         horizon_cycles,
         true,
         |consumed, words, cycles, lookahead| {

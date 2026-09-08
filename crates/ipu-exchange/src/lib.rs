@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+mod chunked;
+use chunked::Chunked;
 mod encoding;
 use encoding::{EncodedSchedule, RowWords, build_scheduled_program};
 use tracing::debug;
@@ -240,11 +242,11 @@ pub fn plan_event_cycles(row: &[u32]) -> Result<u32, ExchangeError> {
 
 #[derive(Clone, Debug, Default)]
 struct TileProgramSchedule {
-    senders: Vec<ScheduledSenderRow>,
+    senders: Chunked<ScheduledSenderRow>,
     /// Borrowed transmit lane; no instruction or SRAM access on this tile.
     reserved_sender_end: u32,
     // Chronological, with stable ordering among controls at the same cycle.
-    receive_events: Vec<ReceiveEvent>,
+    receive_events: Chunked<ReceiveEvent>,
     event_cycles: u32,
     receive_stream: Option<ReceiveStream>,
     encoded: OnceLock<Arc<EncodedSchedule>>,
@@ -725,12 +727,14 @@ impl TileProgramSchedule {
         self.event_cycles
     }
 
-    fn receive_events_at(&self, cycles: u32) -> &[ReceiveEvent] {
+    fn receive_events_at(&self, cycles: u32) -> impl Iterator<Item = &ReceiveEvent> {
         let start = self
             .receive_events
             .partition_point(|event| event.cycles < cycles);
-        let count = self.receive_events[start..].partition_point(|event| event.cycles == cycles);
-        &self.receive_events[start..start + count]
+        let end = self
+            .receive_events
+            .partition_point(|event| event.cycles <= cycles);
+        self.receive_events.range(start..end)
     }
 
     fn receive_control_at_send_start(&self, start: u32) -> bool {
@@ -822,7 +826,7 @@ impl TileProgramSchedule {
                 self.receive_stream.as_ref(),
             )?;
             let collision = timing.events.iter().any(|new| {
-                self.receive_events_at(new.cycles).iter().any(|existing| {
+                self.receive_events_at(new.cycles).any(|existing| {
                     !self.receive_stream.as_ref().is_some_and(|previous| {
                         replaces_receive_event(*existing, base.mode, &timing, previous)
                     }) && !receive_events_can_share_instruction(*new, *existing)
@@ -921,15 +925,20 @@ impl TileProgramSchedule {
         }
         self.invalidate_encoding();
         if let Some(stream) = &self.receive_stream {
-            let mut index = 0;
-            self.receive_events.retain(|event| {
-                let remove = replaces_receive_event(*event, base.mode, &timing, stream);
-                if remove {
+            let earliest = stream
+                .source_end_cycles
+                .min(stream.format_end_cycles.unwrap_or(u32::MAX));
+            let mut index = self
+                .receive_events
+                .partition_point(|event| event.cycles < earliest);
+            while index < self.receive_events.len() {
+                if replaces_receive_event(self.receive_events[index], base.mode, &timing, stream) {
                     self.dirty_events = self.dirty_events.min(index);
+                    self.receive_events.remove(index);
+                } else {
+                    index += 1;
                 }
-                index += 1;
-                !remove
-            });
+            }
         }
 
         // `earliest_receiver_offset` checked the new events against the full
