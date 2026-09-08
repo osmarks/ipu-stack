@@ -1849,7 +1849,7 @@ impl MaterializedSchedule {
             // Bound the expensive alignment fallback, not ordinary deferred scheduling.
             // Charge endpoint history revisited, so many independent transfers
             // remain cheap while repeated long-prefix encoding stops promptly.
-            builder: PhaseProgramBuilder::new(tile_count).with_validation_budget(64 * 1024 * 1024),
+            builder: PhaseProgramBuilder::new(tile_count).with_validation_budget(512 * 1024 * 1024),
             horizon: 0,
             tile_availability: vec![TileAvailability::default(); usize::from(tile_count)],
             memory_accesses: (0..tile_count)

@@ -122,9 +122,17 @@ fn plan_in_pool(
         &RegionPlanningConstraints::default(),
     )?;
     let initial = inputs.iter().map(|input| input.value).collect::<Vec<_>>();
+    let selected = finalist_indices(
+        &branches
+            .iter()
+            .map(|branch| branch.peak_memory)
+            .collect::<Vec<_>>(),
+        finalist_count,
+    );
     branches
         .into_iter()
-        .take(finalist_count.max(1))
+        .enumerate()
+        .filter_map(|(index, branch)| selected.contains(&index).then_some(branch))
         .enumerate()
         .map(|(finalist, branch)| {
             let outputs = graph
@@ -792,6 +800,58 @@ pub(super) fn lower_operations(
     Ok(best.operations)
 }
 
+/// The input is latency-ranked. Preserve resource extremes before filling
+/// spare slots with nearby latency variants; otherwise the final cutoff undoes
+/// the Pareto beam's work just before physical placement and scheduling.
+fn finalist_indices(peaks: &[MemoryPeaks], count: usize) -> BTreeSet<usize> {
+    let limit = count.max(1).min(peaks.len());
+    let mut selected = BTreeSet::new();
+    if limit == 0 {
+        return selected;
+    }
+    selected.insert(0);
+    for key in [
+        (|peak: &MemoryPeaks| peak.exchange_rows) as fn(&MemoryPeaks) -> u64,
+        |peak: &MemoryPeaks| peak.total,
+    ] {
+        if selected.len() == limit {
+            break;
+        }
+        let index = peaks
+            .iter()
+            .enumerate()
+            .min_by_key(|(index, peak)| (key(peak), *index))
+            .unwrap()
+            .0;
+        selected.insert(index);
+    }
+    for index in 0..peaks.len() {
+        if selected.len() == limit {
+            break;
+        }
+        selected.insert(index);
+    }
+    selected
+}
+
+#[cfg(test)]
+#[test]
+fn finalists_keep_resource_extremes_and_the_fastest_plan() {
+    let peaks =
+        [(100, 100), (95, 95), (90, 90), (20, 120), (80, 40)].map(|(exchange_rows, total)| {
+            MemoryPeaks {
+                exchange_rows,
+                total,
+                ..MemoryPeaks::default()
+            }
+        });
+    assert_eq!(finalist_indices(&peaks, 1), BTreeSet::from([0]));
+    assert_eq!(finalist_indices(&peaks, 2), BTreeSet::from([0, 3]));
+    assert_eq!(finalist_indices(&peaks, 4), BTreeSet::from([0, 1, 3, 4]));
+    assert!(finalist_indices(&[], 4).is_empty());
+    assert_eq!(finalist_indices(&peaks, 20).len(), peaks.len());
+}
+
 pub(super) fn retain_pareto_beam(
     branches: Vec<BeamBranch>,
     future_origins: &BTreeSet<ValueId>,
@@ -871,12 +931,22 @@ pub(super) fn retain_pareto_beam(
     let mut selected = BTreeSet::new();
     let mut diversity = 0usize;
     if frontier.len() > width {
-        // Preserve the cheapest representative of every live format family
-        // before retaining secondary memory tradeoffs. Partition counts are
+        // Protect latency and row-storage extremes, then preserve live format
+        // families before retaining secondary memory tradeoffs. Partition counts are
         // intentionally excluded: they are searched within a family, whereas
         // physical order and ownership axes determine which imminent
         // consumers can use a value without a qualitatively different
         // conversion.
+        selected.insert(0);
+        if width > 1 {
+            let cheapest_rows = frontier
+                .iter()
+                .enumerate()
+                .min_by_key(|(index, entry)| (entry.objective.memory.exchange_rows, *index))
+                .unwrap()
+                .0;
+            diversity += usize::from(selected.insert(cheapest_rows));
+        }
         let mut requested_families = BTreeSet::new();
         for (index, entry) in frontier.iter().enumerate() {
             if selected.len() == width {
@@ -900,7 +970,6 @@ pub(super) fn retain_pareto_beam(
                 diversity += 1;
             }
         }
-        selected.insert(0);
         for dimension in 0..MemoryPeaks::OBJECTIVE_COUNT {
             if selected.len() == width {
                 break;
