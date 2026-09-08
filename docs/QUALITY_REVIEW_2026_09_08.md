@@ -149,3 +149,13 @@ Artifacts and the comparison are in `artifacts/cleanup-20260908/`. Intermediate
 codelet object names are now consistently derived from their public call symbol;
 the linked kernel ABI and program bytes did not change in this comparison.
 Exchange scheduling was not changed in this cleanup pass.
+
+## Scheduler follow-up
+
+The shared timeline, incremental encoding, shared problem facts and recipe-cache
+work is now implemented and benchmarked on captured ViT phases up to 1,172,736
+transfers. Matching readiness and bounded repair were also changed. See
+[the capture and experiment report](EXCHANGE_SCHEDULER_BENCHMARKS_2026_09_08.md)
+for measurements, the recovered MLP search regression and hardware validation.
+Fast/compact package alternatives and local repair of deferred encoding failures
+remain proposals.
