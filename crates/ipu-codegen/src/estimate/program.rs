@@ -243,7 +243,6 @@ fn kernel_cycles(run: &KernelRun) -> u64 {
     )
 }
 
-#[cfg(test)]
 pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
     let mut chunks = 0u64;
     for phase in &program.exchange_phases {
@@ -339,6 +338,16 @@ mod tests {
             order: crate::CopyOrder::Physical,
         };
         program.exchange_phases[0].transfers = vec![transfer(full)];
+        let footprint = program_footprint(&program).unwrap();
+        let BlockOperation::Repeat(repeat) = &mut program.body.operations[0] else {
+            unreachable!()
+        };
+        repeat.count = 1000;
+        assert_eq!(program_footprint(&program).unwrap(), footprint);
+        let BlockOperation::Repeat(repeat) = &mut program.body.operations[0] else {
+            unreachable!()
+        };
+        repeat.count = 7;
         let contiguous = program_cycles(&program, None).unwrap();
         program.exchange_phases[0].transfers = (0..64)
             .map(|i| {

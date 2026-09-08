@@ -676,7 +676,15 @@ pub(super) fn lower_operation_candidates(
             })
             .collect::<Vec<_>>();
         let mut expanded = Vec::new();
+        let mut rejected_exchange = None::<u64>;
         for (branch, peak) in evaluated {
+            if peak.exchange_rows > config.exchange_table_budget_bytes {
+                rejected_exchange = Some(
+                    rejected_exchange
+                        .map_or(peak.exchange_rows, |bytes| bytes.min(peak.exchange_rows)),
+                );
+                continue;
+            }
             if peak.fits_ipu21_with_budget(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
@@ -688,6 +696,13 @@ pub(super) fn lower_operation_candidates(
             }
         }
         if expanded.is_empty() {
+            if let Some(estimated_bytes) = rejected_exchange {
+                return Err(LoweringError::ExchangeBudgetExceeded {
+                    operation: operation.id,
+                    estimated_bytes,
+                    budget_bytes: config.exchange_table_budget_bytes,
+                });
+            }
             if saw_candidate
                 && let Some(peak) = rejected_memory
                     .into_iter()
@@ -748,10 +763,11 @@ pub(super) fn lower_operation_candidates(
                 graph,
                 &constraints.allocation_copies,
             );
-            (peak.fits_ipu21_with_budget(
-                config.standard_memory_reservation_bytes,
-                config.tile_memory_budget_bytes,
-            ) || contains_forced_plan(&branch.operations, config))
+            (peak.exchange_rows <= config.exchange_table_budget_bytes
+                && (peak.fits_ipu21_with_budget(
+                    config.standard_memory_reservation_bytes,
+                    config.tile_memory_budget_bytes,
+                ) || contains_forced_plan(&branch.operations, config)))
             .then(|| {
                 branch.peak_memory = peak;
                 branch

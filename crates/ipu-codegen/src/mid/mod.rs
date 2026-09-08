@@ -3,8 +3,8 @@
 
 mod copy;
 mod elementwise;
-mod packing;
 pub mod optimistic;
+mod packing;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 mod primitive;
@@ -186,6 +186,11 @@ pub struct PipelineConfig {
     /// Number of complete beam finalists to materialize and rank with the
     /// physical exchange scheduler. One retains analytical-only selection.
     pub exchange_schedule_finalists: usize,
+    /// Per-tile exchange table budget, screened before scheduling using the
+    /// conservative sum of phase maxima (36 bytes per transfer fragment).
+    /// Repeat bodies count once. Exact compact tables must also fit this limit.
+    /// Set to u64::MAX to disable this policy screen.
+    pub exchange_table_budget_bytes: u64,
     /// Diagnostic constraints which retain only one GEMM plan family for the
     /// named source operations.
     pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
@@ -257,6 +262,7 @@ impl PipelineConfig {
             shape_aware_active_tile_counts: true,
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
+            exchange_table_budget_bytes: 64 * 1024,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,
             max_parallel_reductions: 3,
@@ -496,6 +502,14 @@ pub enum LoweringError {
         interleaved: u64,
         total: u64,
         standard_contiguous_overflow: u64,
+    },
+    #[error(
+        "operation {operation:?} exceeds the exchange table budget: smallest estimate {estimated_bytes} bytes, limit {budget_bytes} bytes per tile"
+    )]
+    ExchangeBudgetExceeded {
+        operation: OperationId,
+        estimated_bytes: u64,
+        budget_bytes: u64,
     },
     #[error(
         "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"

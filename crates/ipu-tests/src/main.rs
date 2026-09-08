@@ -118,6 +118,9 @@ struct Arguments {
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
+    /// Cap conservative per-tile exchange table bytes before scheduling (default 64 KiB).
+    #[arg(long, conflicts_with = "reuse_package")]
+    exchange_table_budget_kib: Option<u64>,
     /// Rank this many complete planner finalists with physical exchange scheduling.
     #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
     exchange_schedule_finalists: usize,
@@ -677,6 +680,11 @@ fn main() -> Result<()> {
     if let Some(kib) = arguments.tile_memory_budget_kib {
         let bytes = kib.checked_mul(1024).context("tile SRAM budget overflow")?;
         pipeline = pipeline.with_tile_memory_budget(bytes);
+    }
+    if let Some(kib) = arguments.exchange_table_budget_kib {
+        pipeline.exchange_table_budget_bytes = kib
+            .checked_mul(1024)
+            .context("exchange table budget overflow")?;
     }
     pipeline.exchange_diagnostics = arguments.exchange_diagnostics;
     if arguments.stream_conversions {

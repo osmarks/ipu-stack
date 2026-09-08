@@ -176,15 +176,77 @@ pub(super) fn expand_and_place(
     tile_mapping: Option<&[u16]>,
 ) -> PackageBuildResult<(LowProgram, crate::Placement)> {
     let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
+    check_exchange_budget(
+        crate::estimate::program_footprint(&expanded)?.estimated_row_bytes(),
+        planning,
+    )?;
     placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
     let placement = place(&low)?;
     Ok((low, placement))
 }
 
+pub(super) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> PackageBuildResult<()> {
+    if bytes > config.exchange_table_budget_bytes {
+        return Err(invalid(format!(
+            "exchange tables exceed per-tile budget: {bytes} bytes, limit {} bytes",
+            config.exchange_table_budget_bytes,
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exchange_budget_rejects_before_scheduling() {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [2, 1, 1152]).unwrap();
+        let gamma = graph.parameter("gamma", [1152]).unwrap();
+        let beta = graph.parameter("beta", [1152]).unwrap();
+        let y = graph.layer_norm(x, gamma, beta).unwrap();
+        graph.set_outputs([y]).unwrap();
+        let mut config = PipelineConfig::new(64)
+            .with_automatic_input(x, Precision::F16)
+            .with_automatic_input(gamma, Precision::F16)
+            .with_automatic_input(beta, Precision::F16);
+        let finalists = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
+        let expanded = crate::expand_tiles(&finalists[0]).unwrap();
+        let bytes = crate::estimate::program_footprint(&expanded)
+            .unwrap()
+            .estimated_row_bytes();
+        assert!(bytes > 0);
+        config.exchange_table_budget_bytes = bytes;
+        assert!(expand_and_place(&finalists[0], &config, None).is_ok());
+        config.exchange_table_budget_bytes = bytes - 1;
+        let error =
+            select_scheduled_finalist(finalists, &config, None, |_| -> PackageBuildResult<()> {
+                panic!("over-budget plan reached package finalization")
+            })
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("exchange tables exceed per-tile budget")
+        );
+        config.exchange_table_budget_bytes = 0;
+        // Retain a simpler layout. Late expansion can still reveal traffic
+        // absent from the coarse mid estimate, so enforce both screens.
+        let simple = lower_finalists(&graph, &config, &Ipu21CostModel, 1).unwrap();
+        let simple_bytes =
+            crate::estimate::program_footprint(&crate::expand_tiles(&simple[0]).unwrap())
+                .unwrap()
+                .estimated_row_bytes();
+        assert!(simple_bytes < bytes);
+        assert!(expand_and_place(&simple[0], &config, None).is_err());
+        config.exchange_table_budget_bytes = simple_bytes;
+        assert!(expand_and_place(&simple[0], &config, None).is_ok());
+        config.exchange_table_budget_bytes = u64::MAX;
+        assert!(lower_finalists(&graph, &config, &Ipu21CostModel, 1).is_ok());
+    }
 
     #[test]
     fn package_rejection_does_not_consume_finalist_budget() {

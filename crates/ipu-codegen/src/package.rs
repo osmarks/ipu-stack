@@ -406,6 +406,7 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
+    selection::check_exchange_budget(u64::from(exchange_table_bytes), config)?;
     let profile_samples = config.profiling.then(|| {
         program
             .tiles
@@ -712,6 +713,10 @@ fn build_package_from_objects(
             capacity_bytes = capacity_end - storage.range.start,
             "checked final exchange table capacity"
         );
+        selection::check_exchange_budget(
+            u64::from(finalizer.exchange_code_end() - storage.range.start),
+            config,
+        )?;
         if finalizer.exchange_code_end() > capacity_end {
             return Err(invalid(format!(
                 "final exchange rows require {} bytes; planned {}, reserved capacity {}",
