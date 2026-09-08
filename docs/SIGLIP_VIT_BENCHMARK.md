@@ -163,7 +163,7 @@ prefixes. Slow instruction-alignment retries now log their start and duration.
 Package construction now participates in finalist acceptance: failure to place
 the linked image, row tables or tensors rejects that candidate without consuming
 the successful-finalist budget. The next shortlisted candidate is then tried.
-Incremental alignment retries are limited to 64 Mi accumulated endpoint-history
+Incremental alignment retries were initially limited to 64 Mi accumulated endpoint-history
 entries per schedule attempt. This deterministic compilation-effort policy
 leaves ordinary deferred scheduling unrestricted and reports budget exhaustion
 separately from invalid exchange instructions. It does not claim the rejected
@@ -191,6 +191,35 @@ hardware with the row-first grid (maximum absolute error 0.130188); its rendered
 profile is `artifacts/vit/row-grid-small-b2-fp8/profile.html`. The grid tests cover
 single-row, short-matrix and 729-by-4,304 broadcast additions, and all 160 codegen
 tests and Clippy pass. A better full-model shortlist remains necessary.
+
+The next search preserves resource diversity through the final cutoff. Each
+configuration keeps its fastest estimated plan, its smallest estimated exchange
+tables, and its lowest total-memory plan before filling remaining slots by
+latency. The beam also protects a minimum-row-storage representative before
+format-family selection. Previously the final latency-only cutoff could discard
+the resource alternatives that survived Pareto pruning. This uses the existing
+row-storage estimate, not a raw transfer-count limit.
+
+The incremental validation budget is now 512 Mi endpoint-history entries per
+schedule attempt (eight times the initial limit). The shortlist regression,
+all 161 codegen tests and 46 exchange tests pass. Clippy passes too. The full-size rerun is under
+`artifacts/vit/diverse-so400m-fp8/` and now builds and passes hardware/reference
+validation, with maximum absolute error 0.096191. Its cropped runtime is
+**1,010,676 cycles (0.673784 ms)** versus the original full-size benchmark's
+2,656,824 cycles (1.771216 ms): a 62% reduction, or 2.63x speedup. This comparison
+includes the accumulated kernel and layout changes described above, not just
+the budget/shortlist change.
+
+The first latency-ranked candidate succeeds, so the increased effort budget
+is decisive in this run; the resource alternatives are retained but not needed.
+The final selection stage, including scheduling and package construction,
+takes 179 seconds. The complete invocation takes about five minutes. Incremental
+checks for 195,656-transfer and 127,500-transfer phases finish in about 13 and
+15 seconds respectively. Package support reserves 38,516 bytes per tile for
+exchange tables. The profile is rendered as `profile.html` in the run directory.
+The remaining 729-by-16 coefficient-packing kernel reaches 77,790 cycles on only
+80 tiles and accounts for 160,992 cycles of combined phase spans across its two
+occurrences; broad shortlist retention alone does not fix that implementation.
 
 Remaining structural limitations include standalone projection bias additions
 (which require row-major traversal), separate Q/K/V GEMMs in this benchmark, and
