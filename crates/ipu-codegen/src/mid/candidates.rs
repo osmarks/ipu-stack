@@ -284,9 +284,10 @@ pub(super) fn plans(
             .unwrap_or(u16::MAX)
             .min(config.tile_count / heads);
         if query_partitions != 0 {
-            let key_partitions =
-                u16::try_from(key.shape.0[1].div_ceil(AMP_INNER_BLOCK)).unwrap_or(u16::MAX);
-            if key_partitions == 0 || heads.saturating_mul(key_partitions) > config.tile_count {
+            let key_partitions = u16::try_from(key.shape.0[1].div_ceil(AMP_INNER_BLOCK))
+                .unwrap_or(u16::MAX)
+                .min(config.tile_count / heads);
+            if key_partitions == 0 {
                 return plans;
             }
             let padded_query_dimension =

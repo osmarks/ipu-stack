@@ -72,9 +72,12 @@ impl MemoryPeaks {
         tile_memory_budget_bytes: u64,
     ) -> bool {
         self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
-            && self.total.saturating_add(reserved_standard_bytes)
+            // Row storage is a coarse ranking estimate: it sums independent
+            // phase maxima and cannot prove that an allocation is impossible.
+            // Exact encoded rows participate in package acceptance after scheduling.
+            && self.total.saturating_sub(self.exchange_rows).saturating_add(reserved_standard_bytes)
                 <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
-            && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
+            && self.contiguous_overflow(reserved_standard_bytes) == 0
     }
 
     pub(crate) fn standard_contiguous_overflow(self) -> u64 {

@@ -263,3 +263,35 @@ The rerun with the updated cost model retains the same selected layout and
 passes at the same 901,476 cycles; its profile is
 `artifacts/vit/costed-panel-so400m-fp8/profile.html`. All 162 codegen tests,
 six benchmark/CLI tests, the graph doctest, and Clippy pass.
+
+Full-size batch scaling checks exposed two early planning restrictions. At batch
+8, 128 attention streams times twelve 64-row key panels exceeded the tile count;
+key ownership now caps its partitions at the available tiles per stream, allowing
+multiple panels per owner. Both layout preparation and consumer implementations
+already support that distribution. A regression covers the 1536-panel/1472-tile
+case.
+
+Batch 4's previous down-projection rejection included 187,196 estimated row-table
+bytes in its 575,996-byte peak. After the attention fix, batch 8's rejected peak
+included 165,904 row bytes in 572,144 total bytes. Those estimates sum independent
+phase maxima and proved much larger than actual tables at batch 1. The hard
+planning screen now checks tensor storage and fixed support; estimated rows stay
+in Pareto ranking, and exact encoded rows remain part of package acceptance.
+Memory rejection messages now expose the row component rather than incorrectly
+calling the entire estimate tensor storage. Full reruns are under
+`artifacts/vit/tensor-budget-full-b{2,4,8}-fp8/`; the earlier runs are retained
+under `panel-full-*` and `shared-panels-full-*`.
+
+The fixed 512 Mi history-entry encoding budget also rejected all eight batch-2
+finalists (1,048 seconds in final selection). With the existing incremental
+encoder, one complete pass can itself exceed that limit on a larger phase.
+The budget now scales with a conservative endpoint-history work bound:
+`max(512 Mi, 4 * sum((sends + receives) * (1 + sends + 3 * receives)))`.
+This bounds retries relative to the input's inherent work; it does not remove
+the encoder's quadratic cost. New runs are under
+`artifacts/vit/scaled-budget-full-b{2,4}-fp8/`. Obsolete tensor-budget-only runs
+were stopped after repeated fixed-budget failures; their logs remain available.
+Batch 8 still fails the planner's tensor-memory screen at the MLP up-projection
+(795,856 total estimated bytes, including 214,464 row bytes, with 385,024 bytes
+of peak interleaved storage). This is a failure of the available/planned
+candidates, not a measured hardware batch-size ceiling.

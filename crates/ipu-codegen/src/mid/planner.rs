@@ -697,6 +697,7 @@ pub(super) fn lower_operation_candidates(
                     operation: operation.id,
                     standard: peak.standard,
                     standard_reservation: config.standard_memory_reservation_bytes,
+                    exchange_rows: peak.exchange_rows,
                     interleaved: peak.interleaved,
                     total: peak.total,
                     standard_contiguous_overflow: peak

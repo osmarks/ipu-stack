@@ -466,12 +466,13 @@ pub enum LoweringError {
     #[error("operation {0:?} has no legal format candidate")]
     NoCandidate(OperationId),
     #[error(
-        "operation {operation:?} has no candidate within tile SRAM (smallest rejected peak: standard {standard} bytes plus {standard_reservation} bytes package support, interleaved {interleaved} bytes, simultaneous tensor total {total} bytes, contiguous-standard overflow {standard_contiguous_overflow} bytes)"
+        "operation {operation:?} has no candidate within tile SRAM (smallest rejected peak: standard {standard} bytes plus {standard_reservation} bytes package support, interleaved {interleaved} bytes, total {total} bytes including {exchange_rows} bytes estimated exchange tables, contiguous-standard overflow {standard_contiguous_overflow} bytes)"
     )]
     InsufficientMemory {
         operation: OperationId,
         standard: u64,
         standard_reservation: u64,
+        exchange_rows: u64,
         interleaved: u64,
         total: u64,
         standard_contiguous_overflow: u64,

@@ -1845,11 +1845,24 @@ struct MaterializedSchedule {
 impl MaterializedSchedule {
     fn new(tile_count: u16, transfers: &[PendingTransfer]) -> Self {
         let transfer_count = transfers.len();
+        // A fixed history-entry budget becomes an accidental size cutoff: one
+        // complete incremental pass itself grows quadratically per endpoint.
+        // Allow four conservative full-pass bounds, with headroom for small
+        // phases. This bounds retry effort relative to the input's inherent work.
+        let mut endpoints = vec![(0u64, 0u64); usize::from(tile_count)];
+        for transfer in transfers {
+            endpoints[usize::from(transfer.source)].0 += 1;
+            for &(tile, _) in &transfer.destinations {
+                endpoints[usize::from(tile)].1 += 1;
+            }
+        }
+        let history_work = endpoints.into_iter().fold(0u64, |work, (sends, receives)| {
+            // Each receive can introduce mux, pointer and mode controls.
+            work.saturating_add((sends + receives).saturating_mul(1 + sends + 3 * receives))
+        });
+        let validation_budget = (512 * 1024 * 1024).max(history_work.saturating_mul(4));
         Self {
-            // Bound the expensive alignment fallback, not ordinary deferred scheduling.
-            // Charge endpoint history revisited, so many independent transfers
-            // remain cheap while repeated long-prefix encoding stops promptly.
-            builder: PhaseProgramBuilder::new(tile_count).with_validation_budget(512 * 1024 * 1024),
+            builder: PhaseProgramBuilder::new(tile_count).with_validation_budget(validation_budget),
             horizon: 0,
             tile_availability: vec![TileAvailability::default(); usize::from(tile_count)],
             memory_accesses: (0..tile_count)

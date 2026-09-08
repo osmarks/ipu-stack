@@ -2117,3 +2117,53 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
         assert!(total[0] < total[1]);
     }
 }
+
+#[test]
+fn attention_can_share_key_panels_when_streams_exceed_panel_owner_budget() {
+    // Batch eight has 128 heads and twelve key panels: 1536 panels on 1472
+    // tiles. Some owners must store two panels, which the layout already allows.
+    let mut graph = ComputeGraph::new();
+    let q = graph.host_input("q", [128, 729, 72]).unwrap();
+    let k = graph.host_input("k", [128, 729, 72]).unwrap();
+    let v = graph.host_input("v", [128, 729, 72]).unwrap();
+    let output = graph.flash_attention(q, k, v).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let input = TensorType {
+        shape: TensorShape(vec![128, 729, 72]),
+        format: format(Precision::F16, Layout::head_sharded(128)),
+    };
+    let plans = candidates::plans(
+        &graph.operations()[0],
+        &[input.clone(), input.clone(), input],
+        &[false; 3],
+        &TensorShape(vec![128, 729, 72]),
+        &PipelineConfig::new(1472),
+        &Ipu21CostModel,
+        false,
+        None,
+        &[],
+        &[],
+    );
+    assert!(!plans.is_empty());
+    for plan in plans {
+        let layout = &plan.requirements.inputs[1].format.layout;
+        assert!(layout.tiling.tile_count <= 1472);
+        assert!(layout.resolve(&TensorShape(vec![128, 729, 72])).is_ok());
+    }
+}
+
+#[test]
+fn estimated_exchange_rows_rank_plans_without_proving_tensor_overflow() {
+    let peaks = MemoryPeaks {
+        standard: 544_876,
+        interleaved: 191_488,
+        total: 575_996,
+        exchange_rows: 187_196,
+        maximum_standard_allocation: 122_880,
+    };
+    let reservation = 49_152;
+    assert!(peaks.fits_ipu21_with_budget(reservation, 512 * 1024));
+    assert!(!peaks.fits_ipu21_with_budget(reservation, 400 * 1024));
+    // Keep the table estimate in the resource objectives used by the beam.
+    assert_eq!(peaks.objectives()[5], 187_196);
+}
