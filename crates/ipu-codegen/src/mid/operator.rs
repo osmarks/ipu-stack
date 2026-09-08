@@ -45,6 +45,8 @@ pub enum TileKernelSpec {
         output_columns: u32,
     },
     Gelu,
+    BiasGelu,
+    AddLayerNorm,
     LayerNorm,
     /// FP32 mean and centered squared deviation for each feature shard.
     LayerNormMoments,

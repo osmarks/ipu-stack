@@ -68,11 +68,20 @@ impl TileGraphBuilder {
                                     self.shards[source.index() as usize].tile == tile
                                         && (!matches!(
                                             kernel,
-                                            TileKernelSpec::Gelu | TileKernelSpec::Add
+                                            TileKernelSpec::Gelu
+                                                | TileKernelSpec::Add
+                                                | TileKernelSpec::BiasGelu
+                                                | TileKernelSpec::AddLayerNorm
                                         ) || self.broadcast_view(source, output).is_some())
                                 })
                                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                            if matches!(kernel, TileKernelSpec::Add) && window.0.is_empty() {
+                            if matches!(
+                                kernel,
+                                TileKernelSpec::Add
+                                    | TileKernelSpec::BiasGelu
+                                    | TileKernelSpec::AddLayerNorm
+                            ) && window.0.is_empty()
+                            {
                                 self.broadcast_view(source, output)
                                     .ok_or(ExpansionError::InvalidOperatorPlan)
                             } else {

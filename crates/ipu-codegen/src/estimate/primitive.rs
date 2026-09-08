@@ -127,6 +127,17 @@ pub(crate) fn kernel_cycles(
         }
         TileKernelSpec::Gelu => elements.saturating_mul(10),
         TileKernelSpec::Add => elements.saturating_mul(3),
+        TileKernelSpec::BiasGelu => {
+            return rows
+                .saturating_mul(
+                    crate::kernel::cost::f16_gelu_cycles(elements.checked_div(rows).unwrap_or(0))
+                        .saturating_sub(330)
+                        + 40,
+                )
+                .saturating_add(elements.saturating_mul(2))
+                .saturating_add(330);
+        }
+        TileKernelSpec::AddLayerNorm => elements.saturating_mul(15),
         TileKernelSpec::LayerNorm => elements.saturating_mul(14),
         TileKernelSpec::LayerNormMoments => inputs[0]
             .shape

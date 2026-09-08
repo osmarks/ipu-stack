@@ -9,6 +9,9 @@ pub(crate) struct Options {
     /// Use a small image/width to validate the complete graph quickly.
     #[arg(long)]
     pub vit_small: bool,
+    /// Override image side length while retaining the selected model width.
+    #[arg(long)]
+    pub vit_image_size: Option<u32>,
 }
 
 pub(crate) fn build(options: &Options) -> Result<ComputeGraph> {
@@ -19,7 +22,14 @@ pub(crate) fn build(options: &Options) -> Result<ComputeGraph> {
         (378, 14, 1152, 4304, 16)
     };
     ensure!(options.vit_batch > 0, "--vit-batch must be nonzero");
-    let tokens = (image / patch) * (image / patch);
+    let image = options.vit_image_size.unwrap_or(image);
+    ensure!(
+        image > 0 && image.is_multiple_of(patch),
+        "ViT image side must be a positive multiple of {patch}"
+    );
+    let tokens = (image / patch)
+        .checked_mul(image / patch)
+        .ok_or_else(|| anyhow::anyhow!("ViT token count overflow"))?;
     let mut g = ComputeGraph::new();
     // Nonoverlapping convolution is GEMM on host-packed NHWC image patches.
     // The host supplies every pixel, in [patch_y, patch_x, y, x, channel] order.
@@ -131,6 +141,7 @@ mod tests {
         let g = build(&Options {
             vit_batch: 1,
             vit_small: false,
+            vit_image_size: None,
         })?;
         let image = g
             .inputs()

@@ -7,7 +7,7 @@ mod mid;
 mod primitive;
 mod program;
 pub(crate) use mid::{
-    analyze as analyze_mid, region_estimate, region_peak_memory,
+    analyze as analyze_mid, operation_cost, region_estimate, region_peak_memory,
     region_peak_memory_with_multiplicity, unavailable_memory,
 };
 pub(crate) use program::{ProgramCycles, program_cycles, scheduled_program_cycles};

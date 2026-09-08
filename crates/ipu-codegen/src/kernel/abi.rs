@@ -293,6 +293,18 @@ pub fn tile_kernel_abi(
                 3,
                 &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
             ),
+            TileKernelSpec::BiasGelu => (
+                KernelSymbols::Exact("bias_gelu_f16"),
+                KernelAvailability::Implemented,
+                2,
+                &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+            ),
+            TileKernelSpec::AddLayerNorm => (
+                KernelSymbols::Exact("add_layer_norm_f16"),
+                KernelAvailability::Implemented,
+                4,
+                &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+            ),
             TileKernelSpec::Gelu => {
                 let symbol = gelu_symbol(requirements).unwrap_or("unsupported_gelu");
                 (
@@ -546,7 +558,10 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::RequirementMismatch);
         }
     }
-    if matches!(kernel, TileKernelSpec::LayerNorm) {
+    if matches!(
+        kernel,
+        TileKernelSpec::LayerNorm | TileKernelSpec::AddLayerNorm
+    ) {
         let width = matrix_extent(run, true, true)?;
         if width == 0 || !width.is_multiple_of(2) || matrix_extent(run, false, true)? != width {
             return Err(KernelAbiError::RequirementMismatch);
@@ -580,6 +595,38 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                     return Err(KernelAbiError::RequirementMismatch);
                 }
             }
+        }
+    }
+    if matches!(
+        kernel,
+        TileKernelSpec::BiasGelu | TileKernelSpec::AddLayerNorm
+    ) {
+        let width = matrix_extent(run, true, true)?;
+        if !width.is_multiple_of(2)
+            || width == 0
+            || run.requirements.output.format.precision != Precision::F16
+            || run.requirements.output.format.layout.order != ElementOrder::RowMajor
+            || run
+                .requirements
+                .inputs
+                .iter()
+                .any(|input| input.format.precision != Precision::F16)
+            || run.inputs[0].views[0].extents != run.output.extents
+        {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+        let right = &run.inputs[1].views[0].extents;
+        if matches!(kernel, TileKernelSpec::AddLayerNorm) {
+            if right != &run.output.extents {
+                return Err(KernelAbiError::RequirementMismatch);
+            }
+        } else if right
+            .iter()
+            .map(|e| e.physical_end - e.start)
+            .product::<u32>()
+            != width
+        {
+            return Err(KernelAbiError::RequirementMismatch);
         }
     }
     if matches!(kernel, TileKernelSpec::Gelu) {

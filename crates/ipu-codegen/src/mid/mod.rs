@@ -2,6 +2,8 @@
 //! Tile enumeration occurs only after selection, in low expansion.
 
 mod copy;
+mod elementwise;
+mod packing;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 mod primitive;
@@ -91,7 +93,15 @@ pub(crate) fn lower_finalists(
         .collect::<LoweringResult<Vec<_>>>()?;
     let mut candidates = Vec::with_capacity(resolved.len() * 2);
     for program in resolved {
+        let program = if config.diagnostic_checkpoints {
+            program
+        } else {
+            program.with_elementwise_fusions().unwrap_or(program)
+        };
         if !config.diagnostic_checkpoints {
+            if let Some(packed) = program.with_distributed_packing() {
+                candidates.push(packed);
+            }
             for limit in 2..=config.max_parallel_reductions {
                 if let Some(overlapped) = program.with_overlapped_reductions(limit)
                     && !candidates.contains(&overlapped)

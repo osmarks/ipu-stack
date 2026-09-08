@@ -62,6 +62,13 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             2.0,
             "layernorm: normalization and affine arithmetic",
         ),
+        TileKernelSpec::BiasGelu => (logical, physical, 3.25, "bias add and GeLU arithmetic"),
+        TileKernelSpec::AddLayerNorm => (
+            logical,
+            physical,
+            4.75,
+            "residual add and layernorm arithmetic",
+        ),
         TileKernelSpec::LayerNorm => (
             logical,
             physical,

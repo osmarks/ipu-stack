@@ -41,19 +41,28 @@ impl KernelBuildPlan {
         for (configuration, rows) in rows {
             plan.add_gemm(configuration, rows);
         }
-        if exact_symbols.contains("layer_norm_f16") {
+        for (symbol, extra) in [
+            ("layer_norm_f16", None),
+            ("add_layer_norm_f16", Some("-DNORM_WITH_ADD")),
+        ] {
+            if !exact_symbols.contains(symbol) {
+                continue;
+            }
+            let flags = extra.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let mut codelet_flags = vec!["-O2".into(), "-DVERTEX_LayerNormF16".into()];
+            codelet_flags.extend(flags.clone());
             plan.compilations.extend([
                 KernelCompilation {
                     source: "elementwise_f16.cpp",
-                    name: "layer_norm_f16_codelet".into(),
-                    flags: vec!["-O2".into(), "-DVERTEX_LayerNormF16".into()],
+                    name: format!("{symbol}_codelet"),
+                    flags: codelet_flags,
                     retained_symbols: vec![],
                 },
                 KernelCompilation {
                     source: "layer_norm_f16.S",
-                    name: "layer_norm_f16_wrapper".into(),
-                    flags: vec![],
-                    retained_symbols: vec!["layer_norm_f16".into()],
+                    name: format!("{symbol}_wrapper"),
+                    flags,
+                    retained_symbols: vec![symbol.into()],
                 },
             ]);
         }
@@ -66,13 +75,18 @@ impl KernelBuildPlan {
                 &[3, 4, 2, 5, 6, 7],
             );
         }
-        if exact_symbols.contains("gelu_tanh_approx_f16") {
-            plan.compilations.push(KernelCompilation {
-                source: "gelu_f16.S",
-                name: "gelu_f16".into(),
-                flags: Vec::new(),
-                retained_symbols: vec!["gelu_tanh_approx_f16".into()],
-            });
+        for (symbol, extra) in [
+            ("gelu_tanh_approx_f16", None),
+            ("bias_gelu_f16", Some("-DGELU_WITH_BIAS")),
+        ] {
+            if exact_symbols.contains(symbol) {
+                plan.compilations.push(KernelCompilation {
+                    source: "gelu_f16.S",
+                    name: symbol.into(),
+                    flags: extra.into_iter().map(str::to_owned).collect(),
+                    retained_symbols: vec![symbol.into()],
+                });
+            }
         }
         if exact_symbols.contains("reduce_sum_f16") {
             plan.compilations.push(KernelCompilation {
@@ -116,6 +130,7 @@ impl KernelBuildPlan {
         }
         let has_worker_codelets = [
             "layer_norm_f16",
+            "add_layer_norm_f16",
             "layer_norm_moments",
             "layer_norm_apply",
             "add_f16",

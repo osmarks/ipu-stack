@@ -38,6 +38,13 @@
 	.endm
 
 	.macro GELU_TWO_PAIRS offset
+#ifdef GELU_WITH_BIAS
+	ld32 $a2, $m9, $m15, \offset
+	ld32 $a3, $m9, $m15, (\offset + 1)
+	f16v4add $a0:1, $a0:1, $a2:3
+	ldconst $a4, GELU_BETA_F16X2
+	ldconst $a5, GELU_ALPHA_F16X2
+#endif
 	ld32 $a2, $mvertex_base, $m15, 3
 	ld32 $a3, $mvertex_base, $m15, 3
 	f16v4min $a0:1, $a0:1, $a2:3
@@ -53,6 +60,12 @@
 	  f16v2tanh $a2, $a2 }
 	{ ld32 $a1, $m3, $m15, (\offset + 1)
 	  f16v2tanh $a3, $a3 }
+#ifdef GELU_WITH_BIAS
+	// Polynomial constants are dead here; use their registers to reload x+b.
+	ld32 $a4, $m9, $m15, \offset
+	ld32 $a5, $m9, $m15, (\offset + 1)
+	f16v4add $a0:1, $a0:1, $a4:5
+#endif
 	f16v4add $a2:3, $a6:BL, $a2:3
 	f16v4mul $a2:3, $a7:BL, $a2:3
 	f16v4mul $a2:3, $a0:1, $a2:3
@@ -91,7 +104,14 @@
 	add $m11, $m11, -32
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
+#ifdef GELU_WITH_BIAS
+	// m4 bias, m5 rows, m6 row width; the ordinary entry takes m4 elements.
+	st32 $m5, $m11, $m15, 2
+	st32 $m4, $m11, $m15, 5
+	st32 $m6, $m11, $m15, 6
+#else
 	st32 $m4, $m11, $m15, 2
+#endif
 	ldconst $m0, 0x48004800
 	st32 $m0, $m11, $m15, 3
 	ldconst $m0, 0xc800c800
@@ -104,14 +124,30 @@
 	.size \symbol, .-\symbol
 	.endm
 
+#ifdef GELU_WITH_BIAS
+	GELU_ENTRY bias_gelu_f16, .Lgelu_contiguous_worker
+#else
 	GELU_ENTRY gelu_tanh_approx_f16, .Lgelu_contiguous_worker
+#endif
 
 	.worker
 	.p2align 3
 .Lgelu_contiguous_worker:
+#ifdef GELU_WITH_BIAS
+	ld32 $m7, $mvertex_base, $m15, 2
+	setzi $m1, 0
+.Lgelu_row:
+#endif
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
+#ifdef GELU_WITH_BIAS
+	ld32 $m8, $mvertex_base, $m15, 6
+	ld32 $m9, $mvertex_base, $m15, 5
+	add $m2, $m2, $m1
+	add $m3, $m3, $m1
+#else
 	ld32 $m8, $mvertex_base, $m15, 2
+#endif
 	shr $m8, $m8, 1
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
@@ -122,6 +158,9 @@
 	shl $m5, $m4, 2
 	add $m2, $m2, $m5
 	add $m3, $m3, $m5
+#ifdef GELU_WITH_BIAS
+	add $m9, $m9, $m5
+#endif
 	setzi $m5, 8
 	add $m6, $m5, -1
 	and $m6, $m8, $m6
@@ -130,6 +169,9 @@
 	GELU_EIGHT_PAIRS
 	add $m2, $m2, 192
 	add $m3, $m3, 192
+#ifdef GELU_WITH_BIAS
+	add $m9, $m9, 192
+#endif
 	add $m4, $m4, 48
 	cmpult $m6, $m4, $m8
 	brnz $m6, .Lgelu_contiguous_aligned_loop
@@ -141,12 +183,21 @@
 	GELU_EIGHT_PAIRS
 	add $m2, $m2, 192
 	add $m3, $m3, 192
+#ifdef GELU_WITH_BIAS
+	add $m9, $m9, 192
+#endif
 	add $m4, $m4, 48
 	cmpult $m6, $m4, $m8
 	brnz $m6, .Lgelu_contiguous_loop
 	bri .Lgelu_contiguous_done
 .Lgelu_contiguous_tail:
 	ld32 $a0, $m3, $m15, 0
+#ifdef GELU_WITH_BIAS
+	LOAD_GELU_CONSTANTS
+	ld32 $a2, $m9, $m15, 0
+	f16v2add $a0, $a0, $a2
+	add $m9, $m9, 4
+#endif
 	GELU_PAIR $a0
 	st32 $a2, $m2, $m15, 0
 	add $m2, $m2, 4
@@ -155,4 +206,10 @@
 	cmpult $m6, $m4, $m8
 	brnz $m6, .Lgelu_contiguous_tail
 .Lgelu_contiguous_done:
+#ifdef GELU_WITH_BIAS
+	shl $m6, $m8, 2
+	add $m1, $m1, $m6
+	sub $m7, $m7, 1
+	brnz $m7, .Lgelu_row
+#endif
 	exitz $m15

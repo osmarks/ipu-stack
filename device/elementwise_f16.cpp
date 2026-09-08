@@ -4,20 +4,35 @@
 using namespace poplar;
 
 #ifdef VERTEX_LayerNormF16
-class LayerNormF16 : public MultiVertex {
+#ifdef NORM_WITH_ADD
+#define NORM_VERTEX AddLayerNormF16
+#else
+#define NORM_VERTEX LayerNormF16
+#endif
+class NORM_VERTEX : public MultiVertex {
 public:
-  Input<Vector<half, VectorLayout::ONE_PTR>> source, scale, bias;
+  Input<Vector<half, VectorLayout::ONE_PTR>> source;
+#ifdef NORM_WITH_ADD
+  Input<Vector<half, VectorLayout::ONE_PTR>> right;
+#endif
+  Input<Vector<half, VectorLayout::ONE_PTR>> scale, bias;
   Output<Vector<half, VectorLayout::ONE_PTR>> destination;
   unsigned rows, width;
   InOut<Vector<float, VectorLayout::ONE_PTR>> scratch;
   unsigned stage;
+  half2 load(unsigned i) const {
+    half2 value = reinterpret_cast<const half2 *>(&source[0])[i];
+#ifdef NORM_WITH_ADD
+    value += reinterpret_cast<const half2 *>(&right[0])[i];
+#endif
+    return value;
+  }
   bool compute(unsigned worker) {
     auto *partials = reinterpret_cast<float2 *>(&scratch[0]);
-    const auto *x = reinterpret_cast<const half2 *>(&source[0]);
     if (stage == 0) {
       float2 sum = {0, 0};
       for (unsigned i = worker; i < width / 2; i += 6)
-        sum += __builtin_convertvector(x[i], float2);
+        sum += __builtin_convertvector(load(i), float2);
       partials[worker] = sum;
       return true;
     }
@@ -27,7 +42,7 @@ public:
     if (stage == 1) {
       float2 variance = {0, 0};
       for (unsigned i = worker; i < width / 2; i += 6) {
-        const float2 d = __builtin_convertvector(x[i], float2) - mean;
+        const float2 d = __builtin_convertvector(load(i), float2) - mean;
         variance += d * d;
       }
       partials[6 + worker] = variance;
@@ -40,7 +55,7 @@ public:
     const auto *beta = reinterpret_cast<const half2 *>(&bias[0]);
     auto *y = reinterpret_cast<half2 *>(&destination[0]);
     for (unsigned i = worker; i < width / 2; i += 6) {
-      const float2 normalized = (__builtin_convertvector(x[i], float2) - mean) * inverse;
+      const float2 normalized = (__builtin_convertvector(load(i), float2) - mean) * inverse;
       const float2 result = normalized * __builtin_convertvector(gamma[i], float2)
                             + __builtin_convertvector(beta[i], float2);
       y[i] = __builtin_convertvector(result, half2);

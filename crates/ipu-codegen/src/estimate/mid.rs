@@ -167,7 +167,7 @@ fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
     })
 }
 
-fn operation_cost(
+pub(crate) fn operation_cost(
     operation: &MidOperation,
     values: &[MidValue],
 ) -> Option<(ProgramCycles, MemoryUsage, u64)> {
