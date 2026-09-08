@@ -98,7 +98,7 @@ retained separately there; they are not the final planner's performance.
 ## Exchange table budget
 
 Two independent limits apply: `exchange_transfer_limit_per_tile` defaults to
-8,192 static endpoint fragments per tile before scheduling;
+16,384 static endpoint fragments per tile before scheduling;
 `exchange_table_budget_bytes` defaults to 64 KiB of actual encoded tables per
 tile. Neither converts a heuristic byte estimate into a transfer count.
 The mid estimator's 256-byte payload assumption is only a cycle/ranking
@@ -139,8 +139,8 @@ geometry footprints separately.
 
 Validation: full FP8 B2 ViT now completes mid planning, where it previously
 stopped at operation 19. Its captured first finalist has approximately 12,500
-geometry-derived endpoint fragments on the busiest tile, still above the new
-8,192-fragment default. This run did not schedule exchanges or execute hardware;
+geometry-derived endpoint fragments on the busiest tile, above the former
+8,192-fragment default but below the increased 16,384-fragment default. This run did not schedule exchanges or execute hardware;
 it does not establish that another finalist or retry fits both limits.
 Regression coverage includes a contiguous 8 KiB span, disjoint phase owners,
 Repeat reuse, fragment-limit boundaries, and independent encoded-byte checks.

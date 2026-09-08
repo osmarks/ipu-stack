@@ -269,7 +269,7 @@ impl PipelineConfig {
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
             exchange_table_budget_bytes: 64 * 1024,
-            exchange_transfer_limit_per_tile: 8192,
+            exchange_transfer_limit_per_tile: 16_384,
             exchange_table_cost_per_byte: 0,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,

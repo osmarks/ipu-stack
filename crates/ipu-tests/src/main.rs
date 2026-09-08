@@ -121,7 +121,7 @@ struct Arguments {
     /// Cap actual encoded exchange table storage per tile (default 64 KiB).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_table_budget_kib: Option<u64>,
-    /// Cap geometry-derived static transfer fragments per tile (default 8192).
+    /// Cap geometry-derived static transfer fragments per tile (default 16384).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_transfer_limit_per_tile: Option<u64>,
     /// Rank this many complete planner finalists with physical exchange scheduling.
