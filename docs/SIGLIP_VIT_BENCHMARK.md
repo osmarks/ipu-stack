@@ -355,3 +355,10 @@ current retained layouts/placement strategy are insufficient. Further work
 should improve row-broadcast execution, batch-aware row ownership, compact
 exchange storage and resource-aware candidate selection rather than treating
 additional compiler effort as a memory solution.
+
+The September 8 pointwise/packing update supersedes the above batch-2 runtime:
+`artifacts/vit/fused-distributed-full-b2-fp8/profile.html` measures 1,296,198
+cropped cycles (0.864132 ms/batch), with a passing hardware/reference check.
+See [implementation and measurements](VIT_POINTWISE_AND_PACKING_2026_09_08.md)
+for broadcast loops, batch-row ownership, distributed MAP layernorm, fusion,
+and distributed coefficient packing.
