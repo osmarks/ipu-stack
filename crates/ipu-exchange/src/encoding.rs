@@ -252,6 +252,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validated_transfer_commits_its_encoded_trial_and_rejects_stale_trials() {
+        let topology = Topology::c600();
+        let plan = topology.multicast(0, &[2], 64, 0).unwrap();
+        let mut builder = PhaseProgramBuilder::new(4);
+        let offset = builder
+            .earliest_transfer_offset(0, &[], &[2], &plan, 64, 0)
+            .unwrap();
+        let encoded = builder
+            .staged
+            .as_ref()
+            .unwrap()
+            .updates
+            .iter()
+            .map(|(tile, schedule)| (*tile, schedule.encoded().unwrap().clone()))
+            .collect::<Vec<_>>();
+        builder
+            .append_transfer_at(0, &[], &[2], &plan, offset, 64)
+            .unwrap();
+        assert!(builder.staged.is_none());
+        for (tile, row) in encoded {
+            assert!(Arc::ptr_eq(
+                &row,
+                builder.tile_states[usize::from(tile)].encoded().unwrap()
+            ));
+        }
+        let before = builder.finish().unwrap();
+        let offset = builder
+            .earliest_transfer_offset(0, &[], &[2], &plan, 64, 0)
+            .unwrap();
+        assert!(
+            builder
+                .append_transfer_at(0, &[2], &[2], &plan, offset, 64)
+                .is_err()
+        );
+        assert_eq!(builder.finish().unwrap(), before);
+        // A different transfer must not accidentally commit the cached rows.
+        builder
+            .earliest_transfer_offset(0, &[], &[2], &plan, 64, 0)
+            .unwrap();
+        let other = topology.multicast(1, &[3], 32, 0).unwrap();
+        let offset = builder
+            .earliest_transfer_offset_deferred(1, &[], &[3], &other, 32, 0)
+            .unwrap();
+        let mut reference = builder.clone();
+        reference.staged = None;
+        reference
+            .append_transfer_at(1, &[], &[3], &other, offset, 32)
+            .unwrap();
+        builder
+            .append_transfer_at(1, &[], &[3], &other, offset, 32)
+            .unwrap();
+        assert_eq!(builder.finish().unwrap(), reference.finish().unwrap());
+    }
+
+    #[test]
     fn rejected_receive_preserves_stream_and_encoding() {
         let row = Topology::c600()
             .multicast(0, &[2], 64, 0)

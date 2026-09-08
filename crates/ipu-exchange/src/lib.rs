@@ -276,6 +276,34 @@ struct ScheduledSenderRow {
 pub struct PhaseProgramBuilder {
     tile_states: Vec<TileProgramSchedule>,
     validation_budget: Option<Arc<AtomicU64>>,
+    staged: Option<StagedTransfer>,
+}
+
+#[derive(Clone, Debug)]
+struct StagedTransfer {
+    source: u16,
+    receivers: Vec<u16>,
+    plan: MulticastPlan,
+    offset: u32,
+    words: u32,
+    updates: Vec<(u16, TileProgramSchedule)>,
+}
+
+impl StagedTransfer {
+    fn matches(
+        &self,
+        source: u16,
+        receivers: &[u16],
+        plan: &MulticastPlan,
+        offset: u32,
+        words: u32,
+    ) -> bool {
+        self.source == source
+            && self.receivers == receivers
+            && self.plan == *plan
+            && self.offset == offset
+            && self.words == words
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,6 +329,7 @@ impl PhaseProgramBuilder {
         Self {
             tile_states: vec![TileProgramSchedule::default(); usize::from(tile_count)],
             validation_budget: None,
+            staged: None,
         }
     }
 
@@ -342,7 +371,7 @@ impl PhaseProgramBuilder {
     /// transfer. Compatibility is evaluated across the complete phase state;
     /// tile programs are not encoded until the phase is finished.
     pub fn earliest_transfer_offset(
-        &self,
+        &mut self,
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
@@ -366,7 +395,7 @@ impl PhaseProgramBuilder {
     /// the completed phase and retry with [`Self::earliest_transfer_offset`]
     /// if instruction alignment is not representable.
     pub fn earliest_transfer_offset_deferred(
-        &self,
+        &mut self,
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
@@ -387,7 +416,7 @@ impl PhaseProgramBuilder {
 
     #[allow(clippy::too_many_arguments)]
     fn earliest_transfer_offset_impl(
-        &self,
+        &mut self,
         source: u16,
         reserved_tiles: &[u16],
         receivers: &[u16],
@@ -399,14 +428,14 @@ impl PhaseProgramBuilder {
         if receivers.len() != plan.receivers.len() {
             return Err(ExchangeError::Schedule("receiver row count"));
         }
-        let source_schedule = self
-            .tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?;
         let mut offset = requested;
         loop {
             let previous = offset;
-            offset = source_schedule.earliest_sender_offset(&plan.sender, offset)?;
+            offset = self
+                .tile_states
+                .get(usize::from(source))
+                .ok_or(ExchangeError::Tile(source))?
+                .earliest_sender_offset(&plan.sender, offset)?;
             for &tile in reserved_tiles {
                 let schedule = self
                     .tile_states
@@ -415,9 +444,10 @@ impl PhaseProgramBuilder {
                 offset = offset.max(
                     schedule
                         .senders
-                        .iter()
-                        .map(|row| row.end_cycles)
-                        .fold(schedule.reserved_sender_end, u32::max),
+                        .last()
+                        .map_or(schedule.reserved_sender_end, |row| {
+                            row.end_cycles.max(schedule.reserved_sender_end)
+                        }),
                 );
             }
             for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
@@ -445,13 +475,20 @@ impl PhaseProgramBuilder {
     }
 
     fn transfer_is_encodable_at(
-        &self,
+        &mut self,
         source: u16,
         receivers: &[u16],
         plan: &MulticastPlan,
         schedule_offset: u32,
         words: u32,
     ) -> Result<(), ExchangeError> {
+        if self
+            .staged
+            .as_ref()
+            .is_some_and(|trial| trial.matches(source, receivers, plan, schedule_offset, words))
+        {
+            return Ok(());
+        }
         if let Some(budget) = &self.validation_budget {
             let work =
                 std::iter::once(&source)
@@ -471,32 +508,73 @@ impl PhaseProgramBuilder {
                 })
                 .map_err(|_| ExchangeError::ValidationBudgetExceeded)?;
         }
+        self.staged = None;
+        let updates =
+            self.prepare_transfer_at(source, receivers, plan, schedule_offset, words, true)?;
+        self.staged = Some(StagedTransfer {
+            source,
+            receivers: receivers.to_vec(),
+            plan: plan.clone(),
+            offset: schedule_offset,
+            words,
+            updates,
+        });
+        Ok(())
+    }
+
+    fn prepare_transfer_at(
+        &self,
+        source: u16,
+        receivers: &[u16],
+        plan: &MulticastPlan,
+        offset: u32,
+        words: u32,
+        validate: bool,
+    ) -> Result<Vec<(u16, TileProgramSchedule)>, ExchangeError> {
+        if receivers.len() != plan.receivers.len() {
+            return Err(ExchangeError::Schedule("receiver row count"));
+        }
         let source_state = self
             .tile_states
             .get(usize::from(source))
             .ok_or(ExchangeError::Tile(source))?;
-        // Warm successful prefixes before cloning. A new send can change how
-        // earlier controls encode, so an old encoding failure must not reject
-        // the speculative transfer before its new events have been added.
-        let _ = source_state.encoded();
+        // A newly added event can repair an invalid prefix. Warm successful
+        // encodings, but validate only after the trial has been applied.
+        if validate {
+            let _ = source_state.encoded();
+        }
         let mut source_schedule = source_state.clone();
-        source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
-        source_schedule.encoded()?;
+        source_schedule.append_sender_at(&plan.sender, offset)?;
+        if validate {
+            source_schedule.encoded()?;
+        }
+        let mut updates = vec![(source, source_schedule)];
+        let mut seen = HashSet::new();
         for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
-            let mut receiver_schedule = if receiver == source {
-                source_schedule.clone()
-            } else {
+            if !seen.insert(receiver) {
+                return Err(ExchangeError::DuplicateTile);
+            }
+            if receiver != source {
                 let state = self
                     .tile_states
                     .get(usize::from(receiver))
                     .ok_or(ExchangeError::Tile(receiver))?;
-                let _ = state.encoded();
-                state.clone()
+                if validate {
+                    let _ = state.encoded();
+                }
+                updates.push((receiver, state.clone()));
+            }
+            let schedule = if receiver == source {
+                &mut updates[0].1
+            } else {
+                &mut updates.last_mut().unwrap().1
             };
-            receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
-            receiver_schedule.encoded()?;
+            schedule.append_receiver_at(row, offset, words)?;
+            if validate {
+                schedule.encoded()?;
+            }
         }
-        Ok(())
+        Ok(updates)
     }
 
     /// Adds one transfer to the phase schedule. The transfer's sender and all
@@ -513,17 +591,14 @@ impl PhaseProgramBuilder {
     ) -> Result<PhaseTransferTiming, ExchangeError> {
         let transfer_timing =
             self.transfer_timing_at(source, receivers, plan, schedule_offset, words)?;
-        if receivers.len() != plan.receivers.len() {
-            return Err(ExchangeError::Schedule("receiver row count"));
-        }
-        let mut updates = Vec::with_capacity(receivers.len() + reserved_tiles.len() + 1);
-        let mut source_schedule = self
-            .tile_states
-            .get(usize::from(source))
-            .ok_or(ExchangeError::Tile(source))?
-            .clone();
-        source_schedule.append_sender_at(&plan.sender, schedule_offset)?;
-        updates.push((source, source_schedule));
+        let mut updates = match self.staged.take() {
+            Some(staged) if staged.matches(source, receivers, plan, schedule_offset, words) => {
+                staged.updates
+            }
+            _ => {
+                self.prepare_transfer_at(source, receivers, plan, schedule_offset, words, false)?
+            }
+        };
 
         for &tile in reserved_tiles {
             if tile == source
@@ -545,27 +620,6 @@ impl PhaseProgramBuilder {
             updates.push((tile, schedule));
         }
 
-        let mut seen_receivers = HashSet::new();
-        for (&receiver, row) in receivers.iter().zip(&plan.receivers) {
-            if !seen_receivers.insert(receiver)
-                || (receiver != source && updates.iter().any(|(tile, _)| *tile == receiver))
-            {
-                return Err(ExchangeError::DuplicateTile);
-            }
-            if receiver == source {
-                updates[0]
-                    .1
-                    .append_receiver_at(row, schedule_offset, words)?;
-            } else {
-                let mut receiver_schedule = self
-                    .tile_states
-                    .get(usize::from(receiver))
-                    .ok_or(ExchangeError::Tile(receiver))?
-                    .clone();
-                receiver_schedule.append_receiver_at(row, schedule_offset, words)?;
-                updates.push((receiver, receiver_schedule));
-            }
-        }
         for (tile, schedule) in updates {
             self.tile_states[usize::from(tile)] = schedule;
         }
@@ -704,10 +758,13 @@ impl TileProgramSchedule {
                 .end_cycles
                 .checked_add(offset)
                 .ok_or(ExchangeError::Schedule("send offset overflow"))?;
+            let next = self
+                .senders
+                .partition_point(|sender| sender.end_cycles <= start);
             let conflicting_sender = self
                 .senders
-                .iter()
-                .find(|sender| start < sender.end_cycles && sender.start_cycles < end);
+                .get(next)
+                .filter(|sender| sender.start_cycles < end);
             if let Some(sender) = conflicting_sender {
                 offset = sender
                     .end_cycles
@@ -772,7 +829,10 @@ impl TileProgramSchedule {
                 })
             });
             let sender_boundary = timing.events.iter().any(|event| {
-                self.senders.iter().any(|sender| {
+                let next = self
+                    .senders
+                    .partition_point(|sender| sender.start_cycles < event.cycles.saturating_sub(1));
+                self.senders.get(next).is_some_and(|sender| {
                     event.cycles == sender.start_cycles
                         || event.cycles == sender.start_cycles.saturating_add(1)
                 })
