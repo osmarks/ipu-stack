@@ -236,6 +236,13 @@ fn randomized_matching_wave_orders_preserve_memory_dependencies() {
             &incumbent,
         )
         .expect("balanced point-to-point phases have a matching-wave candidate");
+        assert_eq!(
+            Some(order.clone()),
+            order::reference_matching_wave_order(
+                &SchedulingProblem::new(&pending, tile_count),
+                &incumbent
+            )
+        );
         let mut positions = vec![usize::MAX; pending.len()];
         for (position, &index) in order.iter().enumerate() {
             assert_eq!(positions[index], usize::MAX);
