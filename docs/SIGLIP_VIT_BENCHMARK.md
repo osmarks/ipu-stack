@@ -343,3 +343,15 @@ past the obsolete empty-region check but fails a real 104,960-byte standard
 allocation on tile 46. Its provisional row reservation is 74,344 bytes.
 The earlier scaled-budget batch-4 run was stopped before its last candidate
 because it predated the allocator correction.
+
+Batch 4 completed unsuccessfully after exhausting all eight retained finalists.
+Four fail initial tensor placement (132,608 bytes on tile 0); finalists 3, 2,
+and 6 exhaust executable-region space during package support assembly; finalist
+7 fails the real tensor allocation described above. Final selection takes
+1,607,706 ms (26.8 minutes). There is no batch-4 device profile or runtime result.
+Batch 8's remaining rejection occurs earlier in planning, so no hardware result
+exists there either. Neither result proves a hardware batch-size ceiling: the
+current retained layouts/placement strategy are insufficient. Further work
+should improve row-broadcast execution, batch-aware row ownership, compact
+exchange storage and resource-aware candidate selection rather than treating
+additional compiler effort as a memory solution.
