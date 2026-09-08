@@ -644,7 +644,8 @@ fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
             &SchedulingProblem::new(&transfers, tile_count),
             &incumbent,
             true,
-        );
+        )
+        .unwrap();
         let mut repaired_positions = vec![usize::MAX; transfers.len()];
         for (position, &index) in repaired.iter().enumerate() {
             assert_eq!(repaired_positions[index], usize::MAX);

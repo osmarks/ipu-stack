@@ -343,11 +343,11 @@ pub(super) fn critical_neighborhood_order(
     problem: &SchedulingProblem<'_>,
     incumbent: &MaterializedSchedule,
     local: bool,
-) -> Vec<usize> {
+) -> Option<Vec<usize>> {
     let pending = problem.transfers;
     let tile_count = problem.tile_count;
     if pending.len() < 2 {
-        return incumbent.order.clone();
+        return Some(incumbent.order.clone());
     }
     let mut critical = vec![false; pending.len()];
     let mut cursor = incumbent
@@ -388,7 +388,7 @@ pub(super) fn critical_neighborhood_order(
         }
     }
     if neighborhood.iter().filter(|selected| **selected).count() < 2 {
-        return incumbent.order.clone();
+        return Some(incumbent.order.clone());
     }
 
     let dependents = &problem.dependents;
@@ -464,7 +464,7 @@ pub(super) fn critical_neighborhood_order(
                 visits,
                 "broader exchange repair reached its queue-work budget"
             );
-            return incumbent.order.clone();
+            return None;
         }
         if revision != groups[group].revision {
             continue;
@@ -494,7 +494,7 @@ pub(super) fn critical_neighborhood_order(
         let items = transfer.item_count().unwrap_or(transfer.words);
         let end = match start.checked_add(items) {
             Some(end) => end,
-            None => return incumbent.order.clone(),
+            None => return Some(incumbent.order.clone()),
         };
         availability[usize::from(transfer.source)].send = end;
         if let Some(tile) = transfer.reserved_source {
@@ -502,7 +502,7 @@ pub(super) fn critical_neighborhood_order(
         }
         let bytes = match transfer.words.checked_mul(4) {
             Some(bytes) => bytes,
-            None => return incumbent.order.clone(),
+            None => return Some(incumbent.order.clone()),
         };
         for &(tile, address) in &transfer.destinations {
             availability[usize::from(tile)].receive = end;
@@ -548,11 +548,11 @@ pub(super) fn critical_neighborhood_order(
         local,
         "finished exchange repair ordering"
     );
-    if order.len() == pending.len() {
+    Some(if order.len() == pending.len() {
         order
     } else {
         incumbent.order.clone()
-    }
+    })
 }
 
 #[cfg(test)]
@@ -782,7 +782,8 @@ mod tests {
             }
             let start = std::time::Instant::now();
             let result =
-                critical_neighborhood_order(&SchedulingProblem::new(&pending, 2), &incumbent, true);
+                critical_neighborhood_order(&SchedulingProblem::new(&pending, 2), &incumbent, true)
+                    .unwrap();
             eprintln!(
                 "repair_queue transfers={count} elapsed={:?}",
                 start.elapsed()
