@@ -321,3 +321,25 @@ target. Layernorm still uses only 729 tiles: its row-sharded candidate partition
 the token axis, leaving batches on the same owners. Batch-aware row ownership
 is therefore needed in addition to memory feasibility; higher batch alone does
 not automatically fill those idle tiles.
+
+The successful batch-2 package stores 67,651,392 physical weight bytes, versus
+67,219,936 at batch one. Input-projection weights remain 33,914,880 bytes in
+both. Thus the measured batch growth is not proportional replication of all
+weights. The per-weight inventory is saved beside each profile.
+
+With the empty-lower-region fix, batch 2 admits finalist 0 and completes both
+its ordinary and remapped package alternatives. The ordinary placement is
+selected and passes hardware/reference checks (maximum error 0.092773).
+`artifacts/vit/upper-region-full-b2-fp8/profile.html` measures 1,582,032 cropped
+cycles: 1.054688 ms/batch or 0.527344 ms/image, 14% more throughput than batch one.
+This is 1.8% slower than the prior finalist-2 package despite its preferable
+modelled score; the bounded exact shortlist accepts its first feasible finalist.
+Thus the allocator correction expands feasibility but is not itself a runtime
+speedup. Final selection takes 1,043 seconds.
+
+The corrected batch-4 run is `artifacts/vit/upper-region-full-b4-fp8/`.
+Finalists 3 and 2 still exhaust executable-region space; finalist 7 now gets
+past the obsolete empty-region check but fails a real 104,960-byte standard
+allocation on tile 46. Its provisional row reservation is 74,344 bytes.
+The earlier scaled-budget batch-4 run was stopped before its last candidate
+because it predated the allocator correction.
