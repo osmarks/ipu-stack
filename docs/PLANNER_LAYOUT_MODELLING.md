@@ -126,3 +126,18 @@ budget, before any exchange scheduling. This prevents the previous 105,852- and
 under the new default. Regression coverage checks a lower-exchange layernorm
 alternative, late fragmentation rejection, budget boundaries/override, and
 unchanged static footprint when increasing Repeat execution count.
+
+Exchange-aware shortlisting now refreshes row estimates before either early
+beam prune, including boundary conversions and cached operator implementations.
+It recomputes the prefix sum because fusion can remove earlier operations;
+Repeat contributes its body's static footprint once. The operator shortlist
+also reserves its minimum-row candidate before filling layout-diversity slots
+(when width is greater than one).
+
+When a search exhausts the exchange budget, it retries from the graph inputs
+with search penalties of 16, then 256 cycles per estimated table byte. This
+changes prefix retention, not reported execution cycles or the hard cap.
+Retries share cached operator implementations. The API field
+`exchange_table_cost_per_byte` can set the initial penalty; automatic retries
+only increase it. This is a bounded heuristic, not proof that every feasible
+layout will be found, and does not invoke physical exchange scheduling.

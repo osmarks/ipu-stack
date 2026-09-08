@@ -41,7 +41,25 @@ pub(crate) fn plan_finalists(
         })
         .as_ref()
         .map_err(|error| LoweringError::PlanningThreads(error.clone()))?;
-    pool.install(|| plan_in_pool(graph, config, costs, finalist_count))
+    pool.install(|| {
+        let mut search = config.clone();
+        let costs = MemoizedCostModel::new(costs, config.tile_count);
+        let mut result = plan_in_pool(graph, &search, &costs, finalist_count);
+        for penalty in [16, 256] {
+            if !matches!(result, Err(LoweringError::ExchangeBudgetExceeded { .. })) {
+                break;
+            }
+            if penalty <= search.exchange_table_cost_per_byte {
+                continue;
+            }
+            search.exchange_table_cost_per_byte = penalty;
+            if let Err(error) = &result {
+                tracing::info!(penalty, %error, "retrying planning with stronger exchange storage penalty");
+            }
+            result = plan_in_pool(graph, &search, &costs, finalist_count);
+        }
+        result
+    })
 }
 
 fn plan_in_pool(
@@ -75,7 +93,6 @@ fn plan_in_pool(
     });
     let config = resolved_config.as_ref().unwrap_or(config);
     let mut state = LoweringState::default();
-    let costs = MemoizedCostModel::new(costs, config.tile_count);
     let mut values = BTreeMap::new();
     let mut inputs = Vec::with_capacity(graph.inputs().len());
     for input in graph.inputs() {
@@ -117,7 +134,7 @@ fn plan_in_pool(
         graph.value_shapes(),
         graph,
         config,
-        &costs,
+        costs,
         &mut state,
         &RegionPlanningConstraints::default(),
     )?;
@@ -543,6 +560,7 @@ pub(super) fn lower_operation_candidates(
                     &mut next.state,
                     &mut next.operations,
                 )?;
+                refresh_exchange_rows(&mut next, costs);
                 expanded.push(next);
                 continue;
             }
@@ -608,6 +626,7 @@ pub(super) fn lower_operation_candidates(
                         maximum_standard = maximum_standard.max(memory.standard);
                     }
                     next.peak_memory.observe(usage, maximum_standard);
+                    refresh_exchange_rows(&mut next, costs);
                     next
                 })
                 .collect::<Vec<_>>();
@@ -623,6 +642,7 @@ pub(super) fn lower_operation_candidates(
                     costs,
                     screening_width,
                     &demands,
+                    config.exchange_table_cost_per_byte,
                 )
                 .0;
             }
@@ -634,33 +654,12 @@ pub(super) fn lower_operation_candidates(
             costs,
             screening_width,
             &demands,
+            config.exchange_table_cost_per_byte,
         )
         .0;
         let evaluated = shortlisted
             .into_par_iter()
             .map(|mut branch| {
-                // Construct only shortlisted implementations, retaining the
-                // fragments that the region builder will bind below.
-                for operation in &mut branch.operations {
-                    if let MidOperationKind::Operator {
-                        plan,
-                        implementation,
-                        ..
-                    } = &mut operation.kind
-                        && implementation.is_none()
-                    {
-                        let inputs = operation
-                            .inputs
-                            .iter()
-                            .map(|id| branch.state.get(*id).tensor_type.clone())
-                            .collect::<Vec<_>>();
-                        *implementation = costs.implementation(
-                            plan,
-                            &inputs,
-                            &branch.state.get(operation.results[0]).tensor_type,
-                        );
-                    }
-                }
                 let peak = beam_memory_peak(
                     costs,
                     &branch,
@@ -731,6 +730,7 @@ pub(super) fn lower_operation_candidates(
             costs,
             config.planning_beam_width.max(1),
             &demands,
+            config.exchange_table_cost_per_byte,
         );
         tracing::debug!(
             operation = operation.id.index(),
@@ -747,6 +747,7 @@ pub(super) fn lower_operation_candidates(
         beam = expanded;
     }
     let final_operation = source.len().saturating_sub(1);
+    let mut rejected_exchange = None::<u64>;
     let beam = beam
         .into_iter()
         .filter_map(|mut branch| {
@@ -763,11 +764,17 @@ pub(super) fn lower_operation_candidates(
                 graph,
                 &constraints.allocation_copies,
             );
-            (peak.exchange_rows <= config.exchange_table_budget_bytes
-                && (peak.fits_ipu21_with_budget(
-                    config.standard_memory_reservation_bytes,
-                    config.tile_memory_budget_bytes,
-                ) || contains_forced_plan(&branch.operations, config)))
+            if peak.exchange_rows > config.exchange_table_budget_bytes {
+                rejected_exchange = Some(
+                    rejected_exchange
+                        .map_or(peak.exchange_rows, |bytes| bytes.min(peak.exchange_rows)),
+                );
+                return None;
+            }
+            (peak.fits_ipu21_with_budget(
+                config.standard_memory_reservation_bytes,
+                config.tile_memory_budget_bytes,
+            ) || contains_forced_plan(&branch.operations, config))
             .then(|| {
                 branch.peak_memory = peak;
                 branch
@@ -783,6 +790,13 @@ pub(super) fn lower_operation_candidates(
         ))
     });
     if beam.is_empty() {
+        if let Some(estimated_bytes) = rejected_exchange {
+            return Err(LoweringError::ExchangeBudgetExceeded {
+                operation: source[final_operation].id,
+                estimated_bytes,
+                budget_bytes: config.exchange_table_budget_bytes,
+            });
+        }
         return Err(LoweringError::NoCandidate(source[0].id));
     }
     Ok(beam)
@@ -876,14 +890,24 @@ pub(super) fn retain_pareto_beam(
     costs: &impl CostModel,
     width: usize,
     demands: &OutputDemands,
+    exchange_table_cost_per_byte: u64,
 ) -> (Vec<BeamBranch>, usize, usize, usize) {
     let mut groups = BTreeMap::<FutureBeamState, Vec<RankedBeamBranch>>::new();
     for (order, branch) in branches.into_iter().enumerate() {
         let signature = future_beam_state(&branch, future_origins, constraints);
         let objective = PlanMetrics {
-            cycles: deferred_aware_branch_score(&branch, future_origins).saturating_add(
-                format_equality_cost(&branch, &constraints.required_equal_formats, costs),
-            ),
+            cycles: deferred_aware_branch_score(&branch, future_origins)
+                .saturating_add(format_equality_cost(
+                    &branch,
+                    &constraints.required_equal_formats,
+                    costs,
+                ))
+                .saturating_add(
+                    branch
+                        .peak_memory
+                        .exchange_rows
+                        .saturating_mul(exchange_table_cost_per_byte),
+                ),
             memory: branch.peak_memory,
         };
         let formats = future_formats(&branch, future_origins);
@@ -1388,6 +1412,54 @@ pub(super) fn apply_selected_plan(
     values.insert(operation.results[0], result);
 }
 
+// Refresh all recipes: applying a plan may fuse or remove earlier operations,
+// so adding only the newest operation would retain obsolete conversion costs.
+// Cached operator fragments avoid resolving/cloning the whole prefix here.
+fn refresh_exchange_rows(branch: &mut BeamBranch, costs: &impl CostModel) {
+    let mut rows = 0u64;
+    for operation in &mut branch.operations {
+        let bytes = match &mut operation.kind {
+            MidOperationKind::Operator {
+                plan,
+                implementation,
+                ..
+            } => {
+                if implementation.is_none() {
+                    let inputs = operation
+                        .inputs
+                        .iter()
+                        .map(|id| branch.state.get(*id).tensor_type.clone())
+                        .collect::<Vec<_>>();
+                    *implementation = costs.implementation(
+                        plan,
+                        &inputs,
+                        &branch.state.get(operation.results[0]).tensor_type,
+                    );
+                }
+                implementation
+                    .as_ref()
+                    .map_or(u64::MAX, |p| p.peak_memory.exchange_rows)
+            }
+            MidOperationKind::Repeat(repeat) => repeat.body.peak_memory.exchange_rows,
+            _ => crate::estimate::operation_cost(operation, &branch.state.values)
+                .map_or(u64::MAX, |(_, _, rows)| rows),
+        };
+        rows = rows.saturating_add(bytes);
+    }
+    let old = branch.peak_memory.exchange_rows;
+    branch.peak_memory.standard = branch
+        .peak_memory
+        .standard
+        .saturating_sub(old)
+        .saturating_add(rows);
+    branch.peak_memory.total = branch
+        .peak_memory
+        .total
+        .saturating_sub(old)
+        .saturating_add(rows);
+    branch.peak_memory.exchange_rows = rows;
+}
+
 pub(super) fn beam_memory_peak(
     costs: &impl CostModel,
     branch: &BeamBranch,
@@ -1861,4 +1933,82 @@ pub(super) fn lookup(
         .get(&value)
         .copied()
         .ok_or(LoweringError::UnknownValue(value))
+}
+
+#[cfg(test)]
+#[test]
+fn exchange_refresh_replaces_stale_prefix_costs() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [2, 1, 1152]).unwrap();
+    let gamma = graph.parameter("gamma", [1152]).unwrap();
+    let beta = graph.parameter("beta", [1152]).unwrap();
+    let y = graph.layer_norm(x, gamma, beta).unwrap();
+    graph.set_outputs([y]).unwrap();
+    let config = PipelineConfig::new(64)
+        .with_automatic_input(x, Precision::F16)
+        .with_automatic_input(gamma, Precision::F16)
+        .with_automatic_input(beta, Precision::F16);
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let mut branch = BeamBranch {
+        values: BTreeMap::new(),
+        state: LoweringState {
+            values: mid.values,
+            ..Default::default()
+        },
+        operations: mid.operations,
+        peak_memory: MemoryPeaks::default(),
+        analysis: std::sync::OnceLock::new(),
+    };
+    refresh_exchange_rows(&mut branch, &Ipu21CostModel);
+    assert!(branch.peak_memory.exchange_rows > 0);
+    let refreshed = branch.peak_memory;
+    refresh_exchange_rows(&mut branch, &Ipu21CostModel);
+    assert_eq!(branch.peak_memory, refreshed);
+    branch.operations.clear();
+    refresh_exchange_rows(&mut branch, &Ipu21CostModel);
+    assert_eq!(branch.peak_memory.exchange_rows, 0);
+}
+
+#[cfg(test)]
+#[test]
+fn exchange_pressure_preserves_slower_prefix_without_changing_cycle_estimates() {
+    let graph = ComputeGraph::new();
+    let config = PipelineConfig::new(4);
+    let demands = OutputDemands::new(graph.operations(), graph.value_shapes(), &config);
+    let branches = [(100, 20), (200, 1)].map(|(cycles, rows)| {
+        let peak = MemoryPeaks {
+            exchange_rows: rows,
+            ..Default::default()
+        };
+        BeamBranch {
+            values: BTreeMap::new(),
+            state: LoweringState::default(),
+            operations: Vec::new(),
+            peak_memory: peak,
+            analysis: std::sync::OnceLock::from(Some((
+                crate::estimate::ProgramCycles {
+                    total: cycles,
+                    exchange: 0,
+                },
+                peak,
+                true,
+            ))),
+        }
+    });
+    for (penalty, expected_cycles, expected_rows) in [(0, 100, 20), (16, 200, 1)] {
+        let (kept, _, _, _) = retain_pareto_beam(
+            branches.to_vec(),
+            &BTreeSet::new(),
+            &RegionPlanningConstraints::default(),
+            &Ipu21CostModel,
+            1,
+            &demands,
+            penalty,
+        );
+        assert_eq!(kept[0].peak_memory.exchange_rows, expected_rows);
+        assert_eq!(
+            deferred_aware_branch_score(&kept[0], &BTreeSet::new()),
+            expected_cycles
+        );
+    }
 }

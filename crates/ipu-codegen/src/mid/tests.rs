@@ -1585,14 +1585,19 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
             .len()
             > 2
     );
-    let selected = retain_operator_candidates(
-        candidates,
-        &inputs,
-        &TensorShape::new([128, 64]),
-        &Ipu21CostModel,
-        2,
-    );
+    let output = TensorShape::new([128, 64]);
+    let rows = |plan: &OperatorPlan| {
+        let (inputs, output) = plan.tensor_types(&inputs, &output);
+        Ipu21CostModel
+            .implementation(plan, &inputs, &output)
+            .unwrap()
+            .peak_memory
+            .exchange_rows
+    };
+    let minimum_rows = candidates.iter().map(rows).min().unwrap();
+    let selected = retain_operator_candidates(candidates, &inputs, &output, &Ipu21CostModel, 2);
     assert!((2..=4).contains(&selected.len()));
+    assert_eq!(selected.iter().map(rows).min(), Some(minimum_rows));
 }
 
 #[test]
@@ -2066,6 +2071,7 @@ fn beam_reserves_requested_formats_before_incidental_layout_diversity() {
         &Ipu21CostModel,
         2,
         &demands,
+        0,
     );
     assert_eq!(retained.len(), 2);
     assert!(retained.iter().any(|branch| {

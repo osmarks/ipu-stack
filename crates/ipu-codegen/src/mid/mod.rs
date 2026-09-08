@@ -191,6 +191,10 @@ pub struct PipelineConfig {
     /// Repeat bodies count once. Exact compact tables must also fit this limit.
     /// Set to u64::MAX to disable this policy screen.
     pub exchange_table_budget_bytes: u64,
+    /// Search-only penalty per estimated exchange-table byte. Does not change
+    /// reported execution cycles. Budget failures automatically retry with
+    /// stronger penalties to preserve simpler prefixes earlier in the graph.
+    pub exchange_table_cost_per_byte: u64,
     /// Diagnostic constraints which retain only one GEMM plan family for the
     /// named source operations.
     pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
@@ -263,6 +267,7 @@ impl PipelineConfig {
             planning_beam_width: 64,
             exchange_schedule_finalists: 1,
             exchange_table_budget_bytes: 64 * 1024,
+            exchange_table_cost_per_byte: 0,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,
             max_parallel_reductions: 3,

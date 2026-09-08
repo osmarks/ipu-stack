@@ -1635,6 +1635,21 @@ pub(super) fn retain_operator_candidates_for_demands(
         .iter()
         .any(|(_, metrics, _)| metrics.memory.standard_contiguous_overflow() == 0);
     let mut selected = BTreeSet::new();
+    // Preserve the storage extreme before latency/family slots fill the pool.
+    // The region beam will add boundary conversion traffic for each parent.
+    if width > 1
+        && let Some((index, _)) = ranked
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, metrics, _))| {
+                !has_feasible || metrics.memory.standard_contiguous_overflow() == 0
+            })
+            .min_by_key(|(index, (_, metrics, _))| {
+                (metrics.memory.exchange_rows, metrics.cycles, *index)
+            })
+    {
+        selected.insert(index);
+    }
     // Reserve useful output families before fine-grained K/grid diversity.
     // All representatives are ranked by ordinary producer cost.
     if !demands.is_empty() {
