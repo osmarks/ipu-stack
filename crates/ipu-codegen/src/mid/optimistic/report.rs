@@ -22,7 +22,9 @@ impl DiagnosticMidGraph {
     /// Graphviz dataflow, with unsupported assumptions visible at their steps.
     pub fn to_dot(&self) -> String {
         use std::fmt::Write;
-        let mut dot = String::from("digraph optimistic_mid {\n  rankdir=LR;\n");
+        let mut dot = String::from(
+            "digraph optimistic_mid {\n  rankdir=TB; nodesep=0.2; ranksep=0.35;\n  node [fontname=monospace,fontsize=11];\n",
+        );
         for (id, value) in self.values.iter().enumerate() {
             let label = format!(
                 "v{id} / high {}\n{:?}\n{:?} {:?}\n{} owners, {} replicas",
@@ -33,6 +35,7 @@ impl DiagnosticMidGraph {
                 value.tensor.format.layout.tiling.tile_count,
                 value.tensor.format.layout.tiling.replicas
             );
+            let label = wrap_label(&label);
             writeln!(dot, "  v{id} [shape=box,label={label:?}];").unwrap();
         }
         for (id, step) in self.steps.iter().enumerate() {
@@ -48,6 +51,7 @@ impl DiagnosticMidGraph {
                 "{kind}\n{} / {} cycles\n{:?}",
                 step.cycles.optimistic, step.cycles.conservative, step.assumptions
             );
+            let label = wrap_label(&label);
             let color = if step.assumptions.is_empty() {
                 "black"
             } else {
@@ -67,4 +71,29 @@ impl DiagnosticMidGraph {
         dot.push_str("}\n");
         dot
     }
+}
+
+fn wrap_label(label: &str) -> String {
+    label
+        .lines()
+        .map(|line| {
+            let mut wrapped = String::new();
+            let mut width = 0;
+            for word in line.split_whitespace() {
+                if width != 0 {
+                    if width + 1 + word.len() > 52 {
+                        wrapped.push('\n');
+                        width = 0;
+                    } else {
+                        wrapped.push(' ');
+                        width += 1;
+                    }
+                }
+                wrapped.push_str(word);
+                width += word.len();
+            }
+            wrapped
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

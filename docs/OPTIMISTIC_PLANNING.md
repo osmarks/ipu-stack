@@ -21,7 +21,7 @@ assumptions, not pretend executable kernels.
 - `SearchReport::reference()` returns the cheapest retained assumption-free
   candidate. `opportunities()` finds hypothetical candidates whose optimistic
   estimate beats that reference. Neither promises physical feasibility.
-- `DiagnosticMidGraph::to_dot()` renders the actual dataflow, external results,
+- `DiagnosticMidGraph::to_dot()` renders a vertical graph with wrapped labels showing dataflow, external results,
   ownership/replication, costs, and assumptions. Existing algorithms retain
   their inspectable `Arc<MidProgram>` implementation rather than copied IR.
 
@@ -51,7 +51,8 @@ resolved layouts with legal packed matrix dimensions survive; a hypothetical
 kernel does not make an invalid encoding legal. This exposes producer-local packing and casting,
 late casting, and different packing/redistribution orders. It does not insert
 extra lossy precision round trips. Paths have one to four steps (default three).
-Local cast-and-pack can be hypothetical. Available local kernels are checked
+Row-major F16 to FP8 AMP-left cast/pack is implemented; other local
+cast-and-pack variants can be hypothetical. Available local kernels are checked
 against the shared kernel ABI table; ordinary word-copy unpacking is recognized
 separately so lack of a dedicated kernel is not misreported. Single-row
 row-major/AMP-left equivalence is a distinct zero-work hypothesis.
@@ -131,9 +132,9 @@ FP8 search.
 The LN/two-projection example expanded 1,694 operator candidates in about nine
 seconds on the development host, retaining 17 plans including a supported
 reference. With the default bounded search (`truncated=true`), the reference
-cost was 19,663 cycles; the best hypothetical plan was 16,801 optimistic and
+cost was 19,101 cycles; the best hypothetical plan was 16,801 optimistic and
 20,923 conservative. Missing combined cast/pack kernels appear explicitly in
-its graph. Other retained plans also expose early-cast eligibility and single-row
-equivalence opportunities. The overlapping estimates warrant implementation or
+its graph. Other retained plans can expose early-cast eligibility and equivalence
+opportunities outside the implemented AMP-left path. The overlapping estimates warrant implementation or
 microbenchmark investigation, not a hardware speedup claim. These numbers include
 conversion of the example's F16 weights.

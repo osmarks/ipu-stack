@@ -288,3 +288,16 @@ fn hypothetical_kernels_do_not_make_invalid_packed_geometry_legal() {
     assert!(!valid_tensor(&to, 1));
     assert!(enumerate_conversions(&from, &to, 1, &SearchOptions::default()).is_err());
 }
+
+#[test]
+fn single_row_equivalence_includes_outer_batch_axes() {
+    let from = TensorType::new([2, 1, 128], Precision::F16, Layout::row_sharded(1));
+    let mut to = from.clone();
+    to.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+    let paths = enumerate_conversions(&from, &to, 1, &SearchOptions::default()).unwrap();
+    assert!(paths.iter().all(|path| {
+        path.steps
+            .iter()
+            .all(|step| step.kind != TransformKind::Alias)
+    }));
+}

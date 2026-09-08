@@ -163,7 +163,9 @@ fn equivalent(a: &TensorType, b: &TensorType) -> bool {
         16
     };
     axes.len() >= 2
-        && axes[axes.len() - 2].maximum_extent() == 1
+        && axes[..axes.len() - 1]
+            .iter()
+            .all(|axis| axis.maximum_extent() == 1)
         && axes
             .last()
             .is_some_and(|axis| axis.extents_are_multiple_of(width))
