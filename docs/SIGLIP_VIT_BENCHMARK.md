@@ -302,3 +302,22 @@ code and tables occupying the entire lower region therefore do not alone prove
 an allocation failure. The allocator now accepts that case and its repeat/bank
 separation regression exercises placement with no lower-region space. The
 ongoing scaled-budget runs predate this last correction.
+
+The full batch-2 run completed on hardware and passed its reference check
+(maximum absolute error 0.106445). The rendered profile and query summary are
+under `artifacts/vit/scaled-budget-full-b2-fp8/`. Cropped runtime is 1,554,384
+cycles (1.036256 ms/batch, 0.518128 ms/image), versus batch one's 901,476 cycles
+(0.600984 ms/image): approximately 16% more throughput. Finalist 2, without tile
+remapping, was selected; its provisional compact rows occupied 60,100 bytes per
+tile. Final selection took 948 seconds, including 311 seconds for the optional
+exchange-placement challenger. Compilation time is not device runtime.
+
+Batch scaling exposes a specific pointwise inefficiency: typical bias-add
+workers rise from 2,916 cycles at batch one to 14,856 at batch two; the MLP-up
+bias add rises from 10,044 to 54,306. `AddF16` uses its dense loop when a local
+bias covers the whole output, but switches to the wrap-based broadcast loop
+when batches share that bias. A dense row-broadcast loop is a concrete next
+target. Layernorm still uses only 729 tiles: its row-sharded candidate partitions
+the token axis, leaving batches on the same owners. Batch-aware row ownership
+is therefore needed in addition to memory feasibility; higher batch alone does
+not automatically fill those idle tiles.
