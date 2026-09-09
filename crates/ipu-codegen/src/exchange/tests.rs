@@ -98,13 +98,20 @@ fn grouped_ready_queue_matches_eager_priority() {
 
 #[test]
 fn multicast_loopback_schedules_both_roles_and_rejects_bank_aliases() {
-    for words in [1, 52, 65, 512] {
+    for (words, width) in [
+        (1, ExchangeItemWidth::Word32),
+        (52, ExchangeItemWidth::Word32),
+        (65, ExchangeItemWidth::Word32),
+        (512, ExchangeItemWidth::Word32),
+        (128, ExchangeItemWidth::Paired64),
+        (512, ExchangeItemWidth::Paired64),
+    ] {
         let mut problem = ExchangeScheduleProblem {
             phase: 0,
             transfers: vec![ExchangeScheduleTransfer {
                 source: 0,
                 source_addresses: vec![0x65000],
-                destinations: [0, 1, 2]
+                destinations: [0, 1, 2, 3]
                     .into_iter()
                     .map(|tile| ExchangeScheduleDestination {
                         tile,
@@ -112,7 +119,7 @@ fn multicast_loopback_schedules_both_roles_and_rejects_bank_aliases() {
                     })
                     .collect(),
                 words,
-                width: ExchangeItemWidth::Word32,
+                width,
             }],
         };
         let run = schedule_exchange_problem(4, &problem).unwrap();

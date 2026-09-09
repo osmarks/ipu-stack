@@ -126,3 +126,15 @@ placement. Logs are under `vit-b4/` and `vit-b8/` beside the batch-2 artifacts.
 
 These measurements precede the independent paired-receiver address correction
 described in [the exchange reference](EXCHANGE_INSTRUCTION_REFERENCE.md#paired-sender-lane-reservation).
+
+With that correction, full hardware/reference checks pass again:
+
+| Batch | Cropped cycles | Encoder span | Encoder cycles/image |
+|---|---:|---:|---:|
+| 1 | 659,370 | 469,782 | 469,782 |
+| 2 | 966,162 | 721,272 | 360,636 |
+
+The batch-2 encoder uses 23.2% fewer cycles per image. Output errors remain
+0.093262 and 0.082764 respectively. Rendered profiles:
+[batch 1](../artifacts/encoder-fusions/vit-paired-b1/profile.html),
+[batch 2](../artifacts/encoder-fusions/vit-paired-b2/profile.html).

@@ -624,24 +624,30 @@ impl PhaseProgramBuilder {
             }
         };
 
-        for &tile in reserved_tiles {
-            if tile == source
-                || receivers.contains(&tile)
-                || updates.iter().any(|(updated, _)| *updated == tile)
-            {
+        for (index, &tile) in reserved_tiles.iter().enumerate() {
+            if tile == source || reserved_tiles[..index].contains(&tile) {
                 return Err(ExchangeError::DuplicateTile);
             }
-            let mut schedule = self
-                .tile_states
-                .get(usize::from(tile))
-                .ok_or(ExchangeError::Tile(tile))?
-                .clone();
+            // Borrowing a transmit lane does not prevent this tile from
+            // receiving the same multicast. Preserve its receiver updates.
+            let position = match updates.iter().position(|(updated, _)| *updated == tile) {
+                Some(position) => position,
+                None => {
+                    let state = self
+                        .tile_states
+                        .get(usize::from(tile))
+                        .ok_or(ExchangeError::Tile(tile))?
+                        .clone();
+                    updates.push((tile, state));
+                    updates.len() - 1
+                }
+            };
+            let schedule = &mut updates[position].1;
             schedule.invalidate_encoding();
             schedule.reserved_sender_end = schedule
                 .reserved_sender_end
                 .max(transfer_timing.sender_horizon);
             schedule.event_cycles = schedule.event_cycles.max(transfer_timing.sender_horizon);
-            updates.push((tile, schedule));
         }
 
         for (tile, schedule) in updates {
@@ -2633,8 +2639,6 @@ impl Topology {
         }
         let receiver_set = receivers.iter().copied().collect::<HashSet<_>>();
         if receiver_set.len() != receivers.len()
-            || receiver_set.contains(&sender_logical)
-            || receiver_set.contains(&self.paired_logical(sender_logical)?)
             || receivers.iter().any(|&receiver| {
                 self.paired_logical(receiver)
                     .map_or(true, |paired| !receiver_set.contains(&paired))

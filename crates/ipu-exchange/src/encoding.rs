@@ -219,7 +219,7 @@ mod tests {
             .unwrap();
         assert!(
             builder
-                .append_transfer_at(0, &[2], &[2], &plan.prepare().unwrap(), offset, 64)
+                .append_transfer_at(0, &[2, 2], &[2], &plan.prepare().unwrap(), offset, 64)
                 .is_err()
         );
         assert_eq!(builder.finish().unwrap(), before);

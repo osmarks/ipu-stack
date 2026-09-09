@@ -17,8 +17,9 @@ An ordinary 32-bit multicast can include its transmitting tile among the
 receivers. The source tile executes the combined send and receive controls;
 its own data returns through the fabric into the configured destination.
 `Topology::multicast` and `PhaseProgramBuilder` support this combination.
-Duplicate receivers remain invalid. Source-only and paired loopback have not
-been validated and remain unsupported.
+Duplicate receivers remain invalid. Source-only multicast has not been
+validated and remains unsupported. Paired multicast loopback is supported;
+see the paired receiver checks below.
 
 The `exchange-stress --exchange-pattern loopback` diagnostic checks the source
 and every remote receiver against independently prepared expected data. Eighteen
@@ -49,7 +50,7 @@ same-class copies, and staging conversions retain their local kernels. This is
 a conservative eligibility heuristic, not an exact comparison of both schedules.
 The physical scheduler includes the self-receiver in its receive-bus and memory
 hazards. Snapshot validation checks every repeated source address against the
-self-receiver's memory elements. Paired loopback remains disabled.
+self-receiver's memory elements. The same checks apply to paired loopback.
 
 ### Receive controls
 
@@ -279,11 +280,26 @@ exchange schedule lengths, excluding arrival skew and preceding computation.
 
 Only 8, 9 and 7 receiver pairs respectively have mismatched addresses, but the
 old all-or-nothing multicast check disqualified 579, 727 and 505 transfers.
-Some transfers additionally include the sender pair, whose paired loopback is
-still unsupported. Splitting exceptional receivers off without fixing address
+Some transfers additionally include the sender pair. Splitting exceptional
+receivers off without fixing address
 eligibility barely improved QKV/MLP horizons: the slow receivers remained on
 the critical path. No such splitting or address relocation is needed for the
 independent-pointer correction.
+
+The sender-pair exclusion was subsequently removed too. Paired multicast may
+include the sender and its partner: borrowing the partner's transmit lane does
+not exclude its receive role in that same transfer. The row builder merges
+the receive updates and borrowed-transmit reservation, preserving both.
+Source/destination memory-element overlap remains invalid and is checked for
+every Repeat source address.
+
+Hardware validation covers both sender lanes, standard and interleaved receive
+banks, different pointers on the two receiver tiles, and a remote receiver pair.
+The full QKV/MLP-up/MAP-KV phases also pass with all transfers paired (32,768
+sampled words per phase). Scheduled horizons become 7,092 / 10,063 / 8,549 cycles
+at unchanged addresses. Captures are `all-paired.json` and `loopback-banks.json`
+in the artifact directory above; `replay-all-paired-*.log` and
+`replay-loopback-bank*.log` record the checks.
 
 Hardware replay on 2026-09-05 verifies that a paired-width sender borrows only
 its physical partner's transmit lane. The partner can receive an ordinary

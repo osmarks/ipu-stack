@@ -741,10 +741,8 @@ fn paired_transfer_alternatives(
                     .is_ok_and(|paired| paired == destinations[1].0);
             // Pairing shares the receive stream, not its SRAM pointer. Each
             // receiver row independently programs its destination address.
-            let pairable = complete_pair
-                && destinations
-                    .iter()
-                    .all(|(tile, address)| *tile != source_pair && address & 0b111 == 0);
+            let pairable =
+                complete_pair && destinations.iter().all(|(_, address)| address & 0b111 == 0);
             if pairable {
                 paired_destinations.extend(destinations);
             }
@@ -862,8 +860,7 @@ fn pending_from_problem(
                 .map(|destination| {
                     if destination.tile >= tile_count
                         || (destination.tile == transfer.source
-                            && (transfer.width != ExchangeItemWidth::Word32
-                                || transfer.destinations.len() < 2
+                            && (transfer.destinations.len() < 2
                                 || transfer.source_addresses.iter().any(|&address| {
                                     spans_share_effective_memory_element(
                                         address,
@@ -2246,8 +2243,7 @@ fn append_transfer(
     }
     if destinations.iter().any(|&(tile, address)| {
         tile == source
-            && (width != ExchangeItemWidth::Word32
-                || destinations.len() < 2
+            && (destinations.len() < 2
                 || effective_memory_elements(address, words)
                     .iter()
                     .any(|element| source_elements.contains(element)))

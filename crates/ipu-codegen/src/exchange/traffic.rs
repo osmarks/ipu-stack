@@ -167,8 +167,7 @@ impl MappingPhase {
             let paired = usize::from(partner) < self.tile_count
                 && transfer.destinations.iter().all(|&(tile, _)| {
                     let mapped = mapping[usize::from(tile)];
-                    mapped != partner
-                        && usize::from(mapped ^ 1) < self.tile_count
+                    usize::from(mapped ^ 1) < self.tile_count
                         && transfer
                             .destinations
                             .binary_search_by_key(
@@ -253,9 +252,9 @@ mod tests {
                                     .position(|&tile| tile == mapping[0] ^ 1)
                                     .unwrap()
                                 {
-                                    1 => (44652, 36274),
-                                    2 => (44558, 36201),
-                                    3 => (44539, 36195),
+                                    1 => (41114, 33630),
+                                    2 => (41160, 33601),
+                                    3 => (41183, 33600),
                                     _ => unreachable!(),
                                 }],
                                 "{mapping:?}"
