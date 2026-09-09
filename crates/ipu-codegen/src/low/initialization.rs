@@ -8,6 +8,98 @@
 use super::*;
 use std::collections::BTreeSet;
 
+/// Row-major FP8 packing reads only the logical column prefix and writes its
+/// own output padding. Drop input padding clears when that is the sole reader.
+pub(super) fn omit_unread_cast_padding(program: &mut LowProgram) {
+    let graph = &program.program;
+    let root = |id| storage_root(&graph.shards, id);
+    let mut candidates = BTreeSet::new();
+    let mut forbidden = BTreeSet::new();
+    for run in &graph.kernel_runs {
+        for input in &run.inputs {
+            for view in &input.views {
+                let block = &graph.shards[view.shard.index() as usize];
+                let columns = view.extents.last();
+                let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
+                    from: Precision::F16, to: Precision::F8F143 { .. }
+                }) && block.tensor_type.format.layout.order == ElementOrder::RowMajor
+                    && run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
+                    && view.extents == block.extents
+                    && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
+                    // This kernel still reads physical rows. Only discard
+                    // clears when all padding is in the column dimension.
+                    && view.extents.iter().rev().skip(1).all(|axis| axis.logical_end == axis.physical_end);
+                if ignores_padding {
+                    candidates.insert(root(view.shard));
+                } else {
+                    forbidden.insert(root(view.shard));
+                }
+            }
+        }
+        if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
+            forbidden.extend(run.outputs().map(|view| root(view.shard)));
+        }
+    }
+    for phase in &graph.exchange_phases {
+        forbidden.extend(
+            phase
+                .transfers
+                .iter()
+                .map(|transfer| root(transfer.source.shard)),
+        );
+    }
+    forbidden.extend(graph.local_copies.iter().map(|copy| root(copy.source)));
+    forbidden.extend(
+        graph
+            .outputs
+            .iter()
+            .flat_map(|output| output.shards.iter().map(|&id| root(id))),
+    );
+    for repeat in &program.repeat_runs {
+        for binding in &repeat.carried {
+            forbidden.extend(
+                [
+                    binding.initial,
+                    binding.argument,
+                    binding.yielded,
+                    binding.result,
+                ]
+                .map(root),
+            );
+        }
+        // Iterated/invariant bindings can give storage another reader role.
+        if !repeat.iterated.is_empty() || !repeat.invariants.is_empty() {
+            return;
+        }
+    }
+    candidates.retain(|id| !forbidden.contains(id));
+    let mut removed = 0;
+    let mut keep = |work: &TileWork| {
+        if let TileWork::Kernel(id) = work {
+            let run = &graph.kernel_runs[id.0 as usize];
+            if matches!(
+                run.kernel,
+                TileKernelSpec::FillZero {
+                    padding_only: true,
+                    ..
+                }
+            ) && candidates.contains(&root(run.output.shard))
+            {
+                removed += 1;
+                return false;
+            }
+        }
+        true
+    };
+    for tile in &mut program.tiles {
+        tile.work.retain(&mut keep);
+    }
+    for repeat in &mut program.repeat_runs {
+        repeat.body.work.retain(&mut keep);
+    }
+    tracing::info!(removed, "eliminated unread FP8 cast input padding clears");
+}
+
 pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
     if program
         .shards
@@ -308,6 +400,59 @@ mod tests {
                 ],
             }],
             repeat_runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cast_padding_elision_requires_exclusive_column_only_reader() {
+        let mut baseline = fixture();
+        let graph = Arc::make_mut(&mut baseline.program);
+        graph.shards[0].extents[1].logical_end = 48;
+        let run = &mut graph.kernel_runs[1];
+        run.inputs.truncate(1);
+        run.inputs[0].views[0].extents[1].logical_end = 48;
+        let metadata = Arc::make_mut(&mut run.metadata);
+        metadata.kernel = TileKernelSpec::Cast {
+            from: Precision::F16,
+            to: Precision::F8F143 { scale_exponent: -4 },
+        };
+        metadata.requirements.output.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+        for case in 0..5 {
+            let mut program = baseline.clone();
+            let graph = Arc::make_mut(&mut program.program);
+            match case {
+                1 => {
+                    graph.shards[0].extents[0].logical_end = 1;
+                    graph.kernel_runs[1].inputs[0].views[0].extents[0].logical_end = 1;
+                }
+                2 => graph.outputs.push(ValueBlocks {
+                    value: MidValueId::from_index(0),
+                    shards: vec![BlockValueId(0)],
+                }),
+                3 => graph.local_copies.push(LocalCopy {
+                    source: BlockValueId(0),
+                    source_offset: 0,
+                    destination: BlockValueId(1),
+                    destination_offset: 0,
+                    bytes: 128,
+                    pattern: CopyPattern::Contiguous,
+                }),
+                4 => {
+                    Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
+                        TileKernelSpec::FillZero {
+                            offset: 96,
+                            bytes: 32,
+                            padding_only: false,
+                        };
+                }
+                _ => {}
+            }
+            omit_unread_cast_padding(&mut program);
+            assert_eq!(
+                program.tiles[0].work.len(),
+                if case == 0 { 1 } else { 2 },
+                "case {case}"
+            );
         }
     }
 

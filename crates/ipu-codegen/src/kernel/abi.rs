@@ -42,7 +42,7 @@ pub enum ScalarValue {
     CastSourceScale,
     CastDestinationScale,
     CastPanelRows,
-    CastSourceElements,
+    CastSourceExtent,
     CastRowMajorColumns,
     InputRows,
     OutputScale,
@@ -152,7 +152,23 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                     0
                 },
             ),
-            ScalarValue::CastSourceElements => scalar_source_elements(run),
+            ScalarValue::CastSourceExtent => {
+                // Row-major packing derives the allocation size from rows and
+                // stride; use this field for the readable column prefix.
+                if run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
+                    && run.requirements.output.format.layout.order
+                        == ElementOrder::Amp(AmpOrder::Left)
+                {
+                    let logical = input_matrix_extent(run, true, true)?;
+                    Ok(if logical.is_multiple_of(4) {
+                        logical
+                    } else {
+                        input_matrix_extent(run, false, true)?
+                    })
+                } else {
+                    scalar_source_elements(run)
+                }
+            }
             ScalarValue::CastPanelRows => {
                 if matches!(
                     run.kernel,
@@ -170,6 +186,8 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                     if order == ElementOrder::Amp(AmpOrder::Left)
                         && rows == 1
                         && scalar_source_elements(run)? == element_count(run)?
+                        && input_matrix_extent(run, true, true)?
+                            == input_matrix_extent(run, false, true)?
                     {
                         return Ok(0);
                     }
@@ -449,7 +467,7 @@ pub fn tile_kernel_abi(
                         ScalarValue::CastSourceScale,
                         ScalarValue::CastDestinationScale,
                         ScalarValue::CastPanelRows,
-                        ScalarValue::CastSourceElements,
+                        ScalarValue::CastSourceExtent,
                         ScalarValue::CastRowMajorColumns,
                     ]
                 } else {

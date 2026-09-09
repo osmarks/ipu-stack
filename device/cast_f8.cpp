@@ -124,7 +124,8 @@ public:
   int sourceScale;
   int destinationScale;
   unsigned panelRows;
-  unsigned sourceElements;
+  // Allocation elements for linear/panel input, valid columns for row-major input.
+  unsigned sourceExtent;
   unsigned rowMajorColumns;
   bool compute(unsigned worker) {
     // Assembly writes cannot change the immutable call descriptor. Keep its
@@ -133,8 +134,11 @@ public:
     Destination *destination = &this->destination[0];
     const unsigned elements = this->elements;
     const unsigned panelRows = this->panelRows;
-    const unsigned sourceElements = this->sourceElements;
+    const unsigned sourceExtent = this->sourceExtent;
     const unsigned rowMajorColumns = this->rowMajorColumns;
+    const unsigned sourceElements = rowMajorColumns
+        ? (panelRows ? panelRows : 1) * rowMajorColumns : sourceExtent;
+    const unsigned validColumns = sourceExtent;
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
     setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
     // Combined loads/stores require different memory elements. Group pairs
@@ -158,7 +162,7 @@ public:
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
            panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
         unsigned char *panelTarget = &destination[panel + row * 32];
-        if (rowMajorColumns && column >= rowMajorColumns) {
+        if (rowMajorColumns && column >= validColumns) {
           unsigned offset = 0;
           asm volatile(
               "zero $a0:1\n"
@@ -174,8 +178,8 @@ public:
           continue;
         }
         const half *first = &source[rowMajorColumns ? row * rowMajorColumns + column : panel + row * 16];
-        if (rowMajorColumns && column + 32 > rowMajorColumns) {
-          castRowTail(first, panelTarget, rows, sourceStride, stride, rowMajorColumns - column);
+        if (rowMajorColumns && column + 32 > validColumns) {
+          castRowTail(first, panelTarget, rows, sourceStride, stride, validColumns - column);
           continue;
         }
         const half *second = first + (rowMajorColumns ? 16 : panelRows * 16);

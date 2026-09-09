@@ -85,10 +85,11 @@ fn main() -> Result<()> {
         (95, 32), // Workers straddle the pipeline threshold.
         (96, 48), // Pipelined full panel followed by a half-panel tail.
         (97, 64),
+        (184, 80),
         (184, 96), // Largest cast in the full B1 ViT profile.
         (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
-        for mode in 0..4 {
+        for mode in 0..5 {
             // dense, already packed, row-major -> packed
             if mode >= 2 && args.existing_layouts_only {
                 continue;
@@ -105,11 +106,16 @@ fn main() -> Result<()> {
             ] {
                 for scale in [-4i8, 0, 3] {
                     let tile = programs.len() as u16;
-                    let source_count = rows * columns;
+                    let source_columns = if mode == 4 {
+                        columns.next_multiple_of(32) + 64
+                    } else {
+                        columns
+                    };
+                    let source_count = rows * source_columns;
                     let output_columns = if mode == 0 {
                         columns
                     } else {
-                        if mode == 3 {
+                        if mode >= 3 {
                             columns.next_multiple_of(32) + 64
                         } else {
                             columns.next_multiple_of(32)
@@ -133,7 +139,9 @@ fn main() -> Result<()> {
                             if value == 0x80 { 0 } else { value }
                         })
                         .collect();
-                    let mut input = vec![0u16; source_count as usize];
+                    // Poison unread column padding with NaNs.
+                    let mut input =
+                        vec![if mode == 4 { 0x7e00u16 } else { 0 }; source_count as usize];
                     let mut result = vec![0u8; count as usize];
                     for row in 0..rows {
                         for column in 0..columns {
@@ -141,7 +149,7 @@ fn main() -> Result<()> {
                             let input_index = if mode == 1 {
                                 (column / 16 * rows * 16 + row * 16 + column % 16) as usize
                             } else {
-                                logical_index
+                                (row * source_columns + column) as usize
                             };
                             let output_index = if mode != 0 {
                                 (column / 32 * rows * 32 + row * 32 + column % 32) as usize
@@ -193,13 +201,13 @@ fn main() -> Result<()> {
                                 count,
                                 0,
                                 (i32::from(scale)) as u32,
-                                if mode == 0 || (rows == 1 && source_count == count) {
+                                if mode == 0 || (rows == 1 && source_count == count && mode != 4) {
                                     0
                                 } else {
                                     rows
                                 },
-                                source_count,
-                                if mode >= 2 { columns } else { 0 },
+                                if mode >= 2 { columns } else { source_count },
+                                if mode >= 2 { source_columns } else { 0 },
                             ],
                             profile: StepProfile {
                                 before: Some(0x7f000),
