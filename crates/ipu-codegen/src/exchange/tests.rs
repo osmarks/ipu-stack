@@ -46,53 +46,61 @@ fn grouped_ready_queue_matches_eager_priority() {
             })
             .collect::<Vec<_>>();
         let problem = SchedulingProblem::new(&transfers, tiles);
-        let mut grouped = TransferScheduler::new(&problem);
-        assert!(!grouped.ready_groups.is_empty());
-        assert!(grouped.ready_groups.len() <= 2 * usize::from(tiles * (tiles - 1)));
-        let mut reference = TransferScheduler::new(&problem);
-        reference.ready = std::mem::take(&mut reference.ready_groups)
-            .into_iter()
-            .flatten()
-            .collect();
-        reference.transfer_group.clear();
-        let mut availability = vec![TileAvailability::default(); usize::from(tiles)];
-        while let Some(actual) = grouped.next(&availability) {
-            let expected = reference
-                .ready
-                .iter()
-                .map(|&entry| reference.refresh(entry, &availability))
-                .max()
-                .unwrap();
-            assert_eq!(
-                actual,
-                (
-                    expected.index.0,
-                    reference.dependency_ready[expected.index.0]
-                )
-            );
-            reference
-                .ready
-                .retain(|entry| entry.index != expected.index);
-            let (index, dependency) = actual;
-            let transfer = &transfers[index];
-            let source = usize::from(transfer.source);
-            let completion = transfer
-                .destinations
-                .iter()
-                .map(|&(tile, _)| availability[usize::from(tile)].receive)
-                .chain([availability[source].send, dependency])
-                .max()
-                .unwrap()
-                + transfer.words;
-            availability[source].send = completion;
-            for &(tile, _) in &transfer.destinations {
-                availability[usize::from(tile)].receive = completion;
+        for priority in [
+            ExchangeSchedulingPriority::Automatic,
+            ExchangeSchedulingPriority::Combined,
+            ExchangeSchedulingPriority::Directional,
+            ExchangeSchedulingPriority::RemainingCombined,
+            ExchangeSchedulingPriority::RemainingDirectional,
+        ] {
+            let mut grouped = TransferScheduler::with_priority(&problem, priority);
+            assert!(!grouped.ready_groups.is_empty());
+            assert!(grouped.ready_groups.len() <= 2 * usize::from(tiles * (tiles - 1)));
+            let mut reference = TransferScheduler::with_priority(&problem, priority);
+            reference.ready = std::mem::take(&mut reference.ready_groups)
+                .into_iter()
+                .flatten()
+                .collect();
+            reference.transfer_group.clear();
+            let mut availability = vec![TileAvailability::default(); usize::from(tiles)];
+            while let Some(actual) = grouped.next(&availability) {
+                let expected = reference
+                    .ready
+                    .iter()
+                    .map(|&entry| reference.refresh(entry, &availability))
+                    .max()
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    (
+                        expected.index.0,
+                        reference.dependency_ready[expected.index.0]
+                    )
+                );
+                reference
+                    .ready
+                    .retain(|entry| entry.index != expected.index);
+                let (index, dependency) = actual;
+                let transfer = &transfers[index];
+                let source = usize::from(transfer.source);
+                let completion = transfer
+                    .destinations
+                    .iter()
+                    .map(|&(tile, _)| availability[usize::from(tile)].receive)
+                    .chain([availability[source].send, dependency])
+                    .max()
+                    .unwrap()
+                    + transfer.words;
+                availability[source].send = completion;
+                for &(tile, _) in &transfer.destinations {
+                    availability[usize::from(tile)].receive = completion;
+                }
+                grouped.complete(index, completion);
+                reference.complete(index, completion);
             }
-            grouped.complete(index, completion);
-            reference.complete(index, completion);
+            assert!(grouped.is_complete());
+            assert!(reference.is_complete());
         }
-        assert!(grouped.is_complete());
-        assert!(reference.is_complete());
     }
 }
 
@@ -341,17 +349,26 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
             })
             .collect();
         let problem = ExchangeScheduleProblem { phase, transfers };
-        let first = schedule_exchange_problem(tile_count, &problem).unwrap();
-        validate_exchange_schedule(tile_count, &problem, &first.phase).unwrap();
-        let second = schedule_exchange_problem(tile_count, &problem).unwrap();
-        validate_exchange_schedule(tile_count, &problem, &second.phase).unwrap();
-        assert_eq!(first.phase, second.phase);
-        assert_eq!(first.initial_horizon, second.initial_horizon);
-        assert_eq!(first.endpoint_lower_bound, second.endpoint_lower_bound);
-        assert_eq!(
-            first.neighborhood_improvements,
-            second.neighborhood_improvements
-        );
+        for priority in [
+            ExchangeSchedulingPriority::Automatic,
+            ExchangeSchedulingPriority::RemainingDirectional,
+            ExchangeSchedulingPriority::Streams(64),
+            ExchangeSchedulingPriority::Streams(1024),
+        ] {
+            let first =
+                schedule_exchange_problem_with_priority(tile_count, &problem, priority).unwrap();
+            validate_exchange_schedule(tile_count, &problem, &first.phase).unwrap();
+            let second =
+                schedule_exchange_problem_with_priority(tile_count, &problem, priority).unwrap();
+            validate_exchange_schedule(tile_count, &problem, &second.phase).unwrap();
+            assert_eq!(first.phase, second.phase);
+            assert_eq!(first.initial_horizon, second.initial_horizon);
+            assert_eq!(first.endpoint_lower_bound, second.endpoint_lower_bound);
+            assert_eq!(
+                first.neighborhood_improvements,
+                second.neighborhood_improvements
+            );
+        }
     }
 }
 

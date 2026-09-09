@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ipu_codegen::{
-    ExchangeScheduleCache, ExchangeScheduleSnapshot, schedule_exchange_problem,
-    validate_exchange_schedule,
+    ExchangeScheduleCache, ExchangeScheduleSnapshot, ExchangeSchedulingPriority,
+    schedule_exchange_problem_with_priority, validate_exchange_schedule,
 };
 use ipu_exchange::diagnostic::diagnose_plan_program;
 use std::collections::BTreeSet;
@@ -12,6 +12,28 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Default, ValueEnum)]
+enum Priority {
+    #[default]
+    Automatic,
+    Combined,
+    Directional,
+    RemainingCombined,
+    RemainingDirectional,
+}
+
+impl From<Priority> for ExchangeSchedulingPriority {
+    fn from(value: Priority) -> Self {
+        match value {
+            Priority::Automatic => Self::Automatic,
+            Priority::Combined => Self::Combined,
+            Priority::Directional => Self::Directional,
+            Priority::RemainingCombined => Self::RemainingCombined,
+            Priority::RemainingDirectional => Self::RemainingDirectional,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -20,6 +42,12 @@ use std::time::{Duration, Instant};
 struct Arguments {
     /// JSON snapshot written by ipu-trivial-test --export-exchange-schedule.
     snapshot: PathBuf,
+    /// Offline queue priority experiment, with unchanged timing and validation.
+    #[arg(long, value_enum, default_value_t = Priority::Automatic, conflicts_with_all = ["select_widths", "replay_cache"])]
+    priority: Priority,
+    /// Offline address-ordered stream waves, measured in 32-bit words.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with_all = ["priority", "select_widths", "replay_cache"])]
+    stream_words: Option<u32>,
     /// Restrict the benchmark to these physical exchange phase IDs.
     #[arg(long = "phase")]
     phases: Vec<u32>,
@@ -40,6 +68,12 @@ struct Arguments {
     /// Include the production comparison of ordinary and paired transfers.
     #[arg(long)]
     select_widths: bool,
+    /// Save the selected ordinary/paired transfers for controlled order comparisons.
+    #[arg(long, requires = "select_widths")]
+    write_selected_snapshot: Option<PathBuf>,
+    /// Report the busiest directional endpoints and gaps between their payloads.
+    #[arg(long)]
+    slack_report: bool,
     /// Populate the production recipe cache before timing, then measure replay.
     #[arg(long, requires = "select_widths")]
     replay_cache: bool,
@@ -99,6 +133,7 @@ fn main() -> Result<()> {
         !arguments.first_iteration_only,
     );
 
+    let mut selected_problems = Vec::new();
     let total_start = Instant::now();
     let mut estimated_totals = vec![0u64; usize::from(snapshot.tile_count)];
     let mut storage = ipu_codegen::ExchangeStorageEstimator::new(snapshot.tile_count);
@@ -151,8 +186,15 @@ fn main() -> Result<()> {
                     .schedule_problem(snapshot.tile_count, captured)
                     .map(|(problem, run)| (std::borrow::Cow::Owned(problem), run))
             } else {
-                schedule_exchange_problem(snapshot.tile_count, captured)
-                    .map(|run| (std::borrow::Cow::Borrowed(captured), run))
+                schedule_exchange_problem_with_priority(
+                    snapshot.tile_count,
+                    captured,
+                    arguments
+                        .stream_words
+                        .map(ExchangeSchedulingPriority::Streams)
+                        .unwrap_or_else(|| arguments.priority.into()),
+                )
+                .map(|run| (std::borrow::Cow::Borrowed(captured), run))
             }
         };
         for _ in 0..arguments.warmup {
@@ -178,6 +220,10 @@ fn main() -> Result<()> {
                 }
             } else {
                 baseline = Some(run.phase.clone());
+                selected_problems.push(problem.as_ref().clone());
+                if arguments.slack_report {
+                    report_slack(&run.phase);
+                }
             }
             if durations.len() == 1
                 && let Some(tile) = arguments.dump_tile
@@ -253,6 +299,16 @@ fn main() -> Result<()> {
             }
         }
     }
+    if let Some(path) = &arguments.write_selected_snapshot {
+        serde_json::to_writer(
+            File::create(path)?,
+            &ExchangeScheduleSnapshot {
+                schema_version: snapshot.schema_version,
+                tile_count: snapshot.tile_count,
+                phases: selected_problems,
+            },
+        )?;
+    }
     println!(
         "estimatedMaximumTableBytes={} unsharedMaximumTableBytes={}",
         storage.maximum_bytes(),
@@ -269,4 +325,70 @@ fn percentile(samples: &[Duration], percentile: usize) -> Duration {
 
 fn milliseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn report_slack(phase: &ipu_codegen::PhysicalExchangePhase) {
+    use ipu_codegen::ExchangeActivityKind::{PartnerBusy, Receive, Send};
+    let mut endpoints = Vec::new();
+    for (tile, activities) in phase.activities.iter().enumerate() {
+        for receive in [false, true] {
+            let mut events = activities
+                .iter()
+                .filter(|event| {
+                    if receive {
+                        event.kind == Receive
+                    } else {
+                        matches!(event.kind, Send | PartnerBusy)
+                    }
+                })
+                .collect::<Vec<_>>();
+            events.sort_unstable_by_key(|event| event.start_cycle);
+            let Some(last) = events.last() else {
+                continue;
+            };
+            let end = last.end_cycle;
+            let busy = events
+                .iter()
+                .map(|event| u64::from(event.end_cycle - event.start_cycle))
+                .sum::<u64>();
+            let gaps = events
+                .windows(2)
+                .map(|pair| pair[1].start_cycle.saturating_sub(pair[0].end_cycle))
+                .filter(|&gap| gap != 0)
+                .collect::<Vec<_>>();
+            let discontinuities = events
+                .windows(2)
+                .filter(|pair| {
+                    pair[0].address.checked_add(pair[0].words * 4) != Some(pair[1].address)
+                })
+                .count();
+            endpoints.push((
+                end,
+                tile,
+                receive,
+                busy,
+                events.len(),
+                gaps.iter().map(|&n| u64::from(n)).sum::<u64>(),
+                gaps.into_iter().max().unwrap_or(0),
+                discontinuities,
+            ));
+        }
+    }
+    endpoints.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (end, tile, receive, busy, transfers, gaps, largest_gap, discontinuities) in
+        endpoints.into_iter().take(8)
+    {
+        println!(
+            "slack phase={} tile={} port={} end={} payloadCycles={} transfers={} internalGapCycles={} largestGap={} addressDiscontinuities={}",
+            phase.id.index(),
+            tile,
+            if receive { "rx" } else { "tx" },
+            end,
+            busy,
+            transfers,
+            gaps,
+            largest_gap,
+            discontinuities
+        );
+    }
 }

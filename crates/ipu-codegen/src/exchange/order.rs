@@ -555,6 +555,61 @@ pub(super) fn critical_neighborhood_order(
     })
 }
 
+/// Offline alternative: visit address-ordered endpoint streams in bounded
+/// payload waves. This amortizes receive-pointer/mux changes without imposing
+/// barriers; the ordinary row builder still overlaps independent transfers.
+pub(super) fn stream_wave_order(problem: &SchedulingProblem<'_>, words: u32) -> Vec<usize> {
+    let mut streams = BTreeMap::<_, Vec<usize>>::new();
+    for (index, transfer) in problem.transfers.iter().enumerate() {
+        streams
+            .entry((
+                transfer.source,
+                transfer.reserved_source,
+                transfer
+                    .destinations
+                    .iter()
+                    .map(|&(tile, _)| tile)
+                    .collect::<Vec<_>>(),
+            ))
+            .or_default()
+            .push(index);
+    }
+    let mut rank = vec![(0u64, Reverse(0u64), 0usize, 0usize); problem.transfers.len()];
+    for (stream, indices) in streams.values_mut().enumerate() {
+        indices.sort_unstable_by_key(|&index| {
+            let transfer = &problem.transfers[index];
+            (transfer.destinations[0].1, transfer.source_address(), index)
+        });
+        let total = indices
+            .iter()
+            .map(|&index| u64::from(problem.transfers[index].words))
+            .sum::<u64>();
+        let mut offset = 0u64;
+        for (position, &index) in indices.iter().enumerate() {
+            rank[index] = (offset / u64::from(words), Reverse(total), stream, position);
+            offset += u64::from(problem.transfers[index].words);
+        }
+    }
+    let mut indegrees = problem.indegrees();
+    let mut ready = BinaryHeap::new();
+    for (index, &degree) in indegrees.iter().enumerate() {
+        if degree == 0 {
+            ready.push(Reverse((rank[index], index)));
+        }
+    }
+    let mut order = Vec::with_capacity(rank.len());
+    while let Some(Reverse((_, index))) = ready.pop() {
+        order.push(index);
+        for &next in &problem.dependents[index] {
+            indegrees[next] -= 1;
+            if indegrees[next] == 0 {
+                ready.push(Reverse((rank[next], next)));
+            }
+        }
+    }
+    order
+}
+
 #[cfg(test)]
 pub(super) fn reference_matching_wave_order(
     problem: &SchedulingProblem<'_>,
