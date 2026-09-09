@@ -148,6 +148,9 @@ struct Arguments {
     /// Maximum globally validated regional replacements.
     #[arg(long, default_value_t = 4, requires = "regional_planning")]
     regional_evaluations: usize,
+    /// Maximum globally validated proposals per region.
+    #[arg(long, default_value_t = 4, requires = "regional_planning")]
+    regional_evaluations_per_region: usize,
     /// Expanded plans admitted to placement/mapping, plus a compact alternative.
     #[arg(long, default_value_t = 4, conflicts_with = "reuse_package")]
     placement_finalists: usize,
@@ -705,6 +708,7 @@ fn main() -> Result<()> {
     if arguments.regional_planning {
         pipeline.regional_planning = Some(ipu_codegen::RegionalPlanning {
             max_evaluations: arguments.regional_evaluations,
+            max_evaluations_per_region: arguments.regional_evaluations_per_region,
             ..Default::default()
         });
     }

@@ -93,6 +93,7 @@ pub(super) fn select<T>(
                     continue;
                 }
             };
+            tracing::info!(pass, region=?region, proposals=alternatives.len(), "generated regional proposals");
             let mut ranked = Vec::new();
             for (index, candidate) in alternatives.into_iter().enumerate() {
                 if search::compute_lower_bound(&candidate.program) >= score {
@@ -121,7 +122,7 @@ pub(super) fn select<T>(
                 ranked.push((local_score, index, candidate.program));
             }
             ranked.sort_by_key(|(cycles, index, _)| (*cycles, *index));
-            for (_, _, candidate) in ranked {
+            for (_, _, candidate) in ranked.into_iter().take(options.max_evaluations_per_region) {
                 if evaluations >= options.max_evaluations {
                     break 'passes;
                 }
@@ -140,6 +141,7 @@ pub(super) fn select<T>(
                                 continue;
                             }
                         };
+                        tracing::info!(pass, region=?region, incumbent_cycles=score, candidate_cycles=replacement_score, "validated regional proposal");
                         if replacement_score < score {
                             tracing::info!(pass, region=?region, before=score, after=replacement_score, "accepted feasible regional improvement");
                             program = candidate;
@@ -211,13 +213,16 @@ mod tests {
         let x = graph.host_input("x", [32, 32]).unwrap();
         let w = graph.parameter("w", [32, 32]).unwrap();
         let y = graph.gemm(x, w).unwrap();
-        graph.set_outputs([y]).unwrap();
+        let z = graph.gemm(x, w).unwrap();
+        graph.set_outputs([y, z]).unwrap();
         graph.add_planning_region(0..1).unwrap();
+        graph.add_planning_region(1..2).unwrap();
         let mut config = PipelineConfig::new(8)
             .with_automatic_input(x, Precision::F16)
             .with_automatic_input(w, Precision::F16);
         config.regional_planning = Some(crate::RegionalPlanning {
             max_evaluations: 2,
+            max_evaluations_per_region: 1,
             ..Default::default()
         });
         let mut validations = 0;
@@ -231,9 +236,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(artifact, 42);
-        assert!(
-            validations > 1,
-            "the test must exercise replacement rejection"
+        assert_eq!(
+            validations, 3,
+            "one failed proposal per region must leave budget for the next region"
         );
     }
 }

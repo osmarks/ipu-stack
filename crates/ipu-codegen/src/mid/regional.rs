@@ -9,6 +9,7 @@ pub struct RegionalPlanning {
     pub beam_width: usize,
     pub candidates_per_region: usize,
     pub max_evaluations: usize,
+    pub max_evaluations_per_region: usize,
     pub passes: usize,
 }
 impl Default for RegionalPlanning {
@@ -18,6 +19,7 @@ impl Default for RegionalPlanning {
             beam_width: 8,
             candidates_per_region: 4,
             max_evaluations: 12,
+            max_evaluations_per_region: 4,
             passes: 1,
         }
     }

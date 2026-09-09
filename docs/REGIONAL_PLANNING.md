@@ -28,8 +28,9 @@ choices. This does not use the separate optimistic missing-kernel diagnostic.
 The test CLI exposes `--regional-planning`, `--regional-evaluations N`, and
 repeatable `--planning-region START:END`. Zero evaluations builds only the seed.
 Library defaults are three seed attempts, beam width eight, at most four proposals
-per region, twelve global evaluations, and one pass. The CLI defaults to four
-global evaluations. Budgets bound candidate counts, not wall-clock runtime.
+per region, twelve global evaluations, at most four evaluations per region, and one pass. The CLI defaults to four
+global evaluations. `--regional-evaluations-per-region` independently caps full
+validation after ranking each region's local proposals. Budgets bound candidate counts, not wall-clock runtime.
 
 `--benchmark-selection report.json` runs selection through placement and exchange
 scheduling without compiling executable support. Its report explicitly marks
@@ -135,3 +136,9 @@ same 223,858-cycle incumbent after two proposals. Its profile is
 (five ignored), its documentation test passed, and release Clippy passed for
 codegen and ipu-tests with the repository's existing argument-count/type-complexity
 allowances.
+
+The subsequent full-size ViT trial and measured MLP regression comparison are in
+[REGIONAL_VIT_2026_09_09.md](REGIONAL_VIT_2026_09_09.md). That trial found and fixed
+the FP8 CLI's loss of smaller GEMM tile families, which caused the tiny FP8 failure
+reported above. Default batch-2 Repeat3 MLP performance remains 846,120 measured
+cycles; the regional seed is slower at 1,084,056 measured cycles.
