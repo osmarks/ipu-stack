@@ -48,9 +48,9 @@ pub use mid::{
     Precision, ReductionStaging, ShardExtent, TensorFormat, TensorType,
 };
 pub use package::{
-    CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, PackageConfig,
-    TileProgramData, build_diagnostic_package, build_package, build_tile_program_package,
-    capture_exchange_finalist,
+    CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, ExpansionBenchmark,
+    ExpansionTiming, PackageConfig, TileProgramData, benchmark_mid_expansion,
+    build_diagnostic_package, build_package, build_tile_program_package, capture_exchange_finalist,
 };
 pub(crate) use place::*;
 pub(crate) use storage::*;

@@ -100,6 +100,9 @@ struct Arguments {
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
+    /// Time all retained mid plans serially through low expansion and write JSON; no placement or hardware.
+    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule", "capture_exchange_schedule"])]
+    benchmark_expansion: Option<PathBuf>,
     /// Capture an expanded finalist before scheduling, linking, or hardware execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule"])]
     capture_exchange_schedule: Option<PathBuf>,
@@ -1035,6 +1038,11 @@ fn main() -> Result<()> {
         runtime_source,
         pipeline,
     };
+    if let Some(path) = &arguments.benchmark_expansion {
+        let report = ipu_codegen::benchmark_mid_expansion(&graph, &package_config.pipeline)?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
+        return Ok(());
+    }
     if let Some(path) = &arguments.capture_exchange_schedule {
         let snapshot = ipu_codegen::capture_exchange_finalist(
             &graph,
