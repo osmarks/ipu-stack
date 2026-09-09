@@ -6,6 +6,14 @@ pub struct ExpansionBenchmark {
     pub planning_ms: f64,
     pub retained_finalists: usize,
     pub finalists: Vec<ExpansionTiming>,
+    /// Matching selections are opportunities, not validated reusable graph fragments.
+    pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct SelectionReuse {
+    pub occurrences: usize,
+    pub distinct: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -21,6 +29,7 @@ pub struct ExpansionTiming {
     pub exchange_phases: usize,
     pub logical_transfers: usize,
     pub recipients: usize,
+    pub panel_mappings: usize,
 }
 
 /// Search once, then expand at most `limit` retained mid plans serially (zero
@@ -44,12 +53,64 @@ pub fn benchmark_mid_expansion(
     )?;
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut finalists = Vec::new();
+    let mut selections = std::collections::BTreeMap::<
+        &'static str,
+        (usize, std::collections::BTreeSet<String>),
+    >::new();
     for (finalist, mid) in
         plans
             .iter()
             .enumerate()
             .take(if limit == 0 { usize::MAX } else { limit })
     {
+        // Outside the timed expansion. Ignore IDs/provenance but retain layouts,
+        // tile ownership and alias-group relationships at the operation boundary.
+        fn selections_in(
+            graph: &crate::MidProgram,
+            operations: &[crate::MidOperation],
+            selections: &mut std::collections::BTreeMap<
+                &'static str,
+                (usize, std::collections::BTreeSet<String>),
+            >,
+        ) {
+            for op in operations {
+                if let crate::MidOperationKind::Repeat(repeat) = &op.kind {
+                    selections_in(graph, &repeat.body.operations, selections);
+                    continue;
+                }
+                let category = match &op.kind {
+                    crate::MidOperationKind::Primitive(crate::Primitive::Compute { .. }) => {
+                        "compute"
+                    }
+                    crate::MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => "copy",
+                    crate::MidOperationKind::Primitive(crate::Primitive::Sum { .. }) => "sum",
+                    _ => "other",
+                };
+                let mut groups = Vec::new();
+                let boundary = op
+                    .inputs
+                    .iter()
+                    .chain(&op.results)
+                    .map(|id| {
+                        let value = &graph.values[id.index() as usize];
+                        let group = groups
+                            .iter()
+                            .position(|g| *g == value.storage_group)
+                            .unwrap_or_else(|| {
+                                groups.push(value.storage_group);
+                                groups.len() - 1
+                            });
+                        (&value.tensor_type, value.tile_offset, group)
+                    })
+                    .collect::<Vec<_>>();
+                let entry = selections.entry(category).or_default();
+                entry.0 += 1;
+                entry
+                    .1
+                    .insert(format!("{}|{:?}|{:?}", graph.tile_count, op.kind, boundary));
+            }
+        }
+        selections_in(mid, &mid.operations, &mut selections);
         let start = Instant::now();
         let expanded = crate::low::expand::expand_tiles(mid, config.diagnostic_checkpoints)?;
         let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -67,6 +128,12 @@ pub fn benchmark_mid_expansion(
             local_copies: low.local_copies.len(),
             exchange_phases: low.exchange_phases.len(),
             logical_transfers: low.exchange_phases.iter().map(|p| p.transfers.len()).sum(),
+            panel_mappings: low
+                .exchange_phases
+                .iter()
+                .flat_map(|p| &p.transfers)
+                .filter(|t| t.order == crate::CopyOrder::Panels)
+                .count(),
             recipients: low
                 .exchange_phases
                 .iter()
@@ -86,5 +153,17 @@ pub fn benchmark_mid_expansion(
         planning_ms,
         retained_finalists: plans.len(),
         finalists,
+        selection_reuse: selections
+            .into_iter()
+            .map(|(kind, (occurrences, keys))| {
+                (
+                    kind,
+                    SelectionReuse {
+                        occurrences,
+                        distinct: keys.len(),
+                    },
+                )
+            })
+            .collect(),
     })
 }

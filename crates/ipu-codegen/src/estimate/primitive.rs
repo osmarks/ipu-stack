@@ -57,7 +57,7 @@ impl<'a> Geometry<'a> {
             Self::Storage(s) => s.extents[axis].physical_end - s.extents[axis].start,
         }
     }
-    pub(super) fn from_end(self, offset: usize) -> Option<u32> {
+    pub(super) fn trailing_dimension(self, offset: usize) -> Option<u32> {
         self.rank()
             .checked_sub(offset + 1)
             .map(|axis| self.dimension(axis))
@@ -182,7 +182,7 @@ pub(crate) fn kernel_cycles<'a>(
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }
         TileKernelSpec::Cast { from, to } => {
-            let columns = u64::from(output.from_end(0).unwrap_or(1));
+            let columns = u64::from(output.trailing_dimension(0).unwrap_or(1));
             let panel_rows = output
                 .format()
                 .layout
@@ -197,7 +197,8 @@ pub(crate) fn kernel_cycles<'a>(
             if from.order == ElementOrder::Amp(crate::AmpOrder::TransposedLeft)
                 && output.format().precision == Precision::F16
                 && output.format().layout.order == ElementOrder::RowMajor
-                && let (Some(rows), Some(columns)) = (output.from_end(1), output.from_end(0))
+                && let (Some(rows), Some(columns)) =
+                    (output.trailing_dimension(1), output.trailing_dimension(0))
             {
                 return crate::kernel::cost::f16_transposed_unpack_cycles(
                     output

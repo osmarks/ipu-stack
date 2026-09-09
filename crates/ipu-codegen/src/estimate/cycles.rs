@@ -265,13 +265,13 @@ pub(super) fn pack_geometry_cycles(tensor: super::primitive::Geometry<'_>, eleme
         }) if row_block.is_multiple_of(16)
             && column_block == 16
             && tensor
-                .from_end(1)
+                .trailing_dimension(1)
                 .is_some_and(|rows| rows <= u32::from(row_block))
             && tensor
-                .from_end(0)
+                .trailing_dimension(0)
                 .is_some_and(|columns| columns.is_multiple_of(4)) =>
         {
-            let columns = u64::from(tensor.from_end(0).unwrap());
+            let columns = u64::from(tensor.trailing_dimension(0).unwrap());
             let rows = u64::from(row_block);
             return crate::kernel::cost::f16_coefficient_pack_cycles(
                 elements.div_ceil(rows * columns.div_ceil(16) * 16),
