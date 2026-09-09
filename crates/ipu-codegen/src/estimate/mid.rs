@@ -229,8 +229,12 @@ pub(crate) fn operation_cost(
                     out.shape.0[column_axis] = *output_columns;
                 }
             }
-            price.total =
-                super::primitive::kernel_cycles(&kernel, &inputs, &out).saturating_mul(calls);
+            price.total = super::primitive::kernel_cycles(
+                &kernel,
+                |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
+                super::primitive::Geometry::Tensor(&out),
+            )
+            .saturating_mul(calls);
         }
         MidOperationKind::Primitive(Primitive::Sum { axis, staging }) => {
             let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);

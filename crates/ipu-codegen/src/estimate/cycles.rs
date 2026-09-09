@@ -249,7 +249,11 @@ const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
 const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 1;
 const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
 pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
-    let cycles_per_element = match tensor.format.layout.order {
+    pack_geometry_cycles(super::primitive::Geometry::Tensor(tensor), elements)
+}
+
+pub(super) fn pack_geometry_cycles(tensor: super::primitive::Geometry<'_>, elements: u64) -> u64 {
+    let cycles_per_element = match tensor.format().layout.order {
         ElementOrder::RowMajor => return 0,
         ElementOrder::Amp(AmpOrder::TransposedRight) => {
             IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT
@@ -261,19 +265,13 @@ pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
         }) if row_block.is_multiple_of(16)
             && column_block == 16
             && tensor
-                .shape
-                .0
-                .iter()
-                .rev()
-                .nth(1)
-                .is_some_and(|&rows| rows <= u32::from(row_block))
+                .from_end(1)
+                .is_some_and(|rows| rows <= u32::from(row_block))
             && tensor
-                .shape
-                .0
-                .last()
+                .from_end(0)
                 .is_some_and(|columns| columns.is_multiple_of(4)) =>
         {
-            let columns = u64::from(*tensor.shape.0.last().unwrap());
+            let columns = u64::from(tensor.from_end(0).unwrap());
             let rows = u64::from(row_block);
             return crate::kernel::cost::f16_coefficient_pack_cycles(
                 elements.div_ceil(rows * columns.div_ceil(16) * 16),

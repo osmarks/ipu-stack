@@ -262,31 +262,21 @@ fn geometry_traffic(
     Ok(traffic)
 }
 
-fn kernel_cycles(run: &KernelRun) -> u64 {
-    let tensor = |view: &crate::ShardView, format: &crate::TensorFormat| TensorType {
-        shape: TensorShape(
-            view.extents
-                .iter()
-                .map(|extent| extent.physical_end - extent.start)
-                .collect(),
-        ),
-        format: format.clone(),
-    };
-    let inputs = run
-        .inputs
-        .iter()
-        .zip(&run.requirements.inputs)
-        .filter_map(|(operand, access)| {
-            operand
-                .views
-                .first()
-                .map(|view| tensor(view, &access.format))
+fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
+    let geometry = |view: &'a crate::ShardView, format: &'a crate::TensorFormat| {
+        super::primitive::Geometry::Storage(crate::storage::TensorStorage {
+            format,
+            extents: &view.extents,
         })
-        .collect::<Vec<_>>();
+    };
     super::primitive::kernel_cycles(
         &run.kernel,
-        &inputs,
-        &tensor(&run.output, &run.requirements.output.format),
+        |index| {
+            let operand = run.inputs.get(index)?;
+            let access = run.requirements.inputs.get(index)?;
+            Some(geometry(operand.views.first()?, &access.format))
+        },
+        geometry(&run.output, &run.requirements.output.format),
     )
 }
 
