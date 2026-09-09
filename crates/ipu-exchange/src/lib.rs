@@ -783,6 +783,13 @@ impl TileProgramSchedule {
         requested: u32,
     ) -> Result<u32, ExchangeError> {
         let mut offset = requested.max(self.reserved_sender_end.saturating_sub(base.start_cycles));
+        let first_start = base
+            .start_cycles
+            .checked_add(offset)
+            .ok_or(ExchangeError::Schedule("send offset overflow"))?;
+        let mut next = self
+            .senders
+            .partition_point(|sender| sender.end_cycles <= first_start);
         loop {
             let start = base
                 .start_cycles
@@ -792,9 +799,15 @@ impl TileProgramSchedule {
                 .end_cycles
                 .checked_add(offset)
                 .ok_or(ExchangeError::Schedule("send offset overflow"))?;
-            let next = self
+            // Offsets only advance. Walk occupied intervals once instead of
+            // binary-searching the same dense history after every collision.
+            while self
                 .senders
-                .partition_point(|sender| sender.end_cycles <= start);
+                .get(next)
+                .is_some_and(|sender| sender.end_cycles <= start)
+            {
+                next += 1;
+            }
             let conflicting_sender = self
                 .senders
                 .get(next)
@@ -804,6 +817,7 @@ impl TileProgramSchedule {
                     .end_cycles
                     .checked_sub(base.start_cycles)
                     .ok_or(ExchangeError::Schedule("send offset order"))?;
+                next += 1;
                 continue;
             }
             // A receive control cannot be encoded before the first outgoing
@@ -3351,6 +3365,63 @@ fn send_off(count_minus_one: u32, direction: u32, base_word: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_cursor_matches_exhaustive_offset_search() {
+        let mut rng = fastrand::Rng::with_seed(0x637572736f72);
+        let row = Topology::c600().multicast(0, &[2], 1, 0).unwrap().sender;
+        for _ in 0..64 {
+            let mut schedule = TileProgramSchedule::default();
+            let mut end = 0;
+            for _ in 0..rng.usize(0..400) {
+                let start = end + rng.u32(0..12);
+                end = start + rng.u32(1..32);
+                schedule.senders.push(ScheduledSenderRow {
+                    row,
+                    start_cycles: start,
+                    end_cycles: end,
+                });
+            }
+            let mut controls = (0..64).map(|_| rng.u32(0..end + 80)).collect::<Vec<_>>();
+            controls.sort_unstable();
+            schedule
+                .receive_events
+                .extend(controls.into_iter().map(|cycles| ReceiveEvent {
+                    cycles,
+                    instruction: 0,
+                    kind: ReceiveEventKind::Pointer,
+                }));
+            schedule.reserved_sender_end = rng.u32(0..end + 40);
+            for _ in 0..16 {
+                let start_cycles = rng.u32(0..8);
+                let end_cycles = start_cycles + rng.u32(1..64);
+                let base = SenderRowTiming {
+                    start_cycles,
+                    end_cycles,
+                    horizon_cycles: end_cycles,
+                };
+                let requested = rng.u32(0..end + 80);
+                let expected = (requested..)
+                    .find(|&offset| {
+                        let start = offset + start_cycles;
+                        let finish = offset + end_cycles;
+                        start >= schedule.reserved_sender_end
+                            && schedule.senders.iter().all(|sender| {
+                                sender.end_cycles <= start || sender.start_cycles >= finish
+                            })
+                            && schedule
+                                .receive_events
+                                .iter()
+                                .all(|event| event.cycles < start || event.cycles > start + 1)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    schedule.earliest_sender_offset(&base, requested).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
 
     #[test]
     fn scalar_instruction_encoders_preserve_operands_and_reject_overflow() {

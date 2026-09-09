@@ -342,6 +342,10 @@ fn report_slack(phase: &ipu_codegen::PhysicalExchangePhase) {
                     }
                 })
                 .collect::<Vec<_>>();
+            let backfills = events
+                .windows(2)
+                .filter(|pair| pair[1].start_cycle < pair[0].start_cycle)
+                .count();
             events.sort_unstable_by_key(|event| event.start_cycle);
             let Some(last) = events.last() else {
                 continue;
@@ -371,15 +375,41 @@ fn report_slack(phase: &ipu_codegen::PhysicalExchangePhase) {
                 gaps.iter().map(|&n| u64::from(n)).sum::<u64>(),
                 gaps.into_iter().max().unwrap_or(0),
                 discontinuities,
+                events[0].start_cycle,
+                backfills,
             ));
         }
     }
+    println!(
+        "slackSummary phase={} backfilledSends={} backfilledReceives={}",
+        phase.id.index(),
+        endpoints
+            .iter()
+            .filter(|entry| !entry.2)
+            .map(|entry| entry.9)
+            .sum::<usize>(),
+        endpoints
+            .iter()
+            .filter(|entry| entry.2)
+            .map(|entry| entry.9)
+            .sum::<usize>()
+    );
     endpoints.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
-    for (end, tile, receive, busy, transfers, gaps, largest_gap, discontinuities) in
-        endpoints.into_iter().take(8)
+    for (
+        end,
+        tile,
+        receive,
+        busy,
+        transfers,
+        gaps,
+        largest_gap,
+        discontinuities,
+        first,
+        backfills,
+    ) in endpoints.into_iter().take(8)
     {
         println!(
-            "slack phase={} tile={} port={} end={} payloadCycles={} transfers={} internalGapCycles={} largestGap={} addressDiscontinuities={}",
+            "slack phase={} tile={} port={} end={} payloadCycles={} transfers={} internalGapCycles={} largestGap={} addressDiscontinuities={} initialDelayCycles={} backfills={}",
             phase.id.index(),
             tile,
             if receive { "rx" } else { "tx" },
@@ -388,7 +418,9 @@ fn report_slack(phase: &ipu_codegen::PhysicalExchangePhase) {
             transfers,
             gaps,
             largest_gap,
-            discontinuities
+            discontinuities,
+            first,
+            backfills
         );
     }
 }
