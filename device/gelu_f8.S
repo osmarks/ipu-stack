@@ -1,7 +1,7 @@
 #define GELU_MACROS_ONLY
 #include "gelu_f16.S"
 
-// output, input, rows, width (multiple of four), scale, packed output.
+// output, input, rows, width (multiple of four), scale, packed output, input row stride, output columns.
 .text
 .allow_optimizations
 .section .text.gelu_f8,"ax",@progbits
@@ -10,7 +10,7 @@
 .type gelu_f8,@function
 gelu_f8:
 .supervisor
-add $m11, $m11, -32
+add $m11, $m11, -40
 st32 $m2, $m11, $m15, 0
 st32 $m3, $m11, $m15, 1
 st32 $m4, $m11, $m15, 2
@@ -23,10 +23,12 @@ and $m6, $m6, 255
 st32 $m6, $m11, $m15, 5
 st32 $m5, $m11, $m15, 6
 st32 $m7, $m11, $m15, 7
+st32 $m8, $m11, $m15, 8
+st32 $m9, $m11, $m15, 9
 setzi $m0, .Lfp8_gelu_worker
 runall $m0, $m11, 0
 sync SYNC_COMPUTE_SET
-add $m11, $m11, 32
+add $m11, $m11, 40
 br $m10
 .size gelu_f8, .-gelu_f8
 
@@ -53,7 +55,8 @@ ld32 $m7, $mvertex_base, $m15, 2
 .Lfp8_gelu_row:
 ld32 $m8, $mvertex_base, $m15, 6
 ld32 $m3, $mvertex_base, $m15, 1
-mul $m0, $m1, $m8
+ld32 $m0, $mvertex_base, $m15, 8
+mul $m0, $m1, $m0
 shl $m0, $m0, 1
 add $m3, $m3, $m0
 get $m4, $WSR
@@ -72,7 +75,8 @@ setzi $m0, 192
 mul $m9, $m7, $m0
 bri .Lfp8_gelu_loop
 .Lfp8_gelu_linear:
-mul $m0, $m1, $m8
+ld32 $m0, $mvertex_base, $m15, 9
+mul $m0, $m1, $m0
 add $m2, $m2, $m0
 add $m2, $m2, $m4
 setzi $m9, 192
@@ -101,16 +105,19 @@ add $m2, $m2, 4
 add $m4, $m4, 4
 bri .Lfp8_gelu_tail
 .Lfp8_gelu_padding:
-ld32 $m0, $mvertex_base, $m15, 7
-brz $m0, .Lfp8_gelu_next_row
-add $m8, $m8, 31
-andc $m8, $m8, 31
+ld32 $m8, $mvertex_base, $m15, 9
 .Lfp8_gelu_zero:
 cmpult $m6, $m4, $m8
 brz $m6, .Lfp8_gelu_next_row
 st32 $m15, $m2, $m15, 0
 add $m2, $m2, 4
 add $m4, $m4, 4
+and $m0, $m4, 31
+brnz $m0, .Lfp8_gelu_zero
+// The next panel assigned to this worker is six panels ahead.
+add $m4, $m4, 160
+add $m2, $m2, $m9
+add $m2, $m2, -32
 bri .Lfp8_gelu_zero
 .Lfp8_gelu_next_row:
 add $m1, $m1, 1

@@ -60,14 +60,23 @@ impl KernelBuildPlan {
                     ];
                     (name, symbol, "attention_softmax_f16.S", flags)
                 }
-                KernelSpecialization::Merge(values, padded, keys) => {
-                    let name = format!("attention_merge_v{values}_p{padded}_k{keys}");
+                KernelSpecialization::Merge(values, padded, keys, output) => {
+                    let suffix = match output {
+                        Precision::F16 => "out16",
+                        Precision::F32 => "out32",
+                        _ => return Err(KernelAbiError::RequirementMismatch),
+                    };
+                    let name = format!("attention_merge_v{values}_p{padded}_k{keys}_{suffix}");
                     let symbol = format!("{name}_f16");
                     let flags = vec![
                         format!("-DATTENTION_VALUE_DIMENSION={values}"),
                         format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded}"),
                         format!("-DATTENTION_KEY_BLOCK_COLUMNS={keys}"),
                         format!("-DATTENTION_MERGE_SYMBOL={symbol}"),
+                        format!(
+                            "-DATTENTION_MERGE_OUTPUT_F16={}",
+                            u8::from(output == Precision::F16)
+                        ),
                     ];
                     (name, symbol, "attention_merge_f16.S", flags)
                 }

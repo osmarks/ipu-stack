@@ -75,13 +75,16 @@ pub(super) enum KernelSpecialization {
     ),
     Attention(AttentionKernelShape),
     Softmax(u32, u32, u32),
-    Merge(u32, u32, u32),
+    Merge(u32, u32, u32, Precision),
     Rearrange((RearrangeTarget, u32, u32, u32, u32)),
     Unpack((UnpackSource, u32, u32, u32, u32)),
 }
 
 impl KernelSpecialization {
-    pub(super) fn stage(kernel: &TileKernelSpec) -> Result<Self, KernelAbiError> {
+    pub(super) fn stage(
+        kernel: &TileKernelSpec,
+        output: Precision,
+    ) -> Result<Self, KernelAbiError> {
         Ok(match kernel {
             TileKernelSpec::AttentionSoftmax {
                 head_dimension,
@@ -97,6 +100,7 @@ impl KernelSpecialization {
                 *value_dimension,
                 *padded_value_dimension,
                 *key_block_columns,
+                output,
             ),
             _ => return Err(KernelAbiError::RequirementMismatch),
         })
@@ -129,7 +133,7 @@ impl KernelSpecialization {
             ),
             TileKernelSpec::FlashAttention { .. } => Self::Attention(attention_shape(run)?),
             TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. } => {
-                Self::stage(kernel)?
+                Self::stage(kernel, run.requirements.output.format.precision)?
             }
             TileKernelSpec::Rearrange { from, to } if from.order == ElementOrder::RowMajor => {
                 Self::Rearrange(rearrangement_specialization(

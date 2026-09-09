@@ -176,6 +176,18 @@ fn main() -> Result<()> {
                     }
                     let tile = programs.len() as u16;
                     let elements = width * rows;
+                    let input_stride = if mode == 8 || mode == 9 {
+                        width.next_multiple_of(32) + 64
+                    } else {
+                        width
+                    };
+                    let output_columns = if mode == 9 {
+                        width.next_multiple_of(32) + 64
+                    } else if mode == 7 {
+                        width.next_multiple_of(32)
+                    } else {
+                        width
+                    };
                     let rounded = |x| f16::from_f32(x).to_f32();
                     let input: Vec<f32> = (0..elements)
                         .map(|_| {
@@ -243,7 +255,7 @@ fn main() -> Result<()> {
                         }
                     }
                     if (6..10).contains(&mode) && mode % 2 == 1 {
-                        let mut packed = vec![0.0; (rows * width.next_multiple_of(32)) as usize];
+                        let mut packed = vec![0.0; (rows * output_columns) as usize];
                         for row in 0..rows {
                             for col in 0..width {
                                 packed[((col / 32 * rows + row) * 32 + col % 32) as usize] =
@@ -252,14 +264,23 @@ fn main() -> Result<()> {
                         }
                         wanted = packed;
                     }
+                    let mut physical_input = vec![f32::NAN; (rows * input_stride) as usize];
+                    for row in 0..rows as usize {
+                        physical_input[row * input_stride as usize
+                            ..row * input_stride as usize + width as usize]
+                            .copy_from_slice(
+                                &input[row * width as usize..(row + 1) * width as usize],
+                            );
+                    }
                     let addresses = [
                         0x60000 + offset,
                         0x64000 + offset,
                         0x68000 + offset,
                         0x6a000 + offset,
                     ];
-                    for (values, address) in
-                        [&input, &right, &gamma, &beta].into_iter().zip(addresses)
+                    for (values, address) in [&physical_input, &right, &gamma, &beta]
+                        .into_iter()
+                        .zip(addresses)
                     {
                         if offset == 8 && address == addresses[0] {
                             continue;
@@ -355,7 +376,14 @@ fn main() -> Result<()> {
                         8 | 9 => (
                             "gelu_f8",
                             vec![addresses[0]],
-                            vec![rows, width, (-4i32) as u32, mode % 2],
+                            vec![
+                                rows,
+                                width,
+                                (-4i32) as u32,
+                                mode % 2,
+                                input_stride,
+                                output_columns,
+                            ],
                         ),
                         _ => (
                             "layer_norm_apply",

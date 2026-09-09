@@ -174,9 +174,18 @@ pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
 /// Look through metadata-only copies. Callers still check intervening writes
 /// and whether bypassed values have other readers before removing any copy.
 pub(super) fn producer_through_identity_copies(
+    value: MidValueId,
+    operations: &[MidOperation],
+    values: &[MidValue],
+) -> Option<(MidValueId, usize, Vec<usize>)> {
+    producer_through_copies(value, operations, values, true)
+}
+
+fn producer_through_copies(
     mut value: MidValueId,
     operations: &[MidOperation],
     values: &[MidValue],
+    identity_only: bool,
 ) -> Option<(MidValueId, usize, Vec<usize>)> {
     let mut copies = vec![];
     loop {
@@ -191,10 +200,18 @@ pub(super) fn producer_through_identity_copies(
         };
         if !identity
             || op.inputs.len() != 1
-            || !same_storage(
-                &values[value.index() as usize],
-                &values[op.inputs[0].index() as usize],
-            )
+            || values[value.index() as usize].tensor_type.shape
+                != values[op.inputs[0].index() as usize].tensor_type.shape
+            || values[value.index() as usize].tensor_type.format.precision
+                != values[op.inputs[0].index() as usize]
+                    .tensor_type
+                    .format
+                    .precision
+            || (identity_only
+                && !same_storage(
+                    &values[value.index() as usize],
+                    &values[op.inputs[0].index() as usize],
+                ))
         {
             return Some((value, index, copies));
         }
@@ -242,7 +259,7 @@ fn fuse_fp8_outputs(
             continue;
         }
         let Some((intermediate, previous, identity_copies)) =
-            producer_through_identity_copies(cast.inputs[0], &operations[..index], values)
+            producer_through_copies(cast.inputs[0], &operations[..index], values, false)
         else {
             continue;
         };
@@ -277,7 +294,29 @@ fn fuse_fp8_outputs(
         {
             continue;
         }
-        let input = &values[intermediate.index() as usize];
+        let redistributed = !same_storage(
+            &values[intermediate.index() as usize],
+            &values[cast.inputs[0].index() as usize],
+        );
+        // GELU commutes with coordinate-preserving distribution. Move its
+        // input through the existing copies and run the fused producer on the
+        // consumer's owners; no new layout search or temporary is required.
+        if redistributed
+            && (*kernel != TileKernelSpec::Gelu
+                || producer.inputs.len() != 1
+                || !same_storage(
+                    &values[producer.inputs[0].index() as usize],
+                    &values[intermediate.index() as usize],
+                ))
+        {
+            continue;
+        }
+        let input = &values[if redistributed {
+            cast.inputs[0]
+        } else {
+            intermediate
+        }
+        .index() as usize];
         let output = &values[cast.results[0].index() as usize];
         tracing::debug!(target: "ipu_codegen::mid::elementwise", producer = ?producer.source,
             consumer = ?cast.source, ?kernel, input_layout = ?input.tensor_type.format.layout,
@@ -349,6 +388,9 @@ fn fuse_fp8_outputs(
         }
         let mut replacement = producer.clone();
         replacement.results = cast.results.clone();
+        if redistributed {
+            replacement.inputs = cast.inputs.clone();
+        }
         replacement.kind = MidOperationKind::Primitive(Primitive::Compute {
             kernel: kernel.clone(),
             operands: operands.clone(),
@@ -363,9 +405,14 @@ fn fuse_fp8_outputs(
         }) {
             continue;
         }
+        if redistributed {
+            let first = *identity_copies.last().expect("redistribution has a copy");
+            operations[first].inputs[0] = producer.inputs[0];
+        } else {
+            removed.extend(identity_copies);
+        }
         operations[index] = replacement;
         removed.insert(previous);
-        removed.extend(identity_copies);
     }
     let changed = !removed.is_empty();
     let mut index = 0;
@@ -407,6 +454,95 @@ pub(super) fn compatible_fusion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gelu_moves_through_retile_into_fp8_consumer_owners() {
+        let source = TensorType::new([12, 1152], Precision::F16, Layout::row_sharded(1));
+        let retiled = TensorType::new([12, 1152], Precision::F16, Layout::row_sharded(12));
+        let mut packed = retiled.clone();
+        packed.format.precision = Precision::F8F143 { scale_exponent: -4 };
+        packed.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+        let values = [
+            source.clone(),
+            source.clone(),
+            retiled.clone(),
+            packed.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, tensor_type)| {
+            let id = MidValueId(index as u32);
+            MidValue {
+                id,
+                tile_offset: 0,
+                tensor_type,
+                origin: ValueId::from_index(0),
+                storage_group: id,
+            }
+        })
+        .collect();
+        let operation = |input, result, kind| MidOperation {
+            source: None,
+            inputs: vec![MidValueId(input)],
+            results: vec![MidValueId(result)],
+            kind,
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        };
+        let mut program = MidProgram {
+            tile_count: 12,
+            values,
+            operations: vec![
+                operation(
+                    0,
+                    1,
+                    MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Gelu,
+                        operands: vec![OperandWindow::default()],
+                        product: None,
+                        output_aliases: vec![],
+                    }),
+                ),
+                operation(
+                    1,
+                    2,
+                    MidOperationKind::Convert(ConversionPlan {
+                        input: OperandRequirement::new(source.format, 8),
+                        output: OperandRequirement::new(retiled.format.clone(), 8),
+                        strategy: ConversionStrategy::DirectRetile,
+                    }),
+                ),
+                operation(
+                    2,
+                    3,
+                    MidOperationKind::Convert(ConversionPlan {
+                        input: OperandRequirement::new(retiled.format, 8),
+                        output: OperandRequirement::new(packed.format, 8),
+                        strategy: ConversionStrategy::LocalKernel,
+                    }),
+                ),
+            ],
+            outputs: vec![MidValueId(3)],
+            ..MidProgram::default()
+        };
+        let fused = program.with_elementwise_fusions().unwrap();
+        assert_eq!(fused.operations.len(), 2);
+        assert_eq!(fused.operations[0].inputs, [MidValueId(0)]);
+        assert_eq!(fused.operations[1].inputs, [MidValueId(2)]);
+        assert!(matches!(
+            fused.operations[1].kind,
+            MidOperationKind::Primitive(Primitive::Compute {
+                kernel: TileKernelSpec::Gelu,
+                ..
+            })
+        ));
+        let graph = crate::expand_tiles(&fused).unwrap();
+        for run in &graph.kernel_runs {
+            crate::validate_kernel_run(run).unwrap();
+        }
+        program.outputs.push(MidValueId(1));
+        assert!(program.with_elementwise_fusions().is_none());
+    }
+
     #[test]
     fn fp8_output_fusion_preserves_other_users_and_prices_packed_rows() {
         for norm in [false, true] {
@@ -520,7 +656,11 @@ mod tests {
                     crate::validate_kernel_run(&low.kernel_runs[0]).unwrap();
                     let build = crate::KernelBuildPlan::from_program(&low).unwrap();
                     let call = build.call(&low.kernel_runs[0]).unwrap();
-                    assert_eq!(call.arguments, vec![rows, 1152, (-4i32) as u32, 1]);
+                    let mut expected = vec![rows, 1152, (-4i32) as u32, 1];
+                    if !norm {
+                        expected.extend([1152, 1152]);
+                    }
+                    assert_eq!(call.arguments, expected);
                 }
                 program.outputs.push(MidValueId(3));
                 assert!(program.with_elementwise_fusions().is_none());

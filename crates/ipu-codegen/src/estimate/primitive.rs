@@ -270,6 +270,7 @@ pub(crate) fn kernel_cycles<'a>(
                 u64::from(*value_dimension),
                 *initial,
                 *final_block,
+                output.format().precision == Precision::F16,
             );
         }
         TileKernelSpec::FlashAttention { .. } => {

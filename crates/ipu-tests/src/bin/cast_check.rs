@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         (184, 96), // Largest cast in the full B1 ViT profile.
         (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
-        for mode in 0..5 {
+        for mode in 0..6 {
             // dense, already packed, row-major -> packed
             if mode >= 2 && args.existing_layouts_only {
                 continue;
@@ -106,10 +106,15 @@ fn main() -> Result<()> {
             ] {
                 for scale in [-4i8, 0, 3] {
                     let tile = programs.len() as u16;
-                    let source_columns = if mode == 4 {
+                    let source_columns = if mode >= 4 {
                         columns.next_multiple_of(32) + 64
                     } else {
                         columns
+                    };
+                    let valid_rows = if mode == 5 {
+                        rows.saturating_sub(2)
+                    } else {
+                        rows
                     };
                     let source_count = rows * source_columns;
                     let output_columns = if mode == 0 {
@@ -141,9 +146,9 @@ fn main() -> Result<()> {
                         .collect();
                     // Poison unread column padding with NaNs.
                     let mut input =
-                        vec![if mode == 4 { 0x7e00u16 } else { 0 }; source_count as usize];
+                        vec![if mode >= 4 { 0x7e00u16 } else { 0 }; source_count as usize];
                     let mut result = vec![0u8; count as usize];
-                    for row in 0..rows {
+                    for row in 0..valid_rows {
                         for column in 0..columns {
                             let logical_index = (row * columns + column) as usize;
                             let input_index = if mode == 1 {
@@ -199,9 +204,9 @@ fn main() -> Result<()> {
                             input_addresses: vec![TileAddress::Absolute(input_address)],
                             arguments: vec![
                                 count,
-                                0,
+                                if mode >= 2 { valid_rows } else { 0 },
                                 (i32::from(scale)) as u32,
-                                if mode == 0 || (rows == 1 && source_count == count && mode != 4) {
+                                if mode == 0 || (rows == 1 && source_count == count && mode < 4) {
                                     0
                                 } else {
                                     rows

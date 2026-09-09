@@ -1,5 +1,9 @@
 #include "arch/gc_tile_defines.h"
 
+#ifndef ATTENTION_MERGE_OUTPUT_F16
+#define ATTENTION_MERGE_OUTPUT_F16 0
+#endif
+
 #ifndef ATTENTION_VALUE_DIMENSION
 #define ATTENTION_VALUE_DIMENSION 64
 #endif
@@ -32,17 +36,24 @@
 	.type \name,@function
 \name:
 	.supervisor
-	add $m11, $m11, -24
+	add $m11, $m11, -32
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
 	st32 $m4, $m11, $m15, 2
+#if ATTENTION_MERGE_OUTPUT_F16
+	st32 $m5, $m11, $m15, 6 // previous FP32 accumulator
+	st32 $m6, $m11, $m15, 3
+	st32 $m7, $m11, $m15, 4
+	st32 $m8, $m11, $m15, 5
+#else
 	st32 $m5, $m11, $m15, 3
 	st32 $m6, $m11, $m15, 4
 	st32 $m7, $m11, $m15, 5
+#endif
 	setzi $m0, .Lattention_merge_worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
-	add $m11, $m11, 24
+	add $m11, $m11, 32
 	br $m10
 	.size \name, .-\name
 	.endm
@@ -53,17 +64,31 @@
 	ld32step $a0, $mzero, $m1+=, 1
 	f16v2tof32 $a0:1, $a0
 	f32v2mul $a0:1, $a6:B, $a0:1
+#if ATTENTION_MERGE_OUTPUT_F16
+	f32v2tof16 $a0, $a0:1
+	st32step $a0, $mzero, $m0+=, 1
+#else
 	st64step $a0:1, $mzero, $m0+=, 1
+#endif
 	.endm
 
 	.macro ATTENTION_MERGE_UPDATE_PAIR
 	ld32step $a0, $mzero, $m1+=, 1
 	f16v2tof32 $a0:1, $a0
+#if ATTENTION_MERGE_OUTPUT_F16
+	{ ld64step $a2:3, $mzero, $m3+=, 1
+#else
 	{ ld64 $a2:3, $m0, $m15, 0
+#endif
 	  f32v2mul $a0:1, $a6:B, $a0:1 }
 	f32v2mul $a2:3, $a5:B, $a2:3
 	f32v2add $a2:3, $a2:3, $a0:1
+#if ATTENTION_MERGE_OUTPUT_F16
+	f32v2tof16 $a2, $a2:3
+	st32step $a2, $mzero, $m0+=, 1
+#else
 	st64step $a2:3, $mzero, $m0+=, 1
+#endif
 	.endm
 
 	.worker
@@ -83,11 +108,21 @@
 	ld32 $m1, $mvertex_base, $m15, 1
 	shl $m8, $m9, 5
 	add $m1, $m1, $m8
+#if ATTENTION_MERGE_OUTPUT_F16
+	setzi $m8, ATTENTION_PADDED_VALUE_DIMENSION * 2
+	mul $m8, $m9, $m8
+	add $m0, $m0, $m8
+	ld32 $m3, $mvertex_base, $m15, 6
+	shl $m8, $m8, 1
+	add $m3, $m3, $m8
+	add $m8, $m3, ATTENTION_VALUE_DIMENSION * 4
+#else
 	setzi $m8, ATTENTION_PADDED_VALUE_DIMENSION * 4
 	mul $m8, $m9, $m8
 	add $m0, $m0, $m8
-	// m8 remains the address of the two persistent online-softmax scalars.
+	// Address of the persistent online-softmax scalars.
 	add $m8, $m0, ATTENTION_VALUE_DIMENSION * 4
+#endif
 	ld32 $m4, $mvertex_base, $m15, 2
 	setzi $m2, ATTENTION_KEY_BLOCK_COLUMNS * 2
 	mul $m2, $m5, $m2
@@ -159,9 +194,14 @@
 	.endr
 
 .Lattention_merge_next_row:
-	// The following cast processes the physical row. Old SRAM contents in
-	// its unused columns may be NaN or overflow FP16 even with finite inputs.
-	// Final outputs no longer need persistent max/sum state in this padding.
+#if ATTENTION_MERGE_OUTPUT_F16
+	// A pair store already wrote the odd halfword, if present. Clear all
+	// remaining output padding without touching the previous FP32 state.
+	.rept (ATTENTION_PADDED_VALUE_DIMENSION - ATTENTION_VALUE_DIMENSION) / 2
+	st32step $azero, $mzero, $m0+=, 1
+	.endr
+#else
+	// Final outputs no longer need persistent max/sum state in the padding.
 #if ATTENTION_PADDED_VALUE_DIMENSION > ATTENTION_VALUE_DIMENSION
 	brz $m7, .Lattention_merge_keep_state
 #if ATTENTION_VALUE_DIMENSION % 2
@@ -171,6 +211,7 @@
 	st64step $azeros, $mzero, $m8+=, 1
 	.endr
 .Lattention_merge_keep_state:
+#endif
 #endif
 	add $m9, $m9, 6
 	cmpult $m0, $m9, $m5

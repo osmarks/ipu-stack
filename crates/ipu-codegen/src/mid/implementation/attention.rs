@@ -208,23 +208,37 @@ impl Builder {
                     ],
                 )
             };
+            let final_block = materialized || start + key_block >= key_rows;
+            let direct_f16 = final_block && final_output.format.precision == Precision::F16;
+            let mut inputs = vec![product, weights_id];
+            if direct_f16 {
+                // An explicit previous accumulator keeps FP32 state live while
+                // the final merge writes a separate, compact FP16 result.
+                // The initial-block path does not read this operand.
+                inputs.push(result.unwrap_or(product));
+            }
             result = Some(self.compute(
-                vec![product, weights_id],
-                output.clone(),
+                inputs,
+                if direct_f16 {
+                    final_output.clone()
+                } else {
+                    output.clone()
+                },
                 TileKernelSpec::AttentionMerge {
                     value_dimension: output.shape.0[2],
                     padded_value_dimension: value_width,
                     key_block_columns: key_block,
                     initial: start == 0,
-                    final_block: materialized || start + key_block >= key_rows,
+                    final_block,
                 },
                 None,
-                result,
+                if direct_f16 { None } else { result },
                 vec![],
             ));
         }
         Some(self.cast(result?, final_output.format.precision))
     }
+
     /// Pack once on a small distributed owner grid, then broadcast native
     /// panels. Both materializations are ordinary mid values and copies.
     fn prepare_attention_operand(

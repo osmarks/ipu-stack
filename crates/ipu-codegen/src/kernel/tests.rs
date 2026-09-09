@@ -435,7 +435,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     plan.add_attention_stages(
         stages
             .iter()
-            .map(|(kernel, _)| KernelSpecialization::stage(kernel).unwrap())
+            .map(|(kernel, _)| KernelSpecialization::stage(kernel, Precision::F32).unwrap())
             .collect(),
     )
     .unwrap();
@@ -449,7 +449,11 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             _ => unreachable!(),
         };
         let format = TensorFormat {
-            precision: Precision::F16,
+            precision: if inputs == 2 {
+                Precision::F32
+            } else {
+                Precision::F16
+            },
             layout: Layout::row_major(TensorTiling::replicated(1)),
         };
         let output = ShardView {

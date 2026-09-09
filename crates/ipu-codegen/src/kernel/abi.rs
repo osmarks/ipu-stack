@@ -38,8 +38,9 @@ pub enum ScalarValue {
     NumPartials,
     FeaturePartitions,
     InputColumns,
+    InputPhysicalColumns,
     ScaleExponent,
-    CastSourceScale,
+    CastSourceMetadata,
     CastDestinationScale,
     CastPanelRows,
     CastSourceExtent,
@@ -105,6 +106,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 ))),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
+            ScalarValue::InputPhysicalColumns => input_matrix_extent(run, false, true),
             ScalarValue::InputColumns => {
                 let axis = run.inputs[0].views[0]
                     .extents
@@ -127,9 +129,31 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 } => fp8_scale_argument(2 * i32::from(*scale_exponent)),
                 _ => Err(KernelAbiError::RequirementMismatch),
             },
-            ScalarValue::CastSourceScale | ScalarValue::CastDestinationScale => match run.kernel {
+            ScalarValue::CastSourceMetadata | ScalarValue::CastDestinationScale => match run.kernel
+            {
                 TileKernelSpec::Cast { from, to } => {
-                    let precision = if *argument == ScalarValue::CastSourceScale {
+                    if *argument == ScalarValue::CastSourceMetadata
+                        && from == Precision::F16
+                        && run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
+                        && run.requirements.output.format.layout.order
+                            == ElementOrder::Amp(AmpOrder::Left)
+                    {
+                        let extents = &run.inputs[0].views[0].extents;
+                        // A single local matrix has one readable row prefix.
+                        // For multiple matrices retain physical rows, since
+                        // their padding may be interspersed with valid rows.
+                        return if extents.len() >= 2
+                            && extents[..extents.len() - 2]
+                                .iter()
+                                .all(|a| a.physical_end - a.start == 1)
+                        {
+                            input_matrix_extent(run, true, false)
+                        } else {
+                            Ok(scalar_source_elements(run)?
+                                / input_matrix_extent(run, false, true)?)
+                        };
+                    }
+                    let precision = if *argument == ScalarValue::CastSourceMetadata {
                         from
                     } else {
                         to
@@ -373,6 +397,8 @@ pub fn tile_kernel_abi(
                     ScalarValue::InputColumns,
                     ScalarValue::OutputScale,
                     ScalarValue::PackedOutput,
+                    ScalarValue::InputPhysicalColumns,
+                    ScalarValue::PhysicalColumns,
                 ],
             ),
             TileKernelSpec::Gelu => {
@@ -438,10 +464,14 @@ pub fn tile_kernel_abi(
                     ScalarValue::SplitSoftmaxRows,
                 ],
             ),
-            TileKernelSpec::AttentionMerge { .. } => (
+            TileKernelSpec::AttentionMerge { final_block, .. } => (
                 KernelSymbols::Specialized,
-                KernelAvailability::Implemented,
-                2,
+                if precision == Precision::F32 || (precision == Precision::F16 && *final_block) {
+                    KernelAvailability::Implemented
+                } else {
+                    KernelAvailability::Required
+                },
+                if precision == Precision::F16 { 3 } else { 2 },
                 &[
                     ScalarValue::InitialBlock,
                     ScalarValue::FinalBlock,
@@ -464,7 +494,7 @@ pub fn tile_kernel_abi(
                 {
                     &[
                         ScalarValue::ElementCount,
-                        ScalarValue::CastSourceScale,
+                        ScalarValue::CastSourceMetadata,
                         ScalarValue::CastDestinationScale,
                         ScalarValue::CastPanelRows,
                         ScalarValue::CastSourceExtent,

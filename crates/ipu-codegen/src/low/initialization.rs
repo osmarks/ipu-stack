@@ -26,9 +26,10 @@ pub(super) fn omit_unread_cast_padding(program: &mut LowProgram) {
                     && run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
                     && view.extents == block.extents
                     && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
-                    // This kernel still reads physical rows. Only discard
-                    // clears when all padding is in the column dimension.
-                    && view.extents.iter().rev().skip(1).all(|axis| axis.logical_end == axis.physical_end);
+                    // Column padding is always skipped. Row padding is also
+                    // skipped for a single local matrix (one readable prefix).
+                    && (view.extents.iter().rev().skip(1).all(|axis| axis.logical_end == axis.physical_end)
+                        || (view.extents.len() >= 2 && view.extents[..view.extents.len()-2].iter().all(|axis| axis.physical_end - axis.start == 1)));
                 if ignores_padding {
                     candidates.insert(root(view.shard));
                 } else {
@@ -450,7 +451,7 @@ mod tests {
             omit_unread_cast_padding(&mut program);
             assert_eq!(
                 program.tiles[0].work.len(),
-                if case == 0 { 1 } else { 2 },
+                if case <= 1 { 1 } else { 2 },
                 "case {case}"
             );
         }

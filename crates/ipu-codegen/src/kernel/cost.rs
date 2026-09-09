@@ -77,7 +77,7 @@ pub(crate) fn f16_packed_gemm_cycles(
     )
 }
 
-/// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 47
+/// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 43
 /// issue groups per full 16-key panel. Masked pairs and zero padding use short
 /// scalar loops; no tile program needs to be constructed to price them.
 fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
@@ -85,7 +85,7 @@ fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
         return 0;
     }
     let full_panels = keys / 16;
-    let mut row = 31u64.saturating_add(full_panels.saturating_mul(47));
+    let mut row = 31u64.saturating_add(full_panels.saturating_mul(43));
     let launch = if keys == padded_keys {
         row = row.saturating_add(7);
         216u64
@@ -117,7 +117,7 @@ fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
     }
     let segment = padded_keys
         .div_ceil(48)
-        .saturating_mul(47)
+        .saturating_mul(43)
         .saturating_add(128);
     408u64
         .saturating_add(rows.div_ceil(2).saturating_mul(6).saturating_mul(segment))
@@ -145,18 +145,20 @@ pub(crate) fn f16_attention_merge_cycles(
     values: u64,
     initial: bool,
     final_block: bool,
+    output_f16: bool,
 ) -> u64 {
     if rows == 0 {
         return 0;
     }
     let panels = values / 16;
     let row = (if initial { 27u64 } else { 34u64 })
+        .saturating_add(if output_f16 { 3 } else { 0 })
         .saturating_add(u64::from(panels != 0))
         .saturating_add(panels.saturating_mul(3))
         .saturating_add(
             values
                 .div_ceil(2)
-                .saturating_mul(if initial { 4 } else { 6 }),
+                .saturating_mul((if initial { 4 } else { 6 }) + u64::from(output_f16)),
         )
         .saturating_add(if final_block {
             if initial { 3 } else { 5 }
@@ -271,19 +273,26 @@ pub(crate) fn f16_layernorm_moments_cycles(rows: u64, width: u64) -> u64 {
 /// Final moments merging is small but repeats in each worker. These costs
 /// cover local application only; the mid copy prices the statistics exchange.
 pub(crate) fn f16_layernorm_apply_cycles(rows: u64, width: u64, parts: u16) -> u64 {
-    558u64.saturating_add(
-        rows.saturating_mul(324 + u64::from(parts) * 54 + width.div_ceil(12).saturating_mul(60)),
-    )
+    558u64.saturating_add(rows.saturating_mul(
+        (324 + u64::from(parts) * 54).saturating_add(width.div_ceil(12).saturating_mul(60)),
+    ))
 }
 
 /// Pair conversion stays in ARF and emits complete FP8 words. Packed LN
 /// needs separate address calculations when a tile owns several rows.
 pub(crate) fn fp8_elementwise_cycles(gelu: bool, rows: u64, width: u64, packed: bool) -> u64 {
     if gelu {
-        132 + rows * (372 + width.div_ceil(192) * 1098)
+        132u64.saturating_add(
+            rows.saturating_mul(372u64.saturating_add(width.div_ceil(192).saturating_mul(1098))),
+        )
     } else {
-        f16_layernorm_cycles(rows, width, false)
-            + rows * (270 + width.div_ceil(24) * if packed && rows > 1 { 162 } else { 6 })
+        f16_layernorm_cycles(rows, width, false).saturating_add(rows.saturating_mul(
+            270u64.saturating_add(width.div_ceil(24).saturating_mul(if packed && rows > 1 {
+                162
+            } else {
+                6
+            })),
+        ))
     }
 }
 
@@ -322,16 +331,25 @@ mod tests {
     #[test]
     fn attention_row_models_match_hardware() {
         for rows in [7, 8] {
-            assert_eq!(f16_softmax_cycles(rows, 64, 64), 2928);
-            assert_eq!(f16_softmax_cycles(rows, 25, 64), 2682);
-            assert_eq!(f16_attention_merge_cycles(rows, 72, true, false), 2430);
-            assert_eq!(f16_attention_merge_cycles(rows, 72, false, false), 3378);
-            assert_eq!(f16_attention_merge_cycles(rows, 72, false, true), 3438);
+            assert_eq!(f16_softmax_cycles(rows, 64, 64), 2736);
+            assert_eq!(f16_softmax_cycles(rows, 25, 64), 2634);
+            assert_eq!(
+                f16_attention_merge_cycles(rows, 72, true, false, false),
+                2430
+            );
+            assert_eq!(
+                f16_attention_merge_cycles(rows, 72, false, false, false),
+                3378
+            );
+            assert_eq!(
+                f16_attention_merge_cycles(rows, 72, false, true, false),
+                3438
+            );
         }
         assert_eq!(f16_softmax_cycles(0, 64, 64), 0);
         assert_eq!(f16_softmax_cycles(u64::MAX, u64::MAX, u64::MAX), u64::MAX);
         assert_eq!(
-            f16_attention_merge_cycles(u64::MAX, u64::MAX, false, true),
+            f16_attention_merge_cycles(u64::MAX, u64::MAX, false, true, false),
             u64::MAX
         );
     }
@@ -344,8 +362,8 @@ mod tests {
         assert!(!f16_softmax_split_rows(6, 729, 768));
         for rows in [7, 8] {
             assert!(f16_softmax_split_rows(rows, 729, 768));
-            // Uniform-input device measurements: 21,762 / 21,780 cycles.
-            assert_eq!(f16_softmax_cycles(rows, 729, 768), 21_780);
+            // Uniform-input device measurements: 20,226 / 20,244 cycles.
+            assert_eq!(f16_softmax_cycles(rows, 729, 768), 20_244);
         }
     }
 

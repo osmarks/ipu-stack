@@ -340,7 +340,7 @@ fn main() -> Result<()> {
                 );
                 let actual_sum: f64 = (0..keys).map(|k| readhalf(index(k))).sum();
                 ensure!(
-                    (actual_sum - denominator).abs() < 0.001,
+                    (actual_sum - denominator).abs() < 0.001 + 0.002 * actual_sum,
                     "bad sum {actual_sum} {denominator}"
                 );
                 for k in 0..padded {

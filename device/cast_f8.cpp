@@ -71,6 +71,21 @@ static __attribute__((noinline)) void castRowTail(
   }
 }
 
+static __attribute__((noinline)) void zeroPackedRows(
+    unsigned char *output, unsigned rows, unsigned stride) {
+  unsigned offset = 0;
+  asm volatile(
+      "{ rpt %[rows], 4; fnop }\n"
+      "{ st64 $azeros, %[out], %[offset], 0; fnop }\n"
+      "{ st64 $azeros, %[out], %[offset], 1; fnop }\n"
+      "{ st64 $azeros, %[out], %[offset], 2; fnop }\n"
+      "{ st64 $azeros, %[out], %[offset], 3; fnop }\n"
+      "{ add %[offset], %[offset], %[stride]; fnop }\n"
+      : [offset] "+&r"(offset)
+      : [out] "r"(output), [rows] "r"(rows), [stride] "r"(stride)
+      : "memory");
+}
+
 // Keep the pipeline's register pressure off the small/fallback cast paths.
 static __attribute__((noinline)) void castPackedRows(
     const half *first, const half *second, unsigned char *target,
@@ -121,7 +136,8 @@ public:
   Input<Vector<Source, VectorLayout::ONE_PTR>> source;
   Output<Vector<Destination, VectorLayout::ONE_PTR>> destination;
   unsigned elements;
-  int sourceScale;
+  // FP8 source scale, or readable row count for row-major FP16 packing.
+  int sourceMetadata;
   int destinationScale;
   unsigned panelRows;
   // Allocation elements for linear/panel input, valid columns for row-major input.
@@ -154,7 +170,9 @@ public:
       // workers complete panels when there are enough independent panels.
       const bool wholePanels = panelRows <= 32 && elements >= panelElements * 6;
       const unsigned row = wholePanels ? 0 : worker;
-      const unsigned rows = wholePanels ? panelRows : (panelRows + 5 - worker) / 6;
+      const unsigned physicalRows = wholePanels ? panelRows : (panelRows + 5 - worker) / 6;
+      const unsigned validRows = rowMajorColumns ? static_cast<unsigned>(sourceMetadata) : panelRows;
+      const unsigned rows = row >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - worker) / 6;
       const unsigned stride = wholePanels ? 32 : 192;
       const unsigned sourceStride = rowMajorColumns ? rowMajorColumns * 2 * (wholePanels ? 1 : 6) : stride;
       const unsigned panelStep = panelElements * (wholePanels ? 6 : 1);
@@ -162,19 +180,11 @@ public:
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
            panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
         unsigned char *panelTarget = &destination[panel + row * 32];
+        if (physicalRows > rows)
+          zeroPackedRows(panelTarget + rows * stride, physicalRows - rows, stride);
+        if (!rows) continue;
         if (rowMajorColumns && column >= validColumns) {
-          unsigned offset = 0;
-          asm volatile(
-              "zero $a0:1\n"
-              "{ rpt %[rows], 4; fnop }\n"
-              "{ st64 $a0:1, %[out], %[offset], 0; fnop }\n"
-              "{ st64 $a0:1, %[out], %[offset], 1; fnop }\n"
-              "{ st64 $a0:1, %[out], %[offset], 2; fnop }\n"
-              "{ st64 $a0:1, %[out], %[offset], 3; fnop }\n"
-              "{ add %[offset], %[offset], %[stride]; fnop }\n"
-              : [offset] "+&r"(offset)
-              : [out] "r"(panelTarget), [rows] "r"(rows), [stride] "r"(stride)
-              : "$a0:1", "memory");
+          zeroPackedRows(panelTarget, rows, stride);
           continue;
         }
         const half *first = &source[rowMajorColumns ? row * rowMajorColumns + column : panel + row * 16];
@@ -293,7 +303,7 @@ public:
     return true;
 #else
     setQuarterConfig({quarter_metadata::f143,
-        static_cast<signed char>(INPUT_BYTES == 1 && OUTPUT_BYTES == 2 ? sourceScale : 0)});
+        static_cast<signed char>(INPUT_BYTES == 1 && OUTPUT_BYTES == 2 ? sourceMetadata : 0)});
     // A worker owns complete destination words, including the final RMW.
     for (unsigned base = worker * 4; base < elements; base += 24) {
       half4 value;
@@ -320,7 +330,7 @@ public:
 #if OUTPUT_BYTES == 1
 #if INPUT_BYTES == 1
       for (unsigned lane = 0; lane < 4; ++lane) {
-        float element = static_cast<float>(value[lane]) * powerOfTwo(sourceScale - destinationScale);
+        float element = static_cast<float>(value[lane]) * powerOfTwo(sourceMetadata - destinationScale);
         element = element > 240.0f ? 240.0f : element;
         element = element < -240.0f ? -240.0f : element;
         value[lane] = static_cast<half>(element);
@@ -340,7 +350,7 @@ public:
 #else
       for (unsigned lane = 0; lane < 4 && base + lane < elements; ++lane)
 #if INPUT_BYTES == 1 && OUTPUT_BYTES == 4
-        destination[base + lane] = static_cast<float>(value[lane]) * powerOfTwo(sourceScale);
+        destination[base + lane] = static_cast<float>(value[lane]) * powerOfTwo(sourceMetadata);
 #else
         destination[base + lane] = static_cast<Destination>(value[lane]);
 #endif
