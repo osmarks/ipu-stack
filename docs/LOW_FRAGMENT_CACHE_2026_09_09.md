@@ -59,7 +59,10 @@ rather than using hit rates as evidence of speedup. Experiments remain in commit
 and a too-small entry limit dominated; borrowed lookups and capacity handling
 address that in the retained version.
 
-## Remaining bottlenecks
+The subsequent [symbolic geometry analysis](LOW_GEOMETRY_ANALYSIS_2026_09_09.md)
+implements shared exchange facts and evaluates immutable fragment storage.
+
+## Remaining bottlenecks at this point
 
 A software CPU-clock profile of four materialized-attention expansions identifies:
 
