@@ -1,6 +1,6 @@
 #include <poplar/HalfFloat.hpp>
 #include <poplar/Vertex.hpp>
-#include <cmath>
+#include "elementwise_vector.hpp"
 using namespace poplar;
 
 #ifdef VERTEX_LayerNormF16
@@ -20,46 +20,30 @@ public:
   unsigned rows, width;
   InOut<Vector<float, VectorLayout::ONE_PTR>> scratch;
   unsigned stage;
-  half2 load(unsigned i) const {
-    half2 value = reinterpret_cast<const half2 *>(&source[0])[i];
-#ifdef NORM_WITH_ADD
-    value += reinterpret_cast<const half2 *>(&right[0])[i];
-#endif
-    return value;
-  }
   bool compute(unsigned worker) {
     auto *partials = reinterpret_cast<float2 *>(&scratch[0]);
+    const half *x = &source[0];
+#ifdef NORM_WITH_ADD
+    const half *r = &right[0];
+#else
+    const half *r = nullptr;
+#endif
+    const unsigned width = this->width;
     if (stage == 0) {
-      float2 sum = {0, 0};
-      for (unsigned i = worker; i < width / 2; i += 6)
-        sum += __builtin_convertvector(load(i), float2);
-      partials[worker] = sum;
+      partials[worker] = normSum(x, r, width, worker, 0, false);
       return true;
     }
     float2 sum = {0, 0};
     for (unsigned i = 0; i < 6; ++i) sum += partials[i];
     const float mean = (sum[0] + sum[1]) / width;
     if (stage == 1) {
-      float2 variance = {0, 0};
-      for (unsigned i = worker; i < width / 2; i += 6) {
-        const float2 d = __builtin_convertvector(load(i), float2) - mean;
-        variance += d * d;
-      }
-      partials[6 + worker] = variance;
+      partials[6 + worker] = normSum(x, r, width, worker, mean, true);
       return true;
     }
     float2 variance = {0, 0};
     for (unsigned i = 6; i < 12; ++i) variance += partials[i];
-    const float inverse = 1.0f / std::sqrt((variance[0] + variance[1]) / width + 1e-6f);
-    const auto *gamma = reinterpret_cast<const half2 *>(&scale[0]);
-    const auto *beta = reinterpret_cast<const half2 *>(&bias[0]);
-    auto *y = reinterpret_cast<half2 *>(&destination[0]);
-    for (unsigned i = worker; i < width / 2; i += 6) {
-      const float2 normalized = (__builtin_convertvector(load(i), float2) - mean) * inverse;
-      const float2 result = normalized * __builtin_convertvector(gamma[i], float2)
-                            + __builtin_convertvector(beta[i], float2);
-      y[i] = __builtin_convertvector(result, half2);
-    }
+    const float inverse = normInverse((variance[0] + variance[1]) / width + 1e-6f);
+    normApply(x, r, &scale[0], &bias[0], &destination[0], width, worker, mean, inverse);
     return true;
   }
 };
@@ -76,6 +60,29 @@ public:
     return i;
   }
   bool compute(unsigned worker) {
+    const unsigned elements = this->elements;
+    const unsigned leftElements = this->leftElements;
+    const unsigned rightElements = this->rightElements;
+    // Four-wide dense/suffix-broadcast loop; leave irregular halfword tails
+    // and general broadcasting to the pair path below.
+    if (elements && !(elements % 4) && !(leftElements % 4) && !(rightElements % 4) &&
+        !((reinterpret_cast<unsigned>(&left[0]) | reinterpret_cast<unsigned>(&right[0]) |
+           reinterpret_cast<unsigned>(&destination[0])) & 7)) {
+      if (leftElements == elements && rightElements == elements) {
+        addQuads(&left[0], &right[0], &destination[0], elements / 4, worker);
+        return true;
+      }
+      if ((leftElements == elements || rightElements == elements) &&
+          wrap(elements, leftElements < rightElements ? leftElements : rightElements) == 0) {
+        const half *dense = leftElements == elements ? &left[0] : &right[0];
+        const half *bias = leftElements == elements ? &right[0] : &left[0];
+        const unsigned width = leftElements == elements ? rightElements : leftElements;
+        half *out = &destination[0];
+        for (unsigned row = 0; row < elements; row += width)
+          addQuads(dense + row, bias, out + row, width / 4, worker);
+        return true;
+      }
+    }
     // Short column shards should not wait for inactive contexts to wrap
     // broadcast indices. Worker zero also owns a possible final halfword.
     if (worker != 0 && worker >= elements / 2) return true;

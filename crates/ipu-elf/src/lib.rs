@@ -120,6 +120,11 @@ impl Toolchain {
         if !flags.iter().any(|flag| flag.starts_with("-O")) {
             command.arg("-O2");
         }
+        // popc compiles C++ through a temporary file, so quoted local headers
+        // also need the original source directory on its include path.
+        if let Some(parent) = source.parent().filter(|p| !p.as_os_str().is_empty()) {
+            command.arg("-I").arg(parent);
+        }
         command.args(flags).arg(source).arg("-o").arg(&cache.gp);
         run(&mut command, "popc")?;
 

@@ -1,6 +1,6 @@
 #include <poplar/HalfFloat.hpp>
 #include <poplar/Vertex.hpp>
-#include <cmath>
+#include "elementwise_vector.hpp"
 using namespace poplar;
 
 #ifdef VERTEX_LayerNormMoments
@@ -13,24 +13,17 @@ public:
   unsigned stage;
   bool compute(unsigned worker) {
     auto *partials = reinterpret_cast<float2 *>(&scratch[0]);
-    const auto *x = reinterpret_cast<const half2 *>(&source[0]);
+    const half *x = &source[0];
+    const unsigned width = this->width;
     if (stage == 0) {
-      float2 sum = {0, 0};
-      for (unsigned i = worker; i < width / 2; i += 6)
-        sum += __builtin_convertvector(x[i], float2);
-      partials[worker] = sum;
+      partials[worker] = normSum(x, nullptr, width, worker, 0, false);
       return true;
     }
     float2 sum = {0, 0};
     for (unsigned i = 0; i < 6; ++i) sum += partials[i];
     const float mean = (sum[0] + sum[1]) / width;
     if (stage == 1) {
-      float2 variance = {0, 0};
-      for (unsigned i = worker; i < width / 2; i += 6) {
-        const float2 d = __builtin_convertvector(x[i], float2) - mean;
-        variance += d * d;
-      }
-      partials[6 + worker] = variance;
+      partials[6 + worker] = normSum(x, nullptr, width, worker, mean, true);
     } else if (worker == 0) {
       float2 variance = {0, 0};
       for (unsigned i = 6; i < 12; ++i) variance += partials[i];
@@ -49,11 +42,12 @@ public:
   Output<Vector<half, VectorLayout::ONE_PTR>> destination;
   unsigned rows, width, parts;
   bool compute(unsigned worker) {
-    const auto *x = reinterpret_cast<const half2 *>(&source[0]);
-    const auto *gamma = reinterpret_cast<const half2 *>(&scale[0]);
-    const auto *beta = reinterpret_cast<const half2 *>(&bias[0]);
+    const half *x = &source[0];
+    const half *gamma = &scale[0];
+    const half *beta = &bias[0];
     const auto *stats = reinterpret_cast<const float2 *>(&moments[0]);
-    auto *y = reinterpret_cast<half2 *>(&destination[0]);
+    half *y = &destination[0];
+    const unsigned rows = this->rows, width = this->width, parts = this->parts;
     for (unsigned row = 0; row < rows; ++row) {
       float mean = 0;
       for (unsigned part = 0; part < parts; ++part) mean += stats[row * parts + part][0];
@@ -64,13 +58,9 @@ public:
         const float delta = group[0] - mean;
         variance += group[1] + width * delta * delta;
       }
-      const float inverse = 1.0f / std::sqrt(variance / (width * parts) + 1e-6f);
-      for (unsigned i = worker; i < width / 2; i += 6) {
-        const unsigned at = row * (width / 2) + i;
-        const float2 value = (__builtin_convertvector(x[at], float2) - mean) * inverse;
-        y[at] = __builtin_convertvector(value * __builtin_convertvector(gamma[i], float2)
-                                      + __builtin_convertvector(beta[i], float2), half2);
-      }
+      const float inverse = normInverse(variance / (width * parts) + 1e-6f);
+      normApply(x + row * width, nullptr, gamma, beta, y + row * width,
+                width, worker, mean, inverse);
     }
     return true;
   }
