@@ -23,9 +23,11 @@ use crate::{
     MidProgram, MidRepeat, MidValueId, OutputAliasing, Precision, ShardExtent, TensorTiling,
     TensorType, TileKernelSpec,
 };
+#[cfg(test)]
+pub use copies::view_byte_spans;
 pub(crate) use copies::view_byte_traversal;
 use copies::*;
-pub use copies::{logical_view_byte_spans, shard_storage_bytes, view_byte_spans};
+pub use copies::{logical_view_byte_spans, shard_storage_bytes};
 use gemm::*;
 use mapping::*;
 use ownership::CopyRegions;

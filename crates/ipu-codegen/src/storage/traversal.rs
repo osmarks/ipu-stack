@@ -267,6 +267,17 @@ pub(crate) fn byte_traversal(
     physical: bool,
 ) -> StorageResult<ByteTraversal> {
     validate_view(shard, view)?;
+    if physical
+        && view
+            .iter()
+            .zip(shard.extents)
+            .all(|(a, b)| a.start == b.start && a.physical_end == b.physical_end)
+    {
+        return Ok(ByteTraversal::contiguous(ByteSpan {
+            offset: 0,
+            bytes: storage_bytes(shard)?,
+        }));
+    }
     if view.iter().any(|e| e.start == e.physical_end) {
         return Ok(ByteTraversal { parts: vec![] });
     }
@@ -386,6 +397,15 @@ pub(crate) struct SpanIter<'a> {
     pending: Option<ByteSpan>,
 }
 impl ByteTraversal {
+    pub(crate) fn contiguous(span: ByteSpan) -> Self {
+        Self {
+            parts: vec![Node {
+                offset: span.offset,
+                kind: Kind::Run(span.bytes),
+            }],
+        }
+    }
+
     /// Merge physical address sets for coverage analysis without expanding or sorting them.
     pub(crate) fn physical_union(traversals: impl IntoIterator<Item = Self>) -> Self {
         Self {
@@ -558,6 +578,14 @@ impl ByteTraversal {
         }
         parts.into_iter().reduce(|a, b| a.join(b, limit))
     }
+    pub(crate) fn span_count(&self) -> u64 {
+        self.summary(u32::MAX).map_or(0, |s| s.count)
+    }
+    pub(crate) fn contiguous_span(&self) -> Option<ByteSpan> {
+        self.summary(u32::MAX)
+            .filter(|s| s.count == 1)
+            .map(|s| s.first)
+    }
     pub(crate) fn word_aligned(&self) -> bool {
         self.summary(u32::MAX).is_none_or(|s| s.bad[0] == 0)
     }
@@ -589,6 +617,27 @@ impl ByteTraversal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_whole_allocations_retain_their_kernel_pointer_span() {
+        let shard = super::super::tests::shard(crate::Layout::row_sharded(1), &[0, 16]);
+        let physical = byte_traversal(shard.storage(), &shard.extents, true).unwrap();
+        assert_eq!(
+            physical.spans().collect::<Vec<_>>(),
+            vec![ByteSpan {
+                offset: 0,
+                bytes: 0
+            }]
+        );
+        assert_eq!(physical.byte_len(), 0);
+        assert!(
+            byte_traversal(shard.storage(), &shard.extents, false)
+                .unwrap()
+                .spans()
+                .next()
+                .is_none()
+        );
+    }
+
     #[test]
     fn compact_traversals_match_coordinate_enumeration() {
         let mut random = fastrand::Rng::with_seed(0x7472_6176_6572_7365);

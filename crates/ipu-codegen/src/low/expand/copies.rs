@@ -15,6 +15,7 @@ pub fn shard_storage_bytes(shard: &BlockValue) -> Result<u32, StorageError> {
     crate::storage::storage_bytes(shard.storage())
 }
 
+#[cfg(test)]
 pub fn view_byte_spans(
     shard: &BlockValue,
     view: &ShardView,

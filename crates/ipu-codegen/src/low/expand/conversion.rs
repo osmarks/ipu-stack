@@ -368,27 +368,21 @@ impl TileGraphBuilder {
             };
             // Keep the existing multicast send; only add its local receiver.
             // Placement separates same-class source/receiver SRAM elements.
-            let spans = match order {
-                CopyOrder::Semantic => logical_view_byte_spans,
-                CopyOrder::Physical => view_byte_spans,
-            };
+            let spans = |shard, view| view_byte_traversal(shard, view, order);
             let source_spans = spans(&self.shards[source.shard.index() as usize], &source)?;
             let destination_spans = spans(
                 &self.shards[destination.shard.index() as usize],
                 &destination,
             )?;
-            let aligned = source_spans
-                .iter()
-                .chain(&destination_spans)
-                .all(|span| span.offset % 4 == 0 && span.bytes % 4 == 0);
+            let aligned = source_spans.word_aligned() && destination_spans.word_aligned();
             if let Some(destinations) = transfers.get_mut(&source)
                 && destinations.len() >= 2
                 && aligned
                 // The local receiver must not split existing messages further.
                 && destinations.iter().any(|view| {
                     spans(&self.shards[view.shard.index() as usize], view).is_ok_and(|remote|
-                        remote.iter().map(|span| span.bytes)
-                            .eq(destination_spans.iter().map(|span| span.bytes)))
+                        remote.spans().map(|span| span.bytes)
+                            .eq(destination_spans.spans().map(|span| span.bytes)))
                 })
                 && destinations.iter().all(|view| {
                     self.shards[view.shard.index() as usize].tile

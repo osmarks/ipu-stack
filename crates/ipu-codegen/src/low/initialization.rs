@@ -163,10 +163,10 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
                             extent.physical_end = extent.logical_end;
                         }
                     }
-                    crate::storage::physical_byte_spans(shard.storage(), &rows).ok()
+                    crate::storage::byte_traversal(shard.storage(), &rows, true).ok()
                 });
                 if !ranges.as_ref().is_some_and(|ranges| {
-                    ranges.iter().any(|range| {
+                    ranges.spans().any(|range| {
                         range.offset <= offset
                             && u64::from(offset) + u64::from(bytes)
                                 <= u64::from(range.offset) + u64::from(range.bytes)

@@ -20,7 +20,7 @@ use crate::{
 use crate::{
     AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, GemmKernelMode,
     GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, Precision, StepProfile,
-    StorageError, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_spans,
+    StorageError, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_traversal,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -107,16 +107,16 @@ pub fn materialize_kernel_run(
         let shard = shards.get(view.shard.index() as usize).ok_or(
             KernelMaterializationError::UnplacedShard(view.shard.index()),
         )?;
-        let spans = view_byte_spans(shard, view)?;
-        let span = if spans.len() == 1 || packed {
-            spans.first()
+        let spans = view_byte_traversal(shard, view, crate::CopyOrder::Physical)?;
+        let span = if packed {
+            spans.spans().next()
         } else {
-            None
+            spans.contiguous_span()
         };
         let Some(span) = span else {
             return Err(KernelMaterializationError::FragmentedView {
                 shard: view.shard.index(),
-                spans: spans.len(),
+                spans: spans.span_count() as usize,
             });
         };
         let base = overrides
@@ -135,9 +135,15 @@ pub fn materialize_kernel_run(
     };
     let mut output_address = resolve(&run.output, packed_group.is_some())?;
     if let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel {
-        let output_spans =
-            view_byte_spans(&shards[run.output.shard.index() as usize], &run.output)?;
-        let allocation_bytes = output_spans[0].bytes;
+        let output_spans = view_byte_traversal(
+            &shards[run.output.shard.index() as usize],
+            &run.output,
+            crate::CopyOrder::Physical,
+        )?;
+        let allocation_bytes = output_spans
+            .contiguous_span()
+            .ok_or(StorageError::InvalidView)?
+            .bytes;
         if !offset.is_multiple_of(8)
             || offset
                 .checked_add(bytes)

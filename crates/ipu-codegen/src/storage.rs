@@ -63,6 +63,7 @@ pub(crate) fn storage_bytes(shard: TensorStorage<'_>) -> StorageResult<u32> {
 /// for each outer matrix. AMP left and output operands flatten their outer
 /// axes into the row dimension, which lets one tile-kernel invocation process
 /// activation batches with shared weights.
+#[cfg(test)]
 pub(crate) fn physical_byte_spans(
     shard: TensorStorage<'_>,
     view: &[ShardExtent],

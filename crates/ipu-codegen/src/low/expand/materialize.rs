@@ -368,16 +368,13 @@ impl TileGraphBuilder {
                 destination,
             )?;
             for (source, destination) in pieces {
-                let source_spans = view_byte_spans(source_shard, &source)?;
-                let destination_spans = view_byte_spans(destination_shard, &destination)?;
-                let valid_spans = source_spans
-                    .iter()
-                    .chain(&destination_spans)
-                    .all(|span| span.offset & 0b11 == 0 && span.bytes & 0b11 == 0);
-                let source_bytes = source_spans.iter().map(|span| span.bytes).sum::<u32>();
-                let destination_bytes =
-                    destination_spans.iter().map(|span| span.bytes).sum::<u32>();
-                if !valid_spans || source_bytes != destination_bytes {
+                let source_spans = view_byte_traversal(source_shard, &source, CopyOrder::Physical)?;
+                let destination_spans =
+                    view_byte_traversal(destination_shard, &destination, CopyOrder::Physical)?;
+                if !source_spans.word_aligned()
+                    || !destination_spans.word_aligned()
+                    || source_spans.byte_len() != destination_spans.byte_len()
+                {
                     return Ok(None);
                 }
                 split.push((source, destination));

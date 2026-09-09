@@ -1,11 +1,12 @@
 //! Address-only shortlist score; exact exchange scheduling decides acceptance.
 
 use super::*;
-use crate::{ByteSpan, view_byte_spans};
+use crate::storage::ByteTraversal;
+use crate::view_byte_traversal;
 
 struct Access {
     shard: BlockValueId,
-    span: ByteSpan,
+    traversal: ByteTraversal,
 }
 
 #[derive(Default)]
@@ -34,14 +35,10 @@ impl ExchangeConflicts {
                     } else {
                         &mut tile.receives
                     };
-                    accesses.extend(
-                        view_byte_spans(shard, view)?
-                            .into_iter()
-                            .map(|span| Access {
-                                shard: view.shard,
-                                span,
-                            }),
-                    );
+                    accesses.push(Access {
+                        shard: view.shard,
+                        traversal: view_byte_traversal(shard, view, crate::CopyOrder::Physical)?,
+                    });
                 }
             }
             traffic.extend(
@@ -61,12 +58,12 @@ impl ExchangeConflicts {
         let aggregate = |accesses: &[Access]| {
             let mut grouped = BTreeMap::<Vec<crate::exchange::ExchangeMemoryElement>, u128>::new();
             for access in accesses {
-                let address = placement.shard_addresses[&access.shard] + access.span.offset;
-                let elements = crate::exchange::effective_memory_elements(
-                    address,
-                    access.span.bytes.div_ceil(4),
-                );
-                *grouped.entry(elements).or_default() += u128::from(access.span.bytes);
+                for span in access.traversal.spans() {
+                    let address = placement.shard_addresses[&access.shard] + span.offset;
+                    let elements =
+                        crate::exchange::effective_memory_elements(address, span.bytes.div_ceil(4));
+                    *grouped.entry(elements).or_default() += u128::from(span.bytes);
+                }
             }
             grouped
         };
@@ -97,6 +94,7 @@ impl ExchangeConflicts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ByteSpan;
 
     #[test]
     fn relocation_removes_a_weight_broadcast_bank_conflict() {
@@ -105,17 +103,17 @@ mod tests {
         let conflicts = ExchangeConflicts(vec![Traffic {
             sends: vec![Access {
                 shard: source,
-                span: ByteSpan {
+                traversal: ByteTraversal::contiguous(ByteSpan {
                     offset: 0,
                     bytes: 4148 * 4,
-                },
+                }),
             }],
             receives: vec![Access {
                 shard: destination,
-                span: ByteSpan {
+                traversal: ByteTraversal::contiguous(ByteSpan {
                     offset: 0,
                     bytes: 4148 * 4,
-                },
+                }),
             }],
         }]);
         let placement = |shift: u32| Placement {
