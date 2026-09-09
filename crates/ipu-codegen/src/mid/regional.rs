@@ -415,6 +415,29 @@ pub(crate) fn resolve(program: &MidProgram, checkpoints: bool) -> LoweringResult
 mod tests {
     use super::*;
     #[test]
+    fn fp8_map_projection_seed_uses_a_smaller_tile_family() {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [1, 1, 1152]).unwrap();
+        let w = graph.parameter("w", [1152, 1152]).unwrap();
+        let y = graph.gemm(x, w).unwrap();
+        graph.set_outputs([y]).unwrap();
+        let mut config = PipelineConfig::new(1472)
+            .with_automatic_input(x, Precision::F16)
+            .with_automatic_input(w, Precision::F8F143 { scale_exponent: -4 });
+        config
+            .operator_candidates
+            .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+        config.operator_candidates.extend(
+            candidate_active_tile_counts(1472)
+                .into_iter()
+                .map(|tiles| OperatorCandidate::fp8_gemm(tiles, -4)),
+        );
+        let seed = baseline(&graph, &baseline_config(&config, 0), &Ipu21CostModel).unwrap();
+        let low = crate::low::expand::expand_tiles(&resolve(&seed, false).unwrap(), false).unwrap();
+        assert!(!low.kernel_runs.is_empty());
+    }
+
+    #[test]
     fn regional_repeat_preserves_sequences_and_is_deterministic() {
         let mut graph = ComputeGraph::new();
         let x = graph.host_input("x", [16, 16]).unwrap();

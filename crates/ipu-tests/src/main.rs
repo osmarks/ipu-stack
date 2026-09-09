@@ -1025,15 +1025,22 @@ fn main() -> Result<()> {
         if !(-16..=15).contains(&scale) {
             bail!("FP8 operand scale must be in -16..=15 so the product scale fits the ISA");
         }
+        // Preserve the configured GEMM tile-count alternatives when selecting
+        // FP8. Keeping only the full-device family excludes small projections.
+        let fp8_candidates = pipeline
+            .operator_candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                ipu_codegen::OperatorCandidate::ParallelGemm { tile_count, .. } => {
+                    Some(ipu_codegen::OperatorCandidate::fp8_gemm(*tile_count, scale))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         pipeline
             .operator_candidates
             .retain(|candidate| !matches!(candidate.operator(), MidOperator::Gemm { .. }));
-        pipeline
-            .operator_candidates
-            .push(ipu_codegen::OperatorCandidate::fp8_gemm(
-                active_tiles,
-                scale,
-            ));
+        pipeline.operator_candidates.extend(fp8_candidates);
         for input in graph.inputs() {
             if matches!(arguments.workload, Workload::SiglipVitBenchmark)
                 && !input.name.ends_with(".weight")
