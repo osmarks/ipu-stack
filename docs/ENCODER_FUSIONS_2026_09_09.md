@@ -106,3 +106,23 @@ Final profile: [integrated ViT](../artifacts/encoder-fusions/vit-final/profile.h
 Package and run log are in the same directory. The remaining encoder opportunity
 is choosing compatible ownership across these boundaries, rather than assuming
 that an available fused kernel will automatically be selected.
+
+## Larger batches
+
+The same full-size benchmark was attempted at batches 2, 4 and 8 using the
+normal planner limits. Batch 2 passes hardware/reference validation (maximum
+absolute error 0.082764), at 996,756 cropped cycles and a 744,216-cycle encoder
+span. Per image, the encoder span is 372,108 cycles, 21.6% below batch one.
+Profile: [batch 2](../artifacts/encoder-fusions/vit-b2/profile.html).
+
+Batch 4 exhausts five admitted finalists after about 17 minutes 40 seconds.
+Two fail during host-support assembly (`insufficient tile SRAM for 12 host-data
+bytes`); one fails a 122,880-byte standard allocation, and two fail 88,320-byte
+interleaved allocations. Batch 8 fails at mid operation 18 (MLP-up); the final
+reported rejected peak is 830,080 bytes including 247,152 estimated exchange
+table bytes. Other planner configurations report 828,108 bytes. Neither is a
+hardware batch-size ceiling: these are failures of the retained plans and
+placement. Logs are under `vit-b4/` and `vit-b8/` beside the batch-2 artifacts.
+
+These measurements precede the independent paired-receiver address correction
+described in [the exchange reference](EXCHANGE_INSTRUCTION_REFERENCE.md#paired-sender-lane-reservation).

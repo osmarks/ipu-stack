@@ -349,7 +349,7 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
 }
 
 #[test]
-fn width_selection_compares_complete_paired_schedules() {
+fn width_selection_pairs_receivers_with_independent_addresses() {
     let topology = Topology::c600();
     let problem = ExchangeScheduleProblem {
         phase: 0,
@@ -362,7 +362,7 @@ fn width_selection_compares_complete_paired_schedules() {
                     .into_iter()
                     .map(|tile| ExchangeScheduleDestination {
                         tile,
-                        address: 0x8_8000,
+                        address: 0x8_8000 + u32::from(tile & 1) * 0x4000,
                     })
                     .collect(),
                 words: 4096,

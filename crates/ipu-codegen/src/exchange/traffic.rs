@@ -165,13 +165,16 @@ impl MappingPhase {
         for transfer in &self.transfers {
             let partner = mapping[usize::from(transfer.source)] ^ 1;
             let paired = usize::from(partner) < self.tile_count
-                && transfer.destinations.iter().all(|&(tile, address)| {
+                && transfer.destinations.iter().all(|&(tile, _)| {
                     let mapped = mapping[usize::from(tile)];
                     mapped != partner
                         && usize::from(mapped ^ 1) < self.tile_count
                         && transfer
                             .destinations
-                            .binary_search(&(inverse[usize::from(mapped ^ 1)], address))
+                            .binary_search_by_key(
+                                &inverse[usize::from(mapped ^ 1)],
+                                |&(tile, _)| tile,
+                            )
                             .is_ok()
                 });
             if paired {
@@ -294,8 +297,10 @@ mod tests {
         assert_eq!(traffic.score(&[0, 1, 2, 3], &[1]).0, 100);
         assert_eq!(traffic.score(&[0, 2, 1, 3], &[1]).0, 100);
         assert_eq!(traffic.score(&[0, 2, 1, 3], &[3]).0, 300);
+        let mut independent_addresses = transfer(0, &[2, 3], 128);
+        independent_addresses.destinations[1].1 += 0x4000;
         let multicast = MappingTraffic {
-            phases: vec![MappingPhase::new(vec![transfer(0, &[2, 3], 128)], 4)],
+            phases: vec![MappingPhase::new(vec![independent_addresses], 4)],
             tile_count: 4,
         };
         assert_eq!(multicast.score(&[0, 1, 2, 3], &[1]).0, 64);

@@ -739,11 +739,12 @@ fn paired_transfer_alternatives(
                 && topology
                     .paired_logical(destinations[0].0)
                     .is_ok_and(|paired| paired == destinations[1].0);
+            // Pairing shares the receive stream, not its SRAM pointer. Each
+            // receiver row independently programs its destination address.
             let pairable = complete_pair
                 && destinations
                     .iter()
-                    .all(|(tile, address)| *tile != source_pair && address & 0b111 == 0)
-                && destinations[0].1 == destinations[1].1;
+                    .all(|(tile, address)| *tile != source_pair && address & 0b111 == 0);
             if pairable {
                 paired_destinations.extend(destinations);
             }

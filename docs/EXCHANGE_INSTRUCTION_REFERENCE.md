@@ -263,6 +263,28 @@ or execution instead of inferring all five from a high-level numerical failure.
 
 ## Paired sender lane reservation
 
+Paired receivers do **not** need equal SRAM destination addresses. Each tile
+programs its own incoming pointer; pairing shares the incoming item stream.
+The previous equality condition in width selection and mapping costing was a
+compiler restriction, removed on 2026-09-09. Eight-byte address alignment and
+complete physical receiver pairs are still required by the supported path.
+
+Hardware replay of the current ViT's QKV, MLP-up and MAP-KV preparation phases
+passes with original, unequal receiver addresses and all eligible non-loopback
+multicasts forced to paired width (32,768 sampled words per phase). Captures and
+logs are in `artifacts/encoder-fusions/paired-phase/`. At unchanged placement,
+production width selection reduces their scheduled horizons from 10,772 to
+8,501, 15,854 to 13,276, and 13,499 to 9,229 cycles respectively. These are
+exchange schedule lengths, excluding arrival skew and preceding computation.
+
+Only 8, 9 and 7 receiver pairs respectively have mismatched addresses, but the
+old all-or-nothing multicast check disqualified 579, 727 and 505 transfers.
+Some transfers additionally include the sender pair, whose paired loopback is
+still unsupported. Splitting exceptional receivers off without fixing address
+eligibility barely improved QKV/MLP horizons: the slow receivers remained on
+the critical path. No such splitting or address relocation is needed for the
+independent-pointer correction.
+
 Hardware replay on 2026-09-05 verifies that a paired-width sender borrows only
 its physical partner's transmit lane. The partner can receive an ordinary
 transfer during that interval. Reserving its receive lane as well needlessly

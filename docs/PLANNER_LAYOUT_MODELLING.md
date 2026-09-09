@@ -23,7 +23,7 @@ The resource model charges:
 * Combined send/receive service on each SRAM element.
 * Ordinary and eligible paired-transfer alternatives, choosing the lower modeled
   phase bottleneck. Pair eligibility checks payload size/alignment, complete
-  destination pairs, matching receive addresses and the borrowed source lane.
+  destination pairs, independently aligned receive addresses and the borrowed source lane.
 
 Each phase estimate is its maximum resource load plus the existing phase cost.
 The ordinary whole-program timeline estimator combines those phase prices with
