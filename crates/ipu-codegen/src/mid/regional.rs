@@ -592,11 +592,26 @@ mod tests {
             config = config.with_automatic_input(weight, Precision::F16);
         }
         let seed_config = baseline_config(&config, 0);
-        let seed = baseline(&graph, &seed_config, &Ipu21CostModel).unwrap();
+        let mut seed = baseline(&graph, &seed_config, &Ipu21CostModel).unwrap();
         assert_eq!(
             seed,
             baseline(&graph, &seed_config, &Ipu21CostModel).unwrap()
         );
+        // A replanned body must inherit pre-existing parameter rotations.
+        let groups = seed
+            .inputs
+            .iter()
+            .filter(|i| i.kind == GraphInputKind::Parameter)
+            .map(|i| seed.values[i.value.index() as usize].storage_group)
+            .collect::<BTreeSet<_>>();
+        for value in &mut seed.values {
+            if groups.contains(&value.storage_group) {
+                value.tile_offset = 3;
+            }
+        }
+        let seed_low =
+            crate::low::expand::expand_tiles(&resolve(&seed, true).unwrap(), true).unwrap();
+        crate::place(&crate::low::lower_to_tiles(&seed_low, true)).unwrap();
         let alternatives = replacements(
             &graph,
             &seed,
@@ -610,6 +625,7 @@ mod tests {
         for alternative in alternatives {
             let resolved = resolve(&alternative.program, true).unwrap();
             let low = crate::low::expand::expand_tiles(&resolved, true).unwrap();
+            crate::place(&crate::low::lower_to_tiles(&low, true)).unwrap();
             assert!(
                 matches!(&alternative.program.operations[0].kind, MidOperationKind::Repeat(r) if r.count == 3)
             );

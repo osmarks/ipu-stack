@@ -266,8 +266,10 @@ impl LoweringState {
         tensor_type: TensorType,
         storage_group: MidValueId,
     ) -> MidValueId {
+        let offset = self.get(storage_group).tile_offset;
         let result = self.value(origin, tensor_type);
         self.values[result.index() as usize].storage_group = storage_group;
+        self.values[result.index() as usize].tile_offset = offset;
         result
     }
 

@@ -107,3 +107,10 @@ New logs are `private-weights/run.log` and `mlp-private-weights/run.log` under
 `artifacts/regional-vit-20260909/`. The new ViT run retains the same five regions,
 one global proposal per region, and the usual FP8 reference tolerances
 (atol 0.2, rtol 0.05).
+
+The first private-weight Repeat proposal exposed an ownership bug and was rejected
+before scheduling: a new body argument had offset zero while its parameter
+storage group was rotated by 184 tiles. `LoweringState::value_in_storage_group`
+now inherits the group's offset. A small rotated-parameter Repeat regression
+checks both seed and replacement placement. The failed proposal did not replace
+the feasible incumbent.
