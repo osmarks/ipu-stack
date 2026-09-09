@@ -213,14 +213,31 @@ fn fuse_fp8_outputs(
     let mut removed = BTreeSet::new();
     for index in 0..operations.len() {
         let cast = &operations[index];
-        let Some(plan) = cast.conversion_plan() else {
-            continue;
+        let local_cast = match &cast.kind {
+            MidOperationKind::Convert(plan) => plan.strategy == ConversionStrategy::LocalKernel,
+            MidOperationKind::Primitive(Primitive::Compute {
+                kernel: TileKernelSpec::Cast { .. },
+                operands,
+                product: None,
+                output_aliases,
+            }) => operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty(),
+            _ => false,
         };
-        if plan.strategy != ConversionStrategy::LocalKernel
-            || plan.input.format.precision != Precision::F16
-            || !matches!(plan.output.format.precision, Precision::F8F143 { .. })
+        if !local_cast
             || cast.inputs.len() != 1
             || cast.results.len() != 1
+            || values[cast.inputs[0].index() as usize]
+                .tensor_type
+                .format
+                .precision
+                != Precision::F16
+            || !matches!(
+                values[cast.results[0].index() as usize]
+                    .tensor_type
+                    .format
+                    .precision,
+                Precision::F8F143 { .. }
+            )
         {
             continue;
         }
@@ -465,7 +482,7 @@ mod tests {
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
-                let cast = MidOperation {
+                let mut cast = MidOperation {
                     source: None,
                     inputs: vec![MidValueId(5)],
                     results: vec![MidValueId(4)],
@@ -477,6 +494,17 @@ mod tests {
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
+                if rows > 1 {
+                    cast.kind = MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Cast {
+                            from: Precision::F16,
+                            to: Precision::F8F143 { scale_exponent: -4 },
+                        },
+                        operands: vec![OperandWindow::default()],
+                        product: None,
+                        output_aliases: Vec::new(),
+                    });
+                }
                 let mut program = MidProgram {
                     tile_count: 1,
                     values,
