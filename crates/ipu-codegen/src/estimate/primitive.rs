@@ -161,6 +161,13 @@ pub(crate) fn kernel_cycles<'a>(
             );
         }
         TileKernelSpec::Gelu => elements.saturating_mul(10),
+        TileKernelSpec::Add if output.format().precision == Precision::F16 => {
+            return crate::kernel::cost::f16_add_cycles(
+                elements,
+                inputs(0).map_or(elements, Geometry::elements),
+                inputs(1).map_or(elements, Geometry::elements),
+            );
+        }
         TileKernelSpec::Add => elements.saturating_mul(3),
         TileKernelSpec::BiasGelu => {
             return rows
@@ -172,12 +179,30 @@ pub(crate) fn kernel_cycles<'a>(
                 .saturating_add(elements.saturating_mul(2))
                 .saturating_add(330);
         }
-        TileKernelSpec::AddLayerNorm => elements.saturating_mul(15),
-        TileKernelSpec::LayerNorm => elements.saturating_mul(14),
-        TileKernelSpec::LayerNormMoments => inputs(0).unwrap().elements().saturating_mul(10),
-        TileKernelSpec::LayerNormApply { parts } => elements
-            .saturating_mul(7)
-            .saturating_add(rows.saturating_mul(u64::from(*parts) * 18)),
+        TileKernelSpec::AddLayerNorm | TileKernelSpec::LayerNorm => {
+            return crate::kernel::cost::f16_layernorm_cycles(
+                rows,
+                u64::from(output.trailing_dimension(0).unwrap_or(0)),
+                matches!(kernel, TileKernelSpec::AddLayerNorm),
+            );
+        }
+        TileKernelSpec::LayerNormMoments => {
+            let Some(input) = inputs(0) else {
+                return u64::MAX;
+            };
+            let width = u64::from(input.trailing_dimension(0).unwrap_or(0));
+            return crate::kernel::cost::f16_layernorm_moments_cycles(
+                input.elements().checked_div(width).unwrap_or(0),
+                width,
+            );
+        }
+        TileKernelSpec::LayerNormApply { parts } => {
+            return crate::kernel::cost::f16_layernorm_apply_cycles(
+                rows,
+                u64::from(output.trailing_dimension(0).unwrap_or(0)),
+                *parts,
+            );
+        }
         TileKernelSpec::ReductionSum { partials } => {
             return crate::kernel::cost::f16_reduction_cycles(elements, u64::from(*partials));
         }

@@ -22,6 +22,17 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         .map(|e| u64::from(e.physical_end - e.start))
         .product();
     let precision = run.requirements.output.format.precision;
+    // Usual allocation alignment permits the ACC/SQACC statistics loops.
+    // Small/tail widths use the pair loops; addresses are not available here.
+    let statistics_width = run
+        .inputs
+        .first()
+        .and_then(|input| input.views.first())
+        .and_then(|view| view.extents.last())
+        .map_or(0, |extent| extent.physical_end - extent.start);
+    let wide_statistics = statistics_width >= 96 && statistics_width.is_multiple_of(8);
+    let statistics_issue_slots = if wide_statistics { 0.875 } else { 2.0 };
+
     let (useful, issued, scale, basis) = match run.kernel {
         TileKernelSpec::Gemm { multiply, .. } => {
             let [useful, physical] = run.product_flops?;
@@ -51,9 +62,9 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
                 .map(|e| u64::from(e.logical_end - e.start))
                 .product();
             return Some((
-                elements as f64 * 2.0,
-                elements as f64 * 2.0,
-                "layernorm: local FP32 mean and centered variance",
+                elements as f64 * statistics_issue_slots,
+                elements as f64 * statistics_issue_slots,
+                "layernorm: FP32 sum and centered squares, including vector accumulation",
             ));
         }
         TileKernelSpec::LayerNormApply { .. } => (
@@ -66,14 +77,14 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         TileKernelSpec::AddLayerNorm => (
             logical,
             physical,
-            4.75,
+            if wide_statistics { 3.875 } else { 5.5 },
             "residual add and layernorm arithmetic",
         ),
         TileKernelSpec::LayerNorm => (
             logical,
             physical,
-            4.0,
-            "layernorm: F32 vector sum, centered variance, and affine arithmetic",
+            statistics_issue_slots + 2.0,
+            "layernorm: FP32 statistics and affine arithmetic",
         ),
         TileKernelSpec::Add => (
             logical,

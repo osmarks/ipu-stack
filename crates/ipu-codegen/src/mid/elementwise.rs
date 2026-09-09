@@ -193,27 +193,23 @@ mod tests {
     use super::*;
     #[test]
     fn fusion_preserves_live_add_results_and_matches_kernel_contracts() {
+        // Short rows retain a launch-saving fused alternative. For wide
+        // rows the new standalone add may be cheaper than recomputing it
+        // inside each normalization pass.
         for norm in [false, true] {
             for keep_sum in [false, true] {
                 let mut graph = ComputeGraph::new();
-                let x = graph.host_input("x", [2, 4, 384]).unwrap();
+                let x = graph.host_input("x", [2, 4, 48]).unwrap();
                 let rhs = graph
-                    .host_input(
-                        "rhs",
-                        if norm {
-                            vec![2, 4, 384]
-                        } else {
-                            vec![1, 1, 384]
-                        },
-                    )
+                    .host_input("rhs", if norm { vec![2, 4, 48] } else { vec![1, 1, 48] })
                     .unwrap();
                 let sum = graph.add(x, rhs).unwrap();
                 let mut config = PipelineConfig::new(4)
                     .with_automatic_input(x, Precision::F16)
                     .with_automatic_input(rhs, Precision::F16);
                 let y = if norm {
-                    let gamma = graph.parameter("gamma", [1, 1, 384]).unwrap();
-                    let beta = graph.parameter("beta", [1, 1, 384]).unwrap();
+                    let gamma = graph.parameter("gamma", [1, 1, 48]).unwrap();
+                    let beta = graph.parameter("beta", [1, 1, 48]).unwrap();
                     config = config
                         .with_automatic_input(gamma, Precision::F16)
                         .with_automatic_input(beta, Precision::F16);

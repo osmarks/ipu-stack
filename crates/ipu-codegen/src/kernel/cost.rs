@@ -209,9 +209,104 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
         .unwrap_or(0)
 }
 
+/// Four-half add: two 64-bit loads, one vector add and one store per
+/// six-worker wave. Repeated suffix broadcasts reset the pointers per row.
+/// Allocation bases are eight-byte aligned; irregular widths use the pair loop.
+pub(crate) fn f16_add_cycles(elements: u64, left: u64, right: u64) -> u64 {
+    let width = left.min(right);
+    let dense = left == elements && right == elements;
+    let broadcast =
+        width > 0 && (left == elements || right == elements) && elements.is_multiple_of(width);
+    if elements.is_multiple_of(4)
+        && left.is_multiple_of(4)
+        && right.is_multiple_of(4)
+        && (dense || broadcast)
+    {
+        let rows = if dense { 1 } else { elements / width };
+        let columns = if dense { elements } else { width };
+        492u64
+            .saturating_add(rows.saturating_mul(columns.div_ceil(24).saturating_mul(24)))
+            .saturating_add(rows.saturating_sub(1).saturating_mul(234))
+    } else {
+        450u64.saturating_add(elements.div_ceil(12).saturating_mul(54))
+    }
+}
+
+/// Mean and centered variance retain FP32 precision. Aligned full groups use
+/// F16V8ACC (3 bundles / 8 values) and F32V4SQACC (6 / 4). The fused variant
+/// adds three and two bundles respectively to read/add the residual operand.
+fn norm_statistics_work(width: u64, add: bool) -> u64 {
+    if width >= 96 && width.is_multiple_of(8) {
+        width
+            .div_ceil(48)
+            .saturating_mul(if add { 36 } else { 18 })
+            .saturating_add(width.div_ceil(24).saturating_mul(if add { 48 } else { 36 }))
+    } else {
+        width.div_ceil(12).saturating_mul(if add { 72 } else { 48 })
+    }
+}
+
+/// Three worker launches per row; shared setup constants include partial
+/// reductions and the scalar inverse standard deviation. The apply body is
+/// ten bundles per pair, or twelve with a residual add.
+pub(crate) fn f16_layernorm_cycles(rows: u64, width: u64, add: bool) -> u64 {
+    let setup = if width >= 96 && width.is_multiple_of(8) {
+        if add { 1386 } else { 1329 }
+    } else if add {
+        1290
+    } else {
+        1200
+    };
+    let work = norm_statistics_work(width, add)
+        .saturating_add(width.div_ceil(12).saturating_mul(if add { 72 } else { 60 }));
+    132u64.saturating_add(rows.saturating_mul(work.saturating_add(setup)))
+}
+
+pub(crate) fn f16_layernorm_moments_cycles(rows: u64, width: u64) -> u64 {
+    126u64.saturating_add(
+        rows.saturating_mul(norm_statistics_work(width, false).saturating_add(1080)),
+    )
+}
+
+/// Final moments merging is small but repeats in each worker. These costs
+/// cover local application only; the mid copy prices the statistics exchange.
+pub(crate) fn f16_layernorm_apply_cycles(rows: u64, width: u64, parts: u16) -> u64 {
+    558u64.saturating_add(
+        rows.saturating_mul(324 + u64::from(parts) * 54 + width.div_ceil(12).saturating_mul(60)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elementwise_models_track_device_loops_and_row_setup() {
+        // Independent direct-kernel measurements from elementwise_check.
+        for (rows, width, norm, fused, moments, apply) in [
+            (1, 144, 2448u64, 2778u64, 1476u64, 1656u64),
+            (1, 576, 5418, 6558, 2286, 3816),
+            (1, 1152, 9378, 11598, 3366, 6696),
+            (3, 1152, 27876, 34530, 9846, 18972),
+        ] {
+            for (estimated, measured) in [
+                (f16_layernorm_cycles(rows, width, false), norm),
+                (f16_layernorm_cycles(rows, width, true), fused),
+                (f16_layernorm_moments_cycles(rows, width), moments),
+                (f16_layernorm_apply_cycles(rows, width, 1), apply),
+            ] {
+                assert!(
+                    estimated.abs_diff(measured) < measured / 20 + 24,
+                    "rows={rows} width={width}: estimate {estimated}, measured {measured}"
+                );
+            }
+        }
+        assert_eq!(f16_add_cycles(1728, 1728, 1728), 2220);
+        assert_eq!(f16_add_cycles(3456, 3456, 1152), 4416);
+        assert_eq!(f16_layernorm_cycles(u64::MAX, u64::MAX, true), u64::MAX);
+        assert_eq!(f16_layernorm_moments_cycles(u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(f16_layernorm_apply_cycles(u64::MAX, u64::MAX, 2), u64::MAX);
+    }
 
     #[test]
     fn attention_row_models_match_hardware() {
