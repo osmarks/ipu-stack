@@ -2188,13 +2188,13 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
         for phase in &tiles.exchange_phases {
             for transfer in &phase.transfers {
                 let source = &tiles.shards[transfer.source.shard.index() as usize];
-                let spans = match transfer.span_order(&tiles.shards) {
-                    crate::CopyOrder::Physical => crate::view_byte_spans(source, &transfer.source),
-                    crate::CopyOrder::Semantic => {
-                        crate::logical_view_byte_spans(source, &transfer.source)
-                    }
-                }
+                let traversal = crate::view_byte_traversal(
+                    source,
+                    &transfer.source,
+                    transfer.span_order(&tiles.shards),
+                )
                 .unwrap();
+                let spans = traversal.spans().collect::<Vec<_>>();
                 assert!(
                     spans.iter().all(|span| span.bytes.is_multiple_of(4)),
                     "half-word transfer: {products:?} {transfer:?}"

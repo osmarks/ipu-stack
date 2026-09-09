@@ -2,13 +2,15 @@
 
 use crate::storage::{ByteSpan, StorageError, StorageResult};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CopyOrder {
     /// Preserve tensor coordinates, converting between physical layouts.
     #[default]
     Semantic,
     /// Preserve allocation order, treating both views as packed byte spans.
     Physical,
+    /// Row-major grid of 16-by-16 panels, physical order within each panel.
+    Panels,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,61 @@ pub enum CopyPattern {
 }
 
 impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
+    pub(crate) fn from_traversals(
+        source: Buffer,
+        destination: Buffer,
+        source_traversal: &ByteTraversal,
+        destination_traversal: &ByteTraversal,
+    ) -> StorageResult<Vec<Self>> {
+        if source_traversal.byte_len() != destination_traversal.byte_len() {
+            return Err(StorageError::InvalidView);
+        }
+        if source_traversal.byte_len() == 0 {
+            return Ok(Vec::new());
+        }
+        if let (Some(mut left), Some(mut right)) = (
+            source_traversal.regular_span(),
+            destination_traversal.regular_span(),
+        ) {
+            // Split a contiguous endpoint symbolically to match the other side.
+            if left.rows == 1 && right.rows > 1 {
+                left.bytes = right.bytes;
+                left.stride = right.bytes;
+                left.rows = right.rows;
+            } else if right.rows == 1 && left.rows > 1 {
+                right.bytes = left.bytes;
+                right.stride = left.bytes;
+                right.rows = left.rows;
+            }
+            if left.bytes == right.bytes
+                && left.rows == right.rows
+                && let Some(pattern) = row_copy_pattern(
+                    left.rows,
+                    left.bytes,
+                    left.offset,
+                    right.offset,
+                    left.stride,
+                    right.stride,
+                )
+            {
+                return Ok(vec![Self {
+                    source,
+                    destination,
+                    source_offset: left.offset,
+                    destination_offset: right.offset,
+                    bytes: left.bytes * left.rows,
+                    pattern,
+                }]);
+            }
+        }
+        Self::from_spans(
+            source,
+            destination,
+            source_traversal.spans(),
+            destination_traversal.spans(),
+        )
+    }
+
     pub(crate) fn from_spans(
         source: Buffer,
         destination: Buffer,
@@ -121,6 +178,52 @@ pub(crate) fn for_each_copy_span(
 
 const PARALLEL_STRIDED_COPY_MAX_BYTES: u32 = 512;
 
+/// Shared launch policy for symbolic rows and the irregular-span fallback.
+fn row_copy_pattern(
+    rows: u32,
+    row_bytes: u32,
+    source: u32,
+    destination: u32,
+    source_stride: u32,
+    destination_stride: u32,
+) -> Option<CopyPattern> {
+    if rows == 1 {
+        return Some(CopyPattern::Contiguous);
+    }
+    let geometry = [
+        row_bytes,
+        source,
+        destination,
+        source_stride,
+        destination_stride,
+    ];
+    if source_stride == 0
+        || destination_stride == 0
+        || !geometry.iter().all(|n| n.is_multiple_of(4))
+    {
+        return None;
+    }
+    // Wide copies with too few rows underuse the workers in the strided kernel.
+    if rows < 6
+        && row_bytes.saturating_mul(rows) > PARALLEL_STRIDED_COPY_MAX_BYTES
+        && geometry.iter().all(|n| n.is_multiple_of(8))
+    {
+        return None;
+    }
+    Some(
+        if source_stride == row_bytes && destination_stride == row_bytes {
+            CopyPattern::Contiguous
+        } else {
+            CopyPattern::Strided {
+                rows,
+                row_bytes,
+                source_stride,
+                destination_stride,
+            }
+        },
+    )
+}
+
 fn coalesce_copies<Buffer: Clone>(
     copies: Vec<CopyOperation<Buffer>>,
 ) -> Vec<CopyOperation<Buffer>> {
@@ -167,40 +270,20 @@ fn coalesce_copies<Buffer: Clone>(
             end += 1;
         }
         let rows = u32::try_from(end - index).unwrap_or(u32::MAX);
-        // Very wide copies with too few rows underuse the workers. Retain
-        // ordinary parallel row copies there; longer row lists use all six
-        // workers and should not be split just because total bytes exceed 512.
-        let aligned_u64 = [
+        if let Some(pattern) = row_copy_pattern(
+            rows,
             first.bytes,
             first.source_offset,
             first.destination_offset,
             source_stride,
             destination_stride,
-        ]
-        .into_iter()
-        .all(|n| n.is_multiple_of(8));
-        if aligned_u64
-            && rows < 6
-            && first.bytes.saturating_mul(rows) > PARALLEL_STRIDED_COPY_MAX_BYTES
-        {
-            coalesced.extend(copies[index..end].iter().cloned());
-            index = end;
-            continue;
-        }
-        if source_stride == first.bytes && destination_stride == first.bytes {
+        ) {
             let mut copy = first.clone();
             copy.bytes = copy.bytes.saturating_mul(rows);
+            copy.pattern = pattern;
             coalesced.push(copy);
         } else {
-            let mut copy = first.clone();
-            copy.bytes = copy.bytes.saturating_mul(rows);
-            copy.pattern = CopyPattern::Strided {
-                rows,
-                row_bytes: first.bytes,
-                source_stride,
-                destination_stride,
-            };
-            coalesced.push(copy);
+            coalesced.extend(copies[index..end].iter().cloned());
         }
         index = end;
     }
@@ -239,7 +322,7 @@ impl CopyPlan {
         mappings: &[CopyMapping<'_>],
         order: CopyOrder,
     ) -> StorageResult<Self> {
-        if order == CopyOrder::Physical {
+        if order != CopyOrder::Semantic {
             return Ok(Self {
                 clear_ranges: uncovered_copy_bytes(
                     TensorStorage {

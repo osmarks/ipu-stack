@@ -44,7 +44,14 @@ pub(crate) fn view_byte_traversal(
     if view.shard != shard.id {
         return Err(StorageError::WrongShard);
     }
-    crate::storage::byte_traversal(shard.storage(), &view.extents, order == CopyOrder::Physical)
+    match order {
+        CopyOrder::Panels => crate::storage::panel_byte_traversal(shard.storage(), &view.extents),
+        CopyOrder::Semantic | CopyOrder::Physical => crate::storage::byte_traversal(
+            shard.storage(),
+            &view.extents,
+            order == CopyOrder::Physical,
+        ),
+    }
 }
 
 pub(super) fn append_span_copies(
@@ -62,11 +69,11 @@ pub(super) fn append_span_copies(
         order,
     )?;
     copies.extend(
-        LocalCopy::from_spans(
+        LocalCopy::from_traversals(
             source.shard,
             destination.shard,
-            source_spans.spans(),
-            destination_spans.spans(),
+            &source_spans,
+            &destination_spans,
         )?
         .into_iter()
         .map(|copy| (tile, copy)),

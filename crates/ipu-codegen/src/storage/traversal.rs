@@ -340,6 +340,82 @@ pub(crate) fn byte_traversal(
     Ok(ByteTraversal { parts })
 }
 
+/// Keep a complete micro-panel grid as nested repeats. Both endpoints use
+/// row-panel/column-panel order, independent of their outer storage order.
+pub(crate) fn panel_byte_traversal(
+    shard: TensorStorage<'_>,
+    view: &[ShardExtent],
+) -> StorageResult<ByteTraversal> {
+    validate_view(shard, view)?;
+    let rank = view.len();
+    if rank < 2
+        || view.iter().any(|e| e.start == e.physical_end)
+        || view[..rank - 2]
+            .iter()
+            .any(|e| e.physical_end - e.start != 1)
+        || view[rank - 2..]
+            .iter()
+            .zip(&shard.extents[rank - 2..])
+            .any(|(v, s)| {
+                !(v.start - s.start).is_multiple_of(16)
+                    || !(v.physical_end - s.start).is_multiple_of(16)
+            })
+    {
+        return Err(StorageError::InvalidView);
+    }
+    storage_bytes(shard)?;
+    let dimensions = digits(shard)?;
+    let mut high = [Vec::new(), Vec::new()];
+    let mut low = Vec::new();
+    let mut base = 0;
+    for d in dimensions {
+        if d.axis < rank - 2 {
+            base += ((view[d.axis].start - shard.extents[d.axis].start) / d.divisor % d.count)
+                * d.stride;
+        } else if d.divisor >= 16 {
+            high[d.axis - (rank - 2)].push(Digit {
+                divisor: d.divisor / 16,
+                ..d
+            });
+        } else {
+            let count = (16 / d.divisor).min(d.count);
+            if !d.count.is_multiple_of(count) {
+                return Err(StorageError::InvalidView);
+            }
+            if d.count > count {
+                high[d.axis - (rank - 2)].push(Digit {
+                    divisor: 1,
+                    count: d.count / count,
+                    stride: d.stride * count,
+                    ..d
+                });
+            }
+            low.push(Digit { count, ..d });
+        }
+    }
+    let mut node = Node {
+        offset: 0,
+        kind: Kind::Run(shard.format.precision.bytes() as u32),
+    };
+    for d in low.iter().rev() {
+        node = node.repeat(d.count, d.stride);
+    }
+    for axis in (0..2).rev() {
+        high[axis].sort_by_key(|d| Reverse(d.divisor));
+        let v = view[rank - 2 + axis];
+        let origin = shard.extents[rank - 2 + axis].start;
+        node = axis_tree(
+            &high[axis],
+            (v.start - origin) / 16,
+            (v.physical_end - origin) / 16,
+            &node,
+        );
+    }
+    Ok(ByteTraversal {
+        parts: vec![node.shift(base)],
+    })
+}
+
 struct TreeIter<'a> {
     stack: Vec<(&'a Node, u32, u32)>,
 }
@@ -391,7 +467,52 @@ pub(crate) struct SpanIter<'a> {
     ready: BinaryHeap<Reverse<(u32, u32, usize)>>,
     pending: Option<ByteSpan>,
 }
+/// A regular stream of equal-width runs, without enumerating its rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StridedSpan {
+    pub offset: u32,
+    pub bytes: u32,
+    pub rows: u32,
+    pub stride: u32,
+}
+
 impl ByteTraversal {
+    pub(crate) fn regular_span(&self) -> Option<StridedSpan> {
+        fn regular(node: &Node) -> Option<StridedSpan> {
+            let mut span = match &node.kind {
+                Kind::Run(bytes) => StridedSpan {
+                    offset: 0,
+                    bytes: *bytes,
+                    rows: 1,
+                    stride: *bytes,
+                },
+                Kind::Repeat {
+                    count,
+                    stride,
+                    body,
+                } => {
+                    let mut span = regular(body)?;
+                    if span.rows != 1 && span.stride.checked_mul(span.rows)? != *stride {
+                        return None;
+                    }
+                    if span.rows == 1 {
+                        span.stride = *stride;
+                    }
+                    span.rows = span.rows.checked_mul(*count)?;
+                    span
+                }
+                Kind::Sequence(parts) if parts.len() == 1 => regular(&parts[0])?,
+                Kind::Sequence(_) => return None,
+            };
+            span.offset = span.offset.checked_add(node.offset)?;
+            Some(span)
+        }
+        let [part] = self.parts.as_slice() else {
+            return None;
+        };
+        regular(part)
+    }
+
     pub(crate) fn contiguous(span: ByteSpan) -> Self {
         Self {
             parts: vec![Node {
@@ -676,6 +797,46 @@ mod tests {
                             }
                         })
                         .collect::<Vec<_>>();
+                    if view[0].start == 0 {
+                        let mut panel_view = shard.extents.clone();
+                        panel_view[0].start = 1;
+                        panel_view[0].logical_end = 2;
+                        panel_view[0].physical_end = 2;
+                        panel_view[1].start = 16;
+                        panel_view[1].logical_end = 48;
+                        panel_view[1].physical_end = 48;
+                        panel_view[2].start = 16;
+                        panel_view[2].logical_end = 80;
+                        panel_view[2].physical_end = 80;
+                        let actual = panel_byte_traversal(shard.storage(), &panel_view).unwrap();
+                        let mut expected = Vec::new();
+                        for row in (16..48).step_by(16) {
+                            for column in (16..80).step_by(16) {
+                                let mut part = panel_view.clone();
+                                part[1].start = row;
+                                part[1].logical_end = row + 16;
+                                part[1].physical_end = row + 16;
+                                part[2].start = column;
+                                part[2].logical_end = column + 16;
+                                part[2].physical_end = column + 16;
+                                let mut bytes = byte_spans(shard.storage(), &part, false)
+                                    .unwrap()
+                                    .into_iter()
+                                    .flat_map(|s| s.offset..s.offset + s.bytes)
+                                    .collect::<Vec<_>>();
+                                bytes.sort_unstable();
+                                expected.extend(bytes);
+                            }
+                        }
+                        assert_eq!(
+                            actual
+                                .spans()
+                                .flat_map(|s| s.offset..s.offset + s.bytes)
+                                .collect::<Vec<_>>(),
+                            expected,
+                            "panel {order:?} {precision:?}"
+                        );
+                    }
                     let semantic = byte_traversal(shard.storage(), &view, false).unwrap();
                     let physical = byte_traversal(shard.storage(), &view, true).unwrap();
                     let expected = byte_spans(shard.storage(), &view, false).unwrap();
@@ -697,6 +858,30 @@ mod tests {
                         addresses,
                         "{precision:?} {order:?} {view:?}"
                     );
+                    for traversal in [&semantic, &physical] {
+                        let linear = ByteTraversal::contiguous(ByteSpan {
+                            offset: 0,
+                            bytes: traversal.byte_len() as u32,
+                        });
+                        for (a, b) in [
+                            (traversal, &linear),
+                            (&linear, traversal),
+                            (traversal, traversal),
+                        ] {
+                            assert_eq!(
+                                crate::CopyOperation::from_traversals(0, 1, a, b)
+                                    .unwrap(),
+                                crate::CopyOperation::from_spans(
+                                    0,
+                                    1,
+                                    a.spans(),
+                                    b.spans()
+                                )
+                                .unwrap(),
+                                "direct copy {order:?} {precision:?} {view:?}"
+                            );
+                        }
+                    }
                     assert_eq!(semantic.byte_len(), addresses.len() as u64);
                     assert_eq!(physical.byte_len(), semantic.byte_len());
                     for traversal in [&semantic, &physical] {

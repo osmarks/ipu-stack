@@ -2016,3 +2016,83 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
         assert_eq!(low.shards[source.index() as usize].extents, result.extents);
     }
 }
+
+#[test]
+fn complete_panel_grid_stays_one_logical_exchange() {
+    let mut state = TileGraphBuilder::new(&MidProgram {
+        tile_count: 2,
+        ..MidProgram::default()
+    })
+    .unwrap();
+    for (tile, columns) in [(0, 128), (1, 64)] {
+        let tensor_type = TensorType::new(
+            [64, columns],
+            Precision::F16,
+            Layout::amp_left(columns as u16, 1),
+        );
+        state
+            .push_shard(BlockValue {
+                id: BlockValueId(0),
+                tile,
+                tensor_type,
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: 0,
+                        logical_end: 64,
+                        physical_end: 64,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: 0,
+                        logical_end: columns,
+                        physical_end: columns,
+                    },
+                ],
+                definition: ShardDefinition::Staging,
+            })
+            .unwrap();
+    }
+    let source = state.narrow_view(BlockValueId(0), &[(1, 0, 64)]).unwrap();
+    let destination = state.full_view(BlockValueId(1));
+    let (mappings, order) = state
+        .micro_panel_mappings(vec![(source.clone(), destination.clone())])
+        .unwrap()
+        .unwrap();
+    assert_eq!(order, CopyOrder::Panels);
+    assert_eq!(mappings.len(), 1);
+    let provenance = WorkProvenance {
+        operation: None,
+        value: None,
+        reason: WorkReason::LayoutRearrangement,
+    };
+    let mut batch = conversion::MaterializationBatch::default();
+    let mut body = BlockRegion::default();
+    state
+        .prepare_mapped_views(mappings, order, order, provenance, &mut batch, &mut body)
+        .unwrap();
+    state
+        .append_materialization(batch, provenance, &mut body)
+        .unwrap();
+    assert_eq!(state.phases.len(), 1);
+    let [transfer] = state.phases[0].transfers.as_slice() else {
+        panic!("expanded panel grid");
+    };
+    let pairs = |order| {
+        view_byte_traversal(&state.shards[0], &source, order)
+            .unwrap()
+            .spans()
+            .flat_map(|s| s.offset..s.offset + s.bytes)
+            .zip(
+                view_byte_traversal(&state.shards[1], &destination, order)
+                    .unwrap()
+                    .spans()
+                    .flat_map(|s| s.offset..s.offset + s.bytes),
+            )
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        pairs(transfer.span_order(&state.shards)),
+        pairs(CopyOrder::Semantic)
+    );
+}

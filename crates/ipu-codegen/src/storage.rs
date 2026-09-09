@@ -1,7 +1,7 @@
 //! Conversion from logical shard views to physical byte ranges.
 
 mod traversal;
-pub(crate) use traversal::{ByteTraversal, byte_traversal};
+pub(crate) use traversal::{ByteTraversal, byte_traversal, panel_byte_traversal};
 
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision, ShardExtent, TensorFormat,

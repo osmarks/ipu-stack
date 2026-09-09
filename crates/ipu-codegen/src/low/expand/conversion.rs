@@ -5,8 +5,7 @@ use super::*;
 /// Work needed to populate ordinary destination blocks at one exchange boundary.
 #[derive(Default)]
 pub(super) struct MaterializationBatch {
-    pub(super) semantic: BTreeMap<ShardView, Vec<ShardView>>,
-    physical: BTreeMap<ShardView, Vec<ShardView>>,
+    transfers: BTreeMap<CopyOrder, BTreeMap<ShardView, Vec<ShardView>>>,
     before: Vec<(u16, LocalCopy)>,
     pub(super) after: Vec<(u16, LocalCopy)>,
     kernels: Vec<(u16, KernelRun)>,
@@ -229,14 +228,11 @@ impl TileGraphBuilder {
         } else {
             None
         };
-        let (mappings, copy_order, exchange_order) = physical
-            .map_or((mappings, copy_order, exchange_order), |mappings| {
-                (mappings, CopyOrder::Physical, CopyOrder::Physical)
-            });
-        let transfers = match exchange_order {
-            CopyOrder::Semantic => &mut batch.semantic,
-            CopyOrder::Physical => &mut batch.physical,
-        };
+        let (mappings, copy_order, exchange_order) = physical.map_or(
+            (mappings, copy_order, exchange_order),
+            |(mappings, order)| (mappings, order, order),
+        );
+        let transfers = batch.transfers.entry(exchange_order).or_default();
         let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
         for mapping in mappings {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
@@ -358,10 +354,7 @@ impl TileGraphBuilder {
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         for (source, destination, order) in batch.loopback_candidates {
-            let transfers = match order {
-                CopyOrder::Semantic => &mut batch.semantic,
-                CopyOrder::Physical => &mut batch.physical,
-            };
+            let transfers = batch.transfers.entry(order).or_default();
             // Keep the existing multicast send; only add its local receiver.
             // Placement separates same-class source/receiver SRAM elements.
             let spans = |shard, view| view_byte_traversal(shard, view, order);
@@ -400,7 +393,7 @@ impl TileGraphBuilder {
         for (tile, copy) in batch.before {
             self.append_local_copy(tiles, tile, copy)?;
         }
-        self.append_mixed_phase(batch.semantic, batch.physical, provenance, tiles)?;
+        self.append_mixed_phase(batch.transfers, provenance, tiles)?;
         for (tile, copy) in batch.after {
             self.append_local_copy(tiles, tile, copy)?;
         }

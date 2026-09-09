@@ -144,41 +144,12 @@ pub(super) fn split_mapping_at_panel_boundaries(
     let destination_row_axis = destination_rank - 2;
     let destination_column_axis = destination_rank - 1;
 
-    // The global row tail can finish part-way through a micro-panel while
-    // both allocations contain padding through the same panel boundary.
-    // Carry that padding with the useful values so the direct physical
-    // exchange remains word-aligned. A split head's column tail is not
-    // extended because the following source columns may belong to another
-    // head rather than padding.
-    let source_rows = source.extents[source_row_axis];
-    let destination_rows = destination.extents[destination_row_axis];
-    if source_rows.logical_end == source_shard.tensor_type.shape.0[source_row_axis]
-        && destination_rows.logical_end
-            == destination_shard.tensor_type.shape.0[destination_row_axis]
-    {
-        let source_panel_tail = (AMP_COLUMN_MICRO
-            - (source_rows.logical_end - source_shard.extents[source_row_axis].start)
-                % AMP_COLUMN_MICRO)
-            % AMP_COLUMN_MICRO;
-        let destination_panel_tail = (AMP_COLUMN_MICRO
-            - (destination_rows.logical_end
-                - destination_shard.extents[destination_row_axis].start)
-                % AMP_COLUMN_MICRO)
-            % AMP_COLUMN_MICRO;
-        let padding = source_panel_tail
-            .min(destination_panel_tail)
-            .min(source_shard.extents[source_row_axis].physical_end - source_rows.logical_end)
-            .min(
-                destination_shard.extents[destination_row_axis].physical_end
-                    - destination_rows.logical_end,
-            );
-        source.extents[source_row_axis].physical_end = source_rows
-            .physical_end
-            .max(source_rows.logical_end + padding);
-        destination.extents[destination_row_axis].physical_end = destination_rows
-            .physical_end
-            .max(destination_rows.logical_end + padding);
-    }
+    extend_panel_row_padding(
+        source_shard,
+        &mut source,
+        destination_shard,
+        &mut destination,
+    );
 
     let rows = aligned_ranges(
         source.extents[source_row_axis],
@@ -214,4 +185,53 @@ pub(super) fn split_mapping_at_panel_boundaries(
         }
     }
     Ok(pieces)
+}
+
+/// Preserve known padding when a mapped row reaches both tensors' global tails.
+pub(super) fn extend_panel_row_padding(
+    source_shard: &BlockValue,
+    source: &mut ShardView,
+    destination_shard: &BlockValue,
+    destination: &mut ShardView,
+) {
+    if source.extents.len() < 2 || destination.extents.len() < 2 {
+        return;
+    }
+    let source_row_axis = source.extents.len() - 2;
+    let destination_row_axis = destination.extents.len() - 2;
+    // The global row tail can finish part-way through a micro-panel while
+    // both allocations contain padding through the same panel boundary.
+    // Carry that padding with the useful values so the direct physical
+    // exchange remains word-aligned. A split head's column tail is not
+    // extended because the following source columns may belong to another
+    // head rather than padding.
+    let source_rows = source.extents[source_row_axis];
+    let destination_rows = destination.extents[destination_row_axis];
+    if source_rows.logical_end == source_shard.tensor_type.shape.0[source_row_axis]
+        && destination_rows.logical_end
+            == destination_shard.tensor_type.shape.0[destination_row_axis]
+    {
+        let source_panel_tail = (AMP_COLUMN_MICRO
+            - (source_rows.logical_end - source_shard.extents[source_row_axis].start)
+                % AMP_COLUMN_MICRO)
+            % AMP_COLUMN_MICRO;
+        let destination_panel_tail = (AMP_COLUMN_MICRO
+            - (destination_rows.logical_end
+                - destination_shard.extents[destination_row_axis].start)
+                % AMP_COLUMN_MICRO)
+            % AMP_COLUMN_MICRO;
+        let padding = source_panel_tail
+            .min(destination_panel_tail)
+            .min(source_shard.extents[source_row_axis].physical_end - source_rows.logical_end)
+            .min(
+                destination_shard.extents[destination_row_axis].physical_end
+                    - destination_rows.logical_end,
+            );
+        source.extents[source_row_axis].physical_end = source_rows
+            .physical_end
+            .max(source_rows.logical_end + padding);
+        destination.extents[destination_row_axis].physical_end = destination_rows
+            .physical_end
+            .max(destination_rows.logical_end + padding);
+    }
 }

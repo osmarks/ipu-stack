@@ -48,7 +48,7 @@ impl TileGraphBuilder {
         let (mappings, order) = if let Some(view) = mapping.view {
             let mappings = self.window_view_mappings(&inputs, &outputs, view, &mapping.offsets)?;
             if let Some(physical) = self.micro_panel_mappings(mappings.clone())? {
-                (physical, CopyOrder::Physical)
+                physical
             } else if matches!(
                 source_order,
                 ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
@@ -348,8 +348,46 @@ impl TileGraphBuilder {
     /// panel sequence and tile ownership differ.
     pub(super) fn micro_panel_mappings(
         &self,
-        mappings: Vec<(ShardView, ShardView)>,
-    ) -> ExpansionResult<Option<Vec<(ShardView, ShardView)>>> {
+        mut mappings: Vec<(ShardView, ShardView)>,
+    ) -> ExpansionResult<Option<(Vec<(ShardView, ShardView)>, CopyOrder)>> {
+        for (source, destination) in &mut mappings {
+            extend_panel_row_padding(
+                &self.shards[source.shard.index() as usize],
+                source,
+                &self.shards[destination.shard.index() as usize],
+                destination,
+            );
+        }
+        // Complete grids have one shared traversal specification. Irregular
+        // boundaries retain the existing clipped-rectangle fallback below.
+        let regular = !mappings.is_empty()
+            && mappings.iter().all(|(source, destination)| {
+                let a = &self.shards[source.shard.index() as usize];
+                let b = &self.shards[destination.shard.index() as usize];
+                let rank = source.extents.len();
+                let other_rank = destination.extents.len();
+                rank >= 2
+                    && other_rank >= 2
+                    && a.tensor_type
+                        .format
+                        .supports_micro_panel_exchange(&b.tensor_type.format)
+                    && source.extents[rank - 2..]
+                        .iter()
+                        .zip(&destination.extents[other_rank - 2..])
+                        .all(|(x, y)| {
+                            x.physical_end - x.start == y.physical_end - y.start
+                                && x.logical_end - x.start == y.logical_end - y.start
+                        })
+                    && [(a, source), (b, destination)]
+                        .into_iter()
+                        .all(|(shard, view)| {
+                            crate::storage::panel_byte_traversal(shard.storage(), &view.extents)
+                                .is_ok_and(|traversal| traversal.word_aligned())
+                        })
+            });
+        if regular {
+            return Ok(Some((mappings, CopyOrder::Panels)));
+        }
         let mut split = Vec::new();
         for (source, destination) in mappings {
             let source_shard = &self.shards[source.shard.index() as usize];
@@ -380,6 +418,6 @@ impl TileGraphBuilder {
                 split.push((source, destination));
             }
         }
-        Ok(Some(split))
+        Ok(Some((split, CopyOrder::Physical)))
     }
 }

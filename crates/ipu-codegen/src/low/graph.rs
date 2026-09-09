@@ -95,6 +95,9 @@ impl LogicalExchange {
     /// Equal storage orders can traverse physical spans while preserving the
     /// requested coordinates. Share this decision with pricing and encoding.
     pub(crate) fn span_order(&self, shards: &[BlockValue]) -> CopyOrder {
+        if self.order == CopyOrder::Panels {
+            return CopyOrder::Panels;
+        }
         let source = &shards[self.source.shard.index() as usize];
         if self.order == CopyOrder::Semantic
             && self.destinations.iter().any(|view| {

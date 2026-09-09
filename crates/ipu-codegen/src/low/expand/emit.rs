@@ -101,16 +101,12 @@ impl TileGraphBuilder {
 
     pub(super) fn append_mixed_phase(
         &mut self,
-        semantic: BTreeMap<ShardView, Vec<ShardView>>,
-        physical: BTreeMap<ShardView, Vec<ShardView>>,
+        mappings: BTreeMap<CopyOrder, BTreeMap<ShardView, Vec<ShardView>>>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        let mut transfers = Vec::with_capacity(semantic.len().saturating_add(physical.len()));
-        for (order, mappings) in [
-            (CopyOrder::Semantic, semantic),
-            (CopyOrder::Physical, physical),
-        ] {
+        let mut transfers = Vec::new();
+        for (order, mappings) in mappings {
             transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
                 destinations.sort_unstable();
                 destinations.dedup();
