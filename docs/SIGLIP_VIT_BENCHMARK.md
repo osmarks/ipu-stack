@@ -372,3 +372,50 @@ cropped cycles (0.864132 ms/batch), with a passing hardware/reference check.
 See [implementation and measurements](VIT_POINTWISE_AND_PACKING_2026_09_08.md)
 for broadcast loops, batch-row ownership, distributed MAP layernorm, fusion,
 and distributed coefficient packing.
+
+## Fused encoder QKV and MAP KV (2026-09-09)
+
+Commit `cdafc88` extends `--fuse-qkv` to this benchmark using ordinary GEMMs,
+bias additions, slices and head views. No regional planning or special low-level
+projection operation is involved. The flag remains optional for comparisons.
+
+Full-size batch 1, FP8 scale -4, one encoder layer and MAP, 1,472 tiles:
+
+| Measurement | Separate projections | Fused QKV / KV |
+| --- | ---: | ---: |
+| Cropped hardware cycles | 844,380 | 779,868 |
+| Device time at 1.5 GHz | 0.562920 ms | 0.519912 ms |
+| High-level planning (`lower_mid`) | 260.0 s | 174.0 s |
+| Selection and package validation, including high planning | 377.9 s | 328.5 s |
+| Profile exchange phases | 63 | 53 |
+| Exchange phase spans | 523,086 cycles | 484,428 cycles |
+| Reserved exchange tables per tile | 21,288 bytes | 21,596 bytes |
+| Maximum absolute reference error | 0.075439 | 0.077393 |
+
+Fusion reduces measured device runtime by 7.6%, high-level planning by 33.1%,
+and total selection/package validation by 13.1%. Planning timings are indicative:
+the builds ran concurrently with separate 24-thread Rayon pools on the 56-core
+host and shared the kernel compilation cache. Device access was serialized and
+each package was timed once. Both use the renderer's startup cutoff. The current
+unfused result is also faster than the older 901,476-cycle historical profile;
+that historical difference is not attributed to fusion.
+
+The exchange-table reservation is essentially unchanged. The gain is fewer
+projection and exchange phases, not smaller tables. Fused planning still includes
+large phases with about 156,000 and 127,000 transfers and remains a multi-minute
+process. Random weights have the same per-projection variance but different
+samples after concatenation; these are separate hardware/reference checks, not
+bitwise comparisons between the two packages.
+
+Artifacts (each contains run.log, model.ipuexe, profile.ipuprof, profile.html,
+and summary.json):
+
+- `artifacts/vit/qkv-fused-b1/`
+- `artifacts/vit/qkv-unfused-b1/`
+- `artifacts/vit/qkv-fused-small/`: batch-2 reduced-shape FP16 check, maximum
+  absolute reference error 0.003906.
+
+Reproduce the full-size fused run with the example above, adding `--fuse-qkv`;
+omit that flag for the separate-projection comparison. Six benchmark tests and
+release Clippy passed. The topology test covers both projection choices, including
+the fused weight shapes and preservation of the separate MAP query.
