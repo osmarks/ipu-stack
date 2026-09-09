@@ -171,7 +171,7 @@ impl KernelBuildPlan {
             };
             let symbol = format!("cast_{}_{}", name(from), name(to));
             let vertex = format!("Cast{from}To{to}");
-            plan.add_vertex(
+            let wrapper = plan.add_vertex(
                 "cast_f8.cpp",
                 &symbol,
                 &vertex,
@@ -183,6 +183,9 @@ impl KernelBuildPlan {
                 ],
                 &[3, 2, 4, 5, 6, 7, 8, 9],
             );
+            if (from, to) == (2, 1) {
+                wrapper.source = "cast_f8_call.S";
+            }
         }
         for shape in unpacks {
             plan.add_unpack(shape);
@@ -214,7 +217,7 @@ impl KernelBuildPlan {
         vertex: &str,
         flags: Vec<String>,
         registers: &[u8],
-    ) {
+    ) -> &mut KernelCompilation {
         self.compilations.push(KernelCompilation {
             source,
             name: format!("{symbol}_codelet"),
@@ -238,6 +241,7 @@ impl KernelBuildPlan {
             ],
             retained_symbols: vec![symbol.to_owned()],
         });
+        self.compilations.last_mut().unwrap()
     }
 
     pub fn call(&self, run: &KernelRun) -> Result<PlannedKernelCall, KernelAbiError> {

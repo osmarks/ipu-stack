@@ -130,19 +130,87 @@ static __attribute__((noinline)) void castPackedRows(
         [jump] "r"(jump), [steps] "r"(steps)
       : "$m0", "$m1", "$m2", "$m3", "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
 }
+static __attribute__((always_inline)) inline void castFullRows(
+    const half *first, const half *second, unsigned char *target,
+    unsigned rows, unsigned stride, unsigned sourceStride) {
+        asm volatile(
+            "{ rpt %[rows], 11; fnop }\n"
+            "{ ld64step $a0:1, $mzero, %[first]+=, 1; fnop }\n"
+            "{ ld64step $a2:3, $mzero, %[first]+=, 1; fnop }\n"
+            "{ ld64step $a0:1, $mzero, %[first]+=, 1; f16v8tof8 $a4:5, $a0:3 }\n"
+            "{ ld64step $a2:3, $mzero, %[first]+=, %[srcJump]; fnop }\n"
+            "{ st64step $a4:5, $mzero, %[out]+=, 1; f16v8tof8 $a6:7, $a0:3 }\n"
+            "{ ld64step $a0:1, $mzero, %[second]+=, 1; fnop }\n"
+            "{ ld64step $a2:3, $mzero, %[second]+=, 1; fnop }\n"
+            "{ st64step $a6:7, $mzero, %[out]+=, 1; f16v8tof8 $a4:5, $a0:3 }\n"
+            "{ ld64step $a0:1, $mzero, %[second]+=, 1; fnop }\n"
+            "{ ld64step $a2:3, $mzero, %[second]+=, %[srcJump]; fnop }\n"
+            "{ st64step $a4:5, $mzero, %[out]+=, 1; f16v8tof8 $a6:7, $a0:3 }\n"
+            "{ st64step $a6:7, $mzero, %[out]+=, %[dstJump]; fnop }\n"
+            : [first] "+&r"(first), [second] "+&r"(second), [out] "+&r"(target)
+            : [rows] "r"(rows), [srcJump] "r"(sourceStride / 8 - 3),
+              [dstJump] "r"(stride / 8 - 3)
+            : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
+}
+
+static __attribute__((noinline)) void castPaddedMatrices(
+    const half *source, unsigned char *destination, unsigned elements,
+    unsigned panelRows, unsigned validColumns, unsigned sourceColumns,
+    unsigned rowShape, unsigned worker) {
+  const unsigned matrixRows = rowShape >> 16;
+  const unsigned validRows = rowShape & 65535;
+  const bool wholePanels = panelRows <= 32 && elements >= panelRows * 32 * 6;
+  const unsigned stride = wholePanels ? 32 : 192;
+  const unsigned sourceStride = sourceColumns * 2 * (wholePanels ? 1 : 6);
+  const unsigned inStart = reinterpret_cast<unsigned>(source);
+  const unsigned outStart = reinterpret_cast<unsigned>(destination);
+  const bool separate = (((inStart + panelRows * sourceColumns * 2 - 1) >> 15) < (outStart >> 15) ||
+      ((outStart + elements - 1) >> 15) < (inStart >> 15));
+  for (unsigned matrix = 0; matrix < panelRows; matrix += matrixRows) {
+    const unsigned firstRow = wholePanels ? 0 : (worker + 6 - matrix % 6) % 6;
+    if (firstRow >= matrixRows) continue;
+    const unsigned row = matrix + firstRow;
+    const unsigned physicalRows = wholePanels ? matrixRows : (matrixRows + 5 - firstRow) / 6;
+    const unsigned rows = firstRow >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - firstRow) / 6;
+    for (unsigned panel = wholePanels ? worker * panelRows * 32 : 0,
+                  column = wholePanels ? worker * 32 : 0;
+         panel < elements; panel += panelRows * 32 * (wholePanels ? 6 : 1),
+                           column += wholePanels ? 192 : 32) {
+      unsigned char *target = destination + panel + row * 32;
+      if (physicalRows > rows)
+        zeroPackedRows(target + rows * stride, physicalRows - rows, stride);
+      if (!rows) continue;
+      if (column >= validColumns) {
+        zeroPackedRows(target, rows, stride);
+        continue;
+      }
+      const half *first = source + row * sourceColumns + column;
+      if (column + 32 > validColumns) {
+        castRowTail(first, target, rows, sourceStride, stride, validColumns - column);
+      } else if (separate && rows >= 16 && sourceStride / 8 - 2 < 512) {
+        castPackedRows(first, first + 16, target, rows, stride, sourceStride);
+      } else {
+        castFullRows(first, first + 16, target, rows, stride, sourceStride);
+      }
+    }
+  }
+}
 #endif
+// Both worker entry points consume this one descriptor layout. For FP16
+// packing, sourceMetadata holds row bounds and sourceExtent readable columns.
+#define CAST_FIELDS \
+  Input<Vector<Source, VectorLayout::ONE_PTR>> source; \
+  Output<Vector<Destination, VectorLayout::ONE_PTR>> destination; \
+  unsigned elements; \
+  int sourceMetadata; \
+  int destinationScale; \
+  unsigned panelRows; \
+  unsigned sourceExtent; \
+  unsigned rowMajorColumns;
+
 class CAST_VERTEX : public MultiVertex {
 public:
-  Input<Vector<Source, VectorLayout::ONE_PTR>> source;
-  Output<Vector<Destination, VectorLayout::ONE_PTR>> destination;
-  unsigned elements;
-  // FP8 source scale, or packed physical/logical matrix rows for FP16 packing.
-  int sourceMetadata;
-  int destinationScale;
-  unsigned panelRows;
-  // Allocation elements for linear/panel input, valid columns for row-major input.
-  unsigned sourceExtent;
-  unsigned rowMajorColumns;
+  CAST_FIELDS
   bool compute(unsigned worker) {
     // Assembly writes cannot change the immutable call descriptor. Keep its
     // fields in registers rather than reloading them after each memory clobber.
@@ -157,6 +225,7 @@ public:
     const unsigned validColumns = sourceExtent;
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
     setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
+    const unsigned rowShape = rowMajorColumns ? static_cast<unsigned>(sourceMetadata) : 0;
     // Combined loads/stores require different memory elements. Group pairs
     // of standard banks conservatively so this also covers interleaved SRAM.
     const unsigned inStart = reinterpret_cast<unsigned>(source);
@@ -169,21 +238,16 @@ public:
       // Small panels have too few rows to amortize six-worker setup. Give
       // workers complete panels when there are enough independent panels.
       const bool wholePanels = panelRows <= 32 && elements >= panelElements * 6;
-      const unsigned rowShape = rowMajorColumns ? static_cast<unsigned>(sourceMetadata) : 0;
-      const unsigned matrixRows = rowShape ? rowShape >> 16 : panelRows;
-      const unsigned validRows = rowShape ? rowShape & 65535 : matrixRows;
+      const unsigned row = wholePanels ? 0 : worker;
+      const unsigned physicalRows = wholePanels ? panelRows : (panelRows + 5 - worker) / 6;
+      const unsigned validRows = rowShape && (rowShape >> 16) == panelRows ? rowShape & 65535 : panelRows;
+      const unsigned rows = row >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - worker) / 6;
       const unsigned stride = wholePanels ? 32 : 192;
       const unsigned sourceStride = rowMajorColumns ? rowMajorColumns * 2 * (wholePanels ? 1 : 6) : stride;
       const unsigned panelStep = panelElements * (wholePanels ? 6 : 1);
       unsigned column = wholePanels ? worker * 32 : 0;
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
-           panel < elements; panel += panelStep, column += wholePanels ? 192 : 32) {
-       for (unsigned matrix = 0; matrix < panelRows; matrix += matrixRows) {
-        const unsigned firstRow = wholePanels ? 0 : (worker + 6 - matrix % 6) % 6;
-        if (firstRow >= matrixRows) continue;
-        const unsigned row = matrix + firstRow;
-        const unsigned physicalRows = wholePanels ? matrixRows : (matrixRows + 5 - firstRow) / 6;
-        const unsigned rows = firstRow >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - firstRow) / 6;
+           panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
         unsigned char *panelTarget = &destination[panel + row * 32];
         if (physicalRows > rows)
           zeroPackedRows(panelTarget + rows * stride, physicalRows - rows, stride);
@@ -225,27 +289,7 @@ public:
           castPackedRows(first, second, target, rows, stride, sourceStride);
           continue;
         }
-        // Separate loads/stores also use post-increments: no per-row
-        // address arithmetic, and no memory-element separation requirement.
-        asm volatile(
-            "{ rpt %[rows], 11; fnop }\n"
-            "{ ld64step $a0:1, $mzero, %[first]+=, 1; fnop }\n"
-            "{ ld64step $a2:3, $mzero, %[first]+=, 1; fnop }\n"
-            "{ ld64step $a0:1, $mzero, %[first]+=, 1; f16v8tof8 $a4:5, $a0:3 }\n"
-            "{ ld64step $a2:3, $mzero, %[first]+=, %[srcJump]; fnop }\n"
-            "{ st64step $a4:5, $mzero, %[out]+=, 1; f16v8tof8 $a6:7, $a0:3 }\n"
-            "{ ld64step $a0:1, $mzero, %[second]+=, 1; fnop }\n"
-            "{ ld64step $a2:3, $mzero, %[second]+=, 1; fnop }\n"
-            "{ st64step $a6:7, $mzero, %[out]+=, 1; f16v8tof8 $a4:5, $a0:3 }\n"
-            "{ ld64step $a0:1, $mzero, %[second]+=, 1; fnop }\n"
-            "{ ld64step $a2:3, $mzero, %[second]+=, %[srcJump]; fnop }\n"
-            "{ st64step $a4:5, $mzero, %[out]+=, 1; f16v8tof8 $a6:7, $a0:3 }\n"
-            "{ st64step $a6:7, $mzero, %[out]+=, %[dstJump]; fnop }\n"
-            : [first] "+&r"(first), [second] "+&r"(second), [out] "+&r"(target)
-            : [rows] "r"(rows), [srcJump] "r"(sourceStride / 8 - 3),
-              [dstJump] "r"(stride / 8 - 3)
-            : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
-      }
+        castFullRows(first, second, target, rows, stride, sourceStride);
       }
       return true;
     }
@@ -366,3 +410,21 @@ public:
 #endif
   }
 };
+
+#if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
+// The supervisor selects this entry only for padding between batch matrices.
+// Sharing the descriptor preserves one cast ABI without burdening the hot loop.
+class Cast2To1Padded : public MultiVertex {
+public:
+  CAST_FIELDS
+  bool compute(unsigned worker) {
+    setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
+    castPaddedMatrices(&source[0], &destination[0], elements, panelRows,
+                       sourceExtent, rowMajorColumns,
+                       static_cast<unsigned>(sourceMetadata), worker);
+    return true;
+  }
+};
+#endif
+
+#undef CAST_FIELDS

@@ -49,11 +49,16 @@ fn main() -> Result<()> {
         .status()?;
     ensure!(status.success(), "cast compilation failed");
     let source = format!(
-        "#include \"{}\"\n#include \"{}\"\n#include \"{}\"\n#define WORKER_CALL_SYMBOL cast_check\n#define WORKER_CODELET_SYMBOL __runCodelet_Cast2To1\n#define WORKER_ARGUMENTS $m3,$m2,$m4,$m5,$m6,$m7,$m8,$m9\n#define WORKER_FRAME_BYTES 32\n#include \"{}\"\n",
+        "#include \"{}\"\n#include \"{}\"\n#include \"{}\"\n#define WORKER_CALL_SYMBOL cast_check\n#define WORKER_CODELET_SYMBOL __runCodelet_Cast2To1\n#define WORKER_ARGUMENTS $m3,$m2,$m4,$m5,$m6,$m7,$m8,$m9\n#define WORKER_FRAME_BYTES 32\n{selector}#include \"{}\"\n",
         device.join("static_runtime.S").display(),
         device.join("worker_support.S").display(),
         assembly.canonicalize()?.display(),
         device.join("worker_call.S").display(),
+        selector = if args.existing_layouts_only {
+            ""
+        } else {
+            "#define WORKER_SELECT_CODELET \"cast_f8_select.inc\"\n"
+        },
     );
     let mut programs = Vec::new();
     let mut data = Vec::new();

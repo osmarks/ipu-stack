@@ -18,7 +18,11 @@ WORKER_CALL_SYMBOL:
 	st32 \argument, $m11, $m15, argument_index
 	.set argument_index, argument_index + 1
 	.endr
+#ifdef WORKER_SELECT_CODELET
+#include WORKER_SELECT_CODELET
+#else
 	setzi $m0, WORKER_CODELET_SYMBOL
+#endif
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
 	add $m11, $m11, WORKER_FRAME_BYTES
