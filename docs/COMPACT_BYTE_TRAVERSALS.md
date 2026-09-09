@@ -56,3 +56,36 @@ relative). Its rendered profile is
 Final validation: 197 codegen tests passed, five ignored, the doctest passed,
 and Clippy passed for codegen and test binaries with the repository's existing
 argument-count/type-complexity allowances.
+
+## Pre-placement follow-up
+
+Commit 036a082 removes whole-device shard scans from primitive operand lookup:
+input shards are indexed once by tile, preserving their original within-tile
+order for broadcast and writable-alias matching. Physical traversal slicing now
+writes into a scratch bounds array rather than recursively constructing nested
+vectors of digit selections.
+
+The first retained FlashAttention plan now expands in 0.933 s (previously
+1.401 s). Materialized attention is 0.741 s (0.959 s), MLP B1 is 0.289 s
+(0.344 s), and MLP B2 Repeat3 is 1.408 s (1.509 s). These remain individual CPU
+measurements; timings vary. Component counts match all measured counterparts.
+The 197 codegen tests, doctest and Clippy pass; no new device execution was
+needed for the lookup/scratch-allocation changes.
+
+Debug logging in `ipu_codegen::low::expand` now separates graph construction,
+simplification and pre-placement analytical costing. First-plan measurements:
+
+| Workload | Construct graph | Simplify | Cost graph |
+|---|---:|---:|---:|
+| FlashAttention B1 | 741 ms | 7 ms | 185 ms |
+| Materialized attention B1 | 566 ms | 4 ms | 171 ms |
+| MLP B1 | 197 ms | 2 ms | 90 ms |
+| MLP B2 Repeat3 | 1150 ms | 4 ms | 253 ms |
+
+The small difference from total expansion is logging and final bookkeeping.
+Commands, perf samples, stage logs and result JSON are in
+`artifacts/low-expansion-followup-20260909/`. The perf call stacks have incomplete
+unwinding, so they identify hotspots but do not support precise inclusive
+attribution of all expansion time. Broader use of low-graph costing would
+benefit from reusing unchanged expansion work between candidates; these changes
+do not implement that cache or change the planning search.
