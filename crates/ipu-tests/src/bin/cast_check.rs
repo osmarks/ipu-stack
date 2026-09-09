@@ -89,7 +89,12 @@ fn main() -> Result<()> {
         (184, 96), // Largest cast in the full B1 ViT profile.
         (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
-        for mode in 0..6 {
+        for mode in 0..7 {
+            if mode == 6 && rows > 97 {
+                continue;
+            }
+            let matrix_rows = rows;
+            let rows = rows * if mode == 6 { 2 } else { 1 };
             // dense, already packed, row-major -> packed
             if mode >= 2 && args.existing_layouts_only {
                 continue;
@@ -111,10 +116,10 @@ fn main() -> Result<()> {
                     } else {
                         columns
                     };
-                    let valid_rows = if mode == 5 {
-                        rows.saturating_sub(2)
+                    let valid_rows = if mode >= 5 {
+                        matrix_rows.saturating_sub(2)
                     } else {
-                        rows
+                        matrix_rows
                     };
                     let source_count = rows * source_columns;
                     let output_columns = if mode == 0 {
@@ -133,7 +138,7 @@ fn main() -> Result<()> {
                         output_address
                     };
                     // Keep large inputs disjoint even in the shared-bank case.
-                    let output_address = if placement == "shared-standard" {
+                    let output_address = if placement != "interleaved" {
                         output_address.max(input_address + source_count * 2 + 8)
                     } else {
                         output_address
@@ -148,7 +153,10 @@ fn main() -> Result<()> {
                     let mut input =
                         vec![if mode >= 4 { 0x7e00u16 } else { 0 }; source_count as usize];
                     let mut result = vec![0u8; count as usize];
-                    for row in 0..valid_rows {
+                    for row in 0..rows {
+                        if row % matrix_rows >= valid_rows {
+                            continue;
+                        }
                         for column in 0..columns {
                             let logical_index = (row * columns + column) as usize;
                             let input_index = if mode == 1 {
@@ -204,7 +212,11 @@ fn main() -> Result<()> {
                             input_addresses: vec![TileAddress::Absolute(input_address)],
                             arguments: vec![
                                 count,
-                                if mode >= 2 { valid_rows } else { 0 },
+                                if mode >= 2 {
+                                    (matrix_rows << 16) | valid_rows
+                                } else {
+                                    0
+                                },
                                 (i32::from(scale)) as u32,
                                 if mode == 0 || (rows == 1 && source_count == count && mode < 4) {
                                     0

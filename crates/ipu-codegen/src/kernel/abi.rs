@@ -138,20 +138,16 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                         && run.requirements.output.format.layout.order
                             == ElementOrder::Amp(AmpOrder::Left)
                     {
-                        let extents = &run.inputs[0].views[0].extents;
-                        // A single local matrix has one readable row prefix.
-                        // For multiple matrices retain physical rows, since
-                        // their padding may be interspersed with valid rows.
-                        return if extents.len() >= 2
-                            && extents[..extents.len() - 2]
-                                .iter()
-                                .all(|a| a.physical_end - a.start == 1)
-                        {
-                            input_matrix_extent(run, true, false)
+                        let physical = input_matrix_extent(run, false, false)?;
+                        let logical = input_matrix_extent(run, true, false)?;
+                        // Two row bounds share the otherwise unused FP16
+                        // source-scale word. Zero retains the unmasked path
+                        // for shapes outside the compact descriptor's range.
+                        return Ok(if physical <= u16::MAX.into() {
+                            (physical << 16) | logical
                         } else {
-                            Ok(scalar_source_elements(run)?
-                                / input_matrix_extent(run, false, true)?)
-                        };
+                            0
+                        });
                     }
                     let precision = if *argument == ScalarValue::CastSourceMetadata {
                         from
@@ -212,6 +208,8 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                         && scalar_source_elements(run)? == element_count(run)?
                         && input_matrix_extent(run, true, true)?
                             == input_matrix_extent(run, false, true)?
+                        && input_matrix_extent(run, true, false)?
+                            == input_matrix_extent(run, false, false)?
                     {
                         return Ok(0);
                     }

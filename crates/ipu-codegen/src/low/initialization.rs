@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 /// Row-major FP8 packing reads only the logical column prefix and writes its
 /// own output padding. Drop input padding clears when that is the sole reader.
-pub(super) fn omit_unread_cast_padding(program: &mut LowProgram) {
+pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
     let graph = &program.program;
     let root = |id| storage_root(&graph.shards, id);
     let mut candidates = BTreeSet::new();
@@ -22,14 +22,21 @@ pub(super) fn omit_unread_cast_padding(program: &mut LowProgram) {
                 let columns = view.extents.last();
                 let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
                     from: Precision::F16, to: Precision::F8F143 { .. }
-                }) && block.tensor_type.format.layout.order == ElementOrder::RowMajor
-                    && run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
+                } | TileKernelSpec::Gelu)
+                    && matches!(run.requirements.output.format.precision, Precision::F8F143 { .. })
+                    && block.tensor_type.format.precision == Precision::F16
+                    && block.tensor_type.format.layout.order == ElementOrder::RowMajor
+                    && matches!(run.requirements.output.format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
+                    && (run.kernel == TileKernelSpec::Gelu || run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left))
                     && view.extents == block.extents
                     && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
-                    // Column padding is always skipped. Row padding is also
-                    // skipped for a single local matrix (one readable prefix).
-                    && (view.extents.iter().rev().skip(1).all(|axis| axis.logical_end == axis.physical_end)
-                        || (view.extents.len() >= 2 && view.extents[..view.extents.len()-2].iter().all(|axis| axis.physical_end - axis.start == 1)));
+                    // Matrix-row padding is skipped by the packed row bounds;
+                    // padding in outer dimensions still requires initialization.
+                    && view.extents.iter().rev().skip(2).all(|axis| axis.logical_end == axis.physical_end)
+                    && (view.extents.len() < 2 || {
+                        let rows = view.extents[view.extents.len()-2];
+                        rows.logical_end == rows.physical_end || (matches!(run.kernel, TileKernelSpec::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
+                    });
                 if ignores_padding {
                     candidates.insert(root(view.shard));
                 } else {
@@ -418,7 +425,8 @@ mod tests {
             to: Precision::F8F143 { scale_exponent: -4 },
         };
         metadata.requirements.output.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
-        for case in 0..5 {
+        metadata.requirements.output.format.precision = Precision::F8F143 { scale_exponent: -4 };
+        for case in 0..7 {
             let mut program = baseline.clone();
             let graph = Arc::make_mut(&mut program.program);
             match case {
@@ -438,6 +446,13 @@ mod tests {
                     bytes: 128,
                     pattern: CopyPattern::Contiguous,
                 }),
+                5 | 6 => {
+                    Arc::make_mut(&mut graph.kernel_runs[1].metadata).kernel = TileKernelSpec::Gelu;
+                    if case == 6 {
+                        graph.shards[0].extents[0].logical_end = 1;
+                        graph.kernel_runs[1].inputs[0].views[0].extents[0].logical_end = 1;
+                    }
+                }
                 4 => {
                     Arc::make_mut(&mut graph.kernel_runs[0].metadata).kernel =
                         TileKernelSpec::FillZero {
@@ -448,10 +463,10 @@ mod tests {
                 }
                 _ => {}
             }
-            omit_unread_cast_padding(&mut program);
+            omit_unread_fp8_input_padding(&mut program);
             assert_eq!(
                 program.tiles[0].work.len(),
-                if case <= 1 { 1 } else { 2 },
+                if case <= 1 || case == 5 { 1 } else { 2 },
                 "case {case}"
             );
         }

@@ -160,7 +160,7 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
         tiles,
         repeat_runs,
     };
-    initialization::omit_unread_cast_padding(&mut low);
+    initialization::omit_unread_fp8_input_padding(&mut low);
     initialization::reuse_finite_padding(&mut low);
     low
 }

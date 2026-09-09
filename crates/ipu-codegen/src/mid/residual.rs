@@ -69,17 +69,15 @@ pub(super) fn fuse(
             continue;
         }
         // The statistics must describe the version written by this add.
-        if operations[previous + 1..index].iter().any(|op| {
-            !matches!(
-                op.kind,
-                MidOperationKind::Primitive(Primitive::Copy { .. }) | MidOperationKind::Convert(_)
-            )
-        }) || operations[previous + 1..index]
+        if operations[previous + 1..index]
             .iter()
-            .enumerate()
-            .filter(|(i, _)| !identity_copies.contains(&(previous + 1 + i)))
-            .flat_map(|(_, op)| &op.results)
-            .any(|v| values[v.index() as usize].storage_group == value.storage_group)
+            .any(|op| matches!(op.kind, MidOperationKind::Repeat(_)))
+            || operations[previous + 1..index]
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !identity_copies.contains(&(previous + 1 + i)))
+                .flat_map(|(_, op)| &op.results)
+                .any(|v| values[v.index() as usize].storage_group == value.storage_group)
         {
             continue;
         }

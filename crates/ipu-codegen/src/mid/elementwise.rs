@@ -360,20 +360,22 @@ fn fuse_fp8_outputs(
             .inputs
             .iter()
             .map(|v| values[v.index() as usize].storage_group)
+            .chain(
+                identity_copies
+                    .iter()
+                    .map(|&i| values[operations[i].results[0].index() as usize].storage_group),
+            )
             .collect::<BTreeSet<_>>();
         if operations[previous + 1..index]
             .iter()
             .enumerate()
             .any(|(i, op)| {
                 !identity_copies.contains(&(previous + 1 + i))
-                    && (!matches!(
-                        op.kind,
-                        MidOperationKind::Primitive(Primitive::Copy { .. })
-                            | MidOperationKind::Convert(_)
-                    ) || op
-                        .results
-                        .iter()
-                        .any(|v| groups.contains(&values[v.index() as usize].storage_group)))
+                    && (matches!(op.kind, MidOperationKind::Repeat(_))
+                        || op
+                            .results
+                            .iter()
+                            .any(|v| groups.contains(&values[v.index() as usize].storage_group)))
             })
         {
             continue;
@@ -608,6 +610,20 @@ mod tests {
         for run in &graph.kernel_runs {
             crate::validate_kernel_run(run).unwrap();
         }
+        // Independent arithmetic may intervene; an aliased write may not.
+        let mut independent = program.clone();
+        let mut extra = independent.values[0].clone();
+        extra.id = MidValueId(independent.values.len() as u32);
+        extra.storage_group = extra.id;
+        let mut work = independent.operations[0].clone();
+        work.results = vec![extra.id];
+        independent.outputs.push(extra.id);
+        independent.values.push(extra);
+        independent.operations.insert(2, work);
+        assert!(independent.with_elementwise_fusions().is_some());
+        independent.values.last_mut().unwrap().storage_group = MidValueId(0);
+        assert!(independent.with_elementwise_fusions().is_none());
+
         let mut norm = program.clone();
         for _ in 0..2 {
             let id = MidValueId(norm.values.len() as u32);

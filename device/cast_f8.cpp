@@ -136,7 +136,7 @@ public:
   Input<Vector<Source, VectorLayout::ONE_PTR>> source;
   Output<Vector<Destination, VectorLayout::ONE_PTR>> destination;
   unsigned elements;
-  // FP8 source scale, or readable row count for row-major FP16 packing.
+  // FP8 source scale, or packed physical/logical matrix rows for FP16 packing.
   int sourceMetadata;
   int destinationScale;
   unsigned panelRows;
@@ -169,16 +169,21 @@ public:
       // Small panels have too few rows to amortize six-worker setup. Give
       // workers complete panels when there are enough independent panels.
       const bool wholePanels = panelRows <= 32 && elements >= panelElements * 6;
-      const unsigned row = wholePanels ? 0 : worker;
-      const unsigned physicalRows = wholePanels ? panelRows : (panelRows + 5 - worker) / 6;
-      const unsigned validRows = rowMajorColumns ? static_cast<unsigned>(sourceMetadata) : panelRows;
-      const unsigned rows = row >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - worker) / 6;
+      const unsigned rowShape = rowMajorColumns ? static_cast<unsigned>(sourceMetadata) : 0;
+      const unsigned matrixRows = rowShape ? rowShape >> 16 : panelRows;
+      const unsigned validRows = rowShape ? rowShape & 65535 : matrixRows;
       const unsigned stride = wholePanels ? 32 : 192;
       const unsigned sourceStride = rowMajorColumns ? rowMajorColumns * 2 * (wholePanels ? 1 : 6) : stride;
       const unsigned panelStep = panelElements * (wholePanels ? 6 : 1);
       unsigned column = wholePanels ? worker * 32 : 0;
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
-           panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
+           panel < elements; panel += panelStep, column += wholePanels ? 192 : 32) {
+       for (unsigned matrix = 0; matrix < panelRows; matrix += matrixRows) {
+        const unsigned firstRow = wholePanels ? 0 : (worker + 6 - matrix % 6) % 6;
+        if (firstRow >= matrixRows) continue;
+        const unsigned row = matrix + firstRow;
+        const unsigned physicalRows = wholePanels ? matrixRows : (matrixRows + 5 - firstRow) / 6;
+        const unsigned rows = firstRow >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - firstRow) / 6;
         unsigned char *panelTarget = &destination[panel + row * 32];
         if (physicalRows > rows)
           zeroPackedRows(panelTarget + rows * stride, physicalRows - rows, stride);
@@ -240,6 +245,7 @@ public:
             : [rows] "r"(rows), [srcJump] "r"(sourceStride / 8 - 3),
               [dstJump] "r"(stride / 8 - 3)
             : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
+      }
       }
       return true;
     }
