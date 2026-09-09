@@ -178,3 +178,51 @@ static inline void normApply(const half *input, const half *right,
 }
 #undef NORM_LOAD_RIGHT
 #undef NORM_EXTRA_BUNDLES
+
+// Write the rounded residual once while accumulating its FP32 sum. Subsequent
+// centered-variance/application passes read this explicit result.
+static inline float2 normAddAndStore(const half *left, const half *right, half *output,
+                                     unsigned width, unsigned worker) {
+  float2 result = {0, 0};
+  if (worker >= (width + 7) / 8) return result;
+  const unsigned rounds = worker < width / 8 ? (width / 8 + 5 - worker) / 6 : 0;
+  left += worker * 8;
+  right += worker * 8;
+  output += worker * 8;
+  asm volatile("setzi $a0, (1 << 3)\nuput $FP_CLR, $a0" : : : "$a0", "memory");
+  if (rounds) {
+    asm volatile(
+        "{ rpt %[rounds], 6; fnop }\n"
+        "{ ld64step $a0:1, $mzero, %[left]+=, 1; fnop }\n"
+        "{ ld64step $a2:3, $mzero, %[left]+=, 11; fnop }\n"
+        "{ ld64step $a4:5, $mzero, %[right]+=, 1; fnop }\n"
+        "{ ld64step $a6:7, $mzero, %[right]+=, 11; f16v4add $a0:1, $a0:1, $a4:5 }\n"
+        "{ nop; f16v4add $a2:3, $a2:3, $a6:7 }\n"
+        "{ st64step $a0:1, $mzero, %[out]+=, 1; fnop }\n"
+        "{ st64step $a2:3, $mzero, %[out]+=, 11; f16v8acc $a0:3 }\n"
+        : [left] "+&r"(left), [right] "+&r"(right), [out] "+&r"(output)
+        : [rounds] "r"(rounds)
+        : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
+  }
+  if (worker * 8 + rounds * 48 < width) {
+    asm volatile(
+        "ld64 $a0:1, %[left], $mzero, 0\n"
+        "ld64 $a4:5, %[right], $mzero, 0\n"
+        "f16v4add $a0:1, $a0:1, $a4:5\n"
+        "zero $a2:3\n"
+        "{ st64 $a0:1, %[out], $mzero, 0; f16v8acc $a0:3 }\n"
+        : : [left] "r"(left), [right] "r"(right), [out] "r"(output)
+        : "$a0:1", "$a2:3", "$a4:5", "memory");
+  }
+  asm volatile(
+      "f32v2gina $a0:1, $azeros, 0\n"
+      "f32v2gina $a2:3, $azeros, 0\n"
+      "f32v2add $a0:1, $a0:1, $a2:3\n"
+      "f32v2gina $a2:3, $azeros, 0\n"
+      "f32v2add $a0:1, $a0:1, $a2:3\n"
+      "f32v2gina $a2:3, $azeros, 0\n"
+      "f32v2add $a0:1, $a0:1, $a2:3\n"
+      "st64 $a0:1, %[result], $mzero, 0\n"
+      : : [result] "r"(&result) : "$a0:1", "$a2:3", "memory");
+  return result;
+}

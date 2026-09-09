@@ -4,7 +4,9 @@ use super::*;
 impl MidProgram {
     pub(super) fn with_elementwise_fusions(&self) -> Option<Self> {
         let mut result = self.clone();
-        if !fuse_region(&mut result.operations, &result.values, &result.outputs) {
+        let residual =
+            super::residual::fuse(&mut result.operations, &mut result.values, &result.outputs);
+        if !fuse_region(&mut result.operations, &result.values, &result.outputs) && !residual {
             return None;
         }
         let (before, _) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
@@ -138,7 +140,7 @@ fn fuse_region(
             kernel: fused,
             operands: vec![OperandWindow::default(); arity],
             product: None,
-            reuse_input,
+            output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
         });
         let prices = crate::estimate::operation_cost(add, values)
             .zip(crate::estimate::operation_cost(current, values))
@@ -159,6 +161,46 @@ fn fuse_region(
         keep
     });
     changed
+}
+
+pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
+    a.tile_offset == b.tile_offset
+        && a.tensor_type.format.precision == b.tensor_type.format.precision
+        && a.tensor_type.format.layout.order == b.tensor_type.format.layout.order
+        && a.tensor_type.format.layout.memory_class == b.tensor_type.format.layout.memory_class
+        && implementation::same_distribution(&a.tensor_type, &b.tensor_type)
+}
+
+/// Look through metadata-only copies. Callers still check intervening writes
+/// and whether bypassed values have other readers before removing any copy.
+pub(super) fn producer_through_identity_copies(
+    mut value: MidValueId,
+    operations: &[MidOperation],
+    values: &[MidValue],
+) -> Option<(MidValueId, usize, Vec<usize>)> {
+    let mut copies = vec![];
+    loop {
+        let index = operations.iter().rposition(|op| op.results == [value])?;
+        let op = &operations[index];
+        let identity = match &op.kind {
+            MidOperationKind::Convert(_) => true,
+            MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => {
+                *mapping == CoordinateMapping::default()
+            }
+            _ => false,
+        };
+        if !identity
+            || op.inputs.len() != 1
+            || !same_storage(
+                &values[value.index() as usize],
+                &values[op.inputs[0].index() as usize],
+            )
+        {
+            return Some((value, index, copies));
+        }
+        copies.push(index);
+        value = op.inputs[0];
+    }
 }
 
 // A producer may write a cast's explicit result when its F16 intermediate
@@ -182,22 +224,24 @@ fn fuse_fp8_outputs(
         {
             continue;
         }
-        let intermediate = cast.inputs[0];
-        if required.contains(&intermediate)
-            || operations
-                .iter()
-                .filter(|op| op.read_values().any(|v| *v == intermediate))
-                .count()
-                != 1
-        {
-            continue;
-        }
-        let Some(previous) = operations[..index]
-            .iter()
-            .rposition(|op| op.results == [intermediate])
+        let Some((intermediate, previous, identity_copies)) =
+            producer_through_identity_copies(cast.inputs[0], &operations[..index], values)
         else {
             continue;
         };
+        if std::iter::once(intermediate)
+            .chain(identity_copies.iter().map(|&i| operations[i].results[0]))
+            .any(|value| {
+                required.contains(&value)
+                    || operations
+                        .iter()
+                        .filter(|op| op.read_values().any(|v| *v == value))
+                        .count()
+                        != 1
+            })
+        {
+            continue;
+        }
         if removed.contains(&previous) {
             continue;
         }
@@ -218,6 +262,9 @@ fn fuse_fp8_outputs(
         }
         let input = &values[intermediate.index() as usize];
         let output = &values[cast.results[0].index() as usize];
+        tracing::debug!(target: "ipu_codegen::mid::elementwise", producer = ?producer.source,
+            consumer = ?cast.source, ?kernel, input_layout = ?input.tensor_type.format.layout,
+            output_layout = ?output.tensor_type.format.layout, "considering direct FP8 output");
         if input.tile_offset != output.tile_offset
             || input.tensor_type.format.layout.order != ElementOrder::RowMajor
         {
@@ -230,20 +277,33 @@ fn fuse_fp8_outputs(
                 .tensor_type
                 .fp8_producer_layout(&output.tensor_type.format)
         };
-        if expected.as_ref() != Some(&output.tensor_type.format.layout)
-            || input
-                .tensor_type
-                .format
-                .layout
-                .resolve(&input.tensor_type.shape)
-                .ok()
-                .and_then(|resolved| {
-                    resolved
-                        .axes()
-                        .and_then(|a| a.last())
-                        .map(|a| a.extents_are_multiple_of(4))
-                })
-                != Some(true)
+        if expected.is_none_or(|layout| {
+            !same_storage(
+                &MidValue {
+                    tensor_type: TensorType {
+                        shape: input.tensor_type.shape.clone(),
+                        format: TensorFormat {
+                            precision: output.tensor_type.format.precision,
+                            layout,
+                        },
+                    },
+                    ..input.clone()
+                },
+                output,
+            )
+        }) || input
+            .tensor_type
+            .format
+            .layout
+            .resolve(&input.tensor_type.shape)
+            .ok()
+            .and_then(|resolved| {
+                resolved
+                    .axes()
+                    .and_then(|a| a.last())
+                    .map(|a| a.extents_are_multiple_of(4))
+            })
+            != Some(true)
         {
             continue;
         }
@@ -253,13 +313,21 @@ fn fuse_fp8_outputs(
             .iter()
             .map(|v| values[v.index() as usize].storage_group)
             .collect::<BTreeSet<_>>();
-        if operations[previous + 1..index].iter().any(|op| {
-            !matches!(op.kind, MidOperationKind::Primitive(Primitive::Copy { .. }))
-                || op
-                    .results
-                    .iter()
-                    .any(|v| groups.contains(&values[v.index() as usize].storage_group))
-        }) {
+        if operations[previous + 1..index]
+            .iter()
+            .enumerate()
+            .any(|(i, op)| {
+                !identity_copies.contains(&(previous + 1 + i))
+                    && (!matches!(
+                        op.kind,
+                        MidOperationKind::Primitive(Primitive::Copy { .. })
+                            | MidOperationKind::Convert(_)
+                    ) || op
+                        .results
+                        .iter()
+                        .any(|v| groups.contains(&values[v.index() as usize].storage_group)))
+            })
+        {
             continue;
         }
         let mut replacement = producer.clone();
@@ -268,7 +336,7 @@ fn fuse_fp8_outputs(
             kernel: kernel.clone(),
             operands: operands.clone(),
             product: None,
-            reuse_input: None,
+            output_aliases: Vec::new(),
         });
         let prices = crate::estimate::operation_cost(producer, values)
             .zip(crate::estimate::operation_cost(cast, values))
@@ -280,6 +348,7 @@ fn fuse_fp8_outputs(
         }
         operations[index] = replacement;
         removed.insert(previous);
+        removed.extend(identity_copies);
     }
     let changed = !removed.is_empty();
     let mut index = 0;
@@ -362,18 +431,46 @@ mod tests {
                         },
                         operands: vec![OperandWindow::default(); inputs.len()],
                         product: None,
-                        reuse_input: None,
+                        output_aliases: Vec::new(),
                     }),
                     inputs,
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
-                let cast = MidOperation {
+                let mut identity = values[3].clone();
+                identity.id = MidValueId(5);
+                identity
+                    .tensor_type
+                    .format
+                    .layout
+                    .tiling
+                    .axes
+                    .push(AxisTiling::new(
+                        TensorAxis::FromEnd(1),
+                        1,
+                        4,
+                        Padding::Reject,
+                    ));
+                let identity_format = identity.tensor_type.format.clone();
+                values.push(identity);
+                let copy = MidOperation {
                     source: None,
                     inputs: vec![MidValueId(3)],
+                    results: vec![MidValueId(5)],
+                    kind: MidOperationKind::Convert(ConversionPlan {
+                        input: OperandRequirement::new(source.format.clone(), 8),
+                        output: OperandRequirement::new(identity_format.clone(), 8),
+                        strategy: ConversionStrategy::DirectRetile,
+                    }),
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                };
+                let cast = MidOperation {
+                    source: None,
+                    inputs: vec![MidValueId(5)],
                     results: vec![MidValueId(4)],
                     kind: MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(source.format, 8),
+                        input: OperandRequirement::new(identity_format, 8),
                         output: OperandRequirement::new(output.format, 8),
                         strategy: ConversionStrategy::LocalKernel,
                     }),
@@ -383,7 +480,7 @@ mod tests {
                 let mut program = MidProgram {
                     tile_count: 1,
                     values,
-                    operations: vec![producer, cast],
+                    operations: vec![producer, copy, cast],
                     outputs: vec![MidValueId(4)],
                     ..MidProgram::default()
                 };

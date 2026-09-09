@@ -171,9 +171,9 @@ pub enum Primitive {
         kernel: TileKernelSpec,
         operands: Vec<OperandWindow>,
         product: Option<ProductAxes>,
-        /// Input whose allocation holds the new output version. It may be an
-        /// additional dependency beyond the kernel's explicit operands.
-        reuse_input: Option<usize>,
+        /// (Result index, input index) pairs sharing an allocation. Inputs may
+        /// include lifetime dependencies beyond the kernel's explicit operands.
+        output_aliases: Vec<(usize, usize)>,
     },
     /// Independent partials occupy an explicit tensor axis. The selected
     /// reduction policy determines whether remote contributors arrive together

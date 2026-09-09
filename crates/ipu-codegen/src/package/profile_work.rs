@@ -59,15 +59,21 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             },
             "GeLU arithmetic and optional FP8 conversion",
         ),
-        TileKernelSpec::LayerNormMoments => {
+        TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
             let elements: u64 = run.inputs[0].views[0]
                 .extents
                 .iter()
                 .map(|e| u64::from(e.logical_end - e.start))
                 .product();
+            let slots = statistics_issue_slots
+                + if run.kernel == TileKernelSpec::AddLayerNormMoments {
+                    0.25
+                } else {
+                    0.0
+                };
             return Some((
-                elements as f64 * statistics_issue_slots,
-                elements as f64 * statistics_issue_slots,
+                elements as f64 * slots,
+                elements as f64 * slots,
                 "layernorm: FP32 sum and centered squares, including vector accumulation",
             ));
         }

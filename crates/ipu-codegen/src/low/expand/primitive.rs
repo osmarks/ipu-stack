@@ -25,7 +25,7 @@ impl TileGraphBuilder {
                 kernel,
                 operands,
                 product,
-                reuse_input,
+                output_aliases,
             } => {
                 let output = *operation
                     .results
@@ -56,16 +56,21 @@ impl TileGraphBuilder {
                         continue;
                     }
                     let tile = block.tile;
-                    if let Some(index) = reuse_input {
-                        let previous = inputs_by_tile[*index][usize::from(tile)]
+                    for &(result, input) in output_aliases {
+                        let target = if result == 0 {
+                            output
+                        } else {
+                            self.local_shard(operation.results[result], tile)?
+                        };
+                        let previous = inputs_by_tile[input][usize::from(tile)]
                             .iter()
                             .copied()
-                            .find(|&candidate| {
-                                let candidate = &self.shards[candidate.index() as usize];
-                                candidate.extents == block.extents
+                            .find(|&source| {
+                                self.shards[source.index() as usize].extents
+                                    == self.shards[target.index() as usize].extents
                             })
                             .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                        self.shards[output.index() as usize].definition =
+                        self.shards[target.index() as usize].definition =
                             ShardDefinition::WritableAlias(previous);
                     }
                     let inputs = inputs_by_tile
@@ -110,7 +115,7 @@ impl TileGraphBuilder {
                             body,
                         )?;
                     } else {
-                        let run = self.kernel_run(
+                        let mut run = self.kernel_run(
                             operation_provenance(operation),
                             kernel.clone(),
                             inputs
@@ -119,6 +124,19 @@ impl TileGraphBuilder {
                                 .collect(),
                             self.full_view(output),
                         )?;
+                        for &value in operation.results.iter().skip(1) {
+                            let shard = self.local_shard(value, tile)?;
+                            let view = self.full_view(shard);
+                            let format = self.shards[shard.index() as usize]
+                                .tensor_type
+                                .format
+                                .clone();
+                            Arc::make_mut(&mut run.metadata)
+                                .requirements
+                                .additional_outputs
+                                .push(crate::KernelAccess::new(format, 8));
+                            run.additional_outputs.push(view);
+                        }
                         self.append_kernel(body, tile, run)?;
                     }
                 }

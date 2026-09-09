@@ -52,11 +52,13 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
     for run in &program.kernel_runs {
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
             // Arithmetic results are not known-zero-padded parameters.
-            parameter_storage.remove(&root(run.output.shard));
-            incoming
-                .entry(root(run.output.shard))
-                .or_default()
-                .insert(root(run.output.shard));
+            for output in run.outputs() {
+                parameter_storage.remove(&root(output.shard));
+                incoming
+                    .entry(root(output.shard))
+                    .or_default()
+                    .insert(root(output.shard));
+            }
         }
     }
     // Writes through aliases also invalidate an input's original parameter
@@ -99,7 +101,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
             }
         }
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
-            forbidden.insert(root(run.output.shard));
+            forbidden.extend(run.outputs().map(|output| root(output.shard)));
         }
     }
     for phase in &program.exchange_phases {
@@ -232,6 +234,7 @@ mod tests {
                 inputs,
                 view(output),
                 KernelRequirements {
+                    additional_outputs: Vec::new(),
                     inputs: Vec::new(),
                     output: KernelAccess::new(tensor_type.format.clone(), 8),
                     distinct_elements: Vec::new(),

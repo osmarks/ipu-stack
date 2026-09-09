@@ -40,10 +40,11 @@ pub(crate) fn analyze(
     };
     for (operation, _) in &steps {
         match &operation.kind {
-            MidOperationKind::Primitive(Primitive::Compute {
-                reuse_input: Some(input),
-                ..
-            }) => alias(operation.results[0], operation.inputs[*input]),
+            MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) => {
+                for &(output, input) in output_aliases {
+                    alias(operation.results[output], operation.inputs[input]);
+                }
+            }
             MidOperationKind::Repeat(repeat) => {
                 for (&argument, &input) in repeat.body.arguments.iter().zip(&operation.inputs) {
                     alias(argument, input);

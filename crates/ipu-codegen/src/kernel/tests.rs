@@ -199,6 +199,7 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                     .collect(),
             },
             KernelRequirements {
+                additional_outputs: Vec::new(),
                 inputs: Vec::new(),
                 output: KernelAccess::new(format, 8),
                 distinct_elements: Vec::new(),
@@ -243,6 +244,7 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
         };
         let operand = KernelAccess::new(format, 8);
         let requirements = KernelRequirements {
+            additional_outputs: Vec::new(),
             inputs: vec![operand.clone(), operand.clone()],
             output: operand,
             distinct_elements: Vec::new(),
@@ -383,6 +385,7 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
             )
         };
         let requirements = KernelRequirements {
+            additional_outputs: Vec::new(),
             inputs: vec![requirement(input_layout)],
             output: requirement(output_layout),
             distinct_elements: Vec::new(),
@@ -476,6 +479,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 .collect(),
             output,
             KernelRequirements {
+                additional_outputs: Vec::new(),
                 inputs: vec![KernelAccess::new(format.clone(), 8); inputs],
                 output: KernelAccess::new(format, 8),
                 distinct_elements: Vec::new(),
@@ -587,6 +591,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
             }],
         },
         KernelRequirements {
+            additional_outputs: Vec::new(),
             inputs: Vec::new(),
             output: KernelAccess::new(tensor_type.format, 8),
             distinct_elements: Vec::new(),
@@ -722,6 +727,7 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
             }],
             view(1),
             KernelRequirements {
+                additional_outputs: Vec::new(),
                 inputs: vec![KernelAccess::new(format(Precision::F32), 8)],
                 output: KernelAccess::new(format(Precision::F16), 8),
                 distinct_elements: Vec::new(),

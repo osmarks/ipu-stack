@@ -200,15 +200,18 @@ pub(crate) fn kernel_cycles<'a>(
                 matches!(kernel, TileKernelSpec::AddLayerNorm),
             );
         }
-        TileKernelSpec::LayerNormMoments => {
+        TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
             let Some(input) = inputs(0) else {
                 return u64::MAX;
             };
             let width = u64::from(input.trailing_dimension(0).unwrap_or(0));
-            return crate::kernel::cost::f16_layernorm_moments_cycles(
-                input.elements().checked_div(width).unwrap_or(0),
-                width,
-            );
+            let rows = input.elements().checked_div(width).unwrap_or(0);
+            let extra = if matches!(kernel, TileKernelSpec::AddLayerNormMoments) {
+                rows * (108 + width.div_ceil(48) * 24)
+            } else {
+                0
+            };
+            return crate::kernel::cost::f16_layernorm_moments_cycles(rows, width) + extra;
         }
         TileKernelSpec::LayerNormApply { parts } => {
             return crate::kernel::cost::f16_layernorm_apply_cycles(

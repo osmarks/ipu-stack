@@ -36,6 +36,7 @@ impl TileGraphBuilder {
             {
                 return Ok(KernelRun {
                     product_flops: None,
+                    additional_outputs: Vec::new(),
                     metadata: Arc::clone(metadata),
                     inputs,
                     output,

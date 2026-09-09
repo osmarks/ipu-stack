@@ -24,6 +24,7 @@ impl KernelAccess {
 pub struct KernelRequirements {
     pub inputs: Vec<KernelAccess>,
     pub output: KernelAccess,
+    pub additional_outputs: Vec<KernelAccess>,
     pub distinct_elements: Vec<Vec<MemoryOperand>>,
 }
 
@@ -44,6 +45,7 @@ impl KernelRequirements {
                 .map(|format| KernelAccess::new(format, alignment))
                 .collect(),
             output: KernelAccess::new(output, alignment),
+            additional_outputs: Vec::new(),
             distinct_elements: Vec::new(),
         };
         if let TileKernelSpec::Gemm { multiply, .. } = kernel

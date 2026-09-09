@@ -373,7 +373,9 @@ fn touch_work(
             for view in run.inputs.iter().flat_map(|operand| &operand.views) {
                 touch(view.shard);
             }
-            touch(run.output.shard);
+            for output in run.outputs() {
+                touch(output.shard);
+            }
         }
         TileWorkRef::LocalCopy(copy) => {
             touch(copy.source);
@@ -501,6 +503,13 @@ fn collect_requirements(
                     }
                 }
                 apply_requirement(&mut requirements[run.output.shard.index() as usize], output);
+                for (view, requirement) in run
+                    .additional_outputs
+                    .iter()
+                    .zip(&run.requirements.additional_outputs)
+                {
+                    apply_requirement(&mut requirements[view.shard.index() as usize], requirement);
+                }
             }
             TileWorkRef::LocalCopy(copy) => {
                 requirements[copy.source.index() as usize].alignment =

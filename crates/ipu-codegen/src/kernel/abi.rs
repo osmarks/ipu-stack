@@ -291,6 +291,12 @@ pub fn tile_kernel_abi(
                     scalars,
                 )
             }
+            TileKernelSpec::AddLayerNormMoments => (
+                KernelSymbols::Exact("add_layer_norm_moments"),
+                KernelAvailability::Implemented,
+                2,
+                &[ScalarValue::InputRows, ScalarValue::InputColumns],
+            ),
             TileKernelSpec::LayerNormMoments => (
                 KernelSymbols::Exact("layer_norm_moments"),
                 KernelAvailability::Implemented,
@@ -515,12 +521,26 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             actual: run.inputs.len(),
         });
     }
+    let additional = usize::from(matches!(kernel, TileKernelSpec::AddLayerNormMoments));
+    if run.additional_outputs.len() != additional
+        || run.requirements.additional_outputs.len() != additional
+    {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
     if let Some(index) = run
         .inputs
         .iter()
         .position(|operand| operand.views.len() != 1)
     {
         return Err(KernelAbiError::FragmentedOperand(index));
+    }
+    if additional != 0
+        && (run.inputs[0].views[0].extents != run.inputs[1].views[0].extents
+            || run.additional_outputs[0].extents != run.inputs[0].views[0].extents
+            || run.requirements.additional_outputs[0].format != run.requirements.inputs[0].format
+            || run.requirements.inputs[1].format != run.requirements.inputs[0].format)
+    {
+        return Err(KernelAbiError::RequirementMismatch);
     }
     if matches!(
         kernel,
@@ -571,7 +591,9 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     }
     if matches!(
         kernel,
-        TileKernelSpec::LayerNormMoments | TileKernelSpec::LayerNormApply { .. }
+        TileKernelSpec::LayerNormMoments
+            | TileKernelSpec::AddLayerNormMoments
+            | TileKernelSpec::LayerNormApply { .. }
     ) {
         let extent = run.inputs[0].views[0]
             .extents
@@ -589,14 +611,15 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         let valid = width.is_multiple_of(4)
             && extent.physical_end == extent.logical_end
             && run.requirements.inputs[0].format.precision == Precision::F16
+            && run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
             && run.requirements.output.format.layout.order == ElementOrder::RowMajor
             && match kernel {
-                TileKernelSpec::LayerNormMoments => {
+                TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
                     run.requirements.output.format.precision == Precision::F32
                         && element_count(run)? == rows * 2
                 }
                 TileKernelSpec::LayerNormApply { parts } => {
-                    *parts >= 2
+                    *parts >= 1
                         && run.requirements.output.format.precision == Precision::F16
                         && run.requirements.inputs[1..3]
                             .iter()

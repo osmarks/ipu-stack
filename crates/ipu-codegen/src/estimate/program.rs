@@ -11,7 +11,7 @@ fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> 
         run.inputs
             .iter()
             .map(|i| i.views.first().map(|v| v.extents.as_slice()))
-            .chain(std::iter::once(Some(run.output.extents.as_slice())))
+            .chain(run.outputs().map(|output| Some(output.extents.as_slice())))
     }
     let variants = costs
         .entry(std::sync::Arc::as_ptr(&run.metadata))

@@ -147,7 +147,7 @@ fn distribute_region(
                         },
                         operands: vec![OperandWindow::default()],
                         product: None,
-                        reuse_input: None,
+                        output_aliases: Vec::new(),
                     }),
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,

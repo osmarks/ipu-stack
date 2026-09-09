@@ -133,18 +133,10 @@ impl MidProgram {
             for next in start + 1..result.operations.len() {
                 let operation = &result.operations[next];
                 if selected.len() >= limit
-                    || !matches!(
+                    || !(matches!(
                         operation.kind,
-                        MidOperationKind::Primitive(
-                            Primitive::Copy { .. }
-                                | Primitive::Sum { .. }
-                                | Primitive::Compute {
-                                    reuse_input: None,
-                                    product: Some(_),
-                                    ..
-                                }
-                        )
-                    )
+                        MidOperationKind::Primitive(Primitive::Copy { .. } | Primitive::Sum { .. })
+                    ) || matches!(&operation.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, product: Some(_), .. }) if output_aliases.is_empty()))
                     || selected
                         .iter()
                         .any(|&index| conflicts(&result.operations[index], operation))
@@ -366,7 +358,7 @@ mod tests {
             kernel: TileKernelSpec::Gelu,
             operands: Vec::new(),
             product: None,
-            reuse_input: Some(0),
+            output_aliases: vec![(0, 0)],
         });
         assert!(delayed.with_overlapped_reductions(2).is_none());
         delayed.operations[1] = copy(5, 4); // Would overwrite a delayed partial.

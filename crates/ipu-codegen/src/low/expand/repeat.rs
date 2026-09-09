@@ -158,12 +158,13 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
-    if let MidOperationKind::Primitive(crate::Primitive::Compute {
-        reuse_input: Some(index),
-        ..
-    }) = &operation.kind
+    if let MidOperationKind::Primitive(crate::Primitive::Compute { output_aliases, .. }) =
+        &operation.kind
     {
-        return value_can_alias(operation.inputs[*index], target, operations);
+        return output_aliases.iter().any(|&(output, input)| {
+            operation.results[output] == value
+                && value_can_alias(operation.inputs[input], target, operations)
+        });
     }
     let Some(plan) = operation.operator_plan() else {
         return false;

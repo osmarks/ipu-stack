@@ -50,6 +50,8 @@ pub enum TileKernelSpec {
     LayerNorm,
     /// FP32 mean and centered squared deviation for each feature shard.
     LayerNormMoments,
+    /// Produce FP32 moments and an explicit F16 residual sum.
+    AddLayerNormMoments,
     /// Combine equal-width feature shards' moments and apply normalization.
     LayerNormApply {
         parts: u16,

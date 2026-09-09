@@ -191,7 +191,7 @@ fn known_fusion_cost(
             kernel,
             operands: vec![OperandWindow::default(); inputs.len()],
             product: None,
-            reuse_input: None,
+            output_aliases: Vec::new(),
         }),
         inputs: inputs
             .into_iter()

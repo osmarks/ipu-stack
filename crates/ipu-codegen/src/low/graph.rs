@@ -159,9 +159,15 @@ pub struct KernelRun {
     pub(crate) metadata: Arc<KernelRunMetadata>,
     pub inputs: Vec<KernelOperand>,
     pub output: ShardView,
+    /// Additional writes, with the same lifetime and scheduling semantics as output.
+    pub additional_outputs: Vec<ShardView>,
 }
 
 impl KernelRun {
+    pub fn outputs(&self) -> impl Iterator<Item = &ShardView> {
+        std::iter::once(&self.output).chain(&self.additional_outputs)
+    }
+
     pub fn new(
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
@@ -171,6 +177,7 @@ impl KernelRun {
     ) -> Self {
         Self {
             product_flops: None,
+            additional_outputs: Vec::new(),
             metadata: Arc::new(KernelRunMetadata {
                 provenance,
                 kernel,

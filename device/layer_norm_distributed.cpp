@@ -4,21 +4,37 @@
 using namespace poplar;
 
 #ifdef VERTEX_LayerNormMoments
-class LayerNormMoments : public MultiVertex {
+#ifdef NORM_STORE_SUM
+#define MOMENTS_VERTEX AddLayerNormMoments
+#else
+#define MOMENTS_VERTEX LayerNormMoments
+#endif
+class MOMENTS_VERTEX : public MultiVertex {
 public:
   Input<Vector<half, VectorLayout::ONE_PTR>> source;
   Output<Vector<float, VectorLayout::ONE_PTR>> destination;
   unsigned width;
   InOut<Vector<float, VectorLayout::ONE_PTR>> scratch;
   unsigned stage;
+#ifdef NORM_STORE_SUM
+  Input<Vector<half, VectorLayout::ONE_PTR>> right;
+  Output<Vector<half, VectorLayout::ONE_PTR>> residual;
+#endif
   bool compute(unsigned worker) {
     auto *partials = reinterpret_cast<float2 *>(&scratch[0]);
     const half *x = &source[0];
     const unsigned width = this->width;
     if (stage == 0) {
+#ifdef NORM_STORE_SUM
+      partials[worker] = normAddAndStore(x, &right[0], &residual[0], width, worker);
+#else
       partials[worker] = normSum(x, nullptr, width, worker, 0, false);
+#endif
       return true;
     }
+#ifdef NORM_STORE_SUM
+    x = &residual[0];
+#endif
     float2 sum = {0, 0};
     for (unsigned i = 0; i < 6; ++i) sum += partials[i];
     const float mean = (sum[0] + sum[1]) / width;

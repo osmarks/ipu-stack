@@ -5,6 +5,7 @@ mod copy;
 mod elementwise;
 pub mod optimistic;
 mod packing;
+mod residual;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 mod primitive;

@@ -269,7 +269,7 @@ impl Builder {
                 kernel,
                 operands,
                 product,
-                reuse_input,
+                output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
             },
         )
     }

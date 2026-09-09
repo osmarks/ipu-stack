@@ -114,19 +114,30 @@ impl KernelBuildPlan {
                 &[3, 2, 4],
             );
         }
-        if exact_symbols.contains("layer_norm_moments") {
-            plan.compilations.push(KernelCompilation {
-                source: "layer_norm_distributed.cpp",
-                name: "layer_norm_moments_codelet".into(),
-                flags: vec!["-O2".into(), "-DVERTEX_LayerNormMoments".into()],
-                retained_symbols: Vec::new(),
-            });
-            plan.compilations.push(KernelCompilation {
-                source: "layer_norm_moments.S",
-                name: "layer_norm_moments_wrapper".into(),
-                flags: Vec::new(),
-                retained_symbols: vec!["layer_norm_moments".into()],
-            });
+        for (symbol, extra) in [
+            ("layer_norm_moments", None),
+            ("add_layer_norm_moments", Some("-DNORM_STORE_SUM")),
+        ] {
+            if !exact_symbols.contains(symbol) {
+                continue;
+            }
+            let flags: Vec<_> = extra.into_iter().map(str::to_owned).collect();
+            let mut codelet_flags = vec!["-O2".into(), "-DVERTEX_LayerNormMoments".into()];
+            codelet_flags.extend(flags.clone());
+            plan.compilations.extend([
+                KernelCompilation {
+                    source: "layer_norm_distributed.cpp",
+                    name: format!("{symbol}_codelet"),
+                    flags: codelet_flags,
+                    retained_symbols: vec![],
+                },
+                KernelCompilation {
+                    source: "layer_norm_moments.S",
+                    name: format!("{symbol}_wrapper"),
+                    flags,
+                    retained_symbols: vec![symbol.into()],
+                },
+            ]);
         }
         if exact_symbols.contains("layer_norm_apply") {
             plan.add_vertex(
@@ -142,6 +153,7 @@ impl KernelBuildPlan {
             "layer_norm_f8",
             "add_layer_norm_f16",
             "layer_norm_moments",
+            "add_layer_norm_moments",
             "layer_norm_apply",
             "add_f16",
             "cast_f32_f16",

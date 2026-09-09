@@ -157,6 +157,11 @@ pub fn materialize_kernel_run(
         .inputs
         .iter()
         .map(|operand| resolve(&operand.views[0], false))
+        .chain(
+            run.additional_outputs
+                .iter()
+                .map(|view| resolve(view, false)),
+        )
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
         symbol: call.symbol,
