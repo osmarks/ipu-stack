@@ -166,7 +166,8 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             ..
         } => {
             // Full panels: five maximum reductions, four MIXes and one
-            // accumulator readout, eight exps, conversions, and sum updates.
+            // accumulator readout, eight exps, eight FP16 additions, one
+            // conversion and two FP32 additions: 29 arithmetic issue slots.
             // The narrow tail retains the original eight-slot pair sequence.
             let rows = logical / u64::from(padded_key_columns + 16);
             let physical_rows = physical / u64::from(padded_key_columns + 16);
@@ -181,11 +182,11 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             };
             return Some((
                 rows as f64
-                    * (34.0 * f64::from(key_columns / 16)
+                    * (29.0 * f64::from(key_columns / 16)
                         + 4.0 * f64::from(key_columns % 16)
                         + row_reductions),
                 physical_rows as f64
-                    * (34.0 * f64::from(key_columns / 16)
+                    * (29.0 * f64::from(key_columns / 16)
                         + 8.0 * f64::from((key_columns % 16).div_ceil(2))
                         + row_reductions),
                 "softmax: arithmetic/conversion issue slots, excluding loads and row addressing",

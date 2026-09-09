@@ -13,6 +13,7 @@ pub(super) fn fuse(
         }
     }
     let mut removed = BTreeSet::new();
+    let mut preparation = BTreeMap::new();
     for index in 0..operations.len() {
         let current = &operations[index];
         let MidOperationKind::Primitive(Primitive::Compute {
@@ -33,13 +34,12 @@ pub(super) fn fuse(
         let Some(&input) = current.inputs.first() else {
             continue;
         };
-        let Some((sum, previous, identity_copies)) =
-            super::elementwise::producer_through_identity_copies(
-                input,
-                &operations[..index],
-                values,
-            )
-        else {
+        let Some((sum, previous, identity_copies)) = super::elementwise::producer_through_copies(
+            input,
+            &operations[..index],
+            values,
+            !ordinary,
+        ) else {
             continue;
         };
         if removed.contains(&previous) {
@@ -83,39 +83,22 @@ pub(super) fn fuse(
         {
             continue;
         }
+        let redistributed =
+            !super::elementwise::same_storage(value, &values[input.index() as usize]);
+        let old_value_count = values.len();
         let mut stats_value = None;
         let stats = if ordinary {
             if current.results.len() != 1
                 || !super::elementwise::same_storage(
                     &values[current.results[0].index() as usize],
-                    value,
+                    &values[input.index() as usize],
                 )
             {
                 continue;
             }
-            let rank = tensor.shape.0.len();
-            let mut stats_type = tensor.clone();
-            stats_type.shape.0.pop();
-            stats_type.shape.0.extend([1, 2]);
-            stats_type.format.precision = Precision::F32;
-            let mut valid = true;
-            for axis in &mut stats_type.format.layout.tiling.axes {
-                let Ok(index) = axis.axis.resolve(rank) else {
-                    valid = false;
-                    break;
-                };
-                axis.axis = TensorAxis::FromStart(index as u16);
-                if index + 1 == rank {
-                    if axis.partitions != 1 {
-                        valid = false;
-                        break;
-                    }
-                    *axis = AxisTiling::new(axis.axis, 1, 1, Padding::Reject);
-                }
-            }
-            if !valid {
+            let Some(stats_type) = row_moments_type(tensor) else {
                 continue;
-            }
+            };
             let id = MidValueId(values.len() as u32);
             stats_value = Some(MidValue {
                 id,
@@ -140,7 +123,7 @@ pub(super) fn fuse(
         });
         let mut apply = current.clone();
         if ordinary {
-            apply.inputs[0] = sum;
+            apply.inputs[0] = if redistributed { input } else { sum };
             apply.inputs.truncate(3);
             apply.inputs.push(stats);
             apply.kind = MidOperationKind::Primitive(Primitive::Compute {
@@ -153,6 +136,39 @@ pub(super) fn fuse(
         if let Some(value) = stats_value {
             values.push(value);
         }
+        let stats_copy = if redistributed {
+            let target = &values[input.index() as usize];
+            let Some(tensor_type) = row_moments_type(&target.tensor_type) else {
+                values.truncate(old_value_count);
+                continue;
+            };
+            let id = MidValueId(values.len() as u32);
+            let copy = MidOperation {
+                source: current.source,
+                inputs: vec![stats],
+                results: vec![id],
+                kind: MidOperationKind::Convert(ConversionPlan {
+                    input: OperandRequirement::new(
+                        values[stats.index() as usize].tensor_type.format.clone(),
+                        8,
+                    ),
+                    output: OperandRequirement::new(tensor_type.format.clone(), 8),
+                    strategy: ConversionStrategy::DirectRetile,
+                }),
+                estimated_cycles: 0,
+                estimated_exchange_cycles: 0,
+            };
+            values.push(MidValue {
+                id,
+                storage_group: id,
+                tensor_type,
+                ..target.clone()
+            });
+            *apply.inputs.last_mut().unwrap() = id;
+            Some(copy)
+        } else {
+            None
+        };
         let cost = |op: &MidOperation| {
             crate::estimate::operation_cost(op, values).map(|(cost, _, _)| cost.total)
         };
@@ -161,17 +177,16 @@ pub(super) fn fuse(
             .map(|(a, b)| a.saturating_add(b));
         let after = cost(&fused)
             .zip(if ordinary { cost(&apply) } else { Some(0) })
-            .map(|(a, b)| a.saturating_add(b));
+            .zip(stats_copy.as_ref().map_or(Some(0), cost))
+            .map(|((a, b), c)| a.saturating_add(b).saturating_add(c));
         if before
             .zip(after)
             .is_none_or(|(before, after)| after >= before)
         {
-            if ordinary {
-                values.pop();
-            }
+            values.truncate(old_value_count);
             continue;
         }
-        for copy in identity_copies {
+        for copy in identity_copies.into_iter().filter(|_| !redistributed) {
             let result = operations[copy].results[0];
             if !required.contains(&result)
                 && operations
@@ -183,6 +198,9 @@ pub(super) fn fuse(
                 removed.insert(copy);
             }
         }
+        if let Some(copy) = stats_copy {
+            preparation.insert(index, copy);
+        }
         operations[previous] = fused;
         if ordinary {
             operations[index] = apply;
@@ -191,13 +209,40 @@ pub(super) fn fuse(
         }
         changed = true;
     }
-    let mut index = 0;
-    operations.retain(|_| {
-        let keep = !removed.contains(&index);
-        index += 1;
-        keep
-    });
+    *operations = std::mem::take(operations)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, op)| {
+            preparation
+                .remove(&index)
+                .into_iter()
+                .chain((!removed.contains(&index)).then_some(op))
+        })
+        .collect();
     changed
+}
+
+/// One FP32 mean/centered-sum pair per complete row, on the same owners.
+fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
+    if tensor.format.layout.order != ElementOrder::RowMajor {
+        return None;
+    }
+    let rank = tensor.shape.0.len();
+    let mut stats = tensor.clone();
+    stats.shape.0.pop()?;
+    stats.shape.0.extend([1, 2]);
+    stats.format.precision = Precision::F32;
+    for axis in &mut stats.format.layout.tiling.axes {
+        let index = axis.axis.resolve(rank).ok()?;
+        axis.axis = TensorAxis::FromStart(index as u16);
+        if index + 1 == rank {
+            if axis.partitions != 1 {
+                return None;
+            }
+            *axis = AxisTiling::new(axis.axis, 1, 1, Padding::Reject);
+        }
+    }
+    Some(stats)
 }
 
 #[cfg(test)]
@@ -334,5 +379,53 @@ mod tests {
             }
         }
         assert_eq!(sums, 4);
+
+        // Keep the residual on four owners while normalizing on two. Only
+        // the tiny statistics follow the existing activation redistribution.
+        let mut norm = program.operations.pop().unwrap();
+        program.values[5].tensor_type.format.layout = Layout::row_sharded(2);
+        for operand in &mut norm.inputs {
+            let source = *operand;
+            let mut value = program.values[source.index() as usize].clone();
+            value.id = MidValueId(program.values.len() as u32);
+            value.storage_group = value.id;
+            value.tensor_type.format.layout = Layout::row_sharded(2);
+            program.operations.push(MidOperation {
+                source: None,
+                inputs: vec![source],
+                results: vec![value.id],
+                kind: MidOperationKind::Convert(ConversionPlan {
+                    input: OperandRequirement::new(tensor.format.clone(), 8),
+                    output: OperandRequirement::new(value.tensor_type.format.clone(), 8),
+                    strategy: ConversionStrategy::DirectRetile,
+                }),
+                estimated_cycles: 0,
+                estimated_exchange_cycles: 0,
+            });
+            *operand = value.id;
+            program.values.push(value);
+        }
+        let norm_input = norm.inputs[0];
+        program.operations.push(norm);
+        let fused = program.with_elementwise_fusions().unwrap();
+        assert_eq!(fused.operations[0].results[1], MidValueId(4));
+        assert_eq!(fused.operations.last().unwrap().inputs[0], norm_input);
+        assert_eq!(fused.outputs, program.outputs);
+        let graph = crate::expand_tiles(&fused).unwrap();
+        for run in &graph.kernel_runs {
+            crate::validate_kernel_run(run).unwrap();
+        }
+        assert!(
+            graph
+                .kernel_runs
+                .iter()
+                .any(|run| run.kernel == TileKernelSpec::AddLayerNormMoments)
+        );
+        assert!(
+            graph
+                .kernel_runs
+                .iter()
+                .any(|run| run.kernel == TileKernelSpec::LayerNormApply { parts: 1 })
+        );
     }
 }
