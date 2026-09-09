@@ -28,13 +28,13 @@ impl Node {
         if count == 1 {
             return self;
         }
-        if let Kind::Run(bytes) = self.kind {
-            if bytes == stride {
-                return Self {
-                    offset: self.offset,
-                    kind: Kind::Run(bytes * count),
-                };
-            }
+        if let Kind::Run(bytes) = self.kind
+            && bytes == stride
+        {
+            return Self {
+                offset: self.offset,
+                kind: Kind::Run(bytes * count),
+            };
         }
         Self {
             offset: 0,
@@ -204,7 +204,7 @@ fn axis_tree(digits: &[Digit], start: u32, end: u32, suffix: &Node) -> Node {
             .shift(first * digit.stride);
     }
     let mut parts = Vec::new();
-    if start % div != 0 {
+    if !start.is_multiple_of(div) {
         parts.push(axis_tree(rest, start % div, div, suffix).shift(first * digit.stride));
     }
     let full_start = start.div_ceil(div);
@@ -216,7 +216,7 @@ fn axis_tree(digits: &[Digit], start: u32, end: u32, suffix: &Node) -> Node {
                 .shift(full_start * digit.stride),
         );
     }
-    if end % div != 0 {
+    if !end.is_multiple_of(div) {
         parts.push(axis_tree(rest, 0, end % div, suffix).shift(full_end * digit.stride));
     }
     Node::sequence(parts)
@@ -242,10 +242,10 @@ fn axis_boxes(digits: &[(usize, Digit)], start: u32, end: u32) -> Vec<Vec<(usize
         partial(first, start % div, (end - 1) % div + 1);
         return result;
     }
-    if start % div != 0 {
+    if !start.is_multiple_of(div) {
         partial(first, start % div, div);
     }
-    if end % div != 0 {
+    if !end.is_multiple_of(div) {
         partial(end / div, 0, end % div);
     }
     let lo = start.div_ceil(div);
@@ -439,6 +439,153 @@ impl Iterator for SpanIter<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Summary {
+    first: ByteSpan,
+    last: ByteSpan,
+    count: u64,
+    chunks: u64,
+    bad: [u64; 4],
+}
+fn bad(span: ByteSpan, shift: u32) -> u64 {
+    u64::from((span.offset.wrapping_add(shift) | span.bytes) & 3 != 0)
+}
+impl Summary {
+    fn span(span: ByteSpan, limit: u32) -> Self {
+        Self {
+            first: span,
+            last: span,
+            count: 1,
+            chunks: u64::from(span.bytes.div_ceil(limit)),
+            bad: std::array::from_fn(|i| bad(span, i as u32)),
+        }
+    }
+    fn shift(mut self, offset: u32) -> Self {
+        self.first.offset += offset;
+        self.last.offset += offset;
+        self.bad = std::array::from_fn(|i| self.bad[(i + offset as usize) % 4]);
+        self
+    }
+    fn join(mut self, right: Self, limit: u32) -> Self {
+        let adjacent = self.last.offset + self.last.bytes == right.first.offset;
+        let merged = ByteSpan {
+            offset: self.last.offset,
+            bytes: if adjacent {
+                self.last.bytes + right.first.bytes
+            } else {
+                0
+            },
+        };
+        for i in 0..4 {
+            self.bad[i] += right.bad[i];
+            if adjacent {
+                self.bad[i] = self.bad[i] - bad(self.last, i as u32) - bad(right.first, i as u32)
+                    + bad(merged, i as u32);
+            }
+        }
+        self.chunks += right.chunks;
+        if adjacent {
+            self.chunks = self.chunks
+                - u64::from(self.last.bytes.div_ceil(limit))
+                - u64::from(right.first.bytes.div_ceil(limit))
+                + u64::from(merged.bytes.div_ceil(limit));
+        }
+        if adjacent && self.count == 1 {
+            self.first = merged;
+        }
+        self.last = if adjacent && right.count == 1 {
+            merged
+        } else {
+            right.last
+        };
+        self.count += right.count - u64::from(adjacent);
+        self
+    }
+}
+impl Node {
+    fn summary(&self, limit: u32) -> Option<Summary> {
+        fn repeated(body: Summary, count: u32, stride: u32, limit: u32) -> Summary {
+            if count == 1 {
+                return body;
+            }
+            let half = repeated(body, count / 2, stride, limit);
+            let result = half.join(half.shift(count / 2 * stride), limit);
+            if count.is_multiple_of(2) {
+                result
+            } else {
+                result.join(body.shift((count - 1) * stride), limit)
+            }
+        }
+        let result = match &self.kind {
+            Kind::Run(bytes) => Some(Summary::span(
+                ByteSpan {
+                    offset: 0,
+                    bytes: *bytes,
+                },
+                limit,
+            )),
+            Kind::Repeat {
+                count,
+                stride,
+                body,
+            } => body
+                .summary(limit)
+                .map(|s| repeated(s, *count, *stride, limit)),
+            Kind::Sequence(parts) => parts
+                .iter()
+                .filter_map(|p| p.summary(limit))
+                .reduce(|a, b| a.join(b, limit)),
+        };
+        result.map(|s| s.shift(self.offset))
+    }
+}
+impl ByteTraversal {
+    fn summary(&self, limit: u32) -> Option<Summary> {
+        let mut parts = self
+            .parts
+            .iter()
+            .filter_map(|p| p.summary(limit))
+            .collect::<Vec<_>>();
+        parts.sort_by_key(|s| s.first.offset);
+        if parts
+            .windows(2)
+            .any(|p| p[0].last.offset + p[0].last.bytes > p[1].first.offset)
+        {
+            return self
+                .spans()
+                .map(|s| Summary::span(s, limit))
+                .reduce(|a, b| a.join(b, limit));
+        }
+        parts.into_iter().reduce(|a, b| a.join(b, limit))
+    }
+    pub(crate) fn word_aligned(&self) -> bool {
+        self.summary(u32::MAX).is_none_or(|s| s.bad[0] == 0)
+    }
+    pub(crate) fn copy_fragments(&self, other: &Self, limit: u32) -> StorageResult<u64> {
+        if self.byte_len() != other.byte_len() {
+            return Err(StorageError::InvalidView);
+        }
+        let Some(left) = self.summary(limit) else {
+            return Ok(0);
+        };
+        let Some(right) = other.summary(limit) else {
+            return Ok(0);
+        };
+        if left.count == 1 {
+            return Ok(right.chunks);
+        }
+        if right.count == 1 {
+            return Ok(left.chunks);
+        }
+        let mut count = 0;
+        crate::for_each_copy_span(self.spans(), other.spans(), |_, _, bytes| {
+            count += u64::from(bytes.div_ceil(limit));
+            Ok(())
+        })?;
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,152 +688,5 @@ mod tests {
                 }
             }
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Summary {
-    first: ByteSpan,
-    last: ByteSpan,
-    count: u64,
-    chunks: u64,
-    bad: [u64; 4],
-}
-fn bad(span: ByteSpan, shift: u32) -> u64 {
-    u64::from((span.offset.wrapping_add(shift) | span.bytes) & 3 != 0)
-}
-impl Summary {
-    fn span(span: ByteSpan, limit: u32) -> Self {
-        Self {
-            first: span,
-            last: span,
-            count: 1,
-            chunks: u64::from(span.bytes.div_ceil(limit)),
-            bad: std::array::from_fn(|i| bad(span, i as u32)),
-        }
-    }
-    fn shift(mut self, offset: u32) -> Self {
-        self.first.offset += offset;
-        self.last.offset += offset;
-        self.bad = std::array::from_fn(|i| self.bad[(i + offset as usize) % 4]);
-        self
-    }
-    fn join(mut self, right: Self, limit: u32) -> Self {
-        let adjacent = self.last.offset + self.last.bytes == right.first.offset;
-        let merged = ByteSpan {
-            offset: self.last.offset,
-            bytes: if adjacent {
-                self.last.bytes + right.first.bytes
-            } else {
-                0
-            },
-        };
-        for i in 0..4 {
-            self.bad[i] += right.bad[i];
-            if adjacent {
-                self.bad[i] = self.bad[i] - bad(self.last, i as u32) - bad(right.first, i as u32)
-                    + bad(merged, i as u32);
-            }
-        }
-        self.chunks += right.chunks;
-        if adjacent {
-            self.chunks = self.chunks
-                - u64::from(self.last.bytes.div_ceil(limit))
-                - u64::from(right.first.bytes.div_ceil(limit))
-                + u64::from(merged.bytes.div_ceil(limit));
-        }
-        if adjacent && self.count == 1 {
-            self.first = merged;
-        }
-        self.last = if adjacent && right.count == 1 {
-            merged
-        } else {
-            right.last
-        };
-        self.count += right.count - u64::from(adjacent);
-        self
-    }
-}
-impl Node {
-    fn summary(&self, limit: u32) -> Option<Summary> {
-        fn repeated(body: Summary, count: u32, stride: u32, limit: u32) -> Summary {
-            if count == 1 {
-                return body;
-            }
-            let half = repeated(body, count / 2, stride, limit);
-            let result = half.join(half.shift(count / 2 * stride), limit);
-            if count % 2 == 0 {
-                result
-            } else {
-                result.join(body.shift((count - 1) * stride), limit)
-            }
-        }
-        let result = match &self.kind {
-            Kind::Run(bytes) => Some(Summary::span(
-                ByteSpan {
-                    offset: 0,
-                    bytes: *bytes,
-                },
-                limit,
-            )),
-            Kind::Repeat {
-                count,
-                stride,
-                body,
-            } => body
-                .summary(limit)
-                .map(|s| repeated(s, *count, *stride, limit)),
-            Kind::Sequence(parts) => parts
-                .iter()
-                .filter_map(|p| p.summary(limit))
-                .reduce(|a, b| a.join(b, limit)),
-        };
-        result.map(|s| s.shift(self.offset))
-    }
-}
-impl ByteTraversal {
-    fn summary(&self, limit: u32) -> Option<Summary> {
-        let mut parts = self
-            .parts
-            .iter()
-            .filter_map(|p| p.summary(limit))
-            .collect::<Vec<_>>();
-        parts.sort_by_key(|s| s.first.offset);
-        if parts
-            .windows(2)
-            .any(|p| p[0].last.offset + p[0].last.bytes > p[1].first.offset)
-        {
-            return self
-                .spans()
-                .map(|s| Summary::span(s, limit))
-                .reduce(|a, b| a.join(b, limit));
-        }
-        parts.into_iter().reduce(|a, b| a.join(b, limit))
-    }
-    pub(crate) fn word_aligned(&self) -> bool {
-        self.summary(u32::MAX).is_none_or(|s| s.bad[0] == 0)
-    }
-    pub(crate) fn copy_fragments(&self, other: &Self, limit: u32) -> StorageResult<u64> {
-        if self.byte_len() != other.byte_len() {
-            return Err(StorageError::InvalidView);
-        }
-        let Some(left) = self.summary(limit) else {
-            return Ok(0);
-        };
-        let Some(right) = other.summary(limit) else {
-            return Ok(0);
-        };
-        if left.count == 1 {
-            return Ok(right.chunks);
-        }
-        if right.count == 1 {
-            return Ok(left.chunks);
-        }
-        let mut count = 0;
-        crate::for_each_copy_span(self.spans(), other.spans(), |_, _, bytes| {
-            count += u64::from(bytes.div_ceil(limit));
-            Ok(())
-        })?;
-        Ok(count)
     }
 }

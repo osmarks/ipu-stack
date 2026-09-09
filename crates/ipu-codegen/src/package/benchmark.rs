@@ -4,6 +4,7 @@ use super::*;
 #[derive(serde::Serialize)]
 pub struct ExpansionBenchmark {
     pub planning_ms: f64,
+    pub retained_finalists: usize,
     pub finalists: Vec<ExpansionTiming>,
 }
 
@@ -22,13 +23,15 @@ pub struct ExpansionTiming {
     pub recipients: usize,
 }
 
-/// Search once, then expand each retained mid plan serially. Timings include
+/// Search once, then expand at most `limit` retained mid plans serially (zero
+/// measures all candidates). Timings include
 /// tile graph simplification and its normal analytical costing, but exclude
 /// footprint screening, tile mapping, placement, physical transfer preparation,
 /// scheduling, linking, and destruction of each completed low plan.
 pub fn benchmark_mid_expansion(
     graph: &ComputeGraph,
     config: &PipelineConfig,
+    limit: usize,
 ) -> PackageBuildResult<ExpansionBenchmark> {
     let start = Instant::now();
     let plans = lower_finalists(
@@ -41,7 +44,12 @@ pub fn benchmark_mid_expansion(
     )?;
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut finalists = Vec::new();
-    for (finalist, mid) in plans.iter().enumerate() {
+    for (finalist, mid) in
+        plans
+            .iter()
+            .enumerate()
+            .take(if limit == 0 { usize::MAX } else { limit })
+    {
         let start = Instant::now();
         let expanded = crate::low::expand::expand_tiles(mid, config.diagnostic_checkpoints)?;
         let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -76,6 +84,7 @@ pub fn benchmark_mid_expansion(
     }
     Ok(ExpansionBenchmark {
         planning_ms,
+        retained_finalists: plans.len(),
         finalists,
     })
 }

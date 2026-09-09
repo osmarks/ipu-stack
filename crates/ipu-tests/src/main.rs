@@ -103,6 +103,9 @@ struct Arguments {
     /// Time all retained mid plans serially through low expansion and write JSON; no placement or hardware.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule", "capture_exchange_schedule"])]
     benchmark_expansion: Option<PathBuf>,
+    /// Maximum expansion samples after search; zero measures every retained plan.
+    #[arg(long, default_value_t = 4, requires = "benchmark_expansion")]
+    benchmark_expansion_limit: usize,
     /// Capture an expanded finalist before scheduling, linking, or hardware execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule"])]
     capture_exchange_schedule: Option<PathBuf>,
@@ -1039,7 +1042,11 @@ fn main() -> Result<()> {
         pipeline,
     };
     if let Some(path) = &arguments.benchmark_expansion {
-        let report = ipu_codegen::benchmark_mid_expansion(&graph, &package_config.pipeline)?;
+        let report = ipu_codegen::benchmark_mid_expansion(
+            &graph,
+            &package_config.pipeline,
+            arguments.benchmark_expansion_limit,
+        )?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
         return Ok(());
     }
