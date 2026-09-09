@@ -8,6 +8,7 @@ mod initialization;
 mod passes;
 pub(crate) use call::*;
 pub use copy::*;
+pub(crate) use expand::view_byte_traversal;
 pub use expand::{
     ExpansionError, ExpansionResult, logical_view_byte_spans, shard_storage_bytes, view_byte_spans,
 };

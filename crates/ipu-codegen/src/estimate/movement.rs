@@ -176,11 +176,15 @@ mod tests {
                 )
                 .unwrap();
                 let mut fragments = 0;
-                crate::for_each_copy_span(&left, &right, |_, _, bytes| {
-                    fragments +=
-                        u64::from(bytes).div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4);
-                    Ok(())
-                })
+                crate::for_each_copy_span(
+                    left.iter().copied(),
+                    right.iter().copied(),
+                    |_, _, bytes| {
+                        fragments += u64::from(bytes)
+                            .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4);
+                        Ok(())
+                    },
+                )
                 .unwrap();
                 outgoing[i] += fragments;
                 incoming[j] += fragments;

@@ -419,8 +419,8 @@ mod tests {
                                 for movement in LocalCopy::from_spans(
                                     transfer.source.shard,
                                     destination.shard,
-                                    &source_spans,
-                                    &destination_spans,
+                                    source_spans,
+                                    destination_spans,
                                 )
                                 .unwrap()
                                 {

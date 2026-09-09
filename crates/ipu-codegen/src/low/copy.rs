@@ -37,8 +37,8 @@ impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
     pub(crate) fn from_spans(
         source: Buffer,
         destination: Buffer,
-        source_spans: &[ByteSpan],
-        destination_spans: &[ByteSpan],
+        source_spans: impl IntoIterator<Item = ByteSpan>,
+        destination_spans: impl IntoIterator<Item = ByteSpan>,
     ) -> StorageResult<Vec<Self>> {
         let can_reorder = source != destination;
         let mut copies = Vec::new();
@@ -85,12 +85,12 @@ impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
 /// Zip two span streams by byte position, retaining each stream's boundaries.
 /// This is shared by local copy generation and direct-exchange costing.
 pub(crate) fn for_each_copy_span(
-    source: &[ByteSpan],
-    destination: &[ByteSpan],
+    source: impl IntoIterator<Item = ByteSpan>,
+    destination: impl IntoIterator<Item = ByteSpan>,
     mut visit: impl FnMut(u32, u32, u32) -> StorageResult<()>,
 ) -> StorageResult<()> {
-    let mut sources = source.iter().copied().filter(|span| span.bytes != 0);
-    let mut destinations = destination.iter().copied().filter(|span| span.bytes != 0);
+    let mut sources = source.into_iter().filter(|span| span.bytes != 0);
+    let mut destinations = destination.into_iter().filter(|span| span.bytes != 0);
     let mut source = sources.next();
     let mut destination = destinations.next();
     while let (Some(left), Some(right)) = (&mut source, &mut destination) {
@@ -207,7 +207,7 @@ fn coalesce_copies<Buffer: Clone>(
     coalesced
 }
 
-use crate::storage::{TensorStorage, logical_byte_spans, physical_byte_spans, storage_bytes};
+use crate::storage::{ByteTraversal, TensorStorage, byte_traversal, storage_bytes};
 use crate::{
     AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, ShardExtent, TensorFormat,
     TensorTiling, TensorType, TileKernelSpec,
@@ -260,22 +260,18 @@ impl CopyPlan {
         let mut word_aligned = true;
         let mut destination_unaligned = false;
         for mapping in mappings {
-            let source = logical_byte_spans(mapping.source, mapping.source_extents)?;
-            let target = logical_byte_spans(storage, mapping.destination_extents)?;
-            let aligned =
-                |span: &ByteSpan| span.offset.is_multiple_of(4) && span.bytes.is_multiple_of(4);
-            destination_unaligned |= !target.iter().all(aligned);
-            word_aligned &= source.iter().all(aligned) && !destination_unaligned;
+            let source = byte_traversal(mapping.source, mapping.source_extents, false)?;
+            let target = byte_traversal(storage, mapping.destination_extents, false)?;
+            destination_unaligned |= !target.word_aligned();
+            word_aligned &= source.word_aligned() && !destination_unaligned;
             if word_aligned {
-                word_aligned = for_each_copy_span(&source, &target, |_, _, bytes| {
-                    fragments = fragments.saturating_add(
-                        u64::from(bytes).div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
-                    );
-                    Ok(())
-                })
-                .is_ok();
+                match source.copy_fragments(&target, ipu_exchange::MAX_TRANSFER_WORDS * 4) {
+                    Ok(count) => fragments = fragments.saturating_add(count),
+                    Err(_) => word_aligned = false,
+                }
             }
         }
+
         let bytes = u64::from(storage_bytes(storage)?);
         let padding = extents
             .iter()
@@ -356,23 +352,22 @@ pub(crate) fn uncovered_copy_bytes(
     order: CopyOrder,
 ) -> StorageResult<Vec<ByteSpan>> {
     let bytes = storage_bytes(storage)?;
-    let mut covered = Vec::new();
-    for mapping in mappings {
-        covered.extend(match order {
-            CopyOrder::Physical => physical_byte_spans(storage, mapping.destination_extents)?,
-            CopyOrder::Semantic => {
-                let mut logical = mapping.destination_extents.to_vec();
-                for extent in &mut logical {
+    let covered = mappings
+        .iter()
+        .map(|mapping| {
+            let mut extents = mapping.destination_extents.to_vec();
+            if order == CopyOrder::Semantic {
+                for extent in &mut extents {
                     extent.physical_end = extent.logical_end;
                 }
-                logical_byte_spans(storage, &logical)?
             }
-        });
-    }
-    crate::storage::sort_byte_spans(&mut covered);
+            byte_traversal(storage, &extents, true)
+        })
+        .collect::<StorageResult<Vec<_>>>()?;
+    let covered = ByteTraversal::physical_union(covered);
     let mut cursor = 0u32;
     let mut holes: Vec<ByteSpan> = Vec::new();
-    for span in covered.into_iter().chain(std::iter::once(ByteSpan {
+    for span in covered.spans().chain(std::iter::once(ByteSpan {
         offset: bytes,
         bytes: 0,
     })) {
@@ -627,7 +622,9 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
+        let copies =
+            CopyOperation::from_spans(0, 1, source.iter().copied(), destination.iter().copied())
+                .unwrap();
         assert_eq!(copies.len(), 6);
         for (row, copy) in copies.iter().enumerate() {
             assert_eq!(copy.source_offset, row as u32 * 32);
@@ -644,7 +641,7 @@ mod tests {
         }
         // Do not reorder a request that explicitly aliases its source.
         assert_eq!(
-            CopyOperation::from_spans(0, 0, &source, &destination)
+            CopyOperation::from_spans(0, 0, source.iter().copied(), destination.iter().copied())
                 .unwrap()
                 .len(),
             164
@@ -683,7 +680,13 @@ mod tests {
                 .into_iter()
                 .zip(flatten(&destination))
                 .collect::<Vec<_>>();
-            let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
+            let copies = CopyOperation::from_spans(
+                0,
+                1,
+                source.iter().copied(),
+                destination.iter().copied(),
+            )
+            .unwrap();
             let mut actual = copies
                 .into_iter()
                 .flat_map(|copy| {
@@ -714,11 +717,11 @@ mod tests {
             CopyOperation::from_spans(
                 0,
                 1,
-                &[ByteSpan {
+                [ByteSpan {
                     offset: 0,
                     bytes: 4
                 }],
-                &[]
+                []
             )
             .is_err()
         );
@@ -743,8 +746,8 @@ mod tests {
                 let copies = CopyOperation::from_spans(
                     crate::BlockValueId::from_index(0),
                     crate::BlockValueId::from_index(1),
-                    &spans(offset, source_stride),
-                    &spans(0, destination_stride),
+                    spans(offset, source_stride),
+                    spans(0, destination_stride),
                 )
                 .unwrap();
                 assert_eq!(copies.len(), 1);
@@ -792,7 +795,13 @@ mod tests {
                     bytes: 8,
                 })
                 .collect::<Vec<_>>();
-            let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
+            let copies = CopyOperation::from_spans(
+                0,
+                1,
+                source.iter().copied(),
+                destination.iter().copied(),
+            )
+            .unwrap();
             assert_eq!(copies.len(), 1);
             assert_eq!(
                 copies[0].pattern,
@@ -824,7 +833,9 @@ mod tests {
                 bytes: 1024,
             },
         ];
-        let copies = CopyOperation::from_spans(0, 1, &source, &destination).unwrap();
+        let copies =
+            CopyOperation::from_spans(0, 1, source.iter().copied(), destination.iter().copied())
+                .unwrap();
         assert_eq!(copies.len(), 2);
         assert!(
             copies

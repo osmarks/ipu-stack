@@ -35,6 +35,17 @@ pub fn logical_view_byte_spans(
     crate::storage::logical_byte_spans(shard.storage(), &view.extents)
 }
 
+pub(crate) fn view_byte_traversal(
+    shard: &BlockValue,
+    view: &ShardView,
+    order: CopyOrder,
+) -> Result<crate::storage::ByteTraversal, StorageError> {
+    if view.shard != shard.id {
+        return Err(StorageError::WrongShard);
+    }
+    crate::storage::byte_traversal(shard.storage(), &view.extents, order == CopyOrder::Physical)
+}
+
 pub(super) fn append_span_copies(
     shards: &[BlockValue],
     source: &ShardView,
@@ -43,16 +54,18 @@ pub(super) fn append_span_copies(
     copies: &mut Vec<(u16, LocalCopy)>,
     order: CopyOrder,
 ) -> ExpansionResult<()> {
-    let spans = match order {
-        CopyOrder::Semantic => logical_view_byte_spans,
-        CopyOrder::Physical => view_byte_spans,
-    };
+    let source_spans = view_byte_traversal(&shards[source.shard.index() as usize], source, order)?;
+    let destination_spans = view_byte_traversal(
+        &shards[destination.shard.index() as usize],
+        destination,
+        order,
+    )?;
     copies.extend(
         LocalCopy::from_spans(
             source.shard,
             destination.shard,
-            &spans(&shards[source.shard.index() as usize], source)?,
-            &spans(&shards[destination.shard.index() as usize], destination)?,
+            source_spans.spans(),
+            destination_spans.spans(),
         )?
         .into_iter()
         .map(|copy| (tile, copy)),

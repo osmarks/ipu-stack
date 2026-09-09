@@ -1,5 +1,8 @@
 //! Conversion from logical shard views to physical byte ranges.
 
+mod traversal;
+pub(crate) use traversal::{ByteTraversal, byte_traversal};
+
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, Precision, ShardExtent, TensorFormat,
 };
@@ -16,16 +19,6 @@ pub struct ByteSpan {
     /// Byte offset relative to the beginning of the shard allocation.
     pub offset: u32,
     pub bytes: u32,
-}
-
-pub(crate) fn sort_byte_spans(spans: &mut [ByteSpan]) {
-    // Packed-layout benchmarks cross over around 256 entries. Physical-order
-    // spans are often already sorted; preserve that linear-time fast path.
-    if spans.len() < 256 {
-        spans.sort_unstable_by_key(|span| span.offset);
-    } else if !spans.is_sorted_by_key(|span| span.offset) {
-        radsort::sort_by_key(spans, |span| span.offset);
-    }
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -74,36 +67,7 @@ pub(crate) fn physical_byte_spans(
     shard: TensorStorage<'_>,
     view: &[ShardExtent],
 ) -> StorageResult<Vec<ByteSpan>> {
-    validate_view(shard, view)?;
-    if shard
-        .extents
-        .iter()
-        .zip(view)
-        .all(|(a, b)| a.start == b.start && a.physical_end == b.physical_end)
-    {
-        return Ok(vec![ByteSpan {
-            offset: 0,
-            bytes: storage_bytes(shard)?,
-        }]);
-    }
-    if let Some(spans) = block_major_panel_spans(shard, view)? {
-        return Ok(spans);
-    }
-    let mut logical = byte_spans(shard, view, true)?;
-    sort_byte_spans(&mut logical);
-    let mut spans = Vec::<ByteSpan>::new();
-    for span in logical {
-        match spans.last_mut() {
-            Some(previous) if previous.offset.checked_add(previous.bytes) == Some(span.offset) => {
-                previous.bytes = previous
-                    .bytes
-                    .checked_add(span.bytes)
-                    .ok_or(StorageError::Overflow)?;
-            }
-            _ => spans.push(span),
-        }
-    }
-    Ok(spans)
+    Ok(byte_traversal(shard, view, true)?.spans().collect())
 }
 
 /// Converts a semantic view into physical spans ordered by canonical logical
@@ -113,12 +77,13 @@ pub(crate) fn logical_byte_spans(
     shard: TensorStorage<'_>,
     view: &[ShardExtent],
 ) -> StorageResult<Vec<ByteSpan>> {
-    byte_spans(shard, view, false)
+    Ok(byte_traversal(shard, view, false)?.spans().collect())
 }
 
 // Walk contiguous storage lanes instead of visiting each element. Physical
 // traversal may exchange the two matrix axes; semantic traversal must retain
 // canonical coordinate order for layout conversions.
+#[cfg(test)]
 fn byte_spans(
     shard: TensorStorage<'_>,
     view: &[ShardExtent],
@@ -205,6 +170,7 @@ fn byte_spans(
     Ok(spans)
 }
 
+#[cfg(test)]
 fn physical_index(
     shard: TensorStorage<'_>,
     widths: &[u32],
@@ -283,6 +249,7 @@ fn physical_index(
     }
 }
 
+#[cfg(test)]
 fn encode_row_major(widths: &[u32], coordinates: &[u32]) -> StorageResult<u64> {
     widths
         .iter()
@@ -298,6 +265,7 @@ fn encode_row_major(widths: &[u32], coordinates: &[u32]) -> StorageResult<u64> {
         })
 }
 
+#[cfg(test)]
 fn amp_matrix_index(
     role: AmpOrder,
     precision: Precision,
@@ -344,6 +312,7 @@ fn amp_matrix_index(
     }
 }
 
+#[cfg(test)]
 fn right_matrix_index(
     precision: Precision,
     rows: u32,
@@ -369,6 +338,7 @@ fn right_matrix_index(
         .ok_or(StorageError::Overflow)
 }
 
+#[cfg(test)]
 fn block_major_matrix_index(
     order: BlockMajorOrder,
     precision: Precision,
@@ -423,106 +393,6 @@ fn block_major_matrix_index(
         .checked_mul(row_micro * column_block)
         .and_then(|base| base.checked_add(column % column_block * row_micro + row % row_micro))
         .ok_or(StorageError::Overflow)
-}
-
-fn block_major_panel_spans(
-    shard: TensorStorage<'_>,
-    view: &[ShardExtent],
-) -> StorageResult<Option<Vec<ByteSpan>>> {
-    if shard.extents.len() < 2 {
-        return Ok(None);
-    }
-    let rank = shard.extents.len();
-    let (inner_block, inner_axis, column_axis, column_tensor_axis) = match shard.format.layout.order
-    {
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => (
-            u32::from(row_block),
-            rank - 2,
-            rank - 1,
-            crate::TensorAxis::FromEnd(1),
-        ),
-        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { row_block, .. }) => (
-            u32::from(row_block),
-            rank - 1,
-            rank - 2,
-            crate::TensorAxis::FromEnd(2),
-        ),
-        _ => return Ok(None),
-    };
-    if shard.extents[..rank - 2] != view[..rank - 2] {
-        return Ok(None);
-    }
-    let rows = shard.extents[inner_axis].physical_end - shard.extents[inner_axis].start;
-    let columns = shard.extents[column_axis].physical_end - shard.extents[column_axis].start;
-    let inner_start = view[inner_axis].start - shard.extents[inner_axis].start;
-    let column_start = view[column_axis].start - shard.extents[column_axis].start;
-    let inner_width = view[inner_axis].physical_end - view[inner_axis].start;
-    let column_width = view[column_axis].physical_end - view[column_axis].start;
-    let Some(output_column_block) = shard
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|axis| axis.axis == column_tensor_axis)
-        .map(|axis| axis.block_size)
-        .filter(|block| *block != 0 && block.is_multiple_of(AMP_COLUMN_MICRO))
-    else {
-        return Ok(None);
-    };
-    if rows.is_multiple_of(inner_block)
-        && columns.is_multiple_of(output_column_block)
-        && inner_width == inner_block
-        && column_width.is_multiple_of(output_column_block)
-        && inner_start.is_multiple_of(inner_block)
-        && column_start.is_multiple_of(output_column_block)
-    {
-        let panel = inner_start
-            .checked_div(inner_block)
-            .and_then(|inner| inner.checked_mul(columns / output_column_block))
-            .and_then(|panel| panel.checked_add(column_start / output_column_block))
-            .ok_or(StorageError::Overflow)?;
-        let panel_bytes = inner_block
-            .checked_mul(output_column_block)
-            .and_then(|elements| elements.checked_mul(shard.format.precision.bytes() as u32))
-            .ok_or(StorageError::Overflow)?;
-        let bytes = inner_block
-            .checked_mul(column_width)
-            .and_then(|elements| elements.checked_mul(shard.format.precision.bytes() as u32))
-            .ok_or(StorageError::Overflow)?;
-        let matrix_bytes = rows
-            .checked_mul(columns)
-            .and_then(|elements| elements.checked_mul(shard.format.precision.bytes() as u32))
-            .ok_or(StorageError::Overflow)?;
-        let outer = shard.extents[..rank - 2]
-            .iter()
-            .try_fold(1u32, |product, extent| {
-                product
-                    .checked_mul(extent.physical_end - extent.start)
-                    .ok_or(StorageError::Overflow)
-            })?;
-        let panel_offset = panel
-            .checked_mul(panel_bytes)
-            .ok_or(StorageError::Overflow)?;
-        let mut spans = Vec::<ByteSpan>::with_capacity(outer as usize);
-        for matrix in 0..outer {
-            let offset = matrix
-                .checked_mul(matrix_bytes)
-                .and_then(|offset| offset.checked_add(panel_offset))
-                .ok_or(StorageError::Overflow)?;
-            match spans.last_mut() {
-                Some(previous) if previous.offset + previous.bytes == offset => {
-                    previous.bytes = previous
-                        .bytes
-                        .checked_add(bytes)
-                        .ok_or(StorageError::Overflow)?;
-                }
-                _ => spans.push(ByteSpan { offset, bytes }),
-            }
-        }
-        return Ok(Some(spans));
-    }
-    Ok(None)
 }
 
 fn validate_view(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<()> {
@@ -621,6 +491,7 @@ fn physical_coordinates(
     Ok(coordinates)
 }
 
+#[cfg(test)]
 fn decode_row_major(widths: &[u32], mut linear: u64, output: &mut [u32]) {
     for (coordinate, &width) in output.iter_mut().zip(widths).rev() {
         *coordinate = (linear % u64::from(width)) as u32;

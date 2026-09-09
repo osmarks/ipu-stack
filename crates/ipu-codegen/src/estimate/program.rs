@@ -194,48 +194,52 @@ fn geometry_traffic(
     let mut traffic = ExchangeEndpointTraffic::default();
     for transfer in &phase.transfers {
         let source = &program.shards[transfer.source.shard.index() as usize];
-        let spans = match transfer.span_order(&program.shards) {
-            crate::CopyOrder::Physical => crate::view_byte_spans,
-            crate::CopyOrder::Semantic => crate::logical_view_byte_spans,
-        };
-        let source_spans = spans(source, &transfer.source)?;
-        let bytes = source_spans.iter().map(|span| u64::from(span.bytes)).sum();
+        let order = transfer.span_order(&program.shards);
+        let source_spans = crate::view_byte_traversal(source, &transfer.source, order)?;
+        let bytes = source_spans.byte_len();
         let mut outgoing_fragments = 0;
         let mut outgoing_long_fragments = 0;
         for destination in &transfer.destinations {
             let target = &program.shards[destination.shard.index() as usize];
             let mut fragments = 0u64;
             let mut long_fragments = 0u64;
-            crate::for_each_copy_span(
-                &source_spans,
-                &spans(target, destination)?,
-                |_, offset, bytes| {
-                    if let Some(storage) = storage.as_deref_mut() {
-                        let max_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
-                        let mut remaining = u64::from(bytes);
-                        let mut address =
-                            (u64::from(destination.shard.index()) << 32) + u64::from(offset);
-                        while remaining != 0 {
-                            let chunk = remaining.min(max_bytes);
-                            long_fragments += u64::from(chunk > 256);
-                            storage.connection(
-                                source.tile,
-                                target.tile,
-                                chunk,
-                                false,
-                                transfer.destinations.len(),
-                            );
-                            storage.receive(target.tile, address, chunk);
-                            address += chunk;
-                            remaining -= chunk;
+            let target_spans = crate::view_byte_traversal(target, destination, order)?;
+            if storage.is_none() {
+                fragments = source_spans
+                    .copy_fragments(&target_spans, ipu_exchange::MAX_TRANSFER_WORDS * 4)?;
+            } else {
+                crate::for_each_copy_span(
+                    source_spans.spans(),
+                    target_spans.spans(),
+                    |_, offset, bytes| {
+                        if let Some(storage) = storage.as_deref_mut() {
+                            let max_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
+                            let mut remaining = u64::from(bytes);
+                            let mut address =
+                                (u64::from(destination.shard.index()) << 32) + u64::from(offset);
+                            while remaining != 0 {
+                                let chunk = remaining.min(max_bytes);
+                                long_fragments += u64::from(chunk > 256);
+                                storage.connection(
+                                    source.tile,
+                                    target.tile,
+                                    chunk,
+                                    false,
+                                    transfer.destinations.len(),
+                                );
+                                storage.receive(target.tile, address, chunk);
+                                address += chunk;
+                                remaining -= chunk;
+                            }
                         }
-                    }
-                    fragments = fragments.saturating_add(
-                        u64::from(bytes).div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
-                    );
-                    Ok(())
-                },
-            )?;
+                        fragments = fragments.saturating_add(
+                            u64::from(bytes)
+                                .div_ceil(u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4),
+                        );
+                        Ok(())
+                    },
+                )?;
+            }
             outgoing_fragments = outgoing_fragments.max(fragments);
             outgoing_long_fragments = outgoing_long_fragments.max(long_fragments);
             traffic.add_incoming(target.tile, bytes, fragments);
