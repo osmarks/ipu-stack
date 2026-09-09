@@ -28,12 +28,6 @@ impl<K: Eq + Hash, V> Memo<K, V> {
         }
         found
     }
-    fn insert(&self, key: K, value: V) {
-        let mut state = self.entries.lock().unwrap();
-        if state.0.len() < MAX_ENTRIES {
-            state.0.entry(key).or_insert_with(|| Arc::new(value));
-        }
-    }
     fn stats(&self) -> (usize, u64, u64) {
         let state = self.entries.lock().unwrap();
         (state.0.len(), state.1, state.2)
@@ -54,34 +48,72 @@ impl Geometry {
     }
 }
 #[derive(PartialEq, Eq, Hash)]
+struct CopyGeometry {
+    precision: Precision,
+    order: ElementOrder,
+    allocation: Vec<ShardExtent>,
+    view: Vec<ShardExtent>,
+}
+impl CopyGeometry {
+    fn new(shard: &BlockValue, view: &ShardView) -> ExpansionResult<Self> {
+        if shard.extents.len() != view.extents.len() {
+            return Err(StorageError::InvalidView.into());
+        }
+        let mut allocation = shard.extents.clone();
+        let mut view = view.extents.clone();
+        for (a, v) in allocation.iter_mut().zip(&mut view) {
+            let start = a.start;
+            a.start = 0;
+            a.logical_end -= start;
+            a.physical_end -= start;
+            v.start = v
+                .start
+                .checked_sub(start)
+                .ok_or(StorageError::InvalidView)?;
+            v.logical_end = v
+                .logical_end
+                .checked_sub(start)
+                .ok_or(StorageError::InvalidView)?;
+            v.physical_end = v
+                .physical_end
+                .checked_sub(start)
+                .ok_or(StorageError::InvalidView)?;
+        }
+        Ok(Self {
+            precision: shard.tensor_type.format.precision,
+            order: shard.tensor_type.format.layout.order,
+            allocation,
+            view,
+        })
+    }
+}
+#[derive(PartialEq, Eq, Hash)]
 struct CopyKey {
-    source: Geometry,
-    destination: Geometry,
-    source_view: Vec<ShardExtent>,
-    destination_view: Vec<ShardExtent>,
+    source: CopyGeometry,
+    destination: CopyGeometry,
     order: CopyOrder,
     same_buffer: bool,
 }
-#[derive(PartialEq, Eq, Hash)]
-struct ProductKey {
-    kernel: TileKernelSpec,
-    axes: crate::ProductAxes,
-    bindings: Vec<Geometry>,
-    inputs: Vec<(usize, Vec<ShardExtent>)>,
-    output: usize,
+
+struct ComputeFragment {
+    primitive: crate::Primitive,
+    boundary: Vec<(u16, Geometry)>,
+    values: Vec<Vec<usize>>,
+    runs: Vec<KernelRun>,
+    aliases: Vec<(usize, usize)>,
 }
 
 pub(crate) struct ExpansionCache {
     enabled: bool,
     copies: Memo<CopyKey, Vec<CopyOperation<()>>>,
-    products: Memo<ProductKey, Vec<KernelRun>>,
+    computes: Memo<u64, Vec<Arc<ComputeFragment>>>,
 }
 impl Default for ExpansionCache {
     fn default() -> Self {
         Self {
             enabled: true,
             copies: Memo::default(),
-            products: Memo::default(),
+            computes: Memo::default(),
         }
     }
 }
@@ -95,7 +127,7 @@ impl ExpansionCache {
     }
 
     pub(crate) fn stats(&self) -> [(usize, u64, u64); 2] {
-        [self.copies.stats(), self.products.stats()]
+        [self.copies.stats(), self.computes.stats()]
     }
     pub(super) fn copy(
         &self,
@@ -136,10 +168,8 @@ impl ExpansionCache {
             return Ok(Arc::new(generate()?));
         }
         let key = CopyKey {
-            source: Geometry::of(&shards[source.shard.index() as usize]),
-            destination: Geometry::of(&shards[destination.shard.index() as usize]),
-            source_view: source.extents.clone(),
-            destination_view: destination.extents.clone(),
+            source: CopyGeometry::new(left, source)?,
+            destination: CopyGeometry::new(right, destination)?,
             order,
             same_buffer: source.shard == destination.shard,
         };
@@ -158,93 +188,84 @@ impl ExpansionCache {
 }
 
 impl TileGraphBuilder {
-    pub(super) fn cached_product_calls(
+    pub(super) fn build_primitive(
         &mut self,
-        provenance: WorkProvenance,
-        tile: u16,
-        kernel: &TileKernelSpec,
-        inputs: &[ShardView],
-        output: BlockValueId,
-        axes: crate::ProductAxes,
+        operation: &MidOperation,
+        primitive: &crate::Primitive,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
+        use std::hash::{Hash, Hasher};
+        let crate::Primitive::Compute {
+            kernel,
+            operands,
+            product,
+            reuse_input,
+        } = primitive
+        else {
+            return self.build_primitive_uncached(operation, primitive, body);
+        };
         if !self.cache.enabled {
-            return self.product_calls(provenance, tile, kernel, inputs, output, axes, body);
-        }
-        // A one-call GEMM is cheaper to emit than to key and rebind. Cache only
-        // fragments which actually expand blocking or outer matrix iteration.
-        if let TileKernelSpec::Gemm {
-            inner_block,
-            output_columns,
-            ..
-        } = kernel
-            && *inner_block != 0
-            && *output_columns != 0
-            && let Some(left) = inputs.first()
-        {
-            let output_shard = &self.shards[output.index() as usize];
-            let k = left.extents[axes.left_inner.resolve(left.extents.len())?];
-            let c = output_shard.extents[axes.output_column.resolve(output_shard.extents.len())?];
-            let step = output_shard
-                .tensor_type
-                .format
-                .layout
-                .order
-                .gemm_output_group()
-                .map_or(*output_columns, |group| group.min(*output_columns));
-            let outer = if matches!(
-                output_shard.tensor_type.format.layout.order,
-                ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-            ) {
-                1
-            } else {
-                output_shard.extents[..output_shard.extents.len().saturating_sub(2)]
-                    .iter()
-                    .map(|e| u64::from(e.physical_end - e.start))
-                    .product::<u64>()
-            };
-            if k.physical_end - k.start <= *inner_block
-                && c.physical_end - c.start <= step
-                && outer <= 1
-            {
-                return self.product_calls(provenance, tile, kernel, inputs, output, axes, body);
-            }
+            return self.build_primitive_uncached(operation, primitive, body);
         }
         let mut bindings = Vec::new();
-        let mut slot = |id| {
-            bindings.iter().position(|&b| b == id).unwrap_or_else(|| {
-                bindings.push(id);
-                bindings.len() - 1
-            })
-        };
-        let bound_inputs = inputs
-            .iter()
-            .map(|v| (slot(v.shard), v.extents.clone()))
-            .collect();
-        let output_slot = slot(output);
-        // A deferred view must be resolved by the enclosing builder, not replayed
-        // from a fragment created under a different materialization decision.
-        if bindings.iter().any(|&id| {
-            self.full_view(id)
-                != ShardView {
-                    shard: id,
-                    extents: self.shards[id.index() as usize].extents.clone(),
+        let mut slots = HashMap::new();
+        let mut values = Vec::new();
+        for &value in operation.inputs.iter().chain(&operation.results) {
+            let mut ids = Vec::new();
+            for &id in self.value_shards(value)? {
+                // Leave deferred materialization to normal lowering. It can
+                // redirect operands to buffers outside this operation boundary.
+                if self.materialized_views.contains_key(&id) {
+                    return self.build_primitive_uncached(operation, primitive, body);
                 }
-        }) {
-            return self.product_calls(provenance, tile, kernel, inputs, output, axes, body);
+                let slot = *slots.entry(id).or_insert_with(|| {
+                    bindings.push(id);
+                    bindings.len() - 1
+                });
+                ids.push(slot);
+            }
+            values.push(ids);
         }
-        let key = ProductKey {
-            kernel: kernel.clone(),
-            axes,
-            inputs: bound_inputs,
-            bindings: bindings
-                .iter()
-                .map(|id| Geometry::of(&self.shards[id.index() as usize]))
-                .collect(),
-            output: output_slot,
-        };
-        if let Some(runs) = self.cache.products.get(&key) {
-            for template in runs.iter() {
+        // Hash borrowed geometry; allocate a stored boundary only on a miss.
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        kernel.hash(&mut hash);
+        operands.hash(&mut hash);
+        product.hash(&mut hash);
+        reuse_input.hash(&mut hash);
+        values.hash(&mut hash);
+        for &id in &bindings {
+            let shard = &self.shards[id.index() as usize];
+            shard.tile.hash(&mut hash);
+            shard.tensor_type.hash(&mut hash);
+            shard.extents.hash(&mut hash);
+        }
+        let key = hash.finish();
+        let bucket = self.cache.computes.get(&key);
+        let hit = bucket.as_ref().and_then(|bucket| {
+            bucket.iter().find(|entry| {
+                entry.primitive == *primitive
+                    && entry.values == values
+                    && entry.boundary.len() == bindings.len()
+                    && entry
+                        .boundary
+                        .iter()
+                        .zip(&bindings)
+                        .all(|((tile, geometry), id)| {
+                            let shard = &self.shards[id.index() as usize];
+                            *tile == shard.tile
+                                && geometry.tensor == shard.tensor_type
+                                && geometry.extents == shard.extents
+                        })
+            })
+        });
+        let provenance = operation_provenance(operation);
+        if let Some(fragment) = hit {
+            for &(output, input) in &fragment.aliases {
+                self.shards[bindings[output].index() as usize].definition =
+                    ShardDefinition::WritableAlias(bindings[input]);
+            }
+            let mut metadata = HashMap::new();
+            for template in &fragment.runs {
                 let mut run = template.clone();
                 for view in run
                     .inputs
@@ -254,26 +275,50 @@ impl TileGraphBuilder {
                 {
                     view.shard = bindings[view.shard.index() as usize];
                 }
-                if let Some(metadata) = self.kernel_metadata.iter().find(|m| {
-                    m.provenance == provenance
-                        && m.kernel == run.kernel
-                        && m.requirements == run.requirements
-                }) {
-                    run.metadata = Arc::clone(metadata);
-                } else {
-                    run.metadata = Arc::new(KernelRunMetadata {
-                        provenance,
-                        kernel: run.kernel.clone(),
-                        requirements: run.requirements.clone(),
-                    });
-                    self.kernel_metadata.push(Arc::clone(&run.metadata));
-                }
-                self.append_single_kernel(body, tile, run)?;
+                run.metadata = Arc::clone(
+                    metadata
+                        .entry(Arc::as_ptr(&template.metadata) as usize)
+                        .or_insert_with(|| {
+                            if let Some(m) = self.kernel_metadata.iter().find(|m| {
+                                m.provenance == provenance
+                                    && m.kernel == template.kernel
+                                    && m.requirements == template.requirements
+                            }) {
+                                Arc::clone(m)
+                            } else {
+                                let m = Arc::new(KernelRunMetadata {
+                                    provenance,
+                                    kernel: template.kernel.clone(),
+                                    requirements: template.requirements.clone(),
+                                });
+                                self.kernel_metadata.push(Arc::clone(&m));
+                                m
+                            }
+                        }),
+                );
+                self.append_single_kernel(
+                    body,
+                    self.shards[run.output.shard.index() as usize].tile,
+                    run,
+                )?;
             }
             return Ok(());
         }
         let start = self.kernel_runs.len();
-        self.product_calls(provenance, tile, kernel, inputs, output, axes, body)?;
+        self.build_primitive_uncached(operation, primitive, body)?;
+        let mut aliases = Vec::new();
+        if reuse_input.is_some() {
+            for &output in self.value_shards(operation.results[0])? {
+                let shard = &self.shards[output.index() as usize];
+                if shard.extents.iter().any(|e| e.start == e.physical_end) {
+                    continue;
+                }
+                let ShardDefinition::WritableAlias(input) = shard.definition else {
+                    unreachable!("compute reuses the selected input")
+                };
+                aliases.push((slots[&output], slots[&input]));
+            }
+        }
         let mut runs = self.kernel_runs[start..].to_vec();
         for run in &mut runs {
             for view in run
@@ -282,15 +327,34 @@ impl TileGraphBuilder {
                 .flat_map(|operand| &mut operand.views)
                 .chain(std::iter::once(&mut run.output))
             {
-                view.shard = BlockValueId(
-                    bindings
-                        .iter()
-                        .position(|&id| id == view.shard)
-                        .expect("product uses bound operands") as u32,
-                );
+                view.shard = BlockValueId(slots[&view.shard] as u32);
             }
         }
-        self.cache.products.insert(key, runs);
+        let fragment = Arc::new(ComputeFragment {
+            primitive: primitive.clone(),
+            values,
+            runs,
+            aliases,
+            boundary: bindings
+                .iter()
+                .map(|id| {
+                    let s = &self.shards[id.index() as usize];
+                    (s.tile, Geometry::of(s))
+                })
+                .collect(),
+        });
+        let mut state = self.cache.computes.entries.lock().unwrap();
+        if state.0.len() < 256 {
+            let bucket = state.0.entry(key).or_insert_with(|| Arc::new(Vec::new()));
+            // Concurrent misses may have computed the same immutable fragment.
+            if !bucket.iter().any(|entry| {
+                entry.primitive == fragment.primitive
+                    && entry.values == fragment.values
+                    && entry.boundary == fragment.boundary
+            }) {
+                Arc::make_mut(bucket).push(fragment);
+            }
+        }
         Ok(())
     }
 }

@@ -3,10 +3,15 @@ fn lower_to_tiles(
     graph: &crate::MidProgram,
     checkpoints: bool,
 ) -> super::ExpansionResult<crate::LowProgram> {
-    Ok(crate::low::lower_to_tiles(
-        &crate::expand_tiles(graph)?,
-        checkpoints,
-    ))
+    let graph = crate::mid::implementation::resolve(graph.clone())
+        .ok_or(super::ExpansionError::InvalidOperatorPlan)?;
+    let cache = Arc::new(ExpansionCache::default());
+    let expected = super::expand_tiles_cached(&graph, true, Arc::new(ExpansionCache::disabled()))?;
+    for _ in 0..2 {
+        let cached = super::expand_tiles_cached(&graph, true, Arc::clone(&cache))?;
+        assert_eq!(cached, expected, "cache changed the complete low graph");
+    }
+    Ok(crate::low::lower_to_tiles(&expected, checkpoints))
 }
 use super::*;
 use crate::{

@@ -4,7 +4,7 @@ use super::*;
 
 /// A rectangular operand window in global tensor coordinates. Omitted axes
 /// retain their full extent. Windows do not allocate temporary tensors.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct OperandWindow(pub Vec<(u16, u32, u32)>);
 
 /// Matrix axes used by a local product after the distributed operands have

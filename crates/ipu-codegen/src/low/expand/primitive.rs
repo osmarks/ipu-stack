@@ -5,7 +5,7 @@ use super::*;
 use crate::{OperandWindow, Primitive, ProductAxes};
 
 impl TileGraphBuilder {
-    pub(super) fn build_primitive(
+    pub(super) fn build_primitive_uncached(
         &mut self,
         operation: &MidOperation,
         primitive: &Primitive,
@@ -100,7 +100,7 @@ impl TileGraphBuilder {
                         })
                         .collect::<ExpansionResult<Vec<_>>>()?;
                     if let Some(axes) = product {
-                        self.cached_product_calls(
+                        self.product_calls(
                             operation_provenance(operation),
                             tile,
                             kernel,
