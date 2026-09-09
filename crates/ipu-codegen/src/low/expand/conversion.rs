@@ -171,14 +171,13 @@ impl TileGraphBuilder {
                 return Err(ExpansionError::InvalidConversionPlan);
             }
         };
+        let mut regions = CopyRegions::new(&self.shards, &inputs);
         let mut mappings = Vec::new();
         for output in outputs {
             let tile = self.shards[output.index() as usize].tile;
-            for (extents, source) in self.intersecting_shard_set(
-                &inputs,
-                &self.shards[output.index() as usize].extents,
-                tile,
-            ) {
+            for (extents, source) in
+                regions.intersections(&self.shards[output.index() as usize].extents, tile)
+            {
                 mappings.push((
                     ShardView {
                         shard: source,

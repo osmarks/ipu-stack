@@ -103,6 +103,7 @@ impl TileGraphBuilder {
         reuse_local: bool,
         body: &mut BlockRegion,
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
+        let mut regions = CopyRegions::new(&self.shards, inputs);
         let mut mappings = Vec::new();
         for &output in outputs {
             let destination = &self.shards[output.index() as usize];
@@ -123,8 +124,8 @@ impl TileGraphBuilder {
                     .checked_add(offset)
                     .ok_or(ExpansionError::IdOverflow)?;
             }
-            let intersections = self
-                .intersecting_shard_set(inputs, &source_region, tile)
+            let intersections = regions
+                .intersections(&source_region, tile)
                 .into_iter()
                 .map(|(_, source)| {
                     (
@@ -200,6 +201,7 @@ impl TileGraphBuilder {
         view: AxisFactorView,
         offsets: &[u32],
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
+        let mut regions = CopyRegions::new(&self.shards, source_shards);
         let mut mappings = Vec::new();
         for &output in output_shards {
             let mut output_extents = self.shards[output.index() as usize].extents.clone();
@@ -258,9 +260,7 @@ impl TileGraphBuilder {
                                 physical_end: end,
                             })
                             .collect::<Vec<_>>();
-                        for (source_extents, source) in
-                            self.intersecting_shard_set(source_shards, &target, tile)
-                        {
+                        for (source_extents, source) in regions.intersections(&target, tile) {
                             let mut destination_extents = source_extents.clone();
                             destination_extents[merge].start = stream;
                             destination_extents[merge].logical_end = stream + 1;
@@ -299,9 +299,7 @@ impl TileGraphBuilder {
                 let (target, column_base) = view
                     .source_extents(source_shape, &output_shape, &stream_extents)
                     .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                for (mut source_extents, source) in
-                    self.intersecting_shard_set(source_shards, &target, tile)
-                {
+                for (mut source_extents, source) in regions.intersections(&target, tile) {
                     let mut destination_extents = source_extents.clone();
                     destination_extents[merge] = stream_extents[merge];
                     destination_extents[split].start -= column_base;

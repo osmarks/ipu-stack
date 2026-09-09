@@ -206,3 +206,30 @@ replaces the expanded fragment-slot byte price with endpoint/control estimates.
 Admission now prioritizes predicted-fit candidates and retains minimum estimated
 storage, rather than minimum fragments. This is a soft admission preference;
 encoded byte acceptance and the explicit fragment effort limit remain hard checks.
+
+### Copy ownership geometry (2026-09-09)
+
+Copy expansion now resolves ownership regions before repeatedly intersecting
+individual replica recipients. `low/expand/ownership.rs` groups sources by
+logical extents, retaining their local owners and the original default sender.
+Destination requests reuse the same intersection geometry, including through
+offset and factor-view mappings. An interval index skips source regions which
+cannot intersect a request; prefix maximum ends keep overlapping regions valid.
+Padding remains a property of the selected source and the eventual copy plan.
+
+This preserves existing source selection and physical transfers. It does not
+split partially overlapping requests into new multicast messages, change beam
+search, or provide a new exchange-storage bound. Destination-specific staging
+still follows region resolution. It removes repeated ownership discovery before
+the existing source-view grouping and physical multicast splitting/scheduling.
+
+The manual `benchmark_copy_regions` test compares against the old destination-
+first algorithm, including region-index construction and returned mappings.
+Measured old/new times in milliseconds were 119.30/0.63 for 1,472 replicas,
+10.26/0.53 for a mixed replicated grid, 17.40/2.06 for 1,472 distinct shards,
+0.29/0.24 for one source distributed over 64 replicated regions, and 25.05/9.36
+for 64 source regions gathered onto 1,472 replicas. These are geometry-only CPU
+measurements, not full compiler timings or device performance claims. The log
+is in `artifacts/multicast-regions-20260909/benchmark.log`. Randomized equivalence
+tests include local-owner preference, unsorted source lists, clipped overlaps,
+both indexed axes, and differing padding on replicas.

@@ -10,6 +10,7 @@ mod conversion;
 mod copies;
 mod gemm;
 mod mapping;
+mod ownership;
 mod pointwise;
 mod reduce;
 mod repeat;
@@ -26,6 +27,7 @@ use copies::*;
 pub use copies::{logical_view_byte_spans, shard_storage_bytes, view_byte_spans};
 use gemm::*;
 use mapping::*;
+use ownership::CopyRegions;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -142,8 +144,6 @@ pub(crate) fn expand_tiles(
     Ok(Arc::new(program))
 }
 
-type ShardIntersections = Vec<(Vec<ShardExtent>, Vec<BlockValueId>)>;
-
 struct TileGraphBuilder {
     tile_count: u16,
     storage_groups: Vec<MidValueId>,
@@ -223,49 +223,6 @@ impl TileGraphBuilder {
             state.canonical[value.id.index() as usize] = value_shards;
         }
         Ok(state)
-    }
-
-    fn shard_intersection_groups(
-        &self,
-        sources: &[BlockValueId],
-        target: &[ShardExtent],
-    ) -> ShardIntersections {
-        let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<BlockValueId>>::new();
-        for &source in sources {
-            if let Some(extents) =
-                intersect_extents(&self.shards[source.index() as usize].extents, target)
-            {
-                groups.entry(extents).or_default().push(source);
-            }
-        }
-        groups.into_iter().collect()
-    }
-
-    fn select_intersections(
-        &self,
-        groups: &ShardIntersections,
-        local_tile: u16,
-    ) -> Vec<(Vec<ShardExtent>, BlockValueId)> {
-        groups
-            .iter()
-            .map(|(extents, candidates)| {
-                let selected = candidates
-                    .iter()
-                    .copied()
-                    .find(|source| self.shards[source.index() as usize].tile == local_tile)
-                    .unwrap_or(candidates[0]);
-                (extents.clone(), selected)
-            })
-            .collect()
-    }
-
-    fn intersecting_shard_set(
-        &self,
-        sources: &[BlockValueId],
-        target: &[ShardExtent],
-        local_tile: u16,
-    ) -> Vec<(Vec<ShardExtent>, BlockValueId)> {
-        self.select_intersections(&self.shard_intersection_groups(sources, target), local_tile)
     }
 
     fn build_region(
