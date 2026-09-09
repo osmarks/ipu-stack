@@ -45,13 +45,12 @@ pub use mid::{
     AMP_COLUMN_MICRO, AmpOrder, AttentionProducts, AttentionStrategy, BlockMajorOrder,
     ConversionStreamingPolicy, GemmOrientation, GemmOutputPacking, GemmPlanConstraint, GridOrder,
     Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorCandidate, PipelineConfig,
-    Precision, ReductionStaging, RegionalPlanning, ShardExtent, TensorFormat, TensorType,
+    Precision, ReductionStaging, ShardExtent, TensorFormat, TensorType,
 };
 pub use package::{
     CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, ExpansionBenchmark,
-    ExpansionTiming, PackageConfig, SelectionBenchmark, TileProgramData, benchmark_mid_expansion,
-    benchmark_selection, build_diagnostic_package, build_package, build_tile_program_package,
-    capture_exchange_finalist,
+    ExpansionTiming, PackageConfig, TileProgramData, benchmark_mid_expansion,
+    build_diagnostic_package, build_package, build_tile_program_package, capture_exchange_finalist,
 };
 pub(crate) use place::*;
 pub(crate) use storage::*;

@@ -1,4 +1,4 @@
-//! Compiler diagnostics for expansion and physical plan selection.
+//! Compiler timings which stop before placement and exchange scheduling.
 use super::*;
 use std::sync::Arc;
 
@@ -204,32 +204,5 @@ pub fn benchmark_mid_expansion(
                 )
             })
             .collect(),
-    })
-}
-
-/// Compiler-only experiment; executable support compilation is deliberately not
-/// included. Production package selection additionally validates that support.
-#[derive(serde::Serialize)]
-pub struct SelectionBenchmark {
-    pub elapsed_ms: f64,
-    pub scheduled_cycles: u64,
-    pub shards: usize,
-    pub kernels: usize,
-    pub exchange_phases: usize,
-    pub executable_support_validated: bool,
-}
-pub fn benchmark_selection(
-    graph: &ComputeGraph,
-    config: &PipelineConfig,
-) -> PackageBuildResult<SelectionBenchmark> {
-    let start = Instant::now();
-    let (selected, ()) = selection::select_graph_finalist(graph, config, None, |_| Ok(()))?;
-    Ok(SelectionBenchmark {
-        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
-        scheduled_cycles: selected.cycles,
-        shards: selected.program.shards.len(),
-        kernels: selected.program.kernel_runs.len(),
-        exchange_phases: selected.phases.len(),
-        executable_support_validated: false,
     })
 }

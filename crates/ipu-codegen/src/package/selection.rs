@@ -20,8 +20,6 @@ struct ModelledPlan {
 /// Selected work and its completed provisional allocation/schedule. Package
 /// sizing consumes these same artifacts before support storage changes addresses.
 pub(super) struct ScheduledPlan {
-    /// Cost of the most recently validated placement; package finalization updates it.
-    pub cycles: u64,
     pub program: LowProgram,
     pub placement: crate::Placement,
     pub phases: Vec<crate::PhysicalExchangePhase>,
@@ -34,9 +32,6 @@ pub(super) fn select_graph_finalist<T>(
     tile_mapping: Option<&[u16]>,
     mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
-    if planning.regional_planning.is_some() {
-        return super::regional::select(graph, planning, tile_mapping, finalize);
-    }
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, planning.tile_count);
     let mut search = planning.clone();
     let mut result = Err(invalid("no operator-plan finalists"));
@@ -73,25 +68,10 @@ pub(super) fn select_scheduled_finalist<T>(
     finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
-    finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
-) -> PackageBuildResult<(ScheduledPlan, T)> {
-    select_scheduled_cached(
-        finalists,
-        planning,
-        tile_mapping,
-        finalize,
-        Arc::new(crate::low::expand::ExpansionCache::default()),
-    )
-}
-
-pub(super) fn select_scheduled_cached<T>(
-    finalists: Vec<crate::MidProgram>,
-    planning: &PipelineConfig,
-    tile_mapping: Option<&[u16]>,
     mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
-    expansion_cache: Arc<crate::low::expand::ExpansionCache>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let topology = active_topology(planning.tile_count)?;
+    let expansion_cache = Arc::new(crate::low::expand::ExpansionCache::default());
     let screened = finalists
         .into_par_iter()
         .enumerate()
@@ -225,7 +205,6 @@ pub(super) fn select_scheduled_cached<T>(
                     Ok((
                         (refined.total, index, mapped),
                         ScheduledPlan {
-                            cycles: refined.total,
                             program: low,
                             placement,
                             phases: exchanges.phases,
@@ -239,7 +218,7 @@ pub(super) fn select_scheduled_cached<T>(
         let mut feasible = false;
         for (mapped, result) in results {
             match result {
-                Ok((mut score, mut plan)) => {
+                Ok((score, mut plan)) => {
                     // Exact support placement is part of acceptance. A fast
                     // but unplaceable package must not consume the budget or
                     // prevent another finalist from being attempted.
@@ -247,7 +226,6 @@ pub(super) fn select_scheduled_cached<T>(
                     caches[usize::from(mapped)] = plan.cache.clone();
                     match finalized {
                         Ok(artifact) => {
-                            score.0 = plan.cycles;
                             feasible = true;
                             if best
                                 .as_ref()

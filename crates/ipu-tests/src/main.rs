@@ -136,21 +136,6 @@ struct Arguments {
     /// Complete plans per configuration to expand and estimate.
     #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
     expanded_plan_finalists: usize,
-    /// Build a bounded baseline and improve explicit graph regions.
-    #[arg(long, conflicts_with = "benchmark_expansion")]
-    regional_planning: bool,
-    /// Explicit top-level high-operation region START:END; may be repeated.
-    #[arg(long, requires = "regional_planning")]
-    planning_region: Vec<String>,
-    /// Benchmark selection through placement/scheduling without compiling executable support.
-    #[arg(long, conflicts_with_all = ["benchmark_expansion", "capture_exchange_schedule"])]
-    benchmark_selection: Option<PathBuf>,
-    /// Maximum globally validated regional replacements.
-    #[arg(long, default_value_t = 4, requires = "regional_planning")]
-    regional_evaluations: usize,
-    /// Maximum globally validated proposals per region.
-    #[arg(long, default_value_t = 4, requires = "regional_planning")]
-    regional_evaluations_per_region: usize,
     /// Expanded plans admitted to placement/mapping, plus a compact alternative.
     #[arg(long, default_value_t = 4, conflicts_with = "reuse_package")]
     placement_finalists: usize,
@@ -705,13 +690,6 @@ fn main() -> Result<()> {
     };
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
     pipeline.expanded_plan_finalists = arguments.expanded_plan_finalists.max(1);
-    if arguments.regional_planning {
-        pipeline.regional_planning = Some(ipu_codegen::RegionalPlanning {
-            max_evaluations: arguments.regional_evaluations,
-            max_evaluations_per_region: arguments.regional_evaluations_per_region,
-            ..Default::default()
-        });
-    }
     pipeline.placement_finalists = arguments.placement_finalists.max(1);
     pipeline = pipeline
         .with_attention_strategy(arguments.attention_strategy.into())
@@ -1029,22 +1007,15 @@ fn main() -> Result<()> {
         if !(-16..=15).contains(&scale) {
             bail!("FP8 operand scale must be in -16..=15 so the product scale fits the ISA");
         }
-        // Preserve the configured GEMM tile-count alternatives when selecting
-        // FP8. Keeping only the full-device family excludes small projections.
-        let fp8_candidates = pipeline
-            .operator_candidates
-            .iter()
-            .filter_map(|candidate| match candidate {
-                ipu_codegen::OperatorCandidate::ParallelGemm { tile_count, .. } => {
-                    Some(ipu_codegen::OperatorCandidate::fp8_gemm(*tile_count, scale))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
         pipeline
             .operator_candidates
             .retain(|candidate| !matches!(candidate.operator(), MidOperator::Gemm { .. }));
-        pipeline.operator_candidates.extend(fp8_candidates);
+        pipeline
+            .operator_candidates
+            .push(ipu_codegen::OperatorCandidate::fp8_gemm(
+                active_tiles,
+                scale,
+            ));
         for input in graph.inputs() {
             if matches!(arguments.workload, Workload::SiglipVitBenchmark)
                 && !input.name.ends_with(".weight")
@@ -1073,17 +1044,6 @@ fn main() -> Result<()> {
         runtime_source,
         pipeline,
     };
-    for region in &arguments.planning_region {
-        let (start, end) = region
-            .split_once(':')
-            .context("planning region must be START:END")?;
-        graph.add_planning_region(start.parse()?..end.parse()?)?;
-    }
-    if let Some(path) = &arguments.benchmark_selection {
-        let report = ipu_codegen::benchmark_selection(&graph, &package_config.pipeline)?;
-        serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
-        return Ok(());
-    }
     if let Some(path) = &arguments.benchmark_expansion {
         let report = ipu_codegen::benchmark_mid_expansion(
             &graph,

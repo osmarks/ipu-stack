@@ -15,8 +15,6 @@ mod layout;
 mod operator;
 mod ownership;
 mod planner;
-pub(crate) mod regional;
-pub use regional::RegionalPlanning;
 mod resolved;
 mod view;
 pub use crate::graph::AxisFactorView;
@@ -170,10 +168,6 @@ pub enum GemmOutputPacking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
     pub tile_count: u16,
-    /// Opt into a bounded baseline followed by incumbent-preserving regional search.
-    pub regional_planning: Option<RegionalPlanning>,
-    /// Use simple divisor grids and balanced row-major boundaries for bounded baseline construction.
-    pub compact_layout_search: bool,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Graph-boundary tensors whose layout may be selected by their first
     /// consumer. Precision remains fixed, while packaging exposes the chosen
@@ -272,8 +266,6 @@ impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
         Self {
             tile_count,
-            regional_planning: None,
-            compact_layout_search: false,
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),

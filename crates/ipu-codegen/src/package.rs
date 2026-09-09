@@ -5,12 +5,8 @@ mod profile;
 mod profile_work;
 use profile::{instrument_profile, profile_binding, profile_step_count};
 mod benchmark;
-mod regional;
 mod selection;
-pub use benchmark::{
-    ExpansionBenchmark, ExpansionTiming, SelectionBenchmark, benchmark_mid_expansion,
-    benchmark_selection,
-};
+pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
 mod tile_program;
 use selection::ScheduledPlan;
 pub use tile_program::build_tile_program_package;
@@ -853,7 +849,6 @@ fn build_package_from_objects(
     });
     application.host_exchange = host.protocol;
     application.validate()?;
-    selected.cycles = final_cost.total;
     Ok(BuiltApplication {
         application,
         placement,

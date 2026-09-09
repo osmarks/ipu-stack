@@ -22,15 +22,6 @@ pub(crate) fn plan_finalists(
     costs: &impl CostModel,
     finalist_count: usize,
 ) -> LoweringResult<Vec<MidProgram>> {
-    in_planning_pool(|| {
-        let costs = MemoizedCostModel::new(costs, config.tile_count);
-        plan_in_pool(graph, config, &costs, finalist_count)
-    })
-}
-
-pub(super) fn in_planning_pool<T: Send>(
-    work: impl FnOnce() -> LoweringResult<T> + Send,
-) -> LoweringResult<T> {
     // Fragment construction allocates substantially more than scalar costing.
     // Use a fixed small pool instead of spreading allocator arenas over every
     // logical CPU on large build hosts. Concurrent planners share this bound.
@@ -50,7 +41,10 @@ pub(super) fn in_planning_pool<T: Send>(
         })
         .as_ref()
         .map_err(|error| LoweringError::PlanningThreads(error.clone()))?;
-    pool.install(work)
+    pool.install(|| {
+        let costs = MemoizedCostModel::new(costs, config.tile_count);
+        plan_in_pool(graph, config, &costs, finalist_count)
+    })
 }
 
 fn plan_in_pool(
@@ -266,10 +260,8 @@ impl LoweringState {
         tensor_type: TensorType,
         storage_group: MidValueId,
     ) -> MidValueId {
-        let offset = self.get(storage_group).tile_offset;
         let result = self.value(origin, tensor_type);
         self.values[result.index() as usize].storage_group = storage_group;
-        self.values[result.index() as usize].tile_offset = offset;
         result
     }
 
@@ -631,34 +623,6 @@ pub(super) fn lower_operation_candidates(
                             &mut next.state,
                             &mut next.operations,
                         );
-                        if config.compact_layout_search {
-                            for &origin in &operation.results {
-                                let value = next.values[&origin];
-                                let tensor = &next.state.get(value).tensor_type;
-                                if let Some(layout) = balanced_row_major(
-                                    &tensor.shape,
-                                    tensor.format.precision,
-                                    config.tile_count,
-                                    true,
-                                ) {
-                                    let target = TensorFormat {
-                                        precision: tensor.format.precision,
-                                        layout,
-                                    };
-                                    let converted = ensure_format(
-                                        value,
-                                        target,
-                                        OperandMaterialization::Complete,
-                                        false,
-                                        operation.id,
-                                        costs,
-                                        &mut next.state,
-                                        &mut next.operations,
-                                    );
-                                    next.values.insert(origin, converted);
-                                }
-                            }
-                        }
                         let boundary = next.operations.last().unwrap();
                         let tensors = boundary
                             .inputs

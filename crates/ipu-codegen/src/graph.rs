@@ -230,7 +230,6 @@ pub struct ComputeGraph {
     next_operation: u32,
     next_value: u32,
     next_sequence: u32,
-    planning_regions: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -264,28 +263,6 @@ pub type GraphResult<T> = std::result::Result<T, GraphError>;
 impl ComputeGraph {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Mark a contiguous top-level optimization region. Regions may not overlap;
-    /// structured Repeat remains a single operation at this boundary.
-    pub fn add_planning_region(&mut self, operations: std::ops::Range<usize>) -> GraphResult<()> {
-        if operations.is_empty()
-            || operations.end > self.operations.len()
-            || self
-                .planning_regions
-                .iter()
-                .any(|r| r.start < operations.end && operations.start < r.end)
-        {
-            return Err(GraphError::InvalidShape(
-                "invalid or overlapping planning region".into(),
-            ));
-        }
-        self.planning_regions.push(operations);
-        self.planning_regions.sort_by_key(|r| r.start);
-        Ok(())
-    }
-    pub fn planning_regions(&self) -> &[std::ops::Range<usize>] {
-        &self.planning_regions
     }
 
     pub fn inputs(&self) -> &[GraphInput] {
