@@ -144,7 +144,7 @@ fn main() -> Result<()> {
     let mut cases = Vec::new();
     let mut rng = fastrand::Rng::with_seed(0x6e6f726d);
     for width in [
-        1u32, 2, 3, 4, 6, 7, 12, 14, 16, 24, 32, 72, 144, 288, 576, 1152, 1728,
+        1u32, 2, 3, 4, 6, 7, 12, 14, 16, 24, 32, 72, 144, 288, 576, 1152, 1728, 2152,
     ] {
         for rows in [1, 3] {
             for mode in 0..if args.residual {
@@ -157,10 +157,7 @@ fn main() -> Result<()> {
                 if (6..10).contains(&mode) && !args.fp8 {
                     continue;
                 }
-                if mode >= 10 && !width.is_multiple_of(4) {
-                    continue;
-                }
-                if (6..10).contains(&mode) && !width.is_multiple_of(4) {
+                if mode >= 6 && !width.is_multiple_of(4) {
                     continue;
                 }
                 if mode >= 2 && width % 2 != 0 {
