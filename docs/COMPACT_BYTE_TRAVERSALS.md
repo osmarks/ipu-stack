@@ -48,3 +48,11 @@ under `artifacts/mid-expansion-20260909/`.
 Hardware/reference checks passed for the small FP16 ViT (maximum absolute error
 0.002930) and FP8 batch-2 MLP with three repeats (0.015625). The MLP profile is
 `artifacts/compact-traversal-20260909/mlp-b2-hardware-fixed/profile.html`.
+
+The full FP8 batch-2 ViT also builds and passes hardware/reference validation
+(maximum absolute error 0.083496, diagnostic tolerances 0.2 absolute / 0.05
+relative). Its rendered profile is
+`artifacts/compact-traversal-20260909/vit-b2/profile.html`.
+Final validation: 197 codegen tests passed, five ignored, the doctest passed,
+and Clippy passed for codegen and test binaries with the repository's existing
+argument-count/type-complexity allowances.
