@@ -15,6 +15,8 @@ use std::{fs, path::PathBuf};
 struct Arguments {
     #[arg(long)]
     sdk: PathBuf,
+    #[arg(long)]
+    fp8: bool,
     #[arg(long, default_value = "device")]
     source: PathBuf,
     #[arg(long, default_value = "c600-init.ipucfg")]
@@ -34,7 +36,7 @@ fn main() -> Result<()> {
         device.join("static_runtime.S").display(),
         device.join("worker_support.S").display()
     );
-    for (index, (symbol, vertex, cpp, flags, wrapper, registers)) in [
+    let mut kernels = vec![
         (
             "add_f16",
             "AddF16",
@@ -75,9 +77,18 @@ fn main() -> Result<()> {
             None,
             "$m3,$m4,$m5,$m6,$m2,$m7,$m8,$m9",
         ),
-    ]
-    .into_iter()
-    .enumerate()
+    ];
+    if args.fp8 {
+        kernels.extend([(
+            "layer_norm_f8",
+            "LayerNormF8",
+            "elementwise_f16.cpp",
+            vec!["-DVERTEX_LayerNormF16", "-DNORM_FP8"],
+            Some("layer_norm_f16.S"),
+            "",
+        )]);
+    }
+    for (index, (symbol, vertex, cpp, flags, wrapper, registers)) in kernels.into_iter().enumerate()
     {
         let assembly = args.output.join(format!("{symbol}.S"));
         let status = std::process::Command::new(args.sdk.join("bin/popc"))
@@ -95,15 +106,21 @@ fn main() -> Result<()> {
             if symbol == "add_layer_norm_f16" {
                 source += "#define NORM_WITH_ADD\n";
             }
+            if symbol == "layer_norm_f8" {
+                source += "#define NORM_FP8\n";
+            }
             source += &fs::read_to_string(args.source.join(wrapper))?
                 .replace(".L", &format!(".Lwrap{index}_"));
-            source += "\n#undef NORM_WITH_ADD\n#undef NORM_SYMBOL\n#undef NORM_VERTEX\n#undef NORM_ROWS\n#undef NORM_WIDTH\n#undef NORM_GAMMA\n#undef NORM_BETA\n#undef NORM_SHIFT\n#undef NORM_STACK\n#undef NORM_SCRATCH\n";
+            source += "\n#undef NORM_FP8\n#undef NORM_WITH_ADD\n#undef NORM_SYMBOL\n#undef NORM_VERTEX\n#undef NORM_ROWS\n#undef NORM_WIDTH\n#undef NORM_GAMMA\n#undef NORM_BETA\n#undef NORM_SHIFT\n#undef NORM_STACK\n#undef NORM_SCRATCH\n";
         } else {
             source += &format!(
                 "#define WORKER_CALL_SYMBOL {symbol}\n#define WORKER_CODELET_SYMBOL __runCodelet_{vertex}\n#define WORKER_ARGUMENTS {registers}\n#define WORKER_FRAME_BYTES 48\n#include \"{}\"\n#undef WORKER_CALL_SYMBOL\n#undef WORKER_CODELET_SYMBOL\n#undef WORKER_ARGUMENTS\n#undef WORKER_FRAME_BYTES\n",
                 device.join("worker_call.S").display()
             );
         }
+    }
+    if args.fp8 {
+        source += &format!("#include \"{}\"\n", device.join("gelu_f8.S").display());
     }
     let mut programs = Vec::new();
     let mut data = Vec::new();
@@ -115,13 +132,19 @@ fn main() -> Result<()> {
         1u32, 2, 3, 4, 6, 7, 14, 16, 24, 32, 72, 144, 288, 576, 1152, 1728,
     ] {
         for rows in [1, 3] {
-            for mode in 0..6 {
+            for mode in 0..if args.fp8 { 10 } else { 6 } {
+                if mode >= 6 && !width.is_multiple_of(8) {
+                    continue;
+                }
                 if mode >= 2 && width % 2 != 0 {
                     continue;
                 }
                 // Add, broadcast add, ordinary LN, add+LN, distributed moments,
                 // and distributed apply (equal-sized feature shards).
                 for offset in [0, 4, 8] {
+                    if mode >= 6 && offset != 0 {
+                        continue;
+                    }
                     // Offset 8 tests safe in-place F16 output; moments use
                     // a separate FP32 output allocation by definition.
                     if offset == 8 && mode == 4 {
@@ -137,7 +160,7 @@ fn main() -> Result<()> {
                             } else {
                                 rounded(
                                     (rng.f32() - 0.5) * 4.0
-                                        + if width == 14 || width == 144 {
+                                        + if mode < 8 && (width == 14 || width == 144) {
                                             100.0
                                         } else {
                                             0.0
@@ -172,6 +195,9 @@ fn main() -> Result<()> {
                             for (col, &v) in slice.iter().enumerate() {
                                 wanted.push(if mode < 2 {
                                     rounded(v + right[(row * width as usize + col) % right.len()])
+                                } else if mode >= 8 {
+                                    0.5 * v
+                                        * (1.0 + (0.7978846 * (v + 0.044715 * v.powi(3))).tanh())
                                 } else {
                                     rounded(
                                         (((v as f64 - mean)
@@ -183,6 +209,16 @@ fn main() -> Result<()> {
                                 });
                             }
                         }
+                    }
+                    if mode >= 6 && mode % 2 == 1 {
+                        let mut packed = vec![0.0; (rows * width.next_multiple_of(32)) as usize];
+                        for row in 0..rows {
+                            for col in 0..width {
+                                packed[((col / 32 * rows + row) * 32 + col % 32) as usize] =
+                                    wanted[(row * width + col) as usize];
+                            }
+                        }
+                        wanted = packed;
                     }
                     let addresses = [
                         0x60000 + offset,
@@ -215,7 +251,13 @@ fn main() -> Result<()> {
                     } else {
                         0x70008 + if mode == 4 { 0 } else { offset }
                     };
-                    let bytes_per_element = if mode == 4 { 4 } else { 2 };
+                    let bytes_per_element = if mode == 4 {
+                        4
+                    } else if mode >= 6 {
+                        1
+                    } else {
+                        2
+                    };
                     let byte_count = wanted.len() * bytes_per_element;
                     let guarded = (byte_count + 16).next_multiple_of(8);
                     let mut initial = vec![0xa5; guarded];
@@ -264,6 +306,16 @@ fn main() -> Result<()> {
                         ),
                         3 => ("add_layer_norm_f16", addresses.to_vec(), vec![rows, width]),
                         4 => ("layer_norm_moments", vec![addresses[0]], vec![rows, width]),
+                        6 | 7 => (
+                            "layer_norm_f8",
+                            vec![addresses[0], addresses[2], addresses[3]],
+                            vec![rows, width, (-4i32) as u32, mode % 2],
+                        ),
+                        8 | 9 => (
+                            "gelu_f8",
+                            vec![addresses[0]],
+                            vec![rows, width, (-4i32) as u32, mode % 2],
+                        ),
                         _ => (
                             "layer_norm_apply",
                             vec![addresses[0], addresses[2], addresses[3], 0x6c000],
@@ -343,7 +395,7 @@ fn main() -> Result<()> {
     let mut session = runtime.host_session(&application)?;
     session.start()?;
     let call = session.invoke_streaming_deferred("run", &[0; 4]).inspect_err(|_| {
-        for (tile, case) in cases.iter().enumerate().take(32) {
+        for (tile, case) in cases.iter().enumerate() {
             let physical = ipu_exchange::c600_logical_to_physical(tile as u16);
             for context in 0..=6 {
                 if runtime.device().tile_context_state(physical, context).ok() == Some(3) {
@@ -391,7 +443,13 @@ fn main() -> Result<()> {
     let mut logical = 0;
     for (case, times) in cases.iter().zip(actual[bytes..].chunks_exact(8)) {
         let (width, rows, mode, offset, count, guarded) = *case;
-        let size = if mode == 4 { 4 } else { 2 };
+        let size = if mode == 4 {
+            4
+        } else if mode >= 6 {
+            1
+        } else {
+            2
+        };
         ensure!(
             actual[at..at + 8]
                 .iter()
@@ -403,12 +461,20 @@ fn main() -> Result<()> {
             let begin = at + 8 + i * size;
             let value = if mode == 4 {
                 f32::from_le_bytes(actual[begin..begin + 4].try_into()?)
+            } else if mode >= 6 {
+                ipu_codegen::f143::f143_to_f32(actual[begin], -4)
             } else {
                 f16::from_bits(u16::from_le_bytes(actual[begin..begin + 2].try_into()?)).to_f32()
             };
             let wanted = expected[logical + i];
             ensure!(
-                value.is_finite() && (value - wanted).abs() <= 0.002 + 0.002 * wanted.abs(),
+                value.is_finite()
+                    && (value - wanted).abs()
+                        <= if mode >= 6 {
+                            0.02 + 0.13 * wanted.abs()
+                        } else {
+                            0.002 + 0.002 * wanted.abs()
+                        },
                 "mismatch: {case:?} index={i} expected={wanted} actual={value}"
             );
         }

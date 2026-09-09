@@ -44,6 +44,7 @@ impl KernelBuildPlan {
         for (symbol, extra) in [
             ("layer_norm_f16", None),
             ("add_layer_norm_f16", Some("-DNORM_WITH_ADD")),
+            ("layer_norm_f8", Some("-DNORM_FP8")),
         ] {
             if !exact_symbols.contains(symbol) {
                 continue;
@@ -88,6 +89,14 @@ impl KernelBuildPlan {
                 });
             }
         }
+        if exact_symbols.contains("gelu_f8") {
+            plan.compilations.push(KernelCompilation {
+                source: "gelu_f8.S",
+                name: "gelu_f8".into(),
+                flags: vec![],
+                retained_symbols: vec!["gelu_f8".into()],
+            });
+        }
         if exact_symbols.contains("reduce_sum_f16") {
             plan.compilations.push(KernelCompilation {
                 source: "reduce_add_f16.S",
@@ -130,6 +139,7 @@ impl KernelBuildPlan {
         }
         let has_worker_codelets = [
             "layer_norm_f16",
+            "layer_norm_f8",
             "add_layer_norm_f16",
             "layer_norm_moments",
             "layer_norm_apply",

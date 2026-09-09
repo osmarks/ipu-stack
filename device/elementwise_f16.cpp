@@ -1,11 +1,16 @@
 #include <poplar/HalfFloat.hpp>
 #include <poplar/Vertex.hpp>
 #include "elementwise_vector.hpp"
+#ifdef NORM_FP8
+#include "elementwise_fp8.hpp"
+#endif
 using namespace poplar;
 
 #ifdef VERTEX_LayerNormF16
 #ifdef NORM_WITH_ADD
 #define NORM_VERTEX AddLayerNormF16
+#elif defined(NORM_FP8)
+#define NORM_VERTEX LayerNormF8
 #else
 #define NORM_VERTEX LayerNormF16
 #endif
@@ -16,10 +21,19 @@ public:
   Input<Vector<half, VectorLayout::ONE_PTR>> right;
 #endif
   Input<Vector<half, VectorLayout::ONE_PTR>> scale, bias;
+#ifdef NORM_FP8
+  Output<Vector<unsigned char, VectorLayout::ONE_PTR>> destination;
+#else
   Output<Vector<half, VectorLayout::ONE_PTR>> destination;
+#endif
   unsigned rows, width;
   InOut<Vector<float, VectorLayout::ONE_PTR>> scratch;
   unsigned stage;
+#ifdef NORM_FP8
+  unsigned row;
+  int outputScale;
+  unsigned packed;
+#endif
   bool compute(unsigned worker) {
     auto *partials = reinterpret_cast<float2 *>(&scratch[0]);
     const half *x = &source[0];
@@ -43,7 +57,12 @@ public:
     float2 variance = {0, 0};
     for (unsigned i = 6; i < 12; ++i) variance += partials[i];
     const float inverse = normInverse((variance[0] + variance[1]) / width + 1e-6f);
+#ifdef NORM_FP8
+    setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-outputScale)});
+    normApplyFp8(x, &scale[0], &bias[0], &destination[0], width, worker, mean, inverse, row, rows, packed);
+#else
     normApply(x, r, &scale[0], &bias[0], &destination[0], width, worker, mean, inverse);
+#endif
     return true;
   }
 };

@@ -49,11 +49,15 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         }
         // GELU_TWO_PAIRS: ten v4 arithmetic instructions and two v2 tanhs
         // per four values (including the finite-range clamp).
-        TileKernelSpec::Gelu if precision == Precision::F16 => (
+        TileKernelSpec::Gelu => (
             logical,
             physical,
-            3.0,
-            "GeLU: 12 arithmetic issue slots / 4 elements",
+            if matches!(precision, Precision::F8F143 { .. }) {
+                3.5
+            } else {
+                3.0
+            },
+            "GeLU arithmetic and optional FP8 conversion",
         ),
         TileKernelSpec::LayerNormMoments => {
             let elements: u64 = run.inputs[0].views[0]
@@ -83,7 +87,13 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         TileKernelSpec::LayerNorm => (
             logical,
             physical,
-            statistics_issue_slots + 2.0,
+            statistics_issue_slots
+                + 2.0
+                + if matches!(precision, Precision::F8F143 { .. }) {
+                    0.5
+                } else {
+                    0.0
+                },
             "layernorm: FP32 statistics and affine arithmetic",
         ),
         TileKernelSpec::Add => (

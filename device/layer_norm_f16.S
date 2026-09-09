@@ -10,6 +10,16 @@
 #define NORM_SHIFT 1
 #define NORM_STACK 160
 #define NORM_SCRATCH 64
+#elif defined(NORM_FP8)
+#define NORM_SYMBOL layer_norm_f8
+#define NORM_VERTEX __runCodelet_LayerNormF8
+#define NORM_ROWS $m6
+#define NORM_WIDTH $m7
+#define NORM_GAMMA $m4
+#define NORM_BETA $m5
+#define NORM_SHIFT 0
+#define NORM_STACK 160
+#define NORM_SCRATCH 64
 #else
 #define NORM_SYMBOL layer_norm_f16
 #define NORM_VERTEX __runCodelet_LayerNormF16
@@ -44,6 +54,11 @@ NORM_SYMBOL:
 	st32 NORM_WIDTH, $m11, $m15, (5 + NORM_SHIFT)
 	add $m0, $m11, NORM_SCRATCH
 	st32 $m0, $m11, $m15, (6 + NORM_SHIFT)
+#ifdef NORM_FP8
+	st32 $m15, $m11, $m15, 8
+	st32 $m8, $m11, $m15, 9
+	st32 $m9, $m11, $m15, 10
+#endif
 	setzi $m0, NORM_VERTEX
 .Lrow:
 	setzi $m1, 0
@@ -58,9 +73,15 @@ NORM_SYMBOL:
 	ld32 $m3, $m11, $m15, 0
 	add $m3, $m3, $m2
 	st32 $m3, $m11, $m15, 0
+#ifdef NORM_FP8
+	ld32 $m3, $m11, $m15, 8
+	add $m3, $m3, 1
+	st32 $m3, $m11, $m15, 8
+#else
 	ld32 $m3, $m11, $m15, (3 + NORM_SHIFT)
 	add $m3, $m3, $m2
 	st32 $m3, $m11, $m15, (3 + NORM_SHIFT)
+#endif
 #ifdef NORM_WITH_ADD
 	ld32 $m3, $m11, $m15, 1
 	add $m3, $m3, $m2

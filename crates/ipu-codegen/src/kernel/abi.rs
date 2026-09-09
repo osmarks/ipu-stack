@@ -44,6 +44,9 @@ pub enum ScalarValue {
     CastPanelRows,
     CastSourceElements,
     CastRowMajorColumns,
+    InputRows,
+    OutputScale,
+    PackedOutput,
     InitialBlock,
     FinalBlock,
     WordsPerWorker,
@@ -72,6 +75,18 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
         .iter()
         .map(|argument| match argument {
             ScalarValue::ElementCount => Ok(count),
+            ScalarValue::InputRows => {
+                Ok(scalar_source_elements(run)? / input_matrix_extent(run, false, true)?)
+            }
+            ScalarValue::OutputScale => {
+                fp8_scale_argument(match run.requirements.output.format.precision {
+                    Precision::F8F143 { scale_exponent } => i32::from(scale_exponent),
+                    _ => 0,
+                })
+            }
+            ScalarValue::PackedOutput => Ok(u32::from(
+                run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left),
+            )),
             ScalarValue::FlattenedRows => Ok(count / matrix_extent(run, true, true)?),
             ScalarValue::QueryRows => gemm_rows(run),
             ScalarValue::KeyRows => match &run.kernel {
@@ -292,6 +307,17 @@ pub fn tile_kernel_abi(
                     ScalarValue::FeaturePartitions,
                 ],
             ),
+            TileKernelSpec::LayerNorm if matches!(precision, Precision::F8F143 { .. }) => (
+                KernelSymbols::Exact("layer_norm_f8"),
+                KernelAvailability::Implemented,
+                3,
+                &[
+                    ScalarValue::InputRows,
+                    ScalarValue::InputColumns,
+                    ScalarValue::OutputScale,
+                    ScalarValue::PackedOutput,
+                ],
+            ),
             TileKernelSpec::LayerNorm => (
                 KernelSymbols::Exact("layer_norm_f16"),
                 if precision == Precision::F16 {
@@ -313,6 +339,17 @@ pub fn tile_kernel_abi(
                 KernelAvailability::Implemented,
                 4,
                 &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+            ),
+            TileKernelSpec::Gelu if matches!(precision, Precision::F8F143 { .. }) => (
+                KernelSymbols::Exact("gelu_f8"),
+                KernelAvailability::Implemented,
+                1,
+                &[
+                    ScalarValue::InputRows,
+                    ScalarValue::InputColumns,
+                    ScalarValue::OutputScale,
+                    ScalarValue::PackedOutput,
+                ],
             ),
             TileKernelSpec::Gelu => {
                 let symbol = gelu_symbol(requirements).unwrap_or("unsupported_gelu");
@@ -578,10 +615,43 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::RequirementMismatch);
         }
     }
+    let fp8_producer = matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::LayerNorm)
+        && matches!(
+            run.requirements.output.format.precision,
+            Precision::F8F143 { .. }
+        );
+    if fp8_producer {
+        let input = &run.inputs[0].views[0];
+        let width = input_matrix_extent(run, false, true)?;
+        let columns = matrix_extent(run, false, true)?;
+        let packed =
+            run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left);
+        if width == 0
+            || !width.is_multiple_of(4)
+            || input_matrix_extent(run, true, true)? != width
+            || (!packed && run.requirements.output.format.layout.order != ElementOrder::RowMajor)
+            || columns
+                != if packed {
+                    width.next_multiple_of(32)
+                } else {
+                    width
+                }
+            || input.extents.len() != run.output.extents.len()
+            || input.extents[..input.extents.len() - 1]
+                != run.output.extents[..run.output.extents.len() - 1]
+            || run.requirements.inputs.iter().any(|r| {
+                r.format.precision != Precision::F16
+                    || r.format.layout.order != ElementOrder::RowMajor
+            })
+        {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+    }
     if matches!(
         kernel,
         TileKernelSpec::LayerNorm | TileKernelSpec::AddLayerNorm
-    ) {
+    ) && !fp8_producer
+    {
         let width = matrix_extent(run, true, true)?;
         if width == 0 || !width.is_multiple_of(2) || matrix_extent(run, false, true)? != width {
             return Err(KernelAbiError::RequirementMismatch);
@@ -649,7 +719,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::RequirementMismatch);
         }
     }
-    if matches!(kernel, TileKernelSpec::Gelu) {
+    if matches!(kernel, TileKernelSpec::Gelu) && !fp8_producer {
         let KernelSymbols::Exact(symbol) = abi.symbols else {
             return Err(KernelAbiError::RequirementMismatch);
         };

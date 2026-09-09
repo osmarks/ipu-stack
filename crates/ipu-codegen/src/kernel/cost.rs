@@ -276,6 +276,17 @@ pub(crate) fn f16_layernorm_apply_cycles(rows: u64, width: u64, parts: u16) -> u
     )
 }
 
+/// Pair conversion stays in ARF and emits complete FP8 words. Packed LN
+/// needs separate address calculations when a tile owns several rows.
+pub(crate) fn fp8_elementwise_cycles(gelu: bool, rows: u64, width: u64, packed: bool) -> u64 {
+    if gelu {
+        132 + rows * (372 + width.div_ceil(192) * 1098)
+    } else {
+        f16_layernorm_cycles(rows, width, false)
+            + rows * (270 + width.div_ceil(24) * if packed && rows > 1 { 162 } else { 6 })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

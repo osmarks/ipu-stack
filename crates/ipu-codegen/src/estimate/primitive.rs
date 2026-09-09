@@ -82,6 +82,20 @@ pub(crate) fn kernel_cycles<'a>(
         .widths()
         .take(output.rank().saturating_sub(1))
         .fold(1u64, |n, width| n.saturating_mul(u64::from(width)));
+    if matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::LayerNorm)
+        && matches!(output.format().precision, Precision::F8F143 { .. })
+    {
+        let Some(input) = inputs(0) else {
+            return u64::MAX;
+        };
+        let width = u64::from(input.trailing_dimension(0).unwrap_or(0));
+        return crate::kernel::cost::fp8_elementwise_cycles(
+            matches!(kernel, TileKernelSpec::Gelu),
+            input.elements().checked_div(width).unwrap_or(0),
+            width,
+            output.format().layout.order == ElementOrder::Amp(crate::AmpOrder::Left),
+        );
+    }
     let work = match kernel {
         TileKernelSpec::Gemm {
             multiply,

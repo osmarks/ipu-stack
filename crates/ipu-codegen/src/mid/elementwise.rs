@@ -24,7 +24,7 @@ fn fuse_region(
     values: &[MidValue],
     required: &[MidValueId],
 ) -> bool {
-    let mut changed = false;
+    let mut changed = fuse_fp8_outputs(operations, values, required);
     for operation in &mut *operations {
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
             changed |= fuse_region(&mut repeat.body.operations, values, &repeat.body.yields);
@@ -161,6 +161,136 @@ fn fuse_region(
     changed
 }
 
+// A producer may write a cast's explicit result when its F16 intermediate
+// has no other readers. Keep the separate path whenever it costs less.
+fn fuse_fp8_outputs(
+    operations: &mut Vec<MidOperation>,
+    values: &[MidValue],
+    required: &[MidValueId],
+) -> bool {
+    let mut removed = BTreeSet::new();
+    for index in 0..operations.len() {
+        let cast = &operations[index];
+        let Some(plan) = cast.conversion_plan() else {
+            continue;
+        };
+        if plan.strategy != ConversionStrategy::LocalKernel
+            || plan.input.format.precision != Precision::F16
+            || !matches!(plan.output.format.precision, Precision::F8F143 { .. })
+            || cast.inputs.len() != 1
+            || cast.results.len() != 1
+        {
+            continue;
+        }
+        let intermediate = cast.inputs[0];
+        if required.contains(&intermediate)
+            || operations
+                .iter()
+                .filter(|op| op.read_values().any(|v| *v == intermediate))
+                .count()
+                != 1
+        {
+            continue;
+        }
+        let Some(previous) = operations[..index]
+            .iter()
+            .rposition(|op| op.results == [intermediate])
+        else {
+            continue;
+        };
+        if removed.contains(&previous) {
+            continue;
+        }
+        let producer = &operations[previous];
+        let MidOperationKind::Primitive(Primitive::Compute {
+            kernel,
+            operands,
+            product: None,
+            ..
+        }) = &producer.kind
+        else {
+            continue;
+        };
+        if !matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::LayerNorm)
+            || operands.iter().any(|window| !window.0.is_empty())
+        {
+            continue;
+        }
+        let input = &values[intermediate.index() as usize];
+        let output = &values[cast.results[0].index() as usize];
+        if input.tile_offset != output.tile_offset
+            || input.tensor_type.format.layout.order != ElementOrder::RowMajor
+        {
+            continue;
+        }
+        let expected = if output.tensor_type.format.layout.order == ElementOrder::RowMajor {
+            Some(input.tensor_type.format.layout.clone())
+        } else {
+            input
+                .tensor_type
+                .fp8_producer_layout(&output.tensor_type.format)
+        };
+        if expected.as_ref() != Some(&output.tensor_type.format.layout)
+            || input
+                .tensor_type
+                .format
+                .layout
+                .resolve(&input.tensor_type.shape)
+                .ok()
+                .and_then(|resolved| {
+                    resolved
+                        .axes()
+                        .and_then(|a| a.last())
+                        .map(|a| a.extents_are_multiple_of(4))
+                })
+                != Some(true)
+        {
+            continue;
+        }
+        // Parameter copies may intervene, provided they cannot overwrite inputs.
+        let groups = producer
+            .inputs
+            .iter()
+            .map(|v| values[v.index() as usize].storage_group)
+            .collect::<BTreeSet<_>>();
+        if operations[previous + 1..index].iter().any(|op| {
+            !matches!(op.kind, MidOperationKind::Primitive(Primitive::Copy { .. }))
+                || op
+                    .results
+                    .iter()
+                    .any(|v| groups.contains(&values[v.index() as usize].storage_group))
+        }) {
+            continue;
+        }
+        let mut replacement = producer.clone();
+        replacement.results = cast.results.clone();
+        replacement.kind = MidOperationKind::Primitive(Primitive::Compute {
+            kernel: kernel.clone(),
+            operands: operands.clone(),
+            product: None,
+            reuse_input: None,
+        });
+        let prices = crate::estimate::operation_cost(producer, values)
+            .zip(crate::estimate::operation_cost(cast, values))
+            .zip(crate::estimate::operation_cost(&replacement, values));
+        if prices.is_none_or(|(((a, _, _), (b, _, _)), (c, _, _))| {
+            c.total >= a.total.saturating_add(b.total)
+        }) {
+            continue;
+        }
+        operations[index] = replacement;
+        removed.insert(previous);
+    }
+    let changed = !removed.is_empty();
+    let mut index = 0;
+    operations.retain(|_| {
+        let keep = !removed.contains(&index);
+        index += 1;
+        keep
+    });
+    changed
+}
+
 // Shared with the optimistic regional search: known fusion is not a missing kernel.
 pub(super) fn compatible_fusion(
     kernel: &TileKernelSpec,
@@ -191,6 +321,88 @@ pub(super) fn compatible_fusion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fp8_output_fusion_preserves_other_users_and_prices_packed_rows() {
+        for norm in [false, true] {
+            for rows in [1, 3] {
+                let source = TensorType::new([rows, 1152], Precision::F16, Layout::row_sharded(1));
+                let mut output = source.clone();
+                output.format.precision = Precision::F8F143 { scale_exponent: -4 };
+                output.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+                let mut values = vec![];
+                for tensor in [
+                    source.clone(),
+                    source.clone(),
+                    source.clone(),
+                    source.clone(),
+                    output.clone(),
+                ] {
+                    let id = MidValueId(values.len() as u32);
+                    values.push(MidValue {
+                        id,
+                        tile_offset: 0,
+                        tensor_type: tensor,
+                        origin: ValueId::from_index(0),
+                        storage_group: id,
+                    });
+                }
+                let inputs = if norm {
+                    vec![MidValueId(0), MidValueId(1), MidValueId(2)]
+                } else {
+                    vec![MidValueId(0)]
+                };
+                let producer = MidOperation {
+                    source: None,
+                    results: vec![MidValueId(3)],
+                    kind: MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: if norm {
+                            TileKernelSpec::LayerNorm
+                        } else {
+                            TileKernelSpec::Gelu
+                        },
+                        operands: vec![OperandWindow::default(); inputs.len()],
+                        product: None,
+                        reuse_input: None,
+                    }),
+                    inputs,
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                };
+                let cast = MidOperation {
+                    source: None,
+                    inputs: vec![MidValueId(3)],
+                    results: vec![MidValueId(4)],
+                    kind: MidOperationKind::Convert(ConversionPlan {
+                        input: OperandRequirement::new(source.format, 8),
+                        output: OperandRequirement::new(output.format, 8),
+                        strategy: ConversionStrategy::LocalKernel,
+                    }),
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                };
+                let mut program = MidProgram {
+                    tile_count: 1,
+                    values,
+                    operations: vec![producer, cast],
+                    outputs: vec![MidValueId(4)],
+                    ..MidProgram::default()
+                };
+                let fused = program.with_elementwise_fusions();
+                assert_eq!(fused.is_some(), !norm || rows == 1);
+                if let Some(fused) = fused {
+                    let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
+                    assert_eq!(low.kernel_runs.len(), 1);
+                    crate::validate_kernel_run(&low.kernel_runs[0]).unwrap();
+                    let build = crate::KernelBuildPlan::from_program(&low).unwrap();
+                    let call = build.call(&low.kernel_runs[0]).unwrap();
+                    assert_eq!(call.arguments, vec![rows, 1152, (-4i32) as u32, 1]);
+                }
+                program.outputs.push(MidValueId(3));
+                assert!(program.with_elementwise_fusions().is_none());
+            }
+        }
+    }
+
     #[test]
     fn fusion_preserves_live_add_results_and_matches_kernel_contracts() {
         // Short rows retain a launch-saving fused alternative. For wide

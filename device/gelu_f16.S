@@ -94,6 +94,8 @@
 	st32 $a3, $m2, $m15, 7
 	.endm
 
+
+#ifndef GELU_MACROS_ONLY
 	.macro GELU_ENTRY symbol, worker
 	.section .text.\symbol,"ax",@progbits
 	.globl \symbol
@@ -213,3 +215,5 @@
 	brnz $m7, .Lgelu_row
 #endif
 	exitz $m15
+
+#endif
