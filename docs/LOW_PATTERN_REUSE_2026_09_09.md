@@ -86,5 +86,7 @@ Keep final assembly outside that cache:
 Cache the corresponding grouped preparation result or assemble cached preparation
 fragments through the existing rules; do not cache an operation's final phases
 using only its MidOperation and tensor shapes. A safe implementation therefore
-needs an explicit fragment boundary first. No production graph cache is enabled
-by these changes. Kernel-contract sharing is the implemented, narrower reuse.
+needs an explicit fragment boundary first. This initial change enabled only
+kernel-contract sharing. The subsequent [copy-cache evaluation](LOW_FRAGMENT_CACHE_2026_09_09.md)
+adds narrower production caches and records why whole-compute templates were
+not retained.

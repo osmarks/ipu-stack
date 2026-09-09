@@ -7,8 +7,10 @@ pub struct ExpansionBenchmark {
     pub planning_ms: f64,
     pub retained_finalists: usize,
     pub finalists: Vec<ExpansionTiming>,
+    /// Cache entries, hits and misses, respectively.
+    pub fragment_cache: (usize, u64, u64),
+    pub copy_plan_cache: (usize, u64, u64),
     /// Matching selections are opportunities, not validated reusable graph fragments.
-    pub fragment_cache: [(usize, u64, u64); 2],
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
 }
 
@@ -43,6 +45,7 @@ pub fn benchmark_mid_expansion(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     limit: usize,
+    cache_enabled: bool,
 ) -> PackageBuildResult<ExpansionBenchmark> {
     let start = Instant::now();
     let plans = lower_finalists(
@@ -55,7 +58,11 @@ pub fn benchmark_mid_expansion(
     )?;
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut finalists = Vec::new();
-    let cache = Arc::new(crate::low::expand::ExpansionCache::default());
+    let cache = Arc::new(if cache_enabled {
+        crate::low::expand::ExpansionCache::default()
+    } else {
+        crate::low::expand::ExpansionCache::disabled()
+    });
     let mut selections = std::collections::BTreeMap::<
         &'static str,
         (usize, std::collections::BTreeSet<String>),
@@ -161,6 +168,7 @@ pub fn benchmark_mid_expansion(
         retained_finalists: plans.len(),
         finalists,
         fragment_cache: cache.stats(),
+        copy_plan_cache: cache.plan_stats(),
         selection_reuse: selections
             .into_iter()
             .map(|(kind, (occurrences, keys))| {

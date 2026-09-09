@@ -106,6 +106,9 @@ struct Arguments {
     /// Maximum expansion samples after search; zero measures every retained plan.
     #[arg(long, default_value_t = 4, requires = "benchmark_expansion")]
     benchmark_expansion_limit: usize,
+    /// Disable low-fragment caching for an expansion benchmark comparison.
+    #[arg(long, requires = "benchmark_expansion")]
+    benchmark_expansion_uncached: bool,
     /// Capture an expanded finalist before scheduling, linking, or hardware execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule"])]
     capture_exchange_schedule: Option<PathBuf>,
@@ -1046,6 +1049,7 @@ fn main() -> Result<()> {
             &graph,
             &package_config.pipeline,
             arguments.benchmark_expansion_limit,
+            !arguments.benchmark_expansion_uncached,
         )?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
         return Ok(());

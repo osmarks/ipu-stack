@@ -5,7 +5,7 @@ use super::*;
 use crate::{OperandWindow, Primitive, ProductAxes};
 
 impl TileGraphBuilder {
-    pub(super) fn build_primitive_uncached(
+    pub(super) fn build_primitive(
         &mut self,
         operation: &MidOperation,
         primitive: &Primitive,
@@ -136,7 +136,7 @@ impl TileGraphBuilder {
         self.narrow_view(source, &ranges)
     }
 
-    pub(super) fn product_calls(
+    fn product_calls(
         &mut self,
         provenance: WorkProvenance,
         tile: u16,

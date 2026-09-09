@@ -419,21 +419,8 @@ impl TileGraphBuilder {
         mappings: &[(ShardView, ShardView)],
         destination: BlockValueId,
         copy_order: CopyOrder,
-    ) -> ExpansionResult<crate::CopyPlan> {
-        let shard = &self.shards[destination.index() as usize];
-        let mappings = mappings
-            .iter()
-            .map(|(source, destination)| crate::CopyMapping {
-                source: self.shards[source.shard.index() as usize].storage(),
-                source_extents: &source.extents,
-                destination_extents: &destination.extents,
-            })
-            .collect::<Vec<_>>();
-        Ok(crate::CopyPlan::for_destination(
-            &shard.tensor_type,
-            &shard.extents,
-            &mappings,
-            copy_order,
-        )?)
+    ) -> ExpansionResult<Arc<crate::CopyPlan>> {
+        self.cache
+            .plan(&self.shards, mappings, destination, copy_order)
     }
 }

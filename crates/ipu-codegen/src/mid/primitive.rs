@@ -4,12 +4,12 @@ use super::*;
 
 /// A rectangular operand window in global tensor coordinates. Omitted axes
 /// retain their full extent. Windows do not allocate temporary tensors.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OperandWindow(pub Vec<(u16, u32, u32)>);
 
 /// Matrix axes used by a local product after the distributed operands have
 /// been materialized. Blocking is in the selected GEMM kernel specification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProductAxes {
     pub left_inner: TensorAxis,
     pub right_inner: TensorAxis,

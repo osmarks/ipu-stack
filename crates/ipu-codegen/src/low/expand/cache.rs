@@ -1,26 +1,31 @@
-//! Per-build caches for pure, relative low fragments. Phase assembly, alias
+//! Per-build caches for relative copy fragments and copy preparation plans.
+//! Phase assembly, alias
 //! mutation and deferred materialization stay in the caller.
 use super::*;
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 
 const MAX_ENTRIES: usize = 32768;
 
 struct Memo<K, V> {
-    entries: Mutex<(HashMap<K, Arc<V>>, u64, u64)>,
+    entries: Mutex<(HashMap<u64, Vec<(K, Arc<V>)>>, u64, u64, usize)>,
 }
 impl<K, V> Default for Memo<K, V> {
     fn default() -> Self {
         Self {
-            entries: Mutex::new((HashMap::new(), 0, 0)),
+            entries: Mutex::new((HashMap::new(), 0, 0, 0)),
         }
     }
 }
-impl<K: Eq + Hash, V> Memo<K, V> {
-    fn get(&self, key: &K) -> Option<Arc<V>> {
+impl<K: Eq, V> Memo<K, V> {
+    fn get(&self, hash: u64, matches: impl Fn(&K) -> bool) -> Option<Arc<V>> {
         let mut state = self.entries.lock().unwrap();
-        let found = state.0.get(key).cloned();
+        let found = state
+            .0
+            .get(&hash)
+            .and_then(|bucket| bucket.iter().find(|(key, _)| matches(key)))
+            .map(|(_, value)| Arc::clone(value));
         if found.is_some() {
             state.1 += 1;
         } else {
@@ -28,25 +33,25 @@ impl<K: Eq + Hash, V> Memo<K, V> {
         }
         found
     }
+    fn insert(&self, hash: u64, key: K, value: Arc<V>, limit: usize) {
+        let mut state = self.entries.lock().unwrap();
+        if state.3 < limit {
+            let bucket = state.0.entry(hash).or_default();
+            if !bucket.iter().any(|(existing, _)| *existing == key) {
+                bucket.push((key, value));
+                state.3 += 1;
+            }
+        }
+    }
+    fn has_capacity(&self, limit: usize) -> bool {
+        self.entries.lock().unwrap().3 < limit
+    }
     fn stats(&self) -> (usize, u64, u64) {
         let state = self.entries.lock().unwrap();
-        (state.0.len(), state.1, state.2)
+        (state.3, state.1, state.2)
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Geometry {
-    tensor: TensorType,
-    extents: Vec<ShardExtent>,
-}
-impl Geometry {
-    fn of(shard: &BlockValue) -> Self {
-        Self {
-            tensor: shard.tensor_type.clone(),
-            extents: shard.extents.clone(),
-        }
-    }
-}
 #[derive(PartialEq, Eq, Hash)]
 struct CopyGeometry {
     precision: Precision,
@@ -95,40 +100,133 @@ struct CopyKey {
     same_buffer: bool,
 }
 
-struct ComputeFragment {
-    primitive: crate::Primitive,
-    boundary: Vec<(u16, Geometry)>,
-    values: Vec<Vec<usize>>,
-    runs: Vec<KernelRun>,
-    aliases: Vec<(usize, usize)>,
+#[derive(PartialEq, Eq, Hash)]
+struct PlanSource {
+    format: TensorFormat,
+    allocation: Vec<ShardExtent>,
+    source: Vec<ShardExtent>,
+    destination: Vec<ShardExtent>,
+}
+#[derive(PartialEq, Eq, Hash)]
+struct PlanKey {
+    destination: TensorType,
+    allocation: Vec<ShardExtent>,
+    mappings: Vec<PlanSource>,
+    order: CopyOrder,
 }
 
 pub(crate) struct ExpansionCache {
     enabled: bool,
     copies: Memo<CopyKey, Vec<CopyOperation<()>>>,
-    computes: Memo<u64, Vec<Arc<ComputeFragment>>>,
+    plans: Memo<PlanKey, crate::CopyPlan>,
 }
 impl Default for ExpansionCache {
     fn default() -> Self {
         Self {
             enabled: true,
             copies: Memo::default(),
-            computes: Memo::default(),
+            plans: Memo::default(),
         }
     }
 }
 impl ExpansionCache {
-    #[cfg(test)]
-    pub(super) fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         Self {
             enabled: false,
             ..Self::default()
         }
     }
 
-    pub(crate) fn stats(&self) -> [(usize, u64, u64); 2] {
-        [self.copies.stats(), self.computes.stats()]
+    pub(crate) fn stats(&self) -> (usize, u64, u64) {
+        self.copies.stats()
     }
+    pub(crate) fn plan_stats(&self) -> (usize, u64, u64) {
+        self.plans.stats()
+    }
+
+    pub(super) fn plan(
+        &self,
+        shards: &[BlockValue],
+        mappings: &[(ShardView, ShardView)],
+        destination: BlockValueId,
+        order: CopyOrder,
+    ) -> ExpansionResult<Arc<crate::CopyPlan>> {
+        let shard = &shards[destination.index() as usize];
+        let generate = || {
+            let mappings = mappings
+                .iter()
+                .map(|(source, destination)| crate::CopyMapping {
+                    source: shards[source.shard.index() as usize].storage(),
+                    source_extents: &source.extents,
+                    destination_extents: &destination.extents,
+                })
+                .collect::<Vec<_>>();
+            crate::CopyPlan::for_destination(&shard.tensor_type, &shard.extents, &mappings, order)
+        };
+        if !self.enabled
+            || (order != CopyOrder::Semantic
+                && mappings.len() == 1
+                && mappings[0].1.extents == shard.extents)
+        {
+            return Ok(Arc::new(generate()?));
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        shard.tensor_type.hash(&mut hash);
+        shard.extents.hash(&mut hash);
+        order.hash(&mut hash);
+        mappings.len().hash(&mut hash);
+        for (source, destination) in mappings {
+            let input = &shards[source.shard.index() as usize];
+            input.tensor_type.format.hash(&mut hash);
+            input.extents.hash(&mut hash);
+            source.extents.hash(&mut hash);
+            destination.extents.hash(&mut hash);
+        }
+        let hash = hash.finish();
+        if let Some(plan) = self.plans.get(hash, |key| {
+            key.destination == shard.tensor_type
+                && key.allocation == shard.extents
+                && key.order == order
+                && key.mappings.len() == mappings.len()
+                && key
+                    .mappings
+                    .iter()
+                    .zip(mappings)
+                    .all(|(key, (source, destination))| {
+                        let input = &shards[source.shard.index() as usize];
+                        key.format == input.tensor_type.format
+                            && key.allocation == input.extents
+                            && key.source == source.extents
+                            && key.destination == destination.extents
+                    })
+        }) {
+            return Ok(plan);
+        }
+        if !self.plans.has_capacity(MAX_ENTRIES) {
+            return Ok(Arc::new(generate()?));
+        }
+        let key = PlanKey {
+            destination: shard.tensor_type.clone(),
+            allocation: shard.extents.clone(),
+            order,
+            mappings: mappings
+                .iter()
+                .map(|(source, destination)| {
+                    let shard = &shards[source.shard.index() as usize];
+                    PlanSource {
+                        format: shard.tensor_type.format.clone(),
+                        allocation: shard.extents.clone(),
+                        source: source.extents.clone(),
+                        destination: destination.extents.clone(),
+                    }
+                })
+                .collect(),
+        };
+        let plan = Arc::new(generate()?);
+        self.plans.insert(hash, key, Arc::clone(&plan), MAX_ENTRIES);
+        Ok(plan)
+    }
+
     pub(super) fn copy(
         &self,
         shards: &[BlockValue],
@@ -173,188 +271,83 @@ impl ExpansionCache {
             order,
             same_buffer: source.shard == destination.shard,
         };
-        if let Some(copies) = self.copies.get(&key) {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hash);
+        let hash = hash.finish();
+        if let Some(copies) = self.copies.get(hash, |existing| *existing == key) {
             return Ok(copies);
         }
         let copies = generate()?;
         // Generation is outside the lock, so unrelated finalists do not serialize.
         let result = Arc::new(copies);
-        let mut state = self.copies.entries.lock().unwrap();
-        if state.0.len() < MAX_ENTRIES {
-            state.0.entry(key).or_insert_with(|| Arc::clone(&result));
-        }
+        self.copies
+            .insert(hash, key, Arc::clone(&result), MAX_ENTRIES);
         Ok(result)
     }
 }
 
-impl TileGraphBuilder {
-    pub(super) fn build_primitive(
-        &mut self,
-        operation: &MidOperation,
-        primitive: &crate::Primitive,
-        body: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        use std::hash::{Hash, Hasher};
-        let crate::Primitive::Compute {
-            kernel,
-            operands,
-            product,
-            reuse_input,
-        } = primitive
-        else {
-            return self.build_primitive_uncached(operation, primitive, body);
-        };
-        if !self.cache.enabled {
-            return self.build_primitive_uncached(operation, primitive, body);
-        }
-        let mut bindings = Vec::new();
-        let mut slots = HashMap::new();
-        let mut values = Vec::new();
-        for &value in operation.inputs.iter().chain(&operation.results) {
-            let mut ids = Vec::new();
-            for &id in self.value_shards(value)? {
-                // Leave deferred materialization to normal lowering. It can
-                // redirect operands to buffers outside this operation boundary.
-                if self.materialized_views.contains_key(&id) {
-                    return self.build_primitive_uncached(operation, primitive, body);
-                }
-                let slot = *slots.entry(id).or_insert_with(|| {
-                    bindings.push(id);
-                    bindings.len() - 1
-                });
-                ids.push(slot);
-            }
-            values.push(ids);
-        }
-        // Hash borrowed geometry; allocate a stored boundary only on a miss.
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        kernel.hash(&mut hash);
-        operands.hash(&mut hash);
-        product.hash(&mut hash);
-        reuse_input.hash(&mut hash);
-        values.hash(&mut hash);
-        for &id in &bindings {
-            let shard = &self.shards[id.index() as usize];
-            shard.tile.hash(&mut hash);
-            shard.tensor_type.hash(&mut hash);
-            shard.extents.hash(&mut hash);
-        }
-        let key = hash.finish();
-        let bucket = self.cache.computes.get(&key);
-        let hit = bucket.as_ref().and_then(|bucket| {
-            bucket.iter().find(|entry| {
-                entry.primitive == *primitive
-                    && entry.values == values
-                    && entry.boundary.len() == bindings.len()
-                    && entry
-                        .boundary
-                        .iter()
-                        .zip(&bindings)
-                        .all(|((tile, geometry), id)| {
-                            let shard = &self.shards[id.index() as usize];
-                            *tile == shard.tile
-                                && geometry.tensor == shard.tensor_type
-                                && geometry.extents == shard.extents
-                        })
-            })
-        });
-        let provenance = operation_provenance(operation);
-        if let Some(fragment) = hit {
-            for &(output, input) in &fragment.aliases {
-                self.shards[bindings[output].index() as usize].definition =
-                    ShardDefinition::WritableAlias(bindings[input]);
-            }
-            let mut metadata = HashMap::new();
-            for template in &fragment.runs {
-                let mut run = template.clone();
-                for view in run
-                    .inputs
-                    .iter_mut()
-                    .flat_map(|operand| &mut operand.views)
-                    .chain(std::iter::once(&mut run.output))
-                {
-                    view.shard = bindings[view.shard.index() as usize];
-                }
-                run.metadata = Arc::clone(
-                    metadata
-                        .entry(Arc::as_ptr(&template.metadata) as usize)
-                        .or_insert_with(|| {
-                            if let Some(m) = self.kernel_metadata.iter().find(|m| {
-                                m.provenance == provenance
-                                    && m.kernel == template.kernel
-                                    && m.requirements == template.requirements
-                            }) {
-                                Arc::clone(m)
-                            } else {
-                                let m = Arc::new(KernelRunMetadata {
-                                    provenance,
-                                    kernel: template.kernel.clone(),
-                                    requirements: template.requirements.clone(),
-                                });
-                                self.kernel_metadata.push(Arc::clone(&m));
-                                m
-                            }
-                        }),
-                );
-                self.append_single_kernel(
-                    body,
-                    self.shards[run.output.shard.index() as usize].tile,
-                    run,
-                )?;
-            }
-            return Ok(());
-        }
-        let start = self.kernel_runs.len();
-        self.build_primitive_uncached(operation, primitive, body)?;
-        let mut aliases = Vec::new();
-        if reuse_input.is_some() {
-            for &output in self.value_shards(operation.results[0])? {
-                let shard = &self.shards[output.index() as usize];
-                if shard.extents.iter().any(|e| e.start == e.physical_end) {
-                    continue;
-                }
-                let ShardDefinition::WritableAlias(input) = shard.definition else {
-                    unreachable!("compute reuses the selected input")
-                };
-                aliases.push((slots[&output], slots[&input]));
-            }
-        }
-        let mut runs = self.kernel_runs[start..].to_vec();
-        for run in &mut runs {
-            for view in run
-                .inputs
-                .iter_mut()
-                .flat_map(|operand| &mut operand.views)
-                .chain(std::iter::once(&mut run.output))
-            {
-                view.shard = BlockValueId(slots[&view.shard] as u32);
-            }
-        }
-        let fragment = Arc::new(ComputeFragment {
-            primitive: primitive.clone(),
-            values,
-            runs,
-            aliases,
-            boundary: bindings
-                .iter()
-                .map(|id| {
-                    let s = &self.shards[id.index() as usize];
-                    (s.tile, Geometry::of(s))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memo_checks_full_keys_and_bounds_entries_even_on_hash_collisions() {
+        let memo = Memo::default();
+        memo.insert(7, 1, Arc::new(10), 2);
+        memo.insert(7, 2, Arc::new(20), 2);
+        memo.insert(7, 3, Arc::new(30), 2);
+        assert_eq!(*memo.get(7, |key| *key == 1).unwrap(), 10);
+        assert_eq!(*memo.get(7, |key| *key == 2).unwrap(), 20);
+        assert!(memo.get(7, |key| *key == 3).is_none());
+        assert_eq!(memo.stats(), (2, 2, 1));
+    }
+
+    #[test]
+    fn copy_fragments_share_relative_geometry_across_tiles_and_origins() {
+        let cache = ExpansionCache::default();
+        let mut first = None;
+        for shift in [0, 16] {
+            let shards = (0..2)
+                .map(|id| BlockValue {
+                    id: BlockValueId(id),
+                    tile: id as u16,
+                    tensor_type: TensorType::new([2, 64], Precision::F16, Layout::row_sharded(1)),
+                    extents: vec![
+                        ShardExtent {
+                            axis: 0,
+                            start: 0,
+                            logical_end: 2,
+                            physical_end: 2,
+                        },
+                        ShardExtent {
+                            axis: 1,
+                            start: shift,
+                            logical_end: shift + 8,
+                            physical_end: shift + 8,
+                        },
+                    ],
+                    definition: ShardDefinition::Staging,
                 })
-                .collect(),
-        });
-        let mut state = self.cache.computes.entries.lock().unwrap();
-        if state.0.len() < 256 {
-            let bucket = state.0.entry(key).or_insert_with(|| Arc::new(Vec::new()));
-            // Concurrent misses may have computed the same immutable fragment.
-            if !bucket.iter().any(|entry| {
-                entry.primitive == fragment.primitive
-                    && entry.values == fragment.values
-                    && entry.boundary == fragment.boundary
-            }) {
-                Arc::make_mut(bucket).push(fragment);
+                .collect::<Vec<_>>();
+            let view = |id: usize| {
+                let mut extents = shards[id].extents.clone();
+                extents[1].start += 2;
+                extents[1].logical_end -= 2;
+                extents[1].physical_end -= 2;
+                ShardView {
+                    shard: BlockValueId(id as u32),
+                    extents,
+                }
+            };
+            let result = cache
+                .copy(&shards, &view(0), &view(1), CopyOrder::Semantic)
+                .unwrap();
+            if let Some(first) = &first {
+                assert!(Arc::ptr_eq(first, &result));
+            } else {
+                first = Some(result);
             }
         }
-        Ok(())
+        assert_eq!(cache.stats(), (1, 1, 1));
     }
 }

@@ -89,7 +89,7 @@ pub(super) fn select_scheduled_finalist<T>(
             (index, result)
         })
         .collect();
-    tracing::info!(cache_stats = ?expansion_cache.stats(), "expanded fragment cache");
+    tracing::info!(cache_stats = ?expansion_cache.stats(), plan_cache_stats = ?expansion_cache.plan_stats(), "expanded fragment cache");
     let mut failure = invalid("no operator-plan finalists");
     let expanded = feasible_candidates(screened, &mut failure);
     let expanded = admit_candidates(
