@@ -70,6 +70,7 @@ pub(crate) fn expand_tiles(
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
+    let start = Instant::now();
     let mut state = TileGraphBuilder::new(graph)?;
     let body = state.build_region(&graph.operations, checkpoints)?;
     let inputs = graph
@@ -105,11 +106,6 @@ pub(crate) fn expand_tiles(
             })
         })
         .collect();
-    tracing::debug!(
-        shards = state.shards.len(),
-        exchange_phases = state.phases.len(),
-        "built logical tile schedule"
-    );
     let mut program = TileGraph {
         tile_count: graph.tile_count,
         shards: state.shards,
@@ -140,8 +136,20 @@ pub(crate) fn expand_tiles(
         estimated_cycles: graph.estimated_cycles,
         estimated_exchange_cycles: graph.estimated_exchange_cycles,
     };
+    let build_time = start.elapsed();
+    let start = Instant::now();
     crate::low::passes::simplify(&mut program);
+    let simplify_time = start.elapsed();
+    let start = Instant::now();
     let cycles = crate::estimate::program_cycles(&program, None)?;
+    tracing::debug!(
+        shards = program.shards.len(),
+        exchange_phases = program.exchange_phases.len(),
+        build_ms = build_time.as_secs_f64() * 1000.0,
+        simplify_ms = simplify_time.as_secs_f64() * 1000.0,
+        cost_ms = start.elapsed().as_secs_f64() * 1000.0,
+        "built and costed logical tile schedule"
+    );
     program.estimated_cycles = cycles.total;
     program.estimated_exchange_cycles = cycles.exchange;
     Ok(Arc::new(program))

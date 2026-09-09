@@ -224,41 +224,42 @@ fn axis_tree(digits: &[Digit], start: u32, end: u32, suffix: &Node) -> Node {
 
 // A sliced logical axis is a short union of digit boxes, even when a physical
 // layout permutes those digits (including AMP accumulator output pairs).
-fn axis_boxes(digits: &[(usize, Digit)], start: u32, end: u32) -> Vec<Vec<(usize, u32, u32)>> {
+fn axis_boxes(
+    digits: &[(usize, Digit)],
+    start: u32,
+    end: u32,
+    bounds: &mut [(u32, u32)],
+    visit: &mut impl FnMut(&[(u32, u32)]),
+) {
     let Some((&(index, digit), rest)) = digits.split_first() else {
-        return vec![vec![]];
+        visit(bounds);
+        return;
     };
     let div = digit.divisor;
     let first = start / div;
     let last = (end - 1) / div;
-    let mut result = Vec::new();
-    let mut partial = |value, lo, hi| {
-        for mut tail in axis_boxes(rest, lo, hi) {
-            tail.push((index, value, 1));
-            result.push(tail);
-        }
-    };
     if first == last {
-        partial(first, start % div, (end - 1) % div + 1);
-        return result;
+        bounds[index] = (first, 1);
+        axis_boxes(rest, start % div, (end - 1) % div + 1, bounds, visit);
+        return;
     }
     if !start.is_multiple_of(div) {
-        partial(first, start % div, div);
+        bounds[index] = (first, 1);
+        axis_boxes(rest, start % div, div, bounds, visit);
     }
     if !end.is_multiple_of(div) {
-        partial(end / div, 0, end % div);
+        bounds[index] = (end / div, 1);
+        axis_boxes(rest, 0, end % div, bounds, visit);
     }
     let lo = start.div_ceil(div);
     let hi = end / div;
     if lo < hi {
-        let mut full = rest
-            .iter()
-            .map(|(i, d)| (*i, 0, d.count))
-            .collect::<Vec<_>>();
-        full.push((index, lo, hi - lo));
-        result.push(full);
+        bounds[index] = (lo, hi - lo);
+        for &(i, d) in rest {
+            bounds[i] = (0, d.count);
+        }
+        visit(bounds);
     }
-    result
 }
 
 pub(crate) fn byte_traversal(
@@ -312,23 +313,17 @@ pub(crate) fn byte_traversal(
     }
     let mut boxes = vec![vec![(0, 1); dimensions.len()]];
     for axis in 0..view.len() {
-        let choices = axis_boxes(
-            &axes[axis],
-            view[axis].start - shard.extents[axis].start,
-            view[axis].physical_end - shard.extents[axis].start,
-        );
-        boxes = boxes
-            .into_iter()
-            .flat_map(|bounds| {
-                choices.iter().map(move |choice| {
-                    let mut bounds = bounds.clone();
-                    for &(index, start, count) in choice {
-                        bounds[index] = (start, count);
-                    }
-                    bounds
-                })
-            })
-            .collect();
+        let mut next = Vec::new();
+        for mut bounds in boxes {
+            axis_boxes(
+                &axes[axis],
+                view[axis].start - shard.extents[axis].start,
+                view[axis].physical_end - shard.extents[axis].start,
+                &mut bounds,
+                &mut |bounds| next.push(bounds.to_vec()),
+            );
+        }
+        boxes = next;
     }
     let parts = boxes
         .into_iter()

@@ -32,6 +32,20 @@ impl TileGraphBuilder {
                     .first()
                     .ok_or(ExpansionError::ResultArity)?;
                 let outputs = self.value_shards(output)?.to_vec();
+                // Preserve shard order within each tile, but avoid searching all tiles
+                // again for every output shard (quadratic for whole-device operations).
+                let inputs_by_tile = operation
+                    .inputs
+                    .iter()
+                    .map(|&value| {
+                        let mut tiles = vec![Vec::new(); usize::from(self.tile_count)];
+                        for &source in self.value_shards(value)? {
+                            tiles[usize::from(self.shards[source.index() as usize].tile)]
+                                .push(source);
+                        }
+                        Ok(tiles)
+                    })
+                    .collect::<ExpansionResult<Vec<_>>>()?;
                 for output in outputs {
                     let block = &self.shards[output.index() as usize];
                     if block
@@ -43,36 +57,32 @@ impl TileGraphBuilder {
                     }
                     let tile = block.tile;
                     if let Some(index) = reuse_input {
-                        let previous = self
-                            .value_shards(operation.inputs[*index])?
+                        let previous = inputs_by_tile[*index][usize::from(tile)]
                             .iter()
                             .copied()
                             .find(|&candidate| {
                                 let candidate = &self.shards[candidate.index() as usize];
-                                candidate.tile == tile && candidate.extents == block.extents
+                                candidate.extents == block.extents
                             })
                             .ok_or(ExpansionError::InvalidOperatorPlan)?;
                         self.shards[output.index() as usize].definition =
                             ShardDefinition::WritableAlias(previous);
                     }
-                    let inputs = operation
-                        .inputs
+                    let inputs = inputs_by_tile
                         .iter()
                         .zip(operands)
-                        .map(|(&value, window)| {
-                            let source = self
-                                .value_shards(value)?
+                        .map(|(tiles, window)| {
+                            let source = tiles[usize::from(tile)]
                                 .iter()
                                 .copied()
                                 .find(|&source| {
-                                    self.shards[source.index() as usize].tile == tile
-                                        && (!matches!(
-                                            kernel,
-                                            TileKernelSpec::Gelu
-                                                | TileKernelSpec::Add
-                                                | TileKernelSpec::BiasGelu
-                                                | TileKernelSpec::AddLayerNorm
-                                        ) || self.broadcast_view(source, output).is_some())
+                                    !matches!(
+                                        kernel,
+                                        TileKernelSpec::Gelu
+                                            | TileKernelSpec::Add
+                                            | TileKernelSpec::BiasGelu
+                                            | TileKernelSpec::AddLayerNorm
+                                    ) || self.broadcast_view(source, output).is_some()
                                 })
                                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
                             if matches!(
