@@ -17,7 +17,8 @@ sample for the remaining two; the span still includes all three iterations.
 | Recent pre-regional compact-traversal build | 846,120 |
 | Current default planner, before FP8 tile-family fix | 846,120 |
 | Current default planner, after FP8 tile-family fix | 846,120 |
-| Experimental regional seed | 1,084,056 |
+| Experimental regional seed with fixed weights | 1,084,056 |
+| Regional replacement with private weights and ownership fix | 805,944 |
 
 The default planner has not regressed in this comparison. Both current default
 builds passed hardware and numerical checks (maximum absolute error 0.015625).
@@ -114,3 +115,52 @@ storage group was rotated by 184 tiles. `LoweringState::value_in_storage_group`
 now inherits the group's offset. A small rotated-parameter Repeat regression
 checks both seed and replacement placement. The failed proposal did not replace
 the feasible incumbent.
+
+## Hardware results with private weights
+
+The repeated MLP accepted one replacement at 893,778 finalized estimated cycles,
+versus its seed's 1,157,979. Hardware and reference validation passed (maximum
+absolute error 0.015625). The cropped measured span is **805,944 cycles**, 4.75%
+faster than the current default's 846,120, and 25.65% faster than the earlier
+fixed-weight regional result. Selection plus package validation took 156.3 s.
+Profile: `mlp-private-weights-fixed/profile.html`.
+
+The full-size ViT accepted the MAP-MLP replacement and passed hardware/reference
+validation (maximum absolute error 0.085938). Its cropped measured span is
+**993,132 cycles, 0.662088 ms**. The finalized estimate is 983,426 cycles.
+Profile: `private-weights/profile.html`.
+
+| Region | Finalized candidate estimate | Decision |
+|---|---:|---|
+| Seed | 991,915 | Feasible incumbent |
+| Embedding/position | 1,003,022 | Retain seed |
+| Encoder attention | 1,031,126 | Retain seed |
+| Encoder MLP | 1,080,383 | Retain seed |
+| MAP attention | — | Expansion rejected a rotated probe binding |
+| MAP MLP | 983,426 | Accept |
+
+The ViT process was already running when the ownership fix was made. The same
+storage-group offset inheritance also applies to derived cast values; a separate
+rotated FP16-probe/FP8-projection test now checks expansion and placement. A
+compiler-only follow-up for region 25:39 is recorded in `map-ownership-fixed.*`.
+It does not repeat device timing and does not validate executable support storage.
+
+The complete ViT trial took **833.2 seconds** for selection and package validation.
+This remains too slow for frequent iteration. The result demonstrates working
+incumbent preservation and parameter retargeting, not inexpensive global
+validation. Neither the ViT seed nor each rejected proposal was separately timed
+on hardware, so the modest estimated MAP-MLP improvement is not claimed as a
+measured speedup over that seed.
+
+The ownership-fixed MAP-attention compiler-only follow-up completed successfully
+in 130.2 s. Its proposal passed expansion, placement and scheduling and reduced
+the provisional estimate from 1,035,818 to 1,017,524 cycles. This variant has not
+undergone executable-support validation or hardware execution; it is separate
+from the measured 993,132-cycle ViT package above.
+
+Final validation: 209 codegen tests passed (five ignored), the documentation test
+passed, and release Clippy passed for codegen and ipu-tests with the repository's
+existing argument-count/type-complexity allowances. Commits include the FP8
+family fix, finalized-cost selection, private parameter retargeting, and inherited
+storage-group ownership. Existing user changes to TODO and untracked artifacts
+were retained.

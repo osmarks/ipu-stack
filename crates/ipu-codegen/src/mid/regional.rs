@@ -551,6 +551,50 @@ mod tests {
     }
 
     #[test]
+    fn regional_fp8_projection_cast_preserves_rotated_probe_ownership() {
+        let mut graph = ComputeGraph::new();
+        let probe = graph.parameter("probe", [1, 1, 64]).unwrap();
+        let weights = graph.parameter("weights", [64, 64]).unwrap();
+        let y = graph.gemm(probe, weights).unwrap();
+        graph.set_outputs([y]).unwrap();
+        let mut config = PipelineConfig::new(8)
+            .with_automatic_input(probe, Precision::F16)
+            .with_automatic_input(weights, Precision::F8F143 { scale_exponent: -4 });
+        config
+            .operator_candidates
+            .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+        config
+            .operator_candidates
+            .push(OperatorCandidate::fp8_gemm(8, -4));
+        let mut seed = baseline(&graph, &baseline_config(&config, 0), &Ipu21CostModel).unwrap();
+        let id = seed.inputs[0].value;
+        let group = seed.values[id.index() as usize].storage_group;
+        for value in &mut seed.values {
+            if value.storage_group == group {
+                value.tile_offset = 3;
+            }
+        }
+        let alternatives = replacements(
+            &graph,
+            &seed,
+            0..1,
+            &config,
+            &RegionalPlanning::default(),
+            &Ipu21CostModel,
+        )
+        .unwrap();
+        assert!(!alternatives.is_empty());
+        for alternative in alternatives {
+            let tiles = crate::low::expand::expand_tiles(
+                &resolve(&alternative.program, false).unwrap(),
+                false,
+            )
+            .unwrap();
+            crate::place(&crate::low::lower_to_tiles(&tiles, false)).unwrap();
+        }
+    }
+
+    #[test]
     fn fp8_map_projection_seed_uses_a_smaller_tile_family() {
         let mut graph = ComputeGraph::new();
         let x = graph.host_input("x", [1, 1, 1152]).unwrap();

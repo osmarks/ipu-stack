@@ -153,3 +153,9 @@ selected input type, so the host supplies the new representation directly. Tests
 cover avoiding device weight conversions, shared weights, explicit formats, and
 Repeat. Final package costs are also propagated back to both regional and
 ordinary finalist selection instead of retaining the provisional schedule score.
+
+With private weights and inherited storage-group ownership, batch-2 Repeat3 MLP
+now measures 805,944 cycles and passes its hardware reference check, versus
+846,120 for the unchanged default selection. The full-size one-layer ViT with
+MAP also passes at 993,132 measured cycles. Detailed qualification, compile times,
+and the separate MAP-attention compiler-only check are in the follow-up report.
