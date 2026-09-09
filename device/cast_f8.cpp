@@ -153,50 +153,8 @@ static __attribute__((always_inline)) inline void castFullRows(
             : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
 }
 
-static __attribute__((noinline)) void castPaddedMatrices(
-    const half *source, unsigned char *destination, unsigned elements,
-    unsigned panelRows, unsigned validColumns, unsigned sourceColumns,
-    unsigned rowShape, unsigned worker) {
-  const unsigned matrixRows = rowShape >> 16;
-  const unsigned validRows = rowShape & 65535;
-  const bool wholePanels = panelRows <= 32 && elements >= panelRows * 32 * 6;
-  const unsigned stride = wholePanels ? 32 : 192;
-  const unsigned sourceStride = sourceColumns * 2 * (wholePanels ? 1 : 6);
-  const unsigned inStart = reinterpret_cast<unsigned>(source);
-  const unsigned outStart = reinterpret_cast<unsigned>(destination);
-  const bool separate = (((inStart + panelRows * sourceColumns * 2 - 1) >> 15) < (outStart >> 15) ||
-      ((outStart + elements - 1) >> 15) < (inStart >> 15));
-  for (unsigned matrix = 0; matrix < panelRows; matrix += matrixRows) {
-    const unsigned firstRow = wholePanels ? 0 : (worker + 6 - matrix % 6) % 6;
-    if (firstRow >= matrixRows) continue;
-    const unsigned row = matrix + firstRow;
-    const unsigned physicalRows = wholePanels ? matrixRows : (matrixRows + 5 - firstRow) / 6;
-    const unsigned rows = firstRow >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - firstRow) / 6;
-    for (unsigned panel = wholePanels ? worker * panelRows * 32 : 0,
-                  column = wholePanels ? worker * 32 : 0;
-         panel < elements; panel += panelRows * 32 * (wholePanels ? 6 : 1),
-                           column += wholePanels ? 192 : 32) {
-      unsigned char *target = destination + panel + row * 32;
-      if (physicalRows > rows)
-        zeroPackedRows(target + rows * stride, physicalRows - rows, stride);
-      if (!rows) continue;
-      if (column >= validColumns) {
-        zeroPackedRows(target, rows, stride);
-        continue;
-      }
-      const half *first = source + row * sourceColumns + column;
-      if (column + 32 > validColumns) {
-        castRowTail(first, target, rows, sourceStride, stride, validColumns - column);
-      } else if (separate && rows >= 16 && sourceStride / 8 - 2 < 512) {
-        castPackedRows(first, first + 16, target, rows, stride, sourceStride);
-      } else {
-        castFullRows(first, first + 16, target, rows, stride, sourceStride);
-      }
-    }
-  }
-}
 #endif
-// Both worker entry points consume this one descriptor layout. For FP16
+// For FP16
 // packing, sourceMetadata holds row bounds and sourceExtent readable columns.
 #define CAST_FIELDS \
   Input<Vector<Source, VectorLayout::ONE_PTR>> source; \
@@ -235,19 +193,20 @@ public:
          ((outStart + elements - 1) >> 15) < (inStart >> 15));
     if (panelRows) {
       const unsigned panelElements = panelRows * 32;
+      const unsigned matrixRows = rowShape ? rowShape >> 16 : panelRows;
       // Small panels have too few rows to amortize six-worker setup. Give
       // workers complete panels when there are enough independent panels.
-      const bool wholePanels = panelRows <= 32 && elements >= panelElements * 6;
+      const bool wholePanels = matrixRows <= 32 && elements >= panelElements * 6;
       const unsigned row = wholePanels ? 0 : worker;
-      const unsigned physicalRows = wholePanels ? panelRows : (panelRows + 5 - worker) / 6;
-      const unsigned validRows = rowShape && (rowShape >> 16) == panelRows ? rowShape & 65535 : panelRows;
+      const unsigned physicalRows = wholePanels ? matrixRows : (matrixRows + 5 - worker) / 6;
+      const unsigned validRows = rowShape ? rowShape & 65535 : matrixRows;
       const unsigned rows = row >= validRows ? 0 : wholePanels ? validRows : (validRows + 5 - worker) / 6;
       const unsigned stride = wholePanels ? 32 : 192;
       const unsigned sourceStride = rowMajorColumns ? rowMajorColumns * 2 * (wholePanels ? 1 : 6) : stride;
       const unsigned panelStep = panelElements * (wholePanels ? 6 : 1);
       unsigned column = wholePanels ? worker * 32 : 0;
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
-           panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
+           panel < elements && row < matrixRows; panel += panelStep, column += wholePanels ? 192 : 32) {
         unsigned char *panelTarget = &destination[panel + row * 32];
         if (physicalRows > rows)
           zeroPackedRows(panelTarget + rows * stride, physicalRows - rows, stride);
@@ -410,21 +369,5 @@ public:
 #endif
   }
 };
-
-#if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
-// The supervisor selects this entry only for padding between batch matrices.
-// Sharing the descriptor preserves one cast ABI without burdening the hot loop.
-class Cast2To1Padded : public MultiVertex {
-public:
-  CAST_FIELDS
-  bool compute(unsigned worker) {
-    setQuarterConfig({quarter_metadata::f143, static_cast<signed char>(-destinationScale)});
-    castPaddedMatrices(&source[0], &destination[0], elements, panelRows,
-                       sourceExtent, rowMajorColumns,
-                       static_cast<unsigned>(sourceMetadata), worker);
-    return true;
-  }
-};
-#endif
 
 #undef CAST_FIELDS

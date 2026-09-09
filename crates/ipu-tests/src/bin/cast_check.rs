@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         selector = if args.existing_layouts_only {
             ""
         } else {
-            "#define WORKER_SELECT_CODELET \"cast_f8_select.inc\"\n"
+            "#define WORKER_SELECT_CODELET \"cast_f8_select.inc\"\n#define WORKER_AFTER_LAUNCH \"cast_f8_repeat.inc\"\n"
         },
     );
     let mut programs = Vec::new();
@@ -94,12 +94,20 @@ fn main() -> Result<()> {
         (184, 96), // Largest cast in the full B1 ViT profile.
         (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
-        for mode in 0..7 {
-            if mode == 6 && rows > 97 {
+        for mode in 0..10 {
+            if (mode == 6 && rows > 97)
+                || (mode >= 7 && (columns != 64 || !(5..=7).contains(&rows)))
+            {
                 continue;
             }
             let matrix_rows = rows;
-            let rows = rows * if mode == 6 { 2 } else { 1 };
+            let rows = rows
+                * match mode {
+                    6 => 2,
+                    7 | 9 => 3,
+                    8 => 8,
+                    _ => 1,
+                };
             // dense, already packed, row-major -> packed
             if mode >= 2 && args.existing_layouts_only {
                 continue;
@@ -121,7 +129,7 @@ fn main() -> Result<()> {
                     } else {
                         columns
                     };
-                    let valid_rows = if mode >= 5 {
+                    let valid_rows = if mode >= 5 && mode != 9 {
                         matrix_rows.saturating_sub(2)
                     } else {
                         matrix_rows
@@ -217,7 +225,7 @@ fn main() -> Result<()> {
                             input_addresses: vec![TileAddress::Absolute(input_address)],
                             arguments: vec![
                                 count,
-                                if mode >= 2 {
+                                if valid_rows < matrix_rows {
                                     (matrix_rows << 16) | valid_rows
                                 } else {
                                     0

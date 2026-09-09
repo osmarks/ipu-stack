@@ -141,9 +141,10 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                         let physical = input_matrix_extent(run, false, false)?;
                         let logical = input_matrix_extent(run, true, false)?;
                         // Two row bounds share the otherwise unused FP16
-                        // source-scale word. Zero retains the unmasked path
+                        // source-scale word. Unpadded matrices remain one
+                        // flattened stream; zero also retains initialization
                         // for shapes outside the compact descriptor's range.
-                        return Ok(if physical <= u16::MAX.into() {
+                        return Ok(if logical < physical && physical <= u16::MAX.into() {
                             (physical << 16) | logical
                         } else {
                             0

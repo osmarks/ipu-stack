@@ -23,8 +23,12 @@ WORKER_CALL_SYMBOL:
 #else
 	setzi $m0, WORKER_CODELET_SYMBOL
 #endif
+1:
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
+#ifdef WORKER_AFTER_LAUNCH
+#include WORKER_AFTER_LAUNCH
+#endif
 	add $m11, $m11, WORKER_FRAME_BYTES
 	br $m10
 	.size WORKER_CALL_SYMBOL, .-WORKER_CALL_SYMBOL

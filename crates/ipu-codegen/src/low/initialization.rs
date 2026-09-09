@@ -1,15 +1,16 @@
-//! Reuse finite SRAM contents for GEMM activation K padding.
+//! Remove padding initialization when readers do not need it.
 //!
-//! Numerical inputs and operation results are assumed finite. For an all-F16
+//! Packing kernels can skip unread input padding and write their own zeros.
+//! Separately, numerical inputs and operation results are assumed finite. For an all-F16
 //! program, zeroing the tensor arena once establishes an invariant preserved
-//! by writes, copies and allocation reuse. Mixed-precision arenas deliberately
-//! retain their clears: finite FP32 bits need not encode finite FP16 values.
+//! by writes, copies and allocation reuse. This second proof cannot apply to
+//! mixed-precision arenas: finite FP32 bits need not encode finite FP16 values.
 
 use super::*;
 use std::collections::BTreeSet;
 
-/// Row-major FP8 packing reads only the logical column prefix and writes its
-/// own output padding. Drop input padding clears when that is the sole reader.
+/// Row-major FP8 packing reads only logical columns/rows and writes its own
+/// output padding. Drop input padding clears when that is the sole reader.
 pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
     let graph = &program.program;
     let root = |id| storage_root(&graph.shards, id);
