@@ -76,6 +76,16 @@ the host reference automatically. `--vit-small --tiles 64` uses a 28×28 image,
 width 144, two 72-wide heads and MLP width 288 while preserving the whole graph.
 `--vit-batch` sets the batch size (default one).
 
+`--fuse-qkv` replaces the encoder's three input projections with one
+1152-to-3456 GEMM and bias addition, followed by ordinary last-axis slices.
+MAP uses one 1152-to-2304 KV projection; its learned-query projection remains
+separate because it consumes a different activation. The complete graph has
+10 GEMMs instead of 13. The existing planner handles these GEMMs and composes
+the slices with head views; no special planning path is added. Concatenated
+weights retain the initialization variance of the individual projections.
+Omit the flag to compare the original separate projections.
+
+
 The FP8 example explicitly loosens the comparison tolerance. Small upstream
 rounding differences can cross activation-quantization thresholds and accumulate
 through the 13 GEMMs; the host reference quantizes operands at each selected

@@ -187,7 +187,7 @@ struct Arguments {
     /// Offer batches of up to this many independent reductions (1 disables).
     #[arg(long, default_value_t = 3)]
     max_parallel_reductions: usize,
-    /// Use one concatenated QKV projection in the projected-attention workload.
+    /// Fuse shared-input QKV projections (and MAP KV) in attention and ViT benchmarks.
     #[arg(long)]
     fuse_qkv: bool,
     /// Native F143 GEMMs with a shared operand scale (value = F143 * 2^scale).
@@ -928,7 +928,7 @@ fn main() -> Result<()> {
             pipeline.profiling = !arguments.no_profile;
         }
     } else if matches!(arguments.workload, Workload::SiglipVitBenchmark) {
-        graph = vit::build(&arguments.vit)?;
+        graph = vit::build(&arguments.vit, arguments.fuse_qkv)?;
 
         pipeline.profiling = !arguments.no_profile;
         for input in graph.inputs() {

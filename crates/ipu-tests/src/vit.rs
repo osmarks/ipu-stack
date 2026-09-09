@@ -14,7 +14,7 @@ pub(crate) struct Options {
     pub vit_image_size: Option<u32>,
 }
 
-pub(crate) fn build(options: &Options) -> Result<ComputeGraph> {
+pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
     let (image, patch, width, hidden, heads) = if options.vit_small {
         // Retain So400m's 72-wide heads, including their packed-layout tails.
         (28, 14, 144, 288, 2)
@@ -48,6 +48,7 @@ pub(crate) fn build(options: &Options) -> Result<ComputeGraph> {
         "encoder.attention",
         width,
         heads,
+        fuse_qkv,
     )?;
     x = g.add(x, attended)?;
     let normalized = norm(&mut g, x, "encoder.mlp_norm", width)?;
@@ -58,7 +59,7 @@ pub(crate) fn build(options: &Options) -> Result<ComputeGraph> {
     // A replicated probe is expressed as a batch-shaped parameter. Input
     // generation repeats the same learned vector across batches.
     let probe = g.parameter("vit.map.probe", [options.vit_batch, 1, width])?;
-    x = attention(&mut g, probe, x, "map.attention", width, heads)?;
+    x = attention(&mut g, probe, x, "map.attention", width, heads, fuse_qkv)?;
     let normalized = norm(&mut g, x, "map.norm", width)?;
     let update = mlp(&mut g, normalized, "map.mlp", width, hidden)?;
     x = g.add(x, update)?;
@@ -92,10 +93,30 @@ fn attention(
     name: &str,
     width: u32,
     heads: u32,
+    fuse_qkv: bool,
 ) -> Result<ValueId> {
-    let query = dense(g, q, &format!("{name}.query"), width, width)?;
-    let key = dense(g, kv, &format!("{name}.key"), width, width)?;
-    let value = dense(g, kv, &format!("{name}.value"), width, width)?;
+    let (query, key, value) = if fuse_qkv {
+        // Only projections of the same activation can share a GEMM. MAP's
+        // learned query remains separate from its image-key/value projection.
+        let shared_query = q == kv;
+        let suffix = if shared_query { "qkv" } else { "kv" };
+        let count = if shared_query { 3 } else { 2 };
+        let projected = dense(g, kv, &format!("{name}.{suffix}"), width, count * width)?;
+        let query = if shared_query {
+            g.slice(projected, 2, 0, width)?
+        } else {
+            dense(g, q, &format!("{name}.query"), width, width)?
+        };
+        let key = g.slice(projected, 2, (count - 2) * width, width)?;
+        let value = g.slice(projected, 2, (count - 1) * width, width)?;
+        (query, key, value)
+    } else {
+        (
+            dense(g, q, &format!("{name}.query"), width, width)?,
+            dense(g, kv, &format!("{name}.key"), width, width)?,
+            dense(g, kv, &format!("{name}.value"), width, width)?,
+        )
+    };
     let query = g.split_heads(query, heads)?;
     let key = g.split_heads(key, heads)?;
     let value = g.split_heads(value, heads)?;
@@ -117,7 +138,15 @@ pub(crate) fn random_input(input: &GraphInput, seed: u64, index: u64) -> Option<
     } else if input.name == "vit.position" {
         (width as f32).sqrt().recip()
     } else if input.name.ends_with(".weight") {
-        (2.0 / (input.shape.0[0] + width) as f32).sqrt()
+        // Concatenation does not change an individual projection's fan-out.
+        let output = if input.name.ends_with(".qkv.weight") {
+            width / 3
+        } else if input.name.ends_with(".kv.weight") {
+            width / 2
+        } else {
+            width
+        };
+        (2.0 / (input.shape.0[0] + output) as f32).sqrt()
     } else if input.name == "vit.map.probe" {
         (1.0 / width as f32).sqrt()
     } else {
@@ -138,45 +167,59 @@ mod tests {
 
     #[test]
     fn complete_single_layer_topology_and_shapes() -> Result<()> {
-        let g = build(&Options {
-            vit_batch: 1,
-            vit_small: false,
-            vit_image_size: None,
-        })?;
-        let image = g
-            .inputs()
-            .iter()
-            .find(|i| i.name == "vit.image.patches")
-            .unwrap();
-        assert_eq!(image.shape.0, [1, 729, 588]);
-        assert_eq!(image.shape.elements(), 378 * 378 * 3);
-        assert_eq!(
-            g.operations()
+        for fused in [false, true] {
+            let g = build(
+                &Options {
+                    vit_batch: 1,
+                    vit_small: false,
+                    vit_image_size: None,
+                },
+                fused,
+            )?;
+            let image = g
+                .inputs()
                 .iter()
-                .filter(|o| matches!(o.kind, OperationKind::LayerNorm))
-                .count(),
-            4
-        );
-        assert_eq!(
-            g.operations()
+                .find(|i| i.name == "vit.image.patches")
+                .unwrap();
+            assert_eq!(image.shape.0, [1, 729, 588]);
+            assert_eq!(image.shape.elements(), 378 * 378 * 3);
+            assert_eq!(
+                g.operations()
+                    .iter()
+                    .filter(|o| matches!(o.kind, OperationKind::LayerNorm))
+                    .count(),
+                4
+            );
+            assert_eq!(
+                g.operations()
+                    .iter()
+                    .filter(|o| matches!(o.kind, OperationKind::FlashAttention(_)))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                g.operations()
+                    .iter()
+                    .filter(|o| matches!(o.kind, OperationKind::Gemm(_)))
+                    .count(),
+                if fused { 10 } else { 13 }
+            );
+            let probe = g
+                .inputs()
                 .iter()
-                .filter(|o| matches!(o.kind, OperationKind::FlashAttention(_)))
-                .count(),
-            2
-        );
-        assert_eq!(
-            g.operations()
-                .iter()
-                .filter(|o| matches!(o.kind, OperationKind::Gemm(_)))
-                .count(),
-            13
-        );
-        let probe = g
-            .inputs()
-            .iter()
-            .find(|i| i.name == "vit.map.probe")
-            .unwrap();
-        assert_eq!(probe.shape.0, [1, 1, 1152]);
+                .find(|i| i.name == "vit.map.probe")
+                .unwrap();
+            assert_eq!(probe.shape.0, [1, 1, 1152]);
+            if fused {
+                for (name, shape) in [
+                    ("vit.encoder.attention.qkv.weight", [1152, 3456]),
+                    ("vit.map.attention.kv.weight", [1152, 2304]),
+                ] {
+                    let weight = g.inputs().iter().find(|i| i.name == name).unwrap();
+                    assert_eq!(weight.shape.0, shape);
+                }
+            }
+        }
         Ok(())
     }
 }
