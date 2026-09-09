@@ -216,9 +216,39 @@ fn replacements_in_pool(
         .filter(|i| i.kind == GraphInputKind::Parameter)
         .map(|i| i.value)
         .collect::<BTreeSet<_>>();
+    // Parameters used only here are implementation choices, not activation
+    // boundaries. Reuse normal automatic-input retargeting so the host loads
+    // their selected representation directly, without a device rearrangement.
+    let outside_origins = graph
+        .operations()
+        .iter()
+        .filter(|op| !origins.contains(&op.id))
+        .flat_map(|op| operation_graph_inputs(op, graph))
+        .chain(graph.outputs().iter().copied())
+        .collect::<BTreeSet<_>>();
+    let outside_groups = incumbent.operations[..start]
+        .iter()
+        .chain(&incumbent.operations[end..])
+        .flat_map(references)
+        .chain(incumbent.outputs.iter().copied())
+        .map(|id| incumbent.values[id.index() as usize].storage_group)
+        .collect::<BTreeSet<_>>();
+    let private_parameters = incumbent
+        .inputs
+        .iter()
+        .filter(|input| input.kind == GraphInputKind::Parameter && live_in.contains(&input.value))
+        .filter(|input| {
+            let value = &incumbent.values[input.value.index() as usize];
+            config.automatic_inputs.contains_key(&value.origin)
+                && !config.inputs.contains_key(&value.origin)
+                && !outside_origins.contains(&value.origin)
+                && !outside_groups.contains(&value.storage_group)
+        })
+        .map(|input| input.value)
+        .collect::<BTreeSet<_>>();
     let mut state = LoweringState {
         values: incumbent.values.clone(),
-        automatic_inputs: BTreeSet::new(),
+        automatic_inputs: private_parameters.clone(),
         parameter_values: incumbent
             .values
             .iter()
@@ -242,8 +272,22 @@ fn replacements_in_pool(
     )?;
     let mut result = Vec::new();
     for mut branch in branches.into_iter().take(options.candidates_per_region) {
-        // No region replacement may change the storage contract of an existing value.
-        if branch.state.values[..incumbent.values.len()] != incumbent.values {
+        // Existing activations/shared parameters remain fixed. Private host
+        // parameters may change layout, but retain precision, shape and identity.
+        if !branch
+            .state
+            .values
+            .iter()
+            .zip(&incumbent.values)
+            .filter(|(new, old)| new != old)
+            .all(|(new, old)| {
+                let mut expected = old.clone();
+                if private_parameters.contains(&old.id) {
+                    expected.tensor_type.format.layout = new.tensor_type.format.layout.clone();
+                }
+                *new == expected
+            })
+        {
             continue;
         }
         let mut bindings = BTreeMap::new();
@@ -416,6 +460,96 @@ pub(crate) fn resolve(program: &MidProgram, checkpoints: bool) -> LoweringResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn region_private_weights_are_loaded_in_the_selected_layout() {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [32, 32]).unwrap();
+        let other = graph.host_input("other", [32, 128]).unwrap();
+        let private = graph.parameter("private", [32, 128]).unwrap();
+        let shared = graph.parameter("shared", [128, 32]).unwrap();
+        let y = graph.gemm(x, private).unwrap();
+        let y = graph.gelu(y).unwrap();
+        let y = graph.gemm(y, shared).unwrap();
+        let z = graph.gemm(other, shared).unwrap();
+        graph.set_outputs([y, z]).unwrap();
+        let mut config = PipelineConfig::new(8);
+        for input in graph.inputs() {
+            config = config.with_automatic_input(input.value, Precision::F16);
+        }
+        // Start from a valid, deliberately inconvenient host representation.
+        let fixed = TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(8),
+        };
+        let mut seed_config = baseline_config(&config, 0);
+        seed_config.inputs.insert(private, fixed.clone());
+        let seed = baseline(&graph, &seed_config, &Ipu21CostModel).unwrap();
+        let private_id = seed
+            .inputs
+            .iter()
+            .find(|i| i.name == "private")
+            .unwrap()
+            .value;
+        let shared_id = seed
+            .inputs
+            .iter()
+            .find(|i| i.name == "shared")
+            .unwrap()
+            .value;
+        let alternatives = replacements(
+            &graph,
+            &seed,
+            0..3,
+            &config,
+            &RegionalPlanning::default(),
+            &Ipu21CostModel,
+        )
+        .unwrap();
+        assert!(!alternatives.is_empty());
+        for alternative in &alternatives {
+            assert_eq!(alternative.program.inputs, seed.inputs);
+            assert_ne!(
+                alternative.program.values[private_id.index() as usize]
+                    .tensor_type
+                    .format
+                    .layout,
+                fixed.layout
+            );
+            assert_eq!(
+                alternative.program.values[shared_id.index() as usize],
+                seed.values[shared_id.index() as usize]
+            );
+            assert!(!alternative.program.operations.iter().any(|op| matches!(
+                op.kind,
+                MidOperationKind::Convert(_)
+            )
+                && op.inputs.contains(&private_id)));
+            let low = crate::low::expand::expand_tiles(
+                &resolve(&alternative.program, false).unwrap(),
+                false,
+            )
+            .unwrap();
+            assert!(!low.kernel_runs.is_empty());
+        }
+        // An explicit caller contract is stronger than regional ownership.
+        config.inputs.insert(private, fixed);
+        for alternative in replacements(
+            &graph,
+            &seed,
+            0..3,
+            &config,
+            &RegionalPlanning::default(),
+            &Ipu21CostModel,
+        )
+        .unwrap()
+        {
+            assert_eq!(
+                alternative.program.values[private_id.index() as usize],
+                seed.values[private_id.index() as usize]
+            );
+        }
+    }
+
     #[test]
     fn fp8_map_projection_seed_uses_a_smaller_tile_family() {
         let mut graph = ComputeGraph::new();

@@ -53,10 +53,12 @@ run to establish executable feasibility and correctness.
    are retained.
 3. **Feasible incumbent.** Low expansion, footprint checks, placement, scheduling,
    and executable support validation run on a proposed complete replacement.
-   Only a strictly lower scheduled cycle count replaces the incumbent. Failed
+   Only a strictly lower finalized package cycle estimate replaces the incumbent. Failed
    search, memory, exchange, or package validation retains the previous artifact.
-4. **Boundary contracts.** Live inputs preserve their tensor types and tile
-   ownership. Escaping outputs are restored to the incumbent's tensor type and
+4. **Boundary contracts.** Live activations and shared parameters preserve their
+   tensor types and tile ownership. Automatically laid-out parameters used only
+   inside the region may select a new host-loaded layout. Precision and shape
+   remain fixed; explicit caller-specified formats are respected. Escaping outputs are restored to the incumbent's tensor type and
    ownership. Internal layouts and operator implementations remain searchable.
    Suffix consumers, aliases, and structured Repeat references are rebound.
    The caller's physical tile map is fixed; absent one, regional mode uses identity.
@@ -142,3 +144,12 @@ The subsequent full-size ViT trial and measured MLP regression comparison are in
 the FP8 CLI's loss of smaller GEMM tile families, which caused the tiny FP8 failure
 reported above. Default batch-2 Repeat3 MLP performance remains 846,120 measured
 cycles; the regional seed is slower at 1,084,056 measured cycles.
+
+Region-private weight layouts are now searched using the same automatic-input
+retargeting as initial planning. Outside high-graph consumers (including Repeat
+sequences and graph outputs) and outside physical storage-group references keep
+shared parameters fixed. Input IDs/names remain stable; packaging reads the
+selected input type, so the host supplies the new representation directly. Tests
+cover avoiding device weight conversions, shared weights, explicit formats, and
+Repeat. Final package costs are also propagated back to both regional and
+ordinary finalist selection instead of retaining the provisional schedule score.

@@ -73,3 +73,37 @@ The original trial allowed up to four global validations per region. It was
 stopped after the seed and during the first replacement, then restarted with the
 one-per-region budget because each validation still takes minutes. This was a
 compiler restart, not a repeated hardware timing measurement.
+
+A further restriction matters when interpreting the regional MLP result: the
+current live-input contract includes parameter layouts. A region can stage those
+weights into a different layout, but cannot change their original host-loaded
+representation, even when the weights are used only inside that region. Thus an
+unfortunate seed weight layout can make an otherwise better GEMM grid expensive
+to reach. The user stopped this fixed-weight trial during MAP-attention validation to
+implement region-private parameter retargeting. No final ViT hardware run was
+performed with the fixed-weight trial.
+
+## Private-weight follow-up
+
+Private automatically laid-out parameters now participate in region search:
+their host-loaded format can change, while activations, shared parameters, and
+explicitly pinned parameter formats remain fixed. A regression test starts from
+an inconvenient row-major weight, selects a different host format, and verifies
+that no device conversion of that weight is introduced. It also checks shared
+and explicitly pinned weights.
+
+The trial also exposed a cost handoff bug. Finalization computes a new cost after
+support placement and address optimization, but selection was still reading the
+provisional schedule. The finalized cost is now stored on the selected plan and
+used by ordinary and regional selection. A regression test rejects a provisionally
+faster alternative whose finalizer reports a worse package cost.
+
+For the stopped trial, finalized estimates were 991,915 cycles for the seed,
+1,008,050 for embedding, 1,043,632 for encoder attention, and 1,097,723 for encoder
+MLP. Thus the scoring fix does not change those three rejection decisions.
+The previously logged 1,035,818 seed score was provisional.
+
+New logs are `private-weights/run.log` and `mlp-private-weights/run.log` under
+`artifacts/regional-vit-20260909/`. The new ViT run retains the same five regions,
+one global proposal per region, and the usual FP8 reference tolerances
+(atol 0.2, rtol 0.05).
