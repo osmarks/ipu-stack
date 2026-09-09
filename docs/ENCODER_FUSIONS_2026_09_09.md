@@ -144,3 +144,26 @@ batch 1 takes 653,988 cycles (encoder 465,156), batch 2 takes 959,646 (encoder
 715,698). The corresponding profiles are
 [batch 1](../artifacts/encoder-fusions/vit-loopback-b1/profile.html) and
 [batch 2](../artifacts/encoder-fusions/vit-loopback-b2/profile.html).
+
+## Final exchange-audit build
+
+After removing the paired size cutoff and validating delivery to just the
+sender's pair, both full-model checks pass again with unchanged numerical error:
+
+| Batch | Cropped cycles | Time (ms) | Encoder span | Encoder cycles/image |
+|---|---:|---:|---:|---:|
+| 1 | 652,740 | 0.435160 | 463,908 | 463,908 |
+| 2 | 959,136 | 0.639424 | 715,188 | 357,594 |
+
+Batch 2 uses 22.9% fewer encoder cycles per image than batch 1. Relative to the
+start of this batch sweep (668,484 / 996,756 cycles), the exchange corrections
+save 15,744 / 37,620 whole-model cycles and 10,824 / 29,028 encoder cycles.
+The no-cutoff build saves another 1,248 / 510 cycles versus the paired-loopback
+build. Width selection still rejects slower paired candidates: batch-1 phase 51
+retains ordinary width at 518 cycles versus 947 paired.
+
+Current rendered profiles:
+[batch 1](../artifacts/encoder-fusions/vit-audit-b1/profile.html),
+[batch 2](../artifacts/encoder-fusions/vit-audit-b2/profile.html).
+The batch-4/8 failures above were measured before these exchange corrections;
+they were not rerun during the exchange audit.
