@@ -62,25 +62,22 @@ impl TileGraphBuilder {
                 extents: source.extents.clone(),
                 definition: ShardDefinition::Staging,
             })?;
-            self.append_kernel(
-                tiles,
-                source.tile,
-                self.kernel_run(
-                    provenance,
-                    TileKernelSpec::Rearrange {
-                        from: source.tensor_type.format.layout.clone(),
-                        to: self.shards[staging.index() as usize]
-                            .tensor_type
-                            .format
-                            .layout
-                            .clone(),
-                    },
-                    vec![KernelOperand {
-                        views: vec![self.full_view(source_shard)],
-                    }],
-                    self.full_view(staging),
-                )?,
+            let run = self.kernel_run(
+                provenance,
+                TileKernelSpec::Rearrange {
+                    from: source.tensor_type.format.layout.clone(),
+                    to: self.shards[staging.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .clone(),
+                },
+                vec![KernelOperand {
+                    views: vec![self.full_view(source_shard)],
+                }],
+                self.full_view(staging),
             )?;
+            self.append_kernel(tiles, source.tile, run)?;
             staging_shards.push(staging);
         }
         Ok(Some(staging_shards))
@@ -115,10 +112,8 @@ impl TileGraphBuilder {
         for output in self.value_shards(*result)?.to_vec() {
             let tile = self.shards[output.index() as usize].tile;
             let input = self.local_shard(*input, tile)?;
-            self.append_kernel(
-                tiles,
-                tile,
-                self.kernel_run(
+            {
+                let run = self.kernel_run(
                     operation_provenance(operation),
                     if plan.input.format.precision != plan.output.format.precision {
                         TileKernelSpec::Cast {
@@ -135,8 +130,9 @@ impl TileGraphBuilder {
                         views: vec![self.full_view(input)],
                     }],
                     self.full_view(output),
-                )?,
-            )?;
+                )?;
+                self.append_kernel(tiles, tile, run)
+            }?;
         }
         Ok(())
     }

@@ -414,10 +414,8 @@ impl TileGraphBuilder {
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
         let tile = self.shards[shard.index() as usize].tile;
-        self.append_kernel(
-            tiles,
-            tile,
-            self.kernel_run(
+        {
+            let run = self.kernel_run(
                 provenance,
                 TileKernelSpec::FillZero {
                     offset: range.offset,
@@ -426,8 +424,9 @@ impl TileGraphBuilder {
                 },
                 Vec::new(),
                 self.full_view(shard),
-            )?,
-        )
+            )?;
+            self.append_kernel(tiles, tile, run)
+        }
     }
 }
 

@@ -4,12 +4,44 @@ use super::*;
 
 impl TileGraphBuilder {
     pub(super) fn kernel_run(
-        &self,
+        &mut self,
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
         output: ShardView,
     ) -> ExpansionResult<KernelRun> {
+        // Intern the contract before allocating its formats/requirements. Operand
+        // views vary by tile; the kernel and storage contracts usually do not.
+        let format = |operand: &KernelOperand| -> ExpansionResult<&TensorFormat> {
+            let view = operand
+                .views
+                .first()
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
+            Ok(&self.shards[view.shard.index() as usize].tensor_type.format)
+        };
+        let output_format = &self.shards[output.shard.index() as usize]
+            .tensor_type
+            .format;
+        for metadata in &self.kernel_metadata {
+            if metadata.provenance == provenance
+                && metadata.kernel == kernel
+                && metadata.requirements.output.format == *output_format
+                && metadata.requirements.inputs.len() == inputs.len()
+                && inputs
+                    .iter()
+                    .zip(&metadata.requirements.inputs)
+                    .all(|(operand, requirement)| {
+                        format(operand).is_ok_and(|f| *f == requirement.format)
+                    })
+            {
+                return Ok(KernelRun {
+                    product_flops: None,
+                    metadata: Arc::clone(metadata),
+                    inputs,
+                    output,
+                });
+            }
+        }
         let formats = inputs
             .iter()
             .map(|operand| {
@@ -31,13 +63,9 @@ impl TileGraphBuilder {
                 .format
                 .clone(),
         );
-        Ok(KernelRun::new(
-            provenance,
-            kernel,
-            inputs,
-            output,
-            requirements,
-        ))
+        let run = KernelRun::new(provenance, kernel, inputs, output, requirements);
+        self.kernel_metadata.push(Arc::clone(&run.metadata));
+        Ok(run)
     }
 
     pub(super) fn append_physical_phase(
@@ -213,17 +241,8 @@ impl TileGraphBuilder {
         &mut self,
         tiles: &mut BlockRegion,
         tile: u16,
-        mut run: KernelRun,
+        run: KernelRun,
     ) -> ExpansionResult<()> {
-        if let Some(metadata) = self
-            .kernel_metadata
-            .iter()
-            .find(|metadata| metadata.as_ref() == run.metadata.as_ref())
-        {
-            run.metadata = Arc::clone(metadata);
-        } else {
-            self.kernel_metadata.push(Arc::clone(&run.metadata));
-        }
         let id = KernelRunId(
             u32::try_from(self.kernel_runs.len()).map_err(|_| ExpansionError::IdOverflow)?,
         );
