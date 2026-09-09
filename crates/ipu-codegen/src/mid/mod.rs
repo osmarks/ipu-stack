@@ -172,7 +172,7 @@ pub struct PipelineConfig {
     pub tile_count: u16,
     /// Opt into a bounded baseline followed by incumbent-preserving regional search.
     pub regional_planning: Option<RegionalPlanning>,
-    /// Restrict grid enumeration to simple divisors for bounded baseline construction.
+    /// Use simple divisor grids and balanced row-major boundaries for bounded baseline construction.
     pub compact_layout_search: bool,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Graph-boundary tensors whose layout may be selected by their first

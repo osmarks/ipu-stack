@@ -28,7 +28,7 @@ pub(crate) fn baseline_config(config: &PipelineConfig, attempt: usize) -> Pipeli
     seed.regional_planning = None;
     seed.compact_layout_search = true;
     seed.shape_aware_active_tile_counts = false;
-    seed.planning_beam_width = 2;
+    seed.planning_beam_width = [2, 8, 16][attempt.min(2)];
     seed.expanded_plan_finalists = 1;
     seed.placement_finalists = 1;
     seed.exchange_schedule_finalists = 1;
@@ -42,7 +42,21 @@ pub(crate) fn baseline(
     config: &PipelineConfig,
     costs: &impl CostModel,
 ) -> LoweringResult<MidProgram> {
-    planner::plan_finalists(graph, config, costs, 1)?
+    let mut seed = config.clone();
+    for input in graph
+        .inputs()
+        .iter()
+        .filter(|input| input.kind == GraphInputKind::Host)
+    {
+        if let Some(&precision) = seed.automatic_inputs.get(&input.value)
+            && let Some(layout) = balanced_row_major(&input.shape, precision, seed.tile_count, true)
+        {
+            seed.inputs
+                .insert(input.value, TensorFormat { precision, layout });
+            seed.automatic_inputs.remove(&input.value);
+        }
+    }
+    planner::plan_finalists(graph, &seed, costs, 1)?
         .into_iter()
         .next()
         .ok_or(LoweringError::InvalidImplementation)
@@ -111,6 +125,19 @@ pub(crate) struct Replacement {
 /// Multiple representations of the same origin and escaping deferred producers
 /// need a richer contract; leave those incumbents untouched for now.
 pub(crate) fn replacements(
+    graph: &ComputeGraph,
+    incumbent: &MidProgram,
+    range: Range<usize>,
+    config: &PipelineConfig,
+    options: &RegionalPlanning,
+    costs: &impl CostModel,
+) -> LoweringResult<Vec<Replacement>> {
+    planner::in_planning_pool(|| {
+        replacements_in_pool(graph, incumbent, range, config, options, costs)
+    })
+}
+
+fn replacements_in_pool(
     graph: &ComputeGraph,
     incumbent: &MidProgram,
     range: Range<usize>,
@@ -309,48 +336,69 @@ pub(crate) fn replacements(
 /// 1024 floating operations per tile-cycle exceeds the supported kernels' peak.
 /// Ignore non-GEMM work rather than treating heuristic prices as hard bounds.
 pub(crate) fn compute_lower_bound(program: &MidProgram) -> u64 {
-    fn work(ops: &[MidOperation], values: &[MidValue]) -> u64 {
-        ops.iter()
-            .map(|op| match &op.kind {
-                MidOperationKind::Repeat(r) => {
-                    work(&r.body.operations, values).saturating_mul(u64::from(r.count))
+    fn work(ops: &[MidOperation], values: &[MidValue]) -> (u64, u64) {
+        let (mut total, mut bottleneck) = (0u64, 0u64);
+        for op in ops {
+            if let MidOperationKind::Repeat(r) = &op.kind {
+                let (body, local) = work(&r.body.operations, values);
+                total = total.saturating_add(body.saturating_mul(u64::from(r.count)));
+                bottleneck = bottleneck.max(local.saturating_mul(u64::from(r.count)));
+                continue;
+            }
+            let Some(plan) = op.operator_plan() else {
+                continue;
+            };
+            let MidOperator::Gemm { options, .. } = plan.operator else {
+                continue;
+            };
+            let Some(input) = op
+                .inputs
+                .first()
+                .map(|id| &values[id.index() as usize].tensor_type.shape.0)
+            else {
+                continue;
+            };
+            let Some(output) = op
+                .results
+                .first()
+                .map(|id| &values[id.index() as usize].tensor_type.shape.0)
+            else {
+                continue;
+            };
+            let Some(axis) = input
+                .len()
+                .checked_sub(if options.transpose_left { 2 } else { 1 })
+            else {
+                continue;
+            };
+            let flops = output
+                .iter()
+                .fold(2u64, |p, &n| p.saturating_mul(u64::from(n)))
+                .saturating_mul(u64::from(input[axis]));
+            let active = match plan.dispatch {
+                OperatorDispatch::BlockedGemm {
+                    distribution:
+                        GemmDistribution::ParallelReduction {
+                            row_partitions,
+                            column_partitions,
+                            inner_partitions,
+                            ..
+                        },
+                    ..
+                } => {
+                    u64::from(row_partitions)
+                        * u64::from(column_partitions)
+                        * u64::from(inner_partitions)
                 }
-                MidOperationKind::Operator { plan, .. } => {
-                    if let MidOperator::Gemm { options, .. } = plan.operator {
-                        let Some(input) = op
-                            .inputs
-                            .first()
-                            .map(|id| &values[id.index() as usize].tensor_type.shape.0)
-                        else {
-                            return 0;
-                        };
-                        let Some(output) = op
-                            .results
-                            .first()
-                            .map(|id| &values[id.index() as usize].tensor_type.shape.0)
-                        else {
-                            return 0;
-                        };
-                        let Some(axis) =
-                            input
-                                .len()
-                                .checked_sub(if options.transpose_left { 2 } else { 1 })
-                        else {
-                            return 0;
-                        };
-                        output
-                            .iter()
-                            .fold(2u64, |p, &n| p.saturating_mul(u64::from(n)))
-                            .saturating_mul(u64::from(input[axis]))
-                    } else {
-                        0
-                    }
-                }
-                _ => 0,
-            })
-            .fold(0u64, u64::saturating_add)
+                _ => u64::from(plan.requirements.output.format.layout.tiling.tile_count),
+            };
+            total = total.saturating_add(flops);
+            bottleneck = bottleneck.max(flops / (active.max(1) * 1024));
+        }
+        (total, bottleneck)
     }
-    work(&program.operations, &program.values) / (u64::from(program.tile_count).max(1) * 1024)
+    let (flops, bottleneck) = work(&program.operations, &program.values);
+    (flops / (u64::from(program.tile_count).max(1) * 1024)).max(bottleneck)
 }
 
 pub(crate) fn resolve(program: &MidProgram, checkpoints: bool) -> LoweringResult<MidProgram> {
@@ -366,6 +414,50 @@ pub(crate) fn resolve(program: &MidProgram, checkpoints: bool) -> LoweringResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn regional_repeat_preserves_sequences_and_is_deterministic() {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [16, 16]).unwrap();
+        let weights = (0..3)
+            .map(|i| graph.parameter(format!("w{i}"), [16, 16]).unwrap())
+            .collect::<Vec<_>>();
+        let sequence = graph.value_sequence("weights", weights.clone()).unwrap();
+        let y = graph
+            .repeat(3, [x], [], [sequence], |body, args| {
+                Ok(vec![body.gemm(args.carried[0], args.iterated[0])?])
+            })
+            .unwrap()[0];
+        graph.set_outputs([y]).unwrap();
+        let mut config = PipelineConfig::new(8).with_automatic_input(x, Precision::F16);
+        for weight in weights {
+            config = config.with_automatic_input(weight, Precision::F16);
+        }
+        let seed_config = baseline_config(&config, 0);
+        let seed = baseline(&graph, &seed_config, &Ipu21CostModel).unwrap();
+        assert_eq!(
+            seed,
+            baseline(&graph, &seed_config, &Ipu21CostModel).unwrap()
+        );
+        let alternatives = replacements(
+            &graph,
+            &seed,
+            0..1,
+            &config,
+            &RegionalPlanning::default(),
+            &Ipu21CostModel,
+        )
+        .unwrap();
+        assert!(!alternatives.is_empty());
+        for alternative in alternatives {
+            let resolved = resolve(&alternative.program, true).unwrap();
+            let low = crate::low::expand::expand_tiles(&resolved, true).unwrap();
+            assert!(
+                matches!(&alternative.program.operations[0].kind, MidOperationKind::Repeat(r) if r.count == 3)
+            );
+            assert!(compute_lower_bound(&alternative.program) <= low.estimated_cycles);
+        }
+    }
+
     #[test]
     fn replacements_preserve_boundary_types_and_expand_with_residual_consumers() {
         let mut graph = ComputeGraph::new();

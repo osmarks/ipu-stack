@@ -520,55 +520,14 @@ pub(super) fn plans(
                         .layout
                         .tiling
                         .tile_count;
-                    let Some(&columns) = output.0.last() else {
+                    let Some(layout) = balanced_row_major(
+                        output,
+                        candidate.requirements.output.format.precision,
+                        capacity,
+                        format_policy == OperatorFormatPolicy::RowMajorGrid,
+                    ) else {
                         continue;
                     };
-                    if columns == 0 {
-                        continue;
-                    }
-                    let grain = (8 / candidate.requirements.output.format.precision.bytes()) as u32;
-                    let mut row_parts = 1u16;
-                    let mut axes = Vec::new();
-                    // Keep complete rows local before using spare tiles for columns.
-                    // Leading batch axes carry independent rows just like tokens.
-                    for (axis, &size) in output.0[..output.0.len() - 1].iter().enumerate().rev() {
-                        if size == 0 || (size == 1 && axis + 2 != output.0.len()) {
-                            continue;
-                        }
-                        let parts = size.min(u32::from(capacity / row_parts)) as u16;
-                        axes.push(
-                            AxisTiling::new(
-                                TensorAxis::FromEnd((output.0.len() - axis) as u16),
-                                parts,
-                                1,
-                                Padding::Reject,
-                            )
-                            .with_tile_stride(row_parts),
-                        );
-                        row_parts *= parts;
-                    }
-                    let column_parts = if format_policy == OperatorFormatPolicy::RowMajorGrid {
-                        (u32::from(capacity / row_parts)).min(columns.div_ceil(grain)) as u16
-                    } else {
-                        1
-                    };
-                    for axis in &mut axes {
-                        axis.tile_stride = axis.tile_stride.map(|stride| stride * column_parts);
-                    }
-                    axes.push(
-                        AxisTiling::new(
-                            TensorAxis::FromEnd(1),
-                            column_parts,
-                            grain,
-                            Padding::Reject,
-                        )
-                        .with_tile_stride(1),
-                    );
-                    let layout = Layout::row_major(TensorTiling {
-                        tile_count: row_parts * column_parts,
-                        replicas: 1,
-                        axes,
-                    });
                     candidate.requirements.output.format.layout = layout.clone();
                     let output_type = TensorType {
                         shape: output.clone(),
@@ -1028,9 +987,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         });
     let mut grids = Vec::new();
     for inner_partitions in 2..=inner_groups.min(tile_count) {
-        if config.compact_layout_search
-            && (!tile_count.is_multiple_of(inner_partitions) || inner_partitions > 32)
-        {
+        if config.compact_layout_search && !tile_count.is_multiple_of(inner_partitions) {
             continue;
         }
         let maximum_columns = grouped_column_groups
@@ -1841,4 +1798,59 @@ pub(super) fn operator_matches(operation: &OperationKind, operator: MidOperator)
         }
         _ => false,
     }
+}
+
+/// Shared default ownership: spread complete rows over leading axes, then use
+/// remaining capacity for word-aligned column shards.
+pub(super) fn balanced_row_major(
+    output: &TensorShape,
+    precision: Precision,
+    capacity: u16,
+    split_columns: bool,
+) -> Option<Layout> {
+    if capacity == 0 {
+        return None;
+    }
+    let &columns = output.0.last()?;
+    if columns == 0 {
+        return None;
+    }
+    let grain = (8 / precision.bytes()) as u32;
+    let mut row_parts = 1u16;
+    let mut axes = Vec::new();
+    // Keep complete rows local before using spare tiles for columns.
+    // Leading batch axes carry independent rows just like tokens.
+    for (axis, &size) in output.0[..output.0.len() - 1].iter().enumerate().rev() {
+        if size == 0 || (size == 1 && axis + 2 != output.0.len()) {
+            continue;
+        }
+        let parts = size.min(u32::from(capacity / row_parts)) as u16;
+        axes.push(
+            AxisTiling::new(
+                TensorAxis::FromEnd((output.0.len() - axis) as u16),
+                parts,
+                1,
+                Padding::Reject,
+            )
+            .with_tile_stride(row_parts),
+        );
+        row_parts *= parts;
+    }
+    let column_parts = if split_columns {
+        (u32::from(capacity / row_parts)).min(columns.div_ceil(grain)) as u16
+    } else {
+        1
+    };
+    for axis in &mut axes {
+        axis.tile_stride = axis.tile_stride.map(|stride| stride * column_parts);
+    }
+    axes.push(
+        AxisTiling::new(TensorAxis::FromEnd(1), column_parts, grain, Padding::Reject)
+            .with_tile_stride(1),
+    );
+    Some(Layout::row_major(TensorTiling {
+        tile_count: row_parts * column_parts,
+        replicas: 1,
+        axes,
+    }))
 }

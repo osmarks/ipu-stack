@@ -137,8 +137,14 @@ struct Arguments {
     #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
     expanded_plan_finalists: usize,
     /// Build a bounded baseline and improve explicit graph regions.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "benchmark_expansion")]
     regional_planning: bool,
+    /// Explicit top-level high-operation region START:END; may be repeated.
+    #[arg(long, requires = "regional_planning")]
+    planning_region: Vec<String>,
+    /// Benchmark selection through placement/scheduling without compiling executable support.
+    #[arg(long, conflicts_with_all = ["benchmark_expansion", "capture_exchange_schedule"])]
+    benchmark_selection: Option<PathBuf>,
     /// Maximum globally validated regional replacements.
     #[arg(long, default_value_t = 4, requires = "regional_planning")]
     regional_evaluations: usize,
@@ -1056,6 +1062,17 @@ fn main() -> Result<()> {
         runtime_source,
         pipeline,
     };
+    for region in &arguments.planning_region {
+        let (start, end) = region
+            .split_once(':')
+            .context("planning region must be START:END")?;
+        graph.add_planning_region(start.parse()?..end.parse()?)?;
+    }
+    if let Some(path) = &arguments.benchmark_selection {
+        let report = ipu_codegen::benchmark_selection(&graph, &package_config.pipeline)?;
+        serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
+        return Ok(());
+    }
     if let Some(path) = &arguments.benchmark_expansion {
         let report = ipu_codegen::benchmark_mid_expansion(
             &graph,

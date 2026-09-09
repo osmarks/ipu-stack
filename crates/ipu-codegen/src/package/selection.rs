@@ -71,10 +71,25 @@ pub(super) fn select_scheduled_finalist<T>(
     finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
+    finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
+) -> PackageBuildResult<(ScheduledPlan, T)> {
+    select_scheduled_cached(
+        finalists,
+        planning,
+        tile_mapping,
+        finalize,
+        Arc::new(crate::low::expand::ExpansionCache::default()),
+    )
+}
+
+pub(super) fn select_scheduled_cached<T>(
+    finalists: Vec<crate::MidProgram>,
+    planning: &PipelineConfig,
+    tile_mapping: Option<&[u16]>,
     mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
+    expansion_cache: Arc<crate::low::expand::ExpansionCache>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let topology = active_topology(planning.tile_count)?;
-    let expansion_cache = Arc::new(crate::low::expand::ExpansionCache::default());
     let screened = finalists
         .into_par_iter()
         .enumerate()

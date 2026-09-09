@@ -7,7 +7,10 @@ use profile::{instrument_profile, profile_binding, profile_step_count};
 mod benchmark;
 mod regional;
 mod selection;
-pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
+pub use benchmark::{
+    ExpansionBenchmark, ExpansionTiming, SelectionBenchmark, benchmark_mid_expansion,
+    benchmark_selection,
+};
 mod tile_program;
 use selection::ScheduledPlan;
 pub use tile_program::build_tile_program_package;
