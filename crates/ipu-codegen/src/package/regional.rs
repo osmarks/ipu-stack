@@ -3,10 +3,6 @@ use super::selection::{ScheduledPlan, select_scheduled_cached};
 use super::*;
 use crate::mid::regional as search;
 
-fn cycles(plan: &ScheduledPlan) -> PackageBuildResult<u64> {
-    Ok(crate::estimate::scheduled_program_cycles(&plan.program.program, &plan.phases)?.total)
-}
-
 pub(super) fn select<T>(
     graph: &ComputeGraph,
     planning: &PipelineConfig,
@@ -50,7 +46,7 @@ pub(super) fn select<T>(
         let result = (|| -> PackageBuildResult<_> {
             let program = search::baseline(graph, &seed, &costs)?;
             let (physical, artifact) = evaluate(&program)?;
-            let score = cycles(&physical)?;
+            let score = physical.cycles;
             Ok((program, score, physical, artifact))
         })();
         match result {
@@ -134,13 +130,7 @@ pub(super) fn select<T>(
                 evaluations += 1;
                 match evaluate(&candidate) {
                     Ok((replacement, replacement_artifact)) => {
-                        let replacement_score = match cycles(&replacement) {
-                            Ok(score) => score,
-                            Err(error) => {
-                                tracing::info!(%error, "kept incumbent after replacement scoring failed");
-                                continue;
-                            }
-                        };
+                        let replacement_score = replacement.cycles;
                         tracing::info!(pass, region=?region, incumbent_cycles=score, candidate_cycles=replacement_score, "validated regional proposal");
                         if replacement_score < score {
                             tracing::info!(pass, region=?region, before=score, after=replacement_score, "accepted feasible regional improvement");
@@ -195,16 +185,32 @@ mod tests {
         config.regional_planning = Some(crate::RegionalPlanning::default());
         let mut baseline = None;
         let (selected, artifact) = select(&graph, &config, None, |plan| {
-            let score = cycles(plan)?;
+            let score = plan.cycles;
             baseline.get_or_insert(score);
             Ok(score)
         })
         .unwrap();
-        assert_eq!(cycles(&selected).unwrap(), artifact);
+        assert_eq!(selected.cycles, artifact);
         assert!(
             artifact < baseline.unwrap(),
             "baseline={baseline:?}, selected={artifact}"
         );
+        // A promising provisional schedule must lose if final package placement
+        // makes it slower. Keep the artifact and finalized score together.
+        let mut validations = 0;
+        let (selected, artifact) = select(&graph, &config, None, |plan| {
+            validations += 1;
+            plan.cycles = if validations == 1 {
+                1_000_000
+            } else {
+                2_000_000
+            };
+            Ok(validations)
+        })
+        .unwrap();
+        assert!(validations > 1);
+        assert_eq!(artifact, 1);
+        assert_eq!(selected.cycles, 1_000_000);
     }
 
     #[test]

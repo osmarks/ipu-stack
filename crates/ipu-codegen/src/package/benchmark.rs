@@ -226,11 +226,7 @@ pub fn benchmark_selection(
     let (selected, ()) = selection::select_graph_finalist(graph, config, None, |_| Ok(()))?;
     Ok(SelectionBenchmark {
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
-        scheduled_cycles: crate::estimate::scheduled_program_cycles(
-            &selected.program.program,
-            &selected.phases,
-        )?
-        .total,
+        scheduled_cycles: selected.cycles,
         shards: selected.program.shards.len(),
         kernels: selected.program.kernel_runs.len(),
         exchange_phases: selected.phases.len(),

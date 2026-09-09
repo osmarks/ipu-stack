@@ -20,6 +20,8 @@ struct ModelledPlan {
 /// Selected work and its completed provisional allocation/schedule. Package
 /// sizing consumes these same artifacts before support storage changes addresses.
 pub(super) struct ScheduledPlan {
+    /// Cost of the most recently validated placement; package finalization updates it.
+    pub cycles: u64,
     pub program: LowProgram,
     pub placement: crate::Placement,
     pub phases: Vec<crate::PhysicalExchangePhase>,
@@ -223,6 +225,7 @@ pub(super) fn select_scheduled_cached<T>(
                     Ok((
                         (refined.total, index, mapped),
                         ScheduledPlan {
+                            cycles: refined.total,
                             program: low,
                             placement,
                             phases: exchanges.phases,
@@ -236,7 +239,7 @@ pub(super) fn select_scheduled_cached<T>(
         let mut feasible = false;
         for (mapped, result) in results {
             match result {
-                Ok((score, mut plan)) => {
+                Ok((mut score, mut plan)) => {
                     // Exact support placement is part of acceptance. A fast
                     // but unplaceable package must not consume the budget or
                     // prevent another finalist from being attempted.
@@ -244,6 +247,7 @@ pub(super) fn select_scheduled_cached<T>(
                     caches[usize::from(mapped)] = plan.cache.clone();
                     match finalized {
                         Ok(artifact) => {
+                            score.0 = plan.cycles;
                             feasible = true;
                             if best
                                 .as_ref()

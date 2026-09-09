@@ -853,6 +853,7 @@ fn build_package_from_objects(
     });
     application.host_exchange = host.protocol;
     application.validate()?;
+    selected.cycles = final_cost.total;
     Ok(BuiltApplication {
         application,
         placement,
