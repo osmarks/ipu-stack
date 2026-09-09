@@ -27,6 +27,12 @@ pub struct ExpansionTiming {
     pub mid_values: usize,
     pub expand_ms: f64,
     pub tile_lists_ms: f64,
+    pub footprint_ms: f64,
+    /// Distinct views, view pairs and stored receive-row descriptors.
+    pub geometry: (usize, usize, usize),
+    /// Diagnostic copying costs, outside expansion/footprint timings.
+    pub clone_shards_ms: f64,
+    pub clone_kernel_runs_ms: f64,
     pub shards: usize,
     pub kernels: usize,
     pub local_copies: usize,
@@ -121,22 +127,39 @@ pub fn benchmark_mid_expansion(
             }
         }
         selections_in(mid, &mid.operations, &mut selections);
+        let mut analysis = crate::estimate::GeometryAnalysis::default();
         let start = Instant::now();
-        let expanded = crate::low::expand::expand_tiles_cached(
+        let expanded = crate::low::expand::expand_tiles_analyzed(
             mid,
             config.diagnostic_checkpoints,
             Arc::clone(&cache),
+            &mut analysis,
         )?;
         let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
         let start = Instant::now();
+        let _footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
+        let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = Instant::now();
         let low = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
         let tile_lists_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let start = Instant::now();
+        let cloned = std::hint::black_box(expanded.shards.clone());
+        let clone_shards_ms = start.elapsed().as_secs_f64() * 1000.0;
+        drop(cloned);
+        let start = Instant::now();
+        let cloned = std::hint::black_box(expanded.kernel_runs.clone());
+        let clone_kernel_runs_ms = start.elapsed().as_secs_f64() * 1000.0;
+        drop(cloned);
         let timing = ExpansionTiming {
             finalist,
             mid_operations: mid.operations.len(),
             mid_values: mid.values.len(),
             expand_ms,
             tile_lists_ms,
+            footprint_ms,
+            geometry: analysis.stats(),
+            clone_shards_ms,
+            clone_kernel_runs_ms,
             shards: low.shards.len(),
             kernels: low.kernel_runs.len(),
             local_copies: low.local_copies.len(),

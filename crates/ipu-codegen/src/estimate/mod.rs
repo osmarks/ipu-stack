@@ -1,6 +1,8 @@
 //! Estimates share one vocabulary: tensor geometry and traffic describe work;
 //! memory evaluates allocations/liveness, and cycles applies IPU21 prices.
 
+mod geometry;
+pub(crate) use geometry::GeometryAnalysis;
 mod cycles;
 use cycles::exchange_fragment_price;
 mod exchange_storage;
@@ -15,7 +17,8 @@ pub(crate) use mid::{
     region_peak_memory_with_multiplicity, unavailable_memory,
 };
 pub(crate) use program::{
-    ProgramCycles, program_cycles, program_footprint, scheduled_program_cycles,
+    ProgramCycles, program_cycles, program_cycles_analyzed, program_footprint_analyzed,
+    scheduled_program_cycles,
 };
 mod movement;
 mod tensor;
@@ -38,3 +41,6 @@ pub(crate) use traffic::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use program::program_footprint;

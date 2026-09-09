@@ -53,49 +53,9 @@ impl<K: Eq, V> Memo<K, V> {
 }
 
 #[derive(PartialEq, Eq, Hash)]
-struct CopyGeometry {
-    precision: Precision,
-    order: ElementOrder,
-    allocation: Vec<ShardExtent>,
-    view: Vec<ShardExtent>,
-}
-impl CopyGeometry {
-    fn new(shard: &BlockValue, view: &ShardView) -> ExpansionResult<Self> {
-        if shard.extents.len() != view.extents.len() {
-            return Err(StorageError::InvalidView.into());
-        }
-        let mut allocation = shard.extents.clone();
-        let mut view = view.extents.clone();
-        for (a, v) in allocation.iter_mut().zip(&mut view) {
-            let start = a.start;
-            a.start = 0;
-            a.logical_end -= start;
-            a.physical_end -= start;
-            v.start = v
-                .start
-                .checked_sub(start)
-                .ok_or(StorageError::InvalidView)?;
-            v.logical_end = v
-                .logical_end
-                .checked_sub(start)
-                .ok_or(StorageError::InvalidView)?;
-            v.physical_end = v
-                .physical_end
-                .checked_sub(start)
-                .ok_or(StorageError::InvalidView)?;
-        }
-        Ok(Self {
-            precision: shard.tensor_type.format.precision,
-            order: shard.tensor_type.format.layout.order,
-            allocation,
-            view,
-        })
-    }
-}
-#[derive(PartialEq, Eq, Hash)]
 struct CopyKey {
-    source: CopyGeometry,
-    destination: CopyGeometry,
+    source: crate::storage::ViewGeometry,
+    destination: crate::storage::ViewGeometry,
     order: CopyOrder,
     same_buffer: bool,
 }
@@ -266,8 +226,8 @@ impl ExpansionCache {
             return Ok(Arc::new(generate()?));
         }
         let key = CopyKey {
-            source: CopyGeometry::new(left, source)?,
-            destination: CopyGeometry::new(right, destination)?,
+            source: crate::storage::ViewGeometry::new(left.storage(), &source.extents)?,
+            destination: crate::storage::ViewGeometry::new(right.storage(), &destination.extents)?,
             order,
             same_buffer: source.shard == destination.shard,
         };

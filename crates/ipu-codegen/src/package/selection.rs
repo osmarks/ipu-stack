@@ -361,10 +361,15 @@ fn expand_and_screen(
     cache: Arc<crate::low::expand::ExpansionCache>,
 ) -> PackageBuildResult<(LowProgram, crate::estimate::ExchangeFootprint)> {
     let start = Instant::now();
-    let mut expanded =
-        crate::low::expand::expand_tiles_cached(mid, planning.diagnostic_checkpoints, cache)?;
+    let mut analysis = crate::estimate::GeometryAnalysis::default();
+    let mut expanded = crate::low::expand::expand_tiles_analyzed(
+        mid,
+        planning.diagnostic_checkpoints,
+        cache,
+        &mut analysis,
+    )?;
     let expansion_ms = start.elapsed().as_millis();
-    let footprint = crate::estimate::program_footprint(&expanded)?;
+    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
     let fragments = footprint.maximum_transfer_chunks_per_tile;
     tracing::info!(
         expansion_ms,

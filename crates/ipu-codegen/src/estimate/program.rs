@@ -2,6 +2,42 @@
 
 use super::{IPU21_TARGET_COSTS as TARGET, *};
 use crate::{BlockOperation, BlockRegion, ExpansionResult, KernelRun, TileGraph};
+// Contracts are already interned by expansion. Keep the few physical shape
+// variants under each contract, comparing borrowed widths without allocation.
+type KernelCosts<'a> =
+    std::collections::HashMap<*const crate::low::KernelRunMetadata, Vec<(&'a KernelRun, u64)>>;
+fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> u64 {
+    fn shapes(run: &KernelRun) -> impl Iterator<Item = Option<&[crate::ShardExtent]>> {
+        run.inputs
+            .iter()
+            .map(|i| i.views.first().map(|v| v.extents.as_slice()))
+            .chain(std::iter::once(Some(run.output.extents.as_slice())))
+    }
+    let variants = costs
+        .entry(std::sync::Arc::as_ptr(&run.metadata))
+        .or_default();
+    let found = variants.iter().find(|(other, _)| {
+        run.inputs.len() == other.inputs.len()
+            && shapes(run).zip(shapes(other)).all(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => {
+                    a.len() == b.len()
+                        && a.iter()
+                            .zip(b)
+                            .all(|(a, b)| a.physical_end - a.start == b.physical_end - b.start)
+                }
+                (None, None) => true,
+                _ => false,
+            })
+    });
+    if let Some((_, cycles)) = found {
+        #[cfg(test)]
+        assert_eq!(*cycles, kernel_cycles(run));
+        return *cycles;
+    }
+    let cycles = kernel_cycles(run);
+    variants.push((run, cycles));
+    cycles
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProgramCycles {
@@ -111,6 +147,14 @@ pub(crate) fn program_cycles(
     program: &TileGraph,
     exchange: Option<&[u64]>,
 ) -> ExpansionResult<ProgramCycles> {
+    program_cycles_analyzed(program, exchange, &mut GeometryAnalysis::default())
+}
+
+pub(crate) fn program_cycles_analyzed(
+    program: &TileGraph,
+    exchange: Option<&[u64]>,
+    geometry: &mut GeometryAnalysis,
+) -> ExpansionResult<ProgramCycles> {
     let phases = if let Some(costs) = exchange {
         costs.to_vec()
     } else {
@@ -118,7 +162,7 @@ pub(crate) fn program_cycles(
             .exchange_phases
             .iter()
             .map(|phase| {
-                let traffic = phase_traffic(program, phase)?;
+                let traffic = geometry_traffic(program, phase, true, None, geometry)?;
                 // Fragmented transfers also consume routing/pointer events.
                 // Use the same calibration as materialization selection;
                 // bandwidth alone makes scattered views look nearly free.
@@ -130,13 +174,18 @@ pub(crate) fn program_cycles(
             })
             .collect::<ExpansionResult<Vec<_>>>()?
     };
-    fn region(program: &TileGraph, body: &BlockRegion, phases: &[u64]) -> Timeline {
+    fn region<'a>(
+        program: &'a TileGraph,
+        body: &BlockRegion,
+        phases: &[u64],
+        kernels: &mut KernelCosts<'a>,
+    ) -> Timeline {
         let mut timeline = Timeline::new(usize::from(program.tile_count));
         for operation in &body.operations {
             match operation {
                 BlockOperation::Compute { tile, run } => timeline.local(
                     usize::from(*tile),
-                    kernel_cycles(&program.kernel_runs[run.0 as usize]),
+                    cached_kernel_cycles(&program.kernel_runs[run.0 as usize], kernels),
                 ),
                 BlockOperation::Copy { tile, copy } => {
                     let copy = &program.local_copies[copy.0 as usize];
@@ -167,7 +216,7 @@ pub(crate) fn program_cycles(
                 }
                 BlockOperation::Exchange(phase) => timeline.barrier(phases[phase.index() as usize]),
                 BlockOperation::Repeat(repeat) => timeline.repeat(
-                    region(program, &repeat.body, phases),
+                    region(program, &repeat.body, phases, kernels),
                     u64::from(repeat.count),
                 ),
                 BlockOperation::Checkpoint(..) => {}
@@ -175,17 +224,156 @@ pub(crate) fn program_cycles(
         }
         timeline
     }
-    Ok(region(program, &program.body, &phases).cycles())
-}
-
-pub(super) fn phase_traffic(
-    program: &TileGraph,
-    phase: &crate::ExchangePhase,
-) -> ExpansionResult<ExchangeEndpointTraffic> {
-    geometry_traffic(program, phase, true, None)
+    Ok(region(
+        program,
+        &program.body,
+        &phases,
+        &mut std::collections::HashMap::new(),
+    )
+    .cycles())
 }
 
 fn geometry_traffic(
+    program: &TileGraph,
+    phase: &crate::ExchangePhase,
+    shared_tx_lane: bool,
+    mut storage: Option<&mut ExchangeStoragePhase>,
+    geometry: &mut GeometryAnalysis,
+) -> ExpansionResult<ExchangeEndpointTraffic> {
+    #[cfg(test)]
+    let mut expected_storage = storage.as_deref().cloned();
+    let mut traffic = ExchangeEndpointTraffic::default();
+    for transfer in &phase.transfers {
+        let source = &program.shards[transfer.source.shard.index() as usize];
+        let order = transfer.span_order(&program.shards);
+        let source_geometry = geometry.view(program, &transfer.source, order)?;
+        let bytes = geometry.bytes(source_geometry);
+        let mut outgoing_fragments = 0;
+        let mut outgoing_long_fragments = 0;
+        for destination in &transfer.destinations {
+            let target = &program.shards[destination.shard.index() as usize];
+            let copy = geometry.copy(program, source_geometry, destination, order)?;
+            if let Some(storage) = storage.as_deref_mut() {
+                for row in &copy.receives {
+                    storage.connection_rows(
+                        source.tile,
+                        target.tile,
+                        (u64::from(destination.shard.index()) << 32) + u64::from(row.offset),
+                        row.bytes,
+                        row.rows,
+                        row.stride,
+                        transfer.destinations.len(),
+                        ipu_exchange::MAX_TRANSFER_WORDS * 4,
+                    );
+                }
+            }
+            outgoing_fragments = outgoing_fragments.max(copy.fragments);
+            outgoing_long_fragments = outgoing_long_fragments.max(copy.long_fragments);
+            traffic.add_incoming(target.tile, bytes, copy.fragments);
+        }
+        if let Some(storage) = storage.as_deref_mut() {
+            storage.send(source.tile, outgoing_fragments, outgoing_long_fragments);
+        }
+        // A multicast source is sent once, rather than once per receiver.
+        traffic.add_outgoing(
+            if shared_tx_lane {
+                source.tile / 2
+            } else {
+                source.tile
+            },
+            bytes,
+            outgoing_fragments,
+        );
+    }
+
+    #[cfg(test)]
+    {
+        let expected =
+            enumerated_geometry_traffic(program, phase, shared_tx_lane, expected_storage.as_mut())?;
+        assert_eq!(traffic, expected);
+        assert_eq!(storage.as_deref(), expected_storage.as_ref());
+    }
+    Ok(traffic)
+}
+
+fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
+    let geometry = |view: &'a crate::ShardView, format: &'a crate::TensorFormat| {
+        super::primitive::Geometry::Storage(crate::storage::TensorStorage {
+            format,
+            extents: &view.extents,
+        })
+    };
+    super::primitive::kernel_cycles(
+        &run.kernel,
+        |index| {
+            let operand = run.inputs.get(index)?;
+            let access = run.requirements.inputs.get(index)?;
+            Some(geometry(operand.views.first()?, &access.format))
+        },
+        geometry(&run.output, &run.requirements.output.format),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
+    program_footprint_analyzed(program, &mut GeometryAnalysis::default())
+}
+
+pub(crate) fn program_footprint_analyzed(
+    program: &TileGraph,
+    geometry: &mut GeometryAnalysis,
+) -> ExpansionResult<ExchangeFootprint> {
+    // Storage belongs to a tile, not to a shared transmit lane. Count both
+    // endpoint roles conservatively (bidi encoding may later combine them).
+    // Sum each tile across static phases before taking the maximum; Repeat
+    // execution counts do not multiply its stored table.
+    let mut chunks = vec![0u64; usize::from(program.tile_count)];
+    fn iterated_sources(region: &BlockRegion, sources: &mut HashSet<crate::BlockValueId>) {
+        for operation in &region.operations {
+            if let BlockOperation::Repeat(repeat) = operation {
+                sources.extend(
+                    repeat
+                        .bindings
+                        .iter()
+                        .flat_map(|binding| &binding.iterated)
+                        .map(|binding| binding.argument),
+                );
+                iterated_sources(&repeat.body, sources);
+            }
+        }
+    }
+    let mut iterated = HashSet::new();
+    iterated_sources(&program.body, &mut iterated);
+    let mut table = ExchangeStorageEstimator::new(program.tile_count);
+    for phase in &program.exchange_phases {
+        let mut storage = ExchangeStoragePhase::new(program.tile_count);
+        let traffic = geometry_traffic(program, phase, false, Some(&mut storage), geometry)?;
+        for transfer in &phase.transfers {
+            if iterated.contains(&transfer.source.shard) {
+                storage
+                    .disable_sharing(program.shards[transfer.source.shard.index() as usize].tile);
+            }
+        }
+        table.add(storage);
+        for (tile, load) in traffic
+            .outgoing_lanes
+            .iter()
+            .enumerate()
+            .chain(traffic.incoming_tiles.iter().enumerate())
+        {
+            let count = &mut chunks[tile];
+            *count = count.saturating_add(load.fragments);
+        }
+    }
+    Ok(ExchangeFootprint {
+        phases: program.exchange_phases.len() as u64,
+        maximum_transfer_chunks_per_tile: chunks.into_iter().max().unwrap_or(0),
+        encoded_row_bytes: Some(table.maximum_bytes()),
+    })
+}
+
+#[cfg(test)]
+fn enumerated_geometry_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
     shared_tx_lane: bool,
@@ -204,10 +392,7 @@ fn geometry_traffic(
             let mut fragments = 0u64;
             let mut long_fragments = 0u64;
             let target_spans = crate::view_byte_traversal(target, destination, order)?;
-            if storage.is_none() {
-                fragments = source_spans
-                    .copy_fragments(&target_spans, ipu_exchange::MAX_TRANSFER_WORDS * 4)?;
-            } else {
+            {
                 crate::for_each_copy_span(
                     source_spans.spans(),
                     target_spans.spans(),
@@ -260,74 +445,6 @@ fn geometry_traffic(
     }
 
     Ok(traffic)
-}
-
-fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
-    let geometry = |view: &'a crate::ShardView, format: &'a crate::TensorFormat| {
-        super::primitive::Geometry::Storage(crate::storage::TensorStorage {
-            format,
-            extents: &view.extents,
-        })
-    };
-    super::primitive::kernel_cycles(
-        &run.kernel,
-        |index| {
-            let operand = run.inputs.get(index)?;
-            let access = run.requirements.inputs.get(index)?;
-            Some(geometry(operand.views.first()?, &access.format))
-        },
-        geometry(&run.output, &run.requirements.output.format),
-    )
-}
-
-pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
-    // Storage belongs to a tile, not to a shared transmit lane. Count both
-    // endpoint roles conservatively (bidi encoding may later combine them).
-    // Sum each tile across static phases before taking the maximum; Repeat
-    // execution counts do not multiply its stored table.
-    let mut chunks = vec![0u64; usize::from(program.tile_count)];
-    fn iterated_sources(region: &BlockRegion, sources: &mut HashSet<crate::BlockValueId>) {
-        for operation in &region.operations {
-            if let BlockOperation::Repeat(repeat) = operation {
-                sources.extend(
-                    repeat
-                        .bindings
-                        .iter()
-                        .flat_map(|binding| &binding.iterated)
-                        .map(|binding| binding.argument),
-                );
-                iterated_sources(&repeat.body, sources);
-            }
-        }
-    }
-    let mut iterated = HashSet::new();
-    iterated_sources(&program.body, &mut iterated);
-    let mut table = ExchangeStorageEstimator::new(program.tile_count);
-    for phase in &program.exchange_phases {
-        let mut storage = ExchangeStoragePhase::new(program.tile_count);
-        let traffic = geometry_traffic(program, phase, false, Some(&mut storage))?;
-        for transfer in &phase.transfers {
-            if iterated.contains(&transfer.source.shard) {
-                storage
-                    .disable_sharing(program.shards[transfer.source.shard.index() as usize].tile);
-            }
-        }
-        table.add(storage);
-        for (tile, load) in traffic
-            .outgoing_lanes
-            .iter()
-            .enumerate()
-            .chain(traffic.incoming_tiles.iter().enumerate())
-        {
-            let count = &mut chunks[tile];
-            *count = count.saturating_add(load.fragments);
-        }
-    }
-    Ok(ExchangeFootprint {
-        phases: program.exchange_phases.len() as u64,
-        maximum_transfer_chunks_per_tile: chunks.into_iter().max().unwrap_or(0),
-        encoded_row_bytes: Some(table.maximum_bytes()),
-    })
 }
 
 #[cfg(test)]

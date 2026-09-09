@@ -42,6 +42,49 @@ pub type StorageResult<T> = Result<T, StorageError>;
 #[cfg(test)]
 mod sort_bench;
 
+/// Allocation-relative view identity. Storage traversal depends on precision,
+/// element order and these extents, not tile identity, memory class or tensor shape.
+#[derive(PartialEq, Eq, Hash)]
+pub(crate) struct ViewGeometry {
+    precision: Precision,
+    order: ElementOrder,
+    allocation: Vec<ShardExtent>,
+    view: Vec<ShardExtent>,
+}
+impl ViewGeometry {
+    pub(crate) fn new(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<Self> {
+        if shard.extents.len() != view.len() {
+            return Err(StorageError::InvalidView);
+        }
+        let mut allocation = shard.extents.to_vec();
+        let mut view = view.to_vec();
+        for (a, v) in allocation.iter_mut().zip(&mut view) {
+            let start = a.start;
+            a.start = 0;
+            a.logical_end -= start;
+            a.physical_end -= start;
+            v.start = v
+                .start
+                .checked_sub(start)
+                .ok_or(StorageError::InvalidView)?;
+            v.logical_end = v
+                .logical_end
+                .checked_sub(start)
+                .ok_or(StorageError::InvalidView)?;
+            v.physical_end = v
+                .physical_end
+                .checked_sub(start)
+                .ok_or(StorageError::InvalidView)?;
+        }
+        Ok(Self {
+            precision: shard.format.precision,
+            order: shard.format.layout.order,
+            allocation,
+            view,
+        })
+    }
+}
+
 /// Returns the physical allocation size of a shard.
 pub(crate) fn storage_bytes(shard: TensorStorage<'_>) -> StorageResult<u32> {
     let elements = shard.extents.iter().try_fold(1u64, |product, extent| {

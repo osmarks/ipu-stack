@@ -73,10 +73,25 @@ pub(crate) fn expand_tiles(
     expand_tiles_cached(graph, checkpoints, Arc::new(ExpansionCache::default()))
 }
 
+#[cfg(test)]
 pub(crate) fn expand_tiles_cached(
     graph: &MidProgram,
     checkpoints: bool,
     cache: Arc<ExpansionCache>,
+) -> ExpansionResult<Arc<TileGraph>> {
+    expand_tiles_analyzed(
+        graph,
+        checkpoints,
+        cache,
+        &mut crate::estimate::GeometryAnalysis::default(),
+    )
+}
+
+pub(crate) fn expand_tiles_analyzed(
+    graph: &MidProgram,
+    checkpoints: bool,
+    cache: Arc<ExpansionCache>,
+    analysis: &mut crate::estimate::GeometryAnalysis,
 ) -> ExpansionResult<Arc<TileGraph>> {
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
@@ -153,7 +168,7 @@ pub(crate) fn expand_tiles_cached(
     crate::low::passes::simplify(&mut program);
     let simplify_time = start.elapsed();
     let start = Instant::now();
-    let cycles = crate::estimate::program_cycles(&program, None)?;
+    let cycles = crate::estimate::program_cycles_analyzed(&program, None, analysis)?;
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),

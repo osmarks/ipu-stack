@@ -48,40 +48,24 @@ impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
         if source_traversal.byte_len() == 0 {
             return Ok(Vec::new());
         }
-        if let (Some(mut left), Some(mut right)) = (
-            source_traversal.regular_span(),
-            destination_traversal.regular_span(),
-        ) {
-            // Split a contiguous endpoint symbolically to match the other side.
-            if left.rows == 1 && right.rows > 1 {
-                left.bytes = right.bytes;
-                left.stride = right.bytes;
-                left.rows = right.rows;
-            } else if right.rows == 1 && left.rows > 1 {
-                right.bytes = left.bytes;
-                right.stride = left.bytes;
-                right.rows = left.rows;
-            }
-            if left.bytes == right.bytes
-                && left.rows == right.rows
-                && let Some(pattern) = row_copy_pattern(
-                    left.rows,
-                    left.bytes,
-                    left.offset,
-                    right.offset,
-                    left.stride,
-                    right.stride,
-                )
-            {
-                return Ok(vec![Self {
-                    source,
-                    destination,
-                    source_offset: left.offset,
-                    destination_offset: right.offset,
-                    bytes: left.bytes * left.rows,
-                    pattern,
-                }]);
-            }
+        if let Some((left, right)) = source_traversal.regular_copy(destination_traversal)
+            && let Some(pattern) = row_copy_pattern(
+                left.rows,
+                left.bytes,
+                left.offset,
+                right.offset,
+                left.stride,
+                right.stride,
+            )
+        {
+            return Ok(vec![Self {
+                source,
+                destination,
+                source_offset: left.offset,
+                destination_offset: right.offset,
+                bytes: left.bytes * left.rows,
+                pattern,
+            }]);
         }
         Self::from_spans(
             source,

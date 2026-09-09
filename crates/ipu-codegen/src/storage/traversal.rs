@@ -513,6 +513,27 @@ impl ByteTraversal {
         regular(part)
     }
 
+    /// Equal-sized contiguous or strided copy rows. A contiguous endpoint can
+    /// be split to match the other's row boundaries without enumeration.
+    pub(crate) fn regular_copy(&self, other: &Self) -> Option<(StridedSpan, StridedSpan)> {
+        let (mut left, mut right) = (self.regular_span()?, other.regular_span()?);
+        if u64::from(left.bytes) * u64::from(left.rows)
+            != u64::from(right.bytes) * u64::from(right.rows)
+        {
+            return None;
+        }
+        if left.rows == 1 && right.rows > 1 {
+            left.bytes = right.bytes;
+            left.stride = right.bytes;
+            left.rows = right.rows;
+        } else if right.rows == 1 && left.rows > 1 {
+            right.bytes = left.bytes;
+            right.stride = left.bytes;
+            right.rows = left.rows;
+        }
+        (left.bytes == right.bytes && left.rows == right.rows).then_some((left, right))
+    }
+
     pub(crate) fn contiguous(span: ByteSpan) -> Self {
         Self {
             parts: vec![Node {
@@ -709,6 +730,9 @@ impl ByteTraversal {
         if self.byte_len() != other.byte_len() {
             return Err(StorageError::InvalidView);
         }
+        if let Some((rows, _)) = self.regular_copy(other) {
+            return Ok(u64::from(rows.rows) * u64::from(rows.bytes.div_ceil(limit)));
+        }
         let Some(left) = self.summary(limit) else {
             return Ok(0);
         };
@@ -733,6 +757,24 @@ impl ByteTraversal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn regular_copy_counts_a_million_fragmented_rows_symbolically() {
+        let traversal = |stride| ByteTraversal {
+            parts: vec![
+                Node {
+                    offset: 0,
+                    kind: Kind::Run(32),
+                }
+                .repeat(1_000_000, stride),
+            ],
+        };
+        let (source, target) = (traversal(64), traversal(96));
+        let (_, rows) = source.regular_copy(&target).unwrap();
+        assert_eq!(rows.rows, 1_000_000);
+        assert_eq!(source.copy_fragments(&target, 16).unwrap(), 2_000_000);
+        assert_eq!(source.copy_fragments(&target, 1024).unwrap(), 1_000_000);
+    }
+
     #[test]
     fn empty_whole_allocations_retain_their_kernel_pointer_span() {
         let shard = super::super::tests::shard(crate::Layout::row_sharded(1), &[0, 16]);
@@ -869,15 +911,9 @@ mod tests {
                             (traversal, traversal),
                         ] {
                             assert_eq!(
-                                crate::CopyOperation::from_traversals(0, 1, a, b)
+                                crate::CopyOperation::from_traversals(0, 1, a, b).unwrap(),
+                                crate::CopyOperation::from_spans(0, 1, a.spans(), b.spans())
                                     .unwrap(),
-                                crate::CopyOperation::from_spans(
-                                    0,
-                                    1,
-                                    a.spans(),
-                                    b.spans()
-                                )
-                                .unwrap(),
                                 "direct copy {order:?} {precision:?} {view:?}"
                             );
                         }
