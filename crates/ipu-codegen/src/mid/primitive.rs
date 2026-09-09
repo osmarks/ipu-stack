@@ -9,7 +9,7 @@ pub struct OperandWindow(pub Vec<(u16, u32, u32)>);
 
 /// Matrix axes used by a local product after the distributed operands have
 /// been materialized. Blocking is in the selected GEMM kernel specification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProductAxes {
     pub left_inner: TensorAxis,
     pub right_inner: TensorAxis,

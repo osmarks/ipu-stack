@@ -100,7 +100,7 @@ impl TileGraphBuilder {
                         })
                         .collect::<ExpansionResult<Vec<_>>>()?;
                     if let Some(axes) = product {
-                        self.product_calls(
+                        self.cached_product_calls(
                             operation_provenance(operation),
                             tile,
                             kernel,
@@ -136,7 +136,7 @@ impl TileGraphBuilder {
         self.narrow_view(source, &ranges)
     }
 
-    fn product_calls(
+    pub(super) fn product_calls(
         &mut self,
         provenance: WorkProvenance,
         tile: u16,

@@ -55,6 +55,7 @@ pub(crate) fn view_byte_traversal(
 }
 
 pub(super) fn append_span_copies(
+    cache: &ExpansionCache,
     shards: &[BlockValue],
     source: &ShardView,
     destination: &ShardView,
@@ -62,21 +63,23 @@ pub(super) fn append_span_copies(
     copies: &mut Vec<(u16, LocalCopy)>,
     order: CopyOrder,
 ) -> ExpansionResult<()> {
-    let source_spans = view_byte_traversal(&shards[source.shard.index() as usize], source, order)?;
-    let destination_spans = view_byte_traversal(
-        &shards[destination.shard.index() as usize],
-        destination,
-        order,
-    )?;
     copies.extend(
-        LocalCopy::from_traversals(
-            source.shard,
-            destination.shard,
-            &source_spans,
-            &destination_spans,
-        )?
-        .into_iter()
-        .map(|copy| (tile, copy)),
+        cache
+            .copy(shards, source, destination, order)?
+            .iter()
+            .map(|c| {
+                (
+                    tile,
+                    LocalCopy {
+                        source: source.shard,
+                        destination: destination.shard,
+                        source_offset: c.source_offset,
+                        destination_offset: c.destination_offset,
+                        bytes: c.bytes,
+                        pattern: c.pattern,
+                    },
+                )
+            }),
     );
     Ok(())
 }

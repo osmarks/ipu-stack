@@ -98,6 +98,7 @@ impl TileGraphBuilder {
                     };
                     if self.shards[source.shard.index() as usize].tile == owner.tile {
                         append_span_copies(
+                            &self.cache,
                             &self.shards,
                             &source,
                             &destination,
@@ -152,6 +153,7 @@ impl TileGraphBuilder {
                 let seed_source = source_view(&contributors[seed]);
                 if self.shards[contributors[seed].shard.index() as usize].tile == owner.tile {
                     append_span_copies(
+                        &self.cache,
                         &self.shards,
                         &seed_source,
                         &self.full_view(initial),
@@ -228,6 +230,7 @@ impl TileGraphBuilder {
                     result
                 };
                 append_span_copies(
+                    &self.cache,
                     &self.shards,
                     &self.full_view(final_result),
                     &ShardView {

@@ -1,5 +1,6 @@
 //! Compiler timings which stop before placement and exchange scheduling.
 use super::*;
+use std::sync::Arc;
 
 #[derive(serde::Serialize)]
 pub struct ExpansionBenchmark {
@@ -7,6 +8,7 @@ pub struct ExpansionBenchmark {
     pub retained_finalists: usize,
     pub finalists: Vec<ExpansionTiming>,
     /// Matching selections are opportunities, not validated reusable graph fragments.
+    pub fragment_cache: [(usize, u64, u64); 2],
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
 }
 
@@ -53,6 +55,7 @@ pub fn benchmark_mid_expansion(
     )?;
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut finalists = Vec::new();
+    let cache = Arc::new(crate::low::expand::ExpansionCache::default());
     let mut selections = std::collections::BTreeMap::<
         &'static str,
         (usize, std::collections::BTreeSet<String>),
@@ -112,7 +115,11 @@ pub fn benchmark_mid_expansion(
         }
         selections_in(mid, &mid.operations, &mut selections);
         let start = Instant::now();
-        let expanded = crate::low::expand::expand_tiles(mid, config.diagnostic_checkpoints)?;
+        let expanded = crate::low::expand::expand_tiles_cached(
+            mid,
+            config.diagnostic_checkpoints,
+            Arc::clone(&cache),
+        )?;
         let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
         let start = Instant::now();
         let low = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
@@ -153,6 +160,7 @@ pub fn benchmark_mid_expansion(
         planning_ms,
         retained_finalists: plans.len(),
         finalists,
+        fragment_cache: cache.stats(),
         selection_reuse: selections
             .into_iter()
             .map(|(kind, (occurrences, keys))| {

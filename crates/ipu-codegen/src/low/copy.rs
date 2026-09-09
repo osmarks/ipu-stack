@@ -2,7 +2,7 @@
 
 use crate::storage::{ByteSpan, StorageError, StorageResult};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CopyOrder {
     /// Preserve tensor coordinates, converting between physical layouts.
     #[default]

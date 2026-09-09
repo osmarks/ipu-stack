@@ -1,6 +1,8 @@
 //! Expand selected whole-device primitives into tile-local calls and movement.
 
+mod cache;
 mod emit;
+pub(crate) use cache::ExpansionCache;
 mod primitive;
 
 mod materialize;
@@ -63,15 +65,25 @@ pub enum ExpansionError {
 
 pub type ExpansionResult<T> = Result<T, ExpansionError>;
 
+#[cfg(test)]
 pub(crate) fn expand_tiles(
     graph: &MidProgram,
     checkpoints: bool,
+) -> ExpansionResult<Arc<TileGraph>> {
+    expand_tiles_cached(graph, checkpoints, Arc::new(ExpansionCache::default()))
+}
+
+pub(crate) fn expand_tiles_cached(
+    graph: &MidProgram,
+    checkpoints: bool,
+    cache: Arc<ExpansionCache>,
 ) -> ExpansionResult<Arc<TileGraph>> {
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
     let start = Instant::now();
     let mut state = TileGraphBuilder::new(graph)?;
+    state.cache = cache;
     let body = state.build_region(&graph.operations, checkpoints)?;
     let inputs = graph
         .inputs
@@ -156,6 +168,7 @@ pub(crate) fn expand_tiles(
 }
 
 struct TileGraphBuilder {
+    cache: Arc<ExpansionCache>,
     tile_count: u16,
     storage_groups: Vec<MidValueId>,
     shards: Vec<BlockValue>,
@@ -171,6 +184,7 @@ impl TileGraphBuilder {
     fn new(graph: &MidProgram) -> ExpansionResult<Self> {
         let tile_count = graph.tile_count;
         let mut state = Self {
+            cache: Arc::new(ExpansionCache::default()),
             tile_count,
             storage_groups: graph
                 .values

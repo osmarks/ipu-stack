@@ -1325,6 +1325,7 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
 
 #[test]
 fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
+    let shared_cache = Arc::new(ExpansionCache::default());
     let mut random = fastrand::Rng::with_seed(0x6765_6d6d);
     for case in 0..CASES {
         let tiles = 1_u16 << random.u32(0..=3);
@@ -1343,6 +1344,15 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let resolved = crate::mid::implementation::resolve(mid.clone()).unwrap();
+        let uncached =
+            super::expand_tiles_cached(&resolved, true, Arc::new(ExpansionCache::disabled()))
+                .unwrap();
+        for _ in 0..2 {
+            let cached =
+                super::expand_tiles_cached(&resolved, true, Arc::clone(&shared_cache)).unwrap();
+            assert_eq!(cached, uncached, "cache changed graph in case {case}");
+        }
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         assert!(std::mem::size_of::<TileWork>() <= 8);

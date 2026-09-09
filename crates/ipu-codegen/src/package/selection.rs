@@ -1,5 +1,6 @@
 //! Expand a bounded shortlist, model placement, then schedule its best candidates.
 use super::*;
+use std::sync::Arc;
 
 struct ExpandedPlan {
     index: usize,
@@ -70,22 +71,25 @@ pub(super) fn select_scheduled_finalist<T>(
     mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let topology = active_topology(planning.tile_count)?;
+    let expansion_cache = Arc::new(crate::low::expand::ExpansionCache::default());
     let screened = finalists
         .into_par_iter()
         .enumerate()
         .map(|(index, mid)| {
             let span = tracing::info_span!("screen_finalist", finalist = index);
             let _entered = span.enter();
-            let result = expand_and_screen(&mid, planning, tile_mapping).map(|(low, footprint)| {
-                ExpandedPlan {
-                    index,
-                    low,
-                    footprint,
-                }
-            });
+            let result =
+                expand_and_screen(&mid, planning, tile_mapping, Arc::clone(&expansion_cache)).map(
+                    |(low, footprint)| ExpandedPlan {
+                        index,
+                        low,
+                        footprint,
+                    },
+                );
             (index, result)
         })
         .collect();
+    tracing::info!(cache_stats = ?expansion_cache.stats(), "expanded fragment cache");
     let mut failure = invalid("no operator-plan finalists");
     let expanded = feasible_candidates(screened, &mut failure);
     let expanded = admit_candidates(
@@ -340,7 +344,12 @@ pub(super) fn expand_and_place(
     crate::Placement,
     crate::estimate::ExchangeFootprint,
 )> {
-    let (low, footprint) = expand_and_screen(mid, planning, tile_mapping)?;
+    let (low, footprint) = expand_and_screen(
+        mid,
+        planning,
+        tile_mapping,
+        Arc::new(crate::low::expand::ExpansionCache::default()),
+    )?;
     let placement = place(&low)?;
     Ok((low, placement, footprint))
 }
@@ -349,9 +358,11 @@ fn expand_and_screen(
     mid: &crate::MidProgram,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
+    cache: Arc<crate::low::expand::ExpansionCache>,
 ) -> PackageBuildResult<(LowProgram, crate::estimate::ExchangeFootprint)> {
     let start = Instant::now();
-    let mut expanded = crate::low::expand::expand_tiles(mid, planning.diagnostic_checkpoints)?;
+    let mut expanded =
+        crate::low::expand::expand_tiles_cached(mid, planning.diagnostic_checkpoints, cache)?;
     let expansion_ms = start.elapsed().as_millis();
     let footprint = crate::estimate::program_footprint(&expanded)?;
     let fragments = footprint.maximum_transfer_chunks_per_tile;

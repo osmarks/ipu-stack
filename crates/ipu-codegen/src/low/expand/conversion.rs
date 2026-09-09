@@ -301,6 +301,7 @@ impl TileGraphBuilder {
                         &mut batch.after
                     };
                     append_span_copies(
+                        &self.cache,
                         &self.shards,
                         &source,
                         &destination,
@@ -334,6 +335,7 @@ impl TileGraphBuilder {
                     ));
                 } else {
                     append_span_copies(
+                        &self.cache,
                         &self.shards,
                         &staging,
                         &destination,
@@ -381,6 +383,7 @@ impl TileGraphBuilder {
                 destinations.push(destination);
             } else {
                 append_span_copies(
+                    &self.cache,
                     &self.shards,
                     &source,
                     &destination,
