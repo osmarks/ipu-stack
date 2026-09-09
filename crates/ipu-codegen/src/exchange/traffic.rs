@@ -121,7 +121,7 @@ impl MappingPhase {
             for &resource in &resources {
                 loads[resource] += u64::from(transfer.words);
             }
-            if transfer.words >= 128
+            if transfer.words >= 2
                 && transfer.words.is_multiple_of(2)
                 && transfer
                     .source_addresses
@@ -252,9 +252,9 @@ mod tests {
                                     .position(|&tile| tile == mapping[0] ^ 1)
                                     .unwrap()
                                 {
-                                    1 => (41114, 33630),
-                                    2 => (41160, 33601),
-                                    3 => (41183, 33600),
+                                    1 => (40952, 33466),
+                                    2 => (41000, 33460),
+                                    3 => (41024, 33459),
                                     _ => unreachable!(),
                                 }],
                                 "{mapping:?}"

@@ -138,3 +138,9 @@ The batch-2 encoder uses 23.2% fewer cycles per image. Output errors remain
 0.093262 and 0.082764 respectively. Rendered profiles:
 [batch 1](../artifacts/encoder-fusions/vit-paired-b1/profile.html),
 [batch 2](../artifacts/encoder-fusions/vit-paired-b2/profile.html).
+
+Enabling paired sender-pair loopback subsequently passes both full model checks:
+batch 1 takes 653,988 cycles (encoder 465,156), batch 2 takes 959,646 (encoder
+715,698). The corresponding profiles are
+[batch 1](../artifacts/encoder-fusions/vit-loopback-b1/profile.html) and
+[batch 2](../artifacts/encoder-fusions/vit-loopback-b2/profile.html).

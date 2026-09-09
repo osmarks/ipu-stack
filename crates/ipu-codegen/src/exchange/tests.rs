@@ -365,14 +365,18 @@ fn width_selection_pairs_receivers_with_independent_addresses() {
             .map(|source| ExchangeScheduleTransfer {
                 source,
                 source_addresses: vec![0x8_0000],
-                destinations: [source + 2, source + 3]
-                    .into_iter()
-                    .map(|tile| ExchangeScheduleDestination {
-                        tile,
-                        address: 0x8_8000 + u32::from(tile & 1) * 0x4000,
-                    })
-                    .collect(),
-                words: 4096,
+                destinations: (if source == 0 {
+                    [0, 1]
+                } else {
+                    [source + 2, source + 3]
+                })
+                .into_iter()
+                .map(|tile| ExchangeScheduleDestination {
+                    tile,
+                    address: 0x8_8000 + u32::from(tile & 1) * 0x4000,
+                })
+                .collect(),
+                words: 64,
                 width: ExchangeItemWidth::Word32,
             })
             .collect(),

@@ -710,7 +710,7 @@ fn paired_transfer_alternatives(
     let mut alternatives = Vec::with_capacity(pending.len());
     for transfer in pending {
         if transfer.width != ExchangeItemWidth::Word32
-            || transfer.words < 128
+            || transfer.words < 2
             || transfer.words & 1 != 0
             || transfer
                 .source_addresses
@@ -814,9 +814,7 @@ fn pending_from_problem(
                     problem.phase, transfer.words
                 )));
             }
-            if transfer.width == ExchangeItemWidth::Paired64
-                && (transfer.words < 128 || transfer.words & 1 != 0)
-            {
+            if transfer.width == ExchangeItemWidth::Paired64 && transfer.words & 1 != 0 {
                 return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                     "phase {} transfer {index} has invalid {}-word paired payload",
                     problem.phase, transfer.words

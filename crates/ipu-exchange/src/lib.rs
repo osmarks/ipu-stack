@@ -2631,9 +2631,6 @@ impl Topology {
         count: u32,
     ) -> Result<MulticastPlan, ExchangeError> {
         validate_count(count)?;
-        if count < 64 {
-            return Err(ExchangeError::Count(count));
-        }
         if receivers.is_empty() || receivers.len() & 1 != 0 {
             return Err(ExchangeError::ReceiverSet);
         }
@@ -2649,7 +2646,7 @@ impl Topology {
 
         let mut plan = self.multicast(sender_logical, receivers, count, 0)?;
         let sender_physical = u32::from(self.physical(sender_logical)?);
-        let send_control = if receivers.len() == 2 {
+        let send_control = if receivers.len() == 2 && !receivers.contains(&sender_logical) {
             u8::try_from(direction(sender_physical, u32::from(self.physical(receivers[0])?)) | 4)
                 .expect("send control is three bits")
         } else {
@@ -2842,8 +2839,8 @@ impl Topology {
         validate_count(count)?;
         let source_physical = u32::from(self.physical(sender_logical)?);
         let mut used = HashSet::new();
-        // Loopback is validated as part of a multicast with remote receivers.
-        // A source-only route would use a different send direction.
+        // Source-only ordinary routing failed hardware probes with both one-
+        // and two-direction sends. Paired and remote multicast loopback work.
         if receiver_logical.is_empty()
             || receiver_logical == [sender_logical]
             || receiver_logical

@@ -17,8 +17,8 @@ An ordinary 32-bit multicast can include its transmitting tile among the
 receivers. The source tile executes the combined send and receive controls;
 its own data returns through the fabric into the configured destination.
 `Topology::multicast` and `PhaseProgramBuilder` support this combination.
-Duplicate receivers remain invalid. Source-only multicast has not been
-validated and remains unsupported. Paired multicast loopback is supported;
+Duplicate receivers remain invalid. Source-only multicast corrupted data in a
+hardware probe with the current encoding and remains unsupported. Paired multicast loopback is supported;
 see the paired receiver checks below.
 
 The `exchange-stress --exchange-pattern loopback` diagnostic checks the source
@@ -295,11 +295,45 @@ every Repeat source address.
 
 Hardware validation covers both sender lanes, standard and interleaved receive
 banks, different pointers on the two receiver tiles, and a remote receiver pair.
+Delivery only to the sender's own pair also passes all four lane/bank probes;
+that route uses both directions (`sctl=7`) rather than the generic one-direction
+pair route. These cases are `own-pair-only.json` and
+`replay-both-own-pair-only-*.log`.
 The full QKV/MLP-up/MAP-KV phases also pass with all transfers paired (32,768
 sampled words per phase). Scheduled horizons become 7,092 / 10,063 / 8,549 cycles
 at unchanged addresses. Captures are `all-paired.json` and `loopback-banks.json`
 in the artifact directory above; `replay-all-paired-*.log` and
 `replay-loopback-bank*.log` record the checks.
+
+The blanket 128-word minimum for paired transfers was also unsupported.
+Thirty-nine hardware probes pass for encodable even lengths from 2 to 130
+32-bit words, covering nearby, distant and loopback routes. Six route/length
+combinations (including four-word transfers) hit the encoder's existing
+coincident-control rejection before execution. These use the ordinary fallback;
+the compiler no longer uses 128 words as either a validity or selection cutoff.
+At the near route, two words tie the ordinary schedule at 63 cycles; six words
+take 64 rather than 67, and 64 words take 93 rather than 125. Paired rows add
+three words of code in these cases, not a prohibitive encoding cost. Whole-phase
+ordinary/paired comparison remains responsible for accepting a width change.
+
+A mixed phase of 48 ordinary/paired transfers with changing sources, pointers
+and lengths also passes hardware validation (12,384 sampled words):
+`short-mixed.json` and `replay-short-mixed.log`.
+
+Artifacts: `short-paired.json`, `short-results.json`, `short-*-costs.log` and
+`replay-short-*.log` in the directory above. The source-only ordinary test
+(`source-only.json`, phase zero, `replay-source-only-0.log`) sent one word from
+tile 0 at `0x65000` back only to tile 0 at `0x60000`. The destination retained
+its initial `0x95a55a5a` instead of receiving the source's `0x97255a5a`.
+The first attempt used the multicast builder's single-receiver direction
+(`sctl=2`). Explicitly using both directions (`sctl=3`) also left standard
+destinations unchanged at 1, 52, 64, 65 and 512 words; the one-word interleaved
+case raised an address exception. The experiment stopped there. Decoded rows
+and logs are `source-only-row.txt` and `replay-both-source-only-*.log`.
+Its exclusion is retained for this encoding; these experiments do not establish
+that source-only loopback is impossible in hardware. The point-to-point template
+was explicitly bypassed in both experiments; unicast and multicast still use
+the same SEND instruction, differing in enabled directions and receiver setup.
 
 Hardware replay on 2026-09-05 verifies that a paired-width sender borrows only
 its physical partner's transmit lane. The partner can receive an ordinary
