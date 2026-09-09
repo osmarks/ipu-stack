@@ -1028,10 +1028,20 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
         });
     let mut grids = Vec::new();
     for inner_partitions in 2..=inner_groups.min(tile_count) {
+        if config.compact_layout_search
+            && (!tile_count.is_multiple_of(inner_partitions) || inner_partitions > 32)
+        {
+            continue;
+        }
         let maximum_columns = grouped_column_groups
             .unwrap_or(column_groups)
             .min(tile_count / inner_partitions);
         for column_partitions in 1..=maximum_columns {
+            if config.compact_layout_search
+                && !(tile_count / inner_partitions).is_multiple_of(column_partitions)
+            {
+                continue;
+            }
             let grouped_options = [
                 (column_partitions <= column_groups).then_some((false, column_groups)),
                 grouped_output.and_then(|grouping| match orientation {

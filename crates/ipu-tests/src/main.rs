@@ -136,6 +136,12 @@ struct Arguments {
     /// Complete plans per configuration to expand and estimate.
     #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
     expanded_plan_finalists: usize,
+    /// Build a bounded baseline and improve explicit graph regions.
+    #[arg(long)]
+    regional_planning: bool,
+    /// Maximum globally validated regional replacements.
+    #[arg(long, default_value_t = 4, requires = "regional_planning")]
+    regional_evaluations: usize,
     /// Expanded plans admitted to placement/mapping, plus a compact alternative.
     #[arg(long, default_value_t = 4, conflicts_with = "reuse_package")]
     placement_finalists: usize,
@@ -690,6 +696,12 @@ fn main() -> Result<()> {
     };
     pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
     pipeline.expanded_plan_finalists = arguments.expanded_plan_finalists.max(1);
+    if arguments.regional_planning {
+        pipeline.regional_planning = Some(ipu_codegen::RegionalPlanning {
+            max_evaluations: arguments.regional_evaluations,
+            ..Default::default()
+        });
+    }
     pipeline.placement_finalists = arguments.placement_finalists.max(1);
     pipeline = pipeline
         .with_attention_strategy(arguments.attention_strategy.into())

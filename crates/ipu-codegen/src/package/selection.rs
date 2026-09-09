@@ -32,6 +32,9 @@ pub(super) fn select_graph_finalist<T>(
     tile_mapping: Option<&[u16]>,
     mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
+    if planning.regional_planning.is_some() {
+        return super::regional::select(graph, planning, tile_mapping, finalize);
+    }
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, planning.tile_count);
     let mut search = planning.clone();
     let mut result = Err(invalid("no operator-plan finalists"));
