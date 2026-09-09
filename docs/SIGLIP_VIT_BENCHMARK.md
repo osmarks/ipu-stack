@@ -419,3 +419,9 @@ Reproduce the full-size fused run with the example above, adding `--fuse-qkv`;
 omit that flag for the separate-projection comparison. Six benchmark tests and
 release Clippy passed. The topology test covers both projection choices, including
 the fused weight shapes and preservation of the separate MAP query.
+
+The subsequent [add/layernorm kernel upgrade](ELEMENTWISE_KERNELS_2026_09_09.md)
+and corresponding cost models improve this fused batch-1 benchmark to
+**715,350 cropped cycles (0.476900 ms)**, with maximum reference error 0.071045.
+The current rendered profile is
+`artifacts/elementwise-upgrade/vit-costed/profile.html`.
