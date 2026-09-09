@@ -895,8 +895,24 @@ impl TensorType {
         if layout.order == ElementOrder::RowMajor && target.layout.order != ElementOrder::RowMajor {
             let resolved = layout.resolve(&self.shape).ok()?;
             let axes = resolved.axes()?;
-            if axes.len() < 2 || !axes.last()?.extents_are_multiple_of(32) {
+            if axes.len() < 2 || !axes.last()?.extents_are_multiple_of(4) {
                 return None;
+            }
+            if !axes.last()?.extents_are_multiple_of(32) {
+                let rank = self.shape.0.len();
+                if let Some(axis) = layout
+                    .tiling
+                    .axes
+                    .iter_mut()
+                    .find(|axis| axis.axis.resolve(rank) == Ok(rank - 1))
+                {
+                    axis.shard_padding_multiple = axis.shard_padding_multiple.max(32);
+                } else {
+                    layout.tiling.axes.push(
+                        AxisTiling::new(TensorAxis::FromEnd(1), 1, 1, Padding::Zero)
+                            .with_shard_padding_multiple(32),
+                    );
+                }
             }
             layout.order = ElementOrder::Amp(AmpOrder::Left);
         }

@@ -43,7 +43,7 @@ pub trait CostModel: Sync {
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
     fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
         let mut packed = input.clone();
-        packed.format.layout.order = output.layout.order;
+        packed.format.layout = output.layout.clone();
         self.cast_cycles(&packed, output.precision)
     }
     fn rearrangement_cost(

@@ -132,7 +132,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                     && run.requirements.output.format.layout.order
                         == ElementOrder::Amp(AmpOrder::Left)
                 {
-                    matrix_extent(run, false, true)?
+                    input_matrix_extent(run, false, true)?
                 } else {
                     0
                 },
@@ -511,12 +511,17 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                     width != target_width
                         && !(run.requirements.output.format.layout.order
                             == ElementOrder::Amp(AmpOrder::Left)
-                            && !row_pack
                             && axis + 1 == input.extents.len()
-                            && width.is_multiple_of(16)
-                            && target_width == width.next_multiple_of(32))
+                            && if row_pack {
+                                width.is_multiple_of(4) && target_width >= width
+                            } else {
+                                width.is_multiple_of(16)
+                                    && target_width == width.next_multiple_of(32)
+                            })
                 })
-            || (row_pack && !matrix_extent(run, false, true)?.is_multiple_of(32))
+            || (row_pack
+                && (!matrix_extent(run, false, true)?.is_multiple_of(32)
+                    || !input_matrix_extent(run, false, true)?.is_multiple_of(4)))
             || (panel_rows != 0
                 && !element_count(run)?.is_multiple_of(
                     panel_rows

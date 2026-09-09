@@ -1816,6 +1816,45 @@ pub(super) fn ensure_format(
     {
         return value;
     }
+    // For late FP8 conversion, compare packing F16 before the cast with
+    // receiving row-major F16 and constructing the FP8 panels directly.
+    // Ownership stays fixed; this chooses a local conversion implementation.
+    if packed_cast && !cast_before && target.layout.order == ElementOrder::Amp(AmpOrder::Left) {
+        let input = &state.get(value).tensor_type;
+        let mut row_layout = initial_layout.clone();
+        row_layout.order = ElementOrder::RowMajor;
+        let row_type = TensorType {
+            shape: input.shape.clone(),
+            format: TensorFormat {
+                precision: from,
+                layout: row_layout.clone(),
+            },
+        };
+        if row_type.fp8_producer_layout(&target).is_some() {
+            let price = |layout: &Layout| {
+                let staging = TensorType {
+                    shape: input.shape.clone(),
+                    format: TensorFormat {
+                        precision: from,
+                        layout: layout.clone(),
+                    },
+                };
+                costs
+                    .rearrangement_cost(
+                        &input.shape,
+                        from,
+                        layout_conversion_strategy(&input.format.layout, layout),
+                        &input.format.layout,
+                        layout,
+                    )
+                    .cycles
+                    .saturating_add(costs.cast_format_cycles(&staging, &target))
+            };
+            if price(&row_layout) < price(&initial_layout) {
+                initial_layout = row_layout;
+            }
+        }
+    }
     let cast_layout = if fp8_cast {
         initial_layout
     } else {
@@ -1834,7 +1873,11 @@ pub(super) fn ensure_format(
             },
             TensorFormat {
                 precision: target.precision,
-                layout: cast_layout,
+                layout: if packed_cast && !cast_before {
+                    target.layout.clone()
+                } else {
+                    cast_layout
+                },
             },
             target,
         ]

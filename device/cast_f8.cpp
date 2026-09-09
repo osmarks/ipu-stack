@@ -23,6 +23,54 @@ using Destination = half;
 using Destination = float;
 #endif
 #if INPUT_BYTES == 2 && OUTPUT_BYTES == 1
+// Only boundary panels use guarded loads. Complete panels retain the pipelined
+// loop below; entirely padded panels require no reads or floating-point work.
+static __attribute__((noinline)) void castRowTail(
+    const half *source, unsigned char *target, unsigned rows,
+    unsigned sourceStride, unsigned stride, unsigned columns) {
+  for (unsigned block = 0; block < 32; block += 8) {
+    const half *input = source + block;
+    unsigned char *output = target + block;
+    unsigned src = 0, dst = 0;
+    if (block + 8 <= columns) {
+      asm volatile(
+          "{ rpt %[rows], 4; fnop }\n"
+          "{ ld64 $a0:1, %[in], %[src], 0; fnop }\n"
+          "{ ld64 $a2:3, %[in], %[src], 1; fnop }\n"
+          "{ add %[src], %[src], %[sourceStride]; f16v8tof8 $a4:5, $a0:3 }\n"
+          "{ st64 $a4:5, %[out], %[dst], 0; fnop }\n"
+          "{ add %[dst], %[dst], %[stride]; fnop }\n"
+          : [src] "+&r"(src), [dst] "+&r"(dst)
+          : [in] "r"(input), [out] "r"(output), [rows] "r"(rows),
+            [stride] "r"(stride), [sourceStride] "r"(sourceStride)
+          : "$a0:1", "$a2:3", "$a4:5", "memory");
+    } else if (block < columns) {
+      // Row strides are multiples of four halves; the only short vector
+      // contains exactly four values and never reads past the row.
+      asm volatile(
+          "zero $a2:3\n"
+          "{ rpt %[rows], 3; fnop }\n"
+          "{ ld64 $a0:1, %[in], %[src], 0; fnop }\n"
+          "{ add %[src], %[src], %[sourceStride]; f16v8tof8 $a4:5, $a0:3 }\n"
+          "{ st64 $a4:5, %[out], %[dst], 0; fnop }\n"
+          "{ add %[dst], %[dst], %[stride]; fnop }\n"
+          : [src] "+&r"(src), [dst] "+&r"(dst)
+          : [in] "r"(input), [out] "r"(output), [rows] "r"(rows),
+            [stride] "r"(stride), [sourceStride] "r"(sourceStride)
+          : "$a0:1", "$a2:3", "$a4:5", "memory");
+    } else {
+      asm volatile(
+          "zero $a0:1\n"
+          "{ rpt %[rows], 1; fnop }\n"
+          "{ st64 $a0:1, %[out], %[dst], 0; fnop }\n"
+          "{ add %[dst], %[dst], %[stride]; fnop }\n"
+          : [dst] "+&r"(dst)
+          : [out] "r"(output), [rows] "r"(rows), [stride] "r"(stride)
+          : "$a0:1", "memory");
+    }
+  }
+}
+
 // Keep the pipeline's register pressure off the small/fallback cast paths.
 static __attribute__((noinline)) void castPackedRows(
     const half *first, const half *second, unsigned char *target,
@@ -109,11 +157,31 @@ public:
       unsigned column = wholePanels ? worker * 32 : 0;
       for (unsigned panel = wholePanels ? worker * panelElements : 0;
            panel < elements && row < panelRows; panel += panelStep, column += wholePanels ? 192 : 32) {
+        unsigned char *panelTarget = &destination[panel + row * 32];
+        if (rowMajorColumns && column >= rowMajorColumns) {
+          unsigned offset = 0;
+          asm volatile(
+              "zero $a0:1\n"
+              "{ rpt %[rows], 4; fnop }\n"
+              "{ st64 $a0:1, %[out], %[offset], 0; fnop }\n"
+              "{ st64 $a0:1, %[out], %[offset], 1; fnop }\n"
+              "{ st64 $a0:1, %[out], %[offset], 2; fnop }\n"
+              "{ st64 $a0:1, %[out], %[offset], 3; fnop }\n"
+              "{ add %[offset], %[offset], %[stride]; fnop }\n"
+              : [offset] "+&r"(offset)
+              : [out] "r"(panelTarget), [rows] "r"(rows), [stride] "r"(stride)
+              : "$a0:1", "memory");
+          continue;
+        }
         const half *first = &source[rowMajorColumns ? row * rowMajorColumns + column : panel + row * 16];
+        if (rowMajorColumns && column + 32 > rowMajorColumns) {
+          castRowTail(first, panelTarget, rows, sourceStride, stride, rowMajorColumns - column);
+          continue;
+        }
         const half *second = first + (rowMajorColumns ? 16 : panelRows * 16);
         unsigned char *target = &destination[panel + row * 32];
         unsigned sourceOffset = 0, destinationOffset = 0;
-        if (panel + panelElements > sourceElements) {
+        if (!rowMajorColumns && panel + panelElements > sourceElements) {
           // A producer may own only a 16-element tail. Populate the other
           // half of the FP8 panel here, without a padded F16 staging copy.
           asm volatile(

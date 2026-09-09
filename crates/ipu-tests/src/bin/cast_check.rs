@@ -69,6 +69,9 @@ fn main() -> Result<()> {
         (1, 16),
         (5, 48),
         (33, 48),
+        (38, 80),
+        (9, 12),
+        (6, 24),
         (1, 47),
         (1, 48),
         (1, 49),
@@ -85,13 +88,13 @@ fn main() -> Result<()> {
         (184, 96), // Largest cast in the full B1 ViT profile.
         (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
-        for mode in 0..3 {
+        for mode in 0..4 {
             // dense, already packed, row-major -> packed
-            if mode == 2 && args.existing_layouts_only {
+            if mode >= 2 && args.existing_layouts_only {
                 continue;
             }
             if (mode == 1 && !columns.is_multiple_of(16))
-                || (mode == 2 && !columns.is_multiple_of(32))
+                || (mode >= 2 && !columns.is_multiple_of(4))
             {
                 continue;
             }
@@ -106,7 +109,11 @@ fn main() -> Result<()> {
                     let output_columns = if mode == 0 {
                         columns
                     } else {
-                        columns.next_multiple_of(32)
+                        if mode == 3 {
+                            columns.next_multiple_of(32) + 64
+                        } else {
+                            columns.next_multiple_of(32)
+                        }
                     };
                     let count = rows * output_columns;
                     let output_address = if placement == "shared-standard" && count <= 2048 {
@@ -192,7 +199,7 @@ fn main() -> Result<()> {
                                     rows
                                 },
                                 source_count,
-                                if mode == 2 { columns } else { 0 },
+                                if mode >= 2 { columns } else { 0 },
                             ],
                             profile: StepProfile {
                                 before: Some(0x7f000),
