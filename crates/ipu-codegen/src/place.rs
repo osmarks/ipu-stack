@@ -722,11 +722,44 @@ fn allocate_tile(
             request.lifetime.last,
         )
     });
+    let initial = arena.clone();
+    match allocate_requests(program, tile, &requests, members, arena, addresses) {
+        Ok(()) => return Ok(()),
+        Err(PlacementError::OutOfMemory { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    *arena = initial;
+    arena.offline = true;
+    addresses.clear();
+    requests.sort_by_key(|request| {
+        (
+            std::cmp::Reverse(request.alignment),
+            std::cmp::Reverse(request.bytes),
+            std::cmp::Reverse(request.lifetime.last - request.lifetime.first),
+            request.lifetime.first,
+        )
+    });
+    allocate_requests(program, tile, &requests, members, arena, addresses)?;
+    tracing::debug!(
+        tile,
+        "recovered fragmented tile with size-ordered placement"
+    );
+    Ok(())
+}
+
+fn allocate_requests(
+    program: &LowProgram,
+    tile: u16,
+    requests: &[AllocationRequest],
+    members: &BTreeMap<usize, Vec<usize>>,
+    arena: &mut Arena,
+    addresses: &mut BTreeMap<BlockValueId, u32>,
+) -> Result<(), PlacementError> {
     for request in requests {
         let class = request.class;
-        let Some(base) = arena.allocate(&request) else {
+        let Some(base) = arena.allocate(request) else {
             let representative = &program.shards[members[&request.assignments[0].0][0]];
-            tracing::error!(
+            tracing::debug!(
                 tile,
                 ?class,
                 bytes = request.bytes,
@@ -744,7 +777,7 @@ fn allocate_tile(
                 bytes: request.bytes,
             });
         };
-        for (index, (root, offset)) in request.assignments.into_iter().enumerate() {
+        for (index, (root, offset)) in request.assignments.iter().copied().enumerate() {
             let offset = if base >= IPU21_INTERLEAVED_MEMORY_BASE {
                 request.region1_stride.map_or(Ok(offset), |stride| {
                     stride
@@ -780,7 +813,10 @@ struct IteratedGroup {
     alignment: u32,
 }
 
+#[derive(Clone)]
 struct Arena {
+    offline: bool,
+    history: Vec<(Lifetime, u32, u32)>,
     ranges: Vec<(u32, u32)>,
     free: Vec<(u32, u32)>,
     active: Vec<(u32, u32, u32)>,
@@ -791,6 +827,8 @@ struct Arena {
 impl Arena {
     fn new(ranges: &[(u32, u32)], interleaved_offset: u32) -> Self {
         Self {
+            offline: false,
+            history: Vec::new(),
             ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
@@ -802,6 +840,32 @@ impl Arena {
     fn allocate(&mut self, request: &AllocationRequest) -> Option<u32> {
         let first = request.lifetime.first;
         let last = request.lifetime.last;
+        if self.offline {
+            self.free.clone_from(&self.ranges);
+            for &(lifetime, base, end) in &self.history {
+                if lifetime.last < first || last < lifetime.first {
+                    continue;
+                }
+                self.free = self
+                    .free
+                    .iter()
+                    .flat_map(|&(start, limit)| {
+                        if end <= start || limit <= base {
+                            return vec![(start, limit)];
+                        }
+                        let mut pieces = Vec::with_capacity(2);
+                        if start < base {
+                            pieces.push((start, base));
+                        }
+                        if end < limit {
+                            pieces.push((end, limit));
+                        }
+                        pieces
+                    })
+                    .collect();
+            }
+            self.active.clear();
+        }
         let mut retained = Vec::with_capacity(self.active.len());
         let active = std::mem::take(&mut self.active);
         for (active_last, address, active_bytes) in active {
@@ -887,6 +951,9 @@ impl Arena {
             self.free.sort_unstable();
             self.active.push((last, start, end - start));
             self.occupied.push((start, end));
+            if self.offline {
+                self.history.push((request.lifetime, start, end));
+            }
             return Some(start);
         }
         None
@@ -1008,6 +1075,31 @@ mod tests {
     }
 
     #[test]
+    fn offline_arena_recovers_fragmentation_and_preserves_lifetimes() {
+        let base = IPU21_INTERLEAVED_MEMORY_BASE;
+        let ranges = [(base, base + 128)];
+        let early = request(MemoryClass::Ipu21Standard, 32, 8, 0, 1);
+        let lasting = request(MemoryClass::Ipu21Standard, 32, 8, 0, 3);
+        let late = request(MemoryClass::Ipu21Interleaved, 96, 8, 2, 3);
+        let mut greedy = Arena::new(&ranges, 0);
+        assert_eq!(greedy.allocate(&early), Some(base));
+        assert_eq!(greedy.allocate(&lasting), Some(base + 32));
+        assert_eq!(greedy.allocate(&late), None);
+
+        let mut offline = Arena::new(&ranges, 0);
+        offline.offline = true;
+        assert_eq!(offline.allocate(&late), Some(base));
+        assert_eq!(offline.allocate(&lasting), Some(base + 96));
+        assert_eq!(offline.allocate(&early), Some(base));
+        // Endpoints are inclusive: the early buffer is still live at event 1.
+        assert_eq!(
+            offline.allocate(&request(MemoryClass::Ipu21Standard, 72, 8, 1, 2)),
+            None
+        );
+        assert!(offline.unused_ranges().is_empty());
+    }
+
+    #[test]
     fn joint_arena_reuses_region_one_across_classes() {
         let base = IPU21_INTERLEAVED_MEMORY_BASE;
         let mut arena = Arena::new(&[(base, base + 320 * 1024)], 0);
@@ -1092,10 +1184,16 @@ mod tests {
             (boundary - 16384, boundary),
             (boundary, IPU21_APPLICATION_MEMORY_LIMIT),
         ];
-        for _ in 0..128 {
+        for trial in 0..128 {
             let mut arena = Arena::new(&ranges, 256);
+            arena.offline = trial % 2 != 0;
             let mut placed = Vec::<(u32, u32, u32, u32)>::new();
-            for first in 0..32 {
+            for step in 0..32 {
+                let first = if arena.offline {
+                    random.u32(0..32)
+                } else {
+                    step
+                };
                 for _ in 0..random.u32(1..=6) {
                     let class = if random.bool() {
                         MemoryClass::Ipu21Standard
