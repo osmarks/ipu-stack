@@ -1,4 +1,4 @@
-//! Single-layer Big Vision ViT, including its learned-query MAP pool.
+//! Big Vision ViT, including its learned-query MAP pool.
 use anyhow::{Result, ensure};
 use ipu_codegen::{AxisFactorView, ComputeGraph, GraphInput, ValueId};
 
@@ -6,6 +6,9 @@ use ipu_codegen::{AxisFactorView, ComputeGraph, GraphInput, ValueId};
 pub(crate) struct Options {
     #[arg(long, default_value_t = 1)]
     pub vit_batch: u32,
+    /// Distinct encoder layers, represented by one structured Repeat when >1.
+    #[arg(long, default_value_t = 1)]
+    pub vit_layers: u32,
     /// Use a small image/width to validate the complete graph quickly.
     #[arg(long)]
     pub vit_small: bool,
@@ -22,6 +25,7 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
         (378, 14, 1152, 4304, 16)
     };
     ensure!(options.vit_batch > 0, "--vit-batch must be nonzero");
+    ensure!(options.vit_layers > 0, "--vit-layers must be nonzero");
     let image = options.vit_image_size.unwrap_or(image);
     ensure!(
         image > 0 && image.is_multiple_of(patch),
@@ -40,20 +44,49 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
     let mut x = dense(&mut g, image, "embedding", patch * patch * 3, width)?;
     let position = g.parameter("vit.position", [1, tokens, width])?;
     x = g.add(x, position)?;
-    let normalized = norm(&mut g, x, "encoder.attention_norm", width)?;
-    let attended = attention(
-        &mut g,
-        normalized,
-        normalized,
-        "encoder.attention",
-        width,
-        heads,
-        fuse_qkv,
-    )?;
-    x = g.add(x, attended)?;
-    let normalized = norm(&mut g, x, "encoder.mlp_norm", width)?;
-    let update = mlp(&mut g, normalized, "encoder.mlp", width, hidden)?;
-    x = g.add(x, update)?;
+    x = if options.vit_layers == 1 {
+        encoder(&mut g, x, width, hidden, heads, fuse_qkv)?
+    } else {
+        // Build the body once, then bind each parameter to an iterated sequence.
+        // Import its ordinary operations through the same checked graph API.
+        let mut template = ComputeGraph::new();
+        let state = template.host_input("state", [options.vit_batch, tokens, width])?;
+        let result = encoder(&mut template, state, width, hidden, heads, fuse_qkv)?;
+        let parameters = &template.inputs()[1..];
+        let mut sequences = Vec::new();
+        for input in parameters {
+            let mut layers = Vec::new();
+            for layer in 0..options.vit_layers {
+                let name =
+                    input
+                        .name
+                        .replacen("vit.encoder.", &format!("vit.encoder.layer{layer}."), 1);
+                layers.push(g.parameter(name, input.shape.0.clone())?);
+            }
+            sequences.push(g.value_sequence(input.name.clone(), layers)?);
+        }
+        g.repeat(options.vit_layers, [x], [], sequences, |body, arguments| {
+            let mut values = std::collections::BTreeMap::from([(state, arguments.carried[0])]);
+            values.extend(
+                parameters
+                    .iter()
+                    .zip(&arguments.iterated)
+                    .map(|(input, &value)| (input.value, value)),
+            );
+            for operation in template.operations() {
+                let outputs = body.operation(
+                    operation.kind.clone(),
+                    operation.inputs.iter().map(|value| values[value]),
+                    operation
+                        .results
+                        .iter()
+                        .map(|value| template.value_shape(*value).unwrap().clone()),
+                )?;
+                values.extend(operation.results.iter().copied().zip(outputs));
+            }
+            Ok(vec![values[&result]])
+        })?[0]
+    };
     x = norm(&mut g, x, "encoder.final_norm", width)?;
 
     // A replicated probe is expressed as a batch-shaped parameter. Input
@@ -65,6 +98,31 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
     x = g.add(x, update)?;
     g.set_outputs([x])?; // [batch, 1, width], singleton probe axis retained.
     Ok(g)
+}
+
+fn encoder(
+    g: &mut ComputeGraph,
+    mut x: ValueId,
+    width: u32,
+    hidden: u32,
+    heads: u32,
+    fuse_qkv: bool,
+) -> Result<ValueId> {
+    let normalized = norm(g, x, "encoder.attention_norm", width)?;
+    let attended = attention(
+        g,
+        normalized,
+        normalized,
+        "encoder.attention",
+        width,
+        heads,
+        fuse_qkv,
+    )?;
+    x = g.add(x, attended)?;
+    let normalized = norm(g, x, "encoder.mlp_norm", width)?;
+    let update = mlp(g, normalized, "encoder.mlp", width, hidden)?;
+    x = g.add(x, update)?;
+    Ok(x)
 }
 
 fn dense(g: &mut ComputeGraph, x: ValueId, name: &str, input: u32, output: u32) -> Result<ValueId> {
@@ -166,11 +224,64 @@ mod tests {
     use ipu_codegen::OperationKind;
 
     #[test]
+    fn repeated_encoder_has_distinct_parameters_and_one_time_bookends() -> Result<()> {
+        for fused in [false, true] {
+            let graph = build(
+                &Options {
+                    vit_batch: 1,
+                    vit_layers: 2,
+                    vit_small: true,
+                    vit_image_size: None,
+                },
+                fused,
+            )?;
+            let repeats = graph
+                .operations()
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OperationKind::Repeat(repeat) => Some(repeat),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(repeats.len(), 1);
+            assert_eq!(repeats[0].count, 2);
+            assert_eq!(graph.sequences().len(), if fused { 12 } else { 16 });
+            for sequence in graph.sequences() {
+                assert_eq!(sequence.values.len(), 2);
+                assert_ne!(sequence.values[0], sequence.values[1]);
+            }
+            assert_eq!(
+                repeats[0]
+                    .body
+                    .operations
+                    .iter()
+                    .filter(|op| matches!(op.kind, OperationKind::LayerNorm))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                graph
+                    .operations()
+                    .iter()
+                    .filter(|op| matches!(op.kind, OperationKind::LayerNorm))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                graph.value_shape(graph.outputs()[0]).unwrap().0,
+                [1, 1, 144]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn complete_single_layer_topology_and_shapes() -> Result<()> {
         for fused in [false, true] {
             let g = build(
                 &Options {
                     vit_batch: 1,
+                    vit_layers: 1,
                     vit_small: false,
                     vit_image_size: None,
                 },
