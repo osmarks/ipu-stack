@@ -155,3 +155,53 @@ Artifacts: `artifacts/vit-repeat-bulk-20260910/`, including `check.rs`,
 The focused check uses the production helper and a copy of the old scalar loop;
 it covers non-multiples of six and the dispatch boundary. Its source can be
 built temporarily as an ipu-tests binary, then run with --sdk and --output.
+
+## Reusable region planning
+
+Implementation: `d43c1ff`. The body search is now a separate, reusable candidate
+frontier in `mid/region.rs`, with Repeat-specific construction still in the
+planner. The search instance owns an immutable source/output/shape, graph,
+configuration and cost-model context. Its cache key contains argument types,
+ownership offsets, canonical storage groups, automatic-layout and parameter
+flags, allocation multiplicity and required format equalities. It caches both
+successful frontiers and infeasible contexts.
+
+Body values use local IDs; attaching a candidate remaps values, storage groups,
+deferred-input references and nested Repeat references into the enclosing state.
+Operator implementation programs retain their independent local namespaces.
+Unrelated outer prefixes are not part of the cache key. Instead, every attached
+candidate is costed with the enclosing live values before the outer Pareto beam
+prunes it. The usual beam limits bound combinations between parent branches.
+Repeat no longer discards all but the first body candidate, and an infeasible
+boundary rejects that branch rather than aborting other outer alternatives.
+This introduces no new IR layer or fixed weight-layout policy.
+
+The full-size batch-one, two-layer ViT now completes at the default beam width
+of 64. Each of four planner configurations performs **8 body searches and 56
+cache hits**, replacing 256 body searches with 32 in total. Different boundaries
+still require different searches. High-level planning took **415414 ms**;
+selection including high-level planning, scheduling and package construction
+completed in **521188 ms**. The prior default-width run was stopped after about
+ten minutes, so there is no completed before/after wall-time ratio. A CPU sample
+still shows shard-layout resolution dominating the remaining work.
+
+The build screens 48 complete candidates, admits four to placement and one to
+scheduling, selecting finalist zero. Hardware and reference validation pass,
+maximum absolute error **0.109497**. Cropped runtime is **1,040,742 cycles
+(0.693828 ms)**; the second-iteration remainder spans 422622 cycles. This is
+12.18% faster than the previous beam-eight worker-patching package (1185018
+cycles), but both beam width and retention of body alternatives changed.
+The package was executed once.
+
+Artifacts: `artifacts/vit-repeat-region-20260910/`, including `run.log`,
+`model.ipuexe`, `profile.ipuprof`, rendered `profile.html`, `operations.json`
+and a CPU sample. Reproduce with the command above, omit --planning-beam-width,
+and use this artifact directory for outputs.
+
+Validation: 212 release codegen tests pass, five ignored. New tests cover
+renumbered-equivalent boundaries, key distinctions, cached failures, retained
+body alternatives, attachment into an existing state and tile expansion of the
+attached candidates. Existing randomized Repeat lowering, sequence, placement
+and low-expansion tests also pass. Clippy passes with the existing argument-count
+and type-complexity allowances. Additional per-context start/end timing logs
+make distinct slow searches visible before an entire region search completes.

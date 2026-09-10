@@ -122,6 +122,13 @@ impl<'a, C: CostModel> RegionSearch<'a, C> {
             return candidates.clone();
         }
         self.searches += 1;
+        let started = std::time::Instant::now();
+        tracing::info!(
+            context = self.searches,
+            cache_hits = self.hits,
+            operations = self.source.len(),
+            "searching region body context"
+        );
         let (mut state, mut values) = key.0.state();
         let argument_count = state.values.len();
         let candidates = lower_operation_candidates(
@@ -143,9 +150,15 @@ impl<'a, C: CostModel> RegionSearch<'a, C> {
                         branch,
                         argument_count,
                     })
-                    .collect(),
+                    .collect::<Vec<_>>(),
             )
         });
+        tracing::info!(
+            context = self.searches,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            candidates = candidates.as_ref().map_or(0, |plans| plans.len()),
+            "searched region body context"
+        );
         self.cache.insert(key, candidates.clone());
         candidates
     }
