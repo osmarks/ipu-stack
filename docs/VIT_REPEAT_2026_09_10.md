@@ -205,3 +205,70 @@ attached candidates. Existing randomized Repeat lowering, sequence, placement
 and low-expansion tests also pass. Clippy passes with the existing argument-count
 and type-complexity allowances. Additional per-context start/end timing logs
 make distinct slow searches visible before an entire region search completes.
+
+## Depth sweep through 27 layers
+
+Code under test: `71ab221`. Full-size tests keep batch one, fused QKV, FP8
+weights/GEMMs at scale -4, distinct parameters for every layer, the default
+64-wide planner, and the same reference tolerances. Counts tested were 3, 4, 5,
+6, 7, 8, 10, 11, 12, 16 and 27. Builds ran concurrently with eight Rayon threads
+per process; hardware access was serialized. Each successful package ran once.
+Artifacts and reproduction script: `artifacts/vit-repeat-sweep-20260910/`;
+`run.sh N` runs a full-size case and renders its profile on success. The
+machine-readable results are in `summary.json`.
+
+| Layers | Result | Rejection stage | High-level planning seconds | Rejected effective bytes/tile |
+|---:|---|---|---:|---:|
+| 3 | Hardware/reference PASS | — | 329.0 | — |
+| 4 | Rejected | Outer Repeat composition, operation 24 | 332.6 | 641456 |
+| 5 | Rejected | Outer Repeat composition, operation 24 | 264.1 | 659328 |
+| 6 | Rejected | Outer Repeat composition, operation 24 | 299.2 | 721488 |
+| 7 | Rejected | Body MLP up GEMM, operation 18 | 180.6 | 635744 |
+| 8 | Rejected | Body MLP up GEMM, operation 18 | 220.2 | 638848 |
+| 10 | Rejected | Body MLP up GEMM, operation 18 | 190.7 | 693696 |
+| 11 | Rejected | Input projection, operation 0 | 0.8 | 607808 |
+| 12 | Rejected | Input projection, operation 0 | 0.7 | 649520 |
+| 16 | Rejected | Input projection, operation 0 | 0.9 | 816368 |
+| 27 | Rejected | Input projection, operation 0 | 1.0 | 1275200 |
+
+The effective memory column follows the planner's actual acceptance test:
+reported total minus its exchange-row estimate plus the 49152-byte package
+support reserve. The corresponding tile budget is 586960 bytes. These are
+estimates of rejected shortlisted plans, not lower bounds proving that no
+implementation fits. None of the failed full-size cases reached hardware.
+Elapsed planning times are from concurrent builds, not isolated CPU benchmarks.
+
+Three layers selected finalist 12 and passed with maximum absolute error
+**0.104492**. Cropped runtime is **1,455,594 cycles (0.970396 ms)**. The
+repeat-remainder spans 843642 cycles for the two unprofiled iterations, or
+**421821 cycles per layer**. This is close to 422622 cycles for the second
+iteration of the previous two-layer default-width build. Total package
+construction took 445685 ms. Rendered profile: `layers-3/profile.html`.
+
+The early rejection at 11 layers exposes a placeholder-layout problem before
+Repeat planning starts. Automatic inputs initially use row sharding; a parameter
+with shape [1,1,width] has only one row and is concentrated on one tile. Each
+encoder layer contributes 29344 bytes of FP16 bias/normalization vectors, plus
+12368 bytes in the sum of initial maximum FP8 weight shards: **41712 bytes per
+layer**. This matches the observed slope of the initial memory failures exactly.
+The consumers have not yet had an opportunity to retarget those automatic
+layouts. At 27 layers, encoder parameters contain 15224832 FP8 weight bytes and
+29344 FP16 vector bytes per layer, **392.78 MiB in total**, averaging 279798 bytes
+per tile before replication, bookends and scratch. The operation-zero failure
+therefore does not establish aggregate SRAM exhaustion. Fixing that early
+accounting/layout issue alone would not establish that the later replicated
+weights and scratch fit; the 4–10-layer rejections occur farther into planning.
+
+As an independent runtime control, the small FP16 ViT (28x28 image, width 144,
+hidden 288, two heads) ran **27 distinct layers** at the default planner width.
+It passed hardware/reference validation with maximum absolute error **0.007812**,
+1,187,256 cropped cycles and a 1,088,646-cycle remainder for the other 26
+iterations. This validates the loop and parameter advancement at count 27 for
+that smaller workload, not full-size FP8 storage feasibility. Reproduce with
+`--vit-small --vit-layers 27 --fuse-qkv --reference-run` and the same reference
+tolerances, omitting --fp8-scale. Its profile is `small-layers-27/profile.html`.
+
+The full-size searches that reached Repeat each performed 32 body searches and
+224 cache hits across four configurations. The small control had 64 searches
+and 192 hits, reflecting more distinct boundary layouts. No runtime/compiler
+source changes were made for this sweep.
