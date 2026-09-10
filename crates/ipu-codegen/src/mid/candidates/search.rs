@@ -1,14 +1,7 @@
-//! Candidate eligibility and caching for one operation across beam branches.
+//! Candidate eligibility for one whole-device operation.
 //! This boundary accepts tensor facts, never mutable planner state.
 
 use super::*;
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct PlanCacheKey {
-    input_shapes: Vec<TensorShape>,
-    parameter_inputs: Vec<bool>,
-    format_sensitive_inputs: Vec<(usize, TensorFormat)>,
-}
 
 pub(in crate::mid) struct CandidateSearch<'a> {
     operation: &'a Operation,
@@ -16,11 +9,7 @@ pub(in crate::mid) struct CandidateSearch<'a> {
     value_uses: &'a BTreeMap<ValueId, usize>,
     config: &'a PipelineConfig,
     demands: &'a OutputDemands,
-    format_sensitive_indices: BTreeSet<usize>,
     distributed_result_is_useful: bool,
-    cache: BTreeMap<PlanCacheKey, Vec<OperatorPlan>>,
-    pub generated_plan_sets: usize,
-    pub plan_cache_hits: usize,
 }
 
 impl<'a> CandidateSearch<'a> {
@@ -53,40 +42,18 @@ impl<'a> CandidateSearch<'a> {
                                 })
                         }))
         });
-        let format_sensitive_indices = if matches!(
-            operation.kind,
-            OperationKind::View(_) | OperationKind::Slice(_)
-        ) {
-            (0..operation.inputs.len()).collect::<BTreeSet<_>>()
-        } else {
-            config
-                .operator_candidates
-                .iter()
-                .filter(|candidate| operator_matches(&operation.kind, candidate.operator()))
-                .filter_map(|candidate| match candidate.format_policy() {
-                    OperatorFormatPolicy::Concrete
-                    | OperatorFormatPolicy::RowMajorGrid
-                    | OperatorFormatPolicy::RowMajorRows => None,
-                    OperatorFormatPolicy::PreserveInputLayout(index) => Some(usize::from(index)),
-                })
-                .collect()
-        };
         Self {
             operation,
             consumers,
             value_uses,
             config,
             demands,
-            format_sensitive_indices,
             distributed_result_is_useful,
-            cache: BTreeMap::new(),
-            generated_plan_sets: 0,
-            plan_cache_hits: 0,
         }
     }
 
     pub(in crate::mid) fn generate(
-        &mut self,
+        &self,
         input_types: &[TensorType],
         parameter_inputs: &[bool],
         automatic_inputs: &[bool],
@@ -104,76 +71,53 @@ impl<'a> CandidateSearch<'a> {
         {
             return Err(LoweringError::UnsupportedGemmBatching(operation.id));
         }
-        let cache_key = PlanCacheKey {
-            input_shapes: input_types
-                .iter()
-                .map(|input| input.shape.clone())
-                .collect(),
-            parameter_inputs: parameter_inputs.to_vec(),
-            format_sensitive_inputs: self
-                .format_sensitive_indices
-                .iter()
-                .filter_map(|&index| {
-                    input_types
-                        .get(index)
-                        .map(|input| (index, input.format.clone()))
+        let output_demands = self.demands.get(operation.results[0]);
+        let mut groupings = output_demands
+            .iter()
+            .map(|d| d.column_groups)
+            .filter(|&groups| groups > 1)
+            .collect::<BTreeSet<_>>();
+        if let Some(grouping) =
+            grouped_output_layout(self.consumers, operation, output_shape, self.value_uses)
+        {
+            groupings.insert(grouping.groups);
+        }
+        let mut groupings = groupings
+            .into_iter()
+            .map(|groups| {
+                Some(GroupedOutputLayout {
+                    groups,
+                    physical_lane_multiple: AMP_COLUMN_MICRO,
                 })
-                .collect(),
-        };
-        let cached = if let Some(cached) = self.cache.get(&cache_key) {
-            self.plan_cache_hits += 1;
-            cached
-        } else {
-            self.generated_plan_sets += 1;
-            let output_demands = self.demands.get(operation.results[0]);
-            let mut groupings = output_demands
-                .iter()
-                .map(|d| d.column_groups)
-                .filter(|&groups| groups > 1)
-                .collect::<BTreeSet<_>>();
-            if let Some(grouping) =
-                grouped_output_layout(self.consumers, operation, output_shape, self.value_uses)
-            {
-                groupings.insert(grouping.groups);
-            }
-            let mut groupings = groupings
-                .into_iter()
-                .map(|groups| {
-                    Some(GroupedOutputLayout {
-                        groups,
-                        physical_lane_multiple: AMP_COLUMN_MICRO,
-                    })
-                })
-                .collect::<Vec<_>>();
-            if groupings.is_empty() {
-                groupings.push(None);
-            }
-            let direct_consumer_layouts =
-                direct_consumer_layouts(self.consumers, operation.results[0], output_shape, config);
-            let mut generated = Vec::new();
-            for grouped_output in groupings {
-                for plan in plans(
-                    operation,
-                    input_types,
-                    parameter_inputs,
-                    output_shape,
-                    config,
-                    costs,
-                    self.distributed_result_is_useful,
-                    grouped_output,
-                    &direct_consumer_layouts,
-                    output_demands,
-                ) {
-                    if !generated.contains(&plan) {
-                        generated.push(plan);
-                    }
+            })
+            .collect::<Vec<_>>();
+        if groupings.is_empty() {
+            groupings.push(None);
+        }
+        let direct_consumer_layouts =
+            direct_consumer_layouts(self.consumers, operation.results[0], output_shape, config);
+        let mut generated = Vec::new();
+        for grouped_output in groupings {
+            for plan in plans(
+                operation,
+                input_types,
+                parameter_inputs,
+                output_shape,
+                config,
+                costs,
+                self.distributed_result_is_useful,
+                grouped_output,
+                &direct_consumer_layouts,
+                output_demands,
+            ) {
+                if !generated.contains(&plan) {
+                    generated.push(plan);
                 }
             }
-            self.cache.entry(cache_key).or_insert(generated)
-        };
-        let candidate_plans = cached
-            .iter()
-            .filter(|&plan| {
+        }
+        let candidate_plans = generated
+            .into_iter()
+            .filter(|plan| {
                 input_types
                     .iter()
                     .zip(automatic_inputs)
@@ -195,7 +139,6 @@ impl<'a> CandidateSearch<'a> {
                                     .supports_row_major_population())
                     })
             })
-            .cloned()
             .collect::<Vec<_>>();
         let candidate_plans = if matches!(operation.kind, OperationKind::Gemm(_)) {
             retain_operator_candidates_for_demands(
@@ -203,7 +146,7 @@ impl<'a> CandidateSearch<'a> {
                 input_types,
                 output_shape,
                 costs,
-                config.planning_beam_width.max(1),
+                config.operator_candidate_limit.max(1),
                 self.demands.get(operation.results[0]),
             )
         } else {

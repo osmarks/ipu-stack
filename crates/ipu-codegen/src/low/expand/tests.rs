@@ -671,7 +671,13 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
         assert!(
             low.exchange_phases
                 .iter()
-                .all(|phase| phase.provenance.reason != WorkReason::LayoutRearrangement),
+                .all(
+                    |phase| phase.provenance.reason != WorkReason::LayoutRearrangement
+                        || phase
+                            .provenance
+                            .value
+                            .is_none_or(|value| !deferred.contains(&value))
+                ),
             "case {case}"
         );
         assert!(
@@ -1543,6 +1549,18 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                 column_block: crate::mid::AMP_COLUMN_MICRO as u16,
             })
         );
+        // Native host bindings exercise resident kernels independently of the
+        // canonical baseline's explicit activation/compact-weight conversions.
+        let config = config
+            .with_input(
+                left,
+                mid.values[operation.inputs[0].index() as usize]
+                    .tensor_type
+                    .format
+                    .clone(),
+            )
+            .with_input(right, right_type.format.clone());
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
             !matches!(work, TileWorkRef::LocalCopy(_)) && !matches!(work, TileWorkRef::Exchange(_))

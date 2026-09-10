@@ -5,7 +5,10 @@ use super::*;
 pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
     pub open_boundaries: BTreeSet<ValueId>,
-    pub late_casts: BTreeSet<OperationId>,
+    pub early_casts: BTreeSet<OperationId>,
+    pub packing_rows: Option<u16>,
+    pub parallel_reductions: usize,
+    pub disjoint_copy_sources: bool,
 }
 
 pub(crate) struct Baseline {
@@ -20,9 +23,65 @@ pub(crate) fn lower(
     costs: &impl CostModel,
     recipe: &Recipe,
 ) -> LoweringResult<Baseline> {
+    let mut selected = select(graph, config, costs, recipe)?;
+    let program =
+        implementation::resolve(selected.program).ok_or(LoweringError::InvalidImplementation)?;
+    selected.program = if config.diagnostic_checkpoints {
+        program
+    } else {
+        program.with_elementwise_fusions().unwrap_or(program)
+    };
+    if !config.diagnostic_checkpoints {
+        if let Some(rows) = recipe.packing_rows {
+            let program = selected.program;
+            selected.program = program.with_distributed_packing(rows).unwrap_or(program);
+        }
+        if recipe.parallel_reductions > 1 {
+            let program = selected.program;
+            selected.program = program
+                .with_overlapped_reductions(recipe.parallel_reductions)
+                .unwrap_or(program);
+        }
+    }
+    if recipe.disjoint_copy_sources {
+        let program = selected.program;
+        selected.program = program
+            .with_disjoint_copy_sources(config.diagnostic_checkpoints)
+            .unwrap_or(program);
+    }
+    let (cycles, peak) = crate::estimate::analyze_mid(&selected.program, &BTreeMap::new())
+        .ok_or(LoweringError::InvalidImplementation)?;
+    selected.program.estimated_cycles = cycles.total;
+    selected.program.estimated_exchange_cycles = cycles.exchange;
+    selected.program.peak_memory = peak;
+    Ok(selected)
+}
+
+pub(crate) fn select(
+    graph: &ComputeGraph,
+    config: &PipelineConfig,
+    costs: &impl CostModel,
+    recipe: &Recipe,
+) -> LoweringResult<Baseline> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
+    let expanded_config = (config.shape_aware_active_tile_counts
+        && config.operator_candidates == default_operator_candidates(config.tile_count))
+    .then(|| {
+        let mut expanded = config.clone();
+        for tiles in
+            shape_aware_active_tile_counts(config.tile_count, graph.value_shapes().values())
+        {
+            for candidate in operator_candidates_for_tile_count(tiles) {
+                if !expanded.operator_candidates.contains(&candidate) {
+                    expanded.operator_candidates.push(candidate);
+                }
+            }
+        }
+        expanded
+    });
+    let config = expanded_config.as_ref().unwrap_or(config);
     let mut builder = Builder {
         graph,
         config,
@@ -32,7 +91,7 @@ pub(crate) fn lower(
         values: BTreeMap::new(),
         alternatives: BTreeMap::new(),
         copies: BTreeMap::new(),
-        optimizing: !recipe.plans.is_empty(),
+        optimizing: !recipe.plans.is_empty() || !recipe.open_boundaries.is_empty(),
     };
     let mut inputs = Vec::new();
     for input in graph.inputs() {
@@ -72,6 +131,16 @@ pub(crate) fn lower(
         .iter()
         .map(|id| lookup(&builder.values, *id))
         .collect::<LoweringResult<Vec<_>>>()?;
+    ownership::assign_parameter_tiles(
+        &mut builder.state.values,
+        &inputs
+            .iter()
+            .filter(|input| input.kind == GraphInputKind::Parameter)
+            .map(|input| input.value)
+            .collect::<Vec<_>>(),
+        &BTreeMap::new(),
+        config.tile_count,
+    )?;
     let program = MidProgram {
         tile_count: config.tile_count,
         inputs,
@@ -82,13 +151,6 @@ pub(crate) fn lower(
         estimated_exchange_cycles: 0,
         peak_memory: MemoryPeaks::default(),
     };
-    let mut program =
-        implementation::resolve(program).ok_or(LoweringError::InvalidImplementation)?;
-    let (cycles, peak) = crate::estimate::analyze_mid(&program, &BTreeMap::new())
-        .ok_or(LoweringError::InvalidImplementation)?;
-    program.estimated_cycles = cycles.total;
-    program.estimated_exchange_cycles = cycles.exchange;
-    program.peak_memory = peak;
     Ok(Baseline {
         program,
         recipe: builder.recipe,
@@ -97,11 +159,29 @@ pub(crate) fn lower(
 }
 
 fn canonical(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
-    if shape.0.len() >= 2 {
-        Layout::row_sharded(tiles)
-    } else {
-        flat(shape, precision, tiles)
+    if shape.0.len() < 2 {
+        return flat(shape, precision, tiles);
     }
+    // Coarse contiguous row blocks avoid turning every row into an exchange
+    // endpoint. Aim for one SRAM element per owner, without reserving elements
+    // or imposing a separate persistent/scratch partition on placement.
+    let rows = shape.0[shape.0.len() - 2];
+    let row_bytes = shape.elements() / u64::from(rows) * precision.bytes();
+    let capacity = (u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
+    let block = (1u32 << capacity.min(u64::from(u32::MAX)).ilog2())
+        .min(rows)
+        .max(rows.div_ceil(u32::from(tiles)));
+    let owners = rows.div_ceil(block) as u16;
+    Layout::row_major(TensorTiling {
+        tile_count: owners,
+        replicas: 1,
+        axes: vec![AxisTiling::new(
+            TensorAxis::FromEnd(2),
+            owners,
+            block,
+            Padding::Zero,
+        )],
+    })
 }
 
 fn flat(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
@@ -167,7 +247,7 @@ impl<C: CostModel> Builder<'_, C> {
             let shape = shapes
                 .get(&operation.results[0])
                 .ok_or(LoweringError::MissingShape(operation.results[0]))?;
-            let mut search = CandidateSearch::new(
+            let search = CandidateSearch::new(
                 operation,
                 &source[index + 1..],
                 required.contains(&operation.results[0]),
@@ -175,11 +255,19 @@ impl<C: CostModel> Builder<'_, C> {
                 self.config,
                 &demands,
             );
-            let plans = if let Some(plan) = self.recipe.plans.get(&operation.id) {
+            let mut plans = if let Some(plan) = self.recipe.plans.get(&operation.id) {
                 vec![plan.clone()]
             } else {
                 search.generate(&types, &parameters, &automatic, shape, self.costs)?
             };
+            // Prefer the AMP attention family over the scalar reference kernel
+            // when this shape has a supported whole-device implementation.
+            if plans
+                .iter()
+                .any(|plan| matches!(plan.dispatch, OperatorDispatch::Attention { .. }))
+            {
+                plans.retain(|plan| matches!(plan.dispatch, OperatorDispatch::Attention { .. }));
+            }
             let selected = if let Some(plan) = self.recipe.plans.get(&operation.id) {
                 plan.clone()
             } else {
@@ -189,10 +277,43 @@ impl<C: CostModel> Builder<'_, C> {
                         let (inputs, output) = plan.tensor_types(&types, shape);
                         let implementation = self.costs.implementation(plan, &inputs, &output)?;
                         let memory = implementation.peak_memory;
+                        let mut cycles = self
+                            .costs
+                            .operator_cycle_override(plan, &inputs, &output)
+                            .unwrap_or(implementation.estimated_cycles);
+                        // Use the conversion inserter itself to price boundaries;
+                        // a cheap kernel can require an expensive redistribution.
+                        let mut state = LoweringState::default();
+                        let mut conversions = Vec::new();
+                        for ((source, requirement), &automatic) in
+                            types.iter().zip(&plan.requirements.inputs).zip(&automatic)
+                        {
+                            let id = state.value(operation.results[0], source.clone());
+                            if automatic {
+                                state.automatic_inputs.insert(id);
+                            }
+                            ensure_format(
+                                id,
+                                requirement.format.clone(),
+                                requirement.materialization,
+                                self.recipe.early_casts.contains(&operation.id),
+                                operation.id,
+                                self.costs,
+                                &mut state,
+                                &mut conversions,
+                            );
+                        }
+                        cycles = cycles.saturating_add(
+                            conversions
+                                .iter()
+                                .map(|op| op.estimated_cycles)
+                                .sum::<u64>(),
+                        );
+
                         Some((
                             (
                                 if self.optimizing {
-                                    implementation.estimated_cycles
+                                    cycles
                                 } else {
                                     memory.total
                                 },
@@ -200,7 +321,7 @@ impl<C: CostModel> Builder<'_, C> {
                                 if self.optimizing {
                                     memory.total
                                 } else {
-                                    implementation.estimated_cycles
+                                    cycles
                                 },
                             ),
                             plan,
@@ -238,8 +359,12 @@ impl<C: CostModel> Builder<'_, C> {
                 operation,
                 shape.clone(),
                 selected,
-                &vec![!self.recipe.late_casts.contains(&operation.id); ids.len()],
-                &vec![false; ids.len()],
+                &vec![self.recipe.early_casts.contains(&operation.id); ids.len()],
+                &operation
+                    .inputs
+                    .iter()
+                    .map(|id| uses.get(id) == Some(&1))
+                    .collect::<Vec<_>>(),
                 self.costs,
                 &mut self.values,
                 &mut self.state,
@@ -443,6 +568,38 @@ impl<C: CostModel> Builder<'_, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_invariant_parameters_keep_their_selected_home() {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [16, 64]).unwrap();
+        let weight = graph.parameter("weight", [64, 64]).unwrap();
+        let y = graph
+            .repeat(3, [x], [weight], [], |body, args| {
+                Ok(vec![body.gemm(args.carried[0], args.invariants[0])?])
+            })
+            .unwrap()[0];
+        graph.set_outputs([y]).unwrap();
+        let config = PipelineConfig::new(8)
+            .with_automatic_input(x, Precision::F16)
+            .with_automatic_input(weight, Precision::F16);
+        let baseline = lower(&graph, &config, &Ipu21CostModel, &Recipe::default()).unwrap();
+        let op = baseline
+            .program
+            .operations
+            .iter()
+            .find(|op| matches!(op.kind, MidOperationKind::Repeat(_)))
+            .unwrap();
+        let MidOperationKind::Repeat(repeat) = &op.kind else {
+            unreachable!()
+        };
+        let home = &baseline.program.values[op.inputs[1].index() as usize];
+        let argument = &baseline.program.values[repeat.body.arguments[1].index() as usize];
+        assert_eq!(home.tensor_type, argument.tensor_type);
+        assert_eq!(home.tile_offset, argument.tile_offset);
+        let low = crate::low::expand::expand_tiles(&baseline.program, false).unwrap();
+        crate::place(&crate::lower_to_tiles(&low, false)).unwrap();
+    }
 
     #[test]
     fn baseline_has_canonical_boundaries_and_compact_repeated_weights() {

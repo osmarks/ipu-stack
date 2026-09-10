@@ -8,19 +8,6 @@ pub(super) use demand::{OutputDemand, OutputDemands};
 mod search;
 pub(super) use search::CandidateSearch;
 
-// Explicit diagnostic plans bypass heuristic memory rejection; concrete
-// placement still decides whether their storage fits.
-pub(super) fn contains_forced_plan(operations: &[MidOperation], config: &PipelineConfig) -> bool {
-    operations.iter().any(|operation| {
-        operation.source.is_some_and(|source| {
-            config
-                .gemm_plan_constraints
-                .iter()
-                .any(|constraint| constraint.source_operation == source.index())
-        })
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct GroupedOutputLayout {
     pub(super) groups: u16,
@@ -1454,7 +1441,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             inputs,
             output,
             costs,
-            config.planning_beam_width.max(1),
+            config.operator_candidate_limit.max(1),
             output_demands,
         )
     };

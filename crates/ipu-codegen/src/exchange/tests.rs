@@ -714,9 +714,7 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
                 layout: Layout::block_major_matrix(64, tiles),
             },
         );
-    let mid = crate::mid::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
-        .unwrap()
-        .remove(0);
+    let mid = crate::mid::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
     let expanded = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();

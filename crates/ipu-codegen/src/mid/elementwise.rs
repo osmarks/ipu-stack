@@ -117,13 +117,16 @@ fn fuse_region(
             values[input.index() as usize].storage_group,
         ];
         if operations[previous + 1..index].iter().any(|step| {
-            !matches!(
+            !(matches!(
                 step.kind,
                 MidOperationKind::Primitive(Primitive::Copy { .. })
             ) || step
-                .results
-                .iter()
-                .any(|id| groups.contains(&values[id.index() as usize].storage_group))
+                .conversion_plan()
+                .is_some_and(|plan| plan.input.format.precision == plan.output.format.precision))
+                || step
+                    .results
+                    .iter()
+                    .any(|id| groups.contains(&values[id.index() as usize].storage_group))
         }) {
             continue;
         }
@@ -819,6 +822,32 @@ mod tests {
                 graph
                     .set_outputs(if keep_sum { vec![sum, y] } else { vec![y] })
                     .unwrap();
+                // Exercise fusion of compatible whole-row implementations;
+                // split-statistics LayerNorm is a separate kernel family.
+                config.operator_candidates.retain(|candidate| {
+                    !candidate
+                        .concrete()
+                        .is_some_and(|c| matches!(c.plan.operator, MidOperator::LayerNorm))
+                        || candidate.format_policy() == OperatorFormatPolicy::RowMajorRows
+                });
+                if norm {
+                    let format = TensorFormat {
+                        precision: Precision::F16,
+                        layout: Layout::row_major(TensorTiling {
+                            tile_count: 4,
+                            replicas: 1,
+                            axes: vec![
+                                AxisTiling::new(TensorAxis::FromEnd(2), 4, 1, Padding::Reject)
+                                    .with_tile_stride(1),
+                                AxisTiling::new(TensorAxis::FromEnd(3), 1, 1, Padding::Reject)
+                                    .with_tile_stride(4),
+                                AxisTiling::new(TensorAxis::FromEnd(1), 1, 4, Padding::Reject)
+                                    .with_tile_stride(1),
+                            ],
+                        }),
+                    };
+                    config = config.with_input(x, format.clone()).with_input(rhs, format);
+                }
                 let mid = implementation::resolve(lower(&graph, &config, &Ipu21CostModel).unwrap())
                     .unwrap();
                 let fused = mid.with_elementwise_fusions();

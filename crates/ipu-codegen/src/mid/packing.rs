@@ -2,39 +2,21 @@
 use super::*;
 
 impl MidProgram {
-    pub(super) fn distributed_packing_candidates(&self) -> Vec<Self> {
-        let mut candidates = Vec::<Self>::new();
-        let metrics = |p: &Self| planner::PlanMetrics {
-            cycles: p.estimated_cycles,
-            memory: p.peak_memory,
-        };
-        for rows in [32, 64, 128, 256] {
-            let mut result = self.clone();
-            if !distribute_region(
-                &mut result.operations,
-                &mut result.values,
-                self.tile_count,
-                rows,
-            ) {
-                continue;
-            }
-            let Some((cycles, peak)) = crate::estimate::analyze_mid(&result, &BTreeMap::new())
-            else {
-                continue;
-            };
-            result.estimated_cycles = cycles.total;
-            result.estimated_exchange_cycles = cycles.exchange;
-            result.peak_memory = peak;
-            if candidates
-                .iter()
-                .any(|p| p == &result || metrics(p).dominates(metrics(&result)))
-            {
-                continue;
-            }
-            candidates.retain(|p| !metrics(&result).dominates(metrics(p)));
-            candidates.push(result);
+    pub(super) fn with_distributed_packing(&self, rows: u16) -> Option<Self> {
+        let mut result = self.clone();
+        if !distribute_region(
+            &mut result.operations,
+            &mut result.values,
+            self.tile_count,
+            rows,
+        ) {
+            return None;
         }
-        candidates
+        let (cycles, peak) = crate::estimate::analyze_mid(&result, &BTreeMap::new())?;
+        result.estimated_cycles = cycles.total;
+        result.estimated_exchange_cycles = cycles.exchange;
+        result.peak_memory = peak;
+        Some(result)
     }
 }
 
@@ -257,7 +239,10 @@ mod tests {
                 }],
                 ..MidProgram::default()
             };
-            let candidates = program.distributed_packing_candidates();
+            let candidates = [32, 64, 128, 256]
+                .into_iter()
+                .filter_map(|rows| program.with_distributed_packing(rows))
+                .collect::<Vec<_>>();
             assert!(!candidates.is_empty() && candidates.len() <= 4);
             for packed in candidates {
                 let low = crate::lower_to_tiles(

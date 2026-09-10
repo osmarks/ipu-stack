@@ -97,27 +97,21 @@ struct Arguments {
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
-    /// Write JSON/HTML memory-estimator profiles for finalists and memory rejections.
+    /// Write JSON/HTML memory-estimator profiles for the baseline and local proposals.
     #[arg(long, conflicts_with = "reuse_package")]
     memory_profile_directory: Option<PathBuf>,
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
-    /// Time all retained mid plans serially through low expansion and write JSON; no placement or hardware.
+    /// Time canonical baseline selection and low expansion and write JSON; no placement or hardware.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule", "capture_exchange_schedule"])]
     benchmark_expansion: Option<PathBuf>,
-    /// Maximum expansion samples after search; zero measures every retained plan.
-    #[arg(long, default_value_t = 4, requires = "benchmark_expansion")]
-    benchmark_expansion_limit: usize,
     /// Disable low-fragment caching for an expansion benchmark comparison.
     #[arg(long, requires = "benchmark_expansion")]
     benchmark_expansion_uncached: bool,
-    /// Capture an expanded finalist before scheduling, linking, or hardware execution.
+    /// Capture the expanded canonical baseline before scheduling, linking, or hardware execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule"])]
     capture_exchange_schedule: Option<PathBuf>,
-    /// Planner finalist ordinal to capture (matches package diagnostics).
-    #[arg(long, default_value_t = 0, requires = "capture_exchange_schedule")]
-    capture_finalist: usize,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
@@ -136,21 +130,12 @@ struct Arguments {
     /// Cap geometry-derived static transfer fragments per tile (default 16384).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_transfer_limit_per_tile: Option<u64>,
-    /// Override the layout-search beam (default comes from PipelineConfig).
+    /// Per-operator candidate catalogue breadth (default comes from PipelineConfig).
     #[arg(long, conflicts_with = "reuse_package")]
-    planning_beam_width: Option<usize>,
+    operator_candidate_limit: Option<usize>,
     /// Maximum complete package validations for local improvements after the baseline.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
-    /// Complete plans per configuration to expand and estimate.
-    #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
-    expanded_plan_finalists: usize,
-    /// Expanded plans admitted to placement/mapping, plus a compact alternative.
-    #[arg(long, default_value_t = 4, conflicts_with = "reuse_package")]
-    placement_finalists: usize,
-    /// Rank this many complete planner finalists with physical exchange scheduling.
-    #[arg(long, default_value_t = 1, conflicts_with = "reuse_package")]
-    exchange_schedule_finalists: usize,
     /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL.
     #[arg(
         long,
@@ -691,8 +676,8 @@ fn main() -> Result<()> {
     }
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
-    if let Some(width) = arguments.planning_beam_width {
-        pipeline = pipeline.with_planning_beam_width(width);
+    if let Some(width) = arguments.operator_candidate_limit {
+        pipeline = pipeline.with_operator_candidate_limit(width);
     }
     pipeline.optimization_steps = arguments.optimization_steps;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
@@ -701,9 +686,6 @@ fn main() -> Result<()> {
         "packed" => ipu_codegen::GemmOutputPacking::Packed,
         _ => ipu_codegen::GemmOutputPacking::Automatic,
     };
-    pipeline = pipeline.with_exchange_schedule_finalists(arguments.exchange_schedule_finalists);
-    pipeline.expanded_plan_finalists = arguments.expanded_plan_finalists.max(1);
-    pipeline.placement_finalists = arguments.placement_finalists.max(1);
     pipeline = pipeline
         .with_attention_strategy(arguments.attention_strategy.into())
         .with_attention_products(arguments.attention_products.into());
@@ -1062,18 +1044,13 @@ fn main() -> Result<()> {
         let report = ipu_codegen::benchmark_mid_expansion(
             &graph,
             &package_config.pipeline,
-            arguments.benchmark_expansion_limit,
             !arguments.benchmark_expansion_uncached,
         )?;
         serde_json::to_writer_pretty(std::io::BufWriter::new(fs::File::create(path)?), &report)?;
         return Ok(());
     }
     if let Some(path) = &arguments.capture_exchange_schedule {
-        let snapshot = ipu_codegen::capture_exchange_finalist(
-            &graph,
-            &package_config,
-            arguments.capture_finalist,
-        )?;
+        let snapshot = ipu_codegen::capture_exchange_baseline(&graph, &package_config)?;
         serde_json::to_writer(std::io::BufWriter::new(fs::File::create(path)?), &snapshot)?;
         println!(
             "Captured {} exchange phases to {}",

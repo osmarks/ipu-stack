@@ -14,10 +14,9 @@ pub use primitive::*;
 mod candidates;
 mod catalogue;
 mod layout;
+mod lowering;
 mod operator;
 mod ownership;
-mod planner;
-mod region;
 mod resolved;
 mod view;
 pub use crate::graph::AxisFactorView;
@@ -26,98 +25,15 @@ use candidates::*;
 use catalogue::*;
 pub use catalogue::{ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy};
 pub use layout::*;
-pub use operator::*;
 #[cfg(test)]
-pub(crate) use planner::lower;
-pub(crate) fn lower_finalists(
+pub(crate) use lowering::lower;
+pub use operator::*;
+pub(crate) fn lower_baseline(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
-    count: usize,
-) -> LoweringResult<Vec<MidProgram>> {
-    let mut configurations = vec![config.clone()];
-    // New storage choices must not evict the native baseline from a bounded
-    // beam before the complete implementations can be compared. This repeats
-    // compact planning only; identical candidates share one tile expansion.
-    if config.gemm_output_packing == GemmOutputPacking::Automatic
-        && graph
-            .operations()
-            .iter()
-            .any(|operation| matches!(operation.kind, OperationKind::View(_)))
-    {
-        let mut native = config.clone();
-        native.gemm_output_packing = GemmOutputPacking::Native;
-        configurations.push(native);
-    }
-    if config.attention_products == AttentionProducts::Automatic
-        && config.attention_strategy != AttentionStrategy::Flash
-        && graph
-            .operations()
-            .iter()
-            .any(|op| matches!(op.kind, OperationKind::FlashAttention(_)))
-    {
-        // Preserve the shared-row baseline with both projection-store choices.
-        for index in 0..configurations.len() {
-            let mut baseline = configurations[index].clone();
-            baseline.attention_products = AttentionProducts::SharedRows;
-            configurations.push(baseline);
-        }
-    }
-    let mut candidates = Vec::new();
-    let mut failure = None;
-    let span = tracing::Span::current();
-    let searches = configurations
-        .into_par_iter()
-        .map(|configuration| {
-            let _entered = span.enter();
-            planner::plan_finalists(graph, &configuration, costs, count)
-        })
-        .collect::<Vec<_>>();
-    for search in searches {
-        match search {
-            Ok(plans) => {
-                for candidate in plans {
-                    if !candidates.contains(&candidate) {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::info!(%error, "skipped infeasible planner configuration");
-                failure = Some(error);
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return Err(failure.unwrap_or(LoweringError::InvalidImplementation));
-    }
-    let resolved = candidates
-        .into_iter()
-        .map(|program| implementation::resolve(program).ok_or(LoweringError::InvalidImplementation))
-        .collect::<LoweringResult<Vec<_>>>()?;
-    let mut candidates = Vec::with_capacity(resolved.len() * 2);
-    for program in resolved {
-        let program = if config.diagnostic_checkpoints {
-            program
-        } else {
-            program.with_elementwise_fusions().unwrap_or(program)
-        };
-        if !config.diagnostic_checkpoints {
-            candidates.extend(program.distributed_packing_candidates());
-            for limit in 2..=config.max_parallel_reductions {
-                if let Some(overlapped) = program.with_overlapped_reductions(limit)
-                    && !candidates.contains(&overlapped)
-                {
-                    candidates.push(overlapped);
-                }
-            }
-        }
-        if let Some(rotated) = program.with_disjoint_copy_sources(config.diagnostic_checkpoints) {
-            candidates.push(rotated);
-        }
-        candidates.push(program);
-    }
-    Ok(candidates)
+) -> LoweringResult<MidProgram> {
+    Ok(baseline::lower(graph, config, costs, &baseline::Recipe::default())?.program)
 }
 #[cfg(test)]
 pub(crate) fn expand_tiles(
@@ -127,13 +43,14 @@ pub(crate) fn expand_tiles(
         .ok_or(crate::ExpansionError::InvalidOperatorPlan)?;
     crate::low::expand::expand_tiles(&program, true)
 }
-use planner::*;
+use lowering::*;
 
+#[cfg(test)]
 use crate::estimate::MemoizedCostModel;
+use crate::estimate::region_peak_memory_with_multiplicity;
 pub use crate::estimate::{
     CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, MemoryPeaks, MemoryUsage,
 };
-use crate::estimate::{region_peak_memory, region_peak_memory_with_multiplicity};
 use crate::graph::{
     AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation, OperationId,
     OperationKind, Repeat, TensorShape, ValueId,
@@ -183,18 +100,8 @@ pub struct PipelineConfig {
     pub operator_candidates: Vec<OperatorCandidate>,
     /// Add near-capacity tile counts derived from graph tensor extents.
     pub shape_aware_active_tile_counts: bool,
-    /// Maximum number of partial format assignments retained after each
-    /// operation in a straight-line region.
-    pub planning_beam_width: usize,
-    /// Complete plans returned per planning configuration for geometry screening.
-    pub expanded_plan_finalists: usize,
-    /// Expanded candidates admitted to placement/mapping, plus the smallest
-    /// estimated-storage alternative if absent. Independent of scheduling count.
-    pub placement_finalists: usize,
-    /// Number of buildable finalists compared with physical exchange scheduling.
-    /// A compact alternative is prioritized; late failures may try the remaining
-    /// placed candidates, bounded by the placement shortlist.
-    pub exchange_schedule_finalists: usize,
+    /// Per-operator catalogue breadth before local neighborhood evaluation.
+    pub operator_candidate_limit: usize,
     /// Hard limit on actual compact encoded exchange tables per tile.
     /// Set to u64::MAX to disable this limit.
     pub exchange_table_budget_bytes: u64,
@@ -280,10 +187,7 @@ impl PipelineConfig {
             operator_candidates: default_operator_candidates(tile_count),
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
-            planning_beam_width: 64,
-            expanded_plan_finalists: 16,
-            placement_finalists: 4,
-            exchange_schedule_finalists: 1,
+            operator_candidate_limit: 64,
             exchange_table_budget_bytes: 80 * 1024,
             exchange_transfer_limit_per_tile: 16_384,
             exchange_table_cost_per_byte: 0,
@@ -315,13 +219,8 @@ impl PipelineConfig {
         self
     }
 
-    pub fn with_planning_beam_width(mut self, width: usize) -> Self {
-        self.planning_beam_width = width.max(1);
-        self
-    }
-
-    pub fn with_exchange_schedule_finalists(mut self, finalists: usize) -> Self {
-        self.exchange_schedule_finalists = finalists.max(1);
+    pub fn with_operator_candidate_limit(mut self, width: usize) -> Self {
+        self.operator_candidate_limit = width.max(1);
         self
     }
 
@@ -501,8 +400,6 @@ pub struct MidProgram {
 pub enum LoweringError {
     #[error("selected operator implementation is invalid")]
     InvalidImplementation,
-    #[error("cannot create planning worker pool: {0}")]
-    PlanningThreads(String),
     #[error("cannot write planner memory profile: {0}")]
     MemoryProfile(String),
     #[error(transparent)]
@@ -517,18 +414,6 @@ pub enum LoweringError {
     MissingShape(ValueId),
     #[error("operation {0:?} has no legal format candidate")]
     NoCandidate(OperationId),
-    #[error(
-        "operation {operation:?} has no candidate within tile SRAM (smallest rejected peak: standard {standard} bytes plus {standard_reservation} bytes package support, interleaved {interleaved} bytes, tensor total {total} bytes, separately estimated exchange tables {exchange_rows} bytes, contiguous-standard overflow {standard_contiguous_overflow} bytes)"
-    )]
-    InsufficientMemory {
-        operation: OperationId,
-        standard: u64,
-        standard_reservation: u64,
-        exchange_rows: u64,
-        interleaved: u64,
-        total: u64,
-        standard_contiguous_overflow: u64,
-    },
     #[error(
         "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"
     )]
@@ -559,7 +444,7 @@ fn profile_mlp_finalist_expansion() {
         .with_automatic_input(up, Precision::F16)
         .with_automatic_input(down, Precision::F16);
     let start = std::time::Instant::now();
-    let finalists = planner::plan_finalists(&graph, &config, &crate::Ipu21CostModel, 8).unwrap();
+    let finalists = [lower_baseline(&graph, &config, &crate::Ipu21CostModel).unwrap()];
     eprintln!(
         "compact planning: {:?}, {} finalists",
         start.elapsed(),

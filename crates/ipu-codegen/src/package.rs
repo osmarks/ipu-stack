@@ -6,11 +6,11 @@ mod profile_work;
 use profile::{instrument_profile, profile_binding, profile_step_count};
 mod benchmark;
 mod local;
-mod selection;
+mod validation;
 pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
 mod tile_program;
-use selection::ScheduledPlan;
 pub use tile_program::build_tile_program_package;
+use validation::ScheduledPlan;
 
 use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
@@ -26,7 +26,7 @@ use crate::{
     WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower_to_tiles, place,
     shard_storage_bytes,
 };
-use crate::{Ipu21CostModel, PipelineConfig, Precision, TileGraph, lower_finalists};
+use crate::{Ipu21CostModel, PipelineConfig, Precision, TileGraph, lower_baseline};
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
@@ -336,8 +336,8 @@ fn build_package_artifacts(
             .toolchain
             .compile(&config.runtime_source, "static_runtime", &[])?)
     })?;
-    let (selected, built) = build_phase("select_finalist", || {
-        selection::select_graph_finalist(
+    let (selected, built) = build_phase("plan_package", || {
+        local::optimize(
             graph,
             &planning,
             config.tile_mapping.as_deref(),
@@ -403,7 +403,7 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
-    selection::check_exchange_budget(u64::from(exchange_table_bytes), config)?;
+    validation::check_exchange_budget(u64::from(exchange_table_bytes), config)?;
     let profile_samples = config.profiling.then(|| {
         program
             .tiles
@@ -722,7 +722,7 @@ fn build_package_from_objects(
             capacity_bytes = capacity_end - storage.range.start,
             "checked final exchange table capacity"
         );
-        selection::check_exchange_budget(
+        validation::check_exchange_budget(
             u64::from(finalizer.exchange_code_end() - storage.range.start),
             config,
         )?;
@@ -1286,27 +1286,16 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
 }
 
 /// Capture address-resolved ordinary transfers before scheduling or linking.
-/// Finalist indices match package-selection diagnostics; failed placements remain errors.
-pub fn capture_exchange_finalist(
+/// Capture the canonical baseline; failed placements remain errors.
+pub fn capture_exchange_baseline(
     graph: &ComputeGraph,
     config: &PackageConfig,
-    finalist: usize,
 ) -> PackageBuildResult<crate::ExchangeScheduleSnapshot> {
     let planning = &config.pipeline;
     validate_tile_count(u32::from(planning.tile_count))?;
-    let finalists = lower_finalists(
-        graph,
-        planning,
-        &Ipu21CostModel,
-        planning
-            .expanded_plan_finalists
-            .max(planning.exchange_schedule_finalists),
-    )?;
-    let mid = finalists
-        .get(finalist)
-        .ok_or_else(|| invalid("exchange capture finalist out of range"))?;
+    let mid = lower_baseline(graph, planning, &Ipu21CostModel)?;
     let (low, placement, _) =
-        selection::expand_and_place(mid, planning, config.tile_mapping.as_deref())?;
+        validation::expand_and_place(&mid, planning, config.tile_mapping.as_deref())?;
     Ok(crate::exchange::capture_exchange_schedule(
         &low, &placement,
     )?)
@@ -1403,18 +1392,17 @@ mod tests {
     #[test]
     fn attention_scratch_does_not_override_result_precision() {
         let mut graph = ComputeGraph::new();
-        let q = graph.host_input("q", [2, 4, 16]).unwrap();
-        let k = graph.host_input("k", [2, 4, 16]).unwrap();
-        let v = graph.host_input("v", [2, 4, 16]).unwrap();
+        let q = graph.host_input("q", [2, 17, 72]).unwrap();
+        let k = graph.host_input("k", [2, 73, 72]).unwrap();
+        let v = graph.host_input("v", [2, 73, 72]).unwrap();
         let y = graph.flash_attention(q, k, v).unwrap();
         graph.set_outputs([y]).unwrap();
-        let config = PipelineConfig::new(8)
+        let config = PipelineConfig::new(64)
+            .with_attention_strategy(crate::AttentionStrategy::Flash)
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
-            .unwrap()
-            .remove(0);
+        let mid = lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
         let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
         assert!(
             low.logical_values

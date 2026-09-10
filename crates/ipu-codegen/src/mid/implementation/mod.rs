@@ -364,7 +364,8 @@ fn resolve_region(
                 } else {
                     None
                 }
-                .or_else(|| implement(plan, &inputs, &output.tensor_type))?;
+                .or_else(|| implement(plan, &inputs, &output.tensor_type))
+                .or_else(|| { tracing::debug!(source=?operation.source, ?plan, ?inputs, output=?output.tensor_type, "cannot resolve operator implementation"); None })?;
                 let anchor = match plan.dispatch {
                     OperatorDispatch::BlockedGemm { orientation, .. } => {
                         values[input_ids[orientation.operand_indices().0].index() as usize]

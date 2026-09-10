@@ -538,23 +538,6 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     exchange_fragment_price(bytes, phases, bytes.div_ceil(fragment_bytes.max(1)))
 }
 
-pub(crate) fn region_peak_memory(
-    config: &crate::PipelineConfig,
-    initial: &[MidValueId],
-    operations: &[MidOperation],
-    outputs: &[MidValueId],
-    values: &[MidValue],
-) -> MemoryPeaks {
-    region_peak_memory_with_multiplicity(
-        config,
-        initial,
-        operations,
-        outputs,
-        values,
-        &BTreeMap::new(),
-    )
-}
-
 pub(crate) fn region_peak_memory_with_multiplicity(
     config: &crate::PipelineConfig,
     initial: &[MidValueId],

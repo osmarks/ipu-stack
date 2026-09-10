@@ -351,6 +351,7 @@ impl TileGraphBuilder {
                 tracing::debug!(
                     operation = index,
                     source = ?operation.source.map(OperationId::index),
+                    kind = ?operation.kind,
                     plan = ?operation.operator_plan(),
                     conversion = ?operation.conversion_plan(),
                     inputs = ?operation.inputs,

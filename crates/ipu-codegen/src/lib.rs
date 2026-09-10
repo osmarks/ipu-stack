@@ -51,7 +51,7 @@ pub use mid::{
 pub use package::{
     CompiledPackage, DiagnosticPackage, DiagnosticShard, DiagnosticTensor, ExpansionBenchmark,
     ExpansionTiming, PackageConfig, TileProgramData, benchmark_mid_expansion,
-    build_diagnostic_package, build_package, build_tile_program_package, capture_exchange_finalist,
+    build_diagnostic_package, build_package, build_tile_program_package, capture_exchange_baseline,
 };
 pub(crate) use place::*;
 pub(crate) use storage::*;

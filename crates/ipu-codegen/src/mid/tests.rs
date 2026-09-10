@@ -1,4 +1,3 @@
-use super::planner::plan_finalists as lower_finalists;
 use super::*;
 
 const RANDOM_CASES: usize = 128;
@@ -171,7 +170,7 @@ fn single_row_add_can_keep_column_ownership() {
 }
 
 #[test]
-fn fp8_mlp_retains_quantization_before_replication() {
+fn fp8_mlp_can_quantize_before_replication() {
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [1, 729, 1152]).unwrap();
     let w0 = graph.parameter("w0", [1, 1152, 4304]).unwrap();
@@ -191,7 +190,15 @@ fn fp8_mlp_retains_quantization_before_replication() {
     config
         .operator_candidates
         .push(OperatorCandidate::fp8_gemm(1472, -4));
-    let finalists = lower_finalists(&graph, &config, &crate::Ipu21CostModel, 4).unwrap();
+    let mut recipe = baseline::Recipe::default();
+    recipe
+        .early_casts
+        .extend(graph.operations().iter().map(|op| op.id));
+    let finalists = [
+        baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe)
+            .unwrap()
+            .program,
+    ];
     assert!(finalists.iter().any(|mid| {
         mid.operations
             .iter()
@@ -209,7 +216,7 @@ fn fp8_conversion_precedes_operand_replication() {
     let mut graph = ComputeGraph::new();
     let host = graph.host_input("input", [512, 64]).unwrap();
     graph.gelu(host).unwrap();
-    let mut state = planner::LoweringState::default();
+    let mut state = lowering::LoweringState::default();
     let input_layout = Layout::amp_left(64, 64);
     let input = state.value(
         ValueId::from_index(0),
@@ -223,7 +230,7 @@ fn fp8_conversion_precedes_operand_replication() {
         },
     };
     let mut operations = Vec::new();
-    planner::ensure_format(
+    lowering::ensure_format(
         input,
         target.clone(),
         OperandMaterialization::Complete,
@@ -311,65 +318,6 @@ fn random_format(random: &mut fastrand::Rng, tiles: u16) -> TensorFormat {
 }
 
 #[test]
-fn randomized_future_state_is_id_independent_but_preserves_aliasing() {
-    let mut random = fastrand::Rng::with_seed(0x616c_6961_7365_7321);
-    for _ in 0..RANDOM_CASES {
-        let mut graph = ComputeGraph::new();
-        let first = graph.host_input("first", [1]).unwrap();
-        let second = graph.host_input("second", [1]).unwrap();
-        let dummy = graph.host_input("dummy", [1]).unwrap();
-        let tiles = random.u16(1..=64);
-        let tensor_type = TensorType {
-            shape: TensorShape::new([random.u32(1..=128)]),
-            format: random_format(&mut random, tiles),
-        };
-        let aliases = random.bool();
-        let automatic = random.bool();
-        let parameter = random.bool();
-
-        let make_branch = |prepend_dummy: bool, aliases: bool| {
-            let mut state = LoweringState::default();
-            if prepend_dummy {
-                state.value(dummy, tensor_type.clone());
-            }
-            let first_id = state.value(first, tensor_type.clone());
-            let second_id = if aliases {
-                state.value_in_storage_group(second, tensor_type.clone(), first_id)
-            } else {
-                state.value(second, tensor_type.clone())
-            };
-            if automatic {
-                state.automatic_inputs.extend([first_id, second_id]);
-            }
-            if parameter {
-                state.parameter_values.extend([first_id, second_id]);
-            }
-            BeamBranch {
-                values: [(first, first_id), (second, second_id)]
-                    .into_iter()
-                    .collect(),
-                state,
-                operations: Vec::new(),
-                peak_memory: MemoryPeaks::default(),
-                analysis: std::sync::OnceLock::new(),
-            }
-        };
-        let future = [first, second].into_iter().collect();
-        let constraints = RegionPlanningConstraints {
-            allocation_copies: [(first, random.u32(1..=8))].into_iter().collect(),
-            required_equal_formats: vec![(first, second)],
-            ..Default::default()
-        };
-        let baseline = future_beam_state(&make_branch(false, aliases), &future, &constraints);
-        let renumbered = future_beam_state(&make_branch(true, aliases), &future, &constraints);
-        let changed_aliasing =
-            future_beam_state(&make_branch(true, !aliases), &future, &constraints);
-        assert_eq!(baseline, renumbered);
-        assert_ne!(baseline, changed_aliasing);
-    }
-}
-
-#[test]
 fn randomized_active_tile_candidates_bound_idle_capacity() {
     let mut random = fastrand::Rng::with_seed(0x7469_6c65);
     for _ in 0..RANDOM_CASES {
@@ -428,7 +376,7 @@ fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
             TensorType::new([m, k], Precision::F16, Layout::row_sharded(tiles)),
             TensorType::new([k, n], Precision::F16, Layout::row_sharded(tiles)),
         ];
-        let config = PipelineConfig::new(tiles).with_planning_beam_width(16);
+        let config = PipelineConfig::new(tiles).with_operator_candidate_limit(16);
         let candidates = parallel_reduction_candidates(
             OperatorCandidate::parallel_gemm(tiles).operator(),
             tiles,
@@ -858,129 +806,6 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             "random case {case}"
         );
         assert_conversions_are_explicit(&lowered, &lowered.operations);
-    }
-}
-
-#[test]
-fn randomized_beam_search_preserves_formats_needed_by_later_operators() {
-    let mut random = fastrand::Rng::with_seed(0x6265_616d);
-    for case in 0..RANDOM_CASES {
-        let tiles = [1, 2, 4, 8][random.usize(0..4)];
-        let rows = u32::from(tiles) * random.u32(1..=8);
-        let inner = random.u32(1..=4) * 64;
-        let columns = random.u32(1..=4) * 64;
-        let row = format(Precision::F16, Layout::row_sharded(tiles));
-        let left = format(Precision::F16, Layout::amp_left(64, tiles));
-        let right = format(
-            Precision::F16,
-            Layout::block_major_matrix_storage(
-                64,
-                AMP_OUTPUT_COLUMN_BLOCK,
-                tiles,
-                1,
-                1,
-                MemoryClass::Ipu21Standard,
-            ),
-        );
-        let output = format(Precision::F16, Layout::amp_left_result(tiles));
-
-        let mut graph = ComputeGraph::new();
-        let activation = graph.host_input("activation", [rows, inner]).unwrap();
-        let weights = graph.parameter("weights", [inner, columns]).unwrap();
-        let activated = graph.gelu(activation).unwrap();
-        let product = graph.gemm(activated, weights).unwrap();
-        graph.set_outputs([product]).unwrap();
-
-        let candidates = [
-            ConcreteOperatorCandidate::new(
-                MidOperator::Gelu,
-                [OperandRequirement::new(row.clone(), 8)],
-                OperandRequirement::new(row.clone(), 8),
-            ),
-            ConcreteOperatorCandidate::new(
-                MidOperator::Gelu,
-                [OperandRequirement::new(row.clone(), 8)],
-                OperandRequirement::new(left.clone(), 8),
-            ),
-            ConcreteOperatorCandidate::new(
-                MidOperator::Gemm {
-                    options: GemmOptions::default(),
-                    multiply: Precision::F16,
-                    accumulate: AccumulationPrecision::F32,
-                },
-                [
-                    OperandRequirement::new(left.clone(), 32),
-                    OperandRequirement::new(right.clone(), 32),
-                ],
-                OperandRequirement::new(output, 32),
-            ),
-        ];
-        let make_config = |beam_width| {
-            let mut config = PipelineConfig::new(tiles)
-                .with_input(activation, row.clone())
-                .with_input(weights, right.clone())
-                .with_planning_beam_width(beam_width);
-            config.operator_candidates = candidates
-                .iter()
-                .cloned()
-                .map(OperatorCandidate::Concrete)
-                .collect();
-            config
-        };
-        let greedy = lower(&graph, &make_config(1), &Ipu21CostModel).unwrap();
-        let searched_config = make_config(2);
-        let finalists = lower_finalists(&graph, &searched_config, &Ipu21CostModel, 2).unwrap();
-        assert!(
-            !finalists.is_empty() && finalists.len() <= 2,
-            "random case {case}"
-        );
-        for finalist in &finalists {
-            let program = expand_tiles(finalist).unwrap();
-            let cycles = crate::estimate::program_cycles(&program, None).unwrap();
-            assert_eq!(program.estimated_cycles, cycles.total, "random case {case}");
-            assert_eq!(
-                program.estimated_exchange_cycles, cycles.exchange,
-                "random case {case}"
-            );
-            assert!(
-                finalist.estimated_exchange_cycles <= finalist.estimated_cycles,
-                "random case {case}"
-            );
-        }
-        let searched = &finalists[0];
-
-        assert!(
-            searched.estimated_cycles < greedy.estimated_cycles,
-            "random case {case}"
-        );
-        let gelu = searched
-            .operations
-            .iter()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::Gelu,
-                            ..
-                        },
-                        ..
-                    }
-                )
-            })
-            .unwrap();
-        assert_eq!(
-            value(searched, gelu.results[0]).tensor_type.format,
-            left,
-            "random case {case}"
-        );
-        assert!(
-            searched.peak_memory.fits_ipu21_with_budget(
-                searched_config.standard_memory_reservation_bytes,
-                searched_config.tile_memory_budget_bytes,
-            ),
-            "random case {case}"
-        );
     }
 }
 
@@ -1650,9 +1475,7 @@ fn uneven_mlp_products_preserve_global_coordinates() {
         .with_automatic_input(input, Precision::F16)
         .with_automatic_input(up, Precision::F16)
         .with_automatic_input(down, Precision::F16);
-    let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
-        .unwrap()
-        .remove(0);
+    let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
     let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let useful: u64 = tiles
         .kernel_runs
@@ -1701,9 +1524,7 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .with_automatic_input(query, Precision::F16)
         .with_automatic_input(key, Precision::F16)
         .with_automatic_input(value, Precision::F16);
-    let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
-        .unwrap()
-        .remove(0);
+    let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
     let product = mid
         .operations
         .iter()
@@ -1777,9 +1598,7 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
                 reduction_staging: ReductionStaging::Complete,
                 local_weight_staging: LocalOperandStaging::Direct,
             });
-        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
-            .unwrap()
-            .remove(0);
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         plans.push(
             mid.operations
                 .iter()
@@ -1855,7 +1674,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
             &inputs,
             &shape,
             &costs,
-            config.planning_beam_width,
+            config.operator_candidate_limit,
         );
         for memory in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
             let expected = GemmPlanConstraint {
@@ -1880,7 +1699,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
                 "operation {operation}: lost {memory:?} historical geometry"
             );
         }
-        assert!(retained.len() <= 2 * config.planning_beam_width);
+        assert!(retained.len() <= 2 * config.operator_candidate_limit);
         assert!(retained.iter().all(|plan| {
             let (inputs, output) = plan.tensor_types(&inputs, &shape);
             costs
@@ -1978,10 +1797,10 @@ fn value_projection_retains_head_grouped_swapped_output_from_packed_activations(
     let heads = graph.split_heads(projection, 16).unwrap();
     let result = graph.flash_attention(heads, heads, heads).unwrap();
     graph.set_outputs([result]).unwrap();
-    let config = PipelineConfig::new(1472).with_planning_beam_width(4);
+    let config = PipelineConfig::new(1472).with_operator_candidate_limit(4);
     let demands = OutputDemands::new(graph.operations(), graph.value_shapes(), &config);
     let uses = BTreeMap::from([(projection, 1)]);
-    let mut search = CandidateSearch::new(
+    let search = CandidateSearch::new(
         &graph.operations()[0],
         &graph.operations()[1..],
         false,
@@ -2025,72 +1844,6 @@ fn value_projection_retains_head_grouped_swapped_output_from_packed_activations(
             ..
         }
     )));
-}
-
-#[test]
-fn beam_reserves_requested_formats_before_incidental_layout_diversity() {
-    let mut graph = ComputeGraph::new();
-    let projection = graph.host_input("projection", [1, 17, 288]).unwrap();
-    let heads = graph.split_heads(projection, 4).unwrap();
-    graph.flash_attention(heads, heads, heads).unwrap();
-    let config = PipelineConfig::new(4);
-    let demands = OutputDemands::new(graph.operations(), graph.value_shapes(), &config);
-    let mut compatible = Layout::row_major(TensorTiling::sharded(TensorAxis::FromEnd(1), 4));
-    compatible.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
-    let requested = OutputDemand {
-        order: compatible.order,
-        column_groups: 4,
-        inner_grain: 1,
-    };
-    let shape = graph.value_shape(projection).unwrap();
-    assert!(requested.matches(&compatible, shape));
-    let branches = [Layout::row_sharded(1), Layout::amp_left(64, 1), compatible]
-        .into_iter()
-        .zip([1, 2, 10])
-        .map(|(layout, total)| {
-            let mut state = LoweringState::default();
-            let id = state.value(
-                projection,
-                TensorType::new(shape.0.clone(), Precision::F16, layout),
-            );
-            BeamBranch {
-                values: BTreeMap::from([(projection, id)]),
-                state,
-                operations: Vec::new(),
-                peak_memory: MemoryPeaks::default(),
-                analysis: std::sync::OnceLock::from(Some((
-                    crate::estimate::ProgramCycles { total, exchange: 0 },
-                    MemoryPeaks::default(),
-                    true,
-                ))),
-            }
-        })
-        .collect();
-    let (retained, _, _, _) = retain_pareto_beam(
-        branches,
-        &BTreeSet::from([projection]),
-        &RegionPlanningConstraints::default(),
-        &Ipu21CostModel,
-        2,
-        &demands,
-        0,
-    );
-    assert_eq!(retained.len(), 2);
-    assert!(retained.iter().any(|branch| {
-        requested.matches(
-            &branch
-                .state
-                .get(branch.values[&projection])
-                .tensor_type
-                .format
-                .layout,
-            shape,
-        )
-    }));
-    assert_eq!(
-        deferred_aware_branch_score(&retained[0], &BTreeSet::new()),
-        1
-    );
 }
 
 #[test]
@@ -2173,9 +1926,7 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = super::lower_finalists(&graph, &config, &Ipu21CostModel, 1)
-            .unwrap()
-            .remove(0);
+        let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
         assert_eq!(
             mid.values[mid.outputs[0].index() as usize]
                 .tensor_type
@@ -2269,7 +2020,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         let mut graph = ComputeGraph::new();
         let host = graph.host_input("x", [rows, 128]).unwrap();
         graph.gelu(host).unwrap();
-        let mut state = planner::LoweringState::default();
+        let mut state = lowering::LoweringState::default();
         let input = state.value(
             host,
             TensorType::new([rows, 128], Precision::F16, Layout::row_sharded(1)),
@@ -2284,7 +2035,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         let mut operations = Vec::new();
         let mut results = Vec::new();
         for _ in 0..2 {
-            results.push(planner::ensure_format(
+            results.push(lowering::ensure_format(
                 input,
                 target.clone(),
                 OperandMaterialization::Complete,

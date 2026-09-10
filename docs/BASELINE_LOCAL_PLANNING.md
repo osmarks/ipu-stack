@@ -22,3 +22,51 @@ bounded optimization effort. Retire the old future-state beam bookkeeping,
 configuration products, stronger-penalty retries and their obsolete knobs/tests
 when switching the production entry point. Keep candidate-generation and kernel
 correctness tests, adapting selection-specific assertions to the new contract.
+
+## Implementation
+
+The production entry point now builds one baseline and compares at most
+`optimization_steps` complete proposals (default eight). It retains the actual
+built incumbent, including its final allocation and schedule. Rejection never
+starts a fresh global search. A failed baseline is reported as such.
+
+Canonical boundaries use contiguous row blocks targeting one 16 KiB SRAM
+element per owner. This is a logical distribution policy, not a reservation of
+memory elements. Parameter sequences use compact native homes and a shared
+rotation. Casting initially follows redistribution; early casting is a local
+alternative. Operator selection uses existing implementation estimates and the
+conversion inserter to price the surrounding movement.
+
+Proposals include operator alternatives, joint producer/store and consumer
+changes, opening canonical boundaries, cast order, packing distribution and
+independent reduction overlap. Physical tile mapping is also compared within
+the validation budget. Unchanged operator recipes skip catalogue generation;
+implementation, expansion and exchange-schedule caches are shared across trials.
+
+Removed the whole-graph beam, future-state equivalence machinery, region-beam
+cache/attachment adapter, configuration products, finalist admission layers,
+penalty retries, and their CLI/configuration knobs. The remaining `mid/lowering`
+module applies selections and inserts conversions. `--optimization-steps 0`
+requests just the baseline; `--operator-candidate-limit` controls local catalogue
+breadth. Expansion benchmarks and exchange capture inspect the baseline.
+
+## Validation so far
+
+- Codegen: 217 unit tests and one doctest pass; five manual tests ignored.
+- Compact iterated and invariant Repeat bindings expand and place correctly.
+- Rejected/slower local proposals retain the incumbent; validation budgets and
+  immediate baseline failure are covered.
+- Hardware exposed an existing Repeat bug: local copies used absolute weight
+  addresses. They now use the iterated pointer, like kernels and exchanges.
+- Small two-layer FP8 ViT with three accepted proposals: 8.27 seconds package
+  planning, final modelled cost 300276 cycles, hardware maximum absolute error
+  0.105469. See `artifacts/baseline-local-planner/local-small-r2/`.
+- A full-size one-layer baseline packages successfully (experimental 64 KiB
+  boundary blocks, early casting): 131.36 seconds, 76040 bytes of exchange tables
+  per tile, modelled cost 1252930 cycles. Not yet hardware-validated.
+- Full 27-layer baselines still exceed the 80 KiB exchange-table budget. The
+  latest 16 KiB / late-cast baseline reaches 95080 bytes after 93.21 seconds.
+  No fallback search follows. Repeat patch storage is being investigated.
+
+The baseline policy still needs calibration; this replacement does not claim
+that every previously representable graph now has a feasible starting plan.

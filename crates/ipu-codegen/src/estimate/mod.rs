@@ -14,8 +14,7 @@ mod mid;
 mod primitive;
 mod program;
 pub(crate) use mid::{
-    analyze as analyze_mid, operation_cost, region_estimate, region_peak_memory,
-    region_peak_memory_with_multiplicity, unavailable_memory,
+    analyze as analyze_mid, operation_cost, region_peak_memory_with_multiplicity,
 };
 pub(crate) use program::{
     ProgramCycles, program_cycles, program_cycles_analyzed, program_footprint_analyzed,
@@ -45,3 +44,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use program::program_footprint;
+
+#[cfg(test)]
+use mid::region_estimate;
