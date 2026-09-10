@@ -2375,3 +2375,114 @@ fn pending_parameter_vectors_use_balanced_storage_before_consumers_select_layout
         }
     }
 }
+
+#[test]
+fn repeated_normalization_can_keep_parameters_compact() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [1, 8, 32]).unwrap();
+    let mut config = PipelineConfig::new(8).with_automatic_input(x, Precision::F16);
+    let mut sequences = Vec::new();
+    for name in ["scale", "bias"] {
+        let values = (0..27)
+            .map(|i| {
+                let id = graph.parameter(format!("{name}{i}"), [32]).unwrap();
+                config = config.clone().with_automatic_input(id, Precision::F16);
+                id
+            })
+            .collect::<Vec<_>>();
+        sequences.push(graph.value_sequence(name, values).unwrap());
+    }
+    let out = graph
+        .repeat(27, [x], [], sequences, |body, args| {
+            Ok(vec![body.layer_norm(
+                args.carried[0],
+                args.iterated[0],
+                args.iterated[1],
+            )?])
+        })
+        .unwrap()[0];
+    graph.set_outputs([out]).unwrap();
+    config.tile_memory_budget_bytes = 1500;
+    config.standard_memory_reservation_bytes = 0;
+    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let (_, repeat) = mid
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            MidOperationKind::Repeat(r) => Some((op, r)),
+            _ => None,
+        })
+        .unwrap();
+    for sequence in &repeat.iterated_inputs {
+        let first = &mid.values[sequence[0].index() as usize];
+        assert_eq!(first.tensor_type.format.layout.tiling.replicas, 1);
+        for id in sequence {
+            let value = &mid.values[id.index() as usize];
+            assert_eq!(value.tile_offset, first.tile_offset);
+        }
+    }
+    let resolved = implementation::resolve(mid).unwrap();
+    let (_, peak) = crate::estimate::analyze_mid(&resolved, &BTreeMap::new()).unwrap();
+    assert!(peak.fits_ipu21_with_budget(0, 1500), "{peak:?}");
+}
+
+#[test]
+fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [16, 64]).unwrap();
+    let input_format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::amp_left(64, 8),
+    };
+    let weight_format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::block_major_matrix_storage(64, 64, 1, 2, 1, MemoryClass::Ipu21Standard),
+    };
+    let output_format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::amp_left_result(8),
+    };
+    let mut config = PipelineConfig::new(8).with_input(x, input_format.clone());
+    let weights = (0..16)
+        .map(|i| {
+            let id = graph.parameter(format!("w{i}"), [64, 64]).unwrap();
+            config = config.clone().with_automatic_input(id, Precision::F16);
+            id
+        })
+        .collect::<Vec<_>>();
+    let sequence = graph.value_sequence("weights", weights).unwrap();
+    let y = graph
+        .repeat(16, [x], [], [sequence], |body, args| {
+            Ok(vec![body.gemm(args.carried[0], args.iterated[0])?])
+        })
+        .unwrap()[0];
+    graph.set_outputs([y]).unwrap();
+    config.operator_candidates = vec![OperatorCandidate::Concrete(ConcreteOperatorCandidate::new(
+        MidOperator::Gemm {
+            options: crate::GemmOptions::default(),
+            multiply: Precision::F16,
+            accumulate: crate::AccumulationPrecision::F16,
+        },
+        [
+            OperandRequirement::new(input_format, 32).with_access_tail(16),
+            OperandRequirement::new(weight_format, 32),
+        ],
+        OperandRequirement::new(output_format, 32),
+    ))];
+    config.standard_memory_reservation_bytes = 0;
+    config.tile_memory_budget_bytes = 80000;
+    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let repeat = mid
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            MidOperationKind::Repeat(r) => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    let parameter = &mid.values[repeat.iterated_inputs[0][0].index() as usize];
+    assert_eq!(parameter.tensor_type.format.layout.tiling.tile_count, 8);
+    let resolved = implementation::resolve(mid).unwrap();
+    let (_, peak) = crate::estimate::analyze_mid(&resolved, &BTreeMap::new()).unwrap();
+    assert!(peak.fits_ipu21_with_budget(0, 80000), "{peak:?}");
+}

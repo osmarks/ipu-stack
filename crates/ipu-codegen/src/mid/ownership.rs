@@ -1,7 +1,6 @@
 //! Select ownership rotations before expanding the low schedule.
 
 use super::*;
-use crate::storage::{StorageError, TensorStorage, storage_bytes};
 
 impl MidProgram {
     /// Offer independent reduction results on disjoint owner sets when their
@@ -199,59 +198,68 @@ impl MidProgram {
         }
         changed
     }
+}
 
-    pub(super) fn assign_parameter_tiles(&mut self) -> LoweringResult<()> {
-        let parameter_origins = self
-            .inputs
-            .iter()
-            .filter(|input| input.kind == GraphInputKind::Parameter)
-            .map(|input| self.values[input.value.index() as usize].origin)
-            .collect::<BTreeSet<_>>();
-        let parameter_groups = self
-            .values
-            .iter()
-            .filter(|value| parameter_origins.contains(&value.origin))
-            .map(|value| value.storage_group)
-            .collect::<BTreeSet<_>>();
-        let mut loads = vec![0u64; usize::from(self.tile_count)];
-        let mut offsets = BTreeMap::new();
-        for value in &mut self.values {
-            let layout = &value.tensor_type.format.layout;
-            layout.validate_tile_count(self.tile_count)?;
-            if !parameter_groups.contains(&value.storage_group) {
-                continue;
-            }
-            let extents = layout.shard_extents(&value.tensor_type.shape)?;
-            let bytes = extents
-                .iter()
-                .map(|(_, extents)| {
-                    storage_bytes(TensorStorage {
-                        format: &value.tensor_type.format,
-                        extents,
-                    })
-                    .map(u64::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let offset = *offsets
-                .entry(value.storage_group)
-                .or_insert_with(|| balanced_offset(&loads, &bytes));
-            value.tile_offset = offset;
-            for ((owner, _), bytes) in extents.iter().zip(bytes) {
-                let tile = (usize::from(*owner) + usize::from(offset)) % loads.len();
-                loads[tile] = loads[tile]
-                    .checked_add(bytes)
-                    .ok_or(StorageError::Overflow)?;
-            }
+/// Select persistent homes before capacity screening. Sequence members share
+/// one rotation; derived values follow that rotation but are not counted again.
+pub(super) fn assign_parameter_tiles(
+    values: &mut [MidValue],
+    parameters: &[MidValueId],
+    copies: &BTreeMap<MidValueId, u32>,
+    tile_count: u16,
+) -> LoweringResult<bool> {
+    let mut groups = BTreeMap::<MidValueId, Vec<u64>>::new();
+    for &id in parameters {
+        let value = &values[id.index() as usize];
+        let layout = &value.tensor_type.format.layout;
+        layout.validate_tile_count(tile_count)?;
+        let resolved = layout.resolve(&value.tensor_type.shape)?;
+        let bytes = groups
+            .entry(value.storage_group)
+            .or_insert_with(|| vec![0; usize::from(tile_count)]);
+        for owner in 0..layout.tiling.tile_count {
+            bytes[usize::from(owner)] = bytes[usize::from(owner)].saturating_add(
+                resolved.tile_elements(owner)
+                    * value.tensor_type.format.precision.bytes()
+                    * u64::from(copies.get(&id).copied().unwrap_or(1)),
+            );
         }
-        Ok(())
     }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(id, bytes)| {
+        (
+            std::cmp::Reverse(bytes.iter().copied().max().unwrap_or(0)),
+            *id,
+        )
+    });
+    let mut loads = vec![0u64; usize::from(tile_count)];
+    let mut offsets = BTreeMap::new();
+    for (group, bytes) in groups {
+        let offset = balanced_offset(&loads, &bytes);
+        for (owner, bytes) in bytes.into_iter().enumerate() {
+            loads[(owner + usize::from(offset)) % usize::from(tile_count)] += bytes;
+        }
+        offsets.insert(group, offset);
+    }
+    let mut changed = false;
+    for value in values {
+        if let Some(&offset) = offsets.get(&value.storage_group) {
+            changed |= value.tile_offset != offset;
+            value.tile_offset = offset;
+        }
+    }
+    Ok(changed)
 }
 
 fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
+    if bytes.windows(2).all(|pair| pair[0] == pair[1]) && bytes.len() == loads.len() {
+        return 0;
+    }
     let peak = loads.iter().copied().max().unwrap_or(0);
     // Each shard affects a different tile. The old peak covers unchanged tiles,
     // so candidate scoring needs neither a cloned load array nor a full rescan.
     (0..loads.len())
+        .step_by(loads.len().div_ceil(128))
         .min_by_key(|&offset| {
             let peak = bytes
                 .iter()
@@ -407,6 +415,34 @@ mod tests {
         program.operations[3] = boundary;
         assert!(program.with_disjoint_copy_sources(true).is_none());
         assert!(program.with_disjoint_copy_sources(false).is_some());
+    }
+
+    #[test]
+    fn parameter_homes_group_sequences_without_counting_temporary_derivatives() {
+        let mut values = (0..5)
+            .map(|i| MidValue {
+                id: MidValueId(i),
+                origin: ValueId::from_index(i),
+                storage_group: MidValueId(if i == 1 { 0 } else { i }),
+                tile_offset: 0,
+                tensor_type: TensorType::new([64], Precision::F16, Layout::logical_linear(2, 4)),
+            })
+            .collect::<Vec<_>>();
+        values[4].storage_group = MidValueId(2);
+        values[4].tensor_type =
+            TensorType::new([8192], Precision::F16, Layout::logical_linear(8, 4));
+        let parameters = [MidValueId(0), MidValueId(1), MidValueId(2), MidValueId(3)];
+        assign_parameter_tiles(&mut values, &parameters, &BTreeMap::new(), 8).unwrap();
+        assert_eq!(values[0].tile_offset, values[1].tile_offset);
+        assert_eq!(values[2].tile_offset, values[4].tile_offset);
+        assert_ne!(values[0].tile_offset, values[2].tile_offset);
+        let offsets = values.iter().map(|v| v.tile_offset).collect::<Vec<_>>();
+        values[4].tensor_type.shape = TensorShape(vec![16384]);
+        assign_parameter_tiles(&mut values, &parameters, &BTreeMap::new(), 8).unwrap();
+        assert_eq!(
+            offsets,
+            values.iter().map(|v| v.tile_offset).collect::<Vec<_>>()
+        );
     }
 
     #[test]

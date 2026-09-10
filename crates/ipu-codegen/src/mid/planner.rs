@@ -240,7 +240,7 @@ fn plan_in_pool(
                     .collect::<Vec<_>>(),
                 "retained operator-plan details"
             );
-            let mut graph = MidProgram {
+            let graph = MidProgram {
                 tile_count: config.tile_count,
                 inputs: inputs.clone(),
                 values: branch.state.values,
@@ -250,7 +250,6 @@ fn plan_in_pool(
                 estimated_exchange_cycles,
                 peak_memory,
             };
-            graph.assign_parameter_tiles()?;
             Ok(graph)
         })
         .collect()
@@ -298,7 +297,9 @@ impl LoweringState {
     ) -> MidValueId {
         let origin = self.get(source).origin;
         let storage_group = self.get(source).storage_group;
+        let offset = self.get(source).tile_offset;
         let result = self.value_in_storage_group(origin, tensor_type, storage_group);
+        self.values[result.index() as usize].tile_offset = offset;
         if self.parameter_values.contains(&source) {
             self.parameter_values.insert(result);
         }
@@ -327,6 +328,7 @@ pub(super) struct BeamBranch {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct FutureValueState {
+    pub(super) tile_offset: u16,
     pub(super) origin: ValueId,
     pub(super) tensor_type: TensorType,
     pub(super) automatic_input: bool,
@@ -337,6 +339,7 @@ pub(super) struct FutureValueState {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct FutureDeferredState {
+    pub(super) source_tile_offset: u16,
     pub(super) origin: ValueId,
     pub(super) source_type: TensorType,
     pub(super) source_automatic_input: bool,
@@ -663,12 +666,50 @@ pub(super) fn lower_operation_candidates(
                                 })
                                 .collect();
                         }
+                        let compact_inputs = input_ids
+                            .iter()
+                            .zip(&plan.requirements.inputs)
+                            .filter_map(|(&id, requirement)| {
+                                let value = branch.state.get(id);
+                                (branch.state.automatic_inputs.contains(&id)
+                                    && branch.state.parameter_values.contains(&id)
+                                    && constraints
+                                        .allocation_copies
+                                        .get(&value.origin)
+                                        .copied()
+                                        .unwrap_or(1)
+                                        > 1
+                                    && crate::estimate::maximum_shard_bytes(&TensorType {
+                                        shape: value.tensor_type.shape.clone(),
+                                        format: requirement.format.clone(),
+                                    }) > crate::estimate::maximum_shard_bytes(
+                                        &value.tensor_type,
+                                    ))
+                                .then_some(id)
+                            })
+                            .collect::<Vec<_>>();
+                        let orders = orders
+                            .into_iter()
+                            .flat_map(|order| {
+                                let mut variants = vec![(order.clone(), false)];
+                                if !compact_inputs.is_empty() {
+                                    variants.push((order, true));
+                                }
+                                variants
+                            })
+                            .collect::<Vec<_>>();
                         let branch = &branch;
                         let output_shape = &output_shape;
                         let value_uses = &value_uses;
-                        orders.into_iter().map(move |cast_orders| {
+                        orders.into_iter().map(move |(cast_orders, compact)| {
                             let mut next = branch.clone();
                             next.analysis.take();
+                            if compact {
+                                for id in &compact_inputs {
+                                    next.state.automatic_inputs.remove(id);
+                                }
+                            }
+                            let previous_values = next.state.values.len();
                             apply_selected_plan(
                                 operation,
                                 (*output_shape).clone(),
@@ -684,6 +725,18 @@ pub(super) fn lower_operation_candidates(
                                 &mut next.state,
                                 &mut next.operations,
                             );
+                            if compact {
+                                let origins = compact_inputs
+                                    .iter()
+                                    .map(|id| next.state.get(*id).origin)
+                                    .collect::<BTreeSet<_>>();
+                                for value in &mut next.state.values[previous_values..] {
+                                    if origins.contains(&value.origin) {
+                                        value.storage_group = value.id;
+                                        value.tile_offset = 0;
+                                    }
+                                }
+                            }
                             let boundary = next.operations.last().unwrap();
                             let tensors = boundary
                                 .inputs
@@ -745,6 +798,50 @@ pub(super) fn lower_operation_candidates(
                     graph,
                     &constraints.allocation_copies,
                 );
+                let mut peak = peak;
+                {
+                    let mut rotated = branch.clone();
+                    let parameters = initial
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            rotated.state.parameter_values.contains(id)
+                                && !rotated.state.automatic_inputs.contains(id)
+                        })
+                        .collect::<Vec<_>>();
+                    let copies =
+                        beam_allocation_copies(&rotated, &initial, &constraints.allocation_copies);
+                    if super::ownership::assign_parameter_tiles(
+                        &mut rotated.state.values,
+                        &parameters,
+                        &copies,
+                        config.tile_count,
+                    )
+                    .unwrap_or(false)
+                    {
+                        rotated.analysis.take();
+                        let candidate = beam_memory_peak(
+                            config,
+                            costs,
+                            &rotated,
+                            &initial,
+                            source,
+                            operation_index,
+                            required_outputs,
+                            graph,
+                            &constraints.allocation_copies,
+                        );
+                        if candidate.fits_ipu21_with_budget(
+                            config.standard_memory_reservation_bytes,
+                            config.tile_memory_budget_bytes,
+                        ) || (candidate.total, candidate.interleaved)
+                            < (peak.total, peak.interleaved)
+                        {
+                            branch = rotated;
+                            peak = candidate;
+                        }
+                    }
+                }
                 branch.peak_memory = peak;
                 (branch, peak)
             })
@@ -771,7 +868,8 @@ pub(super) fn lower_operation_candidates(
                 if config.memory_profile_directory.is_some() {
                     let live =
                         beam_live_values(&branch, source, operation_index, required_outputs, graph);
-                    let copies = beam_allocation_copies(&branch, &constraints.allocation_copies);
+                    let copies =
+                        beam_allocation_copies(&branch, &initial, &constraints.allocation_copies);
                     crate::estimate::memory_profile::write(
                         &format!("rejected-op{}", operation.id.index()),
                         graph,
@@ -1117,6 +1215,7 @@ pub(super) fn future_beam_state(
             }
         }
         values.push(FutureValueState {
+            tile_offset: branch.state.get(id).tile_offset,
             origin,
             tensor_type: branch.state.get(id).tensor_type.clone(),
             automatic_input: branch.state.automatic_inputs.contains(&id),
@@ -1149,6 +1248,7 @@ pub(super) fn future_beam_state(
     let deferred = deferred_sources
         .into_iter()
         .map(|(origin, result, source, offer)| FutureDeferredState {
+            source_tile_offset: branch.state.get(source).tile_offset,
             origin,
             source_type: branch.state.get(source).tensor_type.clone(),
             source_automatic_input: branch.state.automatic_inputs.contains(&source),
@@ -1528,12 +1628,12 @@ fn beam_live_values(
 
 fn beam_allocation_copies(
     branch: &BeamBranch,
+    initial: &[MidValueId],
     allocation_multiplicity: &BTreeMap<ValueId, u32>,
 ) -> BTreeMap<MidValueId, u32> {
-    branch
-        .state
-        .values
+    initial
         .iter()
+        .map(|id| branch.state.get(*id))
         .filter_map(|value| {
             allocation_multiplicity
                 .get(&value.origin)
@@ -1554,7 +1654,7 @@ pub(super) fn beam_memory_peak(
     allocation_multiplicity: &BTreeMap<ValueId, u32>,
 ) -> MemoryPeaks {
     let live = beam_live_values(branch, source, operation_index, required_outputs, graph);
-    let multiplicity = beam_allocation_copies(branch, allocation_multiplicity);
+    let multiplicity = beam_allocation_copies(branch, initial, allocation_multiplicity);
     branch
         .analysis
         .get_or_init(|| {
@@ -1709,6 +1809,19 @@ fn lower_repeat_candidates(
         let mut next = prepared.clone();
         let state = &mut next.state;
         let (arguments, body_values, mut body_operations) = candidate.attach(&bindings, state);
+        // Body-selected parameter homes also apply to the enclosing sequence.
+        // Repeat aliases its argument to each member; it does not redistribute
+        // an argument implicitly at the region boundary.
+        for &argument in &arguments {
+            if state.parameter_values.contains(&argument) {
+                let home = state.get(argument).clone();
+                for value in &mut state.values {
+                    if value.storage_group == home.storage_group {
+                        value.tile_offset = home.tile_offset;
+                    }
+                }
+            }
+        }
         let operations = &mut next.operations;
         let values = &mut next.values;
         for index in 0..inputs.len() {
