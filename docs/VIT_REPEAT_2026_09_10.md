@@ -272,3 +272,61 @@ The full-size searches that reached Repeat each performed 32 body searches and
 224 cache hits across four configurations. The small control had 64 searches
 and 192 hits, reflecting more distinct boundary layouts. No runtime/compiler
 source changes were made for this sweep.
+
+## Balanced provisional parameters and memory diagnostics
+
+Commit `49fdeba` replaces provisional row sharding of automatic parameters with
+balanced logical-linear storage. Small vectors use only as many tiles as they
+have eight-byte chunks; odd lengths use a smaller grain. Explicit parameter
+formats and automatic host-input layouts retain their previous behavior.
+Consumers can still choose the eventual parameter layout. A pending width-1152
+FP16 vector now contributes 8 bytes to the maximum-shard estimate instead of
+2304 bytes. This fixes the premature operation-zero rejection; it does not
+change selected consumer layouts or guarantee that a complete 27-layer model
+fits.
+
+The new [memory profiler](MEMORY_PROFILING.md) was enabled for fresh batch-1
+FP8, fused-QKV builds at 2, 4, 8 and 27 distinct layers. Artifacts are in
+`artifacts/vit-memory-profile-20260910/layers-N/`. The earlier invalid-linear-
+layout trial is preserved separately in `invalid-linear-layout/`; it is not a
+result of the corrected implementation.
+
+At four layers, outer Repeat composition still rejects operation 24. The
+lowest-total rejected report peaks during QKV compute (source 4): 607888 bytes
+including the 49152-byte support reserve, against 586960 bytes available.
+Its separate interleaved peak is 437248 bytes, above the 424880-byte limit.
+The four weight groups contribute 110592, 110592, 81920 and 73728 bytes;
+QKV intermediates and the preceding normalized activation add further storage.
+Report: `layers-4/memory/rejected-op24-780465-0000.html`.
+
+At eight layers, MLP up-projection selection (source 18) still exhausts the
+search. A representative rejected report's actual peak is the earlier QKV
+input conversion: effective total 624760 bytes. Attention-output and MLP-up
+weights each contribute 147456 bytes, QKV weights 131072 bytes, and the
+normalized-activation group 47616 bytes. Thus the rejection label alone was
+misleading about where storage peaks.
+Report: `layers-8/memory/rejected-op18-780439-0004.html`.
+
+At 27 layers, search now reaches QKV/bias selection (sources 4 and 5). One
+QKV candidate peaks at the preceding layernorm: effective total 607368 bytes.
+Its QKV weights contribute 221184 bytes (27 x 8192); provisional MLP weights
+contribute 91152 bytes each. Selected, replicated first-layernorm scale and
+bias each contribute 62208 bytes (27 x 2304). Other pending vector sequences
+contribute only 216 bytes each (27 x 8), demonstrating the provisional fix.
+Another configuration reaches source 5 and peaks at 614568 effective bytes.
+These are estimator rejections, not a proof that physical placement of every
+possible layout is infeasible.
+Reports: `layers-27/memory/rejected-op4-780461-0012.html` and
+`layers-27/memory/rejected-op5-780461-0004.html`.
+
+The two-layer build passes hardware/reference validation with maximum absolute
+error **0.087280**. Cropped runtime is **1042884 cycles (0.695256 ms)** versus
+1040742 previously, a 0.21% increase. The repeat-remainder spans 423522 cycles
+versus 422622 previously. End-to-end build/run took 444 seconds with eight Rayon
+threads; the other three planning trials initially ran concurrently. Execution
+profile: `layers-2/profile.html`; planner-finalist memory reports are in
+`layers-2/memory/`.
+
+Validation: 215 codegen tests passed, 5 ignored; Clippy passed for codegen and
+the benchmark crate. Chromium checks covered initial rendering, filtering and
+restoring allocations, peak selection, scaled timeline clicks, and ungrouping.
