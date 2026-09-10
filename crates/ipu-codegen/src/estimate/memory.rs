@@ -2,7 +2,7 @@
 
 use super::*;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct MemoryUsage {
     pub standard: u64,
     pub interleaved: u64,
@@ -32,7 +32,7 @@ impl MemoryUsage {
 /// Independent class maxima and maximum simultaneous live storage. Region 1
 /// is shared by both classes; separate peaks need not coexist. These are cheap
 /// capacity screens, not a guarantee that aligned concrete placement succeeds.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MemoryPeaks {
     pub standard: u64,
     pub interleaved: u64,

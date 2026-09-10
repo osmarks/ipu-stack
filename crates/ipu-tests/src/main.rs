@@ -97,6 +97,9 @@ struct Arguments {
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
+    /// Write JSON/HTML memory-estimator profiles for finalists and memory rejections.
+    #[arg(long, conflicts_with = "reuse_package")]
+    memory_profile_directory: Option<PathBuf>,
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
@@ -1036,6 +1039,7 @@ fn main() -> Result<()> {
             );
         }
     }
+    pipeline.memory_profile_directory = arguments.memory_profile_directory.clone();
     let package_config = PackageConfig {
         tile_mapping: arguments
             .tile_mapping

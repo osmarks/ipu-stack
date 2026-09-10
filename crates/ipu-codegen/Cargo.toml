@@ -13,6 +13,7 @@ ipu-package = { path = "../ipu-package" }
 rayon.workspace = true
 radsort.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

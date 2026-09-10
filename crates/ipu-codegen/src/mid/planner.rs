@@ -47,6 +47,16 @@ pub(crate) fn plan_finalists(
     })
 }
 
+fn provisional_parameter_layout(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
+    let elements = shape.elements();
+    let mut grain = (8 / precision.bytes()) as u32;
+    while !elements.is_multiple_of(u64::from(grain)) {
+        grain /= 2;
+    }
+    let active = (elements / u64::from(grain)).min(u64::from(tiles)) as u16;
+    Layout::logical_linear(active, grain)
+}
+
 fn plan_in_pool(
     graph: &ComputeGraph,
     config: &PipelineConfig,
@@ -87,7 +97,15 @@ fn plan_in_pool(
             (
                 TensorFormat {
                     precision,
-                    layout: Layout::row_sharded(config.tile_count),
+                    // Unselected parameters must not all concentrate their
+                    // single-row vectors on tile zero. Their first consumer can
+                    // still choose another layout; host activations keep their
+                    // row boundary (including carried Repeat state).
+                    layout: if input.kind == GraphInputKind::Parameter {
+                        provisional_parameter_layout(&input.shape, precision, config.tile_count)
+                    } else {
+                        Layout::row_sharded(config.tile_count)
+                    },
                 },
                 true,
             )
@@ -142,6 +160,10 @@ fn plan_in_pool(
                 .iter()
                 .map(|value| lookup(&branch.values, *value))
                 .collect::<LoweringResult<Vec<_>>>()?;
+            crate::estimate::memory_profile::write(
+                &format!("finalist-{finalist}"), graph, config, &initial,
+                &branch.operations, &outputs, &branch.state.values, &BTreeMap::new(),
+            )?;
             let (estimated_cycles, estimated_exchange_cycles, peak_memory) =
                 if let Some(Some((program, peak, true))) = branch.analysis.get() {
                     (program.total, program.exchange, *peak)
@@ -518,7 +540,7 @@ pub(super) fn lower_operation_candidates(
         // operator already has a compact implementation and execution price.
         let screening_width = config.planning_beam_width.max(1).saturating_mul(2);
         let mut expanded = Vec::new();
-        let mut rejected_memory = Vec::new();
+        let mut rejected_memory: Option<(MemoryPeaks, BeamBranch)> = None;
         let mut saw_candidate = false;
         let mut region_failure = None;
         let mut candidates = CandidateSearch::new(
@@ -733,15 +755,31 @@ pub(super) fn lower_operation_candidates(
             {
                 expanded.push(branch);
             } else {
-                rejected_memory.push(peak);
+                if rejected_memory.as_ref().is_none_or(|(best, _)| {
+                    (peak.total, peak.interleaved, peak.standard)
+                        < (best.total, best.interleaved, best.standard)
+                }) {
+                    rejected_memory = Some((peak, branch));
+                }
             }
         }
         if expanded.is_empty() {
-            if saw_candidate
-                && let Some(peak) = rejected_memory
-                    .into_iter()
-                    .min_by_key(|peak| (peak.total, peak.interleaved, peak.standard))
-            {
+            if saw_candidate && let Some((peak, branch)) = rejected_memory {
+                if config.memory_profile_directory.is_some() {
+                    let live =
+                        beam_live_values(&branch, source, operation_index, required_outputs, graph);
+                    let copies = beam_allocation_copies(&branch, &constraints.allocation_copies);
+                    crate::estimate::memory_profile::write(
+                        &format!("rejected-op{}", operation.id.index()),
+                        graph,
+                        config,
+                        &initial,
+                        &branch.operations,
+                        &live,
+                        &branch.state.values,
+                        &copies,
+                    )?;
+                }
                 return Err(LoweringError::InsufficientMemory {
                     operation: operation.id,
                     standard: peak.standard,
@@ -1466,6 +1504,40 @@ fn refresh_exchange_rows(branch: &mut BeamBranch, costs: &impl CostModel) {
     branch.peak_memory.exchange_rows = rows;
 }
 
+fn beam_live_values(
+    branch: &BeamBranch,
+    source: &[Operation],
+    operation_index: usize,
+    required_outputs: &[ValueId],
+    graph: &ComputeGraph,
+) -> Vec<MidValueId> {
+    let live_origins = source[operation_index + 1..]
+        .iter()
+        .flat_map(|operation| operation_graph_inputs(operation, graph))
+        .chain(required_outputs.iter().copied())
+        .collect::<BTreeSet<_>>();
+    live_origins
+        .iter()
+        .filter_map(|origin| branch.values.get(origin).copied())
+        .collect::<Vec<_>>()
+}
+
+fn beam_allocation_copies(
+    branch: &BeamBranch,
+    allocation_multiplicity: &BTreeMap<ValueId, u32>,
+) -> BTreeMap<MidValueId, u32> {
+    branch
+        .state
+        .values
+        .iter()
+        .filter_map(|value| {
+            allocation_multiplicity
+                .get(&value.origin)
+                .map(|copies| (value.id, *copies))
+        })
+        .collect::<BTreeMap<_, _>>()
+}
+
 pub(super) fn beam_memory_peak(
     costs: &impl CostModel,
     branch: &BeamBranch,
@@ -1476,25 +1548,8 @@ pub(super) fn beam_memory_peak(
     graph: &ComputeGraph,
     allocation_multiplicity: &BTreeMap<ValueId, u32>,
 ) -> MemoryPeaks {
-    let live_origins = source[operation_index + 1..]
-        .iter()
-        .flat_map(|operation| operation_graph_inputs(operation, graph))
-        .chain(required_outputs.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let live = live_origins
-        .iter()
-        .filter_map(|origin| branch.values.get(origin).copied())
-        .collect::<Vec<_>>();
-    let multiplicity = branch
-        .state
-        .values
-        .iter()
-        .filter_map(|value| {
-            allocation_multiplicity
-                .get(&value.origin)
-                .map(|copies| (value.id, *copies))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let live = beam_live_values(branch, source, operation_index, required_outputs, graph);
+    let multiplicity = beam_allocation_copies(branch, allocation_multiplicity);
     branch
         .analysis
         .get_or_init(|| {
@@ -2097,4 +2152,25 @@ fn cast_orders_expand_to_different_traffic_and_future_reuse_states() {
         crate::KernelBuildPlan::from_program(&low).unwrap();
     }
     assert_ne!(signatures[0], signatures[1]);
+}
+
+#[cfg(test)]
+#[test]
+fn provisional_parameter_layout_handles_small_and_unaligned_values() {
+    for precision in [
+        Precision::F8F143 { scale_exponent: -4 },
+        Precision::F16,
+        Precision::F32,
+    ] {
+        for elements in [1, 3, 8, 1152, 4304] {
+            let shape = TensorShape(vec![1, 1, elements]);
+            let layout = provisional_parameter_layout(&shape, precision, 1472);
+            let resolved = layout.resolve(&shape).unwrap();
+            assert_eq!(resolved.physical_elements(), u64::from(elements));
+            assert!(
+                resolved.maximum_tile_elements() * precision.bytes()
+                    <= (u64::from(elements) * precision.bytes()).div_ceil(1472) + 7
+            );
+        }
+    }
 }

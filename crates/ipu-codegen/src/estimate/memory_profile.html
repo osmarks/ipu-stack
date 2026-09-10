@@ -1,0 +1,47 @@
+<!doctype html><meta charset="utf-8"><title>Planner memory profile</title>
+<style>
+body{font:15px system-ui;margin:24px;color:#202630;background:#f6f8fa}h1{font-size:24px}p{max-width:1100px}svg{width:100%;height:250px;background:white;border:1px solid #ccc;cursor:crosshair}select,input,button{font:inherit;padding:5px;margin:4px}table{border-collapse:collapse;width:100%;background:white}th,td{text-align:left;padding:7px;border-bottom:1px solid #ddd;vertical-align:top}th{position:sticky;top:0;background:#e9eef3}td.num{text-align:right;white-space:nowrap}.muted{color:#5b6470}#operation{overflow-wrap:anywhere}details{max-width:700px}summary{cursor:pointer}.bar{height:4px;background:#4267ac;margin-top:4px}
+</style>
+<h1>Planner memory profile</h1><p id="context"></p><p id="model" class="muted"></p><p id="peaks"></p>
+<p><span style="color:#111">Black: total + support reserve</span> · <span style="color:#2464ac">Blue: standard + support</span> · <span style="color:#24844b">Green: interleaved</span> · Red: total budget. Click the timeline to inspect a step.</p>
+<svg id="chart" viewBox="0 0 1000 250" role="img" aria-label="Estimated live memory by primitive step"></svg>
+<p><button id="totalPeak">Total peak</button><button id="standardPeak">Standard peak</button><button id="interleavedPeak">Interleaved peak</button><select id="step" aria-label="Primitive step"></select></p>
+<p id="operation"></p><p id="usage"></p>
+<p><input id="filter" placeholder="Filter allocations" aria-label="Filter allocations"><label><input type="checkbox" id="group" checked>Group parameter sequences and semantic values</label></p>
+<table><thead><tr><th>Allocation / group</th><th>Class</th><th>Resident copies</th><th>Shard × copies</th><th>Alignment/tail × copies</th><th>Total bytes</th></tr></thead><tbody id="allocations"></tbody></table>
+<script type="application/json" id="data">__PROFILE_JSON__</script>
+<script>
+'use strict';
+const p=JSON.parse(document.getElementById('data').textContent), steps=p.timeline.steps, roots=new Map();
+const number=x=>x.toLocaleString('en-US'), kib=x=>(x/1024).toFixed(1)+' KiB';
+for(const v of p.timeline.values){const old=roots.get(v.root);if(!old)roots.set(v.root,{...v,aliases:[v.id]});else{const aliases=[...old.aliases,v.id];roots.set(v.root,{...(v.bytes>old.bytes?v:old),aliases});}}
+document.getElementById('context').textContent=p.scope+' · '+p.tile_count+' tiles · '+p.gemm_output_packing+' / '+p.attention_products;
+document.getElementById('model').textContent=p.model+(p.timeline.values.some(v=>v.layout_error)?' WARNING: invalid layouts are present; saturated byte counts indicate unavailable estimates, not real allocations.':'');
+document.getElementById('peaks').textContent='Effective total peak: '+kib(p.effective_peak_bytes)+' / '+kib(p.budget_bytes)+' budget. Support reserve: '+kib(p.support_reserve_bytes)+'. Separate estimated exchange rows: '+kib(p.peak.exchange_rows)+' (replaced by the support reserve in the capacity check). Interleaved limit: '+kib(p.interleaved_budget_bytes)+'. Contiguous-standard overflow: '+number(p.standard_contiguous_overflow_bytes)+' bytes. Budget check: '+(p.fits_budget?'PASS':'FAIL')+'.';
+const select=document.getElementById('step');
+for(const s of steps){const option=document.createElement('option');option.value=s.index;option.textContent=s.index+': source '+(s.source??'none')+' · '+s.operation.slice(0,110);select.append(option);}
+const chart=document.getElementById('chart'), ns='http://www.w3.org/2000/svg';
+const max=Math.max(p.budget_bytes,...steps.map(s=>s.usage.standard+s.usage.interleaved+p.support_reserve_bytes))*1.08;
+const x=i=>50+i*930/Math.max(1,steps.length-1), y=v=>225-v*205/max;
+function svg(tag,attributes){const e=document.createElementNS(ns,tag);for(const [k,v]of Object.entries(attributes))e.setAttribute(k,v);chart.append(e);return e;}
+svg('line',{x1:50,x2:980,y1:y(p.budget_bytes),y2:y(p.budget_bytes),stroke:'#b33','stroke-dasharray':'5 4'});
+for(const [color,fn]of [['#2464ac',s=>s.usage.standard+p.support_reserve_bytes],['#24844b',s=>s.usage.interleaved],['#111',s=>s.usage.standard+s.usage.interleaved+p.support_reserve_bytes]])svg('polyline',{points:steps.map((s,i)=>x(i)+','+y(fn(s))).join(' '),fill:'none',stroke:color,'stroke-width':2});
+for(let i=0;i<=4;i++){const v=max*i/4;svg('text',{x:0,y:y(v),'font-size':11}).textContent=Math.round(v/1024)+'K';}
+const marker=svg('line',{x1:50,x2:50,y1:15,y2:230,stroke:'#aaa'});
+chart.onclick=e=>{const box=chart.getBoundingClientRect();select.value=Math.max(0,Math.min(steps.length-1,Math.round(((e.clientX-box.left)/box.width*1000-50)/930*(steps.length-1))));render();};
+for(const [id,key]of [['totalPeak','total_peak_step'],['standardPeak','standard_peak_step'],['interleavedPeak','interleaved_peak_step']])document.getElementById(id).onclick=()=>{select.value=p[key]??0;render();};
+function render(){const s=steps[Number(select.value)];if(!s)return;marker.setAttribute('x1',x(s.index));marker.setAttribute('x2',x(s.index));
+ document.getElementById('operation').textContent='Step '+s.index+' · source operation '+s.source+' · executed '+s.execution_count+' times: '+s.operation;
+ document.getElementById('usage').textContent='Live tensors + scratch: '+kib(s.usage.standard)+' standard, '+kib(s.usage.interleaved)+' interleaved. Reduction/conversion scratch: '+kib(s.scratch.standard)+' standard, '+kib(s.scratch.interleaved)+' interleaved. Support reserve and exchange rows are not allocation rows below.';
+ const grouped=document.getElementById('group').checked, query=document.getElementById('filter').value.toLowerCase(), groups=new Map();
+ for(const id of s.live){const v=roots.get(id);if(!v||!v.bytes)continue;const key=grouped?v.group+' / '+v.class:'allocation '+id;
+ if(!groups.has(key))groups.set(key,{name:grouped?v.group:'allocation '+id+': '+v.name,class:v.class,copies:0,shard:0,padding:0,bytes:0,values:[]});
+ const g=groups.get(key);g.copies+=v.copies;g.shard+=v.shard_bytes*v.copies;g.padding+=(v.aligned_bytes-v.shard_bytes)*v.copies;g.bytes+=v.bytes;g.values.push(v);}
+ const table=document.getElementById('allocations');table.replaceChildren();
+ for(const g of [...groups.values()].sort((a,b)=>b.bytes-a.bytes)){if(query&&!JSON.stringify(g).toLowerCase().includes(query))continue;
+ const tr=document.createElement('tr'), label=document.createElement('td'), details=document.createElement('details'), summary=document.createElement('summary');summary.textContent=g.name;details.append(summary);
+ const explanation=document.createElement('div');explanation.className='muted';explanation.textContent=g.values.map(v=>'root '+v.root+'; aliases '+v.aliases.join(',')+'; origin '+v.origin+'; '+v.precision+' ['+v.shape.join(',')+']; '+v.layout).join('\n');details.append(explanation);label.append(details);tr.append(label);
+ for(const value of [g.class,g.copies,g.shard,g.padding,g.bytes]){const td=document.createElement('td');td.textContent=typeof value==='number'?number(value):value;if(typeof value==='number')td.className='num';tr.append(td);}table.append(tr);}
+}
+select.value=p.total_peak_step??0;select.onchange=render;document.getElementById('filter').oninput=render;document.getElementById('group').onchange=render;render();
+</script>

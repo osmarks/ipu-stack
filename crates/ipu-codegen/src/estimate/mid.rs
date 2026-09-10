@@ -8,6 +8,40 @@ pub(crate) fn analyze(
     program: &MidProgram,
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
+    analyze_observed(program, copies, &mut ())
+}
+
+/// The normal estimator uses the zero-cost observer. Diagnostics record the
+/// same allocation and liveness decisions, without a second accounting model.
+pub(super) trait MemoryObserver {
+    fn value(
+        &mut self,
+        _value: &MidValue,
+        _root: usize,
+        _shard_bytes: u64,
+        _aligned_bytes: u64,
+        _copies: u32,
+        _bytes: u64,
+    ) {
+    }
+    fn step(
+        &mut self,
+        _index: usize,
+        _operation: &MidOperation,
+        _count: u64,
+        _live: &[bool],
+        _scratch: MemoryUsage,
+        _usage: MemoryUsage,
+    ) {
+    }
+}
+impl MemoryObserver for () {}
+
+pub(super) fn analyze_observed(
+    program: &MidProgram,
+    copies: &BTreeMap<MidValueId, u32>,
+    observer: &mut impl MemoryObserver,
+) -> Option<(ProgramCycles, MemoryPeaks)> {
     let mut steps = Vec::new();
     fn flatten<'a>(
         operations: &'a [MidOperation],
@@ -86,7 +120,8 @@ pub(crate) fn analyze(
     for value in &program.values {
         let id = roots[value.id.index() as usize];
         let class = value.tensor_type.format.layout.memory_class;
-        let mut size = maximum_shard_bytes(&value.tensor_type).checked_add(tail[id])?;
+        let shard_bytes = maximum_shard_bytes(&value.tensor_type);
+        let mut size = shard_bytes.checked_add(tail[id])?;
         if element[id] {
             let alignment = u64::from(if class == MemoryClass::Ipu21Interleaved {
                 ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
@@ -95,7 +130,10 @@ pub(crate) fn analyze(
             });
             size = size.div_ceil(alignment).checked_mul(alignment)?;
         }
-        size = size.checked_mul(u64::from(copies.get(&value.id).copied().unwrap_or(1)))?;
+        let aligned_bytes = size;
+        let count = copies.get(&value.id).copied().unwrap_or(1);
+        size = size.checked_mul(u64::from(count))?;
+        observer.value(value, id, shard_bytes, aligned_bytes, count, size);
         bytes[id] = bytes[id].max(size);
         classes[id] = class;
     }
@@ -142,6 +180,7 @@ pub(crate) fn analyze(
                 }
             }
         }
+        observer.step(index, operation, count, &live, scratch, usage);
         peak.observe(usage, maximum_standard.max(scratch.standard));
         for id in 0..live.len() {
             if last[id] <= index {
@@ -403,6 +442,16 @@ pub(crate) fn region_estimate(
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
+    let program = resolved_region(initial, operations, outputs, values)?;
+    analyze(&program, allocation_multiplicity)
+}
+
+pub(super) fn resolved_region(
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+) -> Option<MidProgram> {
     let mut outputs = outputs.to_vec();
     // A pending view still needs its source storage at the region boundary.
     for operation in operations.iter().rev() {
@@ -437,6 +486,5 @@ pub(crate) fn region_estimate(
         ..crate::MidProgram::default()
     };
 
-    let program = crate::mid::implementation::resolve(candidate)?;
-    analyze(&program, allocation_multiplicity)
+    crate::mid::implementation::resolve(candidate)
 }

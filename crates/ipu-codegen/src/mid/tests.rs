@@ -2339,3 +2339,39 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
     };
     assert!(narrow.fp8_producer_layout(&target).is_some());
 }
+
+#[test]
+fn pending_parameter_vectors_use_balanced_storage_before_consumers_select_layouts() {
+    for precision in [
+        Precision::F16,
+        Precision::F32,
+        Precision::F8F143 { scale_exponent: -4 },
+    ] {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("x", [1, 4, 1152]).unwrap();
+        let parameters = (0..27)
+            .map(|i| graph.parameter(format!("p{i}"), [1, 1, 1152]).unwrap())
+            .collect::<Vec<_>>();
+        let output = graph.gelu(input).unwrap();
+        // Keep all pending vectors resident across the operation without forcing
+        // a consumer layout. Row sharding would put all 27 vectors on tile zero.
+        graph
+            .set_outputs(parameters.iter().copied().chain([output]))
+            .unwrap();
+        let mut config = PipelineConfig::new(8).with_automatic_input(input, Precision::F16);
+        config.standard_memory_reservation_bytes = 0;
+        config.tile_memory_budget_bytes = 32768;
+        for &parameter in &parameters {
+            config = config.with_automatic_input(parameter, precision);
+        }
+        let program = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        for &id in &program.outputs[..parameters.len()] {
+            let tensor = &program.values[id.index() as usize].tensor_type;
+            assert_eq!(
+                tensor.format.layout,
+                Layout::logical_linear(8, (8 / precision.bytes()) as u32)
+            );
+            assert!(crate::estimate::maximum_shard_bytes(tensor) <= 1152 * precision.bytes() / 8);
+        }
+    }
+}

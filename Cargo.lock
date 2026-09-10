@@ -348,6 +348,7 @@ dependencies = [
  "radsort",
  "rayon",
  "serde",
+ "serde_json",
  "thiserror",
  "tracing",
 ]

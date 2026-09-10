@@ -9,6 +9,7 @@ mod exchange_storage;
 use exchange_storage::ExchangeStoragePhase;
 pub use exchange_storage::{ExchangeStorageEstimator, estimate_exchange_phase_storage};
 mod memory;
+pub(crate) mod memory_profile;
 mod mid;
 mod primitive;
 mod program;

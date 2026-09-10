@@ -213,6 +213,9 @@ pub struct PipelineConfig {
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
+    /// Optional JSON/HTML estimator profiles for finalists and exhausted memory
+    /// shortlists. These explain planner decisions, not concrete placement.
+    pub memory_profile_directory: Option<std::path::PathBuf>,
     /// Maximum SRAM per tile available to planned values and the standard
     /// reservation. Lower values emulate a model whose other persistent state
     /// occupies the remainder of SRAM.
@@ -268,6 +271,7 @@ impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
         Self {
             tile_count,
+            memory_profile_directory: None,
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
@@ -495,6 +499,8 @@ pub enum LoweringError {
     InvalidImplementation,
     #[error("cannot create planning worker pool: {0}")]
     PlanningThreads(String),
+    #[error("cannot write planner memory profile: {0}")]
+    MemoryProfile(String),
     #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error(transparent)]
