@@ -356,9 +356,7 @@ fn build_package_artifacts(
                     }
                     Ok(objects)
                 })?;
-                let built =
-                    build_package_from_objects(selected, &planning, &objects, &kernel_plan)?;
-                Ok(built)
+                build_package_from_objects(selected, &planning, &objects, &kernel_plan)
             },
         )
     })?;
@@ -370,7 +368,7 @@ fn build_package_from_objects(
     config: &PipelineConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
-) -> PackageBuildResult<BuiltApplication> {
+) -> PackageBuildResult<(u64, BuiltApplication)> {
     let program = &selected.program;
     let provisional_placement = &selected.placement;
     let provisional_exchanges = &selected.phases;
@@ -861,13 +859,16 @@ fn build_package_from_objects(
     });
     application.host_exchange = host.protocol;
     application.validate()?;
-    Ok(BuiltApplication {
-        application,
-        placement,
-        exchange_phases: exchanges,
-        exchange_schedule,
-        exchange_code_base,
-    })
+    Ok((
+        final_cost.total,
+        BuiltApplication {
+            application,
+            placement,
+            exchange_phases: exchanges,
+            exchange_schedule,
+            exchange_code_base,
+        },
+    ))
 }
 
 /// Sizing-only patches account for exchange rows which become structurally

@@ -30,7 +30,7 @@ pub(super) fn select_graph_finalist<T>(
     graph: &ComputeGraph,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
-    mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
+    mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<(u64, T)>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, planning.tile_count);
     let mut search = planning.clone();
@@ -68,7 +68,7 @@ pub(super) fn select_scheduled_finalist<T>(
     finalists: Vec<crate::MidProgram>,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,
-    mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<T>,
+    mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<(u64, T)>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let topology = active_topology(planning.tile_count)?;
     let expansion_cache = Arc::new(crate::low::expand::ExpansionCache::default());
@@ -214,15 +214,12 @@ pub(super) fn select_scheduled_finalist<T>(
                         refined_cycles = refined.total,
                         "scheduled operator-plan finalist"
                     );
-                    Ok((
-                        (refined.total, index, mapped),
-                        ScheduledPlan {
-                            program: low,
-                            placement,
-                            phases: exchanges.phases,
-                            cache: cache.clone(),
-                        },
-                    ))
+                    Ok(ScheduledPlan {
+                        program: low,
+                        placement,
+                        phases: exchanges.phases,
+                        cache: cache.clone(),
+                    })
                 };
                 (mapped, schedule())
             })
@@ -230,14 +227,15 @@ pub(super) fn select_scheduled_finalist<T>(
         let mut feasible = false;
         for (mapped, result) in results {
             match result {
-                Ok((score, mut plan)) => {
+                Ok(mut plan) => {
                     // Exact support placement is part of acceptance. A fast
                     // but unplaceable package must not consume the budget or
                     // prevent another finalist from being attempted.
                     let finalized = finalize(&mut plan);
                     caches[usize::from(mapped)] = plan.cache.clone();
                     match finalized {
-                        Ok(artifact) => {
+                        Ok((cycles, artifact)) => {
+                            let score = (cycles, index, mapped);
                             feasible = true;
                             if best
                                 .as_ref()
@@ -480,12 +478,16 @@ mod tests {
         config.exchange_table_budget_bytes = 1;
         assert!(check_exchange_budget(1, &config).is_ok());
         config.exchange_transfer_limit_per_tile = fragments - 1;
-        let error =
-            select_scheduled_finalist(finalists, &config, None, |_| -> PackageBuildResult<()> {
+        let error = select_scheduled_finalist(
+            finalists,
+            &config,
+            None,
+            |_| -> PackageBuildResult<(u64, ())> {
                 panic!("over-limit plan reached package finalization")
-            })
-            .err()
-            .unwrap();
+            },
+        )
+        .err()
+        .unwrap();
         assert!(matches!(
             error,
             PackageBuildError::ExchangeTransferLimitExceeded { .. }
@@ -549,7 +551,7 @@ mod tests {
         let mut attempts = 0;
         let result = select_scheduled_finalist(vec![mid; 20], &config, None, |_| {
             attempts += 1;
-            Err::<(), _>(PackageBuildError::ExchangeBudgetExceeded {
+            Err::<(u64, ()), _>(PackageBuildError::ExchangeBudgetExceeded {
                 bytes: 100 * 1024,
                 budget: 64 * 1024,
             })
@@ -559,6 +561,29 @@ mod tests {
             Err(PackageBuildError::ExchangeBudgetExceeded { .. })
         ));
         assert_eq!(attempts, config.placement_finalists);
+    }
+
+    #[test]
+    fn selection_uses_final_cost_after_support_placement() {
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [32, 16]).unwrap();
+        let output = graph.gelu(input).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let mut config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
+        config.exchange_schedule_finalists = 2;
+        let mid = lower_finalists(&graph, &config, &Ipu21CostModel, 1)
+            .unwrap()
+            .remove(0);
+        let mut attempts = 0;
+        // Equal provisional costs, but the second package has a better final
+        // schedule after support reservations change its addresses.
+        let (_, selected) = select_scheduled_finalist(vec![mid; 2], &config, None, |_| {
+            attempts += 1;
+            Ok((100 / attempts, attempts))
+        })
+        .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(selected, 2);
     }
 
     #[test]
@@ -584,7 +609,7 @@ mod tests {
                         },
                     ))
                 } else {
-                    Ok(())
+                    Ok((0, ()))
                 }
             });
             assert!(result.is_ok());
@@ -604,20 +629,18 @@ mod tests {
             crate::low::expand::expand_tiles(&finalists[0], config.diagnostic_checkpoints).unwrap();
         finalists.insert(0, crate::MidProgram::default());
         let (selected, ()) =
-            select_scheduled_finalist(finalists, &config, None, |_| Ok(())).unwrap();
+            select_scheduled_finalist(finalists, &config, None, |_| Ok((0, ()))).unwrap();
         assert_eq!(selected.program, lower_to_tiles(&expected, false));
         assert_eq!(selected.placement, place(&selected.program).unwrap());
         assert!(matches!(
-            select_scheduled_finalist(
-                vec![crate::MidProgram::default()],
-                &config,
-                None,
-                |_| Ok(())
-            ),
+            select_scheduled_finalist(vec![crate::MidProgram::default()], &config, None, |_| Ok((
+                0,
+                ()
+            ))),
             Err(PackageBuildError::Low(
                 crate::ExpansionError::EmptyTileGroup
             ))
         ));
-        assert!(select_scheduled_finalist(vec![], &config, None, |_| Ok(())).is_err());
+        assert!(select_scheduled_finalist(vec![], &config, None, |_| Ok((0, ()))).is_err());
     }
 }
