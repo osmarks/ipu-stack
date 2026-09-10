@@ -339,6 +339,40 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     // Each allocation has 256 bytes on two owners. {7,0}, {1,2}, {3,4}
     // are disjoint even though no layout individually uses all eight tiles.
     assert_eq!(peak(&program), 256);
+    let mut config = crate::PipelineConfig::new(8);
+    config.standard_memory_reservation_bytes = 0;
+    let mut screened_peak = |budget| {
+        config.tile_memory_budget_bytes = budget;
+        let (_, peak) = region_estimate(
+            &config,
+            &[id(0), id(1)],
+            &program.operations,
+            &program.outputs,
+            &program.values,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        peak.total - peak.exchange_rows
+    };
+    assert_eq!(
+        screened_peak(1024),
+        768,
+        "fitting upper bound needs no refinement"
+    );
+    assert_eq!(
+        screened_peak(300),
+        256,
+        "refine before rejecting a fitting plan"
+    );
+    program.values[1].tensor_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
+    let (_, separate_classes) = analyze_mid(&program, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        separate_classes.standard - separate_classes.exchange_rows,
+        256
+    );
+    assert_eq!(separate_classes.interleaved, 256);
+    assert_eq!(peak(&program), 256);
+    program.values[1].tensor_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
     program.values[1].tile_offset = 7;
     assert_eq!(peak(&program), 512);
     program.values[2].tile_offset = 7;

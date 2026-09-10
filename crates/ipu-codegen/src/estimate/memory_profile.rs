@@ -361,7 +361,7 @@ mod tests {
         )
         .unwrap();
         let (_, expected) = mid::region_estimate(
-            config.tile_count,
+            &config,
             &initial,
             &program.operations,
             &program.outputs,

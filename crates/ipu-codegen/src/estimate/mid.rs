@@ -46,6 +46,32 @@ pub(super) fn analyze_observed(
     copies: &BTreeMap<MidValueId, u32>,
     observer: &mut impl MemoryObserver,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
+    analyze_storage::<true>(program, copies, observer)
+}
+
+/// A fitting upper bound needs no refinement. Every failed capacity screen is
+/// checked on actual owners before it can discard a candidate.
+fn analyze_with_budget(
+    program: &MidProgram,
+    copies: &BTreeMap<MidValueId, u32>,
+    config: &crate::PipelineConfig,
+) -> Option<(ProgramCycles, MemoryPeaks)> {
+    let bound = analyze_storage::<false>(program, copies, &mut ())?;
+    if bound.1.fits_ipu21_with_budget(
+        config.standard_memory_reservation_bytes,
+        config.tile_memory_budget_bytes,
+    ) {
+        Some(bound)
+    } else {
+        analyze(program, copies)
+    }
+}
+
+fn analyze_storage<const PER_TILE: bool>(
+    program: &MidProgram,
+    copies: &BTreeMap<MidValueId, u32>,
+    observer: &mut impl MemoryObserver,
+) -> Option<(ProgramCycles, MemoryPeaks)> {
     let mut steps = Vec::new();
     fn flatten<'a>(
         operations: &'a [MidOperation],
@@ -119,7 +145,11 @@ pub(super) fn analyze_observed(
             tail[roots[operation.inputs[0].index() as usize]] = 8 * multiply.bytes();
         }
     }
-    let tiles = usize::from(program.tile_count);
+    let tiles = if PER_TILE {
+        usize::from(program.tile_count)
+    } else {
+        1
+    };
     let mut bytes = vec![vec![0u64; tiles]; parent.len()];
     let mut classes = vec![MemoryClass::Ipu21Standard; parent.len()];
     for value in &program.values {
@@ -127,7 +157,7 @@ pub(super) fn analyze_observed(
         let class = value.tensor_type.format.layout.memory_class;
         let layout = &value.tensor_type.format.layout;
         let resolved = layout.resolve(&value.tensor_type.shape).ok()?;
-        if usize::from(layout.tiling.tile_count) > tiles || tiles == 0 {
+        if layout.tiling.tile_count > program.tile_count || program.tile_count == 0 {
             return None;
         }
         let count = copies.get(&value.id).copied().unwrap_or(1);
@@ -143,10 +173,18 @@ pub(super) fn analyze_observed(
         let mut tile_shards = vec![0; tiles];
         let mut tile_bytes = vec![0; tiles];
         let mut aligned_bytes = 0;
-        for owner in 0..layout.tiling.tile_count {
-            let shard = resolved
-                .tile_elements(owner)
-                .checked_mul(value.tensor_type.format.precision.bytes())?;
+        let owners = if PER_TILE {
+            layout.tiling.tile_count
+        } else {
+            1
+        };
+        for owner in 0..owners {
+            let elements = if PER_TILE {
+                resolved.tile_elements(owner)
+            } else {
+                resolved.maximum_tile_elements()
+            };
+            let shard = elements.checked_mul(value.tensor_type.format.precision.bytes())?;
             if shard == 0 {
                 continue;
             }
@@ -238,7 +276,9 @@ pub(super) fn analyze_observed(
         // Reduction and conversion scratch in operation_cost is proportional
         // to the output shard, and resides on that output's owners.
         let mut tile_scratch = vec![MemoryUsage::default(); tiles];
-        if scratch.total() != 0 {
+        if !PER_TILE {
+            tile_scratch[0] = scratch;
+        } else if scratch.total() != 0 {
             let output = &program.values[operation.results.first()?.index() as usize];
             let layout = &output.tensor_type.format.layout;
             let resolved = layout.resolve(&output.tensor_type.shape).ok()?;
@@ -494,14 +534,14 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
 }
 
 pub(crate) fn region_peak_memory(
-    tile_count: u16,
+    config: &crate::PipelineConfig,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> MemoryPeaks {
     region_peak_memory_with_multiplicity(
-        tile_count,
+        config,
         initial,
         operations,
         outputs,
@@ -511,7 +551,7 @@ pub(crate) fn region_peak_memory(
 }
 
 pub(crate) fn region_peak_memory_with_multiplicity(
-    tile_count: u16,
+    config: &crate::PipelineConfig,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
@@ -519,7 +559,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
 ) -> MemoryPeaks {
     region_estimate(
-        tile_count,
+        config,
         initial,
         operations,
         outputs,
@@ -539,15 +579,15 @@ pub(crate) fn unavailable_memory() -> MemoryPeaks {
 }
 
 pub(crate) fn region_estimate(
-    tile_count: u16,
+    config: &crate::PipelineConfig,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let program = resolved_region(tile_count, initial, operations, outputs, values)?;
-    analyze(&program, allocation_multiplicity)
+    let program = resolved_region(config.tile_count, initial, operations, outputs, values)?;
+    analyze_with_budget(&program, allocation_multiplicity, config)
 }
 
 pub(super) fn resolved_region(
