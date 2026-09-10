@@ -15,8 +15,8 @@ use crate::graph::{ComputeGraph, OperationId, ValueId};
 use crate::host;
 use crate::low::LowProgram;
 use crate::memory::{
-    MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, RUNTIME_STATE_BASE,
-    RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
+    MemoryAllocation, MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE,
+    RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
 use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
@@ -423,12 +423,13 @@ fn build_package_from_objects(
             Ok(memory.allocate(MemoryRequest {
                 name: "cycle profile samples",
                 bytes,
-                // Profile samples are transferred to the host while the tile
-                // executes its host-readback program. Those accesses must not
-                // share a standard-memory element with instruction fetch.
-                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                // Samples are data. Region 1 leaves scarce instruction-fetch
+                // elements for code and exchange rows, and cannot conflict with
+                // instruction fetch during host readback.
+                alignment: 4,
+                bounds: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    ..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                end_alignment: 4,
                 guard_after: 0,
             })?)
         })
@@ -470,8 +471,8 @@ fn build_package_from_objects(
         profile_storage.as_ref().map(|storage| storage.range.start),
     )?;
     let sizing_host_base = memory.next_free(
-        linked_end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START,
+        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
         4,
         "host programs",
     )?;
@@ -498,16 +499,13 @@ fn build_package_from_objects(
         .ok_or_else(|| invalid("host program size underflow"))?;
     let host_code = (host_code_bytes != 0)
         .then(|| {
-            memory.allocate(MemoryRequest {
-                name: "host programs",
-                bytes: host_code_bytes,
-                alignment: 8,
-                bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: 8,
-                // The supervisor can fetch beyond the final host row while
-                // exchange is active, including into the next SRAM element.
-                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
-            })
+            allocate_package_code(
+                &mut memory,
+                "host programs",
+                host_code_bytes,
+                8,
+                ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+            )
         })
         .transpose()?;
     let host_code_base = host_code
@@ -536,8 +534,8 @@ fn build_package_from_objects(
         false,
     )?;
     let sizing_code_address = memory.next_free(
-        host_code_base + host_code_bytes,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START,
+        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
         4,
         "generated tile programs",
     )?;
@@ -579,24 +577,22 @@ fn build_package_from_objects(
             .max()
             .ok_or_else(|| invalid("execution topology has no tiles"))
     })?;
+    tracing::info!(linked_end, host_code_base, host_code_bytes, generated_code_bytes,
+        exchange_table_bytes,
+        executable_ranges = ?memory.free_ranges(RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
+        "placing generated tile programs");
     let code_address = if generated_code_bytes == 0 {
         sizing_code_address
     } else {
-        memory
-            .allocate(MemoryRequest {
-                name: "generated tile programs",
-                bytes: generated_code_bytes,
-                alignment: 4,
-                bounds: (host_code_base + host_code_bytes)
-                    ..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                // Host programs and generated tile code form one contiguous
-                // executable region. Keep planned standard-memory values out
-                // of its final memory element.
-                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                guard_after: 0,
-            })?
-            .range
-            .start
+        allocate_package_code(
+            &mut memory,
+            "generated tile programs",
+            generated_code_bytes,
+            ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+            0,
+        )?
+        .range
+        .start
     };
     // Reserve descriptors before tensors. Their contents depend on final addresses,
     // but their undeduplicated size does not. Final host emission may still reuse
@@ -614,8 +610,8 @@ fn build_package_from_objects(
             })
         })
         .transpose()?;
-    let standard_ranges =
-        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
+    let available_ranges =
+        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT);
     tracing::info!(
         linked_end,
         profile_bytes = profile_storage
@@ -626,14 +622,11 @@ fn build_package_from_objects(
         host_data_bytes,
         generated_code_bytes,
         code_address,
-        ?standard_ranges,
+        ?available_ranges,
         "allocated package support memory"
     );
     let placement = build_phase("place_storage", || {
-        Ok(crate::place::place_with_standard_ranges(
-            program,
-            &standard_ranges,
-        )?)
+        Ok(crate::place::place_with_ranges(program, &available_ranges)?)
     })?;
     let lowered_exchanges = build_phase("lower_exchanges", || {
         Ok(crate::exchange::lower_exchanges_cached(
@@ -647,7 +640,7 @@ fn build_package_from_objects(
     let (placement, lowered_exchanges) = build_phase("optimize_exchange_placement", || {
         placement::improve_exchange_placement(
             program,
-            &standard_ranges,
+            &available_ranges,
             &topology,
             placement,
             lowered_exchanges,
@@ -679,11 +672,7 @@ fn build_package_from_objects(
         &physical_to_logical,
         profile_storage.as_ref().map(|storage| storage.range.start),
     )?;
-    let mut inactive_auxiliary_ranges = standard_ranges.clone();
-    inactive_auxiliary_ranges.push((
-        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-        TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-    ));
+    let inactive_auxiliary_ranges = available_ranges.clone();
     let mut host_data_ranges = auxiliary_ranges(
         program,
         &placement,
@@ -1249,6 +1238,26 @@ fn runtime_symbols(
     ]))
 }
 
+// Calls use explicit addresses. Use any free executable hole, including those
+// before the highest linked section; unrelated support objects need not follow
+// one another. End rounding/guards still isolate instruction fetch from data.
+fn allocate_package_code(
+    memory: &mut TileMemoryMap,
+    name: &'static str,
+    bytes: u32,
+    end_alignment: u32,
+    guard_after: u32,
+) -> Result<MemoryAllocation, MemoryLayoutError> {
+    memory.allocate(MemoryRequest {
+        name,
+        bytes,
+        alignment: 8,
+        bounds: RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        end_alignment,
+        guard_after,
+    })
+}
+
 fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
     linked
         .segments
@@ -1358,6 +1367,51 @@ mod tests {
         memory
             .reserve("runtime state", RUNTIME_STATE_BASE..base)
             .unwrap();
+    }
+
+    #[test]
+    fn package_code_reuses_holes_before_the_last_linked_section() {
+        let base = RUNTIME_EXECUTABLE_START;
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let limit = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
+        let linked = LinkedImage {
+            base,
+            entry: base,
+            bytes: vec![],
+            symbols: BTreeMap::new(),
+            segments: vec![
+                ipu_elf::LinkedSegment {
+                    address: base,
+                    offset: 0,
+                    size: 128,
+                },
+                ipu_elf::LinkedSegment {
+                    address: base + 3 * element,
+                    offset: 128,
+                    size: (limit - base - 3 * element) as usize,
+                },
+            ],
+        };
+        let mut memory = TileMemoryMap::new();
+        reserve_linked_image(&mut memory, &linked, "linked code").unwrap();
+        assert!(
+            memory
+                .next_free(linked_end(&linked).unwrap(), base..limit, 8, "old tail")
+                .is_err()
+        );
+        let host = allocate_package_code(
+            &mut memory,
+            "host programs",
+            4096,
+            8,
+            ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+        )
+        .unwrap();
+        let tile = allocate_package_code(&mut memory, "generated tile programs", 17556, element, 0)
+            .unwrap();
+        assert_eq!(host.range.start, base + element);
+        assert!(host.reserved.end <= tile.range.start);
+        assert_eq!(tile.reserved.end, base + 3 * element);
     }
 
     #[test]

@@ -60,7 +60,6 @@ pub fn build_tile_program_package(
         .clone()
         .into_iter()
         .collect::<BTreeMap<_, _>>();
-    let linked_end = linked_end(&layout)?;
     let mut memory = TileMemoryMap::new();
     reserve_linked_image(&mut memory, &layout, "linked runtime")?;
     memory.reserve(
@@ -148,8 +147,8 @@ pub fn build_tile_program_package(
     run_outputs.push(finish);
     let host_bounds = crate::IPU21_DATA_BASE..TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
     let sizing_host_base = memory.next_free(
-        linked_end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START,
+        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
         8,
         "host programs",
     )?;
@@ -166,14 +165,7 @@ pub fn build_tile_program_package(
         .end
         .checked_sub(sizing_host_base)
         .ok_or_else(|| invalid("host program size underflow"))?;
-    let host_code = memory.allocate(MemoryRequest {
-        name: "host programs",
-        bytes: host_code_bytes,
-        alignment: 8,
-        bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        end_alignment: 8,
-        guard_after: 0,
-    })?;
+    let host_code = allocate_package_code(&mut memory, "host programs", host_code_bytes, 8, 0)?;
     let host_ranges = memory.free_ranges(host_bounds.clone());
     let host = host::plan(
         &[],
@@ -209,8 +201,8 @@ pub fn build_tile_program_package(
     }
 
     let sizing_address = memory.next_free(
-        host_code.range.end,
-        TILE_MEMORY_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START,
+        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
         8,
         "generated tile programs",
     )?;
@@ -227,21 +219,15 @@ pub fn build_tile_program_package(
         )?;
         Ok::<_, PackageBuildError>(maximum.max(u32::try_from(generated.bytes.len())?))
     })?;
-    let code_address = memory
-        .allocate(MemoryRequest {
-            name: "generated tile programs",
-            bytes: maximum_bytes,
-            alignment: 4,
-            bounds: linked_end..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-            // Supervisor instruction fetch and exchange/paired memory access
-            // cannot safely use the same standard-memory element. Reserve the
-            // rest of the element so subsequently placed tensor data cannot
-            // become the source of an exchange while code executes from it.
-            end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-            guard_after: 0,
-        })?
-        .range
-        .start;
+    let code_address = allocate_package_code(
+        &mut memory,
+        "generated tile programs",
+        maximum_bytes,
+        ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+        0,
+    )?
+    .range
+    .start;
     let generated = programs
         .iter()
         .map(|program| {

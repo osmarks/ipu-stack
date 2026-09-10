@@ -89,12 +89,18 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             graph.body = region;
             let low = crate::low::lower_to_tiles(&Arc::new(graph), false);
             // Force standard storage into the shared upper region as well.
-            let placement = crate::place::place_with_standard_ranges(
+            let placement = crate::place::place_with_ranges(
                 &low,
-                &[(
-                    crate::memory::IPU21_DATA_BASE,
-                    crate::memory::IPU21_DATA_BASE + 4,
-                )],
+                &[
+                    (
+                        crate::memory::IPU21_DATA_BASE,
+                        crate::memory::IPU21_DATA_BASE + 4,
+                    ),
+                    (
+                        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                        ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                    ),
+                ],
             )
             .unwrap();
             for transfer in low.exchange_phases.iter().flat_map(|p| &p.transfers) {

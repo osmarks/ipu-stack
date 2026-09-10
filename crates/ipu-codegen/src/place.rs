@@ -78,28 +78,33 @@ impl Lifetime {
 }
 
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
-    place_with_standard_ranges(program, &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)])
+    place_with_ranges(
+        program,
+        &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
+    )
 }
 
-pub(crate) fn place_with_standard_ranges(
+pub(crate) fn place_with_ranges(
     program: &LowProgram,
-    standard_ranges: &[(u32, u32)],
+    available_ranges: &[(u32, u32)],
 ) -> Result<Placement, PlacementError> {
-    place_with_offset(program, standard_ranges, 0)
+    place_with_offset(program, available_ranges, 0)
 }
 
 pub(crate) fn place_with_offset(
     program: &LowProgram,
-    standard_ranges: &[(u32, u32)],
+    available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
 ) -> Result<Placement, PlacementError> {
     let started = std::time::Instant::now();
     if interleaved_offset >= IPU21_INTERLEAVED_ELEMENT_SIZE {
         return Err(PlacementError::Overflow);
     }
-    if standard_ranges.iter().any(|&(start, end)| {
-        start < IPU21_DATA_BASE || end > IPU21_INTERLEAVED_MEMORY_BASE || start >= end
-    }) || standard_ranges.windows(2).any(|pair| pair[0].1 > pair[1].0)
+    if available_ranges.iter().any(|&(start, end)| {
+        start < IPU21_DATA_BASE || end > IPU21_APPLICATION_MEMORY_LIMIT || start >= end
+    }) || available_ranges
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].0)
     {
         return Err(PlacementError::OutOfMemory {
             tile: 0,
@@ -131,7 +136,7 @@ pub(crate) fn place_with_offset(
             place_tile(
                 program,
                 u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
-                standard_ranges,
+                available_ranges,
                 interleaved_offset,
                 &tile_iterated[tile],
                 &tile_members[tile],
@@ -241,7 +246,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
 fn place_tile(
     program: &LowProgram,
     tile: u16,
-    standard_ranges: &[(u32, u32)],
+    available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
     iterated: &[IteratedGroup],
     members: &BTreeMap<usize, Vec<usize>>,
@@ -264,12 +269,7 @@ fn place_tile(
     // Both access classes share region 1. A single lifetime-ordered arena
     // lets ordinary storage reuse dead interleaved buffers and vice versa.
     let mut addresses = BTreeMap::new();
-    let mut ranges = standard_ranges.to_vec();
-    ranges.push((
-        IPU21_INTERLEAVED_MEMORY_BASE,
-        IPU21_APPLICATION_MEMORY_LIMIT,
-    ));
-    let mut arena = Arena::new(&ranges, interleaved_offset);
+    let mut arena = Arena::new(available_ranges, interleaved_offset);
     allocate_tile(
         program,
         tile,
@@ -1091,6 +1091,41 @@ mod tests {
     }
 
     #[test]
+    fn package_reservations_in_region_one_exclude_both_access_classes() {
+        let start = IPU21_INTERLEAVED_MEMORY_BASE + 4096;
+        let available = [(start, start + 4096)];
+        for class in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("x", [1, 128]).unwrap();
+            graph.set_outputs([input]).unwrap();
+            let mut layout = Layout::row_sharded(1);
+            layout.memory_class = class;
+            let config = PipelineConfig::new(1).with_input(
+                input,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout,
+                },
+            );
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+            let placed = place_with_ranges(&low, &available).unwrap();
+            assert!(!placed.shard_addresses.is_empty());
+            for &address in placed.shard_addresses.values() {
+                assert!(start <= address && address + 256 <= start + 4096);
+            }
+            assert!(
+                placed
+                    .tile_auxiliary_ranges
+                    .iter()
+                    .flatten()
+                    .all(|&(a, b)| start <= a && b <= start + 4096)
+            );
+            assert!(place_with_ranges(&low, &[(start, start + 4)]).is_err());
+        }
+    }
+
+    #[test]
     fn offline_arena_recovers_fragmentation_and_preserves_lifetimes() {
         let base = IPU21_INTERLEAVED_MEMORY_BASE;
         let ranges = [(base, base + 128)];
@@ -1303,8 +1338,25 @@ mod tests {
         let mut checked = 0;
         for placement in [
             place(&low).unwrap(),
-            place_with_standard_ranges(&low, &[(IPU21_DATA_BASE, IPU21_DATA_BASE + 4)]).unwrap(),
-            place_with_standard_ranges(&low, &[]).unwrap(),
+            place_with_ranges(
+                &low,
+                &[
+                    (IPU21_DATA_BASE, IPU21_DATA_BASE + 4),
+                    (
+                        IPU21_INTERLEAVED_MEMORY_BASE,
+                        IPU21_APPLICATION_MEMORY_LIMIT,
+                    ),
+                ],
+            )
+            .unwrap(),
+            place_with_ranges(
+                &low,
+                &[(
+                    IPU21_INTERLEAVED_MEMORY_BASE,
+                    IPU21_APPLICATION_MEMORY_LIMIT,
+                )],
+            )
+            .unwrap(),
         ] {
             for tile in &low.tiles {
                 for work in low.work(tile) {
@@ -1370,7 +1422,7 @@ mod tests {
         let (_, addresses, _) = place_tile(
             &low,
             0,
-            &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)],
+            &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
             0,
             std::slice::from_ref(&group),
             &members,
@@ -1462,7 +1514,7 @@ mod tests {
             );
             let placement = place_with_offset(
                 &low,
-                &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)],
+                &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
                 random.u32(0..8) * 4096,
             )
             .unwrap();

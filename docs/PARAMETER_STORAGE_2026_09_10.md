@@ -239,3 +239,32 @@ ViT benchmark. The subsequent trial is `artifacts/vit-full-depth-20260910/`.
 
 Validation after the policy change: 225 codegen tests passed, five ignored;
 Clippy passed with the existing allowances.
+
+
+## Executable-region pressure and profiling data
+
+With the 80-KiB policy, the full-depth run passed the table check and sized
+its generated programs at 17304–17556 bytes. Support allocation then failed
+before tensor placement: there was no permitted range for that code. There
+was no device execution. This exposed two support-placement restrictions:
+
+* Host code was constrained to follow the highest linked address, and tile
+  code to follow host code. Both package entry points now share an executable
+  allocator which can use any free hole in region 0, retaining fetch guards
+  and complete-element exclusion from tensor data. A regression fills the
+  executable tail and places host/tile programs in an earlier hole.
+* Profiling samples, ordinary data, consumed a complete 16-KiB region-0 element.
+  They now use region 1 without element-sized padding. The tensor allocator
+  accepts explicit available ranges across both regions, instead of silently
+  appending all of region 1 to a standard-only allowance. Final placement,
+  exchange-placement alternatives and inactive-tile host allocation all honor
+  the same support reservations. Profiling remains enabled.
+
+The allocator's existing mixed-class/lifetime tests pass. A new regression
+checks that both ordinary and interleaved tensors respect a reserved region-1
+hole, including when the remaining allowed range is too small. The next full
+trial is `artifacts/vit-profile-region-one-20260910/`.
+
+Validation: 226 existing codegen tests passed, five ignored; the added
+region-1 reservation regression passed separately. Clippy passed with the
+existing allowances, and the release test executable was rebuilt.
