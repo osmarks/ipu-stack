@@ -732,6 +732,12 @@ fn emit_exchange_patches(
     repeat_count: u32,
     symbols: &BTreeMap<String, u32>,
 ) -> Result<()> {
+    if exchange.repeat_patches.is_empty() {
+        return Ok(());
+    }
+    // Both patch helpers preserve these values across the entire row.
+    code.ld32(4, 11, 15, 0)?;
+    code.setzi(5, repeat_count)?;
     for patch in &exchange.repeat_patches {
         let byte_offset = patch
             .word_offset
@@ -756,8 +762,6 @@ fn emit_exchange_patches(
                 PATCH_ARITHMETIC_WORD_SYMBOL
             }
         };
-        code.ld32(4, 11, 15, 0)?;
-        code.setzi(5, repeat_count)?;
         code.call(symbol(symbols, helper)?, 9)?;
     }
     Ok(())

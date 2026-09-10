@@ -179,16 +179,16 @@ static_copy_u16:
 
 	.section .text.ipu_stack_static_patch_word,"ax",@progbits
 	// Runtime helper ABI: m2 destination word, m3 value table, m4 remaining
-	// iterations, m5 total iterations, m9 return. Exchange plans are ordinary
+	// iterations, m5 total iterations (both preserved), m9 return. Plans are ordinary
 	// data consumed after this store; no instruction-cache maintenance is needed.
 	.globl ipu_stack_static_patch_word
 	.p2align 2
 	.type ipu_stack_static_patch_word,@function
 ipu_stack_static_patch_word:
 	.supervisor
-	sub $m5, $m5, $m4
-	shl $m5, $m5, 2
-	add $m3, $m3, $m5
+	sub $m0, $m5, $m4
+	shl $m0, $m0, 2
+	add $m3, $m3, $m0
 	ld32 $m0, $m3, $m15, 0
 	st32 $m0, $m2, $m15, 0
 	br $m9
@@ -196,14 +196,15 @@ ipu_stack_static_patch_word:
 
 	.section .text.static_patch_arithmetic_word,"ax",@progbits
 	// m2 destination, m3 initial word, m4 remaining, m5 total, m6 step.
+	// Preserve m4/m5 so the caller sets them only once per exchange.
 	// Low 32-bit arithmetic exactly matches the verified instruction-word series.
 	.globl static_patch_arithmetic_word
 	.p2align 2
 	.type static_patch_arithmetic_word,@function
 static_patch_arithmetic_word:
 	.supervisor
-	sub $m5, $m5, $m4
-	mul $m6, $m6, $m5
+	sub $m0, $m5, $m4
+	mul $m6, $m6, $m0
 	add $m3, $m3, $m6
 	st32 $m3, $m2, $m15, 0
 	br $m9
