@@ -5,8 +5,7 @@ use std::sync::Arc;
 #[derive(serde::Serialize)]
 pub struct ExpansionBenchmark {
     pub planning_ms: f64,
-    pub retained_finalists: usize,
-    pub finalists: Vec<ExpansionTiming>,
+    pub baseline: ExpansionTiming,
     /// Cache entries, hits and misses, respectively.
     pub fragment_cache: (usize, u64, u64),
     pub copy_plan_cache: (usize, u64, u64),
@@ -22,12 +21,13 @@ pub struct SelectionReuse {
 
 #[derive(serde::Serialize)]
 pub struct ExpansionTiming {
-    pub finalist: usize,
     pub mid_operations: usize,
     pub mid_values: usize,
     pub expand_ms: f64,
     pub tile_lists_ms: f64,
     pub footprint_ms: f64,
+    pub estimated_row_bytes: u64,
+    pub maximum_transfer_chunks_per_tile: u64,
     /// Distinct views, view pairs and stored receive-row descriptors.
     pub geometry: (usize, usize, usize),
     /// Diagnostic copying costs, outside expansion/footprint timings.
@@ -52,9 +52,8 @@ pub fn benchmark_mid_expansion(
     cache_enabled: bool,
 ) -> PackageBuildResult<ExpansionBenchmark> {
     let start = Instant::now();
-    let plans = [lower_baseline(graph, config, &Ipu21CostModel)?];
+    let mid = lower_baseline(graph, config, &Ipu21CostModel)?;
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let mut finalists = Vec::new();
     let cache = Arc::new(if cache_enabled {
         crate::low::expand::ExpansionCache::default()
     } else {
@@ -64,118 +63,108 @@ pub fn benchmark_mid_expansion(
         &'static str,
         (usize, std::collections::BTreeSet<String>),
     >::new();
-    for (finalist, mid) in plans.iter().enumerate() {
-        // Outside the timed expansion. Ignore IDs/provenance but retain layouts,
-        // tile ownership and alias-group relationships at the operation boundary.
-        fn selections_in(
-            graph: &crate::MidProgram,
-            operations: &[crate::MidOperation],
-            selections: &mut std::collections::BTreeMap<
-                &'static str,
-                (usize, std::collections::BTreeSet<String>),
-            >,
-        ) {
-            for op in operations {
-                if let crate::MidOperationKind::Repeat(repeat) = &op.kind {
-                    selections_in(graph, &repeat.body.operations, selections);
-                    continue;
-                }
-                let category = match &op.kind {
-                    crate::MidOperationKind::Primitive(crate::Primitive::Compute { .. }) => {
-                        "compute"
-                    }
-                    crate::MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => "copy",
-                    crate::MidOperationKind::Primitive(crate::Primitive::Sum { .. }) => "sum",
-                    _ => "other",
-                };
-                let mut groups = Vec::new();
-                let boundary = op
-                    .inputs
-                    .iter()
-                    .chain(&op.results)
-                    .map(|id| {
-                        let value = &graph.values[id.index() as usize];
-                        let group = groups
-                            .iter()
-                            .position(|g| *g == value.storage_group)
-                            .unwrap_or_else(|| {
-                                groups.push(value.storage_group);
-                                groups.len() - 1
-                            });
-                        (&value.tensor_type, value.tile_offset, group)
-                    })
-                    .collect::<Vec<_>>();
-                let entry = selections.entry(category).or_default();
-                entry.0 += 1;
-                entry
-                    .1
-                    .insert(format!("{}|{:?}|{:?}", graph.tile_count, op.kind, boundary));
+    // Outside the timed expansion. Ignore IDs/provenance but retain layouts,
+    // tile ownership and alias-group relationships at the operation boundary.
+    fn selections_in(
+        graph: &crate::MidProgram,
+        operations: &[crate::MidOperation],
+        selections: &mut std::collections::BTreeMap<
+            &'static str,
+            (usize, std::collections::BTreeSet<String>),
+        >,
+    ) {
+        for op in operations {
+            if let crate::MidOperationKind::Repeat(repeat) = &op.kind {
+                selections_in(graph, &repeat.body.operations, selections);
+                continue;
             }
+            let category = match &op.kind {
+                crate::MidOperationKind::Primitive(crate::Primitive::Compute { .. }) => "compute",
+                crate::MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => "copy",
+                crate::MidOperationKind::Primitive(crate::Primitive::Sum { .. }) => "sum",
+                _ => "other",
+            };
+            let mut groups = Vec::new();
+            let boundary = op
+                .inputs
+                .iter()
+                .chain(&op.results)
+                .map(|id| {
+                    let value = &graph.values[id.index() as usize];
+                    let group = groups
+                        .iter()
+                        .position(|g| *g == value.storage_group)
+                        .unwrap_or_else(|| {
+                            groups.push(value.storage_group);
+                            groups.len() - 1
+                        });
+                    (&value.tensor_type, value.tile_offset, group)
+                })
+                .collect::<Vec<_>>();
+            let entry = selections.entry(category).or_default();
+            entry.0 += 1;
+            entry
+                .1
+                .insert(format!("{}|{:?}|{:?}", graph.tile_count, op.kind, boundary));
         }
-        selections_in(mid, &mid.operations, &mut selections);
-        let mut analysis = crate::estimate::GeometryAnalysis::default();
-        let start = Instant::now();
-        let expanded = crate::low::expand::expand_tiles_analyzed(
-            mid,
-            config.diagnostic_checkpoints,
-            Arc::clone(&cache),
-            &mut analysis,
-        )?;
-        let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let start = Instant::now();
-        let _footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
-        let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let start = Instant::now();
-        let low = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
-        let tile_lists_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let start = Instant::now();
-        let cloned = std::hint::black_box(expanded.shards.clone());
-        let clone_shards_ms = start.elapsed().as_secs_f64() * 1000.0;
-        drop(cloned);
-        let start = Instant::now();
-        let cloned = std::hint::black_box(expanded.kernel_runs.clone());
-        let clone_kernel_runs_ms = start.elapsed().as_secs_f64() * 1000.0;
-        drop(cloned);
-        let timing = ExpansionTiming {
-            finalist,
-            mid_operations: mid.operations.len(),
-            mid_values: mid.values.len(),
-            expand_ms,
-            tile_lists_ms,
-            footprint_ms,
-            geometry: analysis.stats(),
-            clone_shards_ms,
-            clone_kernel_runs_ms,
-            shards: low.shards.len(),
-            kernels: low.kernel_runs.len(),
-            local_copies: low.local_copies.len(),
-            exchange_phases: low.exchange_phases.len(),
-            logical_transfers: low.exchange_phases.iter().map(|p| p.transfers.len()).sum(),
-            panel_mappings: low
-                .exchange_phases
-                .iter()
-                .flat_map(|p| &p.transfers)
-                .filter(|t| t.order == crate::CopyOrder::Panels)
-                .count(),
-            recipients: low
-                .exchange_phases
-                .iter()
-                .flat_map(|p| &p.transfers)
-                .map(|t| t.destinations.len())
-                .sum(),
-        };
-        tracing::info!(
-            finalist,
-            expand_ms,
-            tile_lists_ms,
-            "benchmarked mid-to-low expansion"
-        );
-        finalists.push(timing);
     }
+    selections_in(&mid, &mid.operations, &mut selections);
+    let mut analysis = crate::estimate::GeometryAnalysis::default();
+    let start = Instant::now();
+    let expanded = crate::low::expand::expand_tiles_analyzed(
+        &mid,
+        config.diagnostic_checkpoints,
+        Arc::clone(&cache),
+        &mut analysis,
+    )?;
+    let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let start = Instant::now();
+    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
+    let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let start = Instant::now();
+    let low = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
+    let tile_lists_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let start = Instant::now();
+    let cloned = std::hint::black_box(expanded.shards.clone());
+    let clone_shards_ms = start.elapsed().as_secs_f64() * 1000.0;
+    drop(cloned);
+    let start = Instant::now();
+    let cloned = std::hint::black_box(expanded.kernel_runs.clone());
+    let clone_kernel_runs_ms = start.elapsed().as_secs_f64() * 1000.0;
+    drop(cloned);
+    let timing = ExpansionTiming {
+        mid_operations: mid.operations.len(),
+        mid_values: mid.values.len(),
+        expand_ms,
+        tile_lists_ms,
+        footprint_ms,
+        estimated_row_bytes: footprint.estimated_row_bytes(),
+        maximum_transfer_chunks_per_tile: footprint.maximum_transfer_chunks_per_tile,
+        geometry: analysis.stats(),
+        clone_shards_ms,
+        clone_kernel_runs_ms,
+        shards: low.shards.len(),
+        kernels: low.kernel_runs.len(),
+        local_copies: low.local_copies.len(),
+        exchange_phases: low.exchange_phases.len(),
+        logical_transfers: low.exchange_phases.iter().map(|p| p.transfers.len()).sum(),
+        panel_mappings: low
+            .exchange_phases
+            .iter()
+            .flat_map(|p| &p.transfers)
+            .filter(|t| t.order == crate::CopyOrder::Panels)
+            .count(),
+        recipients: low
+            .exchange_phases
+            .iter()
+            .flat_map(|p| &p.transfers)
+            .map(|t| t.destinations.len())
+            .sum(),
+    };
+    tracing::info!(expand_ms, tile_lists_ms, "benchmarked mid-to-low expansion");
     Ok(ExpansionBenchmark {
         planning_ms,
-        retained_finalists: plans.len(),
-        finalists,
+        baseline: timing,
         fragment_cache: cache.stats(),
         copy_plan_cache: cache.plan_stats(),
         selection_reuse: selections
