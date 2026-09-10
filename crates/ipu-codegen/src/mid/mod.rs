@@ -280,7 +280,7 @@ impl PipelineConfig {
             expanded_plan_finalists: 16,
             placement_finalists: 4,
             exchange_schedule_finalists: 1,
-            exchange_table_budget_bytes: 64 * 1024,
+            exchange_table_budget_bytes: 80 * 1024,
             exchange_transfer_limit_per_tile: 16_384,
             exchange_table_cost_per_byte: 0,
             gemm_plan_constraints: Vec::new(),

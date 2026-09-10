@@ -130,7 +130,7 @@ struct Arguments {
     /// Constrain planning as though only this much SRAM per tile were free.
     #[arg(long, conflicts_with = "reuse_package")]
     tile_memory_budget_kib: Option<u64>,
-    /// Cap actual encoded exchange table storage per tile (default 64 KiB).
+    /// Cap actual encoded exchange table storage per tile (default 80 KiB).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_table_budget_kib: Option<u64>,
     /// Cap geometry-derived static transfer fragments per tile (default 16384).

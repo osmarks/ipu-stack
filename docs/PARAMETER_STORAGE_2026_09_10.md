@@ -222,3 +222,20 @@ spans of at least 512 bytes in both AMP and BlockMajor orientations. Validation:
 224 existing codegen tests passed, five ignored; the new focused regression
 passed separately. Clippy passed with the existing allowances. The full-model
 retry is under `artifacts/vit-fp8-exchange-panels-20260910/`.
+
+
+The full whole-panel trial reached encoded sizes of 70468–71380 bytes with the
+ordinary cost model. Its automatic stronger-penalty search still needed about
+69720 bytes. Both passed copy encoding and provisional allocation but were
+rejected by the independent 65536-byte exchange policy cap before final SRAM
+placement. The third wholesale search was stopped intentionally. No device
+execution occurred in this trial.
+
+The default exchange-table policy cap is now 80 KiB. It remains a finite bound
+below the 100-KiB pathological layouts, while admitting the observed 68–70 KiB
+full-depth plans to actual SRAM placement. Physical memory budgets and placement
+checks are unchanged. This is a general default, not a layout override for the
+ViT benchmark. The subsequent trial is `artifacts/vit-full-depth-20260910/`.
+
+Validation after the policy change: 225 codegen tests passed, five ignored;
+Clippy passed with the existing allowances.

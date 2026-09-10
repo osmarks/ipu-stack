@@ -99,7 +99,7 @@ retained separately there; they are not the final planner's performance.
 
 Two independent limits apply: `exchange_transfer_limit_per_tile` defaults to
 16,384 static endpoint fragments per tile before scheduling;
-`exchange_table_budget_bytes` defaults to 64 KiB of actual encoded tables per
+`exchange_table_budget_bytes` defaults to 80 KiB of actual encoded tables per
 tile. Neither converts a heuristic byte estimate into a transfer count.
 The mid estimator's 256-byte payload assumption is only a cycle/ranking
 heuristic; it never rejects a plan against either limit. Operator and beam
