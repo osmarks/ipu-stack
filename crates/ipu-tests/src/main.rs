@@ -139,6 +139,9 @@ struct Arguments {
     /// Override the layout-search beam (default comes from PipelineConfig).
     #[arg(long, conflicts_with = "reuse_package")]
     planning_beam_width: Option<usize>,
+    /// Maximum complete package validations for local improvements after the baseline.
+    #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
+    optimization_steps: usize,
     /// Complete plans per configuration to expand and estimate.
     #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
     expanded_plan_finalists: usize,
@@ -691,6 +694,7 @@ fn main() -> Result<()> {
     if let Some(width) = arguments.planning_beam_width {
         pipeline = pipeline.with_planning_beam_width(width);
     }
+    pipeline.optimization_steps = arguments.optimization_steps;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
         "native" => ipu_codegen::GemmOutputPacking::Native,

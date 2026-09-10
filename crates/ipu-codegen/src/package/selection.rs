@@ -32,36 +32,7 @@ pub(super) fn select_graph_finalist<T>(
     tile_mapping: Option<&[u16]>,
     mut finalize: impl FnMut(&mut ScheduledPlan) -> PackageBuildResult<(u64, T)>,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
-    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, planning.tile_count);
-    let mut search = planning.clone();
-    let mut result = Err(invalid("no operator-plan finalists"));
-    for penalty in std::iter::once(planning.exchange_table_cost_per_byte).chain(
-        [16, 256]
-            .into_iter()
-            .filter(|p| *p > planning.exchange_table_cost_per_byte),
-    ) {
-        search.exchange_table_cost_per_byte = penalty;
-        let finalists = build_phase("lower_mid", || {
-            Ok(lower_finalists(
-                graph,
-                &search,
-                &costs,
-                search
-                    .expanded_plan_finalists
-                    .max(search.exchange_schedule_finalists),
-            )?)
-        })?;
-        result = select_scheduled_finalist(finalists, &search, tile_mapping, &mut finalize);
-        if !matches!(
-            result,
-            Err(PackageBuildError::ExchangeBudgetExceeded { .. }
-                | PackageBuildError::ExchangeTransferLimitExceeded { .. })
-        ) {
-            break;
-        }
-        tracing::info!(penalty, "geometry or encoded exchange budget exhausted");
-    }
-    result
+    super::local::optimize(graph, planning, tile_mapping, &mut finalize)
 }
 
 pub(super) fn select_scheduled_finalist<T>(
@@ -364,7 +335,7 @@ pub(super) fn expand_and_place(
     Ok((low, placement, footprint))
 }
 
-fn expand_and_screen(
+pub(super) fn expand_and_screen(
     mid: &crate::MidProgram,
     planning: &PipelineConfig,
     tile_mapping: Option<&[u16]>,

@@ -171,6 +171,8 @@ pub enum GemmOutputPacking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
     pub tile_count: u16,
+    /// Maximum complete local proposals validated after establishing a baseline.
+    pub optimization_steps: usize,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Graph-boundary tensors whose layout may be selected by their first
     /// consumer. Precision remains fixed, while packaging exposes the chosen
@@ -277,6 +279,7 @@ impl PipelineConfig {
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
             shape_aware_active_tile_counts: true,
+            optimization_steps: 8,
             planning_beam_width: 64,
             expanded_plan_finalists: 16,
             placement_finalists: 4,

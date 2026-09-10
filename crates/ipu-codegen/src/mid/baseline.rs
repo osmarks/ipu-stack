@@ -1,7 +1,7 @@
 //! Deterministic whole-device lowering with explicit, canonical boundaries.
 use super::*;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
     pub open_boundaries: BTreeSet<ValueId>,
@@ -32,6 +32,7 @@ pub(crate) fn lower(
         values: BTreeMap::new(),
         alternatives: BTreeMap::new(),
         copies: BTreeMap::new(),
+        optimizing: !recipe.plans.is_empty(),
     };
     let mut inputs = Vec::new();
     for input in graph.inputs() {
@@ -121,6 +122,7 @@ struct Builder<'a, C> {
     values: BTreeMap<ValueId, MidValueId>,
     alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
     copies: BTreeMap<MidValueId, u32>,
+    optimizing: bool,
 }
 
 impl<C: CostModel> Builder<'_, C> {
@@ -173,7 +175,11 @@ impl<C: CostModel> Builder<'_, C> {
                 self.config,
                 &demands,
             );
-            let plans = search.generate(&types, &parameters, &automatic, shape, self.costs)?;
+            let plans = if let Some(plan) = self.recipe.plans.get(&operation.id) {
+                vec![plan.clone()]
+            } else {
+                search.generate(&types, &parameters, &automatic, shape, self.costs)?
+            };
             let selected = if let Some(plan) = self.recipe.plans.get(&operation.id) {
                 plan.clone()
             } else {
@@ -185,9 +191,17 @@ impl<C: CostModel> Builder<'_, C> {
                         let memory = implementation.peak_memory;
                         Some((
                             (
-                                memory.total,
+                                if self.optimizing {
+                                    implementation.estimated_cycles
+                                } else {
+                                    memory.total
+                                },
                                 memory.exchange_rows,
-                                implementation.estimated_cycles,
+                                if self.optimizing {
+                                    memory.total
+                                } else {
+                                    implementation.estimated_cycles
+                                },
                             ),
                             plan,
                         ))
@@ -196,7 +210,9 @@ impl<C: CostModel> Builder<'_, C> {
                     .map(|(_, plan)| plan.clone())
                     .ok_or(LoweringError::NoCandidate(operation.id))?
             };
-            self.alternatives.insert(operation.id, plans);
+            if !self.recipe.plans.contains_key(&operation.id) {
+                self.alternatives.insert(operation.id, plans);
+            }
             self.recipe.plans.insert(operation.id, selected.clone());
             // Persistent storage is chosen independently of compute replication.
             // Only automatic homes can change; explicitly bound inputs stay fixed.
@@ -272,7 +288,7 @@ impl<C: CostModel> Builder<'_, C> {
         repeat: &Repeat,
         operations: &mut Vec<MidOperation>,
     ) -> LoweringResult<()> {
-        let inputs = operation
+        let mut inputs = operation
             .inputs
             .iter()
             .map(|id| lookup(&self.values, *id))
@@ -320,6 +336,21 @@ impl<C: CostModel> Builder<'_, C> {
             &repeat.body.yields,
             &repeat.body.value_shapes,
         )?;
+        // A body may select a compact native home for an invariant parameter.
+        // Bind the outer allocation to that same format, just as for sequences.
+        for (index, input) in inputs.iter_mut().enumerate().skip(repeat.carried_inputs) {
+            let target = self.state.get(arguments[index]).tensor_type.format.clone();
+            *input = ensure_format(
+                *input,
+                target,
+                OperandMaterialization::Complete,
+                false,
+                operation.id,
+                self.costs,
+                &mut self.state,
+                operations,
+            );
+        }
         let mut iterated_inputs = Vec::new();
         for (index, sequence) in sequences.iter().enumerate() {
             let target = self

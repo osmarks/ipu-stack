@@ -5,6 +5,7 @@ mod profile;
 mod profile_work;
 use profile::{instrument_profile, profile_binding, profile_step_count};
 mod benchmark;
+mod local;
 mod selection;
 pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
 mod tile_program;
