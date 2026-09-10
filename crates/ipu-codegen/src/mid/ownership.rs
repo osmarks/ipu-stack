@@ -200,6 +200,34 @@ impl MidProgram {
     }
 }
 
+/// Keep small broadcasts in transfer-sized chunks rather than eight-byte
+/// shards, unless the resident sequence would exceed the allocation budget.
+pub(super) fn compact_parameter_layout(
+    tensor: &TensorType,
+    copies: u32,
+    config: &PipelineConfig,
+) -> Option<Layout> {
+    let grain = tensor.format.layout.tiling.linear_grain()?;
+    let owners = tensor
+        .shape
+        .elements()
+        .saturating_mul(tensor.format.precision.bytes())
+        .div_ceil(256)
+        .min(u64::from(tensor.format.layout.tiling.tile_count)) as u16;
+    let layout = Layout::logical_linear(owners, grain);
+    let bytes = layout
+        .resolve(&tensor.shape)
+        .ok()?
+        .maximum_tile_elements()
+        .saturating_mul(tensor.format.precision.bytes())
+        .saturating_mul(u64::from(copies));
+    (bytes.saturating_add(config.standard_memory_reservation_bytes)
+        <= config
+            .tile_memory_budget_bytes
+            .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)))
+    .then_some(layout)
+}
+
 /// Select persistent homes before capacity screening. Sequence members share
 /// one rotation; derived values follow that rotation but are not counted again.
 pub(super) fn assign_parameter_tiles(

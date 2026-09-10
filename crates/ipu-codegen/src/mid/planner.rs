@@ -702,58 +702,74 @@ pub(super) fn lower_operation_candidates(
                         let output_shape = &output_shape;
                         let value_uses = &value_uses;
                         orders.into_iter().map(move |(cast_orders, compact)| {
-                            let mut next = branch.clone();
-                            next.analysis.take();
-                            if compact {
-                                for id in &compact_inputs {
-                                    next.state.automatic_inputs.remove(id);
-                                }
-                            }
-                            let previous_values = next.state.values.len();
-                            apply_selected_plan(
-                                operation,
-                                (*output_shape).clone(),
-                                plan.clone(),
-                                &cast_orders,
-                                &operation
-                                    .inputs
-                                    .iter()
-                                    .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
-                                    .collect::<Vec<_>>(),
-                                costs,
-                                &mut next.values,
-                                &mut next.state,
-                                &mut next.operations,
-                            );
-                            if compact {
-                                let origins = compact_inputs
-                                    .iter()
-                                    .map(|id| next.state.get(*id).origin)
-                                    .collect::<BTreeSet<_>>();
-                                for value in &mut next.state.values[previous_values..] {
-                                    if origins.contains(&value.origin) {
-                                        value.storage_group = value.id;
-                                        value.tile_offset = 0;
+                                let mut next = branch.clone();
+                                next.analysis.take();
+                                if compact {
+                                    for &id in &compact_inputs {
+                                        let value = next.state.get(id);
+                                        let copies = constraints.allocation_copies[&value.origin];
+                                        if let Some(layout) =
+                                            super::ownership::compact_parameter_layout(
+                                                &value.tensor_type,
+                                                copies,
+                                                config,
+                                            )
+                                        {
+                                            next.state.values[id.index() as usize]
+                                                .tensor_type
+                                                .format
+                                                .layout = layout;
+                                        }
+                                        next.state.automatic_inputs.remove(&id);
                                     }
                                 }
-                            }
-                            let boundary = next.operations.last().unwrap();
-                            let tensors = boundary
-                                .inputs
-                                .iter()
-                                .chain(&boundary.results)
-                                .map(|id| &next.state.get(*id).tensor_type);
-                            let mut usage = MemoryUsage::default();
-                            let mut maximum_standard = 0;
-                            for tensor in tensors {
-                                let memory = crate::estimate::tensor_memory(tensor);
-                                usage = usage.saturating_add(memory);
-                                maximum_standard = maximum_standard.max(memory.standard);
-                            }
-                            next.peak_memory.observe(usage, maximum_standard);
-                            refresh_exchange_rows(&mut next, costs);
-                            next
-                        })
+                                let previous_values = next.state.values.len();
+                                apply_selected_plan(
+                                    operation,
+                                    (*output_shape).clone(),
+                                    plan.clone(),
+                                    &cast_orders,
+                                    &operation
+                                        .inputs
+                                        .iter()
+                                        .map(|value| {
+                                            value_uses.get(value).copied().unwrap_or(0) == 1
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    costs,
+                                    &mut next.values,
+                                    &mut next.state,
+                                    &mut next.operations,
+                                );
+                                if compact {
+                                    let origins = compact_inputs
+                                        .iter()
+                                        .map(|id| next.state.get(*id).origin)
+                                        .collect::<BTreeSet<_>>();
+                                    for value in &mut next.state.values[previous_values..] {
+                                        if origins.contains(&value.origin) {
+                                            value.storage_group = value.id;
+                                            value.tile_offset = 0;
+                                        }
+                                    }
+                                }
+                                let boundary = next.operations.last().unwrap();
+                                let tensors = boundary
+                                    .inputs
+                                    .iter()
+                                    .chain(&boundary.results)
+                                    .map(|id| &next.state.get(*id).tensor_type);
+                                let mut usage = MemoryUsage::default();
+                                let mut maximum_standard = 0;
+                                for tensor in tensors {
+                                    let memory = crate::estimate::tensor_memory(tensor);
+                                    usage = usage.saturating_add(memory);
+                                    maximum_standard = maximum_standard.max(memory.standard);
+                                }
+                                next.peak_memory.observe(usage, maximum_standard);
+                                refresh_exchange_rows(&mut next, costs);
+                                next
+                            })
                     })
                     .collect::<Vec<_>>();
                 expanded.extend(evaluated);
@@ -834,8 +850,11 @@ pub(super) fn lower_operation_candidates(
                         if candidate.fits_ipu21_with_budget(
                             config.standard_memory_reservation_bytes,
                             config.tile_memory_budget_bytes,
-                        ) || (candidate.total, candidate.interleaved)
-                            < (peak.total, peak.interleaved)
+                        ) || (!peak.fits_ipu21_with_budget(
+                            config.standard_memory_reservation_bytes,
+                            config.tile_memory_budget_bytes,
+                        ) && (candidate.total, candidate.interleaved)
+                            < (peak.total, peak.interleaved))
                         {
                             branch = rotated;
                             peak = candidate;

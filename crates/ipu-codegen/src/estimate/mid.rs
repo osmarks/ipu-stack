@@ -224,6 +224,13 @@ fn analyze_storage<const PER_TILE: bool>(
     for value in &program.outputs {
         last[roots[value.index() as usize]] = steps.len();
     }
+    // A region argument represents a resident sequence, not just this
+    // iteration's block. Its later members remain needed after the local use.
+    for (&value, &count) in copies {
+        if count > 1 {
+            last[roots[value.index() as usize]] = steps.len();
+        }
+    }
     let mut live = vec![false; parent.len()];
     for input in &program.inputs {
         live[roots[input.value.index() as usize]] = true;

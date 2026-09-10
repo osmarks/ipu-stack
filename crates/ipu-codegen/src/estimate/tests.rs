@@ -377,4 +377,18 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     assert_eq!(peak(&program), 512);
     program.values[2].tile_offset = 7;
     assert_eq!(peak(&program), 768);
+
+    // The first parameter's later sequence members remain resident when a
+    // subsequent operation allocates its output, after the local parameter use.
+    let mut result = program.values[2].clone();
+    result.id = id(3);
+    result.storage_group = id(3);
+    program.values.push(result);
+    let mut copy = program.operations[0].clone();
+    copy.inputs = vec![id(1)];
+    copy.results = vec![id(3)];
+    program.operations.push(copy);
+    program.outputs = vec![id(2), id(3)];
+    let (_, resident) = analyze_mid(&program, &BTreeMap::from([(id(0), 3)])).unwrap();
+    assert_eq!(resident.total - resident.exchange_rows, 6 * 256);
 }
