@@ -219,9 +219,10 @@ pub(super) fn assign_parameter_tiles(
             .or_insert_with(|| vec![0; usize::from(tile_count)]);
         for owner in 0..layout.tiling.tile_count {
             bytes[usize::from(owner)] = bytes[usize::from(owner)].saturating_add(
-                resolved.tile_elements(owner)
-                    * value.tensor_type.format.precision.bytes()
-                    * u64::from(copies.get(&id).copied().unwrap_or(1)),
+                resolved
+                    .tile_elements(owner)
+                    .saturating_mul(value.tensor_type.format.precision.bytes())
+                    .saturating_mul(u64::from(copies.get(&id).copied().unwrap_or(1))),
             );
         }
     }
@@ -237,7 +238,8 @@ pub(super) fn assign_parameter_tiles(
     for (group, bytes) in groups {
         let offset = balanced_offset(&loads, &bytes);
         for (owner, bytes) in bytes.into_iter().enumerate() {
-            loads[(owner + usize::from(offset)) % usize::from(tile_count)] += bytes;
+            let load = &mut loads[(owner + usize::from(offset)) % usize::from(tile_count)];
+            *load = load.saturating_add(bytes);
         }
         offsets.insert(group, offset);
     }
