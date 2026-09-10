@@ -22,6 +22,8 @@ pub(super) trait MemoryObserver {
         _aligned_bytes: u64,
         _copies: u32,
         _bytes: u64,
+        _tile_shards: &[u64],
+        _tile_bytes: &[u64],
     ) {
     }
     fn step(
@@ -32,6 +34,8 @@ pub(super) trait MemoryObserver {
         _live: &[bool],
         _scratch: MemoryUsage,
         _usage: MemoryUsage,
+        _tile_usage: &[MemoryUsage],
+        _tile_scratch: &[MemoryUsage],
     ) {
     }
 }
@@ -115,26 +119,57 @@ pub(super) fn analyze_observed(
             tail[roots[operation.inputs[0].index() as usize]] = 8 * multiply.bytes();
         }
     }
-    let mut bytes = vec![0u64; parent.len()];
+    let tiles = usize::from(program.tile_count);
+    let mut bytes = vec![vec![0u64; tiles]; parent.len()];
     let mut classes = vec![MemoryClass::Ipu21Standard; parent.len()];
     for value in &program.values {
         let id = roots[value.id.index() as usize];
         let class = value.tensor_type.format.layout.memory_class;
-        let shard_bytes = maximum_shard_bytes(&value.tensor_type);
-        let mut size = shard_bytes.checked_add(tail[id])?;
-        if element[id] {
-            let alignment = u64::from(if class == MemoryClass::Ipu21Interleaved {
+        let layout = &value.tensor_type.format.layout;
+        let resolved = layout.resolve(&value.tensor_type.shape).ok()?;
+        if usize::from(layout.tiling.tile_count) > tiles || tiles == 0 {
+            return None;
+        }
+        let count = copies.get(&value.id).copied().unwrap_or(1);
+        let alignment = if element[id] {
+            u64::from(if class == MemoryClass::Ipu21Interleaved {
                 ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
             } else {
                 ipu_package::TILE_MEMORY_ELEMENT_SIZE
-            });
-            size = size.div_ceil(alignment).checked_mul(alignment)?;
+            })
+        } else {
+            1
+        };
+        let mut tile_shards = vec![0; tiles];
+        let mut tile_bytes = vec![0; tiles];
+        let mut aligned_bytes = 0;
+        for owner in 0..layout.tiling.tile_count {
+            let shard = resolved
+                .tile_elements(owner)
+                .checked_mul(value.tensor_type.format.precision.bytes())?;
+            if shard == 0 {
+                continue;
+            }
+            let tile = (usize::from(owner) + usize::from(value.tile_offset)) % tiles;
+            let size = shard
+                .checked_add(tail[id])?
+                .div_ceil(alignment)
+                .checked_mul(alignment)?;
+            aligned_bytes = aligned_bytes.max(size);
+            tile_shards[tile] = shard;
+            tile_bytes[tile] = size.checked_mul(u64::from(count))?;
+            bytes[id][tile] = bytes[id][tile].max(tile_bytes[tile]);
         }
-        let aligned_bytes = size;
-        let count = copies.get(&value.id).copied().unwrap_or(1);
-        size = size.checked_mul(u64::from(count))?;
-        observer.value(value, id, shard_bytes, aligned_bytes, count, size);
-        bytes[id] = bytes[id].max(size);
+        observer.value(
+            value,
+            id,
+            *tile_shards.iter().max()?,
+            aligned_bytes,
+            count,
+            *tile_bytes.iter().max()?,
+            &tile_shards,
+            &tile_bytes,
+        );
         classes[id] = class;
     }
     let mut last = vec![0usize; parent.len()];
@@ -158,6 +193,13 @@ pub(super) fn analyze_observed(
     let mut cycles = ProgramCycles::default();
     let mut peak = MemoryPeaks::default();
     let mut rows = 0u64;
+    let mut accounted = vec![false; live.len()];
+    let mut tile_live = vec![MemoryUsage::default(); tiles];
+    let maximum_sizes = bytes
+        .iter()
+        .map(|sizes| sizes.iter().copied().max().unwrap_or(0))
+        .collect::<Vec<_>>();
+
     for (index, (operation, count)) in steps.into_iter().enumerate() {
         for value in operation.inputs.iter().chain(&operation.results) {
             live[roots[value.index() as usize]] = true;
@@ -170,18 +212,69 @@ pub(super) fn analyze_observed(
             .exchange
             .saturating_add(price.exchange.saturating_mul(count));
         rows = rows.saturating_add(row_bytes);
-        let mut usage = scratch;
-        let mut maximum_standard = 0;
+        let maximum_standard = (0..live.len())
+            .filter(|&id| live[id] && classes[id] == MemoryClass::Ipu21Standard)
+            .map(|id| maximum_sizes[id])
+            .max()
+            .unwrap_or(0);
+        // Update only roots whose liveness changed since the preceding step.
         for id in 0..live.len() {
-            if live[id] {
-                usage.add_class(classes[id], bytes[id]);
-                if classes[id] == MemoryClass::Ipu21Standard {
-                    maximum_standard = maximum_standard.max(bytes[id]);
+            if live[id] == accounted[id] {
+                continue;
+            }
+            for (usage, &size) in tile_live.iter_mut().zip(&bytes[id]) {
+                if live[id] {
+                    usage.add_class(classes[id], size);
+                } else {
+                    let used = match classes[id] {
+                        MemoryClass::Ipu21Standard => &mut usage.standard,
+                        MemoryClass::Ipu21Interleaved => &mut usage.interleaved,
+                    };
+                    *used = used.checked_sub(size)?;
                 }
             }
+            accounted[id] = live[id];
         }
-        observer.step(index, operation, count, &live, scratch, usage);
-        peak.observe(usage, maximum_standard.max(scratch.standard));
+        // Reduction and conversion scratch in operation_cost is proportional
+        // to the output shard, and resides on that output's owners.
+        let mut tile_scratch = vec![MemoryUsage::default(); tiles];
+        if scratch.total() != 0 {
+            let output = &program.values[operation.results.first()?.index() as usize];
+            let layout = &output.tensor_type.format.layout;
+            let resolved = layout.resolve(&output.tensor_type.shape).ok()?;
+            let maximum = resolved.maximum_tile_elements();
+            for owner in 0..layout.tiling.tile_count {
+                let elements = resolved.tile_elements(owner);
+                let tile = (usize::from(owner) + usize::from(output.tile_offset)) % tiles;
+                tile_scratch[tile] = MemoryUsage {
+                    standard: scratch.standard.checked_mul(elements)?.div_ceil(maximum),
+                    interleaved: scratch.interleaved.checked_mul(elements)?.div_ceil(maximum),
+                };
+            }
+        }
+        let tile_usage = tile_live
+            .iter()
+            .zip(&tile_scratch)
+            .map(|(&live, &scratch)| live.saturating_add(scratch))
+            .collect::<Vec<_>>();
+        let usage = tile_usage
+            .iter()
+            .copied()
+            .max_by_key(|usage| usage.total())
+            .unwrap_or_default();
+        observer.step(
+            index,
+            operation,
+            count,
+            &live,
+            scratch,
+            usage,
+            &tile_usage,
+            &tile_scratch,
+        );
+        for &usage in &tile_usage {
+            peak.observe(usage, maximum_standard.max(scratch.standard));
+        }
         for id in 0..live.len() {
             if last[id] <= index {
                 live[id] = false;
@@ -401,15 +494,24 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
 }
 
 pub(crate) fn region_peak_memory(
+    tile_count: u16,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> MemoryPeaks {
-    region_peak_memory_with_multiplicity(initial, operations, outputs, values, &BTreeMap::new())
+    region_peak_memory_with_multiplicity(
+        tile_count,
+        initial,
+        operations,
+        outputs,
+        values,
+        &BTreeMap::new(),
+    )
 }
 
 pub(crate) fn region_peak_memory_with_multiplicity(
+    tile_count: u16,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
@@ -417,6 +519,7 @@ pub(crate) fn region_peak_memory_with_multiplicity(
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
 ) -> MemoryPeaks {
     region_estimate(
+        tile_count,
         initial,
         operations,
         outputs,
@@ -436,17 +539,19 @@ pub(crate) fn unavailable_memory() -> MemoryPeaks {
 }
 
 pub(crate) fn region_estimate(
+    tile_count: u16,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let program = resolved_region(initial, operations, outputs, values)?;
+    let program = resolved_region(tile_count, initial, operations, outputs, values)?;
     analyze(&program, allocation_multiplicity)
 }
 
 pub(super) fn resolved_region(
+    tile_count: u16,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
@@ -467,11 +572,7 @@ pub(super) fn resolved_region(
         }
     }
     let candidate = crate::MidProgram {
-        tile_count: values
-            .iter()
-            .map(|value| value.tensor_type.format.layout.tiling.tile_count)
-            .max()
-            .unwrap_or(1),
+        tile_count,
         inputs: initial
             .iter()
             .map(|&value| crate::MidInput {

@@ -222,6 +222,9 @@ fn randomized_resolved_capacity_matches_physical_storage() {
                 .unwrap();
                 tile_bytes[usize::from(tile)] += u64::from(bytes);
             }
+            for (tile, &bytes) in tile_bytes.iter().enumerate() {
+                assert_eq!(resolved.tile_elements(tile as u16) * 2, bytes);
+            }
             assert_eq!(
                 resolved.maximum_tile_elements() * 2,
                 *tile_bytes.iter().max().unwrap()
@@ -286,4 +289,58 @@ fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
                 .has_empty_shards()
         );
     }
+}
+
+#[test]
+fn live_memory_uses_physical_owners_including_wrapped_offsets() {
+    use crate::{
+        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidOperationKind, MidProgram,
+        MidValue, Primitive, ValueId,
+    };
+    let id = MidValueId::from_index;
+    let mut program = MidProgram {
+        tile_count: 8,
+        values: [7, 1, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tile_offset)| MidValue {
+                id: id(i as u32),
+                origin: ValueId::from_index(i as u32),
+                storage_group: id(i as u32),
+                tile_offset,
+                tensor_type: TensorType::new([256], Precision::F16, Layout::logical_linear(2, 4)),
+            })
+            .collect(),
+        inputs: (0..2)
+            .map(|i| MidInput {
+                name: format!("input{i}"),
+                kind: GraphInputKind::Host,
+                value: id(i),
+            })
+            .collect(),
+        operations: vec![MidOperation {
+            source: None,
+            inputs: vec![id(0)],
+            results: vec![id(2)],
+            kind: MidOperationKind::Primitive(Primitive::Copy {
+                mapping: CoordinateMapping::default(),
+                reuse_local: false,
+            }),
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        }],
+        outputs: vec![id(1), id(2)],
+        ..MidProgram::default()
+    };
+    let peak = |program: &MidProgram| {
+        let (_, peak) = analyze_mid(program, &BTreeMap::new()).unwrap();
+        peak.total - peak.exchange_rows
+    };
+    // Each allocation has 256 bytes on two owners. {7,0}, {1,2}, {3,4}
+    // are disjoint even though no layout individually uses all eight tiles.
+    assert_eq!(peak(&program), 256);
+    program.values[1].tile_offset = 7;
+    assert_eq!(peak(&program), 512);
+    program.values[2].tile_offset = 7;
+    assert_eq!(peak(&program), 768);
 }

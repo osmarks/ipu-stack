@@ -169,6 +169,26 @@ impl ResolvedLayout {
             .fold(1, u64::saturating_mul)
     }
 
+    /// Physical payload on one logical owner, without expanding row fragments.
+    pub(crate) fn tile_elements(&self, tile: u16) -> u64 {
+        if tile >= self.tile_count {
+            return 0;
+        }
+        if let Some(grain) = self.linear_grain {
+            let grains = self.shape.elements() / u64::from(grain);
+            let tiles = u64::from(self.tile_count);
+            return (grains / tiles + u64::from(u64::from(tile) < grains % tiles))
+                * u64::from(grain);
+        }
+        self.axes
+            .iter()
+            .map(|axis| {
+                let extent = axis.extent(tile);
+                u64::from(extent.physical_end - extent.start)
+            })
+            .product()
+    }
+
     pub(crate) fn shard_extents(&self) -> Result<Vec<(u16, Vec<ShardExtent>)>, LayoutError> {
         if let Some(grain) = self.linear_grain {
             let shape = &self.shape;

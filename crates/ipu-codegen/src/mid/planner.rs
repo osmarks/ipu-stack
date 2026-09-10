@@ -171,7 +171,7 @@ fn plan_in_pool(
                     (
                         branch.operations.iter().map(|operation| operation.estimated_cycles).sum(),
                         branch.operations.iter().map(|operation| operation.estimated_exchange_cycles).sum(),
-                        region_peak_memory(&initial, &branch.operations, &outputs, &branch.state.values),
+                        region_peak_memory(config.tile_count, &initial, &branch.operations, &outputs, &branch.state.values),
                     )
                 };
             tracing::info!(
@@ -569,6 +569,7 @@ pub(super) fn lower_operation_candidates(
             if let OperationKind::Repeat(repeat) = &operation.kind {
                 saw_candidate = true;
                 let body_candidates = match lower_repeat_candidates(
+                    config.tile_count,
                     operation,
                     repeat,
                     &branch,
@@ -594,6 +595,7 @@ pub(super) fn lower_operation_candidates(
                         .into_par_iter()
                         .map(|mut next| {
                             next.peak_memory = beam_memory_peak(
+                                config.tile_count,
                                 costs,
                                 &next,
                                 &initial,
@@ -733,6 +735,7 @@ pub(super) fn lower_operation_candidates(
             .into_par_iter()
             .map(|mut branch| {
                 let peak = beam_memory_peak(
+                    config.tile_count,
                     costs,
                     &branch,
                     &initial,
@@ -827,6 +830,7 @@ pub(super) fn lower_operation_candidates(
                 branch.analysis.take();
             }
             let peak = beam_memory_peak(
+                config.tile_count,
                 costs,
                 &branch,
                 &initial,
@@ -1539,6 +1543,7 @@ fn beam_allocation_copies(
 }
 
 pub(super) fn beam_memory_peak(
+    tile_count: u16,
     costs: &impl CostModel,
     branch: &BeamBranch,
     initial: &[MidValueId],
@@ -1554,6 +1559,7 @@ pub(super) fn beam_memory_peak(
         .analysis
         .get_or_init(|| {
             let (cycles, peak) = crate::estimate::region_estimate(
+                tile_count,
                 initial,
                 &branch.operations,
                 &live,
@@ -1608,6 +1614,7 @@ pub(super) fn plan_fits_operator_memory(
 
 #[allow(clippy::too_many_arguments)]
 fn lower_repeat_candidates(
+    tile_count: u16,
     operation: &Operation,
     repeat: &Repeat,
     branch: &BeamBranch,
@@ -1770,6 +1777,7 @@ fn lower_repeat_candidates(
             .map(|argument| (argument, repeat.count))
             .collect::<BTreeMap<_, _>>();
         let body_peak = region_peak_memory_with_multiplicity(
+            tile_count,
             &arguments,
             &body_operations,
             &yields,

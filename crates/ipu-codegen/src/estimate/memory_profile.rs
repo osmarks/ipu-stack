@@ -20,6 +20,8 @@ struct Value {
     aligned_bytes: u64,
     copies: u32,
     bytes: u64,
+    tile_shards: Vec<u64>,
+    tile_bytes: Vec<u64>,
 }
 
 #[derive(Serialize)]
@@ -31,6 +33,9 @@ struct Step {
     live: Vec<usize>,
     scratch: MemoryUsage,
     usage: MemoryUsage,
+    tile_usage: Vec<[u64; 2]>,
+    tile_scratch: Vec<[u64; 2]>,
+    coarse_usage: MemoryUsage,
 }
 
 #[derive(Default, Serialize)]
@@ -48,6 +53,8 @@ impl mid::MemoryObserver for Timeline {
         aligned_bytes: u64,
         copies: u32,
         bytes: u64,
+        tile_shards: &[u64],
+        tile_bytes: &[u64],
     ) {
         self.values.push(Value {
             id: value.id.index(),
@@ -73,6 +80,8 @@ impl mid::MemoryObserver for Timeline {
             aligned_bytes,
             copies,
             bytes,
+            tile_shards: tile_shards.to_vec(),
+            tile_bytes: tile_bytes.to_vec(),
         });
     }
 
@@ -84,6 +93,8 @@ impl mid::MemoryObserver for Timeline {
         live: &[bool],
         scratch: MemoryUsage,
         usage: MemoryUsage,
+        tile_usage: &[MemoryUsage],
+        tile_scratch: &[MemoryUsage],
     ) {
         let description = match &operation.kind {
             MidOperationKind::Primitive(Primitive::Compute { kernel, .. }) => format!("{kernel:?}"),
@@ -92,6 +103,21 @@ impl mid::MemoryObserver for Timeline {
             MidOperationKind::Repeat(repeat) => format!("Repeat {} boundary", repeat.count),
             MidOperationKind::Operator { .. } => "Operator".into(),
         };
+        let mut roots = BTreeMap::new();
+        for value in &self.values {
+            if live[value.root] {
+                let entry = roots.entry(value.root).or_insert((0, &value.class));
+                entry.0 = entry.0.max(value.bytes);
+            }
+        }
+        let mut coarse_usage = scratch;
+        for (bytes, class) in roots.values() {
+            if class.as_str() == "Ipu21Standard" {
+                coarse_usage.standard += bytes;
+            } else {
+                coarse_usage.interleaved += bytes;
+            }
+        }
         self.steps.push(Step {
             index,
             source: operation.source.map(|id| id.index()),
@@ -104,6 +130,15 @@ impl mid::MemoryObserver for Timeline {
                 .collect(),
             scratch,
             usage,
+            tile_usage: tile_usage
+                .iter()
+                .map(|u| [u.standard, u.interleaved])
+                .collect(),
+            tile_scratch: tile_scratch
+                .iter()
+                .map(|u| [u.standard, u.interleaved])
+                .collect(),
+            coarse_usage,
         });
     }
 }
@@ -191,7 +226,7 @@ fn profile(
     values: &[MidValue],
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<Profile> {
-    let program = mid::resolved_region(initial, operations, outputs, values)?;
+    let program = mid::resolved_region(config.tile_count, initial, operations, outputs, values)?;
     let mut timeline = Timeline::default();
     let (_, peak) = mid::analyze_observed(&program, copies, &mut timeline)?;
     let names = names(graph);
@@ -211,9 +246,9 @@ fn profile(
             .map(|step| step.index)
     };
     Some(Profile {
-        version: 1,
+        version: 2,
         scope: scope.into(),
-        model: "Planner estimate: sum of per-allocation maximum shard sizes, not a placed tile. Repeat execution counts do not multiply scratch. Exchange rows are reserved separately for the whole program.",
+        model: "Per-tile live storage using selected ownership, before address placement. Scratch remains estimated. Repeat execution counts do not multiply scratch. Exchange rows are reserved separately.",
         tile_count: config.tile_count,
         budget_bytes: config
             .tile_memory_budget_bytes
@@ -233,8 +268,12 @@ fn profile(
             .saturating_add(config.standard_memory_reservation_bytes),
         peak,
         total_peak_step: peak_step(|step| step.usage.total()),
-        standard_peak_step: peak_step(|step| step.usage.standard),
-        interleaved_peak_step: peak_step(|step| step.usage.interleaved),
+        standard_peak_step: peak_step(|step| {
+            step.tile_usage.iter().map(|u| u[0]).max().unwrap_or(0)
+        }),
+        interleaved_peak_step: peak_step(|step| {
+            step.tile_usage.iter().map(|u| u[1]).max().unwrap_or(0)
+        }),
         gemm_output_packing: format!("{:?}", config.gemm_output_packing),
         attention_products: format!("{:?}", config.attention_products),
         timeline,
@@ -322,6 +361,7 @@ mod tests {
         )
         .unwrap();
         let (_, expected) = mid::region_estimate(
+            config.tile_count,
             &initial,
             &program.operations,
             &program.outputs,
@@ -350,16 +390,26 @@ mod tests {
         );
         assert!(report.timeline.steps.iter().any(|s| s.execution_count == 3));
         for step in &report.timeline.steps {
-            let mut usage = step.scratch;
-            for id in &step.live {
-                let (bytes, class) = allocations[id];
-                if class == "Ipu21Standard" {
-                    usage.standard += bytes;
-                } else {
-                    usage.interleaved += bytes;
+            for tile in 0..usize::from(config.tile_count) {
+                let mut usage = step.tile_scratch[tile];
+                for id in &step.live {
+                    let aliases = report
+                        .timeline
+                        .values
+                        .iter()
+                        .filter(|v| v.root == *id)
+                        .collect::<Vec<_>>();
+                    let bytes = aliases.iter().map(|v| v.tile_bytes[tile]).max().unwrap();
+                    let class = usize::from(aliases[0].class == "Ipu21Interleaved");
+                    usage[class] += bytes;
                 }
+                assert_eq!(
+                    usage, step.tile_usage[tile],
+                    "step {}, tile {tile}",
+                    step.index
+                );
+                assert!(usage[0] + usage[1] <= step.coarse_usage.total());
             }
-            assert_eq!(usage, step.usage, "step {}", step.index);
         }
         let peak = &report.timeline.steps[report.total_peak_step.unwrap()];
         assert_eq!(
