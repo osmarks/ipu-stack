@@ -83,6 +83,7 @@ pub const COPY_STRIDED_U32_SYMBOL: &str = "copy_strided_u32";
 pub const COPY_STRIDED_U64_SYMBOL: &str = "copy_strided_u64";
 pub const FILL_ZERO_U64_SYMBOL: &str = "fill_zero_u64";
 pub const PATCH_WORD_SYMBOL: &str = "ipu_stack_static_patch_word";
+pub const PATCH_ARITHMETIC_WORD_SYMBOL: &str = "static_patch_arithmetic_word";
 pub const PATCH_ROW_SYMBOL: &str = "ipu_stack_static_patch_row";
 pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
 pub const PROGRAM_ADDRESS_SYMBOL: &str = "ipu_stack_static_program";
@@ -206,8 +207,35 @@ pub struct ExchangeSetupPatch {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExchangePatch {
     pub word_offset: u32,
-    /// Full replacement instruction words, indexed by repeat iteration.
-    pub values: PlacedExchangeRow,
+    pub values: ExchangePatchValues,
+}
+
+/// Replacement instruction words, represented exactly rather than approximately.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ExchangePatchValues {
+    Table(PlacedExchangeRow),
+    Arithmetic { initial: u32, step: u32 },
+}
+
+impl ExchangePatchValues {
+    fn valid_for_count(&self, count: u32) -> bool {
+        match self {
+            Self::Table(row) => row.words.len() == count as usize && row.address.is_multiple_of(4),
+            Self::Arithmetic { .. } => count != 0,
+        }
+    }
+}
+
+pub(crate) fn arithmetic_progression(words: &[u32]) -> Option<(u32, u32)> {
+    if words.len() < 3 {
+        return None;
+    }
+    let step = words[1].wrapping_sub(words[0]);
+    words
+        .windows(2)
+        .all(|pair| pair[1].wrapping_sub(pair[0]) == step)
+        .then_some((words[0], step))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,12 +524,12 @@ fn emit_steps(
                     exchange_rows.push(patch.offsets.clone());
                     exchange_rows.push(patch.values.clone());
                 }
-                exchange_rows.extend(
-                    exchange
-                        .repeat_patches
-                        .iter()
-                        .map(|patch| patch.values.clone()),
-                );
+                exchange_rows.extend(exchange.repeat_patches.iter().filter_map(|patch| {
+                    match &patch.values {
+                        ExchangePatchValues::Table(row) => Some(row.clone()),
+                        ExchangePatchValues::Arithmetic { .. } => None,
+                    }
+                }));
             }
             TileStep::Compute(compute) => {
                 if let Some(address) = compute.profile.before {
@@ -599,9 +627,8 @@ fn validate_steps(
                     return Err(invalid("exchange setup patch has an invalid shape"));
                 }
                 for patch in &exchange.repeat_patches {
-                    if repeat_count.is_none_or(|count| patch.values.words.len() != count as usize)
+                    if repeat_count.is_none_or(|count| !patch.values.valid_for_count(count))
                         || patch.word_offset as usize >= exchange.program.words.len()
-                        || patch.values.address & 0b11 != 0
                     {
                         return Err(invalid("exchange patch has invalid shape or address"));
                     }
@@ -705,7 +732,6 @@ fn emit_exchange_patches(
     repeat_count: u32,
     symbols: &BTreeMap<String, u32>,
 ) -> Result<()> {
-    let helper = symbol(symbols, PATCH_WORD_SYMBOL)?;
     for patch in &exchange.repeat_patches {
         let byte_offset = patch
             .word_offset
@@ -719,10 +745,20 @@ fn emit_exchange_patches(
                 .checked_add(byte_offset)
                 .ok_or_else(|| invalid("exchange patch address overflow"))?,
         )?;
-        code.setzi(3, patch.values.address)?;
+        let helper = match &patch.values {
+            ExchangePatchValues::Table(row) => {
+                code.setzi(3, row.address)?;
+                PATCH_WORD_SYMBOL
+            }
+            ExchangePatchValues::Arithmetic { initial, step } => {
+                code.setzi(3, *initial)?;
+                code.setzi(6, *step)?;
+                PATCH_ARITHMETIC_WORD_SYMBOL
+            }
+        };
         code.ld32(4, 11, 15, 0)?;
         code.setzi(5, repeat_count)?;
-        code.call(helper, 9)?;
+        code.call(symbol(symbols, helper)?, 9)?;
     }
     Ok(())
 }
@@ -1085,6 +1121,7 @@ mod tests {
             (REPEAT_CALL_SYMBOL.into(), 0x5000c),
             (SAMPLE_CYCLE_SYMBOL.into(), 0x50010),
             (PATCH_WORD_SYMBOL.into(), 0x50014),
+            (PATCH_ARITHMETIC_WORD_SYMBOL.into(), 0x50018),
             ("gemm".into(), 0x51000),
         ]
         .into_iter()
@@ -1174,9 +1211,32 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_patch_detection_is_exact_across_word_overflow() {
+        let mut random = fastrand::Rng::with_seed(0x61726974686d);
+        for _ in 0..256 {
+            let initial = random.u32(..);
+            let step = random.u32(..);
+            let count = random.u32(3..=128);
+            let mut words = (0..count)
+                .map(|i| initial.wrapping_add(step.wrapping_mul(i)))
+                .collect::<Vec<_>>();
+            assert_eq!(arithmetic_progression(&words), Some((initial, step)));
+            words[1] ^= 1;
+            assert_eq!(arithmetic_progression(&words), None);
+        }
+        assert_eq!(arithmetic_progression(&[1, 2]), None);
+        let legacy = serde_json::json!({"address": 0x60000, "words": [1, 4, 8]});
+        assert!(matches!(
+            serde_json::from_value::<ExchangePatchValues>(legacy).unwrap(),
+            ExchangePatchValues::Table(_)
+        ));
+    }
+
+    #[test]
     fn randomized_repeat_patch_code_is_independent_of_iteration_count() {
         let mut random = fastrand::Rng::with_seed(0x7061_7463_685f_7265);
         let mut code_bytes = None;
+        let mut arithmetic_code_bytes = None;
         for _ in 0..64 {
             let count = random.u32(2..=128);
             let values = (0..count).map(|_| random.u32(..)).collect::<Vec<_>>();
@@ -1204,10 +1264,10 @@ mod tests {
                         setup_patch: None,
                         repeat_patches: vec![ExchangePatch {
                             word_offset: 0,
-                            values: PlacedExchangeRow {
+                            values: ExchangePatchValues::Table(PlacedExchangeRow {
                                 address: 0x61000,
                                 words: values.clone(),
-                            },
+                            }),
                         }],
                         profile: StepProfile::default(),
                     })],
@@ -1240,6 +1300,36 @@ mod tests {
             );
             assert_eq!(
                 *code_bytes.get_or_insert(generated.bytes.len()),
+                generated.bytes.len()
+            );
+            let mut program = program;
+            let TileStep::Repeat(repeat) = &mut program.steps[0] else {
+                unreachable!()
+            };
+            let TileStep::Exchange(exchange) = &mut repeat.body[0] else {
+                unreachable!()
+            };
+            exchange.repeat_patches[0].values = ExchangePatchValues::Arithmetic {
+                initial: 0xeffffff0,
+                step: 0xffffc000,
+            };
+            let generated = emit(
+                &program,
+                &symbols(),
+                &HostProgram::default(),
+                &CodegenOptions {
+                    code_address: 0x52000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                generated.exchange_rows.len(),
+                1,
+                "arithmetic patches allocate no value table"
+            );
+            assert_eq!(
+                *arithmetic_code_bytes.get_or_insert(generated.bytes.len()),
                 generated.bytes.len()
             );
         }

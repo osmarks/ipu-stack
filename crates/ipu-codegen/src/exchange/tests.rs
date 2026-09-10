@@ -833,6 +833,22 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
             .flatten()
             .any(|patch| patch.values.len() == 27)
     );
+    let compact = crate::tile::compact_exchange_table_bytes(&exchanges.phases, 1472, 1472).unwrap();
+    let mut explicit = exchanges.phases.clone();
+    let mut changed = 0;
+    for patch in explicit
+        .iter_mut()
+        .flat_map(|phase| &mut phase.repeat_patches)
+        .flatten()
+    {
+        if crate::arithmetic_progression(&patch.values).is_some() {
+            patch.values[1] ^= 1; // Force the table fallback; this variant is never executed.
+            changed += 1;
+        }
+    }
+    assert!(changed > 0);
+    let expanded = crate::tile::compact_exchange_table_bytes(&explicit, 1472, 1472).unwrap();
+    assert!(compact < expanded);
 }
 
 #[test]

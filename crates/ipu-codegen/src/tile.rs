@@ -416,7 +416,7 @@ fn lower_repeat(
         if exchange
             .repeat_patches
             .iter()
-            .any(|patch| patch.values.words.len() != repeat.count as usize)
+            .any(|patch| !patch.values.valid_for_count(repeat.count))
         {
             return Err(TileLoweringError::InvalidRepeat);
         }
@@ -643,21 +643,27 @@ fn layout_exchange_rows(
         let mut repeat_patches = Vec::new();
         if tile < scheduled_tile_count {
             for patch in &phase.repeat_patches[usize::from(tile)] {
-                let address = cursor;
-                cursor = cursor
-                    .checked_add(
-                        u32::try_from(patch.values.len())
-                            .map_err(|_| TileLoweringError::Overflow)?
-                            .checked_mul(4)
-                            .ok_or(TileLoweringError::Overflow)?,
-                    )
-                    .ok_or(TileLoweringError::Overflow)?;
+                let values =
+                    if let Some((initial, step)) = crate::arithmetic_progression(&patch.values) {
+                        crate::ExchangePatchValues::Arithmetic { initial, step }
+                    } else {
+                        let address = cursor;
+                        cursor = cursor
+                            .checked_add(
+                                u32::try_from(patch.values.len())
+                                    .map_err(|_| TileLoweringError::Overflow)?
+                                    .checked_mul(4)
+                                    .ok_or(TileLoweringError::Overflow)?,
+                            )
+                            .ok_or(TileLoweringError::Overflow)?;
+                        crate::ExchangePatchValues::Table(PlacedExchangeRow {
+                            address,
+                            words: patch.values.clone(),
+                        })
+                    };
                 repeat_patches.push(ExchangePatch {
                     word_offset: patch.word_offset,
-                    values: PlacedExchangeRow {
-                        address,
-                        words: patch.values.clone(),
-                    },
+                    values,
                 });
             }
         }

@@ -403,6 +403,26 @@ fn build_package_from_objects(
         execution_tile_count,
         program.tile_count,
     )?;
+    let mut repeat_bytes = vec![0usize; usize::from(program.tile_count)];
+    let mut arithmetic_savings = repeat_bytes.clone();
+    for phase in provisional_exchanges {
+        for (tile, patches) in phase.repeat_patches.iter().enumerate() {
+            for patch in patches {
+                let words = &patch.values;
+                repeat_bytes[tile] += 4 * words.len();
+                if crate::arithmetic_progression(words).is_some() {
+                    arithmetic_savings[tile] += 4 * words.len();
+                }
+            }
+        }
+    }
+    tracing::info!(
+        exchange_table_bytes,
+        maximum_uncompressed_repeat_patch_bytes = repeat_bytes.iter().max().copied().unwrap_or(0),
+        maximum_elided_arithmetic_patch_bytes =
+            arithmetic_savings.iter().max().copied().unwrap_or(0),
+        "exchange table and repeat patch storage"
+    );
     validation::check_exchange_budget(u64::from(exchange_table_bytes), config)?;
     let profile_samples = config.profiling.then(|| {
         program
@@ -1160,6 +1180,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
         symbols.push(crate::PATCH_ROW_SYMBOL.into());
         if !program.repeat_runs.is_empty() {
             symbols.push(crate::PATCH_WORD_SYMBOL.into());
+            symbols.push(crate::PATCH_ARITHMETIC_WORD_SYMBOL.into());
         }
     }
     if config.profiling {

@@ -194,6 +194,21 @@ ipu_stack_static_patch_word:
 	br $m9
 	.size ipu_stack_static_patch_word, .-ipu_stack_static_patch_word
 
+	.section .text.static_patch_arithmetic_word,"ax",@progbits
+	// m2 destination, m3 initial word, m4 remaining, m5 total, m6 step.
+	// Low 32-bit arithmetic exactly matches the verified instruction-word series.
+	.globl static_patch_arithmetic_word
+	.p2align 2
+	.type static_patch_arithmetic_word,@function
+static_patch_arithmetic_word:
+	.supervisor
+	sub $m5, $m5, $m4
+	mul $m6, $m6, $m5
+	add $m3, $m3, $m6
+	st32 $m3, $m2, $m15, 0
+	br $m9
+	.size static_patch_arithmetic_word, .-static_patch_arithmetic_word
+
 	.section .text.ipu_stack_static_patch_row,"ax",@progbits
 	// Runtime helper ABI: m2 row base, m3 offsets, m4 values, m5 word count,
 	// m9 return. Patching occurs before the exchange synchronization boundary.
