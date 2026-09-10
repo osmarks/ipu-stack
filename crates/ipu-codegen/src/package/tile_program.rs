@@ -101,23 +101,12 @@ pub fn build_tile_program_package(
     // Generated and linked code use common addresses on every tile, so choose
     // them against the union of tile-local data and row ranges. Data on one
     // tile may otherwise legally share an address with a row on another tile.
-    let mut tile_local_ranges = tile_data
+    let tile_local_ranges = tile_data
         .into_iter()
         .chain(tile_rows)
         .flatten()
         .collect::<Vec<_>>();
-    tile_local_ranges.sort_unstable();
-    let mut merged_tile_local = Vec::<(u32, u32)>::new();
-    for (start, end) in tile_local_ranges {
-        if let Some((_, previous_end)) = merged_tile_local.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged_tile_local.push((start, end));
-        }
-    }
-    for (start, end) in merged_tile_local {
+    for (start, end) in crate::memory::merge_ranges(tile_local_ranges) {
         memory.reserve("tile-local data or exchange rows", start..end)?;
     }
 
@@ -145,7 +134,7 @@ pub fn build_tile_program_package(
     };
     let mut run_outputs = outputs.to_vec();
     run_outputs.push(finish);
-    let host_bounds = crate::IPU21_DATA_BASE..TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE;
+    let host_bounds = crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT;
     let sizing_host_base = memory.next_free(
         RUNTIME_EXECUTABLE_START,
         RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
@@ -178,25 +167,14 @@ pub fn build_tile_program_package(
     if host.end - host_code.range.start > host_code_bytes {
         return Err(invalid("host program grew after placement"));
     }
-    let mut host_data_ranges = host
+    let host_data_ranges = host
         .segments
         .iter()
         .flatten()
         .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
         .map(|segment| (segment.address, segment.address + segment.memory_size))
         .collect::<Vec<_>>();
-    host_data_ranges.sort_unstable();
-    let mut merged_host_data = Vec::<(u32, u32)>::new();
-    for (start, end) in host_data_ranges {
-        if let Some((_, previous_end)) = merged_host_data.last_mut()
-            && start <= *previous_end
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged_host_data.push((start, end));
-        }
-    }
-    for (start, end) in merged_host_data {
+    for (start, end) in crate::memory::merge_ranges(host_data_ranges) {
         memory.reserve("host program data", start..end)?;
     }
 

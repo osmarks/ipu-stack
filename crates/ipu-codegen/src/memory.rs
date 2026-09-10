@@ -193,6 +193,22 @@ impl TileMemoryMap {
     }
 }
 
+/// Union occupied ranges, including aliases and adjacent allocations.
+pub(crate) fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.sort_unstable();
+    let mut merged = Vec::<(u32, u32)>::new();
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
 fn align_up(value: u32, alignment: u32, name: &'static str) -> Result<u32, MemoryLayoutError> {
     value
         .checked_add(alignment - 1)

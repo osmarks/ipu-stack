@@ -81,26 +81,22 @@ impl MemoryPeaks {
             // Exact encoded rows participate in package acceptance after scheduling.
             && self.total.saturating_add(reserved_standard_bytes)
                 <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
-            && self.contiguous_overflow(reserved_standard_bytes) == 0
+            && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
     }
 
     pub(crate) fn standard_contiguous_overflow(self) -> u64 {
-        self.contiguous_overflow(0)
+        self.standard_contiguous_overflow_with_reservation(0)
     }
 
     pub fn standard_contiguous_overflow_with_reservation(
         self,
         reserved_standard_bytes: u64,
     ) -> u64 {
-        self.contiguous_overflow(reserved_standard_bytes)
-    }
-
-    fn contiguous_overflow(self, reserved: u64) -> u64 {
         // A standard buffer can use all of region 1 when interleaved
         // temporaries are dead. Do not subtract an unrelated class peak.
         let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
-        let lower_standard =
-            u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES).saturating_sub(reserved);
+        let lower_standard = u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES)
+            .saturating_sub(reserved_standard_bytes);
         self.maximum_standard_allocation
             .saturating_sub(lower_standard.max(upper_standard))
     }

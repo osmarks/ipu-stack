@@ -989,15 +989,7 @@ impl Arena {
     }
 
     fn unused_ranges(&self) -> Vec<(u32, u32)> {
-        let mut occupied = self.occupied.clone();
-        occupied.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::new();
-        for range in occupied {
-            match merged.last_mut() {
-                Some(previous) if range.0 <= previous.1 => previous.1 = previous.1.max(range.1),
-                _ => merged.push(range),
-            }
-        }
+        let merged = crate::memory::merge_ranges(self.occupied.clone());
         let mut unused = Vec::new();
         for &(base, limit) in &self.ranges {
             let mut cursor = base;
