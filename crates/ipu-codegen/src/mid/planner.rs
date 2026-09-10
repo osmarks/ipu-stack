@@ -440,7 +440,7 @@ fn future_format_compatibility(
     )
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct RegionPlanningConstraints {
     /// Number of simultaneously resident blocks represented by a region value.
     pub(super) allocation_copies: BTreeMap<ValueId, u32>,
@@ -520,6 +520,7 @@ pub(super) fn lower_operation_candidates(
         let mut expanded = Vec::new();
         let mut rejected_memory = Vec::new();
         let mut saw_candidate = false;
+        let mut region_failure = None;
         let mut candidates = CandidateSearch::new(
             operation,
             &source[operation_index + 1..],
@@ -531,118 +532,155 @@ pub(super) fn lower_operation_candidates(
             config,
             &demands,
         );
+        let mut regions = match &operation.kind {
+            OperationKind::Repeat(repeat) => Some(super::region::RegionSearch::new(
+                &repeat.body.operations,
+                &repeat.body.yields,
+                &repeat.body.value_shapes,
+                graph,
+                config,
+                costs,
+            )),
+            _ => None,
+        };
         for branch in beam {
             if let OperationKind::Repeat(repeat) = &operation.kind {
                 saw_candidate = true;
-                let mut next = branch.clone();
-                next.analysis.take();
-                lower_repeat(
+                let body_candidates = match lower_repeat_candidates(
                     operation,
                     repeat,
-                    &mut next.values,
+                    &branch,
                     graph,
-                    config,
                     costs,
-                    &mut next.state,
-                    &mut next.operations,
-                )?;
-                refresh_exchange_rows(&mut next, costs);
-                expanded.push(next);
-                continue;
-            }
-            let input_ids = operation
-                .inputs
-                .iter()
-                .map(|value| lookup(&branch.values, *value))
-                .collect::<LoweringResult<Vec<_>>>()?;
-            let input_types = input_ids
-                .iter()
-                .map(|value| branch.state.get(*value).tensor_type.clone())
-                .collect::<Vec<_>>();
-            let output_shape = shapes
-                .get(&operation.results[0])
-                .cloned()
-                .ok_or(LoweringError::MissingShape(operation.results[0]))?;
-            let parameter_inputs = input_ids
-                .iter()
-                .map(|id| branch.state.parameter_values.contains(id))
-                .collect::<Vec<_>>();
-            let automatic_inputs = input_ids
-                .iter()
-                .map(|id| branch.state.automatic_inputs.contains(id))
-                .collect::<Vec<_>>();
-            let candidate_plans = candidates.generate(
-                &input_types,
-                &parameter_inputs,
-                &automatic_inputs,
-                &output_shape,
-                costs,
-            )?;
-            saw_candidate |= !candidate_plans.is_empty();
-            let evaluated = candidate_plans
-                .into_par_iter()
-                .flat_map_iter(|plan| {
-                    let mut orders = vec![Vec::new()];
-                    for (&input, requirement) in input_ids.iter().zip(&plan.requirements.inputs) {
-                        let tensor = &branch.state.get(input).tensor_type;
-                        let alternatives = !branch.state.automatic_inputs.contains(&input)
-                            && early_cast_format(tensor, &requirement.format).is_some()
-                            && tensor.format.layout != requirement.format.layout;
-                        orders = orders
-                            .into_iter()
-                            .flat_map(|order| {
-                                [false, true]
-                                    .into_iter()
-                                    .take(if alternatives { 2 } else { 1 })
-                                    .map(move |early| {
-                                        let mut next = order.clone();
-                                        next.push(early);
-                                        next
-                                    })
-                            })
-                            .collect();
+                    regions.as_mut().unwrap(),
+                ) {
+                    Ok(candidates) => candidates,
+                    Err(
+                        error @ (LoweringError::NoCandidate(_)
+                        | LoweringError::InsufficientMemory { .. }),
+                    ) => {
+                        region_failure = Some(error);
+                        continue;
                     }
-                    let branch = &branch;
-                    let output_shape = &output_shape;
-                    let value_uses = &value_uses;
-                    orders.into_iter().map(move |cast_orders| {
-                        let mut next = branch.clone();
-                        next.analysis.take();
-                        apply_selected_plan(
-                            operation,
-                            (*output_shape).clone(),
-                            plan.clone(),
-                            &cast_orders,
-                            &operation
+                    Err(error) => return Err(error),
+                };
+                // Compare complete memory footprints before pruning the product
+                // of outer prefixes and body alternatives. The body cache itself
+                // deliberately does not depend on unrelated outer live values.
+                expanded.extend(
+                    body_candidates
+                        .into_par_iter()
+                        .map(|mut next| {
+                            next.peak_memory = beam_memory_peak(
+                                costs,
+                                &next,
+                                &initial,
+                                source,
+                                operation_index,
+                                required_outputs,
+                                graph,
+                                &constraints.allocation_copies,
+                            );
+                            next
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                let input_ids = operation
+                    .inputs
+                    .iter()
+                    .map(|value| lookup(&branch.values, *value))
+                    .collect::<LoweringResult<Vec<_>>>()?;
+                let input_types = input_ids
+                    .iter()
+                    .map(|value| branch.state.get(*value).tensor_type.clone())
+                    .collect::<Vec<_>>();
+                let output_shape = shapes
+                    .get(&operation.results[0])
+                    .cloned()
+                    .ok_or(LoweringError::MissingShape(operation.results[0]))?;
+                let parameter_inputs = input_ids
+                    .iter()
+                    .map(|id| branch.state.parameter_values.contains(id))
+                    .collect::<Vec<_>>();
+                let automatic_inputs = input_ids
+                    .iter()
+                    .map(|id| branch.state.automatic_inputs.contains(id))
+                    .collect::<Vec<_>>();
+                let candidate_plans = candidates.generate(
+                    &input_types,
+                    &parameter_inputs,
+                    &automatic_inputs,
+                    &output_shape,
+                    costs,
+                )?;
+                saw_candidate |= !candidate_plans.is_empty();
+                let evaluated = candidate_plans
+                    .into_par_iter()
+                    .flat_map_iter(|plan| {
+                        let mut orders = vec![Vec::new()];
+                        for (&input, requirement) in input_ids.iter().zip(&plan.requirements.inputs)
+                        {
+                            let tensor = &branch.state.get(input).tensor_type;
+                            let alternatives = !branch.state.automatic_inputs.contains(&input)
+                                && early_cast_format(tensor, &requirement.format).is_some()
+                                && tensor.format.layout != requirement.format.layout;
+                            orders = orders
+                                .into_iter()
+                                .flat_map(|order| {
+                                    [false, true]
+                                        .into_iter()
+                                        .take(if alternatives { 2 } else { 1 })
+                                        .map(move |early| {
+                                            let mut next = order.clone();
+                                            next.push(early);
+                                            next
+                                        })
+                                })
+                                .collect();
+                        }
+                        let branch = &branch;
+                        let output_shape = &output_shape;
+                        let value_uses = &value_uses;
+                        orders.into_iter().map(move |cast_orders| {
+                            let mut next = branch.clone();
+                            next.analysis.take();
+                            apply_selected_plan(
+                                operation,
+                                (*output_shape).clone(),
+                                plan.clone(),
+                                &cast_orders,
+                                &operation
+                                    .inputs
+                                    .iter()
+                                    .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
+                                    .collect::<Vec<_>>(),
+                                costs,
+                                &mut next.values,
+                                &mut next.state,
+                                &mut next.operations,
+                            );
+                            let boundary = next.operations.last().unwrap();
+                            let tensors = boundary
                                 .inputs
                                 .iter()
-                                .map(|value| value_uses.get(value).copied().unwrap_or(0) == 1)
-                                .collect::<Vec<_>>(),
-                            costs,
-                            &mut next.values,
-                            &mut next.state,
-                            &mut next.operations,
-                        );
-                        let boundary = next.operations.last().unwrap();
-                        let tensors = boundary
-                            .inputs
-                            .iter()
-                            .chain(&boundary.results)
-                            .map(|id| &next.state.get(*id).tensor_type);
-                        let mut usage = MemoryUsage::default();
-                        let mut maximum_standard = 0;
-                        for tensor in tensors {
-                            let memory = crate::estimate::tensor_memory(tensor);
-                            usage = usage.saturating_add(memory);
-                            maximum_standard = maximum_standard.max(memory.standard);
-                        }
-                        next.peak_memory.observe(usage, maximum_standard);
-                        refresh_exchange_rows(&mut next, costs);
-                        next
+                                .chain(&boundary.results)
+                                .map(|id| &next.state.get(*id).tensor_type);
+                            let mut usage = MemoryUsage::default();
+                            let mut maximum_standard = 0;
+                            for tensor in tensors {
+                                let memory = crate::estimate::tensor_memory(tensor);
+                                usage = usage.saturating_add(memory);
+                                maximum_standard = maximum_standard.max(memory.standard);
+                            }
+                            next.peak_memory.observe(usage, maximum_standard);
+                            refresh_exchange_rows(&mut next, costs);
+                            next
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            expanded.extend(evaluated);
+                    .collect::<Vec<_>>();
+                expanded.extend(evaluated);
+            }
             // Prune between parent branches as well as at the end of the
             // operation. Executable fragments can be large; retaining every
             // rejected Cartesian-product branch defeats the planning beam.
@@ -717,7 +755,7 @@ pub(super) fn lower_operation_candidates(
                         ),
                 });
             }
-            return Err(LoweringError::NoCandidate(operation.id));
+            return Err(region_failure.unwrap_or(LoweringError::NoCandidate(operation.id)));
         }
         let expanded_count = expanded.len();
         let (expanded, dominated, equivalent, diversity) = retain_pareto_beam(
@@ -782,35 +820,6 @@ pub(super) fn lower_operation_candidates(
         return Err(LoweringError::NoCandidate(source[0].id));
     }
     Ok(beam)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn lower_operations(
-    source: &[Operation],
-    required_outputs: &[ValueId],
-    values: &mut BTreeMap<ValueId, MidValueId>,
-    shapes: &BTreeMap<ValueId, TensorShape>,
-    graph: &ComputeGraph,
-    config: &PipelineConfig,
-    costs: &impl CostModel,
-    state: &mut LoweringState,
-    constraints: &RegionPlanningConstraints,
-) -> LoweringResult<Vec<MidOperation>> {
-    let mut candidates = lower_operation_candidates(
-        source,
-        required_outputs,
-        values,
-        shapes,
-        graph,
-        config,
-        costs,
-        state,
-        constraints,
-    )?;
-    let best = candidates.remove(0);
-    *values = best.values;
-    *state = best.state;
-    Ok(best.operations)
 }
 
 /// The input is latency-ranked. Preserve resource extremes before filling
@@ -1543,32 +1552,29 @@ pub(super) fn plan_fits_operator_memory(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn lower_repeat(
+fn lower_repeat_candidates(
     operation: &Operation,
     repeat: &Repeat,
-    values: &mut BTreeMap<ValueId, MidValueId>,
+    branch: &BeamBranch,
     graph: &ComputeGraph,
-    config: &PipelineConfig,
     costs: &impl CostModel,
-    state: &mut LoweringState,
-    operations: &mut Vec<MidOperation>,
-) -> LoweringResult<()> {
+    search: &mut super::region::RegionSearch<'_, impl CostModel>,
+) -> LoweringResult<Vec<BeamBranch>> {
+    let mut prepared = branch.clone();
+    prepared.analysis.take();
+    let values = &prepared.values;
+    let state = &mut prepared.state;
     let inputs = operation
         .inputs
         .iter()
         .map(|value| lookup(values, *value))
         .collect::<LoweringResult<Vec<_>>>()?;
-    let mut argument_types = inputs
-        .iter()
-        .map(|value| state.get(*value).tensor_type.clone())
-        .collect::<Vec<_>>();
     let mut raw_iterated_inputs = Vec::with_capacity(repeat.iterated_inputs.len());
     let mut iterated_parameters = Vec::with_capacity(repeat.iterated_inputs.len());
     let mut iterated_automatic = Vec::with_capacity(repeat.iterated_inputs.len());
     for sequence_id in &repeat.iterated_inputs {
         let sequence = &graph.sequences()[sequence_id.index() as usize];
         let first = lookup(values, sequence.values[0])?;
-        let first_type = state.get(first).tensor_type.clone();
         let sequence_values: Vec<_> = sequence
             .values
             .iter()
@@ -1589,46 +1595,32 @@ pub(super) fn lower_repeat(
                 .all(|value| state.automatic_inputs.contains(value)),
         );
         raw_iterated_inputs.push(sequence_values);
-        argument_types.push(first_type);
     }
-    let mut body_values = BTreeMap::new();
-    let mut arguments = Vec::new();
-    for (argument_index, (&origin, tensor_type)) in
-        repeat.body.arguments.iter().zip(argument_types).enumerate()
-    {
-        let storage_group = if argument_index < inputs.len() {
-            state.get(inputs[argument_index]).storage_group
-        } else {
-            state
-                .get(raw_iterated_inputs[argument_index - inputs.len()][0])
-                .storage_group
-        };
-        let value = state.value_in_storage_group(origin, tensor_type, storage_group);
-        if argument_index < inputs.len() {
-            // A carried buffer persists across iterations. Letting its first
-            // consumer retarget it to a replicated GEMM input also forces the
-            // loop output to retain every replica. Keep its boundary layout;
-            // ordinary mid conversions prepare each consumer's operands.
-            if argument_index >= repeat.carried_inputs
-                && state.automatic_inputs.contains(&inputs[argument_index])
-            {
-                state.automatic_inputs.insert(value);
+    let bindings = inputs
+        .iter()
+        .copied()
+        .chain(raw_iterated_inputs.iter().map(|sequence| sequence[0]))
+        .collect::<Vec<_>>();
+    let boundary = super::region::RegionBoundary::new(
+        &repeat.body.arguments,
+        &bindings,
+        state,
+        |index| {
+            if index < inputs.len() {
+                // Carried layouts must remain stable across iterations.
+                index >= repeat.carried_inputs && state.automatic_inputs.contains(&inputs[index])
+            } else {
+                iterated_automatic[index - inputs.len()]
             }
-            if state.parameter_values.contains(&inputs[argument_index]) {
-                state.parameter_values.insert(value);
+        },
+        |index| {
+            if index < inputs.len() {
+                state.parameter_values.contains(&inputs[index])
+            } else {
+                iterated_parameters[index - inputs.len()]
             }
-        } else {
-            let iterated_index = argument_index - inputs.len();
-            if iterated_automatic[iterated_index] {
-                state.automatic_inputs.insert(value);
-            }
-            if iterated_parameters[iterated_index] {
-                state.parameter_values.insert(value);
-            }
-        }
-        body_values.insert(origin, value);
-        arguments.push(value);
-    }
+        },
+    );
     let body_allocation_copies = repeat
         .body
         .arguments
@@ -1649,117 +1641,118 @@ pub(super) fn lower_repeat(
         allocation_copies: body_allocation_copies,
         required_equal_formats,
     };
-    let mut body_operations = lower_operations(
-        &repeat.body.operations,
-        &repeat.body.yields,
-        &mut body_values,
-        &repeat.body.value_shapes,
-        graph,
-        config,
-        costs,
-        state,
-        &body_constraints,
-    )?;
-    for index in 0..inputs.len() {
-        let body_layout = state
-            .get(arguments[index])
-            .tensor_type
-            .format
-            .layout
-            .clone();
-        state.retarget_automatic_input(inputs[index], body_layout);
-    }
-    let iterated_inputs = raw_iterated_inputs
-        .into_iter()
-        .enumerate()
-        .map(|(index, sequence)| {
-            let target = state
-                .get(arguments[inputs.len() + index])
+    let candidates = search.plan(boundary, body_constraints)?;
+    let mut expanded = Vec::with_capacity(candidates.len());
+    for candidate in candidates.iter() {
+        let mut next = prepared.clone();
+        let state = &mut next.state;
+        let (arguments, body_values, mut body_operations) = candidate.attach(&bindings, state);
+        let operations = &mut next.operations;
+        let values = &mut next.values;
+        for index in 0..inputs.len() {
+            let body_layout = state
+                .get(arguments[index])
                 .tensor_type
                 .format
+                .layout
                 .clone();
-            sequence
-                .into_iter()
-                .map(|value| {
-                    ensure_format(
-                        value,
-                        target.clone(),
-                        OperandMaterialization::Complete,
-                        false,
-                        operation.id,
-                        costs,
-                        state,
-                        operations,
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let mut yields = Vec::new();
-    for (index, high_yield) in repeat.body.yields.iter().enumerate() {
-        let value = lookup(&body_values, *high_yield)?;
-        let target = state.get(inputs[index]).tensor_type.format.clone();
-        yields.push(ensure_format(
-            value,
-            target,
-            OperandMaterialization::Complete,
-            false,
-            operation.id,
-            costs,
-            state,
-            &mut body_operations,
-        ));
+            state.retarget_automatic_input(inputs[index], body_layout);
+        }
+        let iterated_inputs = raw_iterated_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, sequence)| {
+                let target = state
+                    .get(arguments[inputs.len() + index])
+                    .tensor_type
+                    .format
+                    .clone();
+                sequence
+                    .iter()
+                    .copied()
+                    .map(|value| {
+                        ensure_format(
+                            value,
+                            target.clone(),
+                            OperandMaterialization::Complete,
+                            false,
+                            operation.id,
+                            costs,
+                            state,
+                            operations,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut yields = Vec::new();
+        for (index, high_yield) in repeat.body.yields.iter().enumerate() {
+            let value = lookup(&body_values, *high_yield)?;
+            let target = state.get(inputs[index]).tensor_type.format.clone();
+            yields.push(ensure_format(
+                value,
+                target,
+                OperandMaterialization::Complete,
+                false,
+                operation.id,
+                costs,
+                state,
+                &mut body_operations,
+            ));
+        }
+        let body_cost = body_operations
+            .iter()
+            .map(|operation| operation.estimated_cycles)
+            .sum();
+        let body_exchange_cost = body_operations
+            .iter()
+            .map(|operation| operation.estimated_exchange_cycles)
+            .sum::<u64>();
+        let body_allocation_multiplicity = arguments
+            .iter()
+            .skip(inputs.len())
+            .copied()
+            .map(|argument| (argument, repeat.count))
+            .collect::<BTreeMap<_, _>>();
+        let body_peak = region_peak_memory_with_multiplicity(
+            &arguments,
+            &body_operations,
+            &yields,
+            &state.values,
+            &body_allocation_multiplicity,
+        );
+        let mut results = Vec::new();
+        for (origin, input) in operation.results.iter().zip(&inputs) {
+            let tensor_type = state.get(*input).tensor_type.clone();
+            let storage_group = state.get(*input).storage_group;
+            let result = state.value_in_storage_group(*origin, tensor_type, storage_group);
+            values.insert(*origin, result);
+            results.push(result);
+        }
+        operations.push(MidOperation {
+            source: Some(operation.id),
+            inputs: inputs.clone(),
+            results,
+            kind: MidOperationKind::Repeat(MidRepeat {
+                count: repeat.count,
+                carried_inputs: repeat.carried_inputs,
+                invariant_inputs: repeat.invariant_inputs,
+                iterated_inputs,
+                body: MidRegion {
+                    arguments,
+                    operations: body_operations,
+                    yields,
+                    estimated_cycles: body_cost,
+                    peak_memory: body_peak,
+                },
+            }),
+            estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
+            estimated_exchange_cycles: body_exchange_cost.saturating_mul(u64::from(repeat.count)),
+        });
+        refresh_exchange_rows(&mut next, costs);
+        expanded.push(next);
     }
-    let body_cost = body_operations
-        .iter()
-        .map(|operation| operation.estimated_cycles)
-        .sum();
-    let body_exchange_cost = body_operations
-        .iter()
-        .map(|operation| operation.estimated_exchange_cycles)
-        .sum::<u64>();
-    let body_allocation_multiplicity = arguments
-        .iter()
-        .skip(inputs.len())
-        .copied()
-        .map(|argument| (argument, repeat.count))
-        .collect::<BTreeMap<_, _>>();
-    let body_peak = region_peak_memory_with_multiplicity(
-        &arguments,
-        &body_operations,
-        &yields,
-        &state.values,
-        &body_allocation_multiplicity,
-    );
-    let mut results = Vec::new();
-    for (origin, input) in operation.results.iter().zip(&inputs) {
-        let tensor_type = state.get(*input).tensor_type.clone();
-        let storage_group = state.get(*input).storage_group;
-        let result = state.value_in_storage_group(*origin, tensor_type, storage_group);
-        values.insert(*origin, result);
-        results.push(result);
-    }
-    operations.push(MidOperation {
-        source: Some(operation.id),
-        inputs,
-        results,
-        kind: MidOperationKind::Repeat(MidRepeat {
-            count: repeat.count,
-            carried_inputs: repeat.carried_inputs,
-            invariant_inputs: repeat.invariant_inputs,
-            iterated_inputs,
-            body: MidRegion {
-                arguments,
-                operations: body_operations,
-                yields,
-                estimated_cycles: body_cost,
-                peak_memory: body_peak,
-            },
-        }),
-        estimated_cycles: body_cost.saturating_mul(u64::from(repeat.count)),
-        estimated_exchange_cycles: body_exchange_cost.saturating_mul(u64::from(repeat.count)),
-    });
-    Ok(())
+    Ok(expanded)
 }
 
 fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValueId> {

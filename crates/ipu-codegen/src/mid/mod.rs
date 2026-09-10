@@ -16,6 +16,7 @@ mod layout;
 mod operator;
 mod ownership;
 mod planner;
+mod region;
 mod resolved;
 mod view;
 pub use crate::graph::AxisFactorView;
@@ -488,7 +489,7 @@ pub struct MidProgram {
 
 // Estimation policy is kept in `estimate` so this module remains focused on IR and lowering.
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LoweringError {
     #[error("selected operator implementation is invalid")]
     InvalidImplementation,
