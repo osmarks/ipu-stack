@@ -836,3 +836,79 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
             .any(|patch| patch.values.len() == 27)
     );
 }
+
+#[test]
+fn repeat_sources_follow_execution_order_when_sends_fill_earlier_gaps() {
+    let topology =
+        Topology::new((0..3).map(ipu_exchange::c600_logical_to_physical).collect()).unwrap();
+    let pending = (0..2)
+        .map(|i| {
+            let address = 0x10000 + i * 0x4000;
+            PendingTransfer {
+                source: 0,
+                source_shard: BlockValueId::from_index(i),
+                source_offset: 0,
+                source_addresses: vec![address, address + 256],
+                source_elements: effective_memory_elements(address, 8),
+                destinations: vec![(i as u16 + 1, 0x80000)],
+                words: 8,
+                width: ExchangeItemWidth::Word32,
+                reserved_source: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (counts, bases) = receive_configuration(&pending, 3).unwrap();
+    let mut schedule = MaterializedSchedule::new(3, &pending);
+    let mut predecessors = vec![TilePredecessor::default(); 3];
+    schedule
+        .append(
+            &topology,
+            &pending,
+            &bases,
+            &counts,
+            0,
+            1000,
+            false,
+            &mut predecessors,
+        )
+        .unwrap();
+    schedule
+        .append(
+            &topology,
+            &pending,
+            &bases,
+            &counts,
+            1,
+            0,
+            false,
+            &mut predecessors,
+        )
+        .unwrap();
+    schedule.finish_horizon();
+    let sends = schedule.activities[0]
+        .iter()
+        .filter(|activity| activity.kind == ExchangeActivityKind::Send)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sends
+            .iter()
+            .map(|activity| activity.transfer)
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+    let programs = schedule.builder.finish().unwrap();
+    let row = programs.programs[0].as_ref().unwrap();
+    let groups = sender_address_instruction_groups(row).unwrap();
+    assert_eq!(groups.len(), sends.len());
+    for (group, activity) in groups.iter().zip(sends) {
+        for &(word, offset) in group {
+            let mut instruction = row[word];
+            patch_sender_instruction(
+                &mut instruction,
+                pending[activity.transfer as usize].source_address() + offset,
+            )
+            .unwrap();
+            assert_eq!(instruction, row[word]);
+        }
+    }
+}

@@ -389,7 +389,6 @@ pub(crate) fn lower_exchanges_cached(
                 horizon,
                 tile_availability,
                 activities,
-                scheduled_sends,
                 order,
                 timings,
                 ..
@@ -442,20 +441,24 @@ pub(crate) fn lower_exchanges_cached(
                 .iter()
                 .enumerate()
                 .map(|(tile, program)| {
+                    let sends = activities[tile].iter()
+                        .filter(|activity| activity.kind == ExchangeActivityKind::Send)
+                        .map(|activity| &pending[activity.transfer as usize])
+                        .collect::<Vec<_>>();
                     let address_groups = sender_address_instruction_groups(program)?;
-                    if address_groups.len() != scheduled_sends[tile].len() {
+                    if address_groups.len() != sends.len() {
                         tracing::error!(phase = phase.id.index(), tile,
-                            groups = address_groups.len(), sends = scheduled_sends[tile].len(),
-                            row = ?program, sources = ?scheduled_sends[tile],
+                            groups = address_groups.len(), sends = sends.len(),
+                            row = ?program, sources = ?sends.iter().map(|send| (send.source_shard, send.source_offset)).collect::<Vec<_>>(),
                             "exchange send groups differ from scheduled messages");
                         return Err(ExchangeLoweringError::IncompatibleRepeatRows(
                             "send instruction groups do not match scheduled messages",
                         ));
                     }
                     let mut patches = Vec::new();
-                    for (instructions, &(source_shard, source_offset)) in
-                        address_groups.into_iter().zip(&scheduled_sends[tile])
-                    {
+                    for (instructions, transfer) in address_groups.into_iter().zip(sends) {
+                        let source_shard = transfer.source_shard;
+                        let source_offset = transfer.source_offset;
                         let Some(inputs) = repeat_inputs.get(&source_shard) else {
                             continue;
                         };
@@ -1932,7 +1935,6 @@ struct MaterializedSchedule {
     tile_availability: Vec<TileAvailability>,
     memory_accesses: Vec<TileMemorySchedule>,
     activities: Vec<Vec<ExchangeActivity>>,
-    scheduled_sends: Vec<Vec<(BlockValueId, u32)>>,
     order: Vec<usize>,
     timings: Vec<Option<MaterializedTiming>>,
 }
@@ -1964,7 +1966,6 @@ impl MaterializedSchedule {
                 .map(|_| TileMemorySchedule::default())
                 .collect(),
             activities: vec![Vec::new(); usize::from(tile_count)],
-            scheduled_sends: vec![Vec::new(); usize::from(tile_count)],
             order: Vec::with_capacity(transfer_count),
             timings: vec![None; transfer_count],
         }
@@ -2050,8 +2051,6 @@ impl MaterializedSchedule {
                 memory_end,
             );
         }
-        self.scheduled_sends[usize::from(transfer.source)]
-            .push((transfer.source_shard, transfer.source_offset));
         self.activities[usize::from(transfer.source)].push(ExchangeActivity {
             fanout: transfer.destinations.len() as u16,
             paired: transfer.width == ExchangeItemWidth::Paired64,
@@ -2119,6 +2118,11 @@ impl MaterializedSchedule {
 
     fn finish_horizon(&mut self) {
         self.horizon = self.builder.event_cycles();
+        // The row builder can fill earlier gaps. Relocation and profiling must
+        // follow execution order, not the order in which transfers were chosen.
+        for activities in &mut self.activities {
+            activities.sort_by_key(|activity| activity.start_cycle);
+        }
     }
 }
 

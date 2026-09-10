@@ -126,3 +126,25 @@ The restart in `artifacts/vit-bounded-screen-20260910` runs only 27 layers,
 records periodic process RSS in `layers-27/host-memory.jsonl`, and saves elapsed
 time and peak child RSS in `layers-27/host-time.json` on completion. This is
 host compiler memory, distinct from the tile SRAM reports.
+
+The bounded-screening run completed without host OOM: **25331244 KiB peak
+RSS (24.2 GiB)**, **1277.8 seconds**. All five admitted 27-layer candidates
+passed provisional placement. Scheduling rejected them with the old generic
+Repeat row-compatibility error; no device execution took place.
+
+Repeat relocation contained two avoidable dependencies. Its SENDPICP helper
+reconstructed source offsets from timed instruction counts even though the
+restart instruction encodes its address; `4835de8` reads that field directly
+and makes compatibility errors identify their failing check. More importantly,
+the scheduler's separate source list followed selection order, while the row
+builder can insert a send into an earlier free interval. Repeat then paired
+that unsorted list with instructions in execution order. The separate list is
+now removed: timed activities are ordered chronologically and also supply
+relocation sources. A regression inserts a late send first and an early send
+second, then verifies exact source/instruction correspondence. A separate
+27-iteration compact-broadcast test exercises dense sequence placement and
+relocation together.
+
+The decoder-only full retry under `vit-repeat-relocation-20260910` was stopped
+intentionally after 150.6 seconds when the ordering bug was identified; it is
+not a completed model test.
