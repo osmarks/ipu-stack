@@ -127,3 +127,31 @@ sharing-patch phases are 8 and 19, each with maximum one word per tile. The
 largest Repeat-specific patch list is seven words in phase 18. These maxima,
 rather than a percentile across unrelated rows, identify the worker-patching
 and base-relocation experiments worth measuring.
+
+## Worker bulk patching
+
+The row-sharing helper now uses six workers for lists of at least 24 words.
+Workers patch indices worker_id, worker_id + 6, etc. Generated offsets are
+unique instruction positions, so writes are disjoint. The supervisor waits for
+local worker completion before executing the exchange row. Smaller lists retain
+the supervisor loop. Repeat's individual word patcher is unchanged.
+
+Hardware checks used sparse destinations and guard words at list sizes 0, 1, 7,
+23, 24, 25, 29, 30, 31, 77, 78, 79, 156 and 1024. All 28 worker/scalar cases pass
+bitwise comparison. At 24 words the worker path takes 450 cycles versus 846 for
+the old loop; at 78 words it takes **936 versus 2520 cycles**; at 1024 words,
+9468 versus 31848. These include timing/wrapper overhead. The earlier estimate
+of 3744 cycles for 78 words, based on assembly source instruction counting,
+overstated the measured old-loop cost.
+
+The full batch-one, two-layer FP8 ViT passes reference validation with unchanged
+maximum absolute error 0.075684. Cropped runtime is **1,185,018 cycles
+(0.790012 ms)** versus 1,189,716 previously, saving 4698 cycles (0.395%).
+The second-iteration remainder spans 493224 cycles versus 494802. These are
+single executions of each full package, not averaged timing samples.
+
+Artifacts: `artifacts/vit-repeat-bulk-20260910/`, including `check.rs`,
+`compare.log`, `run.log`, `operations.json` and rendered `profile.html`.
+The focused check uses the production helper and a copy of the old scalar loop;
+it covers non-multiples of six and the dispatch boundary. Its source can be
+built temporarily as an ipu-tests binary, then run with --sdk and --output.

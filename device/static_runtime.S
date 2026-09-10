@@ -202,6 +202,11 @@ ipu_stack_static_patch_word:
 	.type ipu_stack_static_patch_row,@function
 ipu_stack_static_patch_row:
 	.supervisor
+	// Short lists avoid worker launch overhead. Long lists distribute disjoint
+	// destination words across all six workers before the row can execute.
+	setzi $m0, 24
+	cmpult $m0, $m5, $m0
+	brz $m0, .Lpatch_row_bulk
 	brz $m5, .Lpatch_row_done
 .Lpatch_row_next:
 	ld32 $m6, $m3, $m15, 0
@@ -214,7 +219,42 @@ ipu_stack_static_patch_row:
 	brnz $m5, .Lpatch_row_next
 .Lpatch_row_done:
 	br $m9
+.Lpatch_row_bulk:
+	add $m11, $m11, -16
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	st32 $m4, $m11, $m15, 2
+	st32 $m5, $m11, $m15, 3
+	setzi $m0, .Lpatch_row_worker
+	runall $m0, $m11, 0
+	sync SYNC_COMPUTE_SET
+	add $m11, $m11, 16
+	br $m9
 	.size ipu_stack_static_patch_row, .-ipu_stack_static_patch_row
+	.worker
+	.p2align 2
+.Lpatch_row_worker:
+	ld32 $m2, $mvertex_base, $m15, 0
+	ld32 $m3, $mvertex_base, $m15, 1
+	ld32 $m4, $mvertex_base, $m15, 2
+	ld32 $m5, $mvertex_base, $m15, 3
+	get $m7, $WSR
+	and $m7, $m7, CSR_W_WSR__CTXTID_M1__MASK
+	shl $m6, $m7, 2
+	add $m3, $m3, $m6
+	add $m4, $m4, $m6
+.Lpatch_row_worker_next:
+	ld32 $m6, $m3, $m15, 0
+	ld32 $m0, $m4, $m15, 0
+	add $m6, $m6, $m2
+	st32 $m0, $m6, $m15, 0
+	add $m3, $m3, 24
+	add $m4, $m4, 24
+	add $m7, $m7, 6
+	cmpult $m0, $m7, $m5
+	brnz $m0, .Lpatch_row_worker_next
+	exitz $m15
+
 
 	.section .text.copy_u64,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 words/worker, m5
