@@ -475,16 +475,15 @@ fn build_package_from_objects(
         4,
         "host programs",
     )?;
-    let provisional_auxiliary_ranges = auxiliary_ranges(
-        program,
-        provisional_placement,
-        &topology,
-        execution_tile_count,
-        &[(
+    // Sizing does not emit these descriptor addresses. Do not depend on holes
+    // left by provisional tensor placement to discover the required reservation.
+    let provisional_auxiliary_ranges = vec![
+        vec![(
             crate::IPU21_DATA_BASE,
-            TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
-        )],
-    )?;
+            ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+        )];
+        usize::from(execution_tile_count)
+    ];
     let provisional_host = host::plan(
         &provisional_bindings.weights,
         &provisional_bindings.inputs,
@@ -599,6 +598,27 @@ fn build_package_from_objects(
             .range
             .start
     };
+    // Reserve descriptors before tensors. Their contents depend on final addresses,
+    // but their undeduplicated size does not. Final host emission may still reuse
+    // packets, leaving part of this reservation unused.
+    let host_data_bytes = provisional_host
+        .tile_data_bytes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    let host_data = (host_data_bytes != 0)
+        .then(|| {
+            memory.allocate(MemoryRequest {
+                name: "host descriptors",
+                bytes: host_data_bytes,
+                alignment: 4,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                end_alignment: 4,
+                guard_after: 0,
+            })
+        })
+        .transpose()?;
     let standard_ranges =
         memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE);
     tracing::info!(
@@ -608,6 +628,7 @@ fn build_package_from_objects(
             .map_or(0, |allocation| allocation.range.len()),
         exchange_table_bytes,
         host_code_bytes,
+        host_data_bytes,
         generated_code_bytes,
         code_address,
         ?standard_ranges,
@@ -668,19 +689,26 @@ fn build_package_from_objects(
         ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
         TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
     ));
+    let mut host_data_ranges = auxiliary_ranges(
+        program,
+        &placement,
+        &topology,
+        execution_tile_count,
+        &inactive_auxiliary_ranges,
+    )?;
+    if let Some(storage) = &host_data {
+        for ranges in &mut host_data_ranges {
+            ranges.push((storage.range.start, storage.range.end));
+            ranges.sort_unstable();
+        }
+    }
     let host = host::plan(
         &weights,
         &inputs,
         &outputs,
         execution_tile_count,
         host_code_base,
-        &auxiliary_ranges(
-            program,
-            &placement,
-            &topology,
-            execution_tile_count,
-            &inactive_auxiliary_ranges,
-        )?,
+        &host_data_ranges,
     )?;
     let final_host_code_bytes = host
         .end

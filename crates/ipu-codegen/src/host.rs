@@ -46,6 +46,8 @@ struct PacketCopy {
 }
 
 pub(crate) struct HostPackagePlan {
+    /// Per-tile upper bound without address-dependent packet deduplication.
+    pub tile_data_bytes: Vec<u32>,
     pub programs: Vec<HostProgram>,
     pub segments: Vec<Vec<Segment>>,
     pub protocol: HostExchange,
@@ -66,6 +68,7 @@ pub(crate) fn plan(
     }
     if weights.is_empty() && inputs.is_empty() && outputs.is_empty() {
         return Ok(HostPackagePlan {
+            tile_data_bytes: vec![0; usize::from(execution_tiles)],
             programs: vec![HostProgram::default(); usize::from(execution_tiles)],
             segments: vec![Vec::new(); usize::from(execution_tiles)],
             protocol: HostExchange::default(),
@@ -126,6 +129,7 @@ pub(crate) fn plan(
     let mut programs = Vec::with_capacity(usize::from(execution_tiles));
     let mut all_segments = Vec::with_capacity(usize::from(execution_tiles));
     let mut maximum_end = base;
+    let mut tile_data_bytes = Vec::with_capacity(usize::from(execution_tiles));
     for physical_tile in 0..execution_tiles {
         let planned = plan_tile(
             physical_tile,
@@ -134,6 +138,7 @@ pub(crate) fn plan(
             &data_ranges[usize::from(physical_tile)],
         )?;
         maximum_end = maximum_end.max(planned.end);
+        tile_data_bytes.push(planned.data_bytes);
         let weight_end = weight_phases.len();
         let input_end = weight_end + input_phases.len();
         programs.push(HostProgram {
@@ -176,6 +181,7 @@ pub(crate) fn plan(
         .checked_mul(u64::try_from(slots.len().max(1))?)
         .ok_or_else(|| invalid("host page arena overflow"))?;
     Ok(HostPackagePlan {
+        tile_data_bytes,
         programs,
         segments: all_segments,
         protocol: HostExchange {
@@ -304,6 +310,7 @@ fn batch(
 }
 
 struct PlannedTile {
+    data_bytes: u32,
     calls: Vec<HostPhase>,
     segments: Vec<Segment>,
     end: u32,
@@ -318,6 +325,7 @@ fn plan_tile(
     let follower = align_up(base, 8)?;
     let mut cursor = follower + 12;
     let mut data_arena = DataArena::new(data_ranges);
+    let mut data_bytes = 0u32;
     let mut segments = vec![segment(
         follower,
         words(&inactive_instructions()),
@@ -340,6 +348,9 @@ fn plan_tile(
         let data = words(&instructions);
         cursor += u32::try_from(data.len())?;
         segments.push(segment(address, data, SEGMENT_READ | SEGMENT_EXECUTE));
+        let packet_bytes = u32::try_from(packet_words.len())?
+            .checked_mul(4)
+            .ok_or_else(|| invalid("host data size overflow"))?;
         let packet_source = if let Some(&source) = packet_cache.get(&packet_words) {
             source
         } else {
@@ -360,6 +371,10 @@ fn plan_tile(
         };
         let descriptors = descriptor_words(physical_tile, phase, packet)?;
         let descriptor_data = words(&descriptors);
+        data_bytes = data_bytes
+            .checked_add(packet_bytes)
+            .and_then(|bytes| bytes.checked_add(u32::try_from(descriptor_data.len()).ok()?))
+            .ok_or_else(|| invalid("host data size overflow"))?;
         let table = data_arena.allocate(u32::try_from(descriptor_data.len())?, 4)?;
         segments.push(segment(table, descriptor_data, SEGMENT_READ));
         calls.push(HostPhase {
@@ -369,6 +384,7 @@ fn plan_tile(
         });
     }
     Ok(PlannedTile {
+        data_bytes,
         calls,
         segments,
         end: cursor,
@@ -557,4 +573,51 @@ fn align_up(value: u32, alignment: u32) -> PackageBuildResult<u32> {
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
         .ok_or_else(|| invalid("host plan address overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_reservation_survives_relocation_and_packet_deduplication() {
+        let mut phases = (0..8)
+            .map(|_| Phase {
+                transfers: vec![Transfer {
+                    direction: Direction::ToHost,
+                    physical_tile: 0,
+                    tile_address: 0x80000,
+                    host_offset: HOST_DATA_START,
+                    bytes: 256,
+                    copy_destination: None,
+                }],
+            })
+            .collect::<Vec<_>>();
+        let initial = plan_tile(0, &phases, 0x60000, &[(0x70000, 0x80000)]).unwrap();
+        let reservation = initial.data_bytes;
+        let actual = initial
+            .segments
+            .iter()
+            .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
+            .map(|segment| segment.memory_size)
+            .sum::<u32>();
+        assert!(
+            actual < reservation,
+            "identical packets should share storage"
+        );
+        for (index, phase) in phases.iter_mut().enumerate() {
+            phase.transfers[0].tile_address += index as u32 * 1024;
+        }
+        let relocated =
+            plan_tile(0, &phases, 0x60000, &[(0x70000, 0x70000 + reservation)]).unwrap();
+        assert_eq!(relocated.data_bytes, reservation);
+        for segment in relocated
+            .segments
+            .iter()
+            .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
+        {
+            assert!(segment.address >= 0x70000);
+            assert!(segment.address + segment.memory_size <= 0x70000 + reservation);
+        }
+    }
 }
