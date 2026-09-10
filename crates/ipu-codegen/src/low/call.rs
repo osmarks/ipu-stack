@@ -36,7 +36,8 @@ impl KernelRequirements {
     ) -> Self {
         let alignment = match kernel {
             TileKernelSpec::Gemm { .. } => 32,
-            TileKernelSpec::Rearrange { .. } => 2,
+            // Includes rearrangement fast paths: these use 64-bit accesses
+            // even when the tensor elements are F16.
             _ => 8,
         };
         let mut requirements = Self {

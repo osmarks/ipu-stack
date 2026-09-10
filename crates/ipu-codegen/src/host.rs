@@ -46,8 +46,8 @@ struct PacketCopy {
 }
 
 pub(crate) struct HostPackagePlan {
-    /// Per-tile upper bound without address-dependent packet deduplication.
-    pub tile_data_bytes: Vec<u32>,
+    /// Maximum tile requirement without address-dependent packet deduplication.
+    pub descriptor_bytes: u32,
     pub programs: Vec<HostProgram>,
     pub segments: Vec<Vec<Segment>>,
     pub protocol: HostExchange,
@@ -68,7 +68,7 @@ pub(crate) fn plan(
     }
     if weights.is_empty() && inputs.is_empty() && outputs.is_empty() {
         return Ok(HostPackagePlan {
-            tile_data_bytes: vec![0; usize::from(execution_tiles)],
+            descriptor_bytes: 0,
             programs: vec![HostProgram::default(); usize::from(execution_tiles)],
             segments: vec![Vec::new(); usize::from(execution_tiles)],
             protocol: HostExchange::default(),
@@ -129,7 +129,7 @@ pub(crate) fn plan(
     let mut programs = Vec::with_capacity(usize::from(execution_tiles));
     let mut all_segments = Vec::with_capacity(usize::from(execution_tiles));
     let mut maximum_end = base;
-    let mut tile_data_bytes = Vec::with_capacity(usize::from(execution_tiles));
+    let mut descriptor_bytes = 0;
     for physical_tile in 0..execution_tiles {
         let planned = plan_tile(
             physical_tile,
@@ -138,7 +138,7 @@ pub(crate) fn plan(
             &data_ranges[usize::from(physical_tile)],
         )?;
         maximum_end = maximum_end.max(planned.end);
-        tile_data_bytes.push(planned.data_bytes);
+        descriptor_bytes = descriptor_bytes.max(planned.data_bytes);
         let weight_end = weight_phases.len();
         let input_end = weight_end + input_phases.len();
         programs.push(HostProgram {
@@ -181,7 +181,7 @@ pub(crate) fn plan(
         .checked_mul(u64::try_from(slots.len().max(1))?)
         .ok_or_else(|| invalid("host page arena overflow"))?;
     Ok(HostPackagePlan {
-        tile_data_bytes,
+        descriptor_bytes,
         programs,
         segments: all_segments,
         protocol: HostExchange {

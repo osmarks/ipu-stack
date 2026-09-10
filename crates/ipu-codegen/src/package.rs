@@ -601,12 +601,7 @@ fn build_package_from_objects(
     // Reserve descriptors before tensors. Their contents depend on final addresses,
     // but their undeduplicated size does not. Final host emission may still reuse
     // packets, leaving part of this reservation unused.
-    let host_data_bytes = provisional_host
-        .tile_data_bytes
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let host_data_bytes = provisional_host.descriptor_bytes;
     let host_data = (host_data_bytes != 0)
         .then(|| {
             memory.allocate(MemoryRequest {
