@@ -77,8 +77,53 @@ This audit does not establish timing or correctness of mid-row base changes.
 
 Cross-phase sharing is a separate, larger patch workload in this model. There
 are 3,377 sharing-patcher call sites inside Repeat; their list lengths have
-median 1, 95th percentile 78, and maximum 78 words. Across the entire program
-there are 9,966 such sites, also with maximum 78. These calls recur on each loop
+maximum 78 words. Across the entire program there are 9,966 such sites, also
+with maximum 78. These calls recur on each loop
 iteration. Unlike the mostly one/two-word Repeat patches, the 78-word batches
 are plausible worker-patcher candidates. No isolated patcher timing or worker
 speedup was measured in this evaluation.
+
+## Phase-level eligibility and worst-tile patch work
+
+The phase audit pairs generated row calls with profile phase metadata, including
+inactive tiles' synchronization records. It checks that every physical tile has
+exactly one corresponding row call for each recorded exchange phase. Code:
+`artifacts/repeat-address-audit/phases.rs`; results: `phase-patch-audit.txt`.
+
+The Repeat body has 25 exchange phases (physical IDs 3–27). Eighteen have no
+iteration-dependent sender addresses. Four changing-source phases have a uniform
+displacement on **every** sender in the phase:
+
+| Phase | Operation | Moving senders | Maximum Repeat-patched words on a tile |
+|---|---|---:|---:|
+| 5 | QKV projection | 292 | 1 |
+| 16 | Attention output projection | 144 | 1 |
+| 21 | MLP up projection | 184 | 2 |
+| 25 | MLP down projection | 288 | 2 |
+
+These four phases are structurally eligible for one constant outgoing base per
+sender for the entire phase. Base registers are per tile: different senders do
+not need equal displacements. Stationary senders use zero displacement, and
+Repeat's receiving buffers retain their addresses.
+
+Three other phases fail the constant-base criterion:
+
+| Phase | Operation | Mixed physical tiles | Displacement runs | Maximum Repeat-patched words on a tile |
+|---|---|---|---:|---:|
+| 3 | Attention normalization preparation | 223 | 2 | 1 |
+| 18 | Output projection bias/add preparation | 524, 526 | 2 each | 7 |
+| 19 | MLP normalization preparation | 524 | 3 | 2 |
+
+Phase 3's mixed sender has displacements `[2304, 0]`; phase 18's two mixed
+senders each have one transfer displaced by 1152 bytes followed by 38 stationary
+transfers; phase 19's mixed sender has `[2304, 0, 2304]`. Thus mid-phase base
+changes would require one, one, and two internal transitions respectively,
+plus whatever initial/final base setup is required. This is structural evidence,
+not validation of the hardware semantics or timing of those base changes.
+
+For cross-phase row sharing, the **worst tile patches 78 words in phase 15**,
+preparation for the attention output projection. Within Repeat, the only other
+sharing-patch phases are 8 and 19, each with maximum one word per tile. The
+largest Repeat-specific patch list is seven words in phase 18. These maxima,
+rather than a percentile across unrelated rows, identify the worker-patching
+and base-relocation experiments worth measuring.
