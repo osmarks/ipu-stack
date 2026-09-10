@@ -72,45 +72,57 @@ pub(super) fn select_scheduled_finalist<T>(
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let topology = active_topology(planning.tile_count)?;
     let expansion_cache = Arc::new(crate::low::expand::ExpansionCache::default());
-    let screened = finalists
-        .into_par_iter()
-        .enumerate()
-        .map(|(index, mid)| {
-            let span = tracing::info_span!("screen_finalist", finalist = index);
-            let _entered = span.enter();
-            let result =
-                expand_and_screen(&mid, planning, tile_mapping, Arc::clone(&expansion_cache)).map(
-                    |(low, footprint)| ExpandedPlan {
-                        index,
-                        low,
-                        footprint,
-                    },
-                );
-            (index, result)
-        })
-        .collect();
-    tracing::info!(cache_stats = ?expansion_cache.stats(), plan_cache_stats = ?expansion_cache.plan_stats(), "expanded fragment cache");
     let mut failure = invalid("no operator-plan finalists");
-    let expanded = feasible_candidates(screened, &mut failure);
-    let expanded = admit_candidates(
-        expanded,
-        planning
-            .placement_finalists
-            .max(planning.exchange_schedule_finalists),
-        planning.exchange_table_budget_bytes,
-        |plan| {
-            (
-                plan.footprint.estimated_row_bytes(),
-                plan.low.estimated_cycles.saturating_add(
-                    plan.footprint
-                        .estimated_row_bytes()
-                        .saturating_mul(planning.exchange_table_cost_per_byte),
-                ),
-                plan.index,
-            )
-        },
-        "placement",
-    );
+    let mut expanded = Vec::new();
+    let mut finalists = finalists.into_iter().enumerate();
+    // Retain only the placement shortlist between batches. Keeping all expanded
+    // graphs until screening finishes makes memory scale with search breadth.
+    loop {
+        let batch = finalists
+            .by_ref()
+            .take(rayon::current_num_threads())
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
+        let screened = batch
+            .into_par_iter()
+            .map(|(index, mid)| {
+                let span = tracing::info_span!("screen_finalist", finalist = index);
+                let _entered = span.enter();
+                let result =
+                    expand_and_screen(&mid, planning, tile_mapping, Arc::clone(&expansion_cache))
+                        .map(|(low, footprint)| ExpandedPlan {
+                            index,
+                            low,
+                            footprint,
+                        });
+                (index, result)
+            })
+            .collect();
+        expanded.extend(feasible_candidates(screened, &mut failure));
+        expanded = admit_candidates(
+            expanded,
+            planning
+                .placement_finalists
+                .max(planning.exchange_schedule_finalists),
+            planning.exchange_table_budget_bytes,
+            |plan| {
+                (
+                    plan.footprint.estimated_row_bytes(),
+                    plan.low.estimated_cycles.saturating_add(
+                        plan.footprint
+                            .estimated_row_bytes()
+                            .saturating_mul(planning.exchange_table_cost_per_byte),
+                    ),
+                    plan.index,
+                )
+            },
+            "placement",
+        );
+    }
+    tracing::info!(cache_stats = ?expansion_cache.stats(), plan_cache_stats = ?expansion_cache.plan_stats(), "expanded fragment cache");
+    drop(expansion_cache);
     let placed = expanded
         .into_par_iter()
         .map(|plan| {
@@ -404,6 +416,27 @@ pub(super) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> Pack
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_admission_preserves_the_complete_shortlist() {
+        let plans = (0..97)
+            .map(|index| ((index * 37) % 23, (index * 71) % 31, index as usize))
+            .collect::<Vec<_>>();
+        for limit in [0, 1, 4, 16] {
+            for budget in [0, 10, u64::MAX] {
+                let expected = admit_candidates(plans.clone(), limit, budget, |plan| *plan, "test");
+                for batch_size in [1, 3, 8, 32] {
+                    let mut retained = Vec::new();
+                    for batch in plans.chunks(batch_size) {
+                        retained.extend_from_slice(batch);
+                        retained = admit_candidates(retained, limit, budget, |plan| *plan, "test");
+                        assert!(retained.len() <= limit.max(1) + 1);
+                    }
+                    assert_eq!(retained, expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn exchange_budget_rejects_before_scheduling() {
