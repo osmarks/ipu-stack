@@ -1,6 +1,7 @@
 //! Whole-device implementation selection, tensor primitives, and layouts.
 //! Tile enumeration occurs only after selection, in low expansion.
 
+pub(crate) mod baseline;
 mod copy;
 mod elementwise;
 pub mod optimistic;
