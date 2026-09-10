@@ -106,3 +106,23 @@ Tests cover compact boundaries and cached failures, resident sequence lifetime,
 dense sequence strides with bank separation in both address regions, and the
 conservative path for independently constrained members. Hardware trials of
 this allocator are recorded separately below when complete.
+
+## Interrupted host build and bounded expansion
+
+The session was reported OOM-killed while three large builds were running.
+The interrupted logs under `vit-compact-region-20260910` and
+`vit-compact-sequence-20260910` stop around 14:54 UTC. They do not establish a
+hardware result for 16 or 27 layers. Host kernel OOM logs were unavailable in
+the replacement container, so the exact victim/limit could not be verified.
+
+Inspection found that finalist screening retained every expanded tile graph
+until all candidates finished, before admitting only a few to placement.
+Commit `ea892e0` screens in thread-pool-sized batches and retains only the same
+placement shortlist after each batch. The ranking and compact alternative are
+unchanged; tests verify identical results across batch sizes and budgets.
+The temporary expansion cache is released before placement as well.
+
+The restart in `artifacts/vit-bounded-screen-20260910` runs only 27 layers,
+records periodic process RSS in `layers-27/host-memory.jsonl`, and saves elapsed
+time and peak child RSS in `layers-27/host-time.json` on completion. This is
+host compiler memory, distinct from the tile SRAM reports.
