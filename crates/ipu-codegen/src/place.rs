@@ -651,10 +651,26 @@ fn allocate_tile(
         let distinct_element = roots
             .iter()
             .any(|root| root_requirements[root].distinct_element);
+        // The current iteration's argument aliases the first member. Isolate
+        // the entire sequence from other allocations, rather than padding every
+        // member to an element. Multiple constrained members may also be used
+        // together outside the loop, so retain individual separation for those.
+        let separate_members = roots
+            .iter()
+            .filter(|root| root_requirements[root].distinct_element)
+            .take(2)
+            .count()
+            > 1;
         let alignment = group.alignment.max(
             roots
                 .iter()
-                .map(|root| allocation_alignment(program, &members[root], root_requirements[root]))
+                .map(|root| {
+                    if separate_members {
+                        allocation_alignment(program, &members[root], root_requirements[root])
+                    } else {
+                        root_requirements[root].alignment
+                    }
+                })
                 .max()
                 .unwrap_or(1),
         );
@@ -685,7 +701,7 @@ fn allocate_tile(
         }
         requests.push(AllocationRequest {
             class: group_class,
-            region1_stride: distinct_element
+            region1_stride: separate_members
                 .then(|| align_up(stride, IPU21_INTERLEAVED_ELEMENT_SIZE))
                 .transpose()?,
             distinct_element,
@@ -1241,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn repeat_stride_includes_late_bank_separation_constraints() {
+    fn repeat_bank_separation_reserves_the_sequence_without_padding_each_member() {
         let mut graph = ComputeGraph::new();
         let carried = graph.host_input("carried", [8, 16]).unwrap();
         let parameters = (0..3)
@@ -1297,17 +1313,32 @@ mod tests {
                     };
                     for input in &repeat.iterated {
                         assert!(input.stride_bytes < TILE_MEMORY_ELEMENT_SIZE);
+                        let output = placement.shard_addresses[&repeat.carried[0].initial];
+                        let element = |address| {
+                            if address >= IPU21_INTERLEAVED_MEMORY_BASE {
+                                IPU21_INTERLEAVED_ELEMENT_SIZE
+                            } else {
+                                TILE_MEMORY_ELEMENT_SIZE
+                            }
+                        };
+                        for member in &input.inputs {
+                            let address = placement.shard_addresses[member];
+                            let bytes =
+                                shard_storage_bytes(&low.shards[member.index() as usize]).unwrap();
+                            assert!(
+                                (address + bytes).div_ceil(element(address)) * element(address)
+                                    <= output
+                                    || output.div_euclid(element(output)) * element(output)
+                                        + element(output)
+                                        <= address,
+                                "a sequence member shares the output's element"
+                            );
+                        }
                         for pair in input.inputs.windows(2) {
                             assert_eq!(
                                 placement.shard_addresses[&pair[1]]
                                     - placement.shard_addresses[&pair[0]],
-                                if placement.shard_addresses[&pair[0]]
-                                    >= IPU21_INTERLEAVED_MEMORY_BASE
-                                {
-                                    IPU21_INTERLEAVED_ELEMENT_SIZE
-                                } else {
-                                    TILE_MEMORY_ELEMENT_SIZE
-                                }
+                                input.stride_bytes
                             );
                         }
                         checked += 1;
@@ -1316,6 +1347,42 @@ mod tests {
             }
         }
         assert!(checked > 0);
+
+        // Independently constrained members still require separate elements.
+        let mut analysis = analyze_allocations(&low).unwrap();
+        let group = analysis
+            .iterated
+            .iter()
+            .find(|group| group.tile == 0)
+            .unwrap()
+            .clone();
+        let second_root = analysis.root_of_member[group.shards[1].index() as usize];
+        analysis
+            .root_requirements
+            .get_mut(&second_root)
+            .unwrap()
+            .distinct_element = true;
+        let members = analysis
+            .members
+            .into_iter()
+            .filter(|(_, members)| low.shards[members[0]].tile == 0)
+            .collect();
+        let (_, addresses, _) = place_tile(
+            &low,
+            0,
+            &[(IPU21_DATA_BASE, IPU21_INTERLEAVED_MEMORY_BASE)],
+            0,
+            std::slice::from_ref(&group),
+            &members,
+            &analysis.root_of_member,
+            &analysis.root_requirements,
+            &analysis.root_lifetimes,
+        )
+        .unwrap();
+        assert_eq!(
+            addresses[&group.shards[1]] - addresses[&group.shards[0]],
+            TILE_MEMORY_ELEMENT_SIZE
+        );
     }
 
     #[test]
