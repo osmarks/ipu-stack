@@ -52,7 +52,8 @@ breadth. Expansion benchmarks and exchange capture inspect the baseline.
 
 ## Validation so far
 
-- Codegen: 217 unit tests and one doctest pass; five manual tests ignored.
+- Codegen: 218 unit tests and one doctest pass; four manual tests ignored.
+  Seven benchmark/diagnostic tests, workspace all-target checks and Clippy pass.
 - Compact iterated and invariant Repeat bindings expand and place correctly.
 - Rejected/slower local proposals retain the incumbent; validation budgets and
   immediate baseline failure are covered.
@@ -61,12 +62,28 @@ breadth. Expansion benchmarks and exchange capture inspect the baseline.
 - Small two-layer FP8 ViT with three accepted proposals: 8.27 seconds package
   planning, final modelled cost 300276 cycles, hardware maximum absolute error
   0.105469. See `artifacts/baseline-local-planner/local-small-r2/`.
-- A full-size one-layer baseline packages successfully (experimental 64 KiB
-  boundary blocks, early casting): 131.36 seconds, 76040 bytes of exchange tables
-  per tile, modelled cost 1252930 cycles. Not yet hardware-validated.
-- Full 27-layer baselines still exceed the 80 KiB exchange-table budget. The
-  latest 16 KiB / late-cast baseline reaches 95080 bytes after 93.21 seconds.
-  No fallback search follows. Repeat patch storage is being investigated.
+- Current full-size one-layer baseline passes hardware/reference validation:
+  139.62 seconds package planning, 62632 bytes maximum initial exchange tables,
+  final modelled cost 1032274 cycles. The renderer-trimmed hardware span is
+  988890 cycles (0.65926 ms); maximum absolute numerical error is 0.077148.
+  Profile: `artifacts/baseline-local-planner/current-full1/model.html`.
+  This is a baseline-only run, not a claim of recovered optimized performance.
+- Current baseline, small FP8 ViT: two and three layers pass hardware/reference
+  checks (maximum absolute errors 0.105469 and 0.189453). These exercise both
+  table-based and arithmetic Repeat patches. Rendered three-layer profile:
+  `artifacts/baseline-local-planner/hoisted-small-r3/model.html`.
+- Full 27-layer baseline now clears exchange storage and generated-code placement.
+  Exact arithmetic Repeat patches reduce the maximum table from 95080 to
+  63784 bytes. Sharing loop state reduces generated code from 25488 to 23048
+  bytes. Non-arithmetic sequences retain their full tables; no approximation is
+  made to instruction words.
+- It still fails final tensor placement: tile 552 cannot place an 82944-byte
+  standard allocation into the remaining tensor range 531792..949168.
+  The run stops after 51.52 seconds, without a fallback search. See
+  `artifacts/baseline-local-planner/hoisted27/run.log` and its memory profile.
+  The mid estimator's total peak is 419840 bytes, already above that final
+  417376-byte tensor range; its provisional support reservation is insufficient
+  here. This is not evidence that the full model is impossible to fit.
 
 The baseline policy still needs calibration; this replacement does not claim
 that every previously representable graph now has a feasible starting plan.
