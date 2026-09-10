@@ -744,23 +744,41 @@ fn allocate_tile(
         Err(PlacementError::OutOfMemory { .. }) => {}
         Err(error) => return Err(error),
     }
-    *arena = initial;
-    arena.offline = true;
-    addresses.clear();
-    requests.sort_by_key(|request| {
-        (
-            std::cmp::Reverse(request.alignment),
-            std::cmp::Reverse(request.bytes),
-            std::cmp::Reverse(request.lifetime.last - request.lifetime.first),
-            request.lifetime.first,
-        )
-    });
-    allocate_requests(program, tile, &requests, members, arena, addresses)?;
-    tracing::debug!(
-        tile,
-        "recovered fragmented tile with size-ordered placement"
-    );
-    Ok(())
+    let mut failure = PlacementError::Overflow;
+    // Packing small bank-aligned temporaries first can split the only span
+    // large enough for a persistent sequence. Try large allocations first,
+    // retaining the alignment-first order for cases where it packs better.
+    for size_first in [true, false] {
+        *arena = initial.clone();
+        arena.offline = true;
+        addresses.clear();
+        requests.sort_by_key(|request| {
+            let (first, second) = if size_first {
+                (request.bytes, request.alignment)
+            } else {
+                (request.alignment, request.bytes)
+            };
+            (
+                std::cmp::Reverse(first),
+                std::cmp::Reverse(second),
+                std::cmp::Reverse(request.lifetime.last - request.lifetime.first),
+                request.lifetime.first,
+            )
+        });
+        match allocate_requests(program, tile, &requests, members, arena, addresses) {
+            Ok(()) => {
+                tracing::debug!(
+                    tile,
+                    size_first,
+                    "recovered fragmented tile with offline placement"
+                );
+                return Ok(());
+            }
+            Err(error @ PlacementError::OutOfMemory { .. }) => failure = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(failure)
 }
 
 fn allocate_requests(

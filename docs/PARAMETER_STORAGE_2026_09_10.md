@@ -278,3 +278,21 @@ was stopped during planning when inspection found the same unnecessary region-0
 bound on host descriptors. Those ordinary data records may now use either
 region; reserved ranges continue to exclude them from tensor placement. The
 replacement full trial is `artifacts/vit-support-regions-20260910/`.
+
+
+## Full-depth tensor fragmentation
+
+The support-regions trial passed support allocation and all four provisional
+placements, but final tensor placement failed. On tile 736, an 84096-byte
+standard temporary needed one span while approximately 114 KiB remained free
+in several holes; the largest was about 69 KiB. Persistent sequences were
+already densely allocated (96768, 82944, 82944 and 27648 bytes). This was not
+per-layer memory-element padding.
+
+The offline fallback prioritized alignment before allocation size, allowing
+small aligned temporaries to fragment space needed by the persistent sequences.
+It now tries size-first packing before the previous alignment-first order,
+with unchanged lifetime, memory-class and bank constraints. The extra attempt
+only runs after online placement fails. All 227 codegen tests passed (five
+ignored), and clippy passed with the existing allowances. The next full trial
+is `artifacts/vit-size-first-placement-20260910/`.
