@@ -790,3 +790,49 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
         }
     }
 }
+
+#[test]
+fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
+    use crate::{ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat};
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [729, 1152]).unwrap();
+    let parameters = (0..27)
+        .map(|i| graph.parameter(format!("bias.{i}"), [1152]).unwrap())
+        .collect::<Vec<_>>();
+    let sequence = graph.value_sequence("bias", parameters.clone()).unwrap();
+    let output = graph
+        .repeat(27, [x], [], [sequence], |body, args| {
+            Ok(vec![body.add(args.carried[0], args.iterated[0])?])
+        })
+        .unwrap()[0];
+    graph.set_outputs([output]).unwrap();
+    let mut config = PipelineConfig::new(1472).with_input(
+        x,
+        TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(729),
+        },
+    );
+    for parameter in parameters {
+        config.inputs.insert(
+            parameter,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::logical_linear(9, 128),
+            },
+        );
+    }
+    let mid = crate::lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let expanded = crate::expand_tiles(&mid).unwrap();
+    let low = crate::lower_to_tiles(&expanded, false);
+    let placement = crate::place(&low).unwrap();
+    let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600(), false).unwrap();
+    assert!(
+        exchanges
+            .phases
+            .iter()
+            .flat_map(|phase| &phase.repeat_patches)
+            .flatten()
+            .any(|patch| patch.values.len() == 27)
+    );
+}

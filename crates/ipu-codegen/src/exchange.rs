@@ -179,8 +179,8 @@ pub enum ExchangeLoweringError {
     SizeMismatch,
     #[error("exchange address arithmetic overflowed")]
     Overflow,
-    #[error("structured-repeat exchange rows have incompatible shapes")]
-    IncompatibleRepeatRows,
+    #[error("structured-repeat exchange incompatibility: {0}")]
+    IncompatibleRepeatRows(&'static str),
     #[error("exchange diagnostic refers to missing tile {0}")]
     DiagnosticTile(u16),
     #[error("invalid exchange-schedule snapshot: {0}")]
@@ -218,7 +218,9 @@ fn repeat_inputs(
                 std::collections::btree_map::Entry::Occupied(entry)
                     if entry.get() != &iterated.inputs =>
                 {
-                    return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                    return Err(ExchangeLoweringError::IncompatibleRepeatRows(
+                        "argument has inconsistent sequence bindings",
+                    ));
                 }
                 std::collections::btree_map::Entry::Occupied(_) => {}
             }
@@ -442,7 +444,13 @@ pub(crate) fn lower_exchanges_cached(
                 .map(|(tile, program)| {
                     let address_groups = sender_address_instruction_groups(program)?;
                     if address_groups.len() != scheduled_sends[tile].len() {
-                        return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                        tracing::error!(phase = phase.id.index(), tile,
+                            groups = address_groups.len(), sends = scheduled_sends[tile].len(),
+                            row = ?program, sources = ?scheduled_sends[tile],
+                            "exchange send groups differ from scheduled messages");
+                        return Err(ExchangeLoweringError::IncompatibleRepeatRows(
+                            "send instruction groups do not match scheduled messages",
+                        ));
                     }
                     let mut patches = Vec::new();
                     for (instructions, &(source_shard, source_offset)) in
@@ -469,7 +477,13 @@ pub(crate) fn lower_exchanges_cached(
                                 })
                                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
                             if values.first() != Some(&program[word_offset]) {
-                                return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                                tracing::error!(phase = phase.id.index(), tile,
+                                    source = source_shard.index(), source_offset, word_offset, byte_offset,
+                                    expected = program[word_offset], actual = ?values.first(), row = ?program,
+                                    "Repeat relocation changes the initial exchange row");
+                                return Err(ExchangeLoweringError::IncompatibleRepeatRows(
+                                    "relocation changes the first iteration",
+                                ));
                             }
                             patches.push(ExchangeRowPatch {
                                 word_offset: u32::try_from(word_offset)
@@ -709,7 +723,9 @@ fn attach_repeat_source_addresses(
                 })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             if addresses.first().copied() != Some(transfer.source_address()) {
-                return Err(ExchangeLoweringError::IncompatibleRepeatRows);
+                return Err(ExchangeLoweringError::IncompatibleRepeatRows(
+                    "argument address differs from its first sequence member",
+                ));
             }
             transfer.source_addresses = addresses;
         }

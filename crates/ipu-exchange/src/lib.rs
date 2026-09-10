@@ -3082,37 +3082,28 @@ pub fn sender_address_instruction_groups(
     row: &[u32],
 ) -> Result<Vec<Vec<(usize, u32)>>, ExchangeError> {
     let mut groups = Vec::<Vec<(usize, u32)>>::new();
-    let mut sent_words = None;
+    let mut source_address = None;
     let mut cursor = 0;
     while cursor < row.len() {
         let instruction = row[cursor];
+        let address =
+            || ((instruction & SEND_ADDRESS_MASK) >> 3) << if instruction & 4 != 0 { 3 } else { 2 };
         if instruction & LONG_OPCODE_MASK == SEND_OPCODE {
             groups.push(vec![(cursor, 0)]);
-            sent_words = Some(instruction_advance(instruction));
+            source_address = Some(address());
         } else if is_send_control_pair(instruction) && instruction & 7 != 0 {
-            let sent = sent_words.ok_or(ExchangeError::Schedule(
+            let source = source_address.ok_or(ExchangeError::Schedule(
                 "SENDPICP precedes initial outgoing SEND",
             ))?;
+            // The restart contains its absolute source address. Read it directly;
+            // recovering it from instruction durations duplicates stream logic.
+            let offset = address()
+                .checked_sub(source)
+                .ok_or(ExchangeError::Schedule("SENDPICP precedes outgoing source"))?;
             groups
                 .last_mut()
                 .ok_or(ExchangeError::Schedule("SENDPICP outgoing group"))?
-                .push((
-                    cursor,
-                    sent.checked_mul(if instruction & 4 != 0 { 8 } else { 4 })
-                        .ok_or(ExchangeError::Schedule("sender byte offset overflow"))?,
-                ));
-            sent_words = Some(
-                sent.checked_add(instruction_advance(instruction))
-                    .ok_or(ExchangeError::Schedule("sender word offset overflow"))?,
-            );
-        } else if (is_send_off(instruction) || is_send_control(instruction)) && sent_words.is_some()
-        {
-            sent_words = Some(
-                sent_words
-                    .unwrap()
-                    .checked_add(instruction_advance(instruction))
-                    .ok_or(ExchangeError::Schedule("sender word offset overflow"))?,
-            );
+                .push((cursor, offset));
         }
         cursor += if is_send_control_pair(instruction) {
             2
@@ -3469,6 +3460,32 @@ mod tests {
         assert_eq!(normalized[2] ^ row[2], row[2] & SEND_ADDRESS_MASK);
         assert_eq!(normalized[0], row[0]);
         assert_eq!(normalized[4], row[4]);
+    }
+
+    #[test]
+    fn restart_relocation_uses_encoded_addresses_for_both_send_widths() {
+        for mode in [3, 7] {
+            let shift = if mode & 4 != 0 { 3 } else { 2 };
+            let source = 0x50000;
+            let row = [
+                encode_send(1, mode, source >> shift).unwrap(),
+                SEND_PICP_OPCODE | (7 << 21) | (((source + 80) >> shift) << 3) | mode,
+                0x1901_5000,
+                RETURN_M10_INSTRUCTION,
+            ];
+            let groups = sender_address_instruction_groups(&row).unwrap();
+            assert_eq!(groups, vec![vec![(0, 0), (1, 80)]]);
+            for (word, offset) in &groups[0] {
+                let mut instruction = row[*word];
+                patch_sender_instruction(&mut instruction, source + offset).unwrap();
+                assert_eq!(instruction, row[*word]);
+                patch_sender_instruction(&mut instruction, source + 256 + offset).unwrap();
+                assert_eq!(
+                    ((instruction & SEND_ADDRESS_MASK) >> 3) << shift,
+                    source + 256 + offset
+                );
+            }
+        }
     }
 
     #[test]
