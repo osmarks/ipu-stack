@@ -9,12 +9,23 @@ use std::sync::Mutex;
 const MAX_ENTRIES: usize = 32768;
 
 struct Memo<K, V> {
-    entries: Mutex<(HashMap<u64, Vec<(K, Arc<V>)>>, u64, u64, usize)>,
+    entries: Mutex<Entries<K, V>>,
+}
+struct Entries<K, V> {
+    buckets: HashMap<u64, Vec<(K, Arc<V>)>>,
+    hits: u64,
+    misses: u64,
+    count: usize,
 }
 impl<K, V> Default for Memo<K, V> {
     fn default() -> Self {
         Self {
-            entries: Mutex::new((HashMap::new(), 0, 0, 0)),
+            entries: Mutex::new(Entries {
+                buckets: HashMap::new(),
+                hits: 0,
+                misses: 0,
+                count: 0,
+            }),
         }
     }
 }
@@ -22,33 +33,33 @@ impl<K: Eq, V> Memo<K, V> {
     fn get(&self, hash: u64, matches: impl Fn(&K) -> bool) -> Option<Arc<V>> {
         let mut state = self.entries.lock().unwrap();
         let found = state
-            .0
+            .buckets
             .get(&hash)
             .and_then(|bucket| bucket.iter().find(|(key, _)| matches(key)))
             .map(|(_, value)| Arc::clone(value));
         if found.is_some() {
-            state.1 += 1;
+            state.hits += 1;
         } else {
-            state.2 += 1;
+            state.misses += 1;
         }
         found
     }
     fn insert(&self, hash: u64, key: K, value: Arc<V>, limit: usize) {
         let mut state = self.entries.lock().unwrap();
-        if state.3 < limit {
-            let bucket = state.0.entry(hash).or_default();
+        if state.count < limit {
+            let bucket = state.buckets.entry(hash).or_default();
             if !bucket.iter().any(|(existing, _)| *existing == key) {
                 bucket.push((key, value));
-                state.3 += 1;
+                state.count += 1;
             }
         }
     }
     fn has_capacity(&self, limit: usize) -> bool {
-        self.entries.lock().unwrap().3 < limit
+        self.entries.lock().unwrap().count < limit
     }
     fn stats(&self) -> (usize, u64, u64) {
         let state = self.entries.lock().unwrap();
-        (state.3, state.1, state.2)
+        (state.count, state.hits, state.misses)
     }
 }
 
