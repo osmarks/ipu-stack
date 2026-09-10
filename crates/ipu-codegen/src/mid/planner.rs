@@ -854,8 +854,8 @@ pub(super) fn lower_operation_candidates(
                         ) || (!peak.fits_ipu21_with_budget(
                             config.standard_memory_reservation_bytes,
                             config.tile_memory_budget_bytes,
-                        ) && (candidate.total, candidate.interleaved)
-                            < (peak.total, peak.interleaved))
+                        ) && (candidate.total_with_exchange(), candidate.interleaved)
+                            < (peak.total_with_exchange(), peak.interleaved))
                         {
                             branch = rotated;
                             peak = candidate;
@@ -876,8 +876,8 @@ pub(super) fn lower_operation_candidates(
                 expanded.push(branch);
             } else {
                 if rejected_memory.as_ref().is_none_or(|(best, _)| {
-                    (peak.total, peak.interleaved, peak.standard)
-                        < (best.total, best.interleaved, best.standard)
+                    (peak.total_with_exchange(), peak.interleaved, peak.standard)
+                        < (best.total_with_exchange(), best.interleaved, best.standard)
                 }) {
                     rejected_memory = Some((peak, branch));
                 }
@@ -994,7 +994,7 @@ fn finalist_indices(peaks: &[MemoryPeaks], count: usize) -> BTreeSet<usize> {
     selected.insert(0);
     for key in [
         (|peak: &MemoryPeaks| peak.exchange_rows) as fn(&MemoryPeaks) -> u64,
-        |peak: &MemoryPeaks| peak.total,
+        |peak: &MemoryPeaks| peak.total_with_exchange(),
     ] {
         if selected.len() == limit {
             break;
@@ -1614,17 +1614,6 @@ fn refresh_exchange_rows(branch: &mut BeamBranch, costs: &impl CostModel) {
         };
         rows = rows.saturating_add(bytes);
     }
-    let old = branch.peak_memory.exchange_rows;
-    branch.peak_memory.standard = branch
-        .peak_memory
-        .standard
-        .saturating_sub(old)
-        .saturating_add(rows);
-    branch.peak_memory.total = branch
-        .peak_memory
-        .total
-        .saturating_sub(old)
-        .saturating_add(rows);
     branch.peak_memory.exchange_rows = rows;
 }
 

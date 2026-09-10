@@ -56,3 +56,7 @@ GEMMs, check body-only parameter multiplicities, and validate JSON/HTML output.
 Ownership tests compare overlapping and disjoint allocations, including wrapped
 tile offsets; randomized geometry tests compare per-tile sizes against concrete
 shard storage without using the estimator to generate the expected sizes.
+
+Memory profile version 3 reports tensor-only `peak.standard` and `peak.total`.
+`peak.exchange_rows` is separate; it remains a ranking estimate rather than a
+capacity proof. Older version-2 reports included rows in those two peaks.

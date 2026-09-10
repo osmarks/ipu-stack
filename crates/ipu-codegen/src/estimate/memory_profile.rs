@@ -246,7 +246,7 @@ fn profile(
             .map(|step| step.index)
     };
     Some(Profile {
-        version: 2,
+        version: 3,
         scope: scope.into(),
         model: "Per-tile live storage using selected ownership, before address placement. Scratch remains estimated. Repeat execution counts do not multiply scratch. Exchange rows are reserved separately.",
         tile_count: config.tile_count,
@@ -264,7 +264,6 @@ fn profile(
         support_reserve_bytes: config.standard_memory_reservation_bytes,
         effective_peak_bytes: peak
             .total
-            .saturating_sub(peak.exchange_rows)
             .saturating_add(config.standard_memory_reservation_bytes),
         peak,
         total_peak_step: peak_step(|step| step.usage.total()),
@@ -412,10 +411,7 @@ mod tests {
             }
         }
         let peak = &report.timeline.steps[report.total_peak_step.unwrap()];
-        assert_eq!(
-            peak.usage.total() + report.peak.exchange_rows,
-            report.peak.total
-        );
+        assert_eq!(peak.usage.total(), report.peak.total);
         assert!(report.timeline.values.iter().any(|v| v.group == "weights"));
 
         let repeat = program

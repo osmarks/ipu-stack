@@ -2250,9 +2250,9 @@ fn attention_can_share_key_panels_when_streams_exceed_panel_owner_budget() {
 #[test]
 fn estimated_exchange_rows_rank_plans_without_proving_tensor_overflow() {
     let peaks = MemoryPeaks {
-        standard: 544_876,
+        standard: 357_680,
         interleaved: 191_488,
-        total: 575_996,
+        total: 388_800,
         exchange_rows: 187_196,
         maximum_standard_allocation: 122_880,
     };

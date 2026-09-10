@@ -1626,7 +1626,7 @@ pub(super) fn retain_operator_candidates_for_demands(
         (
             objective.memory.standard_contiguous_overflow(),
             objective.cycles,
-            objective.memory.total,
+            objective.memory.total_with_exchange(),
             objective.memory.interleaved,
             objective.memory.exchange_rows,
         )

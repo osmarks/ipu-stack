@@ -29,7 +29,7 @@ impl MemoryUsage {
     }
 }
 
-/// Independent class maxima and maximum simultaneous live storage. Region 1
+/// Tensor-only class maxima and maximum simultaneous live storage. Region 1
 /// is shared by both classes; separate peaks need not coexist. These are cheap
 /// capacity screens, not a guarantee that aligned concrete placement succeeds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -37,7 +37,7 @@ pub struct MemoryPeaks {
     pub standard: u64,
     pub interleaved: u64,
     pub total: u64,
-    /// Persistent standard-memory estimate for generated exchange rows.
+    /// Separate persistent estimate for generated exchange rows; ranking only.
     pub exchange_rows: u64,
     pub maximum_standard_allocation: u64,
 }
@@ -48,13 +48,17 @@ impl MemoryPeaks {
     /// Shared Pareto dimensions for operator and region shortlists.
     pub(crate) fn objectives(self) -> [u64; Self::OBJECTIVE_COUNT] {
         [
-            self.standard,
+            self.standard.saturating_add(self.exchange_rows),
             self.interleaved,
-            self.total,
+            self.total_with_exchange(),
             self.maximum_standard_allocation,
             self.standard_contiguous_overflow(),
             self.exchange_rows,
         ]
+    }
+
+    pub(crate) fn total_with_exchange(self) -> u64 {
+        self.total.saturating_add(self.exchange_rows)
     }
 
     pub(crate) fn observe(&mut self, usage: MemoryUsage, maximum_standard_allocation: u64) {
@@ -75,7 +79,7 @@ impl MemoryPeaks {
             // Row storage is a coarse ranking estimate: it sums independent
             // phase maxima and cannot prove that an allocation is impossible.
             // Exact encoded rows participate in package acceptance after scheduling.
-            && self.total.saturating_sub(self.exchange_rows).saturating_add(reserved_standard_bytes)
+            && self.total.saturating_add(reserved_standard_bytes)
                 <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
             && self.contiguous_overflow(reserved_standard_bytes) == 0
     }

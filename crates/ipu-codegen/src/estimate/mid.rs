@@ -329,8 +329,6 @@ fn analyze_storage<const PER_TILE: bool>(
         }
     }
     peak.exchange_rows = rows;
-    peak.standard = peak.standard.saturating_add(rows);
-    peak.total = peak.total.saturating_add(rows);
     Some((cycles, peak))
 }
 

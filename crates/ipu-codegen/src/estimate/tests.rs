@@ -334,7 +334,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     };
     let peak = |program: &MidProgram| {
         let (_, peak) = analyze_mid(program, &BTreeMap::new()).unwrap();
-        peak.total - peak.exchange_rows
+        peak.total
     };
     // Each allocation has 256 bytes on two owners. {7,0}, {1,2}, {3,4}
     // are disjoint even though no layout individually uses all eight tiles.
@@ -352,7 +352,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             &BTreeMap::new(),
         )
         .unwrap();
-        peak.total - peak.exchange_rows
+        peak.total
     };
     assert_eq!(
         screened_peak(1024),
@@ -366,10 +366,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     );
     program.values[1].tensor_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
     let (_, separate_classes) = analyze_mid(&program, &BTreeMap::new()).unwrap();
-    assert_eq!(
-        separate_classes.standard - separate_classes.exchange_rows,
-        256
-    );
+    assert_eq!(separate_classes.standard, 256);
     assert_eq!(separate_classes.interleaved, 256);
     assert_eq!(peak(&program), 256);
     program.values[1].tensor_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
@@ -390,5 +387,5 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     program.operations.push(copy);
     program.outputs = vec![id(2), id(3)];
     let (_, resident) = analyze_mid(&program, &BTreeMap::from([(id(0), 3)])).unwrap();
-    assert_eq!(resident.total - resident.exchange_rows, 6 * 256);
+    assert_eq!(resident.total, 6 * 256);
 }
