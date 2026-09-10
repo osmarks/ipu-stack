@@ -296,3 +296,28 @@ with unchanged lifetime, memory-class and bank constraints. The extra attempt
 only runs after online placement fails. All 227 codegen tests passed (five
 ignored), and clippy passed with the existing allowances. The next full trial
 is `artifacts/vit-size-first-placement-20260910/`.
+
+
+### Size-first trial result
+
+`vit-size-first-placement-20260910` also failed all four final placements;
+there was no hardware execution. It took 1213.6 seconds and peaked at
+7904480 KiB RSS (7.54 GiB). Support reservations again left the tensor range
+531892..949168 (417276 bytes) for the first finalist.
+
+The size-first attempt exposed a stronger constraint than the earlier online
+fragmentation failure. On tile 368 the resident weights occupy 304128 bytes
+(96768 + 96768 + 82944 + 27648). At event 17, the 84096-byte F16 input remains
+live as the 42056-byte FP8 packed cast output is allocated. Those payloads
+alone sum to 430280 bytes, exceeding the available tensor range by 13004 bytes,
+before smaller buffers or element alignment. No ordering of these allocations
+can solve that tile. The size-first attempt fails before allocating the final
+27648-byte weight sequence, so its 56696-byte free tail must not be mistaken
+for enough total capacity.
+
+The experimental fallback from `059c714` is retained in history but removed
+from the active implementation: this trial showed no recovered tiles and did
+not justify another allocation-order heuristic. Further work needs lower
+simultaneous activation storage or better distribution of resident parameters,
+with final support reservations included in the feasibility analysis. The
+last verified ViT hardware run remains four layers, not 27.
