@@ -36,7 +36,7 @@ use ipu_package::{
     SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::num::TryFromIntError;
 use std::path::PathBuf;
@@ -1168,49 +1168,33 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
         symbols.push(crate::HOST_RUN_SYMBOL.into());
         symbols.push(crate::REPEAT_CALL_SYMBOL.into());
     }
-    #[derive(Default)]
-    struct CopySymbols {
-        local: bool,
-        halfword: bool,
-        zero: bool,
-    }
-    let mut copies = CopySymbols::default();
-    fn collect(program: &LowProgram, tile: &crate::TileWorkList, copies: &mut CopySymbols) {
+    fn collect(
+        program: &LowProgram,
+        tile: &crate::TileWorkList,
+        symbols: &mut BTreeSet<&'static str>,
+    ) {
         for work in program.work(tile) {
             match work {
                 crate::TileWorkRef::LocalCopy(copy) => {
-                    copies.local = true;
-                    copies.halfword |= crate::tile::local_copy_call(copy)
-                        .is_some_and(|(symbol, _)| symbol == crate::COPY_U16_SYMBOL);
+                    if let Some((symbol, _)) = crate::tile::local_copy_call(copy) {
+                        symbols.insert(symbol);
+                    }
                 }
-                crate::TileWorkRef::Kernel(run) => {
-                    copies.zero |= matches!(run.kernel, crate::TileKernelSpec::FillZero { .. });
+                crate::TileWorkRef::Kernel(run)
+                    if matches!(run.kernel, crate::TileKernelSpec::FillZero { .. }) =>
+                {
+                    symbols.insert(crate::FILL_ZERO_U64_SYMBOL);
                 }
-                crate::TileWorkRef::Repeat(repeat) => collect(program, &repeat.body, copies),
+                crate::TileWorkRef::Repeat(repeat) => collect(program, &repeat.body, symbols),
                 _ => {}
             }
         }
     }
+    let mut copies = BTreeSet::new();
     for tile in &program.tiles {
         collect(program, tile, &mut copies);
     }
-    if copies.halfword {
-        symbols.push(crate::COPY_U16_SYMBOL.into());
-    }
-    if copies.local {
-        symbols.extend(
-            [
-                crate::COPY_U32_SYMBOL,
-                crate::COPY_U64_SYMBOL,
-                crate::COPY_STRIDED_U64_SYMBOL,
-                crate::COPY_STRIDED_U32_SYMBOL,
-            ]
-            .map(String::from),
-        );
-    }
-    if copies.zero {
-        symbols.push(crate::FILL_ZERO_U64_SYMBOL.into());
-    }
+    symbols.extend(copies.into_iter().map(String::from));
     symbols
 }
 
