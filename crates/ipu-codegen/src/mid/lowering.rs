@@ -381,7 +381,7 @@ fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValue
     .then(|| operation.results[0])
 }
 
-// Eligibility only: the region beam compares complete conversion sequences.
+// Eligibility only: baseline selection also costs the surrounding conversions.
 fn early_cast_format(input: &TensorType, target: &TensorFormat) -> Option<TensorFormat> {
     if input.format.precision != Precision::F16
         || !matches!(target.precision, Precision::F8F143 { .. })

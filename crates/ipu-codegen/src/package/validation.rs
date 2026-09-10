@@ -108,8 +108,8 @@ mod tests {
             .with_automatic_input(x, Precision::F16)
             .with_automatic_input(gamma, Precision::F16)
             .with_automatic_input(beta, Precision::F16);
-        let finalists = [lower_baseline(&graph, &config, &Ipu21CostModel).unwrap()];
-        let expanded = crate::expand_tiles(&finalists[0]).unwrap();
+        let baseline = lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let expanded = crate::expand_tiles(&baseline).unwrap();
         let fragments = crate::estimate::program_footprint(&expanded)
             .unwrap()
             .maximum_transfer_chunks_per_tile;
@@ -118,7 +118,7 @@ mod tests {
         config.exchange_table_budget_bytes = 0;
         // Encoded storage is checked only once encoded; mid heuristics and
         // uncompressed row slots cannot veto this geometry-feasible plan.
-        assert!(expand_and_place(&finalists[0], &config, None).is_ok());
+        assert!(expand_and_place(&baseline, &config, None).is_ok());
         assert!(check_exchange_budget(1, &config).is_err());
         config.exchange_table_budget_bytes = 1;
         assert!(check_exchange_budget(1, &config).is_ok());

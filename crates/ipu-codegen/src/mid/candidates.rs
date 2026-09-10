@@ -1623,7 +1623,7 @@ pub(super) fn retain_operator_candidates_for_demands(
         .any(|(_, metrics, _)| metrics.memory.standard_contiguous_overflow() == 0);
     let mut selected = BTreeSet::new();
     // Preserve the storage extreme before latency/family slots fill the pool.
-    // The region beam will add boundary conversion traffic for each parent.
+    // Baseline selection adds the surrounding boundary conversion traffic.
     if width > 1
         && let Some((index, _)) = ranked
             .iter()
@@ -1693,7 +1693,7 @@ pub(super) fn retain_operator_candidates_for_demands(
     }
     // Preserve one tied memory/staging alternative per selected implementation.
     // Sharing its geometry slot avoids trading away a different useful grid.
-    // This bounds the local pool at 2 * width; the region beam remains width.
+    // This bounds the local catalogue at 2 * width.
     let representatives = selected.iter().copied().collect::<Vec<_>>();
     for representative in representatives {
         let (plan, metrics, compatibility) = &ranked[representative];

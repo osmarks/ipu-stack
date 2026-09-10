@@ -170,7 +170,7 @@ pub(super) fn improve_exchange_placement(
     let accepted = candidate_cycles < baseline_cycles && row_bytes <= row_capacity;
     tracing::info!(offset, baseline_score = %baseline_score, score = %score,
         baseline_cycles, candidate_cycles, row_bytes, row_capacity, accepted,
-        "evaluated exchange placement finalist");
+        "evaluated exchange placement candidate");
     if accepted {
         Ok((candidate, candidate_exchanges))
     } else {

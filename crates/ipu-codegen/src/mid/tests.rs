@@ -194,12 +194,10 @@ fn fp8_mlp_can_quantize_before_replication() {
     recipe
         .early_casts
         .extend(graph.operations().iter().map(|op| op.id));
-    let finalists = [
-        baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe)
-            .unwrap()
-            .program,
-    ];
-    assert!(finalists.iter().any(|mid| {
+    let mid = baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe)
+        .unwrap()
+        .program;
+    assert!(
         mid.operations
             .iter()
             .filter_map(|op| op.conversion_plan())
@@ -208,7 +206,7 @@ fn fp8_mlp_can_quantize_before_replication() {
                     && plan.output.format.precision == fp8
                     && plan.output.format.layout.tiling.replicas == 1
             })
-    }));
+    );
 }
 
 #[test]
@@ -1710,7 +1708,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
                 == 0
         }));
     }
-    // Do not pin complete-beam membership to the historical kernel timings:
+    // Do not pin local selection to the historical kernel timings:
     // changes to compute throughput can legitimately favor different grids.
 }
 
@@ -2010,7 +2008,7 @@ fn estimated_exchange_rows_rank_plans_without_proving_tensor_overflow() {
     let reservation = 49_152;
     assert!(peaks.fits_ipu21_with_budget(reservation, 512 * 1024));
     assert!(!peaks.fits_ipu21_with_budget(reservation, 400 * 1024));
-    // Keep the table estimate in the resource objectives used by the beam.
+    // Keep the table estimate in the resource objectives used by the catalogue.
     assert_eq!(peaks.objectives()[5], 187_196);
 }
 

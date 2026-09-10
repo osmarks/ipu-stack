@@ -2,7 +2,7 @@ use super::*;
 
 impl SearchReport {
     /// Best retained candidate with no known missing capability. This is not a
-    /// claim that the production beam would select it or that placement fits.
+    /// claim that the production planner would select it or that placement fits.
     pub fn reference(&self) -> Option<&DiagnosticMidGraph> {
         self.candidates
             .iter()
