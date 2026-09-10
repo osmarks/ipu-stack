@@ -172,7 +172,7 @@ pub fn materialize_kernel_run(
     })
 }
 
-fn add_address_offset(
+pub(crate) fn add_address_offset(
     address: TileAddress,
     offset: u32,
 ) -> Result<TileAddress, KernelMaterializationError> {

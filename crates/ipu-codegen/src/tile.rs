@@ -250,10 +250,22 @@ fn lower_work(
                         destination_offset: copy.destination_offset,
                         bytes: copy.bytes,
                     })?;
+                let resolve = |shard, offset, address| {
+                    overrides
+                        .get(&shard)
+                        .copied()
+                        .map_or(Ok(TileAddress::Absolute(address)), |base| {
+                            crate::kernel::add_address_offset(base, offset)
+                        })
+                };
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),
-                    output_address: TileAddress::Absolute(destination),
-                    input_addresses: vec![TileAddress::Absolute(source)],
+                    output_address: resolve(
+                        copy.destination,
+                        copy.destination_offset,
+                        destination,
+                    )?,
+                    input_addresses: vec![resolve(copy.source, copy.source_offset, source)?],
                     arguments,
                     profile: StepProfile::default(),
                 })
@@ -692,6 +704,86 @@ mod tests {
         lower_exchanges, lower_to_tiles, place,
     };
     use ipu_exchange::{RETURN_M10_INSTRUCTION, Topology};
+
+    #[test]
+    fn local_copies_follow_iterated_pointers_inside_repeat() {
+        let id = crate::BlockValueId::from_index;
+        let graph = crate::TileGraph {
+            tile_count: 1,
+            shards: (0..2)
+                .map(|index| crate::BlockValue {
+                    id: id(index),
+                    tile: 0,
+                    tensor_type: crate::TensorType::new(
+                        [128],
+                        Precision::F16,
+                        Layout::row_sharded(1),
+                    ),
+                    extents: vec![],
+                    definition: crate::ShardDefinition::Staging,
+                })
+                .collect(),
+            local_copies: vec![crate::LocalCopy {
+                source: id(0),
+                source_offset: 8,
+                destination: id(1),
+                destination_offset: 16,
+                bytes: 64,
+                pattern: crate::CopyPattern::Contiguous,
+            }],
+            exchange_phases: vec![],
+            inputs: vec![],
+            body: Default::default(),
+            kernel_runs: vec![],
+            values: vec![],
+            outputs: vec![],
+            logical_values: vec![],
+            checkpoints: vec![],
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        };
+        let program = LowProgram {
+            program: std::sync::Arc::new(graph),
+            repeat_runs: vec![],
+            tiles: vec![TileWorkList {
+                tile: 0,
+                work: vec![crate::TileWork::LocalCopy(crate::LocalCopyId(0))],
+            }],
+        };
+        let placement = Placement {
+            shard_addresses: BTreeMap::from([(id(0), 0x60000), (id(1), 0x70000)]),
+            tile_auxiliary_ranges: vec![],
+        };
+        let overrides = BTreeMap::from([(
+            id(0),
+            TileAddress::RepeatPointer {
+                index: 2,
+                offset: 32,
+            },
+        )]);
+        let steps = lower_work(
+            &program,
+            &program.tiles[0],
+            &placement,
+            &KernelBuildPlan::default(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &overrides,
+            true,
+        )
+        .unwrap();
+        let TileStep::Compute(copy) = &steps[0] else {
+            panic!("missing local copy")
+        };
+        assert_eq!(
+            copy.input_addresses,
+            [TileAddress::RepeatPointer {
+                index: 2,
+                offset: 40
+            }]
+        );
+        assert_eq!(copy.output_address, TileAddress::Absolute(0x70010));
+    }
 
     #[test]
     fn randomized_gemms_finalize_to_address_resolved_tile_programs() {
