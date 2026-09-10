@@ -133,6 +133,9 @@ struct Arguments {
     /// Cap geometry-derived static transfer fragments per tile (default 16384).
     #[arg(long, conflicts_with = "reuse_package")]
     exchange_transfer_limit_per_tile: Option<u64>,
+    /// Override the layout-search beam (default comes from PipelineConfig).
+    #[arg(long, conflicts_with = "reuse_package")]
+    planning_beam_width: Option<usize>,
     /// Complete plans per configuration to expand and estimate.
     #[arg(long, default_value_t = 16, conflicts_with = "reuse_package")]
     expanded_plan_finalists: usize,
@@ -682,6 +685,9 @@ fn main() -> Result<()> {
     }
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
+    if let Some(width) = arguments.planning_beam_width {
+        pipeline = pipeline.with_planning_beam_width(width);
+    }
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
         "native" => ipu_codegen::GemmOutputPacking::Native,
