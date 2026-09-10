@@ -2481,7 +2481,7 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
         })
         .unwrap();
     let parameter = &mid.values[repeat.iterated_inputs[0][0].index() as usize];
-    assert_eq!(parameter.tensor_type.format.layout.tiling.tile_count, 8);
+    assert!(parameter.tensor_type.format.layout.tiling.tile_count > 2);
     let resolved = implementation::resolve(mid).unwrap();
     let (_, peak) = crate::estimate::analyze_mid(&resolved, &BTreeMap::new()).unwrap();
     assert!(peak.fits_ipu21_with_budget(0, 80000), "{peak:?}");

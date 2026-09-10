@@ -207,14 +207,18 @@ pub(super) fn compact_parameter_layout(
     copies: u32,
     config: &PipelineConfig,
 ) -> Option<Layout> {
-    let grain = tensor.format.layout.tiling.linear_grain()?;
-    let owners = tensor
-        .shape
-        .elements()
-        .saturating_mul(tensor.format.precision.bytes())
-        .div_ceil(256)
-        .min(u64::from(tensor.format.layout.tiling.tile_count)) as u16;
-    let layout = Layout::logical_linear(owners, grain);
+    let layout = if tensor.format.layout.order == ElementOrder::RowMajor {
+        let grain = tensor.format.layout.tiling.linear_grain()?;
+        let owners = tensor
+            .shape
+            .elements()
+            .saturating_mul(tensor.format.precision.bytes())
+            .div_ceil(256)
+            .min(u64::from(tensor.format.layout.tiling.tile_count)) as u16;
+        Layout::logical_linear(owners, grain)
+    } else {
+        compact_matrix_layout(tensor, config.tile_count)?
+    };
     let bytes = layout
         .resolve(&tensor.shape)
         .ok()?
@@ -226,6 +230,79 @@ pub(super) fn compact_parameter_layout(
             .tile_memory_budget_bytes
             .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)))
     .then_some(layout)
+}
+
+// Keep physical panels intact while changing ownership. Generic row-major
+// storage would require a new permutation kernel, notably for FP8 weights.
+fn compact_matrix_layout(tensor: &TensorType, tiles: u16) -> Option<Layout> {
+    use crate::{AmpOrder, AxisTiling, BlockMajorOrder, Padding, TensorAxis, TensorTiling};
+    let dimensions = &tensor.shape.0;
+    let (&rows, &columns) = (
+        dimensions.get(dimensions.len().checked_sub(2)?)?,
+        dimensions.last()?,
+    );
+    let micro = 32 / tensor.format.precision.bytes() as u32;
+    let (row_grain, column_grain) = match tensor.format.layout.order {
+        ElementOrder::RowMajor => return None,
+        ElementOrder::Amp(AmpOrder::Left) => (1, micro),
+        ElementOrder::Amp(AmpOrder::TransposedLeft) => (micro, 1),
+        ElementOrder::Amp(AmpOrder::Output) => (1, 16),
+        ElementOrder::Amp(AmpOrder::TransposedOutput) => (16, 1),
+        ElementOrder::Amp(AmpOrder::TransposedRight) => (16, micro),
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+            row_block,
+            column_block,
+        }) => (u32::from(row_block), u32::from(column_block)),
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
+            row_block,
+            column_block,
+        }) => (u32::from(column_block), u32::from(row_block)),
+    };
+    if row_grain == 0 || column_grain == 0 {
+        return None;
+    }
+    let row_blocks = rows.div_ceil(row_grain);
+    let column_blocks = columns.div_ceil(column_grain);
+    let (_, _, row_parts, column_parts) = (1..=row_blocks.min(u32::from(tiles)))
+        .filter_map(|row_parts| {
+            let column_parts = column_blocks.min(u32::from(tiles) / row_parts);
+            if column_parts == 0 {
+                return None;
+            }
+            let shard = u64::from(row_blocks.div_ceil(row_parts))
+                * u64::from(row_grain)
+                * u64::from(column_blocks.div_ceil(column_parts))
+                * u64::from(column_grain);
+            Some((
+                shard,
+                shard * u64::from(row_parts * column_parts),
+                row_parts,
+                column_parts,
+            ))
+        })
+        .min()?;
+    Some(Layout {
+        order: tensor.format.layout.order,
+        tiling: TensorTiling {
+            tile_count: (row_parts * column_parts) as u16,
+            replicas: 1,
+            axes: vec![
+                AxisTiling::new(
+                    TensorAxis::FromEnd(2),
+                    row_parts as u16,
+                    row_grain,
+                    Padding::Zero,
+                ),
+                AxisTiling::new(
+                    TensorAxis::FromEnd(1),
+                    column_parts as u16,
+                    column_grain,
+                    Padding::Zero,
+                ),
+            ],
+        },
+        memory_class: tensor.format.layout.memory_class,
+    })
 }
 
 /// Select persistent homes before capacity screening. Sequence members share
@@ -305,6 +382,66 @@ fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_fp8_homes_preserve_panels_and_avoid_byte_permutations() {
+        let config = PipelineConfig::new(64);
+        let precision = Precision::F8F143 { scale_exponent: -4 };
+        let target = Layout::amp_transposed_left_parallel_grid(64, 8, 2, 2, 2);
+        let native = TensorType::new([128, 256], precision, target.clone());
+        let home = compact_parameter_layout(&native, 27, &config).unwrap();
+        assert_eq!(home.order, target.order);
+        assert_eq!(home.tiling.replicas, 1);
+        assert!(home.tiling.tile_count > target.tiling.tile_count);
+        for (layout, encodable) in [(Layout::logical_linear(64, 8), false), (home, true)] {
+            let source = TensorType::new([128, 256], precision, layout);
+            let output = TensorType::new([128, 256], precision, target.clone());
+            let program = MidProgram {
+                tile_count: 64,
+                inputs: vec![MidInput {
+                    name: "weight".into(),
+                    kind: GraphInputKind::Parameter,
+                    value: MidValueId(0),
+                }],
+                values: [source.clone(), output.clone()]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, tensor_type)| MidValue {
+                        id: MidValueId(id as u32),
+                        tile_offset: 0,
+                        tensor_type,
+                        origin: ValueId::from_index(0),
+                        storage_group: MidValueId(id as u32),
+                    })
+                    .collect(),
+                operations: vec![MidOperation {
+                    source: None,
+                    inputs: vec![MidValueId(0)],
+                    results: vec![MidValueId(1)],
+                    kind: MidOperationKind::Convert(ConversionPlan {
+                        strategy: layout_conversion_strategy(
+                            &source.format.layout,
+                            &output.format.layout,
+                        ),
+                        input: OperandRequirement::new(source.format, 8),
+                        output: OperandRequirement::new(output.format, 8),
+                    }),
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                }],
+                outputs: vec![MidValueId(1)],
+                ..Default::default()
+            };
+            let expanded = crate::expand_tiles(&program).unwrap();
+            assert_eq!(
+                expanded
+                    .local_copies
+                    .iter()
+                    .all(|copy| crate::tile::local_copy_call(copy).is_some()),
+                encodable
+            );
+        }
+    }
 
     #[test]
     fn independent_copy_roots_rotate_without_moving_partials_or_shared_results() {

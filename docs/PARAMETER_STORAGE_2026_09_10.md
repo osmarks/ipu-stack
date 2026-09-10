@@ -148,3 +148,27 @@ relocation together.
 The decoder-only full retry under `vit-repeat-relocation-20260910` was stopped
 intentionally after 150.6 seconds when the ordering bug was identified; it is
 not a completed model test.
+
+The send-order run (`vit-repeat-source-order-20260910`) passed Repeat relocation
+and provisional placement, but final tile lowering rejected one-byte local
+copies. It completed in 1401 seconds at 25620780 KiB peak RSS. Its hundreds of
+millions of estimated low-level cycles described byte-wise FP8 permutations,
+not useful GEMM execution; there was no hardware timing result.
+
+The compact shards already had eight-byte boundaries. Their **row-major order**
+was the problem: transposed FP8 panel population fell back to byte-sized copies.
+Compact per-operator storage alternatives now preserve the selected consumer's
+element order. An unreplicated matrix grid divides whole physical panels across
+the available tiles, minimizing the maximum shard size and then total padding.
+The host can populate those native parameter panels directly, and body-local
+materialization redistributes them without a byte permutation. Row-major
+compact storage remains usable where its conversions are supported, including
+F16 under tight budgets. Normalization vectors retain the small linear-home
+policy. This is a storage choice, independent of the compute grid.
+
+A targeted FP8 test shows that raw row-major homes produce unencodable local
+copies while native packed homes use encodable copies. Finalist expansion also
+checks the existing local-copy kernel selector before admitting a plan to
+placement, rather than discovering unsupported byte copies after scheduling.
+Validation: 224 codegen tests passed, five ignored; Clippy passed with the
+existing argument-count/type-complexity allowances.

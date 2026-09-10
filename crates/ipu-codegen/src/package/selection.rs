@@ -400,6 +400,21 @@ fn expand_and_screen(
     }
     placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
+    if let Some(copy) = low
+        .local_copies
+        .iter()
+        .find(|copy| crate::tile::local_copy_call(copy).is_none())
+    {
+        return Err(crate::TileLoweringError::InvalidLocalCopy {
+            tile: low.shards[copy.source.index() as usize].tile,
+            source_shard: copy.source,
+            source_offset: copy.source_offset,
+            destination_shard: copy.destination,
+            destination_offset: copy.destination_offset,
+            bytes: copy.bytes,
+        }
+        .into());
+    }
     Ok((low, footprint))
 }
 
