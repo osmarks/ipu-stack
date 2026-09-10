@@ -604,7 +604,7 @@ fn build_package_from_objects(
                 name: "host descriptors",
                 bytes: host_data_bytes,
                 alignment: 4,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
                 end_alignment: 4,
                 guard_after: 0,
             })

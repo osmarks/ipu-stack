@@ -268,3 +268,13 @@ trial is `artifacts/vit-profile-region-one-20260910/`.
 Validation: 226 existing codegen tests passed, five ignored; the added
 region-1 reservation regression passed separately. Clippy passed with the
 existing allowances, and the release test executable was rebuilt.
+
+
+The small 64-tile 32x64x64 GEMM in
+`artifacts/profile-region-one-gemm-20260910/` passed hardware/reference checks
+(maximum absolute error 0.000488) and read back detailed profiling samples from
+region 1. Its HTML profile is retained there. The full profile-region-one trial
+was stopped during planning when inspection found the same unnecessary region-0
+bound on host descriptors. Those ordinary data records may now use either
+region; reserved ranges continue to exclude them from tensor placement. The
+replacement full trial is `artifacts/vit-support-regions-20260910/`.

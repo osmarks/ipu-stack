@@ -608,16 +608,17 @@ mod tests {
         for (index, phase) in phases.iter_mut().enumerate() {
             phase.transfers[0].tile_address += index as u32 * 1024;
         }
-        let relocated =
-            plan_tile(0, &phases, 0x60000, &[(0x70000, 0x70000 + reservation)]).unwrap();
-        assert_eq!(relocated.data_bytes, reservation);
-        for segment in relocated
-            .segments
-            .iter()
-            .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
-        {
-            assert!(segment.address >= 0x70000);
-            assert!(segment.address + segment.memory_size <= 0x70000 + reservation);
+        for base in [0x70000, 0x90000] {
+            let relocated = plan_tile(0, &phases, 0x60000, &[(base, base + reservation)]).unwrap();
+            assert_eq!(relocated.data_bytes, reservation);
+            for segment in relocated
+                .segments
+                .iter()
+                .filter(|segment| segment.flags & SEGMENT_EXECUTE == 0)
+            {
+                assert!(segment.address >= base);
+                assert!(segment.address + segment.memory_size <= base + reservation);
+            }
         }
     }
 }
