@@ -330,3 +330,49 @@ profile: `layers-2/profile.html`; planner-finalist memory reports are in
 Validation: 215 codegen tests passed, 5 ignored; Clippy passed for codegen and
 the benchmark crate. Chromium checks covered initial rendering, filtering and
 restoring allocations, peak selection, scaled timeline clicks, and ungrouping.
+
+## Per-tile verification of the memory rejections
+
+The initial diagnostic summed unrelated allocation maxima. The revised
+estimator uses selected tile ownership, uneven shard sizes, and wrapped tile
+offsets; the HTML report selects an actual tile and shows its timeline and live
+allocations. This remains a capacity estimate before address placement, with
+estimated reduction/conversion scratch.
+
+The full per-tile trial is in `artifacts/vit-tile-memory-20260910/`. It did
+**not** rescue the four- or 27-layer models:
+
+| Layers | Lowest reported effective peak | Previous upper bound | Result |
+| --- | ---: | ---: | --- |
+| 4 | 607888 B | 607888 B | Repeat composition rejects source 24 |
+| 27 | 607368 B | 607368 B | Body search rejects sources 4/5 |
+
+All 36 reported 27-layer rejections have unchanged total peaks. In the
+lowest-peak example, tiles 0–63 each reach 607368 bytes including support, and
+all 486 QKV weight-owner tiles exceed the 586960-byte budget. QKV weights use
+486 tiles; the replicated first-layernorm scale and bias use 729 overlapping
+tiles; the other weight shards span all 1472 tiles. Their largest allocations
+really coexist. Report:
+`layers-27/memory/rejected-op4-783204-0012.html`. The four-layer report is
+`layers-4/memory/rejected-op24-783226-0000.html`.
+
+The two-layer full per-tile trial passes hardware/reference validation:
+maximum absolute error 0.087280, cropped runtime **1042878 cycles
+(0.695252 ms)**, essentially unchanged from 1042884. Its execution profile is
+`layers-2/profile.html`.
+
+Checking every candidate per tile increased the four-layer trial from 270 to
+373 seconds. The final implementation therefore accepts a fitting cheap upper
+bound and refines every failed bound before rejecting the candidate. It shares
+the same allocation/liveness walker between both modes; diagnostics always use
+per-tile accounting. Validation of this final screening policy is in
+`artifacts/vit-tile-memory-screen-20260910/`. The 27-layer search still rejects
+in 18 seconds. The four-layer search rejects at the same peak in 330 seconds,
+down from 373 seconds with unconditional per-tile analysis, though still above
+the original 270-second run. These wall times include diagnostics and
+overlapping work, so they are not isolated microbenchmarks.
+
+Validation: 216 codegen tests passed, 5 ignored; Clippy passed. Tests cover
+disjoint/overlapping owners, separate-class peaks on different tiles, wrapped
+offsets, and a candidate that only fits after per-tile refinement. Chromium
+checks cover tile selection as well as the previous report controls.
