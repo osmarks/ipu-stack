@@ -358,6 +358,7 @@ fn randomized_future_state_is_id_independent_but_preserves_aliasing() {
         let constraints = RegionPlanningConstraints {
             allocation_copies: [(first, random.u32(1..=8))].into_iter().collect(),
             required_equal_formats: vec![(first, second)],
+            ..Default::default()
         };
         let baseline = future_beam_state(&make_branch(false, aliases), &future, &constraints);
         let renumbered = future_beam_state(&make_branch(true, aliases), &future, &constraints);

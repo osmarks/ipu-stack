@@ -469,6 +469,8 @@ fn future_format_compatibility(
 pub(super) struct RegionPlanningConstraints {
     /// Number of simultaneously resident blocks represented by a region value.
     pub(super) allocation_copies: BTreeMap<ValueId, u32>,
+    /// Require compact persistent homes, choosing their order from the consumer.
+    pub(super) compact_parameters: bool,
     /// Value pairs whose formats must agree at a structured-region boundary.
     pub(super) required_equal_formats: Vec<(ValueId, ValueId)>,
 }
@@ -691,11 +693,13 @@ pub(super) fn lower_operation_candidates(
                         let orders = orders
                             .into_iter()
                             .flat_map(|order| {
-                                let mut variants = vec![(order.clone(), false)];
-                                if !compact_inputs.is_empty() {
-                                    variants.push((order, true));
+                                if compact_inputs.is_empty() {
+                                    vec![(order, false)]
+                                } else if constraints.compact_parameters {
+                                    vec![(order, true)]
+                                } else {
+                                    vec![(order.clone(), false), (order, true)]
                                 }
-                                variants
                             })
                             .collect::<Vec<_>>();
                         let branch = &branch;
@@ -1818,6 +1822,7 @@ fn lower_repeat_candidates(
     let body_constraints = RegionPlanningConstraints {
         allocation_copies: body_allocation_copies,
         required_equal_formats,
+        ..Default::default()
     };
     let candidates = search.plan(boundary, body_constraints)?;
     let mut expanded = Vec::with_capacity(candidates.len());

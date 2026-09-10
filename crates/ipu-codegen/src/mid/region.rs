@@ -52,32 +52,6 @@ impl RegionBoundary {
         )
     }
 
-    fn compact_parameters(
-        &self,
-        copies: &BTreeMap<ValueId, u32>,
-        config: &PipelineConfig,
-    ) -> Option<Self> {
-        let mut boundary = self.clone();
-        let mut changed = false;
-        for argument in &mut boundary.0 {
-            if argument.automatic
-                && argument.parameter
-                && copies.get(&argument.origin).copied().unwrap_or(1) > 1
-            {
-                if let Some(layout) = super::ownership::compact_parameter_layout(
-                    &argument.tensor_type,
-                    copies[&argument.origin],
-                    config,
-                ) {
-                    argument.tensor_type.format.layout = layout;
-                }
-                argument.automatic = false;
-                changed = true;
-            }
-        }
-        changed.then_some(boundary)
-    }
-
     fn state(&self) -> (LoweringState, BTreeMap<ValueId, MidValueId>) {
         let mut state = LoweringState::default();
         let mut values = BTreeMap::new();
@@ -188,12 +162,23 @@ impl<'a, C: CostModel> RegionSearch<'a, C> {
         if matches!(
             candidates,
             Err(LoweringError::NoCandidate(_) | LoweringError::InsufficientMemory { .. })
-        ) && let Some(boundary) = key
-            .0
-            .compact_parameters(&key.1.allocation_copies, self.config)
+        ) && !key.1.compact_parameters
+            && key.0.0.iter().any(|argument| {
+                argument.automatic
+                    && argument.parameter
+                    && key
+                        .1
+                        .allocation_copies
+                        .get(&argument.origin)
+                        .copied()
+                        .unwrap_or(1)
+                        > 1
+            })
         {
             tracing::info!("retrying region with compact persistent parameter homes");
-            candidates = self.plan(boundary, key.1.clone());
+            let mut constraints = key.1.clone();
+            constraints.compact_parameters = true;
+            candidates = self.plan(key.0.clone(), constraints);
         }
         self.cache.insert(key, candidates.clone());
         candidates
@@ -308,38 +293,6 @@ fn remap_operations(operations: &mut [MidOperation], remap: &impl Fn(MidValueId)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compact_boundary_only_freezes_repeated_automatic_parameters() {
-        let mut graph = ComputeGraph::new();
-        let origins: Vec<_> = (0..4)
-            .map(|i| graph.host_input(format!("x{i}"), [1152]).unwrap())
-            .collect();
-        let mut state = LoweringState::default();
-        let bindings: Vec<_> = origins
-            .iter()
-            .map(|&origin| {
-                state.value(
-                    origin,
-                    TensorType {
-                        shape: graph.value_shapes()[&origin].clone(),
-                        format: TensorFormat {
-                            precision: Precision::F16,
-                            layout: Layout::logical_linear(288, 4),
-                        },
-                    },
-                )
-            })
-            .collect();
-        let boundary = RegionBoundary::new(&origins, &bindings, &state, |i| i != 3, |i| i != 1);
-        let copies = BTreeMap::from([(origins[0], 27), (origins[1], 27), (origins[3], 27)]);
-        let config = PipelineConfig::new(1472);
-        let compact = boundary.compact_parameters(&copies, &config).unwrap();
-        assert!(!compact.0[0].automatic);
-        assert_eq!(compact.0[0].tensor_type.format.layout.tiling.tile_count, 9);
-        assert!(compact.0[1..] == boundary.0[1..]);
-        assert!(compact.compact_parameters(&copies, &config).is_none());
-    }
 
     #[test]
     fn boundary_ignores_numbering_but_preserves_planning_constraints() {

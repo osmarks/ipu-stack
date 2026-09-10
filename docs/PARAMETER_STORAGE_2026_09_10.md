@@ -172,3 +172,25 @@ checks the existing local-copy kernel selector before admitting a plan to
 placement, rather than discovering unsupported byte copies after scheduling.
 Validation: 224 codegen tests passed, five ignored; Clippy passed with the
 existing argument-count/type-complexity allowances.
+
+
+## Compact micro-panel storage
+
+The exact-order trial (`vit-native-parameter-homes-20260910`) was stopped
+intentionally after rejected prefixes showed that large BlockMajor panels
+still inflated persistent shards. Compact homes now use the compatible AMP
+micro-panel order, allowing the existing panel exchange to regroup them into
+the selected GEMM macro panels. A regression covers FP8 AMP and BlockMajor
+consumers; another checks that the four ViT weight shapes stay within 10% of
+the ideal unreplicated per-tile storage.
+
+The bounded region fallback now constrains storage choices in the existing
+operator search instead of freezing provisional row-major formats at the
+boundary. This preserves consumer-compatible FP8 packing while forcing the
+coherent compact alternative. Tiny linear homes also account for resident
+multiplicity when choosing their chunk count, rather than relying on the old
+boundary fallback to retain finer shards.
+
+Validation: 224 codegen tests passed, five ignored; Clippy passed with the
+existing argument-count/type-complexity allowances. The measured full-model
+retry is under `artifacts/vit-panel-parameter-homes-20260910/`.

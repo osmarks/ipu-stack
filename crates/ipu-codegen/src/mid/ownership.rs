@@ -209,13 +209,31 @@ pub(super) fn compact_parameter_layout(
 ) -> Option<Layout> {
     let layout = if tensor.format.layout.order == ElementOrder::RowMajor {
         let grain = tensor.format.layout.tiling.linear_grain()?;
+        let limit = config
+            .tile_memory_budget_bytes
+            .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+            .saturating_sub(config.standard_memory_reservation_bytes);
+        let chunks_per_owner =
+            limit / (u64::from(grain) * tensor.format.precision.bytes() * u64::from(copies));
+        if chunks_per_owner == 0 {
+            return None;
+        }
+        let required = tensor
+            .shape
+            .elements()
+            .div_ceil(u64::from(grain))
+            .div_ceil(chunks_per_owner);
         let owners = tensor
             .shape
             .elements()
             .saturating_mul(tensor.format.precision.bytes())
             .div_ceil(256)
-            .min(u64::from(tensor.format.layout.tiling.tile_count)) as u16;
-        Layout::logical_linear(owners, grain)
+            .min(u64::from(tensor.format.layout.tiling.tile_count))
+            .max(required);
+        if owners > u64::from(tensor.format.layout.tiling.tile_count) {
+            return None;
+        }
+        Layout::logical_linear(owners as u16, grain)
     } else {
         compact_matrix_layout(tensor, config.tile_count)?
     };
@@ -232,8 +250,9 @@ pub(super) fn compact_parameter_layout(
     .then_some(layout)
 }
 
-// Keep physical panels intact while changing ownership. Generic row-major
-// storage would require a new permutation kernel, notably for FP8 weights.
+// Preserve micro-panel traversal, not the consumer's macro-panel dimensions.
+// The existing panel exchange can regroup these fragments without permutation;
+// retaining large macro panels needlessly restricts persistent ownership.
 fn compact_matrix_layout(tensor: &TensorType, tiles: u16) -> Option<Layout> {
     use crate::{AmpOrder, AxisTiling, BlockMajorOrder, Padding, TensorAxis, TensorTiling};
     let dimensions = &tensor.shape.0;
@@ -242,21 +261,23 @@ fn compact_matrix_layout(tensor: &TensorType, tiles: u16) -> Option<Layout> {
         dimensions.last()?,
     );
     let micro = 32 / tensor.format.precision.bytes() as u32;
-    let (row_grain, column_grain) = match tensor.format.layout.order {
+    let order = match tensor.format.layout.order {
+        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => {
+            ElementOrder::Amp(AmpOrder::TransposedLeft)
+        }
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
+            ElementOrder::Amp(AmpOrder::Left)
+        }
+        order => order,
+    };
+    let (row_grain, column_grain) = match order {
         ElementOrder::RowMajor => return None,
         ElementOrder::Amp(AmpOrder::Left) => (1, micro),
         ElementOrder::Amp(AmpOrder::TransposedLeft) => (micro, 1),
         ElementOrder::Amp(AmpOrder::Output) => (1, 16),
         ElementOrder::Amp(AmpOrder::TransposedOutput) => (16, 1),
         ElementOrder::Amp(AmpOrder::TransposedRight) => (16, micro),
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-            row_block,
-            column_block,
-        }) => (u32::from(row_block), u32::from(column_block)),
-        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
-            row_block,
-            column_block,
-        }) => (u32::from(column_block), u32::from(row_block)),
+        ElementOrder::BlockMajor(_) => unreachable!(),
     };
     if row_grain == 0 || column_grain == 0 {
         return None;
@@ -282,7 +303,7 @@ fn compact_matrix_layout(tensor: &TensorType, tiles: u16) -> Option<Layout> {
         })
         .min()?;
     Some(Layout {
-        order: tensor.format.layout.order,
+        order,
         tiling: TensorTiling {
             tile_count: (row_parts * column_parts) as u16,
             replicas: 1,
@@ -387,58 +408,92 @@ mod tests {
     fn compact_fp8_homes_preserve_panels_and_avoid_byte_permutations() {
         let config = PipelineConfig::new(64);
         let precision = Precision::F8F143 { scale_exponent: -4 };
-        let target = Layout::amp_transposed_left_parallel_grid(64, 8, 2, 2, 2);
-        let native = TensorType::new([128, 256], precision, target.clone());
-        let home = compact_parameter_layout(&native, 27, &config).unwrap();
-        assert_eq!(home.order, target.order);
-        assert_eq!(home.tiling.replicas, 1);
-        assert!(home.tiling.tile_count > target.tiling.tile_count);
-        for (layout, encodable) in [(Layout::logical_linear(64, 8), false), (home, true)] {
-            let source = TensorType::new([128, 256], precision, layout);
-            let output = TensorType::new([128, 256], precision, target.clone());
-            let program = MidProgram {
-                tile_count: 64,
-                inputs: vec![MidInput {
-                    name: "weight".into(),
-                    kind: GraphInputKind::Parameter,
-                    value: MidValueId(0),
-                }],
-                values: [source.clone(), output.clone()]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(id, tensor_type)| MidValue {
-                        id: MidValueId(id as u32),
-                        tile_offset: 0,
-                        tensor_type,
-                        origin: ValueId::from_index(0),
-                        storage_group: MidValueId(id as u32),
-                    })
-                    .collect(),
-                operations: vec![MidOperation {
-                    source: None,
-                    inputs: vec![MidValueId(0)],
-                    results: vec![MidValueId(1)],
-                    kind: MidOperationKind::Convert(ConversionPlan {
-                        strategy: layout_conversion_strategy(
-                            &source.format.layout,
-                            &output.format.layout,
-                        ),
-                        input: OperandRequirement::new(source.format, 8),
-                        output: OperandRequirement::new(output.format, 8),
-                    }),
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
-                }],
-                outputs: vec![MidValueId(1)],
-                ..Default::default()
-            };
-            let expanded = crate::expand_tiles(&program).unwrap();
+        for order in [
+            ElementOrder::Amp(AmpOrder::TransposedLeft),
+            ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            }),
+        ] {
+            let mut target = Layout::amp_transposed_left_parallel_grid(64, 8, 2, 2, 2);
+            target.order = order;
+            let native = TensorType::new([128, 256], precision, target.clone());
+            let home = compact_parameter_layout(&native, 27, &config).unwrap();
             assert_eq!(
-                expanded
-                    .local_copies
-                    .iter()
-                    .all(|copy| crate::tile::local_copy_call(copy).is_some()),
-                encodable
+                home.order.micro_panel_order(),
+                target.order.micro_panel_order()
+            );
+            assert_eq!(home.tiling.replicas, 1);
+            assert!(home.tiling.tile_count > target.tiling.tile_count);
+            for (layout, encodable) in [(Layout::logical_linear(64, 8), false), (home, true)] {
+                let source = TensorType::new([128, 256], precision, layout);
+                let output = TensorType::new([128, 256], precision, target.clone());
+                let program = MidProgram {
+                    tile_count: 64,
+                    inputs: vec![MidInput {
+                        name: "weight".into(),
+                        kind: GraphInputKind::Parameter,
+                        value: MidValueId(0),
+                    }],
+                    values: [source.clone(), output.clone()]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(id, tensor_type)| MidValue {
+                            id: MidValueId(id as u32),
+                            tile_offset: 0,
+                            tensor_type,
+                            origin: ValueId::from_index(0),
+                            storage_group: MidValueId(id as u32),
+                        })
+                        .collect(),
+                    operations: vec![MidOperation {
+                        source: None,
+                        inputs: vec![MidValueId(0)],
+                        results: vec![MidValueId(1)],
+                        kind: MidOperationKind::Convert(ConversionPlan {
+                            strategy: layout_conversion_strategy(
+                                &source.format.layout,
+                                &output.format.layout,
+                            ),
+                            input: OperandRequirement::new(source.format, 8),
+                            output: OperandRequirement::new(output.format, 8),
+                        }),
+                        estimated_cycles: 0,
+                        estimated_exchange_cycles: 0,
+                    }],
+                    outputs: vec![MidValueId(1)],
+                    ..Default::default()
+                };
+                let expanded = crate::expand_tiles(&program).unwrap();
+                assert_eq!(
+                    expanded
+                        .local_copies
+                        .iter()
+                        .all(|copy| crate::tile::local_copy_call(copy).is_some()),
+                    encodable
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_weight_homes_do_not_inherit_gemm_macro_panel_padding() {
+        let config = PipelineConfig::new(1472);
+        for shape in [[1152, 3456], [1152, 1152], [1152, 4304], [4304, 1152]] {
+            let tensor = TensorType::new(
+                shape,
+                Precision::F8F143 { scale_exponent: -4 },
+                Layout::block_major_matrix_storage(288, 16, 1, 1, 1, MemoryClass::Ipu21Standard),
+            );
+            let home = compact_parameter_layout(&tensor, 27, &config).unwrap();
+            let shard = home.resolve(&tensor.shape).unwrap().maximum_tile_elements();
+            let ideal = tensor
+                .shape
+                .elements()
+                .div_ceil(u64::from(config.tile_count));
+            assert!(
+                shard * 100 <= ideal * 110,
+                "{shape:?}: shard {shard}, ideal {ideal}"
             );
         }
     }
