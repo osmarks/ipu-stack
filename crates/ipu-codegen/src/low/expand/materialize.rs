@@ -342,10 +342,9 @@ impl TileGraphBuilder {
         Ok(mappings)
     }
 
-    /// Splits corresponding views at each allocation's 16-element micro-panel
-    /// boundaries. Within every resulting rectangle the source and
-    /// destination have identical physical traversal, even when their outer
-    /// panel sequence and tile ownership differ.
+    /// Match packed grids using their precision-specific panel shape. Irregular
+    /// boundaries use smaller clipped fragments with identical traversal, even
+    /// when the outer panel sequence and tile ownership differ.
     pub(super) fn micro_panel_mappings(
         &self,
         mut mappings: Vec<(ShardView, ShardView)>,

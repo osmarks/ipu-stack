@@ -194,3 +194,31 @@ boundary fallback to retain finer shards.
 Validation: 224 codegen tests passed, five ignored; Clippy passed with the
 existing argument-count/type-complexity allowances. The measured full-model
 retry is under `artifacts/vit-panel-parameter-homes-20260910/`.
+
+
+## FP8 exchange fragmentation
+
+The micro-panel-home run passed copy encoding, provisional placement and
+Repeat scheduling. Its admitted plans were then rejected by the encoded
+exchange-table limit: one needed 162600 bytes per tile against a 65536-byte
+limit. The automatic higher-penalty replan was stopped intentionally.
+Expansion took roughly 7–8 seconds per candidate, compared with 18–22 seconds
+for the earlier byte-permutation plans. Peak host RSS remained about 8.1 GiB.
+No device execution occurred.
+
+The complete-grid exchange traversal still used fixed 16-by-16 panels for
+FP8. Splitting the 32-element contiguous FP8 packing axis in half produced
+strided 16-byte spans. Complete grids now traverse 32-by-16 or 16-by-32 panels,
+according to their shared physical order. Irregular boundaries retain the
+existing clipped fallback. Compact homes also preserve whole exchange panels
+on both axes, avoiding narrow owners which defeat that traversal. For the
+four ViT weight shapes, these grids stay within 25% of ideal per-tile storage;
+this trades about 31 KiB of worst-case resident weight shards for fewer exchange
+fragments compared with the finest ownership grids.
+
+The coordinate-enumeration traversal tests pass with the precision-specific
+panels. A focused regression checks that complete FP8 grids expose contiguous
+spans of at least 512 bytes in both AMP and BlockMajor orientations. Validation:
+224 existing codegen tests passed, five ignored; the new focused regression
+passed separately. Clippy passed with the existing allowances. The full-model
+retry is under `artifacts/vit-fp8-exchange-panels-20260910/`.

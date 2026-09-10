@@ -873,6 +873,21 @@ pub struct TensorFormat {
 }
 
 impl TensorFormat {
+    /// Common physical fragment for packed exchange. FP8 packs 32 elements
+    /// along the contiguous axis; splitting that axis at 16 creates strided
+    /// half-panel traffic even between otherwise compatible layouts.
+    pub(crate) fn exchange_panel_shape(&self) -> Option<[u32; 2]> {
+        let contiguous = match self.precision {
+            Precision::F16 => 16,
+            Precision::F8F143 { .. } => 32,
+            Precision::F32 => return None,
+        };
+        Some(match self.layout.order.micro_panel_order()? {
+            MicroPanelOrder::RowsThenColumns => [16, contiguous],
+            MicroPanelOrder::ColumnsThenRows => [contiguous, 16],
+        })
+    }
+
     pub(crate) fn supports_micro_panel_exchange(&self, destination: &Self) -> bool {
         matches!(self.precision, Precision::F16 | Precision::F8F143 { .. })
             && destination.precision == self.precision

@@ -348,6 +348,7 @@ pub(crate) fn panel_byte_traversal(
 ) -> StorageResult<ByteTraversal> {
     validate_view(shard, view)?;
     let rank = view.len();
+    let panel = shard.format.exchange_panel_shape().unwrap_or([16, 16]);
     if rank < 2
         || view.iter().any(|e| e.start == e.physical_end)
         || view[..rank - 2]
@@ -356,9 +357,10 @@ pub(crate) fn panel_byte_traversal(
         || view[rank - 2..]
             .iter()
             .zip(&shard.extents[rank - 2..])
-            .any(|(v, s)| {
-                !(v.start - s.start).is_multiple_of(16)
-                    || !(v.physical_end - s.start).is_multiple_of(16)
+            .zip(panel)
+            .any(|((v, s), size)| {
+                !(v.start - s.start).is_multiple_of(size)
+                    || !(v.physical_end - s.start).is_multiple_of(size)
             })
     {
         return Err(StorageError::InvalidView);
@@ -372,13 +374,13 @@ pub(crate) fn panel_byte_traversal(
         if d.axis < rank - 2 {
             base += ((view[d.axis].start - shard.extents[d.axis].start) / d.divisor % d.count)
                 * d.stride;
-        } else if d.divisor >= 16 {
+        } else if d.divisor >= panel[d.axis - (rank - 2)] {
             high[d.axis - (rank - 2)].push(Digit {
-                divisor: d.divisor / 16,
+                divisor: d.divisor / panel[d.axis - (rank - 2)],
                 ..d
             });
         } else {
-            let count = (16 / d.divisor).min(d.count);
+            let count = (panel[d.axis - (rank - 2)] / d.divisor).min(d.count);
             if !d.count.is_multiple_of(count) {
                 return Err(StorageError::InvalidView);
             }
@@ -406,8 +408,8 @@ pub(crate) fn panel_byte_traversal(
         let origin = shard.extents[rank - 2 + axis].start;
         node = axis_tree(
             &high[axis],
-            (v.start - origin) / 16,
-            (v.physical_end - origin) / 16,
+            (v.start - origin) / panel[axis],
+            (v.physical_end - origin) / panel[axis],
             &node,
         );
     }
@@ -797,6 +799,29 @@ mod tests {
     }
 
     #[test]
+    fn fp8_panel_exchange_keeps_contiguous_packing_units() {
+        for order in [
+            ElementOrder::Amp(AmpOrder::TransposedLeft),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            }),
+            ElementOrder::Amp(AmpOrder::Left),
+            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix {
+                row_block: 64,
+                column_block: 16,
+            }),
+        ] {
+            let mut shard = super::super::tests::shard(crate::Layout::row_sharded(1), &[64, 64]);
+            shard.tensor_type.format.precision = Precision::F8F143 { scale_exponent: -4 };
+            shard.tensor_type.format.layout.order = order;
+            let traversal = panel_byte_traversal(shard.storage(), &shard.extents).unwrap();
+            assert_eq!(traversal.byte_len(), 4096);
+            assert!(traversal.spans().all(|span| span.bytes >= 512), "{order:?}");
+        }
+    }
+
+    #[test]
     fn compact_traversals_match_coordinate_enumeration() {
         let mut random = fastrand::Rng::with_seed(0x7472_6176_6572_7365);
         for precision in [
@@ -844,23 +869,28 @@ mod tests {
                         panel_view[0].start = 1;
                         panel_view[0].logical_end = 2;
                         panel_view[0].physical_end = 2;
-                        panel_view[1].start = 16;
-                        panel_view[1].logical_end = 48;
-                        panel_view[1].physical_end = 48;
-                        panel_view[2].start = 16;
-                        panel_view[2].logical_end = 80;
-                        panel_view[2].physical_end = 80;
+                        let [rows, columns] = shard
+                            .tensor_type
+                            .format
+                            .exchange_panel_shape()
+                            .unwrap_or([16, 16]);
+                        panel_view[1].start = 0;
+                        panel_view[1].logical_end = 64;
+                        panel_view[1].physical_end = 64;
+                        panel_view[2].start = columns;
+                        panel_view[2].logical_end = 96;
+                        panel_view[2].physical_end = 96;
                         let actual = panel_byte_traversal(shard.storage(), &panel_view).unwrap();
                         let mut expected = Vec::new();
-                        for row in (16..48).step_by(16) {
-                            for column in (16..80).step_by(16) {
+                        for row in (0..64).step_by(rows as usize) {
+                            for column in (columns..96).step_by(columns as usize) {
                                 let mut part = panel_view.clone();
                                 part[1].start = row;
-                                part[1].logical_end = row + 16;
-                                part[1].physical_end = row + 16;
+                                part[1].logical_end = row + rows;
+                                part[1].physical_end = row + rows;
                                 part[2].start = column;
-                                part[2].logical_end = column + 16;
-                                part[2].physical_end = column + 16;
+                                part[2].logical_end = column + columns;
+                                part[2].physical_end = column + columns;
                                 let mut bytes = byte_spans(shard.storage(), &part, false)
                                     .unwrap()
                                     .into_iter()
