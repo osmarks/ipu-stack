@@ -88,7 +88,9 @@ pub enum GemmOutputPacking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
     pub tile_count: u16,
-    /// Maximum complete local proposals validated after establishing a baseline.
+    /// Maximum ordered local search steps after establishing a baseline.
+    /// Parallel speculation can validate later proposals that an earlier
+    /// improvement invalidates; these do not advance the search.
     pub optimization_steps: usize,
     /// Compact address-ordered exchange waves; None uses latency-oriented scheduling.
     pub exchange_stream_words: Option<std::num::NonZeroU32>,

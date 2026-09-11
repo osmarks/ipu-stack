@@ -139,7 +139,7 @@ struct Arguments {
     /// Per-operator candidate catalogue breadth (default comes from PipelineConfig).
     #[arg(long, conflicts_with = "reuse_package")]
     operator_candidate_limit: Option<usize>,
-    /// Maximum complete package validations for local improvements after the baseline.
+    /// Maximum ordered local improvement steps; later candidates may be built speculatively.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
     /// Prefer compact exchange rows using address-ordered waves of this many words.
