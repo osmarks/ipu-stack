@@ -21,45 +21,106 @@ impl TileGraphBuilder {
             return Ok(true);
         }
         // Preserve compute, checkpoints and Repeat boundaries. Moving the whole
-        // copy group preserves dependencies between copies as well.
-        if !between
-            .iter()
-            .all(|op| matches!(op, BlockOperation::Copy { .. }))
-        {
+        // group preserves dependencies between its copies and fills as well.
+        let Some(accesses) = self.local_accesses(between)? else {
             return Ok(false);
-        }
-        if self.copies_commute(between, next)? {
+        };
+        if self.accesses_commute(&accesses, next)? {
             return Ok(true);
         }
-        if self.copies_commute(between, &self.phases[previous.index() as usize].transfers)? {
+        if self.accesses_commute(&accesses, &self.phases[previous.index() as usize].transfers)? {
             region.operations[boundary..].rotate_left(1);
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn copies_commute(
+    fn local_accesses(
         &self,
         operations: &[BlockOperation],
+    ) -> ExpansionResult<Option<Vec<LocalAccess>>> {
+        let mut accesses = Vec::new();
+        for operation in operations {
+            match operation {
+                BlockOperation::Copy { copy, .. } => {
+                    let copy = &self.local_copies[copy.0 as usize];
+                    for write in [false, true] {
+                        let (rows, bytes, stride) = match copy.pattern {
+                            CopyPattern::Contiguous => (1, copy.bytes, 0),
+                            CopyPattern::Strided {
+                                rows,
+                                row_bytes,
+                                source_stride,
+                                destination_stride,
+                            } => (
+                                rows,
+                                row_bytes,
+                                if write {
+                                    destination_stride
+                                } else {
+                                    source_stride
+                                },
+                            ),
+                        };
+                        accesses.push(LocalAccess {
+                            root: self.storage_root(if write {
+                                copy.destination
+                            } else {
+                                copy.source
+                            }),
+                            offset: if write {
+                                copy.destination_offset
+                            } else {
+                                copy.source_offset
+                            },
+                            rows,
+                            bytes,
+                            stride,
+                            write,
+                        });
+                    }
+                }
+                BlockOperation::Compute { run, .. } => {
+                    let run = &self.kernel_runs[run.0 as usize];
+                    let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel else {
+                        return Ok(None);
+                    };
+                    let view = view_byte_traversal(
+                        &self.shards[run.output.shard.index() as usize],
+                        &run.output,
+                        CopyOrder::Physical,
+                    )?;
+                    let Some(span) = view.contiguous_span() else {
+                        return Ok(None);
+                    };
+                    accesses.push(LocalAccess {
+                        root: self.storage_root(run.output.shard),
+                        offset: span
+                            .offset
+                            .checked_add(offset)
+                            .ok_or(StorageError::Overflow)?,
+                        rows: 1,
+                        bytes,
+                        stride: 0,
+                        write: true,
+                    });
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(accesses))
+    }
+
+    fn accesses_commute(
+        &self,
+        local: &[LocalAccess],
         transfers: &[LogicalExchange],
     ) -> ExpansionResult<bool> {
-        // Index only allocations touched by the copies. Large materializations
-        // must not compare every copy with every transfer in the phase.
-        let copies = operations
-            .iter()
-            .map(|operation| {
-                let BlockOperation::Copy { copy, .. } = operation else {
-                    unreachable!()
-                };
-                &self.local_copies[copy.0 as usize]
-            })
-            .collect::<Vec<_>>();
+        // Index only allocations touched locally. Large materializations must
+        // not compare every local access with every transfer in the phase.
         let mut accesses = BTreeMap::<BlockValueId, Vec<(&ShardView, CopyOrder, bool)>>::new();
-        for copy in &copies {
-            accesses.entry(self.storage_root(copy.source)).or_default();
-            accesses
-                .entry(self.storage_root(copy.destination))
-                .or_default();
+        for access in local {
+            accesses.entry(access.root).or_default();
         }
         for transfer in transfers {
             let order = transfer.span_order(&self.shards);
@@ -72,63 +133,39 @@ impl TileGraphBuilder {
                 }
             }
         }
-        for copy in copies {
-            // Moving in either direction must preserve RAW, WAR and WAW;
-            // read/read overlap is harmless. Stream geometry only for aliases.
-            for source in [true, false] {
-                let root = self.storage_root(if source {
-                    copy.source
-                } else {
-                    copy.destination
-                });
-                for &(view, order, write) in &accesses[&root] {
-                    if (!source || write) && self.copy_overlaps_view(copy, source, view, order)? {
-                        return Ok(false);
-                    }
+        for access in local {
+            // Preserve RAW, WAR and WAW; shared reads are harmless.
+            for &(view, order, write) in &accesses[&access.root] {
+                if !access.write && !write {
+                    continue;
+                }
+                let traversal =
+                    view_byte_traversal(&self.shards[view.shard.index() as usize], view, order)?;
+                if traversal.spans().any(|span| {
+                    strided_overlap(
+                        access.offset,
+                        access.rows,
+                        access.bytes,
+                        access.stride,
+                        span,
+                    )
+                }) {
+                    return Ok(false);
                 }
             }
         }
         Ok(true)
     }
+}
 
-    fn copy_overlaps_view(
-        &self,
-        copy: &LocalCopy,
-        source: bool,
-        view: &ShardView,
-        order: CopyOrder,
-    ) -> ExpansionResult<bool> {
-        let (shard, offset) = if source {
-            (copy.source, copy.source_offset)
-        } else {
-            (copy.destination, copy.destination_offset)
-        };
-        if self.storage_root(shard) != self.storage_root(view.shard) {
-            return Ok(false);
-        }
-        let (rows, bytes, stride) = match copy.pattern {
-            CopyPattern::Contiguous => (1, copy.bytes, 0),
-            CopyPattern::Strided {
-                rows,
-                row_bytes,
-                source_stride,
-                destination_stride,
-            } => (
-                rows,
-                row_bytes,
-                if source {
-                    source_stride
-                } else {
-                    destination_stride
-                },
-            ),
-        };
-        let traversal =
-            view_byte_traversal(&self.shards[view.shard.index() as usize], view, order)?;
-        Ok(traversal
-            .spans()
-            .any(|span| strided_overlap(offset, rows, bytes, stride, span)))
-    }
+/// A contiguous or strided read/write, resolved to its allocation root.
+struct LocalAccess {
+    root: BlockValueId,
+    offset: u32,
+    rows: u32,
+    bytes: u32,
+    stride: u32,
+    write: bool,
 }
 
 /// Compare a span with an affine row sequence without enumerating its rows.

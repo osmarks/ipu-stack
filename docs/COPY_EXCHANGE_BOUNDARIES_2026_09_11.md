@@ -193,3 +193,26 @@ Both packages have 1,256 Repeat patch helper calls in the profiled layer.
 Cropped runtime fell from 1,627,302 to 1,614,030 cycles (1.084868 to 1.076020 ms).
 This validates the final selection correction on hardware; an optimized
 27-layer timing with that correction has not yet been measured.
+
+### Grouping across operator labels and zero fills
+
+The next extension removes the same-operator restriction. Exchange provenance
+becomes neutral when phases from different operations are joined; individual
+kernel provenance is retained. Repeat regions and checkpoints still delimit
+motion. Explicit copies and `FillZero` kernels now share one affine read/write
+range representation for dependency checks, including allocation aliases.
+Other kernels remain motion barriers. Groups still retain their internal order.
+
+The unoptimized two-layer hardware test in
+`artifacts/exchange-boundaries-20260911/grouped2/` passed three resident
+invocations with unchanged FP32 cosine 0.997122946. Its profiled layer has 37
+exchange barriers, down from 42 with only the corrected base selection. Five
+internal single-tile copy phases disappear; the Repeat entry/exit copies remain.
+The maximum Repeat patch list remains two words. Runtime increased from
+1,614,030 to 1,624,134 cycles (1.076020 to 1.082756 ms): several merged schedules
+are longer than their separate predecessors. Fewer barriers alone do not
+establish a speedup. Full-model comparisons are recorded separately below.
+
+The codegen suite passes 235 tests (four ignored), including cross-provenance
+copy/fill motion, aliases, shared reads and actual receive-write-send hazards.
+The workspace/all-targets check also passes.

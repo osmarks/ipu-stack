@@ -130,19 +130,17 @@ impl TileGraphBuilder {
         if transfers.is_empty() {
             return Ok(());
         }
-        if let Some(previous) = self.phases.last().map(|phase| phase.id)
-            && self.phases[previous.index() as usize]
-                .provenance
-                .operation
-                .is_some()
-            && self.phases[previous.index() as usize].provenance.operation == provenance.operation
-        {
+        if let Some(previous) = self.phases.last().map(|phase| phase.id) {
             if self.group_exchange_copies(previous, &transfers, tiles)? {
                 let phase = &mut self.phases[previous.index() as usize];
                 phase.transfers.append(&mut transfers);
                 if phase.provenance != provenance {
                     phase.provenance = WorkProvenance {
-                        operation: provenance.operation,
+                        operation: if phase.provenance.operation == provenance.operation {
+                            provenance.operation
+                        } else {
+                            None
+                        },
                         value: None,
                         reason: WorkReason::OperatorInputs,
                     };

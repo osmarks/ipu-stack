@@ -26,13 +26,16 @@ const CASES: usize = 32;
 
 #[test]
 fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
-    for alias in [false, true] {
-        for (source, destination, offset, strided, next_source, blocked, hoisted) in [
-            (3, 1, 256, false, 1, false, true), // Fill the locally owned tail before exchange.
-            (3, 1, 256, true, 1, false, true),
-            (3, 1, 0, false, 1, true, false), // Overwrites received bytes; order matters.
-            (1, 3, 0, false, 3, true, false), // Actual receive-copy-send dependency.
-            (3, 1, 0, false, 3, false, false), // Shared reads permit keeping the copy after.
+    for (alias, cross_operation) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (source, destination, offset, strided, next_source, blocked, hoisted, zero) in [
+            (3, 1, 256, false, 1, false, true, false), // Fill the locally owned tail before exchange.
+            (3, 1, 256, true, 1, false, true, false),
+            (3, 1, 0, false, 1, true, false, false), // Overwrites received bytes; order matters.
+            (1, 3, 0, false, 3, true, false, false), // Actual receive-copy-send dependency.
+            (3, 1, 0, false, 3, false, false, false), // Shared reads permit keeping the copy after.
+            (3, 1, 256, false, 1, false, true, true),
+            (3, 1, 0, false, 1, true, false, true),
+            (3, 1, 0, false, 3, false, false, true),
         ] {
             let mut graph = ComputeGraph::new();
             let input = graph.host_input("input", [16, 16]).unwrap();
@@ -103,17 +106,40 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                     CopyPattern::Contiguous
                 },
             });
-            region.operations.push(BlockOperation::Copy {
-                tile: 1,
-                copy: LocalCopyId(0),
-            });
+            if zero {
+                builder
+                    .append_zero_range(
+                        &mut region,
+                        if alias { alias_id } else { ids[destination] },
+                        crate::ByteSpan { offset, bytes: 128 },
+                        true,
+                        provenance,
+                    )
+                    .unwrap();
+            } else {
+                region.operations.push(BlockOperation::Copy {
+                    tile: 1,
+                    copy: LocalCopyId(0),
+                });
+            }
             let second = LogicalExchange {
                 source: builder.full_view(ids[next_source]),
                 destinations: vec![builder.full_view(ids[2])],
                 order: CopyOrder::Physical,
             };
             builder
-                .append_exchange_phase(vec![second], provenance, &mut region)
+                .append_exchange_phase(
+                    vec![second],
+                    WorkProvenance {
+                        operation: if cross_operation {
+                            None
+                        } else {
+                            provenance.operation
+                        },
+                        ..provenance
+                    },
+                    &mut region,
+                )
                 .unwrap();
             assert_eq!(
                 builder.phases.len(),
@@ -121,7 +147,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                 "alias={alias}, source={source}, destination={destination}, offset={offset}"
             );
             assert_eq!(
-                matches!(region.operations[0], BlockOperation::Copy { .. }),
+                !matches!(region.operations[0], BlockOperation::Exchange(_)),
                 hoisted
             );
             if !blocked {
