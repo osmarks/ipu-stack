@@ -276,7 +276,7 @@ mod tests {
             let original = transfers();
             let first = child.select(phase, &topology, original.clone(), 4).unwrap();
             if words.is_some() {
-                assert_eq!(first.optimized.selected_kind, "compact-streams");
+                assert_eq!(first.optimized.selected_kind, "balanced-compact-streams");
             }
             cache.merge(child);
             let mut relocated = original;

@@ -145,7 +145,7 @@ struct Arguments {
     /// Maximum ordered local improvement steps; later candidates may be built speculatively.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
-    /// Prefer compact exchange rows using address-ordered waves of this many words.
+    /// Use compact exchange rows with endpoint-balanced waves of this many words.
     #[arg(long)]
     exchange_stream_words: Option<std::num::NonZeroU32>,
     /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL.

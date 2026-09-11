@@ -114,3 +114,73 @@ later execution/export steps.
 The larger storage trades in the table have passed representative payload
 replays, but have not been selected and placed together in a complete model.
 They remain excluded by the production per-phase row limits.
+
+## Balanced waves and padding follow-up
+
+`artifacts/b1024-patching-20260911/` contains the follow-up audit. The preserved
+`frontier_audit.rs` uses the normal replay and shared-row accounting code; its
+`patch` mode decodes the exact generated helper calls and their count arguments
+from executable segments, mapping them to profiler phases. All decoded calls
+matched the expected ABI. The temporary example and public accounting reexport
+were removed after the audit.
+
+On the fixed-address 80-phase capture, shared-table peaks are 37,736 bytes/tile
+for S256/B1024, 37,368 for S64/S256/B1024, and 41,032 for B1024 alone. The actual
+S64 package reserves 37,384 bytes/tile. This replay accounts for normalized row
+sharing, row offsets and sharing patches, but omits Repeat relocation metadata;
+it is not a complete placement test. The maximum same-tile increase in unshared
+rows is 4,436 bytes. Summing all tiles' bytes is useful for reporting aggregate
+storage, but is not a substitute for checking the complete allocation on each
+tile. A per-phase maximum alone also misses accumulation across phases and
+cross-phase sharing.
+
+Compact package scheduling now uses one endpoint-balanced wave size directly:
+`--exchange-stream-words 1024` means B1024. The previous S(W), S(W/4), B(4W)
+comparison and its maximum/aggregate row caps are removed. Complete packaging
+still validates storage, dependencies, relocated rows and placement. Offline
+replay retains the individual ordinary and balanced stream algorithms. Omitting
+the flag still selects latency-oriented scheduling. Width selection remains
+storage-first in compact mode; B1024 does not force paired transfers.
+
+For the previous `small-streams-full27` executable, generated patch lists are:
+
+| Work | Calls per layer, all tiles | Words per layer, all tiles | Maximum words on a tile in one phase |
+| --- | ---: | ---: | ---: |
+| Repeat source-address arithmetic | 2,688 | 5,291 | 24 (phase 9) |
+| Cross-phase row-sharing setup | 1,468 | 1,830 | 2 (phases 8 and 27) |
+
+There are no Repeat table-lookup patch calls. Outside the repeated body,
+row-sharing setup has 9,242 calls / 11,330 words in total, with a maximum list of
+32 words. Lists of at least 24 words use the existing six-worker bulk sharing
+patcher; the Repeat arithmetic helper is separate and uses the supervisor.
+The latter has nine loop instructions per word, approximately 54 tile cycles
+per word before setup, so its 24-word maximum is about 1,300 cycles of loop work.
+This is an instruction estimate, not a measured critical-path attribution.
+Patching precedes the exchange barrier and can overlap other tiles' preparation.
+
+The old executable contains ordinary transfers throughout. Independent
+latency-oriented width selection on the capture chooses paired mode only for
+phase 43, in the one-time head. Compact width selection compares maximum row
+bytes, then total bytes, then cycles, and rejects that alternative. Most of the
+other tested whole-phase paired alternatives also have longer horizons; pairing
+is not simply disabled. The search compares ordinary mode with all eligible
+transfers paired, rather than searching arbitrary mixed subsets.
+
+Two causes of unnecessary padding work were corrected:
+
+- Both padding-elision passes stopped entirely when any Repeat had invariant or
+  iterated bindings. They now protect the storage roots of bound values while
+  continuing to optimize unrelated scratch, including scratch within Repeat.
+- Canonical boundary layouts rounded the row count to the ownership block size.
+  For 729 x 1,152 FP16 activations, 729 became 732 rows and one tile cleared
+  6,912 unused bytes. The same owner count now receives balanced whole logical
+  rows, with no tail-row padding. Operator-specific AMP padding is unchanged.
+
+The fusion trace on the baseline identifies two distinct limitations. The first
+layernorm reads the loop-carried activation, whose producing residual add is in
+the previous iteration. The second layernorm follows a feature-partitioned
+residual add. `mid/residual.rs::row_moments_type` currently requires full local
+rows, so that case is rejected before costing. Generalizing it requires partial
+statistics and their redistribution; `LayerNormApply` currently assumes each
+statistics partition has the same width as its local feature partition. Neither
+limitation is fixed by merely making the current fusion cost more optimistic.

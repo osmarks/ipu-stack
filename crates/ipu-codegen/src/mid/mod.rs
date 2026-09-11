@@ -92,7 +92,7 @@ pub struct PipelineConfig {
     /// Parallel speculation can validate later proposals that an earlier
     /// improvement invalidates; these do not advance the search.
     pub optimization_steps: usize,
-    /// Compact address-ordered exchange waves; None uses latency-oriented scheduling.
+    /// Compact endpoint-balanced exchange waves; None uses latency-oriented scheduling.
     pub exchange_stream_words: Option<std::num::NonZeroU32>,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Graph-boundary tensors whose layout may be selected by their first

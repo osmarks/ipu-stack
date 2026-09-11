@@ -92,66 +92,29 @@ pub fn schedule_exchange_problem_with_priority(
     finish_exchange_run(tile_count, problem.phase, incoming_bases, optimized)
 }
 
-pub(super) fn optimize_stream_schedule(
+pub(super) fn balanced_stream_schedule(
     topology: &Topology,
     problem: &SchedulingProblem<'_>,
     incoming_bases: &[u32],
     receive_counts: &[usize],
     words: u32,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
-    let mut orders = vec![order::stream_wave_order(problem, words, false)];
-    let mut schedule = materialize_stream_order(
+    let schedule = materialize_stream_schedule(
         topology,
         problem,
         incoming_bases,
         receive_counts,
-        &orders[0],
+        words,
+        true,
     )?;
-    let initial_horizon = schedule.horizon;
-    let mut improvements = 0;
-    let mut selected_kind = "compact-streams";
-    // Smaller ordinary chunks can shorten endpoint tails; larger balanced
-    // chunks recover pointer compression lost by endpoint balancing. Both must
-    // fit the original maximum and total row budgets. Equal-cycle reductions
-    // in storage are useful too, particularly for resident multi-layer models.
-    let (maximum, total) = encoded_row_storage(&schedule)?;
-    let mut score = (schedule.horizon, maximum, total);
-    for (chunk_words, balanced) in [(words / 4, false), (words.saturating_mul(4), true)] {
-        if chunk_words == 0 {
-            continue;
-        }
-        let order = order::stream_wave_order(problem, chunk_words, balanced);
-        if orders.contains(&order) {
-            continue;
-        }
-        let candidate =
-            materialize_stream_order(topology, problem, incoming_bases, receive_counts, &order);
-        orders.push(order);
-        let Ok(candidate) = candidate else {
-            continue;
-        };
-        if candidate.horizon > score.0 {
-            continue;
-        }
-        let (candidate_maximum, candidate_total) = encoded_row_storage(&candidate)?;
-        let candidate_score = (candidate.horizon, candidate_maximum, candidate_total);
-        if candidate_maximum <= maximum && candidate_total <= total && candidate_score < score {
-            schedule = candidate;
-            score = candidate_score;
-            improvements += 1;
-            selected_kind = if balanced {
-                "balanced-compact-streams"
-            } else {
-                "small-compact-streams"
-            };
-        }
-    }
+    // Choose one compact policy. Complete-package placement accounts for the
+    // per-tile rows, including sharing; aggregate bytes are not a fit test.
     Ok(OptimizedSchedule {
-        initial_horizon,
+        initial_horizon: schedule.horizon,
         endpoint_lower_bound: endpoint_work_lower_bound(problem.transfers, problem.tile_count),
         schedule,
-        selected_kind,
-        neighborhood_improvements: improvements,
+        selected_kind: "balanced-compact-streams",
+        neighborhood_improvements: 0,
     })
 }
 

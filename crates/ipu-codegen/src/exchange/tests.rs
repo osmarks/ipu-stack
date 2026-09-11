@@ -386,10 +386,10 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
             &incoming_bases,
             &receive_counts,
             64,
-            false,
+            true,
         )
         .unwrap();
-        let optimized = replay::optimize_stream_schedule(
+        let optimized = replay::balanced_stream_schedule(
             &topology,
             &scheduling,
             &incoming_bases,
@@ -399,8 +399,8 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
         .unwrap();
         let (maximum, total) = encoded_row_storage(&baseline).unwrap();
         let (new_maximum, new_total) = encoded_row_storage(&optimized.schedule).unwrap();
-        assert!(new_maximum <= maximum && new_total <= total);
-        assert!(optimized.schedule.horizon <= baseline.horizon);
+        assert_eq!((new_maximum, new_total), (maximum, total));
+        assert_eq!(optimized.schedule.horizon, baseline.horizon);
         let run = finish_exchange_run(tile_count, phase, incoming_bases, optimized).unwrap();
         validate_exchange_schedule(tile_count, &problem, &run.phase).unwrap();
     }

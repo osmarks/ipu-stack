@@ -1162,7 +1162,7 @@ fn optimize_pending_schedule(
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
     let problem = SchedulingProblem::new(pending, tile_count);
     if let Some(words) = stream_words {
-        return replay::optimize_stream_schedule(
+        return replay::balanced_stream_schedule(
             topology,
             &problem,
             incoming_bases,

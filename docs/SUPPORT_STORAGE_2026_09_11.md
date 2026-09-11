@@ -75,6 +75,10 @@ fit, nor that a different tensor layout cannot fit.
 
 ## Compact exchange scheduling
 
+The measurements below describe the earlier address-ordered policy. Compact
+package scheduling now uses a single endpoint-balanced wave size; see
+[the later frontier follow-up](EXCHANGE_FRONTIERS_MATERIALIZED_2026_09_11.md#balanced-waves-and-padding-follow-up).
+
 `--exchange-stream-words 256` selects address-ordered stream waves for package
 construction (`PipelineConfig.exchange_stream_words`). The latency-oriented
 scheduler remains the default. Cache recipes carry the selected mode through
