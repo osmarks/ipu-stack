@@ -733,3 +733,35 @@ peaked at **6.53 GiB** and took 94.504 s. Its sampled RSS history is
 `full-b1.memory.json`. Expanding/costing multiple candidates is therefore much
 cheaper in RAM than constructing their complete packages. These baseline
 measurements do not bound all possible layouts or accumulated search caches.
+
+
+### Parallel local-candidate evaluation
+
+The optimizer now shares a single Rayon pool across proposal costing, full
+candidate validation and work within each build. Indexed proposal order and
+`find_first` preserve the ordered first-improvement path. Each candidate starts
+with its own schedule-cache snapshot; expansion and analytical-cost caches are
+shared. Speculation can complete later candidates that an earlier accepted
+improvement invalidates. The configured step count bounds ordered search depth,
+not all speculative builds. A one-thread/four-thread test checks identical low
+programs, placements and exchange phases under perturbed completion timing.
+All ten package tests and the workspace all-targets check passed.
+
+The 56-thread run (`parallel-pairwise-balanced-full27`) reproduced all seven
+accepted recipes and their exact placed cost estimates. Hardware passed three
+resident inferences, cosine 0.994168165, maximum absolute error 0.424608, cropped
+**14,438,190 cycles / 9.625460 ms**. The six-cycle difference from the preceding
+profile does not change the performance conclusion.
+
+Planning took **1,227.527 s** versus 974.010 s with sequential candidates and eight
+Rayon threads. It completed **30 full placed costings versus 9**. Peak process RSS
+was **28.75 GiB**; the sampled trace is `run.memory.json`. This is not a speedup:
+there is enough RAM for concurrency, but exact-path speculation discards too
+much expensive work. The comparison also changes thread count and omits the
+previous run's memory-profile output; it is not an isolated thread-scaling test.
+A 10-second, 49-Hz CPU sample is retained as `compiler.perf`.
+
+A small beam retaining useful validated alternatives is a plausible next search
+policy, replacing the single incumbent rather than adding a retry layer. Its
+breadth/depth and total-validation budget need comparison against the seven
+successive improvements achieved here. It is not implemented by this change.
