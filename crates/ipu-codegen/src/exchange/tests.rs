@@ -966,7 +966,7 @@ fn repeat_sources_follow_execution_order_when_sends_fill_earlier_gaps() {
 }
 
 #[test]
-fn repeat_base_requires_uniform_whole_phase_relocation() {
+fn repeat_base_selects_tile_local_displacements_with_exceptions() {
     let id = BlockValueId::from_index;
     let make = |source, shard, address: u32, stride: u32| PendingTransfer {
         source,
@@ -995,18 +995,18 @@ fn repeat_base_requires_uniform_whole_phase_relocation() {
     assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
     transfers.reverse();
     assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
-    // One sender mixing stationary data with moving weights rules out the phase.
+    // A stationary send gets an inverse relocation patch on this tile.
     transfers.push(make(0, 3, 0x70008, 0));
-    assert_eq!(
-        repeat_outgoing_bases(&transfers, &addresses, 4),
-        vec![None; 4]
-    );
+    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
     transfers.pop();
-    // Agreement on the first two iterations is insufficient.
+    // An irregular exception is patched, not treated as sharing the base.
     transfers[2].source_addresses[2] += 4;
+    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    // A low stationary address prevents relative encoding on tile 0 alone.
+    transfers.push(make(0, 3, 0x50008, 0));
     assert_eq!(
         repeat_outgoing_bases(&transfers, &addresses, 4),
-        vec![None; 4]
+        vec![None, Some((id(2), 8)), None, None]
     );
 }
 
@@ -1078,4 +1078,32 @@ fn coalescing_preserves_loopback_dependencies_in_every_repeat_iteration() {
         ]
         .concat()
     );
+}
+
+#[test]
+fn compact_streams_order_inputs_before_ready_forwarders() {
+    let transfer = |source, address, destination, words| ExchangeScheduleTransfer {
+        source,
+        source_addresses: vec![address],
+        destinations: vec![ExchangeScheduleDestination {
+            tile: destination,
+            address: 0x64000,
+        }],
+        words,
+        width: ExchangeItemWidth::Word32,
+    };
+    let phase = ExchangeScheduleProblem {
+        phase: 0,
+        transfers: vec![
+            transfer(0, 0x60000, 1, 16),
+            transfer(2, 0x60000, 3, 16),
+            transfer(1, 0x64000, 2, 1024),
+        ],
+    };
+    let pending = pending_from_problem(4, &phase).unwrap();
+    let problem = SchedulingProblem::new(&pending, 4);
+    for balanced in [false, true] {
+        let order = order::stream_wave_order(&problem, 1024, balanced);
+        assert_eq!(order.last(), Some(&2));
+    }
 }

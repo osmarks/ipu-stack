@@ -108,3 +108,51 @@ tests after extending shared-read coverage. The workspace/all-targets check pass
 A B1024 hardware replay passed a six-transfer receive-then-forward chain over
 four tiles, checking all 8,192 touched words. The captured inputs and log are
 `artifacts/copy-fusion-20260911/forwarding.json` and `forwarding.log`.
+
+### Scheduling and Repeat corrections
+
+The first full fused build was numerically correct (FP32-reference cosine
+0.994168165 on all three resident invocations), but took 14,458,956 cropped cycles
+(9.639304 ms), slower than the preceding 13,291,890-cycle run. Two interactions
+needed correction before treating fusion as a performance improvement:
+
+- Compact stream ordering could place a newly ready forwarder before the input
+  traffic of other forwarders. Its late payload then occupied receiver-row
+  timelines far into the future. Compact ordering now prioritizes dependency
+  depth before stream-wave rank; actual exchange events may still overlap.
+  This reuses the scheduler's memory-dependency DAG. Independent phases retain
+  their original ordering.
+- `_BASE` selection rejected an entire phase when any sender mixed stationary
+  and moving sources. Arithmetic patching grew from 5,817 to 317,457 words per
+  layer, with the largest list growing from 24 to 236. Selection is now per tile,
+  choosing a common changing displacement and encoding exception patches
+  relative to that base. Stationary sends receive inverse-displacement patches;
+  the many weight sends keep constant encoded offsets. The base remains fixed
+  during each phase. Every iteration must have nonnegative representable offsets;
+  unsuitable tiles retain ordinary absolute-address patching.
+
+At the earlier capture's fixed placement, the four relevant phase pairs have
+these B1024 schedule horizons (excluding barrier/setup/patch time):
+
+| Pair | Separate, summed | Naively fused | With dependency depth |
+|---|---:|---:|---:|
+| QKV, 9 → 10 | 18,977 | 30,549 | 15,948 |
+| Attention output, 21 → 22 | 6,789 | 13,801 | 7,584 |
+| MLP up, 29 → 30 | 15,641 | 23,456 | 16,042 |
+| MLP down, 36 → 37 | 11,371 | 23,017 | 14,751 |
+
+These comparisons preserve all captured Repeat addresses. They are scheduler
+measurements, not predictions of complete runtime savings. Removing a barrier
+also changes setup and overlap with compute. Giving every fragment of a stream
+its maximum dependency depth made no further difference on these pairs and was
+not retained.
+
+With a common moving base, the captured MLP-down phase requires only 486
+exceptional sends instead of 302,920 changing sends, with at most two exceptions
+per tile. This is a send count, not a packaged patch-word count. Tile-local
+selection alone would not solve the critical-path problem; exception patching
+is the essential part.
+
+The corrected two-layer ViT passed three resident hardware invocations with FP32
+reference checking. This also exercises the table-patching path used for two
+iterations. The updated codegen suite passes 235 tests (four ignored).

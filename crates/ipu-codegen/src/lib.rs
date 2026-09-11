@@ -635,9 +635,9 @@ fn validate_steps(
             TileStep::Exchange(exchange) => {
                 validate_exchange_program(exchange)?;
                 if let Some(base) = exchange.outgoing_base {
-                    if exchange.preserve_base_registers || !exchange.repeat_patches.is_empty() {
+                    if exchange.preserve_base_registers {
                         return Err(invalid(
-                            "exchange base relocation conflicts with patches or preserved bases",
+                            "exchange base relocation conflicts with preserved bases",
                         ));
                     }
                     validate_address(base, repeat_pointer_count)?;

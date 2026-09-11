@@ -460,55 +460,39 @@ pub(crate) fn lower_exchanges_cached(
                         ));
                     }
                     let mut patches = Vec::new();
-                    let base = outgoing_bases[tile].map(|(shard, offset)| {
-                        placement.shard_addresses[&shard] + offset
-                    });
+                    let bases = outgoing_bases[tile].map(|(shard, offset)| {
+                        repeat_inputs[&shard].iter().map(|input| {
+                            placement.shard_addresses[input].checked_add(offset)
+                                .ok_or(ExchangeLoweringError::Overflow)
+                        }).collect::<Result<Vec<_>, ExchangeLoweringError>>()
+                    }).transpose()?;
                     for (instructions, transfer) in address_groups.into_iter().zip(sends) {
-                        if let Some(base) = base {
-                            for (word_offset, byte_offset) in instructions {
-                                let offset = transfer.source_address().checked_sub(base)
-                                    .and_then(|offset| offset.checked_add(byte_offset))
-                                    .ok_or(ExchangeLoweringError::Overflow)?;
-                                patch_sender_instruction(&mut program[word_offset], offset)?;
-                            }
+                        if bases.is_none() && transfer.source_addresses.iter().all(|&a| a == transfer.source_address()) {
                             continue;
                         }
-                        let source_shard = transfer.source_shard;
-                        let source_offset = transfer.source_offset;
-                        let Some(inputs) = repeat_inputs.get(&source_shard) else {
-                            continue;
-                        };
+                        let count = transfer.source_addresses.len().max(bases.as_ref().map_or(1, Vec::len));
                         for (word_offset, byte_offset) in instructions {
-                            let values = inputs
-                                .iter()
-                                .map(|input| {
-                                    let address = placement
-                                        .shard_addresses
-                                        .get(input)
-                                        .copied()
-                                        .ok_or(ExchangeLoweringError::UnplacedShard)?
-                                        .checked_add(source_offset)
-                                        .and_then(|address| address.checked_add(byte_offset))
-                                        .ok_or(ExchangeLoweringError::Overflow)?;
-                                    let mut instruction = program[word_offset];
-                                    patch_sender_instruction(&mut instruction, address)?;
-                                    Ok(instruction)
-                                })
-                                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                            if values.first() != Some(&program[word_offset]) {
-                                tracing::error!(phase = phase.id.index(), tile,
-                                    source = source_shard.index(), source_offset, word_offset, byte_offset,
-                                    expected = program[word_offset], actual = ?values.first(), row = ?program,
-                                    "Repeat relocation changes the initial exchange row");
+                            let values = (0..count).map(|i| {
+                                let base = bases.as_ref().map_or(0, |b| b.get(i).copied().unwrap_or(b[0]));
+                                let address = repeat_source_address(transfer, i).checked_sub(base)
+                                    .and_then(|a| a.checked_add(byte_offset))
+                                    .ok_or(ExchangeLoweringError::Overflow)?;
+                                let mut instruction = program[word_offset];
+                                patch_sender_instruction(&mut instruction, address)?;
+                                Ok(instruction)
+                            }).collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+                            if bases.is_none() && values[0] != program[word_offset] {
                                 return Err(ExchangeLoweringError::IncompatibleRepeatRows(
                                     "relocation changes the first iteration",
                                 ));
                             }
-                            patches.push(ExchangeRowPatch {
-                                word_offset: u32::try_from(word_offset)
-                                    .map_err(|_| ExchangeLoweringError::Overflow)?,
-                                values,
-                            });
+                            program[word_offset] = values[0];
+                            if values.iter().any(|&v| v != values[0]) {
+                                patches.push(ExchangeRowPatch {
+                                    word_offset: u32::try_from(word_offset).map_err(|_| ExchangeLoweringError::Overflow)?,
+                                    values,
+                                });
+                            }
                         }
                     }
                     Ok(patches)
@@ -723,65 +707,71 @@ impl PendingTransfer {
     }
 }
 
-/// Keep a single base throughout the timed phase, including all stationary sends.
-/// Reuse an existing Repeat pointer rather than creating a second relocation ABI.
+/// Use a common moving source as each tile's base, patching exceptions.
+/// All relative addresses must remain representable for every Repeat binding.
 fn repeat_outgoing_bases(
     pending: &[PendingTransfer],
     addresses: &BTreeMap<BlockValueId, u32>,
     tile_count: u16,
 ) -> Vec<Option<(BlockValueId, u32)>> {
-    let empty = || vec![None; usize::from(tile_count)];
-    let mut first = vec![None::<&PendingTransfer>; usize::from(tile_count)];
-    let mut paired = vec![false; usize::from(tile_count)];
+    let mut tiles = vec![Vec::new(); usize::from(tile_count)];
     for transfer in pending {
-        let tile = usize::from(transfer.source);
-        paired[tile] |= transfer.width == ExchangeItemWidth::Paired64;
-        if let Some(previous) = first[tile] {
-            let count = previous
-                .source_addresses
-                .len()
-                .max(transfer.source_addresses.len());
-            for i in 0..count {
-                let delta = |t: &PendingTransfer| {
-                    t.source_addresses
-                        .get(i)
-                        .copied()
-                        .unwrap_or(t.source_address())
-                        .wrapping_sub(t.source_address())
-                };
-                if delta(previous) != delta(transfer) {
-                    return empty();
+        tiles[usize::from(transfer.source)].push(transfer);
+    }
+    tiles
+        .into_iter()
+        .map(|transfers| {
+            let count = transfers
+                .iter()
+                .map(|t| t.source_addresses.len())
+                .max()
+                .unwrap_or(1);
+            let mut patterns = BTreeMap::<Vec<u32>, (usize, &PendingTransfer)>::new();
+            for &transfer in &transfers {
+                let deltas = (0..count)
+                    .map(|i| {
+                        repeat_source_address(transfer, i).wrapping_sub(transfer.source_address())
+                    })
+                    .collect::<Vec<_>>();
+                if deltas.iter().all(|&d| d == 0) {
+                    continue;
+                }
+                let entry = patterns.entry(deltas).or_insert((0, transfer));
+                entry.0 += 1;
+                if transfer.source_address() < entry.1.source_address() {
+                    entry.1 = transfer;
                 }
             }
-            if previous.source_address() <= transfer.source_address() {
-                continue;
-            }
-        }
-        first[tile] = Some(transfer);
-    }
-    let mut bases = empty();
-    for (tile, transfer) in first.into_iter().enumerate() {
-        let Some(transfer) = transfer else { continue };
-        if transfer
-            .source_addresses
-            .iter()
-            .all(|&a| a == transfer.source_address())
-        {
-            continue;
-        }
-        // A paired row's encoded offsets must remain eight-byte aligned.
-        if paired[tile] && !transfer.source_address().is_multiple_of(8) {
-            return empty();
-        }
-        let Some(&address) = addresses.get(&transfer.source_shard) else {
-            return empty();
-        };
-        let Some(offset) = transfer.source_address().checked_sub(address) else {
-            return empty();
-        };
-        bases[tile] = Some((transfer.source_shard, offset));
-    }
-    bases
+            let paired = transfers
+                .iter()
+                .any(|t| t.width == ExchangeItemWidth::Paired64);
+            patterns
+                .into_values()
+                .filter(|&(_, base)| {
+                    (!paired || base.source_address().is_multiple_of(8))
+                        && transfers.iter().all(|t| {
+                            (0..count).all(|i| {
+                                repeat_source_address(t, i) >= repeat_source_address(base, i)
+                            })
+                        })
+                })
+                .max_by_key(|&(uses, base)| (uses, Reverse(base.source_address())))
+                .and_then(|(_, base)| {
+                    let offset = base
+                        .source_address()
+                        .checked_sub(*addresses.get(&base.source_shard)?)?;
+                    Some((base.source_shard, offset))
+                })
+        })
+        .collect()
+}
+
+fn repeat_source_address(transfer: &PendingTransfer, iteration: usize) -> u32 {
+    transfer
+        .source_addresses
+        .get(iteration)
+        .copied()
+        .unwrap_or(transfer.source_address())
 }
 
 fn attach_repeat_source_addresses(

@@ -597,20 +597,33 @@ pub(super) fn stream_wave_order(
     if balanced {
         balance_stream_chunks(problem, &mut rank);
     }
+    // A ready forwarding transfer can still depend on a late payload. Giving
+    // it an early stream rank reserves receiver rows far into the future and
+    // delays input transfers for other forwarders. Finish each dependency
+    // depth in the ordering first; the row builder still overlaps their actual
+    // event times. Dependencies always point forward in original input order.
+    let mut depth = vec![0usize; problem.transfers.len()];
+    for (index, predecessors) in problem.predecessors.iter().enumerate() {
+        depth[index] = predecessors
+            .iter()
+            .map(|&before| depth[before] + 1)
+            .max()
+            .unwrap_or(0);
+    }
     let mut indegrees = problem.indegrees();
     let mut ready = BinaryHeap::new();
     for (index, &degree) in indegrees.iter().enumerate() {
         if degree == 0 {
-            ready.push(Reverse((rank[index], index)));
+            ready.push(Reverse((depth[index], rank[index], index)));
         }
     }
     let mut order = Vec::with_capacity(rank.len());
-    while let Some(Reverse((_, index))) = ready.pop() {
+    while let Some(Reverse((_, _, index))) = ready.pop() {
         order.push(index);
         for &next in &problem.dependents[index] {
             indegrees[next] -= 1;
             if indegrees[next] == 0 {
-                ready.push(Reverse((rank[next], next)));
+                ready.push(Reverse((depth[next], rank[next], next)));
             }
         }
     }
