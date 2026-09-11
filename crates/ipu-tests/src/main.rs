@@ -53,7 +53,7 @@ struct Arguments {
     /// Compare with unquantized FP32 inputs, weights and intermediate results.
     #[arg(long, requires = "reference_run")]
     reference_fp32: bool,
-    /// Save packed reference weights/input for resident host-I/O replay.
+    /// Save packed weights, input and validated output for resident inference replay.
     #[arg(long, requires = "reference_run")]
     save_reference_inputs: Option<PathBuf>,
     /// Validate successive inference calls after uploading parameters only once.
