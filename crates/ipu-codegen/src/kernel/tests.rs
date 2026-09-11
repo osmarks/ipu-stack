@@ -337,7 +337,11 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 .iter()
                 .any(|flag| flag == "-DGEMM_SINGLE_ROWS=1")
         );
-        assert_eq!(plan.compilations[0].retained_symbols.len(), 2);
+        assert_eq!(plan.compilations[0].retained_symbols.len(), 1);
+        assert!(
+            plan.retained_symbols()
+                .all(|symbol| !symbol.contains("accumulate"))
+        );
         for run in low
             .tiles
             .iter()

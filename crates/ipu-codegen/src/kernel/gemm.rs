@@ -31,9 +31,14 @@ impl KernelBuildPlan {
             u32,
             u32,
         ),
-        values: BTreeSet<u32>,
+        used: BTreeSet<(u32, GemmKernelMode)>,
     ) {
-        let values = values.into_iter().collect::<Vec<_>>();
+        let values = used
+            .iter()
+            .map(|&(rows, _)| rows)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let (source, prefix) = match precision {
             Precision::F16 => ("gemm_f16_amp.S", "f16"),
             Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
@@ -74,19 +79,21 @@ impl KernelBuildPlan {
                 (GemmKernelMode::Initialize, 0usize),
                 (GemmKernelMode::Accumulate, 2usize),
             ] {
-                self.symbols.insert(
-                    KernelSpecialization::Gemm(
-                        precision,
-                        weights,
-                        inner_block,
-                        output_columns,
-                        mode,
-                        small,
-                        output_group,
-                    ),
-                    symbols[row_index].clone(),
-                );
-                if pair.len() == 2 {
+                if used.contains(&(small, mode)) {
+                    self.symbols.insert(
+                        KernelSpecialization::Gemm(
+                            precision,
+                            weights,
+                            inner_block,
+                            output_columns,
+                            mode,
+                            small,
+                            output_group,
+                        ),
+                        symbols[row_index].clone(),
+                    );
+                }
+                if pair.len() == 2 && used.contains(&(large, mode)) {
                     self.symbols.insert(
                         KernelSpecialization::Gemm(
                             precision,
@@ -126,11 +133,20 @@ impl KernelBuildPlan {
             if weights == GemmWeightLoad::Interleaved {
                 flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
             }
-            let retained_symbols = if single_rows {
-                vec![symbols[0].clone(), symbols[2].clone()]
-            } else {
-                symbols.into_iter().collect()
-            };
+            let retained_symbols = symbols
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, symbol)| {
+                    let mode = if index < 2 {
+                        GemmKernelMode::Initialize
+                    } else {
+                        GemmKernelMode::Accumulate
+                    };
+                    let rows = if index % 2 == 0 { small } else { large };
+                    (used.contains(&(rows, mode)) && (index % 2 == 0 || !single_rows))
+                        .then_some(symbol)
+                })
+                .collect();
             self.compilations.push(KernelCompilation {
                 source,
                 name: format!(

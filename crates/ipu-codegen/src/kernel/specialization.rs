@@ -163,7 +163,8 @@ impl KernelSpecialization {
 #[derive(Default)]
 pub(super) struct KernelInventory {
     pub(super) exact_symbols: BTreeSet<&'static str>,
-    pub(super) rows: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
+    pub(super) rows:
+        BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<(u32, GemmKernelMode)>>,
     pub(super) fp8_casts: BTreeSet<(u64, u64)>,
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     pub(super) unpacks: BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
@@ -201,14 +202,14 @@ impl KernelInventory {
                             weights,
                             inner,
                             columns,
-                            _,
+                            mode,
                             rows,
                             output_group,
                         ) => {
                             self.rows
                                 .entry((precision, weights, inner, columns, output_group))
                                 .or_default()
-                                .insert(rows);
+                                .insert((rows, mode));
                         }
                         KernelSpecialization::Attention(shape) => {
                             self.attention.insert(shape);

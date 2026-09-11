@@ -264,8 +264,9 @@
 	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner
 #endif
 
-	.worker
 	.macro GEMM_WORKER name, retained_output_name, retained_inner_name, rows
+	.section .text.\name,"ax",@progbits
+	.worker
 	.p2align 3
 \name:
 #if GEMM_OUTPUT_GROUP

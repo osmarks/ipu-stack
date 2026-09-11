@@ -35,6 +35,7 @@
 	add $m6, $m6, $m7
 	.endm
 
+	.section .text.gemm_f32_zero_output_worker,"ax",@progbits
 	.worker
 	.p2align 2
 .Lzero_output_worker:
@@ -202,6 +203,7 @@
 	GEMM_SPECIALIZATION gemm_f32_accumulate_small_rows, GEMM_SMALL_ROWS, gemm_f32_accumulate_common
 	GEMM_SPECIALIZATION gemm_f32_accumulate_large_rows, GEMM_LARGE_ROWS, gemm_f32_accumulate_common
 
+	.section .text.gemm_f32_amp_pace_worker,"ax",@progbits
 	.worker
 	.p2align 3
 .Lgemm_amp_pace_worker:
