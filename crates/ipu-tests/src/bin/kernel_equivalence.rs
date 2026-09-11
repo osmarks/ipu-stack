@@ -17,6 +17,8 @@ struct Arguments {
     sdk: PathBuf,
     #[arg(long)]
     reference: PathBuf,
+    #[arg(long, default_value = "device")]
+    source: PathBuf,
     /// Additionally require bitwise equality; useful for instruction scheduling changes.
     #[arg(long)]
     exact: bool,
@@ -42,7 +44,7 @@ fn main() -> Result<()> {
     ipu_runtime::init_tracing();
     let args = Arguments::parse();
     fs::create_dir_all(&args.output)?;
-    let device = PathBuf::from("device").canonicalize()?;
+    let device = args.source.canonicalize()?;
     let mut source = format!(
         "#include \"{}\"\n",
         device.join("static_runtime.S").display()

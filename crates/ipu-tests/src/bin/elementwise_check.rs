@@ -135,7 +135,7 @@ fn main() -> Result<()> {
         }
     }
     if args.fp8 {
-        source += &format!("#include \"{}\"\n", device.join("gelu_f8.S").display());
+        source += &format!("#include \"{}\"\n", args.source.canonicalize()?.join("gelu_f8.S").display());
     }
     let mut programs = Vec::new();
     let mut data = Vec::new();
