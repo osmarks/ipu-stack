@@ -5,7 +5,7 @@ use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
 use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::{
     GroupBy, Query, SortBy, StepKind, calibrate_profiles, cycle_origin, exchange_activity_summary,
-    exchange_boundaries, query,
+    exchange_boundaries, phase_work, query,
 };
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
@@ -92,6 +92,29 @@ enum Command {
         #[arg(long)]
         build_id: String,
     },
+    /// Find short or sparsely occupied compute rounds and their next global barrier.
+    ProfilePhases {
+        profile: PathBuf,
+        #[arg(long)]
+        epoch: Option<u32>,
+        /// Maximum measured compute-span cycles (excluding the following exchange).
+        #[arg(long)]
+        max_cycles: Option<u64>,
+        /// Maximum average fraction of device tiles computing, from 0 to 1.
+        #[arg(long)]
+        max_occupancy: Option<f64>,
+        /// Include rounds whose preparation or following exchange overlaps this offset.
+        #[arg(long)]
+        at_offset: Option<u64>,
+        #[arg(long)]
+        shared_clock: bool,
+        #[arg(long, value_enum, default_value = "occupancy")]
+        sort_by: PhaseSort,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     ProfileQuery {
         profile: PathBuf,
         #[arg(long, value_enum, default_value = "kernel")]
@@ -148,6 +171,13 @@ enum Command {
         #[arg(required = true)]
         calls: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PhaseSort {
+    Occupancy,
+    Duration,
+    Offset,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -346,6 +376,107 @@ fn main() -> Result<()> {
                             .scheduled_event_cycles
                             .map_or_else(|| "unknown".into(), |n| n.to_string()),
                     );
+                }
+            }
+        }
+        Command::ProfilePhases {
+            profile,
+            epoch,
+            max_cycles,
+            max_occupancy,
+            at_offset,
+            shared_clock,
+            sort_by,
+            limit,
+            json,
+        } => {
+            if max_occupancy.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
+                bail!("--max-occupancy must be between 0 and 1");
+            }
+            let report = ProfileReport::read(fs::File::open(profile)?)?;
+            let mut groups = phase_work(&report, shared_clock);
+            groups.retain(|g| {
+                epoch.is_none_or(|e| e == g.epoch)
+                    && max_cycles.is_none_or(|c| g.span_cycles <= c)
+                    && max_occupancy.is_none_or(|o| g.occupancy <= o)
+                    && at_offset.is_none_or(|at| {
+                        g.exchange
+                            .as_ref()
+                            .map_or(g.start, |b| g.start.min(b.first_entry))
+                            <= at
+                            && at
+                                < g.exchange
+                                    .as_ref()
+                                    .map_or(g.end, |b| b.last_exit.max(g.end))
+                    })
+            });
+            groups.sort_by(|a, b| {
+                match sort_by {
+                    PhaseSort::Occupancy => a
+                        .occupancy
+                        .total_cmp(&b.occupancy)
+                        .then_with(|| b.span_cycles.cmp(&a.span_cycles)),
+                    PhaseSort::Duration => b.span_cycles.cmp(&a.span_cycles),
+                    PhaseSort::Offset => a.start.cmp(&b.start),
+                }
+                .then_with(|| a.start.cmp(&b.start))
+            });
+            if limit != 0 {
+                groups.truncate(limit);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&groups)?);
+            } else {
+                println!(
+                    "{} offsets; rounds can overlap; occupancy is measured compute coverage.",
+                    if shared_clock {
+                        "Shared-clock"
+                    } else {
+                        "Renderer-cropped"
+                    }
+                );
+                for g in groups {
+                    let phase = g
+                        .next_exchange_phase
+                        .map_or("end".into(), |p| (p & 0x7fffffff).to_string());
+                    println!(
+                        "epoch={} next={} compute={}..{} span={} occupancy={:.2}% tiles={} work={} exposed={}",
+                        g.epoch,
+                        phase,
+                        g.start,
+                        g.end,
+                        g.span_cycles,
+                        g.occupancy * 100.0,
+                        g.active_tiles,
+                        g.work_cycles,
+                        g.exposed_preparation_cycles
+                            .map_or("N/A".into(), |n| n.to_string())
+                    );
+                    for k in &g.kernels {
+                        println!(
+                            "  {} {} tiles={} calls={} max={} cycles",
+                            k.operation, k.kernel, k.tiles, k.samples, k.maximum_cycles
+                        );
+                    }
+                    if let Some(b) = &g.exchange {
+                        println!(
+                            "  barrier={}..{} exchangeEnd={} scheduled={} lateTile={} unattributed={} exchangeOccupancy={}",
+                            b.first_entry,
+                            b.last_entry,
+                            b.last_exit,
+                            b.scheduled_event_cycles.unwrap_or(0),
+                            b.last_arriving_tile,
+                            g.unattributed_before_barrier_cycles,
+                            g.exchange_occupancy
+                                .map_or("N/A".into(), |v| format!("{:.2}%", v * 100.0))
+                        );
+                        for k in &g.late_tile_kernels {
+                            println!(
+                                "  late tile: {} {} {}..{}",
+                                k.operation, k.kernel, k.start, k.end
+                            );
+                        }
+                    }
                 }
             }
         }

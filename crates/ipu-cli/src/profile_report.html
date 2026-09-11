@@ -259,7 +259,9 @@ function setTimelineStart(cropInitialEntry) {
   exchangePhaseBounds.clear();
   for (const tile of tiles) {
     for (const sample of tile.samples) {
-      if (sample.kind !== "exchange" || sample.duration <= 0 || !exchangeEventCycles(sample)) continue;
+      const boundary = sample.kind === "exchange" || (sample.kind === "synchronization"
+        && sample.metadata.some(entry => entry.name === "reason" && entry.value === "ExchangeBarrier"));
+      if (!boundary || sample.duration <= 0) continue;
       const key = `${sample.epoch}:${sample.phase}`;
       const phase = exchangePhaseBounds.get(key) || { starts: [], ends: [], eventCycles: 0 };
       phase.starts.push(sample.offset);

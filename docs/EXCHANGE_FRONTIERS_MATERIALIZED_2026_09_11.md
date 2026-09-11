@@ -184,3 +184,28 @@ rows, so that case is rejected before costing. Generalizing it requires partial
 statistics and their redistribution; `LayerNormApply` currently assumes each
 statistics partition has the same width as its local feature partition. Neither
 limitation is fixed by merely making the current fusion cost more optimistic.
+
+
+## Full 27-layer validation and phase queries
+
+The B1024 run with the padding corrections completed in 13,291,890 cropped
+cycles (8.861260 ms), versus 14,374,044 (9.582696 ms) previously: 7.53% faster.
+The reserved exchange table increased from 37,384 to 40,824 bytes per tile.
+All three resident invocations passed, with FP32-reference cosine 0.994168165.
+These results combine scheduling and padding changes, rather than isolating them.
+The rendered profile is `artifacts/b1024-patching-20260911/full27/model.html`.
+
+`ipu-stack profile-phases PROFILE --epoch 1 --max-cycles 5000
+--max-occupancy 0.1 --sort-by occupancy` finds short, sparsely occupied
+preparation rounds. `--at-offset CYCLE` selects rounds covering a renderer
+coordinate; `--json` provides kernel and exchange details. Coordinates default
+to the renderer crop; `--shared-clock` disables it. Grouping uses the next global
+exchange, including synchronization-only participants, rather than local step IDs.
+Occupancy measures sampled compute time, not useful-work efficiency.
+
+The exposed-preparation gap excludes preparation overlapping the previous
+exchange. It does **not** measure the saving from removing preparation: even a
+fully hidden copy can prevent adjacent exchanges from merging. Determining that
+requires graph dependencies, which runtime samples do not contain. The exchange
+scheduler already orders overlapping transfer reads and writes; intervening
+compute kernels additionally require legal movement or elimination.

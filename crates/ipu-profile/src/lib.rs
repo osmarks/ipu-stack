@@ -1,3 +1,6 @@
+mod phases;
+pub use phases::{KernelWork, PhaseWork, phase_work};
+
 use ipu_package::{
     CycleSample, ProfileExchangeActivity, ProfileExchangeActivityKind, ProfileReport,
     ProfileStepKind,
@@ -300,12 +303,22 @@ pub struct ExchangeBoundary {
     pub scheduled_event_cycles: Option<u64>,
 }
 
+fn is_exchange_boundary(sample: &CycleSample) -> bool {
+    sample.step.kind == ProfileStepKind::Exchange
+        || (sample.step.kind == ProfileStepKind::Synchronization
+            && sample
+                .step
+                .metadata
+                .iter()
+                .any(|entry| entry.name == "reason" && entry.value == "ExchangeBarrier"))
+}
+
 pub fn exchange_boundaries(report: &ProfileReport) -> Vec<ExchangeBoundary> {
     let base = cycle_origin(report);
     let mut phases = BTreeMap::<(u32, u32), ExchangeBoundary>::new();
     for tile in &report.tiles {
         for sample in &tile.samples {
-            if sample.step.kind != ProfileStepKind::Exchange {
+            if !is_exchange_boundary(sample) {
                 continue;
             }
             let start = u64::from(sample.start_cycle.wrapping_sub(base));
@@ -841,7 +854,7 @@ mod tests {
     use super::*;
     use ipu_package::{CycleSample, ProfileMetadata, ProfileStep, TileProfile};
 
-    fn sample(
+    pub(super) fn sample(
         phase: u32,
         kind: ProfileStepKind,
         kernel: &str,
