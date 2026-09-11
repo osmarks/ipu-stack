@@ -373,3 +373,39 @@ standard and interleaved sources. Each case then executes an absolute-address
 row, checking base reset. All cases pass, including final readback of 1792 words.
 Artifacts: `outgoing-base-stress/` and `outgoing-base-full27/` under
 `artifacts/baseline-local-planner/`; the latter includes the rendered profile.
+
+## Exact per-tile placement viewer
+
+`--memory-profile-directory DIR` now also writes
+`placement-PID.json` and a standalone `placement-PID.html` for the final selected
+package. The existing baseline/proposal estimate reports remain separate.
+
+The address map uses the allocator's actual requests and final addresses.
+Requests are constructed by the same function for allocation and diagnostics.
+Each tile shows its first occupants in the main row and subsequent allocations
+at overlapping addresses in rows below it. Alias groups remain one allocation;
+they are listed on hover. Repeat sequence members are individually visible,
+with stride padding and kernel access tails included. Lifetimes use the
+allocator's inclusive event indices. Logical and physical tile IDs are shown.
+
+Package support is explicitly marked as reserved capacity. Actual per-tile image
+segments outside global support reservations (notably host descriptors placed in
+otherwise unused tensor space) are included. White means no allocation in that row; an address is unused only if it is
+empty in every row. Blank space in an additional reuse row is not additional
+physical SRAM.
+
+The canvas renders only the viewport. Controls provide byte-address zoom,
+tile/address navigation, 4/8/12-pixel row heights, optional reuse rows, allocation
+highlighting, hover details and pinned selection with clear/reset controls.
+
+The 27-layer example contains 633985 allocations/reservations, including
+230450 additional reuse-row entries:
+`artifacts/baseline-local-planner/placement-full27/memory/placement-48914.html`.
+Its JSON is retained alongside it. This was a compile-only capture of the same
+27-layer configuration used for the OUTGOING_BASE hardware measurement.
+
+Validation: all 223 active codegen tests and ten reference tests pass, together
+with the doctest and Clippy. The placement-report test checks every placed shard
+and alias against its actual address and storage size, and rejects overlaps
+between live records. Chromium checks cover hover, pin/clear, reuse toggling,
+tile/address navigation, zoom, highlighting and reset on the full-model report.

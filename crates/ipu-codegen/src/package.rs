@@ -176,6 +176,7 @@ pub struct DiagnosticShard {
 
 struct BuiltApplication {
     application: Application,
+    support_memory: TileMemoryMap,
     placement: crate::Placement,
     exchange_phases: Vec<crate::PhysicalExchangePhase>,
     exchange_schedule: crate::ExchangeScheduleSnapshot,
@@ -361,6 +362,15 @@ fn build_package_artifacts(
             },
         )
     })?;
+    if let Some(directory) = &planning.memory_profile_directory {
+        crate::place::profile::write(
+            directory,
+            &selected.program,
+            &built.placement,
+            &built.support_memory,
+            &built.application,
+        )?;
+    }
     Ok((built, selected.program))
 }
 
@@ -898,6 +908,7 @@ fn build_package_from_objects(
         final_cost.total,
         BuiltApplication {
             application,
+            support_memory: memory,
             placement,
             exchange_phases: exchanges,
             exchange_schedule,

@@ -69,6 +69,10 @@ pub(crate) enum MemoryLayoutError {
 }
 
 impl TileMemoryMap {
+    pub(crate) fn allocations(&self) -> &[MemoryAllocation] {
+        &self.allocations
+    }
+
     pub(crate) fn new() -> Self {
         let free = std::iter::once(
             ipu_package::TILE_MEMORY_BASE

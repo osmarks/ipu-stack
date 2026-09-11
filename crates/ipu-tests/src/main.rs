@@ -100,7 +100,7 @@ struct Arguments {
     /// Summarize packaged exchange rows and exit before loading hardware.
     #[arg(long)]
     inspect_exchanges: bool,
-    /// Write JSON/HTML memory-estimator profiles for the baseline and local proposals.
+    /// Write memory estimates and an exact per-tile placement map as JSON/HTML.
     #[arg(long, conflicts_with = "reuse_package")]
     memory_profile_directory: Option<PathBuf>,
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.

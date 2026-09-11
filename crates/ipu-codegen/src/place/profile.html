@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IPU memory placement</title>
+<style>
+:root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#050505;font:13px/1.45 ui-sans-serif,system-ui,sans-serif}header,main{padding:16px 20px}header{border-bottom:1px solid #000}h1{margin:0;font-size:20px}main{display:grid;gap:14px}.controls,.stats,.legend{display:flex;gap:8px 16px;align-items:center;flex-wrap:wrap}.stats{color:#303030;margin-top:4px}.controls{margin-bottom:12px}input,button,select{font:inherit;border:1px solid #000;border-radius:0;background:#fff;color:#000;height:30px;padding:0 8px}button{cursor:pointer}button:hover{background:#eee}input[type=number]{width:80px}input[type=checkbox]{height:auto;accent-color:#000}label{display:inline-flex;align-items:center;gap:6px}section{border:1px solid #000}.section-head{padding:10px 12px;border-bottom:1px solid #000;display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}.legend{font-size:11px}.legend span{display:inline-flex;align-items:center;gap:5px}.swatch{width:12px;height:12px;border:1px solid #000}#ruler{display:block;width:100%;height:28px;border-bottom:1px solid #000}#viewport{height:68vh;min-height:300px;position:relative;overflow:auto;background:#fff}#spacer{position:absolute;left:0;top:0;pointer-events:none}#map{position:sticky;left:0;top:0;display:block;image-rendering:pixelated;cursor:crosshair}#detail{padding:10px 12px;min-height:100px;white-space:pre-wrap;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}#tooltip{position:fixed;display:none;z-index:10;pointer-events:none;border:1px solid #000;background:#fff;padding:8px 10px;max-width:480px;white-space:pre-wrap;box-shadow:3px 3px 0 #bbb;font-size:12px}#selection{font-weight:700}#address{width:100px}#filter{width:230px}button:focus-visible,input:focus-visible{outline:2px solid #000;outline-offset:2px}
+</style>
+<header><h1>IPU memory placement</h1><div id="summary" class="stats"></div></header>
+<main>
+<div class="controls">
+<label>Tile <input id="tile" type="number" value="0" min="0"></label><button id="jump">Go</button>
+<label>Address <input id="address" value="0x4c000" aria-label="Memory address"></label><button id="goAddress">Go</button>
+<button id="zoomIn" aria-label="Zoom in">+</button><button id="zoomOut" aria-label="Zoom out">−</button><button id="fit">Fit</button><span id="scale"></span>
+<label>Row height <select id="rowHeight"><option value="4">4 px</option><option value="8">8 px</option><option value="12">12 px</option></select></label>
+<label><input id="reuse" type="checkbox" checked>Reused allocations</label>
+<input id="filter" placeholder="Highlight allocation" aria-label="Highlight allocation">
+<button id="reset">Reset view</button>
+</div>
+<section><div class="section-head"><strong>Per-tile SRAM · address →</strong><div class="legend">
+<span><i class="swatch" style="background:#111"></i>Support reservation</span>
+<span><i class="swatch" style="background:#666"></i>Parameters</span>
+<span><i class="swatch" style="background:#aaa"></i>Activations</span>
+<span><i class="swatch" style="background:#d0d0d0"></i>Scratch</span>
+<span><i class="swatch" style="background:repeating-linear-gradient(135deg,#fff 0 2px,#bbb 2px 3px)"></i>Padding / tail</span>
+<span><i class="swatch" style="background:#fff"></i>Empty</span>
+</div></div><canvas id="ruler"></canvas>
+<div id="viewport" tabindex="0" aria-label="Scrollable per-tile address map"><div id="spacer"></div><canvas id="map"></canvas></div>
+</section>
+<section><div class="section-head"><strong id="selection">Allocation</strong><button id="clear">Clear selection</button></div><div id="detail">Hover a region; click to pin.</div></section>
+</main><div id="tooltip"></div>
+<script type="application/json" id="data">__PROFILE_JSON__</script>
+<script>
+'use strict';
+const p=JSON.parse(document.getElementById('data').textContent);
+const $=id=>document.getElementById(id), view=$('viewport'), canvas=$('map'), ruler=$('ruler');
+const colors={support:'#111',parameter:'#666',activation:'#aaa',scratch:'#d0d0d0',padding:'#fff'};
+const hex=n=>'0x'+n.toString(16).padStart(5,'0'), bytes=n=>n.toLocaleString('en-US')+' B';
+const label=88, gap=5, tiles=p.tiles, span=p.end-p.start;
+let band=4;
+let bpp=1024, fitMode=true, pinned=null, hover=null, pending=false, height=0;
+const rows=[];
+function overlap(a,b){return a.start<b.end&&b.start<a.end;}
+function lowerBound(items,start){let lo=0,hi=items.length;while(lo<hi){const m=(lo+hi)>>1;if(items[m].start<start)lo=m+1;else hi=m;}return lo;}
+// First-use order puts subsequent occupants below the original allocation.
+// Alias groups are a single allocation in the backend, not false reuse rows.
+for(const tile of tiles){
+ tile.lanes=[];
+ for(const allocation of tile.allocations){
+  let lane=0;
+  for(;lane<tile.lanes.length;lane++){
+   const items=tile.lanes[lane],i=lowerBound(items,allocation.start);
+   if((i===0||!overlap(items[i-1],allocation))&&(i===items.length||!overlap(items[i],allocation)))break;
+  }
+  if(lane===tile.lanes.length)tile.lanes.push([]);
+  const items=tile.lanes[lane];items.splice(lowerBound(items,allocation.start),0,allocation);
+  allocation.tile=tile;allocation.lane=lane;
+ }
+ if(!tile.lanes.length)tile.lanes.push([]);
+}
+function layout(){
+ rows.length=0;height=0;
+ for(const tile of tiles){tile.y=height;const count=$('reuse').checked?tile.lanes.length:1;for(let lane=0;lane<count;lane++){rows.push({tile,lane,y:height});height+=band;}height+=gap;}
+ $('spacer').style.height=height+'px';
+ $('spacer').style.width=(label+span/bpp)+'px';
+}
+function setupCanvas(c,w,h){const dpr=window.devicePixelRatio||1;c.style.width=w+'px';c.style.height=h+'px';c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);const ctx=c.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);ctx.imageSmoothingEnabled=false;return ctx;}
+function schedule(){if(!pending){pending=true;requestAnimationFrame(()=>{pending=false;draw();});}}
+function x(address){return label+(address-p.start)/bpp-view.scrollLeft;}
+function draw(){
+ const w=view.clientWidth,h=view.clientHeight,ctx=setupCanvas(canvas,w,h),axis=setupCanvas(ruler,w,28);
+ ctx.fillStyle='#fff';ctx.fillRect(0,0,w,h);ctx.font='10px ui-monospace,monospace';
+ axis.fillStyle='#fff';axis.fillRect(0,0,w,28);axis.font='10px ui-monospace,monospace';axis.fillStyle='#000';
+ const step=Math.max(256,2**Math.ceil(Math.log2(bpp*90)));
+ const left=p.start+view.scrollLeft*bpp,right=Math.min(p.end,left+(w-label)*bpp);
+ for(let address=Math.ceil(left/step)*step;address<=right;address+=step){const at=x(address);axis.fillText(hex(address),at+3,15);axis.fillRect(at,20,1,8);}
+ const query=$('filter').value.toLowerCase();
+ for(const row of rows){
+  const y=row.y-view.scrollTop;if(y+band<0)continue;if(y>h)break;
+  const items=row.tile.lanes[row.lane];
+  ctx.fillStyle=row.lane===0?'#ededed':'#f8f8f8';ctx.fillRect(label,y,w-label,band-1);
+  ctx.fillStyle='#fff';ctx.fillRect(label,y,w-label,band-2);
+  let i=Math.max(0,lowerBound(items,left)-1);
+  for(;i<items.length&&items[i].start<right;i++){
+   const a=items[i];if(a.end<=left)continue;
+   const l=Math.max(label,Math.floor(x(a.start))),r=Math.min(w,Math.max(l+1,Math.ceil(x(a.end))));
+   ctx.globalAlpha=query&&!p.labels[a.label].toLowerCase().includes(query)?.18:1;
+   ctx.fillStyle=colors[a.kind];ctx.fillRect(l,y,r-l,band-1);
+   const tail=Math.max(l,Math.floor(x(a.payload_end)));
+   if(tail<r){ctx.fillStyle='#eee';ctx.fillRect(tail,y,r-tail,band-1);ctx.strokeStyle='#888';ctx.lineWidth=1;ctx.beginPath();for(let px=tail-band;px<r;px+=5){ctx.moveTo(Math.max(tail,px),y+Math.max(0,tail-px));ctx.lineTo(Math.min(r,px+band),y+Math.min(band,r-px));}ctx.stroke();}
+   if(r-l>3){ctx.fillStyle='#fff';ctx.fillRect(r-1,y,1,band-1);}
+   if(a===pinned||a===hover){ctx.globalAlpha=1;ctx.strokeStyle='#000';ctx.lineWidth=2;ctx.strokeRect(l,y,r-l,band-1);}
+  }
+  ctx.globalAlpha=1;ctx.fillStyle='#fff';ctx.fillRect(0,y,label,band);
+ }
+ ctx.fillStyle='#000';
+ for(const row of rows){const y=row.y-view.scrollTop;if(y+band<0)continue;if(y>h)break;
+  if(row.lane===0||band>=10)ctx.fillText(row.lane===0?'L'+row.tile.logical+' P'+row.tile.physical:'  ↳ reuse '+row.lane,4,y+9);
+ }
+ ctx.globalAlpha=1;
+ for(const address of [0x80000,p.end]){const at=x(address);if(at>=label&&at<w){ctx.strokeStyle='#000';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(at,0);ctx.lineTo(at,h);ctx.stroke();ctx.setLineDash([]);}}
+ ctx.fillStyle='#000';ctx.fillRect(label-1,0,1,h);
+ $('scale').textContent=bpp.toFixed(bpp<1?2:0)+' B / px';
+}
+function describe(a){
+ return p.labels[a.label]+'\nTile '+a.tile.logical+' · physical '+a.tile.physical+' · '+(a.lane?'reuse row '+a.lane:'main row')
+ +'\n'+hex(a.start)+'–'+hex(a.end)+' (end exclusive) · '+bytes(a.end-a.start)
+ +'\n'+a.kind+' · '+(a.kind==='support'?'reserved capacity ':'payload ')+bytes(a.payload_end-a.start)+' · tail/padding '+bytes(a.end-a.payload_end)
+ +'\nLifetime: '+(a.last===4294967295?'whole program':a.first+'–'+a.last+' (allocator events, inclusive)')
+ +(a.shards.length?'\nShard'+(a.shards.length===1?' ':' aliases ')+a.shards.join(', '):'');
+}
+function findAt(e){
+ const rect=canvas.getBoundingClientRect(),px=e.clientX-rect.left,py=e.clientY-rect.top+view.scrollTop;
+ if(px<label)return null;
+ let lo=0,hi=rows.length;
+ while(lo<hi){const m=(lo+hi)>>1;if(rows[m].y+band<=py)lo=m+1;else hi=m;}
+ const row=rows[lo];if(!row||py<row.y||py>=row.y+band-1)return null;
+ const address=p.start+(px-label+view.scrollLeft)*bpp,items=row.tile.lanes[row.lane];
+ const i=lowerBound(items,address);
+ for(const j of [i-1,i]){const a=items[j];if(a&&a.start<address+bpp&&a.end>address)return a;}
+ return null;
+}
+canvas.onpointermove=e=>{
+ hover=findAt(e);
+ if(hover){$('tooltip').textContent=describe(hover);$('tooltip').style.display='block';$('tooltip').style.left=Math.min(e.clientX+14,innerWidth-$('tooltip').offsetWidth-10)+'px';$('tooltip').style.top=Math.min(e.clientY+14,innerHeight-$('tooltip').offsetHeight-10)+'px';if(!pinned)$('detail').textContent=describe(hover);}
+ else{$('tooltip').style.display='none';if(!pinned)$('detail').textContent='No allocation in this row.';}
+ schedule();
+};
+canvas.onpointerleave=()=>{hover=null;$('tooltip').style.display='none';schedule();};
+canvas.onclick=e=>{pinned=findAt(e);$('selection').textContent=pinned?'Selected allocation':'Allocation';$('detail').textContent=pinned?describe(pinned):'Hover a region; click to pin.';schedule();};
+$('clear').onclick=()=>{pinned=null;$('selection').textContent='Allocation';$('detail').textContent='Hover a region; click to pin.';schedule();};
+function resize(){if(fitMode)bpp=span/Math.max(1,view.clientWidth-label);layout();schedule();}
+function zoom(factor){const address=p.start+(view.scrollLeft+(view.clientWidth-label)/2)*bpp;fitMode=false;bpp=Math.max(1,Math.min(span/64,bpp*factor));layout();view.scrollLeft=(address-p.start)/bpp-(view.clientWidth-label)/2;schedule();}
+$('zoomIn').onclick=()=>zoom(.5);$('zoomOut').onclick=()=>zoom(2);$('fit').onclick=()=>{fitMode=true;view.scrollLeft=0;resize();};
+$('jump').onclick=()=>{const index=Math.max(0,Math.min(tiles.length-1,Number($('tile').value)||0));$('tile').value=index;view.scrollTop=tiles[index].y;schedule();};
+$('goAddress').onclick=()=>{const address=Number($('address').value);if(!Number.isFinite(address))return;fitMode=false;bpp=Math.min(bpp,16);layout();view.scrollLeft=(Math.max(p.start,Math.min(p.end,address))-p.start)/bpp-(view.clientWidth-label)/2;schedule();};
+$('tile').max=tiles.length-1;
+$('reuse').onchange=()=>{const current=rows.find(r=>r.y+band>view.scrollTop)?.tile;layout();if(current)view.scrollTop=current.y;schedule();};
+$('rowHeight').onchange=()=>{band=Number($('rowHeight').value);layout();schedule();};
+$('filter').oninput=schedule;view.onscroll=()=>{$('tooltip').style.display='none';schedule();};
+$('reset').onclick=()=>{pinned=hover=null;band=4;$('rowHeight').value='4';$('filter').value='';$('reuse').checked=true;$('tile').value=0;$('clear').click();view.scrollTop=view.scrollLeft=0;fitMode=true;resize();};
+window.onkeydown=e=>{if(e.key==='Escape')$('clear').click();};
+new ResizeObserver(resize).observe(view);
+const allocations=tiles.reduce((n,t)=>n+t.allocations.length,0),reused=tiles.reduce((n,t)=>n+t.lanes.slice(1).reduce((n,l)=>n+l.length,0),0);
+$('summary').textContent=tiles.length+' tiles · '+allocations.toLocaleString()+' allocations/reservations · '+reused.toLocaleString()+' reused placements · '+hex(p.start)+'–'+hex(p.end);
+resize();
+</script></html>

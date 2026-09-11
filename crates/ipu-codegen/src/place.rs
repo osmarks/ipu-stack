@@ -1,6 +1,7 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
 mod exchange;
+pub(crate) mod profile;
 pub(crate) use exchange::ExchangeConflicts;
 
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
@@ -624,18 +625,15 @@ fn assign_members(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn allocate_tile(
+fn allocation_requests(
     program: &LowProgram,
-    tile: u16,
     iterated: &[IteratedGroup],
     grouped: &BTreeSet<usize>,
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
-    arena: &mut Arena,
-    addresses: &mut BTreeMap<BlockValueId, u32>,
-) -> Result<(), PlacementError> {
+) -> Result<Vec<AllocationRequest>, PlacementError> {
     let mut requests = Vec::<AllocationRequest>::new();
     for group in iterated {
         let roots = group
@@ -729,6 +727,31 @@ fn allocate_tile(
             assignments: vec![(root, 0)],
         });
     }
+    Ok(requests)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_tile(
+    program: &LowProgram,
+    tile: u16,
+    iterated: &[IteratedGroup],
+    grouped: &BTreeSet<usize>,
+    members: &BTreeMap<usize, Vec<usize>>,
+    root_of_member: &[usize],
+    root_requirements: &BTreeMap<usize, Requirement>,
+    root_lifetimes: &BTreeMap<usize, Lifetime>,
+    arena: &mut Arena,
+    addresses: &mut BTreeMap<BlockValueId, u32>,
+) -> Result<(), PlacementError> {
+    let mut requests = allocation_requests(
+        program,
+        iterated,
+        grouped,
+        members,
+        root_of_member,
+        root_requirements,
+        root_lifetimes,
+    )?;
     requests.sort_by_key(|request| {
         (
             request.lifetime.first,
