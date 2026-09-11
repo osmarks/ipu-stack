@@ -48,7 +48,6 @@ pub enum PlacementError {
 struct Requirement {
     alignment: u32,
     access_tail: u32,
-    distinct_element: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,6 +130,7 @@ pub(crate) fn place_with_offset(
         root_of_member,
         root_requirements,
         root_lifetimes,
+        conflicts,
     } = analyze_allocations(program)?;
 
     // Alias groups cannot cross tiles. Partition once rather than walking all
@@ -156,6 +156,7 @@ pub(crate) fn place_with_offset(
                 &root_of_member,
                 &root_requirements,
                 &root_lifetimes,
+                &conflicts,
             )
         })
         .collect::<Result<Vec<_>, PlacementError>>()?;
@@ -184,6 +185,7 @@ struct AllocationAnalysis {
     root_of_member: Vec<usize>,
     root_requirements: BTreeMap<usize, Requirement>,
     root_lifetimes: BTreeMap<usize, Lifetime>,
+    conflicts: BTreeMap<usize, BTreeSet<usize>>,
 }
 
 fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, PlacementError> {
@@ -200,12 +202,13 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         collect_repeat_constraints(program, tile, &mut sets, &mut iterated)?;
     }
 
+    let mut pairs = Vec::new();
     let mut requirements = vec![Requirement::default(); program.shards.len()];
     for tile in &program.tiles {
-        collect_requirements(program, tile, &mut requirements);
+        collect_requirements(program, tile, &mut requirements, &mut pairs);
     }
     // Loopback reads and receives simultaneously. Both access classes share
-    // physical memory, so all local endpoints must occupy separate elements.
+    // physical memory, so each local source/destination pair must be separated.
     for transfer in program
         .exchange_phases
         .iter()
@@ -215,8 +218,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         for destination in &transfer.destinations {
             let destination = &program.shards[destination.shard.index() as usize];
             if source.tile == destination.tile {
-                requirements[source.id.index() as usize].distinct_element = true;
-                requirements[destination.id.index() as usize].distinct_element = true;
+                pairs.push((source.id.index() as usize, destination.id.index() as usize));
             }
         }
     }
@@ -226,7 +228,6 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         let combined = root_requirements.entry(root).or_default();
         combined.alignment = combined.alignment.max(requirement.alignment);
         combined.access_tail = combined.access_tail.max(requirement.access_tail);
-        combined.distinct_element |= requirement.distinct_element;
     }
 
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
@@ -237,6 +238,15 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         members.entry(root).or_default().push(index);
     }
     validate_alias_groups(program, &members)?;
+    let mut conflicts = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (left, right) in pairs {
+        let (left, right) = (root_of_member[left], root_of_member[right]);
+        if left == right {
+            return Err(PlacementError::IncompatibleAlias);
+        }
+        conflicts.entry(left).or_default().insert(right);
+        conflicts.entry(right).or_default().insert(left);
+    }
     let lifetimes = collect_lifetimes(program);
     let mut root_lifetimes = BTreeMap::<usize, Lifetime>::new();
     for (index, lifetime) in lifetimes.into_iter().enumerate() {
@@ -252,6 +262,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         root_of_member,
         root_requirements,
         root_lifetimes,
+        conflicts,
     })
 }
 
@@ -266,6 +277,7 @@ fn place_tile(
     root_of_member: &[usize],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
+    conflicts: &BTreeMap<usize, BTreeSet<usize>>,
 ) -> Result<(u16, BTreeMap<BlockValueId, u32>, Vec<(u32, u32)>), PlacementError> {
     let mut grouped = BTreeSet::<usize>::new();
     for group in iterated {
@@ -298,6 +310,7 @@ fn place_tile(
         root_of_member,
         root_requirements,
         root_lifetimes,
+        conflicts,
         &mut arena,
         &mut addresses,
     )?;
@@ -493,26 +506,30 @@ fn collect_requirements(
     program: &LowProgram,
     tile: &TileWorkList,
     requirements: &mut [Requirement],
+    pairs: &mut Vec<(usize, usize)>,
 ) {
     for work in program.work(tile) {
         match work {
             TileWorkRef::Kernel(run) => {
                 let inputs = &run.requirements.inputs;
                 let output = &run.requirements.output;
-                let distinct_elements = &run.requirements.distinct_elements;
-                for operands in distinct_elements {
-                    for operand in operands {
-                        match operand {
-                            MemoryOperand::Output => {
-                                requirements[run.output.shard.index() as usize].distinct_element =
-                                    true;
-                            }
-                            MemoryOperand::Input(index) => {
-                                if let Some(input) = run.inputs.get(usize::from(*index)) {
-                                    for view in &input.views {
-                                        requirements[view.shard.index() as usize]
-                                            .distinct_element = true;
-                                    }
+                for operands in &run.requirements.distinct_elements {
+                    let groups = operands
+                        .iter()
+                        .map(|operand| match operand {
+                            MemoryOperand::Output => vec![run.output.shard.index() as usize],
+                            MemoryOperand::Input(index) => run.inputs[usize::from(*index)]
+                                .views
+                                .iter()
+                                .map(|view| view.shard.index() as usize)
+                                .collect(),
+                        })
+                        .collect::<Vec<Vec<usize>>>();
+                    for (index, group) in groups.iter().enumerate() {
+                        for other in &groups[..index] {
+                            for &left in group {
+                                for &right in other {
+                                    pairs.push((left, right));
                                 }
                             }
                         }
@@ -544,7 +561,7 @@ fn collect_requirements(
                     .max(8);
             }
             TileWorkRef::Repeat(repeat) => {
-                collect_requirements(program, &repeat.body, requirements)
+                collect_requirements(program, &repeat.body, requirements, pairs)
             }
             TileWorkRef::Exchange(_) | TileWorkRef::Checkpoint(..) => {}
         }
@@ -623,16 +640,6 @@ fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
     }
 }
 
-fn allocation_alignment(program: &LowProgram, members: &[usize], requirement: Requirement) -> u32 {
-    if requirement.distinct_element {
-        requirement
-            .alignment
-            .max(memory_element_size(program, members))
-    } else {
-        requirement.alignment
-    }
-}
-
 fn assign_members(
     addresses: &mut BTreeMap<BlockValueId, u32>,
     members: &[usize],
@@ -656,6 +663,7 @@ fn allocation_requests(
     root_of_member: &[usize],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
+    conflicts: &BTreeMap<usize, BTreeSet<usize>>,
 ) -> Result<Vec<AllocationRequest>, PlacementError> {
     let mut requests = Vec::<AllocationRequest>::new();
     for group in iterated {
@@ -669,25 +677,22 @@ fn allocation_requests(
             .format
             .layout
             .memory_class;
-        let distinct_element = roots
-            .iter()
-            .any(|root| root_requirements[root].distinct_element);
-        // The current iteration's argument aliases the first member. Isolate
-        // the entire sequence from other constrained allocations instead of
-        // padding every member to an element. Multiple constrained members may be used
-        // together outside the loop, so retain individual separation for those.
-        let separate_members = roots
-            .iter()
-            .filter(|root| root_requirements[root].distinct_element)
-            .take(2)
-            .count()
-            > 1;
+        // Only sequence members that are actual simultaneous operands require
+        // separate elements. External conflicts protect the whole sequence, so
+        // the current argument's constraint holds on every Repeat iteration.
+        let separate_members = roots.iter().any(|root| {
+            conflicts
+                .get(root)
+                .is_some_and(|others| roots.iter().any(|other| others.contains(other)))
+        });
         let alignment = group.alignment.max(
             roots
                 .iter()
                 .map(|root| {
                     if separate_members {
-                        allocation_alignment(program, &members[root], root_requirements[root])
+                        root_requirements[root]
+                            .alignment
+                            .max(memory_element_size(program, &members[root]))
                     } else {
                         root_requirements[root].alignment
                     }
@@ -711,7 +716,7 @@ fn allocation_requests(
             .ok_or(PlacementError::Overflow)?;
         let mut lifetime = Lifetime::default();
         let mut assignments = Vec::with_capacity(roots.len());
-        for (index, root) in roots.into_iter().enumerate() {
+        for (index, root) in roots.iter().copied().enumerate() {
             lifetime.include(root_lifetimes[&root]);
             assignments.push((
                 root,
@@ -725,7 +730,13 @@ fn allocation_requests(
             region1_stride: separate_members
                 .then(|| align_up(stride, IPU21_INTERLEAVED_ELEMENT_SIZE))
                 .transpose()?,
-            distinct_element,
+            conflicts: roots
+                .iter()
+                .filter_map(|root| conflicts.get(root))
+                .flatten()
+                .filter(|other| !roots.contains(other))
+                .copied()
+                .collect(),
             lifetime,
             bytes,
             alignment,
@@ -743,10 +754,15 @@ fn allocation_requests(
         requests.push(AllocationRequest {
             class: representative.tensor_type.format.layout.memory_class,
             region1_stride: None,
-            distinct_element: requirement.distinct_element,
+            conflicts: conflicts
+                .get(&root)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect(),
             lifetime,
             bytes,
-            alignment: allocation_alignment(program, root_members, requirement).max(4),
+            alignment: requirement.alignment.max(4),
             assignments: vec![(root, 0)],
         });
     }
@@ -763,6 +779,7 @@ fn allocate_tile(
     root_of_member: &[usize],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
+    conflicts: &BTreeMap<usize, BTreeSet<usize>>,
     arena: &mut Arena,
     addresses: &mut BTreeMap<BlockValueId, u32>,
 ) -> Result<(), PlacementError> {
@@ -774,6 +791,7 @@ fn allocate_tile(
         root_of_member,
         root_requirements,
         root_lifetimes,
+        conflicts,
     )?;
     requests.sort_by_key(|request| {
         (
@@ -860,11 +878,11 @@ struct AllocationRequest {
     class: MemoryClass,
     /// Iterated values need a wider physical stride if placed in region 1.
     region1_stride: Option<u32>,
-    distinct_element: bool,
     lifetime: Lifetime,
     bytes: u32,
     alignment: u32,
     assignments: Vec<(usize, u32)>,
+    conflicts: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -879,6 +897,7 @@ struct IteratedGroup {
 struct Arena {
     offline: bool,
     history: Vec<(Lifetime, u32, u32)>,
+    root_spans: BTreeMap<usize, (u32, u32)>,
     ranges: Vec<(u32, u32)>,
     free: Vec<(u32, u32)>,
     active: Vec<(u32, u32, u32)>,
@@ -891,6 +910,7 @@ impl Arena {
         Self {
             offline: false,
             history: Vec::new(),
+            root_spans: BTreeMap::new(),
             ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
@@ -938,6 +958,16 @@ impl Arena {
             }
         }
         self.active = retained;
+        // Expand only conflicting allocations to their effective memory-element
+        // boundaries. Region 1 interleaves each pair even for standard accesses.
+        let forbidden = crate::memory::merge_ranges(
+            request
+                .conflicts
+                .iter()
+                .filter_map(|root| self.root_spans.get(root))
+                .flat_map(|&(start, end)| element_spans(start, end))
+                .collect(),
+        );
         let interleaved_offset = self.interleaved_offset;
         let candidate = self
             .free
@@ -957,6 +987,7 @@ impl Arena {
             .flat_map(|(index, base, limit)| {
                 // Keep candidate spans within one address region even after free
                 // ranges coalesce across its boundary.
+                let forbidden = &forbidden;
                 [false, true].into_iter().filter_map(move |region1| {
                     let (base, limit) = if region1 {
                         (
@@ -981,20 +1012,22 @@ impl Arena {
                     } else {
                         TILE_MEMORY_ELEMENT_SIZE
                     };
-                    let alignment =
-                        request
-                            .alignment
-                            .max(if request.distinct_element { element } else { 1 });
+                    let alignment = request.alignment.max(if request.region1_stride.is_some() {
+                        element
+                    } else {
+                        1
+                    });
                     let bytes = if region1 && let Some(stride) = request.region1_stride {
                         stride.checked_mul(u32::try_from(request.assignments.len()).ok()?)?
                     } else {
                         request.bytes
                     };
-                    let start = align_up(base, alignment).ok()?;
-                    // Element-aligned starts plus byte non-overlap keep all
-                    // constrained allocations in different elements. Unconstrained
-                    // allocations may use their tails: none is an operand that
-                    // must be separated from a constrained allocation.
+                    let mut start = align_up(base, alignment).ok()?;
+                    for &(a, b) in forbidden {
+                        if start < b && a < start.checked_add(bytes)? {
+                            start = align_up(b, alignment).ok()?;
+                        }
+                    }
                     let end = start.checked_add(bytes)?;
                     // Ordinary buffers prefer region 0; compact addresses within
                     // each region leave long contiguous spans for later requests.
@@ -1012,6 +1045,9 @@ impl Arena {
                 self.free.push((end, limit));
             }
             self.free.sort_unstable();
+            for &(root, _) in &request.assignments {
+                self.root_spans.insert(root, (start, end));
+            }
             self.active.push((last, start, end - start));
             self.occupied.push((start, end));
             if self.offline {
@@ -1062,6 +1098,26 @@ impl Arena {
         }
         unused
     }
+}
+
+/// Logical intervals covering all physical memory elements touched by a span.
+fn element_spans(start: u32, end: u32) -> impl Iterator<Item = (u32, u32)> {
+    [false, true].into_iter().filter_map(move |region1| {
+        let (start, end, size) = if region1 {
+            (
+                start.max(IPU21_INTERLEAVED_MEMORY_BASE),
+                end,
+                IPU21_INTERLEAVED_ELEMENT_SIZE,
+            )
+        } else {
+            (
+                start,
+                end.min(IPU21_INTERLEAVED_MEMORY_BASE),
+                TILE_MEMORY_ELEMENT_SIZE,
+            )
+        };
+        (start < end).then(|| (start / size * size, end.div_ceil(size) * size))
+    })
 }
 
 fn align_up(value: u32, alignment: u32) -> Result<u32, PlacementError> {
@@ -1123,7 +1179,7 @@ mod tests {
             region1_stride: None,
             bytes,
             alignment,
-            distinct_element: false,
+            conflicts: Vec::new(),
             lifetime: Lifetime {
                 first,
                 last,
@@ -1294,6 +1350,33 @@ mod tests {
     }
 
     #[test]
+    fn pairwise_conflicts_allow_unaligned_element_starts_and_unrelated_neighbors() {
+        let base = IPU21_INTERLEAVED_MEMORY_BASE;
+        for offline in [false, true] {
+            let mut arena = Arena::new(
+                &[(base + 120, base + 3 * IPU21_INTERLEAVED_ELEMENT_SIZE - 40)],
+                0,
+            );
+            arena.offline = offline;
+            let mut a = request(MemoryClass::Ipu21Standard, 6912, 8, 0, u32::MAX);
+            a.assignments = vec![(0, 0)];
+            a.conflicts = vec![2];
+            let mut b = request(MemoryClass::Ipu21Interleaved, 6912, 8, 0, u32::MAX);
+            b.assignments = vec![(1, 0)];
+            b.conflicts = vec![2];
+            let mut c = request(MemoryClass::Ipu21Standard, 32768 + 8, 8, 0, u32::MAX);
+            c.assignments = vec![(2, 0)];
+            c.conflicts = vec![0, 1];
+            assert_eq!(arena.allocate(&a), Some(base + 120));
+            assert_eq!(arena.allocate(&b), Some(base + 120 + 6912));
+            assert_eq!(
+                arena.allocate(&c),
+                Some(base + IPU21_INTERLEAVED_ELEMENT_SIZE)
+            );
+        }
+    }
+
+    #[test]
     fn joint_arena_respects_region_and_element_constraints() {
         let base = IPU21_INTERLEAVED_MEMORY_BASE;
         let mut arena = Arena::new(&[(base - 64, base + 2 * IPU21_INTERLEAVED_ELEMENT_SIZE)], 0);
@@ -1302,9 +1385,11 @@ mod tests {
             Some(base - 64)
         );
         let mut constrained = request(MemoryClass::Ipu21Standard, 8, 8, 0, 2);
-        constrained.distinct_element = true;
+        constrained.assignments = vec![(0, 0)];
         assert_eq!(arena.allocate(&constrained), Some(base));
         constrained.class = MemoryClass::Ipu21Interleaved;
+        constrained.conflicts = vec![0];
+        constrained.assignments = vec![(1, 0)];
         assert_eq!(
             arena.allocate(&constrained),
             Some(base + IPU21_INTERLEAVED_ELEMENT_SIZE)
@@ -1314,6 +1399,7 @@ mod tests {
             arena.allocate(&request(MemoryClass::Ipu21Standard, 8, 8, 2, 2)),
             Some(base + 8)
         );
+        constrained.conflicts.push(1);
         assert!(arena.allocate(&constrained).is_none());
         assert!(
             arena
@@ -1328,7 +1414,7 @@ mod tests {
         let base = limit / IPU21_INTERLEAVED_ELEMENT_SIZE * IPU21_INTERLEAVED_ELEMENT_SIZE;
         let mut arena = Arena::new(&[(base, limit)], 0);
         let mut payload = request(MemoryClass::Ipu21Interleaved, limit - base, 8, 0, 1);
-        payload.distinct_element = true;
+
         assert_eq!(arena.allocate(&payload), Some(base));
         assert!(
             arena
@@ -1344,12 +1430,12 @@ mod tests {
         assert!(arena.allocate(&payload).is_none());
 
         // A payload also fits before an unrelated live allocation in the same
-        // element. Another constrained buffer cannot start in that element.
+        // element. Unrelated constrained buffers may also share an element.
         let base = IPU21_INTERLEAVED_MEMORY_BASE;
         let mut ordinary_gap = Arena::new(&[(base, base + 1024)], 0);
         payload.bytes = 512;
         assert_eq!(ordinary_gap.allocate(&payload), Some(base));
-        assert!(ordinary_gap.allocate(&payload).is_none());
+        assert_eq!(ordinary_gap.allocate(&payload), Some(base + 512));
     }
 
     #[test]
@@ -1384,7 +1470,18 @@ mod tests {
                         first,
                         first + random.u32(0..=8),
                     );
-                    request.distinct_element = random.bool();
+                    let constrained = random.bool();
+                    request.assignments = vec![(placed.len(), 0)];
+                    if constrained {
+                        request.conflicts = placed
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (_, _, a, b, c))| {
+                                *c && first <= *b && *a <= request.lifetime.last
+                            })
+                            .map(|(id, _)| id)
+                            .collect();
+                    }
                     let Some(address) = arena.allocate(&request) else {
                         continue;
                     };
@@ -1402,7 +1499,7 @@ mod tests {
                     for &(other, other_end, other_first, other_last, other_constrained) in &placed {
                         if first <= other_last && other_first <= request.lifetime.last {
                             assert!(end <= other || other_end <= address);
-                            if request.distinct_element
+                            if constrained
                                 && other_constrained
                                 && (address >= boundary) == (other >= boundary)
                             {
@@ -1418,13 +1515,7 @@ mod tests {
                             }
                         }
                     }
-                    placed.push((
-                        address,
-                        end,
-                        first,
-                        request.lifetime.last,
-                        request.distinct_element,
-                    ));
+                    placed.push((address, end, first, request.lifetime.last, constrained));
                 }
             }
             for (base, end) in arena.unused_ranges() {
@@ -1555,11 +1646,17 @@ mod tests {
             .unwrap()
             .clone();
         let second_root = analysis.root_of_member[group.shards[1].index() as usize];
+        let first_root = analysis.root_of_member[group.shards[0].index() as usize];
         analysis
-            .root_requirements
-            .get_mut(&second_root)
-            .unwrap()
-            .distinct_element = true;
+            .conflicts
+            .entry(first_root)
+            .or_default()
+            .insert(second_root);
+        analysis
+            .conflicts
+            .entry(second_root)
+            .or_default()
+            .insert(first_root);
         let members = analysis
             .members
             .into_iter()
@@ -1575,6 +1672,7 @@ mod tests {
             &analysis.root_of_member,
             &analysis.root_requirements,
             &analysis.root_lifetimes,
+            &analysis.conflicts,
         )
         .unwrap();
         assert_eq!(
@@ -1709,23 +1807,19 @@ mod tests {
                                     };
                                     for shard in shards {
                                         let definition = &low.shards[shard.index() as usize];
-                                        let element =
-                                            memory_element_size(&low, &[shard.index() as usize]);
                                         let address = placement.shard_addresses[&shard];
-                                        assert_eq!(address % element, 0);
                                         let bytes = shard_storage_bytes(definition).unwrap();
-                                        ranges.push((
-                                            definition.tensor_type.format.layout.memory_class,
-                                            address / element,
-                                            address.saturating_add(bytes).div_ceil(element),
+                                        ranges.push(crate::exchange::effective_memory_elements(
+                                            address,
+                                            bytes.div_ceil(4),
                                         ));
                                     }
                                 }
                                 for (index, left) in ranges.iter().enumerate() {
                                     for right in &ranges[..index] {
-                                        if left.0 == right.0 {
-                                            assert!(left.2 <= right.1 || right.2 <= left.1);
-                                        }
+                                        assert!(
+                                            left.iter().all(|element| !right.contains(element))
+                                        );
                                     }
                                 }
                             }

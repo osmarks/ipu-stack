@@ -99,6 +99,7 @@ fn collect(
             &analysis.root_of_member,
             &analysis.root_requirements,
             &analysis.root_lifetimes,
+            &analysis.conflicts,
         )?;
         for request in requests {
             let first_root = request.assignments[0].0;

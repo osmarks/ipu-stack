@@ -572,3 +572,27 @@ can still increase receiver mux/control instructions, so preserved source order
 alone does not guarantee unchanged table size. Smaller wave sizes and filling
 idle intervals with compatible chunks can be evaluated under the same cap.
 No speedup from these proposed scheduler changes has been claimed or measured.
+
+## Pairwise element constraints
+
+Placement now retains the actual kernel-operand and local-exchange conflicts,
+instead of aligning every participating allocation to an element boundary.
+Only conflicting roots exclude one another's effective element spans. Ordinary
+access alignment and byte lifetimes still apply; standard and interleaved
+accesses share the same region-1 element pairs. Repeat sequences remain contiguous
+and protect their entire span against external conflicts, including on later
+iterations. Separate sequence-member elements are reserved only for actual
+internal operand conflicts. Access tails remain allocated.
+
+The 27-layer batch-1 baseline passed three consecutive hardware inferences after
+one parameter upload (`pairwise-resident-full27-hardware`): identical outputs,
+FP32-reference minimum cosine 0.994212810. All 227 codegen tests passed (four
+ignored), including randomized placement and Repeat separation checks. The
+27-layer materialized-attention baseline now places successfully (previously the
+6,912-byte affine sequence failed). Batch 2 still fails on an 82,944-byte
+persistent QKV-weight sequence; this change does not eliminate fragmentation.
+
+The exact map is under
+`artifacts/baseline-local-planner/pairwise-resident-full27/memory/placement-63074.html`.
+That directory's package was built only to export the final transfer snapshot;
+the hardware run is in the separate `pairwise-resident-full27-hardware` directory.
