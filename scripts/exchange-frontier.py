@@ -16,6 +16,19 @@ def frontier(rows, storage):
         and (q[storage] < r[storage] or q['cycles'] < r['cycles']) for q in rows)]
 
 
+def compact_reference(points):
+    selected = {r['configuration']: r for r in points
+                if r.get('widths', 'selected') == 'selected'}
+    ordinary = selected.get('stream-256')
+    balanced = selected.get('balanced-1024')
+    if not ordinary or not balanced:
+        return None
+    if balanced['cycles'] < ordinary['cycles'] and all(
+            balanced[key] <= ordinary[key] for key in ['maximum_row_bytes', 'total_row_bytes']):
+        return balanced
+    return ordinary
+
+
 def render(rows, output):
     phases = sorted({r['phase'] for r in rows})
     if len(phases) > 12:
@@ -33,7 +46,7 @@ def render(rows, output):
 <title>Exchange scheduling frontiers</title>
 <style>body{max-width:1000px;margin:2em auto;padding:0 1em;font-family:Georgia,serif;color:#111;background:white}a{color:inherit}</style>
 <h1>Exchange scheduling frontiers</h1>
-<p>All captured phases. <a href="results.csv">All measurements</a> ·
+<p><a href="results.csv">All measurements</a> ·
 <a href="frontier.csv">Frontier points</a> · <a href="manifest.json">Commands</a></p><ul>'''
             + '\n'.join(links) + '</ul>')
         return
@@ -59,6 +72,11 @@ def render(rows, output):
                                    color=color, label=family, marker=marker, alpha=.8)
             unique = sorted({(r[storage], r['cycles']) for r in best})
             ax.plot([x for x, y in unique], [y for x, y in unique], color='black', linewidth=.9)
+            reference = compact_reference(points)
+            if reference:
+                ax.scatter([reference[storage]], [reference['cycles']], s=100,
+                           facecolors='none', edgecolors='black', linewidths=1.3,
+                           label='S256/B1024 policy', zorder=4)
             for x, y in unique:
                 matches = [r['configuration'] for r in best if (r[storage], r['cycles']) == (x, y)]
                 name = matches[0]
@@ -73,6 +91,9 @@ def render(rows, output):
             ax.set_xscale('log', base=2)
             xs = [x for x, y in unique]
             ys = [y for x, y in unique]
+            if reference:
+                xs.append(reference[storage])
+                ys.append(reference['cycles'])
             ax.set_xlim(min(xs)/1.07, max(xs)*1.07)
             margin = max(max(ys)-min(ys), max(ys)*.1)*.15
             ax.set_ylim(min(ys)-margin, max(ys)+margin)
@@ -107,7 +128,9 @@ def render(rows, output):
 <style>body{max-width:1400px;margin:2em auto;padding:0 1em;font-family:Georgia,serif;color:#111;background:white}img{width:100%}a{color:inherit}</style>
 <h1>Exchange scheduling frontiers</h1>
 <p>Fixed captured transfers and addresses. Scheduled cycles exclude waiting for the barrier.
-Axes focus on the nondominated frontier; dominated points outside this range are omitted.
+Axes include the nondominated frontier and the S256/B1024 policy replay (black ring);
+other dominated points outside this range are omitted. The policy replay compares
+fresh schedules at these fixed addresses; a cached production recipe may differ.
 Crosses mark ordinary-width alternatives. S: streams; B: balanced streams; C/D: combined/directional priority; R: remaining-work priority.
 A suffix u marks ordinary transfers, and (+N) counts equivalent configurations. <a href="results.csv">All measurements</a> ·
 <a href="frontier.csv">Frontier points</a></p>
