@@ -2,6 +2,7 @@
 
 mod cache;
 mod emit;
+mod exchange_grouping;
 pub(crate) use cache::ExpansionCache;
 mod primitive;
 

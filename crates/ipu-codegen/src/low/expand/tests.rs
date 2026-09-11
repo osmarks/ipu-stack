@@ -25,6 +25,118 @@ use std::collections::BTreeSet;
 const CASES: usize = 32;
 
 #[test]
+fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
+    for alias in [false, true] {
+        for (source, destination, offset, strided, next_source, blocked, hoisted) in [
+            (3, 1, 256, false, 1, false, true), // Fill the locally owned tail before exchange.
+            (3, 1, 256, true, 1, false, true),
+            (3, 1, 0, false, 1, true, false), // Overwrites received bytes; order matters.
+            (1, 3, 0, false, 3, true, false), // Actual receive-copy-send dependency.
+            (3, 1, 0, false, 3, false, false), // Shared reads permit keeping the copy after.
+        ] {
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input("input", [16, 16]).unwrap();
+            let output = graph.gelu(input).unwrap();
+            graph.set_outputs([output]).unwrap();
+            let mid = lower(
+                &graph,
+                &PipelineConfig::new(4).with_input(input, format(1)),
+                &Ipu21CostModel,
+            )
+            .unwrap();
+            let mut builder = TileGraphBuilder::new(&mid).unwrap();
+            let mut ids = vec![builder.shards[0].id];
+            for tile in [1, 2, 1] {
+                let mut shard = builder.shards[0].clone();
+                shard.tile = tile;
+                shard.definition = ShardDefinition::Staging;
+                ids.push(builder.push_shard(shard).unwrap());
+            }
+            let mut alias_shard = builder.shards[ids[1].index() as usize].clone();
+            alias_shard.definition = ShardDefinition::WritableAlias(ids[1]);
+            let alias_id = builder.push_shard(alias_shard).unwrap();
+            let mut from = builder.full_view(ids[0]);
+            let mut to = builder.full_view(ids[1]);
+            for view in [&mut from, &mut to] {
+                view.extents[0].logical_end = 8;
+                view.extents[0].physical_end = 8;
+            }
+            let provenance = WorkProvenance {
+                operation: Some(graph.operations()[0].id),
+                value: None,
+                reason: WorkReason::OperatorInputs,
+            };
+            let mut region = BlockRegion::default();
+            builder
+                .append_exchange_phase(
+                    vec![LogicalExchange {
+                        source: from,
+                        destinations: vec![to],
+                        order: CopyOrder::Physical,
+                    }],
+                    provenance,
+                    &mut region,
+                )
+                .unwrap();
+            builder.local_copies.push(LocalCopy {
+                source: if alias && source == 1 {
+                    alias_id
+                } else {
+                    ids[source]
+                },
+                destination: if alias && destination == 1 {
+                    alias_id
+                } else {
+                    ids[destination]
+                },
+                source_offset: 0,
+                destination_offset: offset,
+                bytes: 128,
+                pattern: if strided {
+                    CopyPattern::Strided {
+                        rows: 4,
+                        row_bytes: 32,
+                        source_stride: 32,
+                        destination_stride: 64,
+                    }
+                } else {
+                    CopyPattern::Contiguous
+                },
+            });
+            region.operations.push(BlockOperation::Copy {
+                tile: 1,
+                copy: LocalCopyId(0),
+            });
+            let second = LogicalExchange {
+                source: builder.full_view(ids[next_source]),
+                destinations: vec![builder.full_view(ids[2])],
+                order: CopyOrder::Physical,
+            };
+            builder
+                .append_exchange_phase(vec![second], provenance, &mut region)
+                .unwrap();
+            assert_eq!(
+                builder.phases.len(),
+                if blocked { 2 } else { 1 },
+                "alias={alias}, source={source}, destination={destination}, offset={offset}"
+            );
+            assert_eq!(
+                matches!(region.operations[0], BlockOperation::Copy { .. }),
+                hoisted
+            );
+            if !blocked {
+                assert_eq!(builder.phases[0].transfers.len(), 2);
+                assert_eq!(builder.phases[0].transfers[0].source.shard, ids[0]);
+                assert_eq!(
+                    builder.phases[0].transfers[1].source.shard,
+                    ids[next_source]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn local_materialization_joins_only_compatible_existing_multicasts() {
     for (remote_count, interleaved, exchange_order, loopback) in [
         (2, true, CopyOrder::Physical, true),

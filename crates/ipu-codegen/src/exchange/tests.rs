@@ -1043,3 +1043,39 @@ fn paired_repeat_base_preserves_encoded_alignment() {
         Some((shard, 8))
     );
 }
+
+#[test]
+fn coalescing_preserves_loopback_dependencies_in_every_repeat_iteration() {
+    let make = |offset: u32, destination, source_addresses: Vec<u32>| {
+        let mut t = PendingTransfer {
+            source: 0,
+            source_shard: BlockValueId::from_index(0),
+            source_offset: offset,
+            source_addresses,
+            source_elements: vec![],
+            destinations: vec![(0, destination)],
+            words: 16,
+            width: ExchangeItemWidth::Word32,
+            reserved_source: None,
+        };
+        t.refresh_source_elements();
+        t
+    };
+    // The second Repeat binding would read the first transfer's destination.
+    let a = make(0, 0x64040, vec![0x60000, 0x64000]);
+    let b = make(64, 0x64080, vec![0x60040, 0x64040]);
+    assert_eq!(coalesce_pending_transfers(vec![a, b]).len(), 2);
+    let a = make(0, 0x68000, vec![0x60000, 0x64000]);
+    let b = make(64, 0x68040, vec![0x60040, 0x64040]);
+    let merged = coalesce_pending_transfers(vec![a, b]);
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].words, 32);
+    assert_eq!(
+        merged[0].source_elements,
+        [
+            effective_memory_elements(0x60000, 32),
+            effective_memory_elements(0x64000, 32)
+        ]
+        .concat()
+    );
+}

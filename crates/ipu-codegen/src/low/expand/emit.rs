@@ -137,39 +137,7 @@ impl TileGraphBuilder {
                 .is_some()
             && self.phases[previous.index() as usize].provenance.operation == provenance.operation
         {
-            let touched = transfers
-                .iter()
-                .flat_map(|transfer| {
-                    std::iter::once(transfer.source.shard)
-                        .chain(transfer.destinations.iter().map(|view| view.shard))
-                })
-                .map(|shard| self.storage_root(shard))
-                .collect::<BTreeSet<_>>();
-            let previous_touched = self.phases[previous.index() as usize]
-                .transfers
-                .iter()
-                .flat_map(|transfer| {
-                    std::iter::once(transfer.source.shard)
-                        .chain(transfer.destinations.iter().map(|view| view.shard))
-                })
-                .map(|shard| self.storage_root(shard))
-                .collect::<BTreeSet<_>>();
-            let disjoint_transfers = touched.is_disjoint(&previous_touched);
-            let only_independent_copies_between = tiles
-                .operations
-                .iter()
-                .rposition(|operation| *operation == BlockOperation::Exchange(previous))
-                .is_some_and(|boundary| {
-                    tiles.operations[boundary + 1..].iter().all(|operation| {
-                        let BlockOperation::Copy { copy, .. } = operation else {
-                            return false;
-                        };
-                        let copy = &self.local_copies[copy.0 as usize];
-                        !touched.contains(&self.storage_root(copy.source))
-                            && !touched.contains(&self.storage_root(copy.destination))
-                    })
-                });
-            if disjoint_transfers && only_independent_copies_between {
+            if self.group_exchange_copies(previous, &transfers, tiles)? {
                 let phase = &mut self.phases[previous.index() as usize];
                 phase.transfers.append(&mut transfers);
                 if phase.provenance != provenance {
@@ -182,7 +150,7 @@ impl TileGraphBuilder {
                 tracing::debug!(
                     phase = previous.index(),
                     operation = ?provenance.operation.map(OperationId::index),
-                    "consolidated independent exchange transfers"
+                    "consolidated exchange transfers"
                 );
                 return Ok(());
             }

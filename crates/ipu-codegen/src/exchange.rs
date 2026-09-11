@@ -238,7 +238,7 @@ fn prepare_phase(
     phase: &crate::low::ExchangePhase,
     repeat_inputs: &BTreeMap<BlockValueId, Vec<BlockValueId>>,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
-    let pending = phase
+    let mut pending: Vec<PendingTransfer> = phase
         .transfers
         .par_iter()
         .enumerate()
@@ -259,9 +259,8 @@ fn prepare_phase(
         .into_iter()
         .flatten()
         .collect();
-    let mut pending = coalesce_pending_transfers(pending);
     attach_repeat_source_addresses(&mut pending, repeat_inputs, placement)?;
-    Ok(pending)
+    Ok(coalesce_pending_transfers(pending))
 }
 
 pub(crate) fn capture_exchange_schedule(
@@ -1614,8 +1613,26 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
                                 .is_some_and(|end| end == right_address)
                     },
                 );
-        if contiguous && combined_words.is_some_and(|words| words <= MAX_TRANSFER_WORDS) {
+        // A merged phase may contain receive-then-forward dependencies. Do
+        // not absorb a local write into a SEND that also reads those bytes;
+        // memory_dependencies must still see the original ordered transfers.
+        let independent = contiguous
+            && combined_words.is_some_and(|words| {
+                let bytes = u64::from(words) * 4;
+                previous.destinations.iter().all(|&(tile, address)| {
+                    tile != previous.source
+                        || previous.source_addresses.iter().all(|&source| {
+                            u64::from(address) + bytes <= u64::from(source)
+                                || u64::from(source) + bytes <= u64::from(address)
+                        })
+                })
+            });
+        if contiguous
+            && independent
+            && combined_words.is_some_and(|words| words <= MAX_TRANSFER_WORDS)
+        {
             previous.words = combined_words.expect("checked above");
+            previous.refresh_source_elements();
         } else {
             merged.push(transfer);
         }
