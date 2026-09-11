@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -64,7 +65,7 @@ def render(rows, output):
             points = [r for r in rows if r['phase'] == phase]
             best = frontier(points, storage)
             for family, color in colors.items():
-                for widths, marker in [('selected', 'o'), ('ordinary', 'x')]:
+                for widths, marker in [('selected', 'o'), ('ordinary', 'x'), ('paired', '^')]:
                     group = [r for r in points if r['family'] == family
                              and r.get('widths', 'selected') == widths]
                     if group:
@@ -82,7 +83,8 @@ def render(rows, output):
                 name = matches[0]
                 for source, target in [('remaining-directional', 'RD'), ('remaining-combined', 'RC'),
                                        ('automatic', 'auto'), ('directional', 'D'), ('combined', 'C'),
-                                       ('balanced-', 'B'), ('stream-', 'S'), ('-ordinary', 'u')]:
+                                       ('balanced-', 'B'), ('stream-', 'S'),
+                                       ('-ordinary', 'u'), ('-paired', 'p')]:
                     name = name.replace(source, target)
                 name += f' (+{len(matches)-1})' if len(matches)>1 else ''
                 right = x == unique[-1][0] and len(unique)>1
@@ -94,10 +96,14 @@ def render(rows, output):
             if reference:
                 xs.append(reference[storage])
                 ys.append(reference['cycles'])
-            ax.set_xlim(min(xs)/1.07, max(xs)*1.07)
+            # A fixed percentage margin crowds ticks when the row sizes differ
+            # by only a few bytes. Scale the margin to the plotted log span.
+            span = math.log(max(xs)/min(xs))
+            padding = span*.07 if span else .03
+            ax.set_xlim(min(xs)/math.exp(padding), max(xs)*math.exp(padding))
             margin = max(max(ys)-min(ys), max(ys)*.1)*.15
             ax.set_ylim(min(ys)-margin, max(ys)+margin)
-            ticks = [xs[0]] if len(xs)==1 else sorted({
+            ticks = [xs[0]] if len(set(xs))==1 else sorted({
                 round(min(xs)**(1-i/4)*max(xs)**(i/4)) for i in range(5)})
             ax.xaxis.set_major_locator(FixedLocator(ticks))
             ax.xaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
@@ -132,8 +138,9 @@ def render(rows, output):
 Axes include the nondominated frontier and the S256/B1024 policy replay (black ring);
 other dominated points outside this range are omitted. The policy replay compares
 fresh schedules at these fixed addresses; a cached production recipe may differ.
-Crosses mark ordinary-width alternatives. S: streams; B: balanced streams; C/D: combined/directional priority; R: remaining-work priority.
-A suffix u marks ordinary transfers, and (+N) counts equivalent configurations. <a href="results.csv">All measurements</a> ·
+Crosses mark ordinary-width alternatives; triangles mark paired alternatives.
+S: streams; B: balanced streams; C/D: combined/directional priority; R: remaining-work priority.
+Suffixes u/p mark ordinary/paired alternatives, and (+N) counts equivalent configurations. <a href="results.csv">All measurements</a> ·
 <a href="frontier.csv">Frontier points</a></p>
 <img src="maximum_row_bytes.svg" alt="Cycles versus maximum row storage per tile">
 <img src="total_row_bytes.svg" alt="Cycles versus total row storage">

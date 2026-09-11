@@ -109,34 +109,48 @@ pub(super) fn optimize_stream_schedule(
     )?;
     let initial_horizon = schedule.horizon;
     let mut improvements = 0;
-    // Larger address-contiguous chunks recover pointer compression lost by
-    // endpoint balancing. Keep the incumbent's maximum and total encoded size
-    // as hard caps; the compact mode must not trade memory for speed.
-    if let Ok(candidate) = materialize_stream_schedule(
-        topology,
-        problem,
-        incoming_bases,
-        receive_counts,
-        words.saturating_mul(4),
-        true,
-    ) && candidate.horizon < schedule.horizon
-    {
-        let (maximum, total) = encoded_row_storage(&schedule)?;
+    let mut selected_kind = "compact-streams";
+    // Smaller ordinary chunks can shorten endpoint tails; larger balanced
+    // chunks recover pointer compression lost by endpoint balancing. Both must
+    // fit the original maximum and total row budgets. Equal-cycle reductions
+    // in storage are useful too, particularly for resident multi-layer models.
+    let (maximum, total) = encoded_row_storage(&schedule)?;
+    let mut score = (schedule.horizon, maximum, total);
+    for (chunk_words, balanced) in [(words / 4, false), (words.saturating_mul(4), true)] {
+        if chunk_words == 0 {
+            continue;
+        }
+        let Ok(candidate) = materialize_stream_schedule(
+            topology,
+            problem,
+            incoming_bases,
+            receive_counts,
+            chunk_words,
+            balanced,
+        ) else {
+            continue;
+        };
+        if candidate.horizon > score.0 {
+            continue;
+        }
         let (candidate_maximum, candidate_total) = encoded_row_storage(&candidate)?;
-        if candidate_maximum <= maximum && candidate_total <= total {
+        let candidate_score = (candidate.horizon, candidate_maximum, candidate_total);
+        if candidate_maximum <= maximum && candidate_total <= total && candidate_score < score {
             schedule = candidate;
-            improvements = 1;
+            score = candidate_score;
+            improvements += 1;
+            selected_kind = if balanced {
+                "balanced-compact-streams"
+            } else {
+                "small-compact-streams"
+            };
         }
     }
     Ok(OptimizedSchedule {
         initial_horizon,
         endpoint_lower_bound: endpoint_work_lower_bound(problem.transfers, problem.tile_count),
         schedule,
-        selected_kind: if improvements == 0 {
-            "compact-streams"
-        } else {
-            "balanced-compact-streams"
-        },
+        selected_kind,
         neighborhood_improvements: improvements,
     })
 }
