@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare scheduler policies on fixed captured transfers; render Pareto curves."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import json
 import os
@@ -16,6 +17,26 @@ def frontier(rows, storage):
 
 
 def render(rows, output):
+    phases = sorted({r['phase'] for r in rows})
+    if len(phases) > 12:
+        links = []
+        chosen = []
+        for start in range(0, len(phases), 12):
+            group = phases[start:start+12]
+            directory = output / f'phases-{group[0]}-{group[-1]}'
+            directory.mkdir(exist_ok=True)
+            render([r for r in rows if r['phase'] in group], directory)
+            chosen.extend(json.loads((directory/'frontier.json').read_text()))
+            links.append(f'<li><a href="{directory.name}/index.html">Phases {group[0]}–{group[-1]}</a></li>')
+        write_tables(rows, chosen, output)
+        (output/'index.html').write_text('''<!doctype html><meta charset="utf-8">
+<title>Exchange scheduling frontiers</title>
+<style>body{max-width:1000px;margin:2em auto;padding:0 1em;font-family:Georgia,serif;color:#111;background:white}a{color:inherit}</style>
+<h1>Exchange scheduling frontiers</h1>
+<p>All captured phases. <a href="results.csv">All measurements</a> ·
+<a href="frontier.csv">Frontier points</a> · <a href="manifest.json">Commands</a></p><ul>'''
+            + '\n'.join(links) + '</ul>')
+        return
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -80,12 +101,7 @@ def render(rows, output):
             r['total_row_frontier'] = r in frontier(points, 'total_row_bytes')
             if r['maximum_row_frontier'] or r['total_row_frontier']:
                 chosen.append(r)
-    for name, data in [('results', rows), ('frontier', chosen)]:
-        (output / f'{name}.json').write_text(json.dumps(data, indent=2)+'\n')
-        with (output / f'{name}.csv').open('w') as f:
-            writer = csv.DictWriter(f, fieldnames=list(data[0]))
-            writer.writeheader()
-            writer.writerows(data)
+    write_tables(rows, chosen, output)
     (output / 'index.html').write_text('''<!doctype html><meta charset="utf-8">
 <title>Exchange scheduling frontiers</title>
 <style>body{max-width:1400px;margin:2em auto;padding:0 1em;font-family:Georgia,serif;color:#111;background:white}img{width:100%}a{color:inherit}</style>
@@ -94,10 +110,19 @@ def render(rows, output):
 Axes focus on the nondominated frontier; dominated points outside this range are omitted.
 Crosses mark ordinary-width alternatives. S: streams; B: balanced streams; C/D: combined/directional priority; R: remaining-work priority.
 A suffix u marks ordinary transfers, and (+N) counts equivalent configurations. <a href="results.csv">All measurements</a> ·
-<a href="frontier.csv">Frontier points</a> · <a href="manifest.json">Commands</a></p>
+<a href="frontier.csv">Frontier points</a></p>
 <img src="maximum_row_bytes.svg" alt="Cycles versus maximum row storage per tile">
 <img src="total_row_bytes.svg" alt="Cycles versus total row storage">
 ''')
+
+
+def write_tables(rows, chosen, output):
+    for name, data in [('results', rows), ('frontier', chosen)]:
+        (output / f'{name}.json').write_text(json.dumps(data, indent=2)+'\n')
+        with (output / f'{name}.csv').open('w') as f:
+            writer = csv.DictWriter(f, fieldnames=list(data[0]))
+            writer.writeheader()
+            writer.writerows(data)
 
 
 def main():
@@ -108,7 +133,11 @@ def main():
     parser.add_argument('--words', default='64,128,256,512,1024,4096,16384')
     parser.add_argument('--phase', type=int, action='append', default=[])
     parser.add_argument('--render-only', action='store_true')
+    parser.add_argument('--jobs', type=int, default=1,
+                        help='Concurrent configurations, each using one Rayon worker')
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error('jobs must be positive')
     args.output.mkdir(parents=True, exist_ok=True)
     if args.render_only:
         render(json.loads((args.output/'results.json').read_text()), args.output)
@@ -122,23 +151,24 @@ def main():
                         (f'balanced-{words}', 'balanced', ['--stream-words', str(words), '--balance-streams'])])
     commands = []
     rows = []
-    for name, family, flags in configs:
+    def measure(config):
+        name, family, flags = config
         command = [str(args.binary.resolve()), str(args.snapshot.resolve()), *flags]
         for phase in args.phase:
             command.extend(['--phase', str(phase)])
-        commands.append(command)
         log = args.output/f'{name}.log'
         print(name, flush=True)
-        # Sequential runs and a single Rayon worker keep compiler-time comparisons
-        # interpretable. Hardware schedules themselves are deterministic.
+        # Each configuration uses one worker. Concurrent configurations affect
+        # compiler timings, but not deterministic device schedule cycles.
         with log.open('w') as f:
             subprocess.run(command, stdout=f, stderr=subprocess.STDOUT, check=True,
                            env={**os.environ, 'RAYON_NUM_THREADS': '1'})
+        measurements = []
         for line in log.read_text().splitlines():
             if 'invariants=PASS' not in line:
                 continue
             fields = dict(token.split('=', 1) for token in shlex.split(line) if '=' in token)
-            rows.append({'phase': int(fields['phase']), 'configuration': name, 'family': family,
+            measurements.append({'phase': int(fields['phase']), 'configuration': name, 'family': family,
                          'cycles': int(fields['horizonCycles']),
                          'maximum_row_bytes': 4*int(fields['maximumRowWords']),
                          'total_row_bytes': 4*int(fields['rowWords']),
@@ -147,10 +177,18 @@ def main():
                          'schedule_ms': float(fields['scheduleCodegenMedianMs']),
                          'transfers': int(fields['transfers']), 'destinations': int(fields['destinations']),
                          'row_fingerprint': fields['rowFingerprint']})
-        (args.output/'results.json').write_text(json.dumps(rows, indent=2)+'\n')
+        return command, measurements
+    with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        for result in as_completed([executor.submit(measure, config) for config in configs]):
+            command, measurements = result.result()
+            commands.append(command)
+            rows.extend(measurements)
+            rows.sort(key=lambda r: (r['phase'], r['configuration']))
+            (args.output/'results.json').write_text(json.dumps(rows, indent=2)+'\n')
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
     (args.output/'manifest.json').write_text(json.dumps({'revision': revision, 'commands': commands,
-        'rayon_threads': 1, 'iterations': 1, 'snapshot': str(args.snapshot.resolve())}, indent=2)+'\n')
+        'rayon_threads': 1, 'concurrent_configurations': args.jobs,
+        'iterations': 1, 'snapshot': str(args.snapshot.resolve())}, indent=2)+'\n')
     render(rows, args.output)
 
 
