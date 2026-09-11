@@ -849,6 +849,7 @@ pub(crate) fn build_schedule_phase_replay(
     phase_index: usize,
     first_transfer: usize,
     transfer_limit: Option<usize>,
+    priority: ipu_codegen::ExchangeSchedulingPriority,
     toolchain: &Toolchain,
     runtime_source: &Path,
 ) -> Result<PhaseReplayPackage> {
@@ -867,7 +868,11 @@ pub(crate) fn build_schedule_phase_replay(
         }
         problem.transfers.truncate(limit);
     }
-    let scheduled = ipu_codegen::schedule_exchange_problem(snapshot.tile_count, &problem)?;
+    let scheduled = ipu_codegen::schedule_exchange_problem_with_priority(
+        snapshot.tile_count,
+        &problem,
+        priority,
+    )?;
     build_physical_phase_replay(&scheduled.phase, phase_index, toolchain, runtime_source)
 }
 

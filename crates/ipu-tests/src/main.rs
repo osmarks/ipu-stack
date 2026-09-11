@@ -87,6 +87,9 @@ struct Arguments {
         conflicts_with = "export_exchange_schedule"
     )]
     replay_exchange_schedule: Option<PathBuf>,
+    /// Balance compact stream chunks when replaying an exported schedule.
+    #[arg(long, requires_all = ["replay_exchange_schedule", "exchange_stream_words"])]
+    exchange_replay_balance_streams: bool,
     /// Maximum number of systematically distributed words read back by an
     /// exact exchange-phase replay.
     #[arg(long, default_value_t = 8192)]
@@ -681,6 +684,13 @@ fn main() -> Result<()> {
             phase,
             arguments.exchange_replay_first_transfer,
             arguments.exchange_replay_transfer_limit,
+            match arguments.exchange_stream_words {
+                Some(words) if arguments.exchange_replay_balance_streams => {
+                    ipu_codegen::ExchangeSchedulingPriority::BalancedStreams(words.get())
+                }
+                Some(words) => ipu_codegen::ExchangeSchedulingPriority::Streams(words.get()),
+                None => ipu_codegen::ExchangeSchedulingPriority::Automatic,
+            },
             &Toolchain::from_sdk(&arguments.sdk),
             &runtime_source,
         )?;
