@@ -395,8 +395,12 @@ empty in every row. Blank space in an additional reuse row is not additional
 physical SRAM.
 
 The canvas renders only the viewport. Controls provide byte-address zoom,
-tile/address navigation, 4/8/12-pixel row heights, optional reuse rows, allocation
+tile/address navigation, 12/16/24-pixel row heights (16 by default), optional reuse rows, allocation
 highlighting, hover details and pinned selection with clear/reset controls.
+Allocations use the cycle profiler’s green/red/gold palette plus purple for
+support. The view has no panel or allocation borders. Dragging across the map
+or address ruler zooms to that range; right-click undoes a zoom, Shift-wheel
+zooms around the pointer, and Escape cancels a drag.
 
 The 27-layer example contains 633985 allocations/reservations, including
 230450 additional reuse-row entries:
