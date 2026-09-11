@@ -225,6 +225,12 @@ fn main() -> Result<()> {
                         })
                         .collect();
                     let mut wanted = Vec::new();
+                    let statistics_parts = if mode == 5 { 1 + offset / 4 } else { 1 };
+                    let statistics_parts = if width % statistics_parts == 0 {
+                        statistics_parts
+                    } else {
+                        1
+                    };
                     let mut moments = Vec::<f32>::new();
                     for row in 0..rows as usize {
                         let slice = &x[row * width as usize..(row + 1) * width as usize];
@@ -233,9 +239,18 @@ fn main() -> Result<()> {
                             .iter()
                             .map(|&v| (v as f64 - mean).powi(2))
                             .sum::<f64>();
-                        moments.extend([mean as f32, variance as f32]);
+                        for partial in slice.chunks_exact((width / statistics_parts) as usize) {
+                            let mean = partial.iter().map(|&v| v as f64).sum::<f64>()
+                                / partial.len() as f64;
+                            let variance = partial
+                                .iter()
+                                .map(|&v| (v as f64 - mean).powi(2))
+                                .sum::<f64>()
+                                / partial.len() as f64;
+                            moments.extend([mean as f32, variance as f32]);
+                        }
                         if mode == 4 || mode == 11 {
-                            wanted.extend([mean as f32, variance as f32]);
+                            wanted.extend([mean as f32, (variance / width as f64) as f32]);
                         } else {
                             for (col, &v) in slice.iter().enumerate() {
                                 wanted.push(if mode < 2 {
@@ -391,7 +406,7 @@ fn main() -> Result<()> {
                         _ => (
                             "layer_norm_apply",
                             vec![addresses[0], addresses[2], addresses[3], 0x6c000],
-                            vec![rows, width, 1],
+                            vec![rows, width, statistics_parts],
                         ),
                     };
                     if mode == 11 {

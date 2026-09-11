@@ -43,7 +43,7 @@ public:
     } else if (worker == 0) {
       float2 variance = {0, 0};
       for (unsigned i = 6; i < 12; ++i) variance += partials[i];
-      *reinterpret_cast<float2 *>(&destination[0]) = {mean, variance[0] + variance[1]};
+      *reinterpret_cast<float2 *>(&destination[0]) = {mean, (variance[0] + variance[1]) / width};
     }
     return true;
   }
@@ -72,9 +72,9 @@ public:
       for (unsigned part = 0; part < parts; ++part) {
         const float2 group = stats[row * parts + part];
         const float delta = group[0] - mean;
-        variance += group[1] + width * delta * delta;
+        variance += group[1] + delta * delta;
       }
-      const float inverse = normInverse(variance / (width * parts) + 1e-6f);
+      const float inverse = normInverse(variance / parts + 1e-6f);
       normApply(x + row * width, nullptr, gamma, beta, y + row * width,
                 width, worker, mean, inverse);
     }

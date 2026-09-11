@@ -34,7 +34,7 @@ impl Builder {
             None,
             vec![],
         );
-        // Replicate only the small (mean, centered sum of squares) vectors;
+        // Replicate only the small (mean, variance) vectors;
         // features and affine parameters remain partitioned.
         moments
             .format

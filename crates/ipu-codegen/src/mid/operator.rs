@@ -48,7 +48,7 @@ pub enum TileKernelSpec {
     BiasGelu,
     AddLayerNorm,
     LayerNorm,
-    /// FP32 mean and centered squared deviation for each feature shard.
+    /// FP32 mean and variance for each feature shard.
     LayerNormMoments,
     /// Produce FP32 moments and an explicit F16 residual sum.
     AddLayerNormMoments,

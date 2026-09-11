@@ -85,6 +85,7 @@ pub(super) fn fuse(
             !super::elementwise::same_storage(value, &values[input.index() as usize]);
         let old_value_count = values.len();
         let mut stats_value = None;
+        let mut statistic_parts = 1;
         let stats = if ordinary {
             if current.results.len() != 1
                 || !super::elementwise::same_storage(
@@ -97,6 +98,7 @@ pub(super) fn fuse(
             let Some(stats_type) = row_moments_type(tensor) else {
                 continue;
             };
+            statistic_parts = *stats_type.shape.0.iter().rev().nth(1).unwrap() as u16;
             let id = MidValueId(values.len() as u32);
             stats_value = Some(MidValue {
                 id,
@@ -125,7 +127,9 @@ pub(super) fn fuse(
             apply.inputs.truncate(3);
             apply.inputs.push(stats);
             apply.kind = MidOperationKind::Primitive(Primitive::Compute {
-                kernel: TileKernelSpec::LayerNormApply { parts: 1 },
+                kernel: TileKernelSpec::LayerNormApply {
+                    parts: statistic_parts,
+                },
                 operands: vec![OperandWindow::default(); 4],
                 product: None,
                 output_aliases: Vec::new(),
@@ -136,10 +140,20 @@ pub(super) fn fuse(
         }
         let stats_copy = if redistributed {
             let target = &values[input.index() as usize];
-            let Some(tensor_type) = row_moments_type(&target.tensor_type) else {
+            let Some(mut tensor_type) = row_moments_type(&target.tensor_type) else {
                 values.truncate(old_value_count);
                 continue;
             };
+            let rank = target.tensor_type.shape.0.len();
+            let target_parts = tensor_type.shape.0[rank - 1] as u16;
+            tensor_type.shape.0[rank - 1] = u32::from(statistic_parts);
+            tensor_type
+                .format
+                .layout
+                .tiling
+                .axes
+                .retain(|axis| axis.axis != TensorAxis::FromStart((rank - 1) as u16));
+            tensor_type.format.layout.tiling.replicas *= target_parts;
             let id = MidValueId(values.len() as u32);
             let copy = MidOperation {
                 source: current.source,
@@ -220,7 +234,7 @@ pub(super) fn fuse(
     changed
 }
 
-/// One FP32 mean/centered-sum pair per complete row, on the same owners.
+/// One FP32 mean/variance pair per equal-sized feature partition, on its owners.
 fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
     if tensor.format.layout.order != ElementOrder::RowMajor {
         return None;
@@ -234,10 +248,23 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
         let index = axis.axis.resolve(rank).ok()?;
         axis.axis = TensorAxis::FromStart(index as u16);
         if index + 1 == rank {
-            if axis.partitions != 1 {
+            let width = *tensor.shape.0.last()?;
+            let parts = u32::from(axis.partitions);
+            if parts == 0
+                || width == 0
+                || !width.is_multiple_of(parts.checked_mul(axis.block_size)?)
+                || !(width / parts).is_multiple_of(4)
+                || !(width / parts).is_multiple_of(axis.padding_multiple)
+                || !(width / parts).is_multiple_of(axis.shard_padding_multiple)
+            {
                 return None;
             }
-            *axis = AxisTiling::new(axis.axis, 1, 1, Padding::Reject);
+            stats.shape.0[rank - 1] = parts;
+            axis.block_size = 1;
+            axis.padding_multiple = 1;
+            axis.shard_padding_multiple = 1;
+            axis.padding_groups = 1;
+            axis.padding = Padding::Reject;
         }
     }
     Some(stats)
@@ -425,5 +452,50 @@ mod tests {
                 .iter()
                 .any(|run| run.kernel == TileKernelSpec::LayerNormApply { parts: 1 })
         );
+
+        // The add owns two feature partitions; the apply owns complete rows.
+        // Statistics retain an explicit partition axis until their small gather.
+        let mut feature_layout = Layout::row_sharded(2);
+        feature_layout.tiling.tile_count = 4;
+        feature_layout.tiling.axes.push(AxisTiling::new(
+            TensorAxis::FromEnd(1),
+            2,
+            576,
+            Padding::Reject,
+        ));
+        for id in [0, 1, 4] {
+            program.values[id].tensor_type.format.layout = feature_layout.clone();
+        }
+        for op in &mut program.operations {
+            if let MidOperationKind::Convert(plan) = &mut op.kind {
+                plan.input.format = program.values[op.inputs[0].index() as usize]
+                    .tensor_type
+                    .format
+                    .clone();
+            }
+        }
+        let fused = program
+            .with_elementwise_fusions()
+            .expect("partial residual statistics should save a scan");
+        let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
+        let placement = crate::place(&low).unwrap();
+        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
+        let mut applied = 0;
+        for run in &low.kernel_runs {
+            crate::validate_kernel_run(run).unwrap();
+            let call = crate::materialize_kernel_run(
+                run,
+                &low.shards,
+                &placement.shard_addresses,
+                &kernels,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            if run.kernel == (TileKernelSpec::LayerNormApply { parts: 2 }) {
+                assert_eq!(call.arguments, vec![2, 1152, 2]);
+                applied += 1;
+            }
+        }
+        assert_eq!(applied, 2);
     }
 }
