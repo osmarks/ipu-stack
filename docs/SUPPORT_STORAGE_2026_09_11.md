@@ -141,3 +141,55 @@ executable storage releases one 16 KiB element: the upper standard tensor range
 now starts at 458752 rather than 475136. The memory-address change also affects
 exchange placement; the whole-model delta is not a pure kernel microbenchmark.
 Profile: `artifacts/baseline-local-planner/shared-worker-full1/model.ipuprof`.
+
+## Bulk Repeat patching
+
+Each exchange now calls at most two descriptor loops: table-backed replacements
+and exact arithmetic progressions. Per-word call sites and their old helpers
+are removed. Immutable destination/value/step descriptors are appended after the
+generated program's completion jump; their addresses are fixed up after code
+emission. They do not consume writable exchange-table space. Duplicate patch
+locations are rejected before grouping, and mixed descriptor relocation is
+covered by the randomized codegen test.
+
+For 27 layers, generated program storage (including the descriptors) falls
+**21620 → 18884 bytes**, saving 2736 bytes. Together with shared GEMMs, the linked
+span and generated program shrink by 14744 bytes. Available tensor storage rises
+from 464768 to **481152 bytes per tile**, after element rounding. The build still
+fails tensor placement on tile 184 for the 82944-byte QKV weight sequence; there
+is no measured full-27 runtime. Admission reaches this failure in 37.05 seconds.
+The exchange table remains 40488 bytes. Log:
+`artifacts/baseline-local-planner/bulk-after-full27/run.log`.
+
+Renderer-cropped hardware cycles, baseline-only planning and 256-word streams:
+
+| Workload | Original compact | Shared supervisors | Also shared workers | Also bulk patches |
+|---|---:|---:|---:|---:|
+| Full-size, one layer | 1011180 | 1012860 | 1026456 | same path; no Repeat |
+| Full-size, two layers | 1777680 | — | 1797174 | 1794522 |
+| Small, three layers, 64 active tiles | 388776 | — | 390888 | 382656 |
+
+Bulk patching alone saves 2652 cycles (0.148%) on the two-layer table-backed case,
+and 8232 cycles (2.106%) on the small three-layer arithmetic case. Combined
+changes are +0.947% and -1.574% respectively versus the original compact images.
+All numerical checks pass with unchanged maximum errors: 0.086670 for full two
+layers and 0.189453 for small three layers. The one-layer maximum remains
+0.077148. Each binary was measured once; the small runs are not extrapolations
+of full-model performance.
+
+A separate packed-output F16 GEMM checks row-panel boundaries at local
+R128/K64/C64. It passes with maximum error 0.000977. The kernel itself changes
+**19944 → 20088 cycles (+0.722%)**, while other kernels in that benchmark retain
+their cycle counts. This isolates dispatch/row-parameter overhead from the
+physical-placement changes in the ViT comparisons. Logs/profiles:
+`{before,shared}-packed-gemm/` under the same artifact directory.
+
+Rendered profiles:
+- `artifacts/baseline-local-planner/shared-worker-full1/model.html`
+- `artifacts/baseline-local-planner/bulk-after-full2/model.html`
+- `artifacts/baseline-local-planner/bulk-after-small-r3/model.html`
+
+219 codegen tests and the doctest pass (four manual tests ignored), as do Clippy
+and workspace all-target checks. Full-size two-layer profiles separately capture
+the pre-sharing, shared-worker and bulk-patch binaries. Small three-layer runs
+exercise arithmetic patching; the two-layer runs exercise value tables.

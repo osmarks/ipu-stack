@@ -177,38 +177,49 @@ static_copy_u16:
 	br $m10
 	.size static_copy_u16, .-static_copy_u16
 
-	.section .text.ipu_stack_static_patch_word,"ax",@progbits
-	// Runtime helper ABI: m2 destination word, m3 value table, m4 remaining
-	// iterations, m5 total iterations (both preserved), m9 return. Plans are ordinary
-	// data consumed after this store; no instruction-cache maintenance is needed.
-	.globl ipu_stack_static_patch_word
+	// Repeat descriptor ABI: m2 descriptors, m3 count (>0), m4 remaining,
+	// m5 total iterations (both preserved), m9 return. Descriptors are immutable
+	// literals; only the addressed exchange words are modified.
+	.section .text.static_patch_repeat_tables,"ax",@progbits
+	.globl static_patch_repeat_tables
 	.p2align 2
-	.type ipu_stack_static_patch_word,@function
-ipu_stack_static_patch_word:
+	.type static_patch_repeat_tables,@function
+static_patch_repeat_tables:
 	.supervisor
-	sub $m0, $m5, $m4
-	shl $m0, $m0, 2
-	add $m3, $m3, $m0
-	ld32 $m0, $m3, $m15, 0
-	st32 $m0, $m2, $m15, 0
+	sub $m8, $m5, $m4
+	shl $m8, $m8, 2
+.Lrepeat_tables:
+	ld32 $m0, $m2, $m15, 0
+	ld32 $m1, $m2, $m15, 1
+	add $m1, $m1, $m8
+	ld32 $m6, $m1, $m15, 0
+	st32 $m6, $m0, $m15, 0
+	add $m2, $m2, 8
+	add $m3, $m3, -1
+	brnz $m3, .Lrepeat_tables
 	br $m9
-	.size ipu_stack_static_patch_word, .-ipu_stack_static_patch_word
+	.size static_patch_repeat_tables, .-static_patch_repeat_tables
 
-	.section .text.static_patch_arithmetic_word,"ax",@progbits
-	// m2 destination, m3 initial word, m4 remaining, m5 total, m6 step.
-	// Preserve m4/m5 so the caller sets them only once per exchange.
-	// Low 32-bit arithmetic exactly matches the verified instruction-word series.
-	.globl static_patch_arithmetic_word
+	.section .text.static_patch_repeat_arithmetic,"ax",@progbits
+	.globl static_patch_repeat_arithmetic
 	.p2align 2
-	.type static_patch_arithmetic_word,@function
-static_patch_arithmetic_word:
+	.type static_patch_repeat_arithmetic,@function
+static_patch_repeat_arithmetic:
 	.supervisor
-	sub $m0, $m5, $m4
-	mul $m6, $m6, $m0
-	add $m3, $m3, $m6
-	st32 $m3, $m2, $m15, 0
+	sub $m8, $m5, $m4
+.Lrepeat_arithmetic:
+	ld32 $m0, $m2, $m15, 0
+	ld32 $m1, $m2, $m15, 1
+	ld32 $m6, $m2, $m15, 2
+	// The verified progression uses wrapping 32-bit instruction-word arithmetic.
+	mul $m6, $m6, $m8
+	add $m1, $m1, $m6
+	st32 $m1, $m0, $m15, 0
+	add $m2, $m2, 12
+	add $m3, $m3, -1
+	brnz $m3, .Lrepeat_arithmetic
 	br $m9
-	.size static_patch_arithmetic_word, .-static_patch_arithmetic_word
+	.size static_patch_repeat_arithmetic, .-static_patch_repeat_arithmetic
 
 	.section .text.ipu_stack_static_patch_row,"ax",@progbits
 	// Runtime helper ABI: m2 row base, m3 offsets, m4 values, m5 word count,

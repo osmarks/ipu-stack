@@ -82,8 +82,8 @@ pub const COPY_U64_SYMBOL: &str = "copy_u64";
 pub const COPY_STRIDED_U32_SYMBOL: &str = "copy_strided_u32";
 pub const COPY_STRIDED_U64_SYMBOL: &str = "copy_strided_u64";
 pub const FILL_ZERO_U64_SYMBOL: &str = "fill_zero_u64";
-pub const PATCH_WORD_SYMBOL: &str = "ipu_stack_static_patch_word";
-pub const PATCH_ARITHMETIC_WORD_SYMBOL: &str = "static_patch_arithmetic_word";
+pub const PATCH_REPEAT_TABLES_SYMBOL: &str = "static_patch_repeat_tables";
+pub const PATCH_REPEAT_ARITHMETIC_SYMBOL: &str = "static_patch_repeat_arithmetic";
 pub const PATCH_ROW_SYMBOL: &str = "ipu_stack_static_patch_row";
 pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
 pub const PROGRAM_ADDRESS_SYMBOL: &str = "ipu_stack_static_program";
@@ -368,6 +368,12 @@ pub fn emit(
         code.add_immediate(11, 11, 8)?;
     }
     code.jump(complete)?;
+    // Read-only descriptors follow the non-returning completion branch. Keeping
+    // them with generated code avoids reserving writable exchange-row space.
+    for (position, register, words) in std::mem::take(&mut code.literals) {
+        code.words[position] = encode_setzi_m(register, code.address(options.code_address)?)?;
+        code.words.extend(words);
+    }
 
     let mut unique_exchange_rows = BTreeMap::new();
     for row in exchange_rows {
@@ -626,8 +632,10 @@ fn validate_steps(
                 }) {
                     return Err(invalid("exchange setup patch has an invalid shape"));
                 }
+                let mut patched_words = std::collections::BTreeSet::new();
                 for patch in &exchange.repeat_patches {
-                    if repeat_count.is_none_or(|count| !patch.values.valid_for_count(count))
+                    if !patched_words.insert(patch.word_offset)
+                        || repeat_count.is_none_or(|count| !patch.values.valid_for_count(count))
                         || patch.word_offset as usize >= exchange.program.words.len()
                     {
                         return Err(invalid("exchange patch has invalid shape or address"));
@@ -735,33 +743,35 @@ fn emit_exchange_patches(
     if exchange.repeat_patches.is_empty() {
         return Ok(());
     }
-    // Both patch helpers preserve these values across the entire row.
     code.ld32(4, 11, 15, 0)?;
     code.setzi(5, repeat_count)?;
+    let mut tables = Vec::new();
+    let mut arithmetic = Vec::new();
     for patch in &exchange.repeat_patches {
-        let byte_offset = patch
+        let address = patch
             .word_offset
             .checked_mul(4)
-            .ok_or_else(|| invalid("exchange patch offset overflow"))?;
-        code.setzi(
-            2,
-            exchange
-                .program
-                .address
-                .checked_add(byte_offset)
-                .ok_or_else(|| invalid("exchange patch address overflow"))?,
-        )?;
-        let helper = match &patch.values {
-            ExchangePatchValues::Table(row) => {
-                code.setzi(3, row.address)?;
-                PATCH_WORD_SYMBOL
-            }
+            .and_then(|offset| exchange.program.address.checked_add(offset))
+            .ok_or_else(|| invalid("exchange patch address overflow"))?;
+        match &patch.values {
+            ExchangePatchValues::Table(row) => tables.extend([address, row.address]),
             ExchangePatchValues::Arithmetic { initial, step } => {
-                code.setzi(3, *initial)?;
-                code.setzi(6, *step)?;
-                PATCH_ARITHMETIC_WORD_SYMBOL
+                arithmetic.extend([address, *initial, *step]);
             }
-        };
+        }
+    }
+    for (words, width, helper) in [
+        (tables, 2, PATCH_REPEAT_TABLES_SYMBOL),
+        (arithmetic, 3, PATCH_REPEAT_ARITHMETIC_SYMBOL),
+    ] {
+        if words.is_empty() {
+            continue;
+        }
+        let count =
+            u32::try_from(words.len() / width).map_err(|_| invalid("too many exchange patches"))?;
+        code.literals.push((code.words.len(), 2, words));
+        code.setzi(2, 0)?;
+        code.setzi(3, count)?;
         code.call(symbol(symbols, helper)?, 9)?;
     }
     Ok(())
@@ -1030,6 +1040,7 @@ fn invalid(message: impl Into<String>) -> CodegenError {
 #[derive(Default)]
 struct TileCode {
     words: Vec<u32>,
+    literals: Vec<(usize, u8, Vec<u32>)>,
 }
 
 impl TileCode {
@@ -1124,8 +1135,8 @@ mod tests {
             (HOST_RUN_SYMBOL.into(), 0x50008),
             (REPEAT_CALL_SYMBOL.into(), 0x5000c),
             (SAMPLE_CYCLE_SYMBOL.into(), 0x50010),
-            (PATCH_WORD_SYMBOL.into(), 0x50014),
-            (PATCH_ARITHMETIC_WORD_SYMBOL.into(), 0x50018),
+            (PATCH_REPEAT_TABLES_SYMBOL.into(), 0x50014),
+            (PATCH_REPEAT_ARITHMETIC_SYMBOL.into(), 0x50018),
             ("gemm".into(), 0x51000),
         ]
         .into_iter()
@@ -1335,6 +1346,63 @@ mod tests {
             assert_eq!(
                 *arithmetic_code_bytes.get_or_insert(generated.bytes.len()),
                 generated.bytes.len()
+            );
+            let TileStep::Repeat(repeat) = &mut program.steps[0] else {
+                unreachable!()
+            };
+            let TileStep::Exchange(exchange) = &mut repeat.body[0] else {
+                unreachable!()
+            };
+            // Mixed descriptors must survive code relocation without relocating
+            // their destinations or mutable value tables.
+            exchange.repeat_patches.push(ExchangePatch {
+                word_offset: 1,
+                values: ExchangePatchValues::Table(PlacedExchangeRow {
+                    address: 0x61000,
+                    words: values,
+                }),
+            });
+            for base in [0x52000, 0x80000] {
+                let mixed = emit(
+                    &program,
+                    &symbols(),
+                    &HostProgram::default(),
+                    &CodegenOptions {
+                        code_address: base,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let words = mixed
+                    .bytes
+                    .chunks_exact(4)
+                    .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                    .collect::<Vec<_>>();
+                let pool = words.len() - 5;
+                assert_eq!(
+                    &words[pool..],
+                    &[0x60004, 0x61000, 0x60000, 0xeffffff0, 0xffffc000]
+                );
+                for offset in [0, 2] {
+                    let pointer = encode_setzi_m(2, base + (pool + offset) as u32 * 4).unwrap();
+                    assert!(words[..pool].contains(&pointer));
+                }
+            }
+            let TileStep::Repeat(repeat) = &mut program.steps[0] else {
+                unreachable!()
+            };
+            let TileStep::Exchange(exchange) = &mut repeat.body[0] else {
+                unreachable!()
+            };
+            exchange.repeat_patches[1].word_offset = 0;
+            assert!(
+                emit(
+                    &program,
+                    &symbols(),
+                    &HostProgram::default(),
+                    &CodegenOptions::default()
+                )
+                .is_err()
             );
         }
     }

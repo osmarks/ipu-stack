@@ -1193,8 +1193,8 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
         symbols.push(WORKER_BARRIER_SYMBOL.into());
         symbols.push(crate::PATCH_ROW_SYMBOL.into());
         if !program.repeat_runs.is_empty() {
-            symbols.push(crate::PATCH_WORD_SYMBOL.into());
-            symbols.push(crate::PATCH_ARITHMETIC_WORD_SYMBOL.into());
+            symbols.push(crate::PATCH_REPEAT_TABLES_SYMBOL.into());
+            symbols.push(crate::PATCH_REPEAT_ARITHMETIC_SYMBOL.into());
         }
     }
     if config.profiling {
