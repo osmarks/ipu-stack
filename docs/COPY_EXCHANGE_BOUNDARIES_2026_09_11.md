@@ -156,3 +156,40 @@ is the essential part.
 The corrected two-layer ViT passed three resident hardware invocations with FP32
 reference checking. This also exercises the table-patching path used for two
 iterations. The updated codegen suite passes 235 tests (four ignored).
+
+The unoptimized two-layer package still has a maximum 169-word Repeat table
+patch list, near the MLP-down reduction/residual boundary. The fixed-placement
+two-exception result above therefore must not be generalized to arbitrary
+layouts or to every phase. The optimized 27-layer package needs its own audit
+of the maximum per-tile patch list, as well as an end-to-end timing comparison.
+
+### Full-model validation and base-selection correction
+
+The next optimized 27-layer run (`artifacts/copy-fusion-20260911/final27/`)
+passed all three resident invocations with the same FP32 cosine, 0.994168165.
+Its cropped runtime was 13,343,658 cycles (8.895772 ms), versus 13,291,890
+cycles (8.861260 ms) before fusion: still 0.39% slower. Exchange-table reservation
+was 40,880 bytes per tile, versus 40,824. The rendered profile is `model.html`.
+
+Repeat arithmetic patches totaled 9,707 words per profiled layer, with a maximum
+107 on one tile/phase; row-sharing patches remained 1,828 words with maximum two.
+The maximum was near the QKV reduction/bias boundary, not the fused weight
+distribution. This exposed a selection error: choosing the most common *moving*
+base ignored the stationary pattern. A few changing bias sends could cause many
+previously stationary addresses to require inverse patches.
+
+Selection now compares against zero base and requires strictly fewer patched
+address words. It uses the actual encoded sender-address groups, including paired
+restarts, rather than transfer counts. The groups are parsed once and reused for
+patch generation. This retains mixed-base relocation where it saves work without
+applying it to stationary-dominated phases. The 27-layer timing above predates
+this final selection correction and must not be presented as its performance.
+
+The corrected unoptimized two-layer run
+(`artifacts/copy-fusion-20260911/repeat2-patch-selection/`) passed all three
+resident invocations with FP32 cosine 0.997122946. Its maximum Repeat patch list
+fell from 169 words to two; total patched words fell from 8,814 to 1,665.
+Both packages have 1,256 Repeat patch helper calls in the profiled layer.
+Cropped runtime fell from 1,627,302 to 1,614,030 cycles (1.084868 to 1.076020 ms).
+This validates the final selection correction on hardware; an optimized
+27-layer timing with that correction has not yet been measured.

@@ -440,25 +440,31 @@ pub(crate) fn lower_exchanges_cached(
                 .into_iter()
                 .map(|program| program.unwrap_or_else(inactive_exchange_program))
                 .collect::<Vec<_>>();
-            let outgoing_bases = repeat_outgoing_bases(&pending, &placement.shard_addresses, program.tile_count);
+            let address_groups = programs.iter()
+                .map(|program| sender_address_instruction_groups(program))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut patch_words = vec![0; pending.len()];
+            for (groups, activity) in address_groups.iter().zip(&activities) {
+                let sends = activity.iter().filter(|a| a.kind == ExchangeActivityKind::Send);
+                if groups.len() != sends.clone().count() {
+                    return Err(ExchangeLoweringError::IncompatibleRepeatRows(
+                        "send instruction groups do not match scheduled messages",
+                    ));
+                }
+                for (group, send) in groups.iter().zip(sends) {
+                    patch_words[send.transfer as usize] = group.len();
+                }
+            }
+            let outgoing_bases = repeat_outgoing_bases(&pending, &patch_words, &placement.shard_addresses, program.tile_count);
             let repeat_patches = programs
                 .iter_mut()
                 .enumerate()
-                .map(|(tile, program)| {
+                .zip(address_groups)
+                .map(|((tile, program), address_groups)| {
                     let sends = activities[tile].iter()
                         .filter(|activity| activity.kind == ExchangeActivityKind::Send)
                         .map(|activity| &pending[activity.transfer as usize])
                         .collect::<Vec<_>>();
-                    let address_groups = sender_address_instruction_groups(program)?;
-                    if address_groups.len() != sends.len() {
-                        tracing::error!(phase = phase.id.index(), tile,
-                            groups = address_groups.len(), sends = sends.len(),
-                            row = ?program, sources = ?sends.iter().map(|send| (send.source_shard, send.source_offset)).collect::<Vec<_>>(),
-                            "exchange send groups differ from scheduled messages");
-                        return Err(ExchangeLoweringError::IncompatibleRepeatRows(
-                            "send instruction groups do not match scheduled messages",
-                        ));
-                    }
                     let mut patches = Vec::new();
                     let bases = outgoing_bases[tile].map(|(shard, offset)| {
                         repeat_inputs[&shard].iter().map(|input| {
@@ -711,45 +717,51 @@ impl PendingTransfer {
 /// All relative addresses must remain representable for every Repeat binding.
 fn repeat_outgoing_bases(
     pending: &[PendingTransfer],
+    patch_words: &[usize],
     addresses: &BTreeMap<BlockValueId, u32>,
     tile_count: u16,
 ) -> Vec<Option<(BlockValueId, u32)>> {
     let mut tiles = vec![Vec::new(); usize::from(tile_count)];
-    for transfer in pending {
-        tiles[usize::from(transfer.source)].push(transfer);
+    for (transfer, &words) in pending.iter().zip(patch_words) {
+        tiles[usize::from(transfer.source)].push((transfer, words));
     }
     tiles
         .into_iter()
         .map(|transfers| {
             let count = transfers
                 .iter()
-                .map(|t| t.source_addresses.len())
+                .map(|(t, _)| t.source_addresses.len())
                 .max()
                 .unwrap_or(1);
             let mut patterns = BTreeMap::<Vec<u32>, (usize, &PendingTransfer)>::new();
-            for &transfer in &transfers {
+            let mut stationary_words = 0;
+            for &(transfer, words) in &transfers {
                 let deltas = (0..count)
                     .map(|i| {
                         repeat_source_address(transfer, i).wrapping_sub(transfer.source_address())
                     })
                     .collect::<Vec<_>>();
                 if deltas.iter().all(|&d| d == 0) {
+                    stationary_words += words;
                     continue;
                 }
                 let entry = patterns.entry(deltas).or_insert((0, transfer));
-                entry.0 += 1;
+                entry.0 += words;
                 if transfer.source_address() < entry.1.source_address() {
                     entry.1 = transfer;
                 }
             }
             let paired = transfers
                 .iter()
-                .any(|t| t.width == ExchangeItemWidth::Paired64);
+                .any(|(t, _)| t.width == ExchangeItemWidth::Paired64);
             patterns
                 .into_values()
-                .filter(|&(_, base)| {
-                    (!paired || base.source_address().is_multiple_of(8))
-                        && transfers.iter().all(|t| {
+                .filter(|&(uses, base)| {
+                    // Zero base already leaves stationary sends unpatched.
+                    // Relocation must eliminate more words than it introduces.
+                    uses > stationary_words
+                        && (!paired || base.source_address().is_multiple_of(8))
+                        && transfers.iter().all(|(t, _)| {
                             (0..count).all(|i| {
                                 repeat_source_address(t, i) >= repeat_source_address(base, i)
                             })

@@ -992,20 +992,26 @@ fn repeat_base_selects_tile_local_displacements_with_exceptions() {
         (id(3), 0x70000),
     ]);
     let expected = vec![Some((id(0), 8)), Some((id(2), 8)), None, None];
-    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
     transfers.reverse();
-    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
     // A stationary send gets an inverse relocation patch on this tile.
     transfers.push(make(0, 3, 0x70008, 0));
-    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
+    // One stationary send can contain more encoded address words than both
+    // moving sends. Keep zero base when inverse patches would cost more.
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &[1, 1, 1, 1, 3], &addresses, 4),
+        vec![None, Some((id(2), 8)), None, None]
+    );
     transfers.pop();
     // An irregular exception is patched, not treated as sharing the base.
     transfers[2].source_addresses[2] += 4;
-    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
     // A low stationary address prevents relative encoding on tile 0 alone.
     transfers.push(make(0, 3, 0x50008, 0));
     assert_eq!(
-        repeat_outgoing_bases(&transfers, &addresses, 4),
+        repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
         vec![None, Some((id(2), 8)), None, None]
     );
 }
@@ -1026,7 +1032,7 @@ fn paired_repeat_base_preserves_encoded_alignment() {
     };
     let addresses = BTreeMap::from([(shard, 0x60000)]);
     assert_eq!(
-        repeat_outgoing_bases(&[transfer.clone()], &addresses, 2)[0],
+        repeat_outgoing_bases(&[transfer.clone()], &[1], &addresses, 2)[0],
         Some((shard, 4))
     );
     let mut paired = transfer.clone();
@@ -1034,12 +1040,12 @@ fn paired_repeat_base_preserves_encoded_alignment() {
     paired.source_offset += 4;
     paired.width = ExchangeItemWidth::Paired64;
     assert_eq!(
-        repeat_outgoing_bases(&[transfer.clone(), paired.clone()], &addresses, 2),
+        repeat_outgoing_bases(&[transfer.clone(), paired.clone()], &[1, 1], &addresses, 2),
         vec![None; 2]
     );
     transfer.source_addresses.iter_mut().for_each(|a| *a += 4);
     assert_eq!(
-        repeat_outgoing_bases(&[transfer, paired], &addresses, 2)[0],
+        repeat_outgoing_bases(&[transfer, paired], &[1, 1], &addresses, 2)[0],
         Some((shard, 8))
     );
 }
