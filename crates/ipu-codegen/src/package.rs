@@ -392,10 +392,7 @@ fn build_package_from_objects(
         ipu_exchange::EXCHANGE_WINDOW_BASE
             ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
     )?;
-    memory.reserve(
-        "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
-    )?;
+    memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
 
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
@@ -453,25 +450,6 @@ fn build_package_from_objects(
             })?)
         })
         .transpose()?;
-    let exchange_rows = (exchange_table_bytes != 0)
-        .then(|| {
-            memory.allocate(MemoryRequest {
-                name: "exchange row tables",
-                bytes: exchange_table_bytes,
-                // Executed exchange rows may not share an SRAM element with
-                // any transfer source or destination. Reserve whole elements
-                // at both ends so storage placement cannot use a prefix of the
-                // row table's first element.
-                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
-            })
-        })
-        .transpose()?;
-    let exchange_code_base = exchange_rows
-        .as_ref()
-        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
@@ -548,7 +526,8 @@ fn build_package_from_objects(
         provisional_placement,
         provisional_exchanges,
         kernel_plan,
-        exchange_code_base,
+        // Sizing only: emission uses fixed-width address materialization.
+        RUNTIME_EXECUTABLE_START,
         execution_tile_count,
         false,
     )?;
@@ -600,19 +579,54 @@ fn build_package_from_objects(
         exchange_table_bytes,
         executable_ranges = ?memory.free_ranges(RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
         "placing generated tile programs");
-    let code_address = if generated_code_bytes == 0 {
-        sizing_code_address
-    } else {
-        allocate_package_code(
-            &mut memory,
-            "generated tile programs",
-            generated_code_bytes,
-            ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-            0,
-        )?
-        .range
-        .start
-    };
+    let tile_code = (generated_code_bytes != 0)
+        .then(|| {
+            allocate_package_code(
+                &mut memory,
+                "generated tile programs",
+                generated_code_bytes,
+                8,
+                0,
+            )
+        })
+        .transpose()?;
+    let code_address = tile_code
+        .as_ref()
+        .map_or(sizing_code_address, |code| code.range.start);
+    // Code can share executable elements. Close their remaining holes only
+    // after all code is placed, before allocating writable rows/descriptors.
+    protect_executable_elements(
+        &mut memory,
+        layout
+            .segments
+            .iter()
+            .map(|segment| segment.address..segment.address + segment.size as u32)
+            .chain(
+                host_code
+                    .iter()
+                    .chain(tile_code.iter())
+                    .map(|code| code.reserved.clone()),
+            ),
+    )?;
+    let exchange_rows = (exchange_table_bytes != 0)
+        .then(|| {
+            memory.allocate(MemoryRequest {
+                name: "exchange row tables",
+                bytes: exchange_table_bytes,
+                // Executed exchange rows may not share an SRAM element with
+                // any transfer source or destination. Reserve whole elements
+                // at both ends so storage placement cannot use a prefix of the
+                // row table's first element.
+                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+            })
+        })
+        .transpose()?;
+    let exchange_code_base = exchange_rows
+        .as_ref()
+        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
     // Reserve descriptors before tensors. Their contents depend on final addresses,
     // but their undeduplicated size does not. Final host emission may still reuse
     // packets, leaving part of this reservation unused.
@@ -1287,16 +1301,21 @@ fn reserve_linked_image(
             .ok_or_else(|| invalid("linked runtime segment range overflow"))?;
         memory.reserve(name, segment.address..end)?;
     }
-    // Instruction fetch conflicts with writes to the same memory element.
-    // Linked sections may leave small holes and a partial final element; none
-    // of those bytes can be handed to tensor or host-command storage.
+    Ok(())
+}
+
+fn protect_executable_elements(
+    memory: &mut TileMemoryMap,
+    ranges: impl IntoIterator<Item = std::ops::Range<u32>>,
+) -> PackageBuildResult<()> {
+    // Instruction fetch conflicts with data access in the same element, but
+    // distinct executable objects can share it safely.
     let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-    for segment in &linked.segments {
-        let start = (segment.address / element * element).max(RUNTIME_EXECUTABLE_START);
-        let end = segment.address + u32::try_from(segment.size)?;
-        let end = end.div_ceil(element) * element;
+    for range in ranges {
+        let start = (range.start / element * element).max(RUNTIME_EXECUTABLE_START);
+        let end = range.end.div_ceil(element) * element;
         for (start, end) in memory.free_ranges(start..end) {
-            memory.reserve("linked executable memory elements", start..end)?;
+            memory.reserve("executable memory elements", start..end)?;
         }
     }
     Ok(())
@@ -1355,6 +1374,17 @@ mod tests {
         };
         let mut memory = TileMemoryMap::new();
         reserve_linked_image(&mut memory, &linked, "test code").unwrap();
+        let extra = allocate_package_code(&mut memory, "extra code", 64, 8, 0).unwrap();
+        assert_eq!(extra.range.start, base + 128);
+        protect_executable_elements(
+            &mut memory,
+            linked
+                .segments
+                .iter()
+                .map(|segment| segment.address..segment.address + segment.size as u32)
+                .chain([extra.reserved]),
+        )
+        .unwrap();
         assert_eq!(
             memory.free_ranges(base..base + 3 * element),
             vec![(base + 2 * element, base + 3 * element)]
@@ -1405,9 +1435,31 @@ mod tests {
         .unwrap();
         let tile = allocate_package_code(&mut memory, "generated tile programs", 17556, element, 0)
             .unwrap();
-        assert_eq!(host.range.start, base + element);
+        assert_eq!(host.range.start, base + 128);
         assert!(host.reserved.end <= tile.range.start);
-        assert_eq!(tile.reserved.end, base + 3 * element);
+        assert_eq!(tile.reserved.end, base + 2 * element);
+    }
+
+    #[test]
+    fn runtime_state_tail_can_hold_data_but_never_code() {
+        let mut memory = TileMemoryMap::new();
+        memory
+            .reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)
+            .unwrap();
+        let data = memory
+            .allocate(MemoryRequest {
+                name: "host descriptors",
+                bytes: 6280,
+                alignment: 4,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                end_alignment: 4,
+                guard_after: 0,
+            })
+            .unwrap();
+        assert_eq!(data.range.start, crate::IPU21_DATA_BASE);
+        assert!(data.range.end < RUNTIME_EXECUTABLE_START);
+        let code = allocate_package_code(&mut memory, "code", 128, 8, 0).unwrap();
+        assert_eq!(code.range.start, RUNTIME_EXECUTABLE_START);
     }
 
     #[test]

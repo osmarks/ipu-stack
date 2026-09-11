@@ -62,15 +62,21 @@ pub fn build_tile_program_package(
         .collect::<BTreeMap<_, _>>();
     let mut memory = TileMemoryMap::new();
     reserve_linked_image(&mut memory, &layout, "linked runtime")?;
+    // Explicit tile programs bring fixed data addresses; protect linked code
+    // before admitting those externally supplied ranges.
+    protect_executable_elements(
+        &mut memory,
+        layout
+            .segments
+            .iter()
+            .map(|segment| segment.address..segment.address + segment.size as u32),
+    )?;
     memory.reserve(
         "host exchange aperture",
         ipu_exchange::EXCHANGE_WINDOW_BASE
             ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
     )?;
-    memory.reserve(
-        "runtime state",
-        RUNTIME_STATE_BASE..RUNTIME_EXECUTABLE_START,
-    )?;
+    memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
     let mut tile_data = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
     for segment in data {
         let bytes = u32::try_from(segment.data.len())?;
