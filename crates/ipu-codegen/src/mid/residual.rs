@@ -240,6 +240,18 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
         return None;
     }
     let rank = tensor.shape.0.len();
+    let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
+    let partitions = resolved.axes()?.last()?.partitions();
+    let first = partitions.first()?;
+    let width = first.logical_end - first.start;
+    if width == 0
+        || !width.is_multiple_of(4)
+        || partitions.iter().any(|part| {
+            part.logical_end - part.start != width || part.physical_end != part.logical_end
+        })
+    {
+        return None;
+    }
     let mut stats = tensor.clone();
     stats.shape.0.pop()?;
     stats.shape.0.extend([1, 2]);
@@ -248,21 +260,7 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
         let index = axis.axis.resolve(rank).ok()?;
         axis.axis = TensorAxis::FromStart(index as u16);
         if index + 1 == rank {
-            let width = *tensor.shape.0.last()?;
             let parts = u32::from(axis.partitions);
-            if parts == 0
-                || width == 0
-                || !width.is_multiple_of(
-                    parts
-                        .checked_mul(axis.block_size)?
-                        .checked_mul(u32::from(axis.padding_groups))?,
-                )
-                || !(width / parts).is_multiple_of(4)
-                || !(width / parts).is_multiple_of(axis.padding_multiple)
-                || !(width / parts).is_multiple_of(axis.shard_padding_multiple)
-            {
-                return None;
-            }
             stats.shape.0[rank - 1] = parts;
             axis.block_size = 1;
             axis.padding_multiple = 1;
@@ -279,16 +277,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn moments_reject_unequal_grouped_partitions() {
+    fn moments_validate_resolved_grouped_partitions() {
         let mut layout = Layout::row_sharded(1);
-        layout.tiling.tile_count = 3;
+        layout.tiling.tile_count = 6;
         layout.tiling.axes.push(
-            AxisTiling::new(TensorAxis::FromEnd(1), 3, 4, Padding::Zero).with_padding_groups(3),
+            AxisTiling::new(TensorAxis::FromEnd(1), 6, 16, Padding::Zero).with_padding_groups(3),
         );
-        // Each 40-feature group assigns 16/12/12 features to its owners.
-        // The total width being divisible by three does not make them equal.
-        let tensor = TensorType::new([1, 120], Precision::F16, layout);
-        assert!(row_moments_type(&tensor).is_none());
+        for (width, valid) in [(96, true), (144, false), (192, true), (186, false)] {
+            // Width 144 has three groups of 48, each split into 32 and 16.
+            // Width 186 additionally has logical padding within each group.
+            let tensor = TensorType::new([1, width], Precision::F16, layout.clone());
+            assert_eq!(row_moments_type(&tensor).is_some(), valid);
+        }
     }
 
     #[test]
