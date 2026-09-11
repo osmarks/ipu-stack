@@ -83,3 +83,28 @@ storage and must not overwrite the partner's live data.
 
 The ordinary and paired restrictions remain unchanged. Probe snapshots, logs,
 and `paired-self-probe.patch` are under `artifacts/copy-boundaries-20260911/`.
+
+## Implementation
+
+`low/expand/exchange_grouping.rs` now checks both legal movements for a whole
+copy group: leave it after the combined exchange, or move it before the preceding
+exchange. The check indexes relevant allocation roots, distinguishes reads from
+writes, and compares actual byte spans with affine copy rows. It does not expand
+strided copies into word operations. Copies retain their relative order; kernels,
+checkpoints, Repeat boundaries and the existing operator-provenance boundary
+remain barriers to this transformation.
+
+Merged transfer lists retain their original order. The existing physical
+scheduler supplies byte-range dependencies, including receive-then-forward
+chains. Transfer coalescing now checks every Repeat source binding before joining
+contiguous messages, so it cannot erase a loopback memory dependency.
+
+The canonical 27-layer graph drops from 92 exchange phases to 86, with unchanged
+local-copy and logical-transfer counts (50,051 and 621,754). Its new expansion
+measurement is 6.46 seconds; this was not an isolated compiler-speed benchmark.
+Codegen validation passed 234 tests (four ignored), plus focused copy-motion
+tests after extending shared-read coverage. The workspace/all-targets check passed.
+
+A B1024 hardware replay passed a six-transfer receive-then-forward chain over
+four tiles, checking all 8,192 touched words. The captured inputs and log are
+`artifacts/copy-fusion-20260911/forwarding.json` and `forwarding.log`.

@@ -17,6 +17,9 @@ impl TileGraphBuilder {
             return Ok(false);
         };
         let between = &region.operations[boundary + 1..];
+        if between.is_empty() {
+            return Ok(true);
+        }
         // Preserve compute, checkpoints and Repeat boundaries. Moving the whole
         // copy group preserves dependencies between copies as well.
         if !between
