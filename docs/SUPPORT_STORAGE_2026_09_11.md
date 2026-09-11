@@ -193,3 +193,40 @@ Rendered profiles:
 and workspace all-target checks. Full-size two-layer profiles separately capture
 the pre-sharing, shared-worker and bulk-patch binaries. Small three-layer runs
 exercise arithmetic patching; the two-layer runs exercise value tables.
+
+## Remaining 27-layer capacity (placement-only probe)
+
+A temporary diagnostic replayed the same final low program through the normal
+allocator, extending the standard range `475136..524288` downwards in 4 KiB
+increments. All other ranges, layouts, tensor lifetimes, alignment/separation
+constraints, and allocator strategies were unchanged. Hypothetical placements
+were discarded: the diagnostic returned the original failure and never loaded
+an image with tensors overlapping real support storage. Production sources and
+the CLI binary were restored afterwards.
+
+- Extra 0–12 KiB: still fails on an 82944-byte weight sequence.
+- Extra 16–48 KiB: gets further but fails on a 27648-byte sequence.
+- Extra **52 KiB (53248 bytes): every tile places successfully**.
+
+This brackets the first success on the tested grid between 48 and 52 KiB, not
+an intrinsic information-theoretic memory deficit. It suggests a practical
+budget of roughly **64 KiB / four 16 KiB elements** for unchanged layouts and
+this allocator. At +52 KiB, tensor capacity is 534400 bytes per tile. Exchange
+rescheduling at the hypothetical addresses and a complete package build were
+not tested, so this is an estimate of the remaining placement requirement.
+
+The current linked span plus host/generated program storage is about 42 KiB,
+occupying three standard elements. Small further code reductions alone cannot
+bridge the measured gap. Better placement, less persistent/scratch storage, or
+combined code/exchange storage reductions are needed.
+
+The encoder baseline already uses FlashAttention with 64-key blocks (eleven
+full blocks plus a 25-key tail), with online merges and FP32 intermediate state.
+MAP uses a single 768-wide padded key block. This predates the code-sharing
+changes. The old optimized September 9 ViT used full materialized attention;
+the current baseline ranks candidates by local peak memory, then exchange row
+storage, then cycles. The comparison runs disabled local optimization with
+`--optimization-steps 0`.
+
+Artifacts: `artifacts/baseline-local-planner/capacity-probe-full27/run.log`,
+`probe.patch`, and `memory/`. The patch is diagnostic-only and is not applied.
