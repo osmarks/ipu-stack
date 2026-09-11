@@ -12,6 +12,7 @@ impl Builder {
         materialized: bool,
         query_key_grid: Option<ProductGrid>,
         probability_value_grid: Option<ProductGrid>,
+        fp8_scales: [Option<i8>; 2],
     ) -> Option<MidValueId> {
         if !materialized && (query_key_grid.is_some() || probability_value_grid.is_some()) {
             return None;
@@ -149,6 +150,7 @@ impl Builder {
                         ..qk_axes
                     },
                     grid,
+                    fp8_scales[0],
                 )?
             } else {
                 self.compute(
@@ -191,6 +193,7 @@ impl Builder {
                         ..pv_axes
                     },
                     grid,
+                    fp8_scales[1],
                 )?
             } else {
                 self.compute(

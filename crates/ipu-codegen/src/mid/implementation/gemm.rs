@@ -230,7 +230,7 @@ impl Builder {
 }
 
 impl Builder {
-    /// A batched F16 product with independent row/column/K ownership, followed by
+    /// A batched product with independent row/column/K ownership, followed by
     /// redistribution (or a sum of explicit partials) into its consumer layout.
     pub(super) fn distributed_product(
         &mut self,
@@ -239,6 +239,7 @@ impl Builder {
         output: &TensorType,
         axes: ProductAxes,
         grid: ProductGrid,
+        fp8_scale: Option<i8>,
     ) -> Option<MidValueId> {
         let mut l = self.tensor(left).clone();
         let mut r = self.tensor(right).clone();
@@ -285,7 +286,11 @@ impl Builder {
 
         r.shape.0[ri] = inner;
         r.shape.0[rc] = columns;
-        let inner_width = inner.div_ceil(16).div_ceil(u32::from(grid.inner)) * 16;
+        let multiply = fp8_scale.map_or(Precision::F16, |scale_exponent| Precision::F8F143 {
+            scale_exponent,
+        });
+        let grain = if fp8_scale.is_some() { 32 } else { 16 };
+        let inner_width = inner.div_ceil(grain).div_ceil(u32::from(grid.inner)) * grain;
         let column_width = columns.div_ceil(16).div_ceil(u32::from(grid.columns)) * 16;
         // The last K group must use the same coefficient block shape as the
         // others. Keep the left padding addressable (softmax stores zero weights
@@ -323,6 +328,8 @@ impl Builder {
         r.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
         let l = self.copy(left, l, vec![]);
         let r = self.copy(right, r, vec![]);
+        let l = self.cast(l, multiply);
+        let r = self.cast(r, multiply);
         let mut product = output.clone();
         product.shape.0[2] = columns;
         product.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
@@ -347,8 +354,12 @@ impl Builder {
             vec![l, r],
             product,
             TileKernelSpec::Gemm {
-                multiply: Precision::F16,
-                accumulate: AccumulationPrecision::F32,
+                multiply,
+                accumulate: if fp8_scale.is_some() {
+                    AccumulationPrecision::F16
+                } else {
+                    AccumulationPrecision::F32
+                },
                 mode: GemmKernelMode::Initialize,
                 weights: GemmWeightLoad::Interleaved,
                 inner_block: inner_width,

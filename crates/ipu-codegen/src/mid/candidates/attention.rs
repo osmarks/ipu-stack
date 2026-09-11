@@ -10,7 +10,19 @@ pub(super) fn product_variants(
     let OperatorDispatch::Attention { materialized, .. } = base.dispatch else {
         return vec![base];
     };
+    let [qk_fp8, pv_fp8] = config.attention_fp8_scales;
+    if (!materialized && (qk_fp8.is_some() || pv_fp8.is_some()))
+        || [qk_fp8, pv_fp8]
+            .into_iter()
+            .flatten()
+            .any(|s| !(-16..=15).contains(&s))
+    {
+        return vec![];
+    }
     let policy = config.attention_products;
+    if policy == AttentionProducts::SharedRows && (qk_fp8.is_some() || pv_fp8.is_some()) {
+        return vec![];
+    }
     if !materialized || policy == AttentionProducts::SharedRows {
         return if matches!(
             policy,
@@ -66,6 +78,12 @@ pub(super) fn product_variants(
         AttentionProducts::Automatic | AttentionProducts::QkOnly
     ) {
         pv.push(None);
+    }
+    if qk_fp8.is_some() {
+        qk.retain(Option::is_some);
+    }
+    if pv_fp8.is_some() {
+        pv.retain(Option::is_some);
     }
     let mut result = Vec::new();
     for &query_key in &qk {

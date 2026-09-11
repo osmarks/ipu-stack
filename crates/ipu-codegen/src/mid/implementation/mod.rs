@@ -73,6 +73,7 @@ pub(crate) fn implement(
             *distribution,
         )?,
         OperatorDispatch::Attention {
+            fp8_scales,
             query_key,
             probability_value,
             materialized,
@@ -87,6 +88,7 @@ pub(crate) fn implement(
             *materialized,
             *query_key,
             *probability_value,
+            *fp8_scales,
         )?,
     };
     b.program.outputs = vec![result];

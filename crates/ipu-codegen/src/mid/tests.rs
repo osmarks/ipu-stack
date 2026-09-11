@@ -1898,6 +1898,34 @@ fn automatic_repeat_state_keeps_an_unreplicated_boundary() {
 }
 
 #[test]
+fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
+    for scales in [[Some(-4), None], [None, Some(-4)], [Some(-4); 2]] {
+        let mut graph = ComputeGraph::new();
+        let q = graph.host_input("q", [4, 17, 72]).unwrap();
+        let k = graph.host_input("k", [4, 73, 72]).unwrap();
+        let v = graph.host_input("v", [4, 73, 72]).unwrap();
+        let result = graph.flash_attention(q, k, v).unwrap();
+        graph.set_outputs([result]).unwrap();
+        let mut config = PipelineConfig::new(64)
+            .with_attention_products(AttentionProducts::Independent)
+            .with_automatic_input(q, Precision::F16)
+            .with_automatic_input(k, Precision::F16)
+            .with_automatic_input(v, Precision::F16);
+        config.attention_fp8_scales = scales;
+        let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
+        let tiled = crate::low::lower_to_tiles(&tiles, false);
+        let kernels = crate::KernelBuildPlan::from_program(&tiled).unwrap();
+        assert!(
+            kernels
+                .compilations
+                .iter()
+                .any(|c| c.name.starts_with("gemm_f8"))
+        );
+    }
+}
+
+#[test]
 fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
     for (strategy, products) in [
         (AttentionStrategy::Flash, AttentionProducts::SharedRows),

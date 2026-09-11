@@ -307,6 +307,7 @@ pub(super) fn plans(
                         accumulate: AccumulationPrecision::F32,
                     },
                     dispatch: OperatorDispatch::Attention {
+                        fp8_scales: config.attention_fp8_scales,
                         query_key: None,
                         probability_value: None,
                         materialized,
@@ -696,6 +697,14 @@ pub(super) fn plans(
                 plans.push(plan);
             }
         }
+    }
+    if matches!(operation.kind, OperationKind::FlashAttention(_))
+        && config.attention_fp8_scales.iter().any(Option::is_some)
+    {
+        // An explicitly requested arithmetic experiment must not silently fall
+        // back to the monolithic F16 implementation.
+        plans.retain(|plan| matches!(plan.dispatch,
+            OperatorDispatch::Attention { fp8_scales, .. } if fp8_scales == config.attention_fp8_scales));
     }
     plans.retain(|plan| {
         (config.gemm_output_packing != GemmOutputPacking::Packed

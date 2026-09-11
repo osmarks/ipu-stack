@@ -147,6 +147,8 @@ pub struct PipelineConfig {
     /// benchmarking; automatic planning retains both alternatives.
     pub attention_strategy: AttentionStrategy,
     pub attention_products: AttentionProducts,
+    /// Experimental materialized QK/PV operand scales; None retains F16/F32.
+    pub attention_fp8_scales: [Option<i8>; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -209,6 +211,7 @@ impl PipelineConfig {
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,
             attention_strategy: AttentionStrategy::Automatic,
             attention_products: AttentionProducts::Automatic,
+            attention_fp8_scales: [None; 2],
         }
     }
 

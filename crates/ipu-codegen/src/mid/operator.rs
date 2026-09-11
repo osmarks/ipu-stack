@@ -143,6 +143,7 @@ pub enum OperatorDispatch {
         distribution: GemmDistribution,
     },
     Attention {
+        fp8_scales: [Option<i8>; 2],
         query_key: Option<ProductGrid>,
         probability_value: Option<ProductGrid>,
         /// Full-key materialization or online softmax over successive blocks.

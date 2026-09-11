@@ -187,6 +187,12 @@ struct Arguments {
     /// Compare shared row ownership with independent materialized QK/PV grids.
     #[arg(long, value_enum, default_value = "auto")]
     attention_products: AttentionProductMode,
+    /// Experimental materialized QK operand scale (native F143/F16 accumulation).
+    #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-16..=15))]
+    attention_qk_fp8_scale: Option<i8>,
+    /// Experimental materialized PV operand scale (softmax remains F16/F32).
+    #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-16..=15))]
+    attention_pv_fp8_scale: Option<i8>,
     /// Compare native and packed GEMM stores, or force one for diagnostics.
     #[arg(long, value_parser = ["auto", "native", "packed"], default_value = "auto")]
     gemm_output_packing: String,
@@ -713,6 +719,10 @@ fn main() -> Result<()> {
     pipeline = pipeline
         .with_attention_strategy(arguments.attention_strategy.into())
         .with_attention_products(arguments.attention_products.into());
+    pipeline.attention_fp8_scales = [
+        arguments.attention_qk_fp8_scale,
+        arguments.attention_pv_fp8_scale,
+    ];
     for constraint in &arguments.gemm_plan_constraint {
         pipeline = pipeline.with_gemm_plan_constraint(*constraint);
     }
