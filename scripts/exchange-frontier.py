@@ -104,7 +104,8 @@ def render(rows, output):
             ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
             ax.set_xlabel(label)
             ax.set_ylabel('Scheduled cycles after barrier')
-            ax.set_title(f"Phase {phase}: {points[0]['transfers']:,} transfers")
+            scope = f" · {points[0]['scope']}" if points[0].get('scope') else ''
+            ax.set_title(f"Phase {phase}{scope}: {points[0]['transfers']:,} transfers")
             ax.grid(True, linewidth=.3, color='#bbbbbb')
         for ax in list(axes.flat)[len(phases):]:
             ax.remove()
