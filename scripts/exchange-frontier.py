@@ -19,6 +19,7 @@ def render(rows, output):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FixedLocator, StrMethodFormatter
     plt.rcParams.update({'font.family': 'serif', 'font.size': 9, 'svg.fonttype': 'none'})
     phases = sorted({r['phase'] for r in rows})
     colors = {'priority': '#555555', 'stream': '#176ba0', 'balanced': '#c34f18'}
@@ -29,16 +30,36 @@ def render(rows, output):
             points = [r for r in rows if r['phase'] == phase]
             best = frontier(points, storage)
             for family, color in colors.items():
-                group = [r for r in points if r['family'] == family]
-                ax.scatter([r[storage] for r in group], [r['cycles'] for r in group], s=25,
-                           color=color, label=family, alpha=.8)
+                for widths, marker in [('selected', 'o'), ('ordinary', 'x')]:
+                    group = [r for r in points if r['family'] == family
+                             and r.get('widths', 'selected') == widths]
+                    if group:
+                        ax.scatter([r[storage] for r in group], [r['cycles'] for r in group], s=25,
+                                   color=color, label=family, marker=marker, alpha=.8)
             unique = sorted({(r[storage], r['cycles']) for r in best})
             ax.plot([x for x, y in unique], [y for x, y in unique], color='black', linewidth=.9)
             for x, y in unique:
                 matches = [r['configuration'] for r in best if (r[storage], r['cycles']) == (x, y)]
-                names = '/'.join(matches[:2]) + (f' (+{len(matches)-2})' if len(matches)>2 else '')
-                ax.annotate(names, (x, y), xytext=(4, 5), textcoords='offset points', fontsize=6)
+                name = matches[0]
+                for source, target in [('remaining-directional', 'RD'), ('remaining-combined', 'RC'),
+                                       ('automatic', 'auto'), ('directional', 'D'), ('combined', 'C'),
+                                       ('balanced-', 'B'), ('stream-', 'S'), ('-ordinary', 'u')]:
+                    name = name.replace(source, target)
+                name += f' (+{len(matches)-1})' if len(matches)>1 else ''
+                right = x == unique[-1][0] and len(unique)>1
+                ax.annotate(name, (x, y), xytext=(-4 if right else 4, 5),
+                            ha='right' if right else 'left', textcoords='offset points', fontsize=7)
             ax.set_xscale('log', base=2)
+            xs = [x for x, y in unique]
+            ys = [y for x, y in unique]
+            ax.set_xlim(min(xs)/1.07, max(xs)*1.07)
+            margin = max(max(ys)-min(ys), max(ys)*.1)*.15
+            ax.set_ylim(min(ys)-margin, max(ys)+margin)
+            ticks = [xs[0]] if len(xs)==1 else sorted({
+                round(min(xs)**(1-i/4)*max(xs)**(i/4)) for i in range(5)})
+            ax.xaxis.set_major_locator(FixedLocator(ticks))
+            ax.xaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
+            ax.yaxis.set_major_formatter(StrMethodFormatter('{x:,.0f}'))
             ax.set_xlabel(label)
             ax.set_ylabel('Scheduled cycles after barrier')
             ax.set_title(f"Phase {phase}: {points[0]['transfers']:,} transfers")
@@ -49,6 +70,7 @@ def render(rows, output):
         fig.tight_layout()
         fig.savefig(output / f'{storage}.svg')
         fig.savefig(output / f'{storage}.pdf')
+        fig.savefig(output / f'{storage}.png', dpi=100)
         plt.close(fig)
     chosen = []
     for phase in phases:
@@ -69,7 +91,9 @@ def render(rows, output):
 <style>body{max-width:1400px;margin:2em auto;padding:0 1em;font-family:Georgia,serif;color:#111;background:white}img{width:100%}a{color:inherit}</style>
 <h1>Exchange scheduling frontiers</h1>
 <p>Fixed captured transfers and addresses. Scheduled cycles exclude waiting for the barrier.
-The black line joins nondominated points. <a href="results.csv">All measurements</a> ·
+Axes focus on the nondominated frontier; dominated points outside this range are omitted.
+Crosses mark ordinary-width alternatives. S: streams; B: balanced streams; C/D: combined/directional priority; R: remaining-work priority.
+A suffix u marks ordinary transfers, and (+N) counts equivalent configurations. <a href="results.csv">All measurements</a> ·
 <a href="frontier.csv">Frontier points</a> · <a href="manifest.json">Commands</a></p>
 <img src="maximum_row_bytes.svg" alt="Cycles versus maximum row storage per tile">
 <img src="total_row_bytes.svg" alt="Cycles versus total row storage">

@@ -7,6 +7,8 @@ use super::*;
 /// no tensor bindings: callers supply initialized tile data and inspect it
 /// through driver diagnostics. A zero-payload `run` rendezvous starts execution
 /// after loading, so breakpoints in the program cannot race the loader.
+/// Initial values in the host aperture are staged and copied in after this
+/// rendezvous, before the supplied device steps execute.
 pub fn build_tile_program_package(
     programs: &[TileProgram],
     data: &[TileProgramData],
@@ -35,6 +37,8 @@ pub fn build_tile_program_package(
         ));
     }
 
+    let mut programs = programs.to_vec();
+    let (mut data, aperture) = split_aperture_data(data)?;
     let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
     let objects = vec![fs::read(runtime_artifact.object)?];
     let kernels = KernelBuildPlan::default();
@@ -44,8 +48,11 @@ pub fn build_tile_program_package(
         REPEAT_CALL_SYMBOL.into(),
         WORKER_BARRIER_SYMBOL.into(),
     ];
-    for program in programs {
+    for program in &programs {
         collect_compute_symbols(&mut retained_runtime, &program.steps);
+    }
+    if !aperture.is_empty() {
+        retained_runtime.push(crate::COPY_U32_SYMBOL.into());
     }
     retained_runtime.sort_unstable();
     retained_runtime.dedup();
@@ -78,7 +85,7 @@ pub fn build_tile_program_package(
     )?;
     memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
     let mut tile_data = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
-    for segment in data {
+    for segment in &data {
         let bytes = u32::try_from(segment.data.len())?;
         let end = segment
             .address
@@ -87,7 +94,7 @@ pub fn build_tile_program_package(
         tile_data[usize::from(segment.tile)].push((segment.address, end));
     }
     let mut tile_rows = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
-    for program in programs {
+    for program in &programs {
         let mut rows = BTreeMap::new();
         collect_exchange_rows(&mut rows, &program.steps)?;
         tile_rows[usize::from(program.tile)].extend(rows);
@@ -103,6 +110,48 @@ pub fn build_tile_program_package(
                 )));
             }
         }
+    }
+    // The host handshake overwrites its aperture. Stage requested initial
+    // contents elsewhere and copy them in at entry to the device program.
+    // Stage independently per tile; a common hole is not required. Region 1
+    // cannot hold executable code and its reservations precede host metadata.
+    for mut segment in aperture {
+        let tile = usize::from(segment.tile);
+        let mut scratch = TileMemoryMap::new();
+        for (start, end) in crate::memory::merge_ranges(
+            tile_data[tile]
+                .iter()
+                .chain(&tile_rows[tile])
+                .copied()
+                .collect(),
+        ) {
+            scratch.reserve("replay data and rows", start..end)?;
+        }
+        let bytes = u32::try_from(segment.data.len())?;
+        let staging = scratch
+            .allocate(MemoryRequest {
+                name: "host aperture initial contents",
+                bytes,
+                alignment: 4,
+                bounds: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
+                    ..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                end_alignment: 4,
+                guard_after: 0,
+            })?
+            .range;
+        programs[tile].steps.insert(
+            0,
+            crate::TileStep::Compute(crate::ComputeStep {
+                symbol: crate::COPY_U32_SYMBOL.into(),
+                output_address: crate::TileAddress::Absolute(segment.address),
+                input_addresses: vec![crate::TileAddress::Absolute(staging.start)],
+                arguments: vec![bytes / 4],
+                profile: Default::default(),
+            }),
+        );
+        segment.address = staging.start;
+        tile_data[tile].push((staging.start, staging.end));
+        data.push(segment);
     }
     // Generated and linked code use common addresses on every tile, so choose
     // them against the union of tile-local data and row ranges. Data on one
@@ -229,7 +278,7 @@ pub fn build_tile_program_package(
         .collect::<PackageBuildResult<Vec<_>>>()?;
 
     let mut segments = vec![Vec::new(); usize::from(execution_tiles)];
-    for segment in data {
+    for segment in &data {
         let physical = topology.physical(segment.tile)?;
         segments[usize::from(physical)].push(Segment {
             address: segment.address,
@@ -335,5 +384,106 @@ fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep])
         if profile.before.is_some() || profile.after.is_some() {
             symbols.push(SAMPLE_CYCLE_SYMBOL.into());
         }
+    }
+}
+
+/// Split loader data from initial values that must be installed after the host
+/// handshake. Coalesce aperture fragments per tile, preserving byte alignment
+/// and insertion order; the runtime helper copies complete words.
+fn split_aperture_data(
+    data: &[crate::TileProgramData],
+) -> PackageBuildResult<(Vec<crate::TileProgramData>, Vec<crate::TileProgramData>)> {
+    let start = ipu_exchange::EXCHANGE_WINDOW_BASE;
+    let end = start + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+    let mut loader = Vec::new();
+    let mut aperture = BTreeMap::<u16, Vec<crate::TileProgramData>>::new();
+    for segment in data {
+        let limit = segment
+            .address
+            .checked_add(u32::try_from(segment.data.len())?)
+            .ok_or_else(|| invalid("tile data range overflow"))?;
+        for (from, to, deferred) in [
+            (segment.address, limit.min(start), false),
+            (segment.address.max(start), limit.min(end), true),
+            (segment.address.max(end), limit, false),
+        ] {
+            if from >= to {
+                continue;
+            }
+            let part = crate::TileProgramData {
+                tile: segment.tile,
+                address: from,
+                data: segment.data
+                    [(from - segment.address) as usize..(to - segment.address) as usize]
+                    .to_vec(),
+            };
+            if deferred {
+                aperture.entry(segment.tile).or_default().push(part);
+            } else {
+                loader.push(part);
+            }
+        }
+    }
+    let aperture = aperture
+        .into_iter()
+        .map(|(tile, parts)| {
+            let start = parts.iter().map(|p| p.address).min().unwrap() & !3;
+            let end = (parts
+                .iter()
+                .map(|p| p.address + p.data.len() as u32)
+                .max()
+                .unwrap()
+                + 3)
+                & !3;
+            let mut data = vec![0; (end - start) as usize];
+            for part in parts {
+                let offset = (part.address - start) as usize;
+                data[offset..offset + part.data.len()].copy_from_slice(&part.data);
+            }
+            crate::TileProgramData {
+                tile,
+                address: start,
+                data,
+            }
+        })
+        .collect();
+    Ok((loader, aperture))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn aperture_initial_values_are_word_aligned_and_kept_out_of_loader_data() {
+        let start = ipu_exchange::EXCHANGE_WINDOW_BASE;
+        let end = start + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+        let input = vec![
+            crate::TileProgramData {
+                tile: 0,
+                address: start - 2,
+                data: vec![1, 2, 3, 4, 5],
+            },
+            crate::TileProgramData {
+                tile: 0,
+                address: start + 6,
+                data: vec![6],
+            },
+            crate::TileProgramData {
+                tile: 1,
+                address: end - 1,
+                data: vec![7, 8],
+            },
+        ];
+        let (loader, staged) = split_aperture_data(&input).unwrap();
+        assert_eq!(loader.len(), 2);
+        assert_eq!(loader[0].address, start - 2);
+        assert_eq!(loader[0].data, [1, 2]);
+        assert_eq!(loader[1].address, end);
+        assert_eq!(loader[1].data, [8]);
+        assert_eq!(staged.len(), 2);
+        assert_eq!(staged[0].address, start);
+        assert_eq!(staged[0].data, [3, 4, 5, 0, 0, 0, 6, 0]);
+        assert_eq!(staged[1].address, end - 4);
+        assert_eq!(staged[1].data, [0, 0, 0, 7]);
     }
 }
