@@ -316,7 +316,19 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             .iter()
             .map(|shard| (shard.id, 0x60000 + shard.id.index() * 0x10000))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(plan.compilations.len(), 1);
+        let specialization = plan
+            .compilations
+            .iter()
+            .find(|unit| !unit.retained_symbols.is_empty())
+            .unwrap();
+        assert_eq!(plan.compilations.len(), 2);
+        assert_eq!(
+            plan.compilations
+                .iter()
+                .filter(|unit| unit.name.ends_with("_dispatch"))
+                .count(),
+            1
+        );
         let planned_rows = plan
             .symbols
             .keys()
@@ -326,18 +338,18 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             })
             .collect::<Vec<_>>();
         assert!(
-            plan.compilations[0]
+            specialization
                 .flags
                 .iter()
                 .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={}", planned_rows[0]))
         );
         assert!(
-            plan.compilations[0]
+            specialization
                 .flags
                 .iter()
                 .any(|flag| flag == "-DGEMM_SINGLE_ROWS=1")
         );
-        assert_eq!(plan.compilations[0].retained_symbols.len(), 1);
+        assert_eq!(specialization.retained_symbols.len(), 1);
         assert!(
             plan.retained_symbols()
                 .all(|symbol| !symbol.contains("accumulate"))

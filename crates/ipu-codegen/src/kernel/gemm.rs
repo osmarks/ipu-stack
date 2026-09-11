@@ -49,6 +49,27 @@ impl KernelBuildPlan {
         } else {
             ""
         };
+        let dispatch = format!("gemm_{prefix}{weight_suffix}_dispatch");
+        if precision != Precision::F32
+            && !self.compilations.iter().any(|unit| unit.name == dispatch)
+        {
+            let mut flags = vec![
+                "-DGEMM_DISPATCH_ONLY=1".into(),
+                format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
+            ];
+            if matches!(precision, Precision::F8F143 { .. }) {
+                flags.push("-DGEMM_NATIVE_FP8=1".into());
+            }
+            if weights == GemmWeightLoad::Interleaved {
+                flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
+            }
+            self.compilations.push(KernelCompilation {
+                source,
+                name: dispatch.clone(),
+                flags,
+                retained_symbols: vec![],
+            });
+        }
         let weight_suffix = if output_group == 0 {
             weight_suffix.to_owned()
         } else {
@@ -110,6 +131,7 @@ impl KernelBuildPlan {
             }
             let single_rows = pair.len() == 1;
             let mut flags = vec![
+                format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
                 format!("-DGEMM_OUTPUT_GROUP={output_group}"),
                 format!(
                     "-DGEMM_OUTPUT_GROUP_SHIFT={}",

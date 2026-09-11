@@ -115,3 +115,13 @@ bulk descriptors plus a shared patch loop, trading some data bytes for fewer
 instructions. That is separate from the already implemented bulk cross-phase
 row patching. Per-tile kernel linking/reservations offer another opportunity but
 require more changes to package address planning than sharing GEMM bodies.
+
+## Shared GEMM dispatch
+
+F16/F8 entry points now populate a small frame and call one supervisor per
+precision/coefficient-load mode. Row, column and inner extents no longer duplicate
+the coefficient feed and dispatch loop. Worker inner loops are unchanged.
+The full-size one-layer compact run passes with the same 0.077148 maximum error.
+Linked end falls 403576 → 399080 (4496 bytes); runtime rises 1011180 → 1012860
+cycles, **0.166%**. This does not cross another executable-element boundary.
+Profile: `artifacts/baseline-local-planner/shared-supervisor-full1/model.ipuprof`.

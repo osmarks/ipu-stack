@@ -186,24 +186,15 @@
 #endif
 	.endm
 
-	// Tile-kernel ABI for every GEMM_SUPERVISOR entry:
-	//   m2 output, m3 packed left, m4 packed right, m10 return address.
-	// The symbol fixes initialize/accumulate mode and row specialization; the
-	// inner block is 64 and the output-column block is a compile-time multiple
-	// of 16. Native F8 builds additionally
-	// consume the tensor-wide power-of-two scale exponent in m5.
-	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_output_worker, retained_inner_worker
-	.section .text.\name,"ax",@progbits
-	.globl \name
+// All F16/F8 specializations use this frame. Slots 9..11 are reserved for
+// worker row parameters; m4/m5 still carry coefficients and the FP8 scale.
+#ifdef GEMM_DISPATCH_ONLY
+	.section .text.GEMM_DISPATCH_SYMBOL,"ax",@progbits
+	.globl GEMM_DISPATCH_SYMBOL
 	.p2align 2
-	.type \name,@function
-\name:
+	.type GEMM_DISPATCH_SYMBOL,@function
+GEMM_DISPATCH_SYMBOL:
 	.supervisor
-	add $m11, $m11, -32
-	st32 $m2, $m11, $m15, 0
-	st32 $m3, $m11, $m15, 1
-	setzi $m8, \initial
-	st32 $m8, $m11, $m15, 5
 	get $m8, $FP_ICTL
 	st32 $m8, $m11, $m15, 6
 #if GEMM_STOCHASTIC_ROUNDING
@@ -224,10 +215,10 @@
 	add $m4, $m4, GEMM_RIGHT_BYTE_OFFSET
 	put $CCCSLOAD, $m4
 	zero $m6
-	setzi $m0, \worker
-.Lcolumn_group_\@:
+	ld32 $m0, $m11, $m15, 4
+.Lcolumn_group_dispatch:
 	zero $m7
-.Linner_group_\@:
+.Linner_group_dispatch:
 	// Workers retain their activation and output state between invocations.
 	// Synchronize before replacing the shared AMP coefficients.
 	sync SYNC_COMPUTE_SET
@@ -236,21 +227,47 @@
 	// Arithmetic below is independent of worker state and overlaps the worker
 	// critical path. The next loop-head sync protects the following state and
 	// weight updates.
-	setzi $m0, \retained_inner_worker
+	ld32 $m0, $m11, $m15, 3
 	add $m7, $m7, 1
-	setzi $m8, INNER_GROUPS
+	ld32 $m8, $m11, $m15, 7
 	cmpult $m8, $m7, $m8
-	brnz $m8, .Linner_group_\@
-	setzi $m0, \retained_output_worker
+	brnz $m8, .Linner_group_dispatch
+	ld32 $m0, $m11, $m15, 2
 	add $m6, $m6, 1
-	setzi $m8, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
+	ld32 $m8, $m11, $m15, 8
 	cmpult $m8, $m6, $m8
-	brnz $m8, .Lcolumn_group_\@
+	brnz $m8, .Lcolumn_group_dispatch
 	sync SYNC_COMPUTE_SET
 	ld32 $m8, $m11, $m15, 6
 	put $FP_ICTL, $m8
-	add $m11, $m11, 32
+	add $m11, $m11, 48
 	br $m10
+	.size GEMM_DISPATCH_SYMBOL, .-GEMM_DISPATCH_SYMBOL
+#else
+	// ABI: m2 output, m3 left, m4 right, m5 FP8 scale, m10 return.
+	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_output_worker, retained_inner_worker
+	.section .text.\name,"ax",@progbits
+	.globl \name
+	.p2align 2
+	.type \name,@function
+\name:
+	.supervisor
+	add $m11, $m11, -48
+	st32 $m2, $m11, $m15, 0
+	st32 $m3, $m11, $m15, 1
+	setzi $m0, \retained_output_worker
+	st32 $m0, $m11, $m15, 2
+	setzi $m0, \retained_inner_worker
+	st32 $m0, $m11, $m15, 3
+	setzi $m0, \worker
+	st32 $m0, $m11, $m15, 4
+	setzi $m0, \initial
+	st32 $m0, $m11, $m15, 5
+	setzi $m0, INNER_GROUPS
+	st32 $m0, $m11, $m15, 7
+	setzi $m0, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
+	st32 $m0, $m11, $m15, 8
+	bri GEMM_DISPATCH_SYMBOL
 	.size \name, .-\name
 	.endm
 
@@ -499,3 +516,5 @@
 #ifndef GEMM_SINGLE_ROWS
 	GEMM_WORKER .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner, GEMM_LARGE_ROWS
 #endif
+
+#endif // GEMM_DISPATCH_ONLY
