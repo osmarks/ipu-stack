@@ -172,14 +172,16 @@ fn canonical(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
         .min(rows)
         .max(rows.div_ceil(u32::from(tiles)));
     let owners = rows.div_ceil(block) as u16;
+    // Boundaries do not require blocked rows. Balance whole logical rows over
+    // these owners without introducing tail padding that needs separate clears.
     Layout::row_major(TensorTiling {
         tile_count: owners,
         replicas: 1,
         axes: vec![AxisTiling::new(
             TensorAxis::FromEnd(2),
             owners,
-            block,
-            Padding::Zero,
+            1,
+            Padding::Reject,
         )],
     })
 }
@@ -627,6 +629,26 @@ mod tests {
         assert_eq!(home.tile_offset, argument.tile_offset);
         let low = crate::low::expand::expand_tiles(&baseline.program, false).unwrap();
         crate::place(&crate::lower_to_tiles(&low, false)).unwrap();
+    }
+
+    #[test]
+    fn canonical_activation_boundaries_do_not_pad_tail_rows() {
+        for precision in [Precision::F16, Precision::F8F143 { scale_exponent: -4 }] {
+            for shape in [[1, 729, 1152], [2, 729, 3456], [8, 729, 4304]] {
+                let shape = TensorShape(shape.to_vec());
+                let layout = canonical(&shape, precision, 1472);
+                assert_eq!(layout.padded_shape(&shape).unwrap(), shape);
+                let resolved = layout.resolve(&shape).unwrap();
+                assert!(!resolved.has_empty_shards());
+                for (_, extents) in resolved.shard_extents().unwrap() {
+                    assert!(
+                        extents
+                            .iter()
+                            .all(|axis| axis.logical_end == axis.physical_end)
+                    );
+                }
+            }
+        }
     }
 
     #[test]
