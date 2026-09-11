@@ -704,3 +704,32 @@ must not be attributed solely to exchange chunk balancing.
 Rendered runtime: `final-pairwise-balanced-full27/model.html`; exact placement:
 `final-pairwise-balanced-full27/memory/placement-67958.html`, both under
 `artifacts/baseline-local-planner`.
+
+
+### Host memory through detailed costing
+
+`artifacts/candidate-memory-20260911` records fresh-process canonical baseline
+expansion for the 27-layer FP8-weight model, with 56 Rayon threads. The expansion
+benchmark now reports Linux process RSS and its high-water mark at mid lowering,
+tile expansion, footprint costing and tile-list construction. These are process
+measurements including caches and allocator-retained pages, not recursive owned
+sizes of graph objects. No parameter arrays/reference execution are included.
+
+| Checkpoint | Batch 1 RSS | Batch 2 RSS |
+| --- | ---: | ---: |
+| Mid selected | 38.8 MiB | 40.4 MiB |
+| Expanded tile graph | 699.8 MiB | 1005.1 MiB |
+| Detailed footprint costed | 703.8 MiB | 1009.9 MiB |
+| Tile work lists constructed | 704.8 MiB | 1011.3 MiB |
+
+The subsequent diagnostic clone timings increase peak RSS to 796.6 / 1110.1 MiB;
+these clones are not required for costing. Dropping the plan leaves 684.5 /
+967.3 MiB resident: expansion caches remain live and the system allocator need
+not immediately return freed pages. Do not infer live cache size from that RSS.
+
+A separate complete batch-1 baseline build/export, including scheduling, final
+placement and package construction but no hardware or numerical reference,
+peaked at **6.53 GiB** and took 94.504 s. Its sampled RSS history is
+`full-b1.memory.json`. Expanding/costing multiple candidates is therefore much
+cheaper in RAM than constructing their complete packages. These baseline
+measurements do not bound all possible layouts or accumulated search caches.

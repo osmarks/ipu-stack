@@ -5,12 +5,38 @@ use std::sync::Arc;
 #[derive(serde::Serialize)]
 pub struct ExpansionBenchmark {
     pub planning_ms: f64,
+    /// Whole-process Linux RSS, including caches and allocator-retained pages.
+    pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
     pub baseline: ExpansionTiming,
     /// Cache entries, hits and misses, respectively.
     pub fragment_cache: (usize, u64, u64),
     pub copy_plan_cache: (usize, u64, u64),
     /// Matching selections are opportunities, not validated reusable graph fragments.
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ProcessMemory {
+    pub resident_bytes: u64,
+    pub peak_resident_bytes: u64,
+}
+
+fn process_memory() -> Option<ProcessMemory> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let bytes = |key| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()?
+                .checked_mul(1024)
+        })
+    };
+    Some(ProcessMemory {
+        resident_bytes: bytes("VmRSS:")?,
+        peak_resident_bytes: bytes("VmHWM:")?,
+    })
 }
 
 #[derive(Default, serde::Serialize)]
@@ -51,9 +77,11 @@ pub fn benchmark_mid_expansion(
     config: &PipelineConfig,
     cache_enabled: bool,
 ) -> PackageBuildResult<ExpansionBenchmark> {
+    let mut memory = BTreeMap::from([("start", process_memory())]);
     let start = Instant::now();
     let mid = lower_baseline(graph, config, &Ipu21CostModel)?;
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
+    memory.insert("mid", process_memory());
     let cache = Arc::new(if cache_enabled {
         crate::low::expand::ExpansionCache::default()
     } else {
@@ -118,12 +146,15 @@ pub fn benchmark_mid_expansion(
         &mut analysis,
     )?;
     let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
+    memory.insert("expanded", process_memory());
     let start = Instant::now();
     let footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
     let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
+    memory.insert("footprint", process_memory());
     let start = Instant::now();
     let low = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
     let tile_lists_ms = start.elapsed().as_secs_f64() * 1000.0;
+    memory.insert("tile_lists", process_memory());
     let start = Instant::now();
     let cloned = std::hint::black_box(expanded.shards.clone());
     let clone_shards_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -161,9 +192,12 @@ pub fn benchmark_mid_expansion(
             .map(|t| t.destinations.len())
             .sum(),
     };
+    drop((low, expanded, analysis, mid));
+    memory.insert("after_plan_drop", process_memory());
     tracing::info!(expand_ms, tile_lists_ms, "benchmarked mid-to-low expansion");
     Ok(ExpansionBenchmark {
         planning_ms,
+        process_memory: memory,
         baseline: timing,
         fragment_cache: cache.stats(),
         copy_plan_cache: cache.plan_stats(),
