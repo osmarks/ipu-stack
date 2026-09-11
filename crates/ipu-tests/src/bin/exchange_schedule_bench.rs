@@ -8,7 +8,7 @@ use ipu_exchange::diagnostic::diagnose_plan_program;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::hint::black_box;
-use std::io::BufReader;
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -319,7 +319,7 @@ fn main() -> Result<()> {
     }
     if let Some(path) = &arguments.write_selected_snapshot {
         serde_json::to_writer(
-            File::create(path)?,
+            BufWriter::new(File::create(path)?),
             &ExchangeScheduleSnapshot {
                 schema_version: snapshot.schema_version,
                 tile_count: snapshot.tile_count,
