@@ -191,6 +191,9 @@ pub(super) fn fuse(
             .zip(if ordinary { cost(&apply) } else { Some(0) })
             .zip(stats_copy.as_ref().map_or(Some(0), cost))
             .map(|((a, b), c)| a.saturating_add(b).saturating_add(c));
+        tracing::debug!(target: "ipu_codegen::mid::residual", source = ?current.source,
+            parts = statistic_parts, redistributed, ?before, ?after,
+            "priced residual/statistics fusion");
         if before
             .zip(after)
             .is_none_or(|(before, after)| after >= before)
