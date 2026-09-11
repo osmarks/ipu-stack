@@ -1858,6 +1858,17 @@ fn run_checked_inferences(
     count: u32,
     mut check: impl FnMut(u32, &[u8]) -> Result<()>,
 ) -> Result<Vec<u8>> {
+    let planned = application
+        .host_exchange
+        .calls
+        .iter()
+        .find(|call| call.name == "run")
+        .context("package has no run call")?
+        .invocations;
+    anyhow::ensure!(
+        count == planned,
+        "requested {count} inference calls, but the package was built for {planned}"
+    );
     let mut session = runtime.host_session(application)?;
     session.start().inspect_err(|_| {
         eprintln!(

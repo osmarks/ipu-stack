@@ -1135,31 +1135,42 @@ mod tests {
 
     #[test]
     fn pointwise_parameter_input_is_never_overwritten() {
-        let mut graph = ComputeGraph::new();
-        let parameter = graph.parameter("p", [8, 64]).unwrap();
-        let output = graph.gelu(parameter).unwrap();
-        graph.set_outputs([output]).unwrap();
-        let config = PipelineConfig::new(4).with_input(
-            parameter,
-            TensorFormat {
-                precision: Precision::F16,
-                layout: Layout::row_sharded(4),
-            },
-        );
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-        let analysis = analyze_allocations(&low).unwrap();
-        let roots = low.inputs[0]
-            .shards
-            .iter()
-            .map(|id| analysis.root_of_member[id.index() as usize])
-            .collect::<BTreeSet<_>>();
-        for run in &low.kernel_runs {
-            assert!(
-                run.outputs().all(
-                    |out| !roots.contains(&analysis.root_of_member[out.shard.index() as usize])
-                )
+        for case in 0..3 {
+            let mut graph = ComputeGraph::new();
+            let parameter = graph.parameter("p", [8, 64]).unwrap();
+            let output = match case {
+                0 => graph.gelu(parameter).unwrap(),
+                1 => {
+                    let view = graph.slice(parameter, 0, 0, 4).unwrap();
+                    graph.gelu(view).unwrap()
+                }
+                _ => graph
+                    .repeat(2, [parameter], [], [], |body, args| {
+                        Ok(vec![body.gelu(args.carried[0])?])
+                    })
+                    .unwrap()[0],
+            };
+            graph.set_outputs([output]).unwrap();
+            let config = PipelineConfig::new(4).with_input(
+                parameter,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout: Layout::row_sharded(4),
+                },
             );
+            let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+            let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+            let analysis = analyze_allocations(&low).unwrap();
+            let roots = low.inputs[0]
+                .shards
+                .iter()
+                .map(|id| analysis.root_of_member[id.index() as usize])
+                .collect::<BTreeSet<_>>();
+            for run in &low.kernel_runs {
+                assert!(run.outputs().all(|out| {
+                    !roots.contains(&analysis.root_of_member[out.shard.index() as usize])
+                }));
+            }
         }
     }
 

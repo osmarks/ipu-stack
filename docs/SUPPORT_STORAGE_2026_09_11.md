@@ -2,6 +2,13 @@
 
 Branch: `baseline-local-planner`.
 
+**Residency correction:** measurements below made before the “Persistent inference
+and host-aperture reuse” section validated only one inference. The allocator then
+allowed parameter storage to be reused after its last operator use. Those runs
+were not evidence of a valid resident model. The corrected implementation now
+passes three successive 27-layer inferences after one parameter upload; see the
+final section for current profiles and measurements.
+
 Package construction now reserves the linked section payloads, places host and
 per-tile generated code into their remaining holes, and only then closes the
 occupied executable SRAM elements to writable allocations. Exchange tables are
@@ -413,3 +420,80 @@ with the doctest and Clippy. The placement-report test checks every placed shard
 and alias against its actual address and storage size, and rejects overlaps
 between live records. Chromium checks cover hover, pin/clear, reuse toggling,
 tile/address navigation, zoom, highlighting and reset on the full-model report.
+
+
+## Persistent inference and host-aperture reuse
+
+Parameter allocations now span the entire inference lifetime, including aliases
+and all members of Repeat sequences. The mid memory estimator and its diagnostic
+timeline retain parameters through the end too. Repeat-body estimates retain
+invariant parameters even when their multiplicity is one.
+
+In-place pointwise candidates cannot overwrite parameters or inputs with later
+uses. Logical views preserve their source's read-only parameter provenance. A
+parameter used as initial carried state gets an explicit fresh mid Copy before
+Repeat, since carried storage is writable. Materialized temporary copies remain
+reusable.
+
+The host exchange aperture at **0x50000–0x58000** is now available to transient
+standard-addressed tensors between host phases. Inputs, parameters and outputs
+cannot borrow it, and unused aperture bytes are never offered to persistent
+host descriptors or exchange rows. Packet headers are copied from permanent
+descriptors before each active host exchange; incoming staging bytes are
+replaced by the host transfer. Both online and offline placement enforce the
+same restriction.
+
+Programs that elide padding clears using the arena-wide finite-F16 invariant
+continue to reserve the aperture: host protocol words do not preserve that
+invariant. This is tracked explicitly when clears are removed. The mixed-FP8
+ViT retains its required padding initialization and can use the aperture.
+The coarse planner budget remains conservative; it is not increased by 32 KiB
+in a way that would incorrectly admit additional resident parameter storage.
+
+The exact placement viewer shows the reusable host reservation at the input
+and output boundaries. Parameters show “whole program”; outputs remain live
+through host readback. Panel borders, allocation colors, stacked reuse rows and
+drag-to-zoom behavior are retained.
+
+The corrected 27-layer package already fits without borrowing the aperture
+(`artifacts/baseline-local-planner/resident-full27/`, compile-only). With aperture
+reuse, the final full-model run passes **three successive host calls** after one
+`initialize`, without SRAM reset or parameter re-upload. All three logical outputs
+are bit-identical; each has FP32-reference cosine **0.994212810** and maximum
+absolute error **0.410389**.
+
+The final map has 161,375 resident parameter allocations, none overlapping any
+other tensor allocation. All 1,472 tiles borrow the aperture: the occupied union
+ranges from 5,632 to 32,768 bytes per tile, totaling **46,681,608 bytes** across
+the device (about 30.97 KiB per tile on average).
+
+The first invocation's cropped profile spans **19,340,886 cycles / 12.893924 ms**,
+versus 19,792,236 cycles / 13.194824 ms in the previous one-shot BASE profile.
+This is a comparison of complete placements, not an isolated aperture benchmark.
+The reference test saves detailed profiling for the first invocation only.
+
+Use `--reference-run --reference-fp32 --reference-inferences 3` to repeat this
+validation. `PackageConfig::invocations` exposes the emitter's existing host-call
+loop, and the package's `run` metadata records the count. Intermediate calls finish
+at their host-exchange boundary; only the final call waits for terminal device
+completion. Without this package option, the original one-inference program
+correctly stops after its first call and cannot service a second request.
+
+Current artifacts:
+
+- `artifacts/baseline-local-planner/resident-final-full27/model.html`: execution profile.
+- `artifacts/baseline-local-planner/resident-final-full27/memory/placement-58176.html`:
+  exact placement, with its adjacent JSON.
+- `artifacts/baseline-local-planner/resident-final-full27/run.log`: all three numerical checks.
+
+Regression coverage includes persistent parameter lifetimes, direct/view/Repeat
+parameter write protection, memory-estimate retention after last use, aperture
+eligibility and reuse under both allocator orders, exclusion from auxiliary
+storage, and exact placement-report overlap checks. The rendered full-model
+report was also loaded and exercised in headless Chromium.
+
+Validation: **226 codegen tests passed, 4 ignored; all 10 benchmark/reference
+tests and the doctest passed**. Workspace/all-target checks pass. Clippy completes
+with the repository's existing argument-count/type-complexity warnings. Browser
+checks include forward/reverse map and ruler drags, cancellation, right-click
+zoom undo, and preservation of panel borders.

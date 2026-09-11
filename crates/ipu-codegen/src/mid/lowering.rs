@@ -232,6 +232,17 @@ pub(super) fn apply_selected_plan(
             format: plan.requirements.output.format.clone(),
         },
     );
+    // A logical view may remain an alias of resident parameter storage.
+    // Keep its read-only provenance until an actual materialization occurs.
+    if matches!(
+        operation.kind,
+        OperationKind::View(_) | OperationKind::Slice(_)
+    ) && original_input_ids
+        .iter()
+        .any(|id| state.parameter_values.contains(id))
+    {
+        state.parameter_values.insert(result);
+    }
     let converted_types = converted
         .iter()
         .map(|value| state.get(*value).tensor_type.clone())

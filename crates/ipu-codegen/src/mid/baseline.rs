@@ -418,6 +418,27 @@ impl<C: CostModel> Builder<'_, C> {
             .iter()
             .map(|id| lookup(&self.values, *id))
             .collect::<LoweringResult<Vec<_>>>()?;
+        // Repeat updates carried storage in place. A resident parameter can
+        // seed that state, but must not become its writable backing allocation.
+        for input in inputs.iter_mut().take(repeat.carried_inputs) {
+            if self.state.parameter_values.contains(input) {
+                let source = self.state.get(*input).clone();
+                let result = self.state.value(source.origin, source.tensor_type);
+                self.state.values[result.index() as usize].tile_offset = source.tile_offset;
+                operations.push(MidOperation {
+                    source: Some(operation.id),
+                    inputs: vec![*input],
+                    results: vec![result],
+                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                        mapping: CoordinateMapping::default(),
+                        reuse_local: false,
+                    }),
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                });
+                *input = result;
+            }
+        }
         let sequences = repeat
             .iterated_inputs
             .iter()
