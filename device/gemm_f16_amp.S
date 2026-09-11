@@ -67,18 +67,16 @@
 	.set CLEAR_AACC, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
 	.set ENABLE_STOCHASTIC_ROUNDING, 1 << CSR_S_FP_ICTL__ESR__SHIFT
 
-	.macro PARTITION_ROWS count
+	.macro PARTITION_ROWS
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
-	setzi $m5, (\count) / 6
-	mul $m6, $m4, (\count) / 6
-	.if (\count) % 6
-	setzi $m9, (\count) % 6
+	ld32 $m5, $mvertex_base, $m15, 9
+	mul $m6, $m4, $m5
+	ld32 $m9, $mvertex_base, $m15, 10
 	cmpult $m7, $m4, $m9
 	add $m5, $m5, $m7
 	min $m7, $m4, $m9
 	add $m6, $m6, $m7
-	.endif
 	.endm
 
 	.macro LOAD_AMP16_WEIGHTS
@@ -187,7 +185,7 @@
 	.endm
 
 // All F16/F8 specializations use this frame. Slots 9..11 are reserved for
-// worker row parameters; m4/m5 still carry coefficients and the FP8 scale.
+// worker quotient, remainder and byte stride; m4/m5 carry coefficients/scale.
 #ifdef GEMM_DISPATCH_ONLY
 	.section .text.GEMM_DISPATCH_SYMBOL,"ax",@progbits
 	.globl GEMM_DISPATCH_SYMBOL
@@ -243,7 +241,7 @@ GEMM_DISPATCH_SYMBOL:
 	add $m11, $m11, 48
 	br $m10
 	.size GEMM_DISPATCH_SYMBOL, .-GEMM_DISPATCH_SYMBOL
-#else
+#elif !defined(GEMM_WORKER_ONLY)
 	// ABI: m2 output, m3 left, m4 right, m5 FP8 scale, m10 return.
 	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_output_worker, retained_inner_worker
 	.section .text.\name,"ax",@progbits
@@ -267,23 +265,30 @@ GEMM_DISPATCH_SYMBOL:
 	st32 $m0, $m11, $m15, 7
 	setzi $m0, OUTPUT_COLUMNS / COLUMN_MICRO_DIMENSION
 	st32 $m0, $m11, $m15, 8
+	setzi $m0, (\rows) / 6
+	st32 $m0, $m11, $m15, 9
+	setzi $m0, (\rows) % 6
+	st32 $m0, $m11, $m15, 10
+	setzi $m0, (\rows) * 32
+	st32 $m0, $m11, $m15, 11
 	bri GEMM_DISPATCH_SYMBOL
 	.size \name, .-\name
 	.endm
 
-#ifdef GEMM_SINGLE_ROWS
-	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
-	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
-#else
-	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
-	GEMM_SUPERVISOR GEMM_INIT_LARGE_SYMBOL, 1, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner
-	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner
-	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner
+	GEMM_SUPERVISOR GEMM_INIT_SMALL_SYMBOL, 1, GEMM_SMALL_ROWS, GEMM_WORKER_SYMBOL, GEMM_WORKER_OUTPUT_SYMBOL, GEMM_WORKER_INNER_SYMBOL
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_SMALL_SYMBOL, 0, GEMM_SMALL_ROWS, GEMM_WORKER_SYMBOL, GEMM_WORKER_OUTPUT_SYMBOL, GEMM_WORKER_INNER_SYMBOL
+#ifndef GEMM_SINGLE_ROWS
+	GEMM_SUPERVISOR GEMM_INIT_LARGE_SYMBOL, 1, GEMM_LARGE_ROWS, GEMM_WORKER_SYMBOL, GEMM_WORKER_OUTPUT_SYMBOL, GEMM_WORKER_INNER_SYMBOL
+	GEMM_SUPERVISOR GEMM_ACCUMULATE_LARGE_SYMBOL, 0, GEMM_LARGE_ROWS, GEMM_WORKER_SYMBOL, GEMM_WORKER_OUTPUT_SYMBOL, GEMM_WORKER_INNER_SYMBOL
+#endif
 #endif
 
-	.macro GEMM_WORKER name, retained_output_name, retained_inner_name, rows
+#ifdef GEMM_WORKER_ONLY
+
+	.macro GEMM_WORKER name, retained_output_name, retained_inner_name
 	.section .text.\name,"ax",@progbits
 	.worker
+	.globl \name, \retained_output_name, \retained_inner_name
 	.p2align 3
 \name:
 #if GEMM_OUTPUT_GROUP
@@ -294,7 +299,7 @@ GEMM_DISPATCH_SYMBOL:
 	add $m0, $m0, 512
 	ld32 $m1, $mvertex_base, $m15, 1
 .Lpacked_rows_\@:
-	PARTITION_ROWS \rows
+	PARTITION_ROWS
 	brz $m5, .Lgemm_f16_no_rows_\@
 	shl $m2, $m6, 5
 	add $m2, $m1, $m2
@@ -311,11 +316,9 @@ GEMM_DISPATCH_SYMBOL:
 	add $m3, $m9, 32
 	add $m8, $m4, -1
 #else
-	PARTITION_ROWS \rows
+	PARTITION_ROWS
 	shl $m6, $m6, 5
-	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
-	.endif
 	ld32 $m0, $mvertex_base, $m15, 0
 	ld32 $m1, $mvertex_base, $m15, 1
 	add $m9, $m0, $m6
@@ -324,10 +327,9 @@ GEMM_DISPATCH_SYMBOL:
 	add $m8, $m5, -1
 	bri .Lgemm_f16_load_mode_\@
 \retained_output_name:
-	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
-	.endif
-	add $m9, $m9, (\rows) * COLUMN_MICRO_DIMENSION * 2
+	ld32 $m7, $mvertex_base, $m15, 11
+	add $m9, $m9, $m7
 	add $m2, $m1, $m6
 	add $m3, $m9, 32
 	add $m8, $m5, -1
@@ -410,16 +412,16 @@ GEMM_DISPATCH_SYMBOL:
 #endif
 \retained_inner_name:
 #if GEMM_OUTPUT_GROUP
-	add $m1, $m1, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
+	ld32 $m7, $mvertex_base, $m15, 11
+	add $m1, $m1, $m7
 	bri .Lpacked_rows_\@
 #else
-	.if (\rows) < 6
 	brz $m5, .Lgemm_f16_no_rows_\@
-	.endif
 	// Every inner-group invocation after the first accumulates into the
 	// retained output. Place that entry immediately before the accumulate
 	// body so dispatch does not pay an additional branch for every panel.
-	add $m2, $m2, (\rows) * INNER_MICRO_DIMENSION * GEMM_INPUT_ELEMENT_BYTES
+	ld32 $m7, $mvertex_base, $m15, 11
+	add $m2, $m2, $m7
 #endif
 .Lf16_accumulate_\@:
 	setzi $a6, CLEAR_AACC
@@ -512,9 +514,5 @@ GEMM_DISPATCH_SYMBOL:
 	exitz $mzero
 	.endm
 
-	GEMM_WORKER .Lgemm_f16_amp_worker_small, .Lgemm_f16_amp_worker_small_retained_output, .Lgemm_f16_amp_worker_small_retained_inner, GEMM_SMALL_ROWS
-#ifndef GEMM_SINGLE_ROWS
-	GEMM_WORKER .Lgemm_f16_amp_worker_large, .Lgemm_f16_amp_worker_large_retained_output, .Lgemm_f16_amp_worker_large_retained_inner, GEMM_LARGE_ROWS
-#endif
-
-#endif // GEMM_DISPATCH_ONLY
+	GEMM_WORKER GEMM_WORKER_SYMBOL, GEMM_WORKER_OUTPUT_SYMBOL, GEMM_WORKER_INNER_SYMBOL
+#endif // GEMM_WORKER_ONLY

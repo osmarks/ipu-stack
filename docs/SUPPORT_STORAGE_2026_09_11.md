@@ -125,3 +125,19 @@ The full-size one-layer compact run passes with the same 0.077148 maximum error.
 Linked end falls 403576 → 399080 (4496 bytes); runtime rises 1011180 → 1012860
 cycles, **0.166%**. This does not cross another executable-element boundary.
 Profile: `artifacts/baseline-local-planner/shared-supervisor-full1/model.ipuprof`.
+
+## Shared GEMM workers
+
+Workers are now shared across rows, inner/column extents and coefficient-load
+modes. Only precision and the output store permutation select a worker body.
+The entry frame supplies quotient/remainder for six-worker row partitioning and
+the panel byte stride. Initialize/accumulate and retained-panel entry points
+still use the existing AMP inner loops.
+
+The one-layer run passes (maximum error 0.077148), at **1026456 cycles**: +1.342%
+versus shared supervisors, +1.511% versus the original compact baseline.
+Linked end falls another 7512 bytes, to 391568 (12008 bytes total). Combined
+executable storage releases one 16 KiB element: the upper standard tensor range
+now starts at 458752 rather than 475136. The memory-address change also affects
+exchange placement; the whole-model delta is not a pure kernel microbenchmark.
+Profile: `artifacts/baseline-local-planner/shared-worker-full1/model.ipuprof`.

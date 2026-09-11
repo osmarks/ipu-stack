@@ -321,7 +321,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             .iter()
             .find(|unit| !unit.retained_symbols.is_empty())
             .unwrap();
-        assert_eq!(plan.compilations.len(), 2);
+        assert_eq!(plan.compilations.len(), 3);
         assert_eq!(
             plan.compilations
                 .iter()

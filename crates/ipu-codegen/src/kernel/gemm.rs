@@ -75,6 +75,35 @@ impl KernelBuildPlan {
         } else {
             format!("{weight_suffix}_packed{output_group}")
         };
+        // The worker depends on precision and store permutation, not GEMM
+        // extents, coefficient load mode, or the scale exponent.
+        let worker = format!("gemm_{prefix}_packed{output_group}_worker");
+        let worker_flags = vec![
+            format!("-DGEMM_WORKER_SYMBOL={worker}"),
+            format!("-DGEMM_WORKER_OUTPUT_SYMBOL={worker}_output"),
+            format!("-DGEMM_WORKER_INNER_SYMBOL={worker}_inner"),
+        ];
+        if precision != Precision::F32 && !self.compilations.iter().any(|unit| unit.name == worker)
+        {
+            let mut flags = worker_flags.clone();
+            flags.extend([
+                "-DGEMM_WORKER_ONLY=1".into(),
+                format!("-DGEMM_OUTPUT_GROUP={output_group}"),
+                format!(
+                    "-DGEMM_OUTPUT_GROUP_SHIFT={}",
+                    output_group.max(16).ilog2() - 4
+                ),
+            ]);
+            if matches!(precision, Precision::F8F143 { .. }) {
+                flags.push("-DGEMM_NATIVE_FP8=1".into());
+            }
+            self.compilations.push(KernelCompilation {
+                source,
+                name: worker,
+                flags,
+                retained_symbols: vec![],
+            });
+        }
         for pair in values.chunks(2) {
             let small = pair[0];
             let large = *pair.last().expect("nonempty GEMM row pair");
@@ -149,6 +178,7 @@ impl KernelBuildPlan {
             if matches!(precision, Precision::F8F143 { .. }) {
                 flags.push("-DGEMM_NATIVE_FP8=1".into());
             }
+            flags.extend(worker_flags.clone());
             if single_rows {
                 flags.push("-DGEMM_SINGLE_ROWS=1".into());
             }
