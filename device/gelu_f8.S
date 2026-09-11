@@ -10,14 +10,11 @@
 .type gelu_f8,@function
 gelu_f8:
 .supervisor
-add $m11, $m11, -40
+add $m11, $m11, -64
 st32 $m2, $m11, $m15, 0
 st32 $m3, $m11, $m15, 1
 st32 $m4, $m11, $m15, 2
-ldconst $m0, 0x48004800
-st32 $m0, $m11, $m15, 3
-ldconst $m0, 0xc800c800
-st32 $m0, $m11, $m15, 4
+STORE_GELU_BOUNDS
 sub $m6, 0, $m6
 and $m6, $m6, 255
 st32 $m6, $m11, $m15, 5
@@ -28,7 +25,7 @@ st32 $m9, $m11, $m15, 9
 setzi $m0, .Lfp8_gelu_worker
 runall $m0, $m11, 0
 sync SYNC_COMPUTE_SET
-add $m11, $m11, 40
+add $m11, $m11, 64
 br $m10
 .size gelu_f8, .-gelu_f8
 

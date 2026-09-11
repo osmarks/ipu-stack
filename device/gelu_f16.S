@@ -13,9 +13,9 @@
 
 	.macro GELU_PAIR value
 	// tanh GeLU: x/2 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3))).
-	ld32 $a2, $mvertex_base, $m15, 3
+	ld32 $a2, $mvertex_base, $m15, 10
 	f16v2min $a3, \value, $a2
-	ld32 $a2, $mvertex_base, $m15, 4
+	ld32 $a2, $mvertex_base, $m15, 12
 	f16v2max $a3, $a3, $a2
 	f16v2mul $a2, $a3, $a3
 	f16v2mul $a2, $a2, $a3
@@ -26,6 +26,16 @@
 	f16v2add $a2, $a6, $a2
 	f16v2mul $a2, $a7, $a2
 	f16v2mul $a2, \value, $a2
+	.endm
+
+	// Two identical pairs per bound let the vector loop load both in one issue.
+	.macro STORE_GELU_BOUNDS
+	ldconst $m0, 0x48004800
+	st32 $m0, $m11, $m15, 10
+	st32 $m0, $m11, $m15, 11
+	ldconst $m0, 0xc800c800
+	st32 $m0, $m11, $m15, 12
+	st32 $m0, $m11, $m15, 13
 	.endm
 
 	.macro LOAD_GELU_CONSTANTS
@@ -45,11 +55,9 @@
 	ldconst $a4, GELU_BETA_F16X2
 	ldconst $a5, GELU_ALPHA_F16X2
 #endif
-	ld32 $a2, $mvertex_base, $m15, 3
-	ld32 $a3, $mvertex_base, $m15, 3
+	ld64 $a2:3, $mvertex_base, $m15, 5
 	f16v4min $a0:1, $a0:1, $a2:3
-	ld32 $a2, $mvertex_base, $m15, 4
-	ld32 $a3, $mvertex_base, $m15, 4
+	ld64 $a2:3, $mvertex_base, $m15, 6
 	f16v4max $a0:1, $a0:1, $a2:3
 	f16v4mul $a2:3, $a0:1, $a0:1
 	f16v4mul $a2:3, $a2:3, $a0:1
@@ -103,7 +111,7 @@
 	.type \symbol,@function
 \symbol:
 	.supervisor
-	add $m11, $m11, -32
+	add $m11, $m11, -64
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
 #ifdef GELU_WITH_BIAS
@@ -114,14 +122,11 @@
 #else
 	st32 $m4, $m11, $m15, 2
 #endif
-	ldconst $m0, 0x48004800
-	st32 $m0, $m11, $m15, 3
-	ldconst $m0, 0xc800c800
-	st32 $m0, $m11, $m15, 4
+	STORE_GELU_BOUNDS
 	setzi $m0, \worker
 	runall $m0, $m11, 0
 	sync SYNC_COMPUTE_SET
-	add $m11, $m11, 32
+	add $m11, $m11, 64
 	br $m10
 	.size \symbol, .-\symbol
 	.endm

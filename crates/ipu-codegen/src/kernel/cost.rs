@@ -184,7 +184,7 @@ pub(crate) fn f16_reduction_cycles(elements: u64, partials: u64) -> u64 {
 }
 
 /// gelu_f16.S has a fast path for whole 16-element blocks. Other even lengths
-/// use 88-issue-group blocks and a 20-issue-group scalar-pair tail. Evaluate
+/// use 80-issue-group blocks and a 20-issue-group scalar-pair tail. Evaluate
 /// at most six worker spans, independent of tensor size or tile count. The
 /// tail setup conservatively covers the final worker's six-cycle exit skew.
 pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
@@ -192,7 +192,7 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
         return 0;
     }
     if elements.is_multiple_of(16) {
-        return 330u64.saturating_add(elements.div_ceil(96).saturating_mul(510));
+        return 330u64.saturating_add(elements.div_ceil(96).saturating_mul(462));
     }
     (0..6)
         .map(|worker| {
@@ -203,7 +203,7 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
             let blocks = if pairs < 8 { 0 } else { (pairs - 8) / 48 + 1 };
             let tail = pairs.saturating_sub(blocks.saturating_mul(48));
             blocks
-                .saturating_mul(528)
+                .saturating_mul(480)
                 .saturating_add(tail.saturating_mul(120))
                 .saturating_add(if tail == 0 { 330 } else { 342 })
         })
@@ -286,17 +286,17 @@ pub(crate) fn f16_layernorm_apply_cycles(rows: u64, width: u64, parts: u16) -> u
     } else {
         (558, 324, width.div_ceil(12).saturating_mul(60))
     };
-    setup.saturating_add(rows.saturating_mul(
-        (row_setup + u64::from(parts) * 54).saturating_add(work),
-    ))
+    setup.saturating_add(
+        rows.saturating_mul((row_setup + u64::from(parts) * 54).saturating_add(work)),
+    )
 }
 
 /// Pair conversion stays in ARF and emits complete FP8 words. Packed LN
 /// needs separate address calculations when a tile owns several rows.
 pub(crate) fn fp8_elementwise_cycles(gelu: bool, rows: u64, width: u64, packed: bool) -> u64 {
     if gelu {
-        132u64.saturating_add(
-            rows.saturating_mul(372u64.saturating_add(width.div_ceil(192).saturating_mul(1098))),
+        138u64.saturating_add(
+            rows.saturating_mul(372u64.saturating_add(width.div_ceil(192).saturating_mul(1002))),
         )
     } else {
         layernorm_cycles(rows, width, false, false).saturating_add(rows.saturating_mul(
@@ -405,14 +405,14 @@ mod tests {
             (2, 462),
             (6, 702),
             (14, 1182),
-            (16, 840),
-            (18, 858),
+            (16, 792),
+            (18, 810),
             (30, 1182),
-            (94, 1176),
-            (96, 840),
-            (98, 990),
-            (1408, 7980),
-            (2208, 12060),
+            (94, 1182),
+            (96, 792),
+            (98, 942),
+            (1408, 7260),
+            (2208, 10956),
         ] {
             let predicted = f16_gelu_cycles(elements);
             assert!(predicted >= measured && predicted - measured <= 6);
