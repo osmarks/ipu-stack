@@ -359,6 +359,7 @@ pub(crate) fn lower_exchanges_cached(
                         &incoming_bases,
                         &receive_counts,
                         program.tile_count,
+                        cache.stream_words,
                     )?;
                     tracing::info!(
                         phase = phase.id.index(),
@@ -999,6 +1000,7 @@ fn optimize_owned_pending(
     topology: &Topology,
     pending: Vec<PendingTransfer>,
     tile_count: u16,
+    stream_words: Option<std::num::NonZeroU32>,
 ) -> Result<ScheduledPending, ExchangeLoweringError> {
     let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
     let optimized = optimize_pending_schedule(
@@ -1007,6 +1009,7 @@ fn optimize_owned_pending(
         &incoming_bases,
         &receive_counts,
         tile_count,
+        stream_words,
     )?;
     Ok(ScheduledPending {
         pending,
@@ -1024,19 +1027,20 @@ fn select_transfer_widths(
     topology: &Topology,
     pending: Vec<PendingTransfer>,
     tile_count: u16,
+    stream_words: Option<std::num::NonZeroU32>,
 ) -> Result<ScheduledPending, ExchangeLoweringError> {
     let alternatives = paired_transfer_alternatives(&pending, topology, tile_count)?;
     let candidates = alternatives.iter().flatten().count();
     if candidates == 0 {
-        return optimize_owned_pending(topology, pending, tile_count);
+        return optimize_owned_pending(topology, pending, tile_count, stream_words);
     }
     let paired = pending
         .iter()
         .zip(alternatives)
         .map(|(ordinary, paired)| paired.unwrap_or_else(|| ordinary.clone()))
         .collect();
-    let ordinary = optimize_owned_pending(topology, pending, tile_count);
-    let paired = optimize_owned_pending(topology, paired, tile_count);
+    let ordinary = optimize_owned_pending(topology, pending, tile_count, stream_words);
+    let paired = optimize_owned_pending(topology, paired, tile_count, stream_words);
     let (ordinary, paired) = match (ordinary, paired) {
         (Ok(ordinary), Ok(paired)) => (ordinary, paired),
         (ordinary, Err(error)) => {
@@ -1050,7 +1054,24 @@ fn select_transfer_widths(
     };
     let ordinary_horizon = ordinary.optimized.schedule.horizon;
     let paired_horizon = paired.optimized.schedule.horizon;
-    let use_paired = paired_horizon < ordinary_horizon;
+    let use_paired = if stream_words.is_some() {
+        let storage_score = |candidate: &ScheduledPending| -> Result<_, ExchangeLoweringError> {
+            let encoded = candidate.optimized.schedule.builder.finish()?;
+            let sizes = encoded
+                .programs
+                .iter()
+                .map(|row| row.as_ref().map_or(0, |row| row.len()))
+                .collect::<Vec<_>>();
+            Ok((
+                sizes.iter().max().copied().unwrap_or(0),
+                sizes.iter().sum::<usize>(),
+                candidate.optimized.schedule.horizon,
+            ))
+        };
+        storage_score(&paired)? < storage_score(&ordinary)?
+    } else {
+        paired_horizon < ordinary_horizon
+    };
     tracing::info!(
         phase,
         candidates,
@@ -1068,8 +1089,25 @@ fn optimize_pending_schedule(
     incoming_bases: &[u32],
     receive_counts: &[usize],
     tile_count: u16,
+    stream_words: Option<std::num::NonZeroU32>,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
     let problem = SchedulingProblem::new(pending, tile_count);
+    if let Some(words) = stream_words {
+        let schedule = replay::materialize_stream_schedule(
+            topology,
+            &problem,
+            incoming_bases,
+            receive_counts,
+            words.get(),
+        )?;
+        return Ok(OptimizedSchedule {
+            initial_horizon: schedule.horizon,
+            endpoint_lower_bound: endpoint_work_lower_bound(pending, tile_count),
+            schedule,
+            selected_kind: "compact-streams",
+            neighborhood_improvements: 0,
+        });
+    }
     let schedule = materialize_greedy_schedule(topology, &problem, incoming_bases, receive_counts)?;
     improve_pending_schedule(
         topology,

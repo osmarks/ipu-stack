@@ -48,28 +48,13 @@ pub fn schedule_exchange_problem_with_priority(
                 "stream wave size must be nonzero".into(),
             ));
         }
-        let order = order::stream_wave_order(&scheduling, words);
-        match materialize_schedule_order(
+        materialize_stream_schedule(
             &topology,
             &scheduling,
             &incoming_bases,
             &receive_counts,
-            &order,
-            false,
-        ) {
-            Ok(schedule) => schedule,
-            Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
-                "SENDPICP instruction alignment",
-            ))) => materialize_schedule_order(
-                &topology,
-                &scheduling,
-                &incoming_bases,
-                &receive_counts,
-                &order,
-                true,
-            )?,
-            Err(error) => return Err(error),
-        }
+            words,
+        )?
     } else {
         materialize_greedy_schedule_with_priority(
             &topology,
@@ -88,4 +73,35 @@ pub fn schedule_exchange_problem_with_priority(
         "full-duplex",
     )?;
     finish_exchange_run(tile_count, problem.phase, incoming_bases, optimized)
+}
+
+pub(super) fn materialize_stream_schedule(
+    topology: &Topology,
+    problem: &SchedulingProblem<'_>,
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    words: u32,
+) -> Result<MaterializedSchedule, ExchangeLoweringError> {
+    let order = order::stream_wave_order(problem, words);
+    match materialize_schedule_order(
+        topology,
+        problem,
+        incoming_bases,
+        receive_counts,
+        &order,
+        false,
+    ) {
+        Ok(schedule) => Ok(schedule),
+        Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
+            "SENDPICP instruction alignment",
+        ))) => materialize_schedule_order(
+            topology,
+            problem,
+            incoming_bases,
+            receive_counts,
+            &order,
+            true,
+        ),
+        Err(error) => Err(error),
+    }
 }

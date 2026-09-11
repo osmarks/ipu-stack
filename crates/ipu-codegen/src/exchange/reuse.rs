@@ -7,6 +7,7 @@ use std::sync::Arc;
 #[derive(Clone, Default)]
 pub struct ExchangeScheduleCache {
     phases: BTreeMap<ExchangePhaseId, Arc<ScheduleRecipe>>,
+    pub(super) stream_words: Option<std::num::NonZeroU32>,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,14 @@ fn normalized_rows(
 }
 
 impl ExchangeScheduleCache {
+    /// Use address-ordered stream waves, prioritizing encoded storage over latency.
+    pub fn with_stream_words(stream_words: Option<std::num::NonZeroU32>) -> Self {
+        Self {
+            stream_words,
+            ..Self::default()
+        }
+    }
+
     /// Select ordinary/paired transfers through the production path, retaining
     /// the recipe for subsequent placement or benchmark replay.
     pub fn schedule_problem(
@@ -97,6 +106,7 @@ impl ExchangeScheduleCache {
 
     pub(super) fn take_phase(&mut self, phase: ExchangePhaseId) -> Self {
         Self {
+            stream_words: self.stream_words,
             phases: self
                 .phases
                 .remove(&phase)
@@ -135,7 +145,13 @@ impl ExchangeScheduleCache {
                 }
             }
         }
-        let selected = select_transfer_widths(phase.index(), topology, pending, tile_count)?;
+        let selected = select_transfer_widths(
+            phase.index(),
+            topology,
+            pending,
+            tile_count,
+            self.stream_words,
+        )?;
         self.phases.insert(
             phase,
             Arc::new(ScheduleRecipe {
@@ -247,29 +263,41 @@ mod tests {
 
     #[test]
     fn reuses_rows_after_relocation_and_reoptimizes_changed_transfers() {
-        let topology = Topology::c600();
-        let phase = ExchangePhaseId::from_index(0);
-        let mut cache = ExchangeScheduleCache::default();
-        let original = transfers();
-        let first = cache.select(phase, &topology, original.clone(), 4).unwrap();
-        let mut relocated = original;
-        for transfer in &mut relocated {
-            transfer.source_addresses[0] += 0x4000;
-            transfer.destinations[0].1 += 0x4000;
-            transfer.refresh_source_elements();
+        for words in [
+            None,
+            std::num::NonZeroU32::new(64),
+            std::num::NonZeroU32::new(256),
+        ] {
+            let topology = Topology::c600();
+            let phase = ExchangePhaseId::from_index(0);
+            let mut cache = ExchangeScheduleCache::with_stream_words(words);
+            let mut child = cache.take_phase(phase);
+            assert_eq!(child.stream_words, words);
+            let original = transfers();
+            let first = child.select(phase, &topology, original.clone(), 4).unwrap();
+            if words.is_some() {
+                assert_eq!(first.optimized.selected_kind, "compact-streams");
+            }
+            cache.merge(child);
+            let mut relocated = original;
+            for transfer in &mut relocated {
+                transfer.source_addresses[0] += 0x4000;
+                transfer.destinations[0].1 += 0x4000;
+                transfer.refresh_source_elements();
+            }
+            let second = cache
+                .select(phase, &topology, relocated.clone(), 4)
+                .unwrap();
+            assert_eq!(second.optimized.selected_kind, "reused");
+            assert_eq!(
+                normalized_rows(&first.optimized.schedule).unwrap(),
+                normalized_rows(&second.optimized.schedule).unwrap()
+            );
+            assert_eq!(second.pending[0].source_address(), 0x64000);
+            relocated[0].words = 32;
+            let changed = cache.select(phase, &topology, relocated, 4).unwrap();
+            assert_ne!(changed.optimized.selected_kind, "reused");
         }
-        let second = cache
-            .select(phase, &topology, relocated.clone(), 4)
-            .unwrap();
-        assert_eq!(second.optimized.selected_kind, "reused");
-        assert_eq!(
-            normalized_rows(&first.optimized.schedule).unwrap(),
-            normalized_rows(&second.optimized.schedule).unwrap()
-        );
-        assert_eq!(second.pending[0].source_address(), 0x64000);
-        relocated[0].words = 32;
-        let changed = cache.select(phase, &topology, relocated, 4).unwrap();
-        assert_ne!(changed.optimized.selected_kind, "reused");
     }
 
     #[test]

@@ -136,6 +136,9 @@ struct Arguments {
     /// Maximum complete package validations for local improvements after the baseline.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
+    /// Prefer compact exchange rows using address-ordered waves of this many words.
+    #[arg(long)]
+    exchange_stream_words: Option<std::num::NonZeroU32>,
     /// Retain an exact GEMM family: OP:RxCxK:RRxRC:C:MEMORY:ORIENTATION:REDUCTION:LOCAL.
     #[arg(
         long,
@@ -680,6 +683,7 @@ fn main() -> Result<()> {
         pipeline = pipeline.with_operator_candidate_limit(width);
     }
     pipeline.optimization_steps = arguments.optimization_steps;
+    pipeline.exchange_stream_words = arguments.exchange_stream_words;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
         "native" => ipu_codegen::GemmOutputPacking::Native,

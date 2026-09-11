@@ -399,8 +399,8 @@ fn width_selection_pairs_receivers_with_independent_addresses() {
             .collect(),
     };
     let pending = pending_from_problem(8, &problem).unwrap();
-    let ordinary = optimize_owned_pending(&topology, pending.clone(), 8).unwrap();
-    let selected = select_transfer_widths(0, &topology, pending, 8).unwrap();
+    let ordinary = optimize_owned_pending(&topology, pending.clone(), 8, None).unwrap();
+    let selected = select_transfer_widths(0, &topology, pending, 8, None).unwrap();
     assert!(
         selected
             .pending

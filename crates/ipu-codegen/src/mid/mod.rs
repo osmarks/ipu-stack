@@ -90,6 +90,8 @@ pub struct PipelineConfig {
     pub tile_count: u16,
     /// Maximum complete local proposals validated after establishing a baseline.
     pub optimization_steps: usize,
+    /// Compact address-ordered exchange waves; None uses latency-oriented scheduling.
+    pub exchange_stream_words: Option<std::num::NonZeroU32>,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
     /// Graph-boundary tensors whose layout may be selected by their first
     /// consumer. Precision remains fixed, while packaging exposes the chosen
@@ -187,6 +189,7 @@ impl PipelineConfig {
             operator_candidates: default_operator_candidates(tile_count),
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
+            exchange_stream_words: None,
             operator_candidate_limit: 64,
             exchange_table_budget_bytes: 80 * 1024,
             exchange_transfer_limit_per_tile: 16_384,

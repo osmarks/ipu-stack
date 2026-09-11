@@ -11,7 +11,8 @@ pub(super) fn optimize<T>(
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, config.tile_count);
     let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
-    let mut schedules = crate::ExchangeScheduleCache::default();
+    let mut schedules =
+        crate::ExchangeScheduleCache::with_stream_words(config.exchange_stream_words);
     let mut incumbent = baseline::lower(graph, config, &costs, &Recipe::default())?;
     memory_profile(graph, config, &incumbent.program, "baseline")?;
     let (mut selected, mut cycles, mut artifact) = validate(
