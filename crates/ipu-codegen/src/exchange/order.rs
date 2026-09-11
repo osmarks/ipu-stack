@@ -558,7 +558,11 @@ pub(super) fn critical_neighborhood_order(
 /// Offline alternative: visit address-ordered endpoint streams in bounded
 /// payload waves. This amortizes receive-pointer/mux changes without imposing
 /// barriers; the ordinary row builder still overlaps independent transfers.
-pub(super) fn stream_wave_order(problem: &SchedulingProblem<'_>, words: u32) -> Vec<usize> {
+pub(super) fn stream_wave_order(
+    problem: &SchedulingProblem<'_>,
+    words: u32,
+    balanced: bool,
+) -> Vec<usize> {
     let mut streams = BTreeMap::<_, Vec<usize>>::new();
     for (index, transfer) in problem.transfers.iter().enumerate() {
         streams
@@ -590,6 +594,9 @@ pub(super) fn stream_wave_order(problem: &SchedulingProblem<'_>, words: u32) -> 
             offset += u64::from(problem.transfers[index].words);
         }
     }
+    if balanced {
+        balance_stream_chunks(problem, &mut rank);
+    }
     let mut indegrees = problem.indegrees();
     let mut ready = BinaryHeap::new();
     for (index, &degree) in indegrees.iter().enumerate() {
@@ -608,6 +615,94 @@ pub(super) fn stream_wave_order(problem: &SchedulingProblem<'_>, words: u32) -> 
         }
     }
     order
+}
+
+/// Reorder whole chunks within a wave, preserving their address order. Start
+/// independent endpoints early instead of walking sources in tile-number order.
+/// This is only a ranking heuristic: exact timing and hazards remain in append.
+fn balance_stream_chunks(
+    problem: &SchedulingProblem<'_>,
+    rank: &mut [(u64, Reverse<u64>, usize, usize)],
+) {
+    let mut chunks = BTreeMap::<_, Vec<usize>>::new();
+    for (index, &(wave, _, stream, _)) in rank.iter().enumerate() {
+        chunks.entry((wave, stream)).or_default().push(index);
+    }
+    // Even slots are sending endpoints, odd slots receiving endpoints. A tile
+    // can send and receive together; its paired sender occupies a second TX.
+    let endpoints = |index: usize| {
+        let transfer = &problem.transfers[index];
+        std::iter::once(transfer.source)
+            .chain(transfer.reserved_source)
+            .map(|tile| 2 * usize::from(tile))
+            .chain(
+                transfer
+                    .destinations
+                    .iter()
+                    .map(|&(tile, _)| 2 * usize::from(tile) + 1),
+            )
+    };
+    let mut loads = vec![(0u64, 0u64); 2 * usize::from(problem.tile_count)];
+    for (index, transfer) in problem.transfers.iter().enumerate() {
+        let work = u64::from(transfer.item_count().unwrap_or(transfer.words));
+        for endpoint in endpoints(index) {
+            loads[endpoint].1 += work;
+        }
+    }
+    let mut waves = BTreeMap::<_, Vec<_>>::new();
+    for ((wave, stream), mut indices) in chunks {
+        indices.sort_unstable_by_key(|&index| rank[index].3);
+        let endpoints = endpoints(indices[0]).collect::<Vec<_>>();
+        let work = indices
+            .iter()
+            .map(|&index| {
+                let transfer = &problem.transfers[index];
+                u64::from(transfer.item_count().unwrap_or(transfer.words))
+            })
+            .sum::<u64>();
+        waves
+            .entry(wave)
+            .or_default()
+            .push((stream, indices, endpoints, work));
+    }
+    for chunks in waves.into_values() {
+        let score = |id: usize, loads: &[(u64, u64)]| {
+            let (stream, _, endpoints, _) = &chunks[id];
+            let ready = endpoints
+                .iter()
+                .map(|&endpoint| loads[endpoint].0)
+                .max()
+                .unwrap_or(0);
+            let remaining = endpoints
+                .iter()
+                .map(|&endpoint| loads[endpoint].1)
+                .max()
+                .unwrap_or(0);
+            (ready, Reverse(remaining), *stream)
+        };
+        let mut ready = (0..chunks.len())
+            .map(|id| Reverse((score(id, &loads), id)))
+            .collect::<BinaryHeap<_>>();
+        let mut position = 0;
+        while let Some(Reverse((old, id))) = ready.pop() {
+            let current = score(id, &loads);
+            // Availability only increases and remaining work only decreases.
+            if current != old {
+                ready.push(Reverse((current, id)));
+                continue;
+            }
+            let (_, indices, endpoints, work) = &chunks[id];
+            for &index in indices {
+                rank[index].1 = Reverse(0);
+                rank[index].2 = position;
+            }
+            position += 1;
+            for &endpoint in endpoints {
+                loads[endpoint].0 = current.0 + work;
+                loads[endpoint].1 -= work;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

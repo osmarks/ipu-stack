@@ -354,6 +354,8 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
             ExchangeSchedulingPriority::RemainingDirectional,
             ExchangeSchedulingPriority::Streams(64),
             ExchangeSchedulingPriority::Streams(1024),
+            ExchangeSchedulingPriority::BalancedStreams(64),
+            ExchangeSchedulingPriority::BalancedStreams(1024),
         ] {
             let first =
                 schedule_exchange_problem_with_priority(tile_count, &problem, priority).unwrap();
@@ -369,6 +371,38 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
                 second.neighborhood_improvements
             );
         }
+        let topology = Topology::new(
+            (0..tile_count)
+                .map(ipu_exchange::c600_logical_to_physical)
+                .collect(),
+        )
+        .unwrap();
+        let pending = pending_from_problem(tile_count, &problem).unwrap();
+        let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count).unwrap();
+        let scheduling = SchedulingProblem::new(&pending, tile_count);
+        let baseline = replay::materialize_stream_schedule(
+            &topology,
+            &scheduling,
+            &incoming_bases,
+            &receive_counts,
+            64,
+            false,
+        )
+        .unwrap();
+        let optimized = replay::optimize_stream_schedule(
+            &topology,
+            &scheduling,
+            &incoming_bases,
+            &receive_counts,
+            64,
+        )
+        .unwrap();
+        let (maximum, total) = encoded_row_storage(&baseline).unwrap();
+        let (new_maximum, new_total) = encoded_row_storage(&optimized.schedule).unwrap();
+        assert!(new_maximum <= maximum && new_total <= total);
+        assert!(optimized.schedule.horizon <= baseline.horizon);
+        let run = finish_exchange_run(tile_count, phase, incoming_bases, optimized).unwrap();
+        validate_exchange_schedule(tile_count, &problem, &run.phase).unwrap();
     }
 }
 

@@ -1134,17 +1134,8 @@ fn select_transfer_widths(
     let paired_horizon = paired.optimized.schedule.horizon;
     let use_paired = if stream_words.is_some() {
         let storage_score = |candidate: &ScheduledPending| -> Result<_, ExchangeLoweringError> {
-            let encoded = candidate.optimized.schedule.builder.finish()?;
-            let sizes = encoded
-                .programs
-                .iter()
-                .map(|row| row.as_ref().map_or(0, |row| row.len()))
-                .collect::<Vec<_>>();
-            Ok((
-                sizes.iter().max().copied().unwrap_or(0),
-                sizes.iter().sum::<usize>(),
-                candidate.optimized.schedule.horizon,
-            ))
+            let (maximum, total) = encoded_row_storage(&candidate.optimized.schedule)?;
+            Ok((maximum, total, candidate.optimized.schedule.horizon))
         };
         storage_score(&paired)? < storage_score(&ordinary)?
     } else {
@@ -1171,20 +1162,13 @@ fn optimize_pending_schedule(
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
     let problem = SchedulingProblem::new(pending, tile_count);
     if let Some(words) = stream_words {
-        let schedule = replay::materialize_stream_schedule(
+        return replay::optimize_stream_schedule(
             topology,
             &problem,
             incoming_bases,
             receive_counts,
             words.get(),
-        )?;
-        return Ok(OptimizedSchedule {
-            initial_horizon: schedule.horizon,
-            endpoint_lower_bound: endpoint_work_lower_bound(pending, tile_count),
-            schedule,
-            selected_kind: "compact-streams",
-            neighborhood_improvements: 0,
-        });
+        );
     }
     let schedule = materialize_greedy_schedule(topology, &problem, incoming_bases, receive_counts)?;
     improve_pending_schedule(
@@ -2392,6 +2376,19 @@ fn schedule_encoding_is_valid(
         Err(ipu_exchange::ExchangeError::Schedule("SENDPICP instruction alignment")) => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+fn encoded_row_storage(
+    schedule: &MaterializedSchedule,
+) -> Result<(usize, usize), ExchangeLoweringError> {
+    let encoded = schedule.builder.finish()?;
+    Ok(encoded
+        .programs
+        .iter()
+        .fold((0, 0), |(maximum, total), row| {
+            let words = row.as_ref().map_or(0, |row| row.len());
+            (maximum.max(words), total + words)
+        }))
 }
 
 fn schedule_score(schedule: &MaterializedSchedule) -> u32 {

@@ -596,3 +596,54 @@ The exact map is under
 `artifacts/baseline-local-planner/pairwise-resident-full27/memory/placement-63074.html`.
 That directory's package was built only to export the final transfer snapshot;
 the hardware run is in the separate `pairwise-resident-full27-hardware` directory.
+
+## Compact exchange chunk ordering
+
+The compact scheduler now also evaluates endpoint-balanced chunks four times the
+requested stream-wave size. It retains address order within a chunk and uses
+separate sending/receiving availability and remaining work to prioritize chunks.
+The existing scheduler still enforces dependencies, paired endpoints, all Repeat
+source addresses, memory hazards and encoding constraints. The alternative wins
+only with a shorter horizon and no increase in either maximum or total encoded
+row words. Ordinary/paired selection and recipe caching use the same result.
+
+The replay CLI has `--balance-streams` (with `--stream-words`) and reports
+`firstActivitySpanCycles`: spread of each active tile's first actual transfer,
+measured after the barrier. Explicit stream replays no longer run unrelated
+unconstrained ordering improvements afterward, so the benchmark measures the
+requested compact algorithm.
+
+On the captured 27-layer resident baseline (`artifacts/exchange-chunks-20260911`):
+
+| Phase | Address-order cycles | Balanced cycles | Maximum row words before/after | Total row words before/after | Within budget |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 3 | 6,258 | 3,661 | 71 / 90 | 65,831 / 83,367 | no |
+| 14 | 5,246 | 4,464 | 13 / 14 | 8,415 / 8,496 | no |
+| 16 | 11,164 | 8,123 | 1,044 / 1,043 | 340,210 / 342,564 | no |
+| 42 | 18,402 | 11,896 | 39 / 47 | 37,153 / 45,592 | no |
+| 47 | 9,424 | 6,170 | 1,579 / 1,519 | 626,608 / 617,175 | yes |
+| 49 | 27,439 | 14,301 | 406 / 449 | 351,871 / 394,867 | no |
+
+Thus post-barrier skew is partly ordering, not unavoidable hardware delay.
+Phase 49's first-transfer spread drops from 8,625 to 944 cycles, but that variant
+is rejected by the row cap. Starting every tile earlier is not the objective:
+phase 47 finishes much earlier despite a later last first-transfer.
+
+Hardware (27 layers, batch 1, three successive inferences, FP32 reference):
+
+- Pairwise allocator, original compact order: 19,698,522 cropped cycles.
+- Pairwise allocator, capped balanced comparison: 19,501,650 cycles / 13.0011 ms,
+  cosine 0.994212810; planning 71.241 s versus 61.593 s for the original order.
+- Materialized-attention baseline with both changes: 16,463,916 cycles /
+  10.975944 ms, cosine 0.994168165.
+
+The old aligned allocator's FlashAttention profile was 19,340,886 cycles: denser
+packing changes bank contention and does not itself guarantee faster execution.
+Profiles for the two current working builds are in
+`balanced-chunks-resident-full27/model.html` and
+`balanced-chunks-materialized-baseline27/model.html` under
+`artifacts/baseline-local-planner`.
+
+Local search now reaches materialized attention and a wider output-projection
+candidate. That wider candidate currently traps during casting; the baseline
+above passes, and the wider isolated cast check passes. Investigation continues.

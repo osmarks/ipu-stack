@@ -48,6 +48,9 @@ struct Arguments {
     /// Offline address-ordered stream waves, measured in 32-bit words.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..), conflicts_with_all = ["priority", "select_widths", "replay_cache"])]
     stream_words: Option<u32>,
+    /// Reorder compact chunks by directional endpoint availability.
+    #[arg(long, requires = "stream_words")]
+    balance_streams: bool,
     /// Restrict the benchmark to these physical exchange phase IDs.
     #[arg(long = "phase")]
     phases: Vec<u32>,
@@ -191,7 +194,13 @@ fn main() -> Result<()> {
                     captured,
                     arguments
                         .stream_words
-                        .map(ExchangeSchedulingPriority::Streams)
+                        .map(|words| {
+                            if arguments.balance_streams {
+                                ExchangeSchedulingPriority::BalancedStreams(words)
+                            } else {
+                                ExchangeSchedulingPriority::Streams(words)
+                            }
+                        })
                         .unwrap_or_else(|| arguments.priority.into()),
                 )
                 .map(|run| (std::borrow::Cow::Borrowed(captured), run))
@@ -265,12 +274,20 @@ fn main() -> Result<()> {
                 .map(|transfer| transfer.destinations.len())
                 .sum::<usize>();
             let row_words = run.phase.programs.iter().map(Vec::len).sum::<usize>();
+            let first_activities = run
+                .phase
+                .activities
+                .iter()
+                .filter_map(|events| events.iter().map(|event| event.start_cycle).min())
+                .collect::<Vec<_>>();
+            let first_activity_span = first_activities.iter().max().unwrap_or(&0)
+                - first_activities.iter().min().unwrap_or(&0);
             let maximum_row_words = run.phase.programs.iter().map(Vec::len).max().unwrap_or(0);
             if durations.len() == arguments.iterations {
                 durations.sort_unstable();
                 validation_durations.sort_unstable();
                 println!(
-                    "phase={} transfers={} destinations={} initialHorizonCycles={} horizonCycles={} endpointLowerBoundCycles={} lowerBoundGapCycles={} neighborhoodImprovements={} rowWords={} maximumRowWords={} scheduleCodegenMinMs={:.3} scheduleCodegenMedianMs={:.3} scheduleCodegenP95Ms={:.3} scheduleCodegenMaxMs={:.3} validationMedianMs={:.3} reused={} rowFingerprint={:016x} invariants=PASS",
+                    "phase={} transfers={} destinations={} initialHorizonCycles={} horizonCycles={} endpointLowerBoundCycles={} lowerBoundGapCycles={} neighborhoodImprovements={} rowWords={} maximumRowWords={} firstActivitySpanCycles={} scheduleCodegenMinMs={:.3} scheduleCodegenMedianMs={:.3} scheduleCodegenP95Ms={:.3} scheduleCodegenMaxMs={:.3} validationMedianMs={:.3} reused={} rowFingerprint={:016x} invariants=PASS",
                     problem.phase,
                     problem.transfers.len(),
                     destination_count,
@@ -283,6 +300,7 @@ fn main() -> Result<()> {
                     run.neighborhood_improvements,
                     row_words,
                     maximum_row_words,
+                    first_activity_span,
                     milliseconds(durations[0]),
                     milliseconds(percentile(&durations, 50)),
                     milliseconds(percentile(&durations, 95)),
