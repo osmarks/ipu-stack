@@ -497,3 +497,78 @@ tests and the doctest passed**. Workspace/all-target checks pass. Clippy complet
 with the repository's existing argument-count/type-complexity warnings. Browser
 checks include forward/reverse map and ruler drags, cancellation, right-click
 zoom undo, and preservation of panel borders.
+
+
+## Local optimization and larger-model fit checks
+
+Enabled the default `--optimization-steps 8` on the resident FP8-weight,
+batch-one, 27-layer ViT, retaining `--exchange-stream-words 256` and three host
+inferences. Planning took **347.143 seconds**. The tile-mapping proposal and all
+seven subsequently validated local proposals failed placement; the optimizer
+retained the feasible baseline. All three inferences passed, with identical
+logical outputs and cosine 0.994212810. The cropped execution span was
+**19,340,892 cycles / 12.893928 ms**, effectively unchanged.
+
+Artifacts: `artifacts/baseline-local-planner/optimized-resident-full27/`, including
+`run.sh`, `run.log`, `model.html`, and the selected exact placement report.
+
+Local search is greedy, with one feasible incumbent. Its proposals include
+packing distribution (32/64/128/256 rows), overlapping reductions, disjoint copy
+sources, up to four alternative plans per operator, early/late FP8 casting, and
+opening a layout boundary while re-enumerating its consumers. Some boundary
+proposals also replace the producer's plan. Input tensor formats are fixed to
+the baseline's homes; physical placement remains joint and is recomputed.
+Operator implementations, tile expansions and exchange schedules have caches.
+Candidates must first improve the coarse mid estimate. The best remaining
+candidates, limited by the remaining validation budget, undergo full scheduling,
+support reservation and placement. A fitting lower placed-cycle estimate replaces
+the incumbent, after which proposals are regenerated. This is not a beam or a
+memory/performance Pareto search. An infeasible initial baseline currently stops
+before local improvements can be considered.
+
+Two further **27-layer** builds with the same optimization budget fail at that
+initial-baseline stage:
+
+- Batch 2, automatic attention: tile 184 cannot place a 96,768-byte resident
+  FP8 downprojection-weight sequence. Its 111,180 non-aperture free bytes are
+  fragmented; the largest hole is 73,640 bytes. Exchange tables reserve 53,152
+  bytes. Planning to rejection took 65.347 seconds.
+- Batch 1, forced materialized attention: tile 1060 cannot place a 6,912-byte
+  resident F16 affine-parameter sequence. There are 39,116 non-aperture free
+  bytes, with a largest raw hole of 24,752 bytes, but no permitted memory-element
+  aligned start. Exchange tables reserve 49,312 bytes. Planning to rejection
+  took 38.470 seconds.
+
+These are failures of the current selected layouts/allocator, not proofs that
+no layouts for those configurations can fit. No hardware run was attempted for
+the failed packages. Their diagnostic logs are in `optimized-resident-full27-b2/`
+and `optimized-resident-full27-materialized/` under the same artifact directory.
+
+Replayed the rejected mapping with allocator debug logging in
+`resident-mapping-memory/`. The final size-ordered pass failed on tile 186's
+3,584-byte resident upprojection-weight allocation with **6,744 total free bytes**:
+512 were in the host aperture, leaving **6,232 eligible bytes**, and the largest
+hole was **2,992 bytes**. Its preceding lifetime-ordered pass failed a 10,240-byte
+interleaved scratch allocation despite **151,792 total free bytes**, including
+131,544 in region 1: the remaining holes did not contain a usable 32-KiB-aligned
+start. These describe the allocator's intermediate states, not an ideal repacked
+capacity bound. Parsed free intervals are retained in
+`optimized-resident-full27/failure-spans.json`.
+
+The jagged starts include actual scheduled idle time, not only different arrival
+times at barriers. In the first profiled encoder iteration, rearrangement phase
+14 (operation 5) has first-transfer offsets from 0 to 4,294 cycles across 1,458
+active tiles within a 5,246-cycle schedule. Phase 49 has first-transfer offsets
+from 7 to 8,046 cycles within 24,012 scheduled cycles. These are modeled event
+positions from the profile's static exchange traces, not independently sampled
+hardware transfer timestamps.
+
+The compact scheduler orders address-sorted sender/destination streams in
+256-word waves, prioritizing larger streams and then a fixed stream index.
+A candidate improvement is to choose ready chunks using endpoint availability
+and remaining work, preserving address order within each stream, and accept only
+schedules whose encoded rows stay within the existing footprint. Interleaving
+can still increase receiver mux/control instructions, so preserved source order
+alone does not guarantee unchanged table size. Smaller wave sizes and filling
+idle intervals with compatible chunks can be evaluated under the same cap.
+No speedup from these proposed scheduler changes has been claimed or measured.
