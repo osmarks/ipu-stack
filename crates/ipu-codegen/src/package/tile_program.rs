@@ -161,8 +161,23 @@ pub fn build_tile_program_package(
         .chain(tile_rows)
         .flatten()
         .collect::<Vec<_>>();
-    for (start, end) in crate::memory::merge_ranges(tile_local_ranges) {
+    let tile_local_ranges = crate::memory::merge_ranges(tile_local_ranges);
+    for &(start, end) in &tile_local_ranges {
         memory.reserve("tile-local data or exchange rows", start..end)?;
+    }
+    for (start, end) in tile_local_ranges {
+        // These externally fixed ranges precede code placement. Exclude their
+        // entire executable elements: instruction fetch conflicts with data
+        // access even when the byte ranges do not overlap.
+        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let executable_end = end.min(ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT);
+        if start < executable_end {
+            for (free_start, free_end) in memory
+                .free_ranges(start / element * element..executable_end.div_ceil(element) * element)
+            {
+                memory.reserve("tile data memory elements", free_start..free_end)?;
+            }
+        }
     }
 
     let launch = Binding {
@@ -210,6 +225,7 @@ pub fn build_tile_program_package(
         .checked_sub(sizing_host_base)
         .ok_or_else(|| invalid("host program size underflow"))?;
     let host_code = allocate_package_code(&mut memory, "host programs", host_code_bytes, 8, 0)?;
+    protect_executable_elements(&mut memory, [host_code.range.clone()])?;
     let host_ranges = memory.free_ranges(host_bounds.clone());
     let host = host::plan(
         &[],

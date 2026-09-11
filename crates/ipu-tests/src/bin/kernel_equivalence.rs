@@ -111,7 +111,7 @@ fn main() -> Result<()> {
             while bytes.len() % 8 != 0 {
                 bytes.push(0);
             }
-            let address = 0x5c000 + bytes.len() as u32;
+            let address = 0x80000 + bytes.len() as u32;
             bytes.extend(halves.iter().flat_map(|half| half.to_le_bytes()));
             address
         };
@@ -153,7 +153,7 @@ fn main() -> Result<()> {
             };
             let mut step = call(&symbol, output, &inputs, &scalars);
             if let TileStep::Compute(call) = &mut step {
-                let base = if output == old { 0x7f000 } else { 0x7f008 };
+                let base = if output == old { 0xe7000 } else { 0xe7008 };
                 call.profile = StepProfile {
                     before: Some(base),
                     after: Some(base + 4),
@@ -179,12 +179,12 @@ fn main() -> Result<()> {
         }
         data.push(TileProgramData {
             tile,
-            address: 0x7f000,
+            address: 0xe7000,
             data: vec![0; 16],
         });
         data.push(TileProgramData {
             tile,
-            address: 0x5c000,
+            address: 0x80000,
             data: bytes,
         });
     }
@@ -197,7 +197,7 @@ fn main() -> Result<()> {
             .map(|tile| {
                 Ok(RegionSlice {
                     tile: u32::from(topology.physical(tile as u16)?),
-                    tile_address: 0x7f000,
+                    tile_address: 0xe7000,
                     file_offset: tile as u64 * 16,
                     size: 16,
                 })
@@ -244,7 +244,17 @@ fn main() -> Result<()> {
     )?;
     let mut session = runtime.host_session(&application)?;
     session.start()?;
-    let executed = session.invoke_streaming_deferred("run", &[0; 4])?;
+    let executed = session.invoke_streaming_deferred("run", &[0; 4]).inspect_err(|_| {
+        for (tile, (values, partials, inplace)) in cases.iter().enumerate() {
+            let physical = ipu_exchange::c600_logical_to_physical(tile as u16);
+            for context in 0..=6 {
+                if runtime.device().tile_context_state(physical, context).ok() == Some(3) {
+                    let pc = runtime.device().read_tile_program_counter(physical, context).unwrap_or(0);
+                    eprintln!("case={tile} elements={} partials={partials} inplace={inplace} context={context} pc={pc:x} symbol={:?} exception={:?}", values.len() / *partials as usize, application.symbolize_pc(u32::from(physical), pc), runtime.device().read_tile_context_status(physical, context).map(ipu_driver::TileException::from_status));
+                }
+            }
+        }
+    })?;
     runtime
         .device()
         .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
