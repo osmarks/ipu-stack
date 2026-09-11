@@ -50,6 +50,9 @@ struct Arguments {
     /// the normal optimized schedule instead of inserting operator checkpoints.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     reference_run: bool,
+    /// Compare with unquantized FP32 inputs, weights and intermediate results.
+    #[arg(long, requires = "reference_run")]
+    reference_fp32: bool,
     /// Maximum number of logical elements checked per operator result.
     #[arg(long, default_value_t = 256)]
     diagnostic_samples: usize,
@@ -1157,7 +1160,7 @@ fn main() -> Result<()> {
         } else if !matches!(arguments.workload, Workload::Diagnostic) {
             if arguments.reference_run || matches!(arguments.workload, Workload::SiglipVitBenchmark)
             {
-                let (output, maximum_error) = run_reference(
+                let (_output, maximum_error) = run_reference(
                     &runtime,
                     &application,
                     &graph,
@@ -1165,13 +1168,19 @@ fn main() -> Result<()> {
                         .as_ref()
                         .context("reference validation needs logical storage metadata")?,
                     arguments.timeout_seconds,
-                    (arguments.diagnostic_atol, arguments.diagnostic_rtol),
-                )?;
-                write_profile(
-                    &application,
-                    &output,
-                    arguments.clock_hz,
-                    arguments.profile_output.as_deref(),
+                    if matches!(arguments.workload, Workload::SiglipVitBenchmark) {
+                        ReferenceCheck::Cosine(0.99)
+                    } else {
+                        ReferenceCheck::Elementwise((
+                            arguments.diagnostic_atol,
+                            arguments.diagnostic_rtol,
+                        ))
+                    },
+                    arguments.reference_fp32,
+                    arguments
+                        .profile_output
+                        .as_deref()
+                        .map(|path| (path, arguments.clock_hz)),
                 )?;
                 println!("referenceMaximumAbsoluteError={maximum_error:.6} numericalTest=PASS");
             } else if matches!(
@@ -1195,7 +1204,9 @@ fn main() -> Result<()> {
                         .as_ref()
                         .context("MLP smoke requires a newly compiled package")?,
                     arguments.timeout_seconds,
-                    (0.02, 0.0),
+                    ReferenceCheck::Elementwise((0.02, 0.0)),
+                    false,
+                    None,
                 )?;
                 println!(
                     "mlpNumericalChecks={} maximumAbsoluteError={maximum_error:.6} numericalTest=PASS",
@@ -1428,7 +1439,13 @@ fn run_gemm(
             ))
         })
         .collect::<Vec<_>>();
-    verify_logical_output(application, tensor, &bytes, &expected, (0.0, 0.0))?;
+    verify_logical_output(
+        application,
+        tensor,
+        &bytes,
+        &expected,
+        ReferenceCheck::Elementwise((0.0, 0.0)),
+    )?;
     println!("gemmNumericalChecks={} numericalTest=PASS", expected.len());
     Ok(())
 }
@@ -1439,17 +1456,42 @@ fn run_reference(
     graph: &ComputeGraph,
     package: &CompiledPackage,
     timeout_seconds: u64,
-    tolerance: (f32, f32),
+    check: ReferenceCheck,
+    fp32: bool,
+    profile: Option<(&Path, u64)>,
 ) -> Result<(Vec<u8>, f32)> {
+    let started = std::time::Instant::now();
     let (host_inputs, weights, inputs) =
-        diagnostic::prepare_inputs(graph, application, &package.inputs)?;
+        diagnostic::prepare_inputs(graph, application, &package.inputs, fp32)?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "prepared reference inputs"
+    );
+    let started = std::time::Instant::now();
+    let empty = std::collections::BTreeMap::new();
+    let empty_multiply = std::collections::BTreeMap::new();
     let references = diagnostic::evaluate(
         graph,
         host_inputs,
-        &package.precisions,
-        &package.multiply_precisions,
+        if fp32 { &empty } else { &package.precisions },
+        if fp32 {
+            &empty_multiply
+        } else {
+            &package.multiply_precisions
+        },
     )?;
+    println!(
+        "referencePrecision={}",
+        if fp32 { "fp32" } else { "device" }
+    );
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "evaluated host reference"
+    );
     let output = run_initialized_program(runtime, application, &weights, &inputs, timeout_seconds)?;
+    if let Some((path, clock_hz)) = profile {
+        write_profile(application, &output, clock_hz, Some(path))?;
+    }
     let tensor = package
         .outputs
         .iter()
@@ -1459,7 +1501,7 @@ fn run_reference(
         .get(&tensor.value)
         .context("host reference has no graph output")?;
     let maximum_error =
-        verify_logical_output(application, tensor, &output, &expected.values, tolerance)?;
+        verify_logical_output(application, tensor, &output, &expected.values, check)?;
     Ok((output, maximum_error))
 }
 
@@ -1499,8 +1541,13 @@ fn run_projected_attention_benchmark(
         .context("attention package has no logical output storage map")?;
     let expected = expected_projection_value(model_width).powi(i32::try_from(blocks)?);
     let reference = vec![expected; usize::try_from(tensor.shape.elements())?];
-    let maximum_error =
-        verify_logical_output(application, tensor, &actual, &reference, (0.02, 0.0))?;
+    let maximum_error = verify_logical_output(
+        application,
+        tensor,
+        &actual,
+        &reference,
+        ReferenceCheck::Elementwise((0.02, 0.0)),
+    )?;
     println!(
         "attentionNumericalChecks={} blocks={blocks} expected={expected:.6} maxError={maximum_error:.6} numericalTest=PASS",
         reference.len()
@@ -1801,8 +1848,13 @@ fn run_gemm_benchmark(
         .find(|tensor| tensor.name.as_deref() == Some("output.0"))
         .context("benchmark package has no logical output storage map")?;
     let expected = vec![inner as f32 * 0.25; usize::try_from(tensor.shape.elements())?];
-    let maximum_absolute_error =
-        verify_logical_output(application, tensor, &output, &expected, (0.01, 0.002))?;
+    let maximum_absolute_error = verify_logical_output(
+        application,
+        tensor,
+        &output,
+        &expected,
+        ReferenceCheck::Elementwise((0.01, 0.002)),
+    )?;
     if !profiling_enabled {
         println!(
             "workload=gemm-f16-r{rows}-k{inner}-c{columns} benchmark=gemm-f16 rows={rows} inner={inner} columns={columns} profiling=false maximumAbsoluteError={maximum_absolute_error:.6}"
@@ -1854,7 +1906,9 @@ fn run_siglip_mlp_benchmark(
         graph,
         package,
         timeout_seconds,
-        (0.03, 0.05),
+        ReferenceCheck::Elementwise((0.03, 0.05)),
+        false,
+        None,
     )?;
     if !profiling_enabled {
         println!(
@@ -1964,18 +2018,57 @@ fn validate_mlp_benchmark_shape(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ReferenceCheck {
+    Elementwise((f32, f32)),
+    Cosine(f64),
+}
+
+fn minimum_cosine_similarity(actual: &[f32], expected: &[f32], width: usize) -> Result<f64> {
+    if width == 0
+        || actual.is_empty()
+        || actual.len() != expected.len()
+        || !actual.len().is_multiple_of(width)
+    {
+        bail!("invalid embedding dimensions for cosine similarity");
+    }
+    let mut minimum = 1.0f64;
+    for (index, (a, b)) in actual
+        .chunks_exact(width)
+        .zip(expected.chunks_exact(width))
+        .enumerate()
+    {
+        let (mut dot, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            if !x.is_finite() || !y.is_finite() {
+                bail!("embedding {index} contains a non-finite value");
+            }
+            let (x, y) = (f64::from(x), f64::from(y));
+            dot += x * y;
+            aa += x * x;
+            bb += y * y;
+        }
+        if aa == 0.0 || bb == 0.0 {
+            bail!("embedding {index} has zero norm");
+        }
+        minimum = minimum.min(dot / (aa * bb).sqrt());
+    }
+    Ok(minimum)
+}
+
 fn verify_logical_output(
     application: &Application,
     tensor: &DiagnosticTensor,
     bytes: &[u8],
     expected: &[f32],
-    tolerance: (f32, f32),
+    check: ReferenceCheck,
 ) -> Result<f32> {
     let (binding, base) = output_binding(application, "output.0")?;
     if expected.len() != usize::try_from(tensor.shape.elements())? {
         bail!("logical output metadata is inconsistent with its reference");
     }
     let mut covered = vec![false; expected.len()];
+    let mut actual_values = vec![0.0f32; expected.len()];
     let mut maximum = 0.0f32;
     let mut mismatches = Vec::new();
     let mut mismatch_count = 0usize;
@@ -2006,7 +2099,12 @@ fn verify_logical_output(
             checked += 1;
             maximum = maximum.max(error);
             covered[index] = true;
-            if !actual.is_finite() || error > tolerance.0 + tolerance.1 * reference.abs() {
+            actual_values[index] = actual;
+            if !actual.is_finite()
+                || !reference.is_finite()
+                || matches!(check,
+                ReferenceCheck::Elementwise((atol, rtol)) if error > atol + rtol * reference.abs())
+            {
                 mismatch_count += 1;
                 if mismatches.len() < 16 {
                     mismatches.push((index, reference, actual, error));
@@ -2022,6 +2120,18 @@ fn verify_logical_output(
             "numerical comparison failed for {mismatch_count}/{} logical shard values (maximum absolute error {maximum}): {mismatches:?}",
             checked
         );
+    }
+    if let ReferenceCheck::Cosine(minimum) = check {
+        let width = *tensor
+            .shape
+            .0
+            .last()
+            .context("embedding has no feature dimension")? as usize;
+        let similarity = minimum_cosine_similarity(&actual_values, expected, width)?;
+        println!("referenceMinimumCosineSimilarity={similarity:.9}");
+        if similarity <= minimum {
+            bail!("minimum embedding cosine similarity {similarity} must exceed {minimum}");
+        }
     }
     Ok(maximum)
 }
@@ -2520,6 +2630,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cosine_checks_each_embedding_and_rejects_invalid_values() -> Result<()> {
+        assert!((minimum_cosine_similarity(&[2.0, 4.0], &[1.0, 2.0], 2)? - 1.0).abs() < 1e-12);
+        assert_eq!(
+            minimum_cosine_similarity(&[100.0, 0.0, 0.0, 1.0], &[100.0, 0.0, 1.0, 0.0], 2)?,
+            0.0
+        );
+        assert!(minimum_cosine_similarity(&[f32::NAN], &[1.0], 1).is_err());
+        assert!(minimum_cosine_similarity(&[0.0], &[1.0], 1).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn randomized_logical_io_ignores_slice_order_and_rejects_corruption() -> Result<()> {
         use ipu_codegen::{
             BlockValue, BlockValueId, DiagnosticShard, GridOrder, ShardDefinition, TensorType,
@@ -2619,7 +2741,13 @@ mod tests {
             let (_, repacked) = diagnostic::pack_inputs(&application, &[tensor.clone()], &values)?;
             assert_eq!(packed, repacked);
             assert_eq!(
-                verify_logical_output(&application, &tensor, &packed, &expected, (0.0, 0.0))?,
+                verify_logical_output(
+                    &application,
+                    &tensor,
+                    &packed,
+                    &expected,
+                    ReferenceCheck::Elementwise((0.0, 0.0))
+                )?,
                 0.0
             );
             let shard = tensor
@@ -2647,8 +2775,14 @@ mod tests {
                 corrupted[offset..offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
             }
             assert!(
-                verify_logical_output(&application, &tensor, &corrupted, &expected, (0.0, 0.0))
-                    .is_err()
+                verify_logical_output(
+                    &application,
+                    &tensor,
+                    &corrupted,
+                    &expected,
+                    ReferenceCheck::Elementwise((0.0, 0.0))
+                )
+                .is_err()
             );
         }
         Ok(())

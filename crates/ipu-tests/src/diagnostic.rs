@@ -7,6 +7,7 @@ use ipu_codegen::{
 use ipu_driver::{Device, DriverError, TileException};
 use ipu_package::{Application, Binding};
 use ipu_runtime::Runtime;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
@@ -34,7 +35,8 @@ pub fn run(
     rtol: f32,
     timeout: Duration,
 ) -> Result<()> {
-    let (values, weights, inputs) = prepare_inputs(graph, &package.application, &package.inputs)?;
+    let (values, weights, inputs) =
+        prepare_inputs(graph, &package.application, &package.inputs, false)?;
     let references = evaluate(
         graph,
         values,
@@ -332,40 +334,48 @@ pub(crate) fn prepare_inputs(
     graph: &ComputeGraph,
     application: &Application,
     metadata: &[DiagnosticTensor],
+    fp32: bool,
 ) -> Result<PreparedInputs> {
-    let mut values = BTreeMap::new();
-    for input in graph.inputs() {
-        let metadata = metadata
-            .iter()
-            .find(|tensor| tensor.value == input.value)
-            .with_context(|| format!("diagnostic metadata for {} is missing", input.name))?;
-        let scale = match input.kind {
-            ipu_codegen::GraphInputKind::Host => 0.25,
-            ipu_codegen::GraphInputKind::Parameter => {
-                // Keep variance bounded as width and repeat depth change.
-                let rank = metadata.shape.0.len();
-                let fan_in = metadata.shape.0[rank.saturating_sub(2)];
-                (fan_in as f32).sqrt().recip()
-            }
-        };
-        let seed = 0x4449_4147_4e4f_5354 ^ u64::from(input.value.index());
-        let data = (0..input.shape.elements())
-            .map(|index| {
-                quantize(
-                    super::vit::random_input(input, seed, index)
-                        .unwrap_or_else(|| super::gaussian(seed, index) * scale),
-                    metadata.precision,
-                )
-            })
-            .collect();
-        values.insert(
-            input.value,
-            HostTensor {
-                shape: input.shape.0.clone(),
-                values: data,
-            },
-        );
-    }
+    let values = graph
+        .inputs()
+        .par_iter()
+        .map(|input| -> Result<_> {
+            let metadata = metadata
+                .iter()
+                .find(|tensor| tensor.value == input.value)
+                .with_context(|| format!("diagnostic metadata for {} is missing", input.name))?;
+            let scale = match input.kind {
+                ipu_codegen::GraphInputKind::Host => 0.25,
+                ipu_codegen::GraphInputKind::Parameter => {
+                    // Keep variance bounded as width and repeat depth change.
+                    let rank = metadata.shape.0.len();
+                    let fan_in = metadata.shape.0[rank.saturating_sub(2)];
+                    (fan_in as f32).sqrt().recip()
+                }
+            };
+            let seed = 0x4449_4147_4e4f_5354 ^ u64::from(input.value.index());
+            let data = (0..input.shape.elements())
+                .map(|index| {
+                    quantize(
+                        super::vit::random_input(input, seed, index)
+                            .unwrap_or_else(|| super::gaussian(seed, index) * scale),
+                        if fp32 {
+                            Precision::F32
+                        } else {
+                            metadata.precision
+                        },
+                    )
+                })
+                .collect();
+            Ok((
+                input.value,
+                HostTensor {
+                    shape: input.shape.0.clone(),
+                    values: data,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let (weights, inputs) = pack_inputs(application, metadata, &values)?;
     Ok((values, weights, inputs))
 }
@@ -376,48 +386,52 @@ pub(crate) fn pack_inputs(
     values: &BTreeMap<ValueId, HostTensor>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let pack = |bindings: &[Binding]| -> Result<Vec<u8>> {
-        let mut result = Vec::new();
-        for binding in bindings {
-            let metadata = metadata
-                .iter()
-                .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
-                .with_context(|| format!("diagnostic metadata for {} is missing", binding.name))?;
-            let tensor = &values[&metadata.value];
-            let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
-            let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
-            for shard in &metadata.shards {
-                let slice = binding
-                    .slices
+        let packed = bindings
+            .par_iter()
+            .map(|binding| -> Result<Vec<u8>> {
+                let metadata = metadata
                     .iter()
-                    .find(|slice| {
-                        slice.tile == u32::from(shard.physical_tile)
-                            && slice.tile_address == shard.address
-                    })
+                    .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
                     .with_context(|| {
-                        format!("binding slice for {} shard is missing", binding.name)
+                        format!("diagnostic metadata for {} is missing", binding.name)
                     })?;
-                for (index, offset) in shard_elements(metadata, shard)? {
-                    if u64::from(offset) + metadata.precision.bytes() > slice.size {
-                        bail!("logical element exceeds binding {} shard", binding.name);
+                let tensor = &values[&metadata.value];
+                let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
+                let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
+                for shard in &metadata.shards {
+                    let slice = binding
+                        .slices
+                        .iter()
+                        .find(|slice| {
+                            slice.tile == u32::from(shard.physical_tile)
+                                && slice.tile_address == shard.address
+                        })
+                        .with_context(|| {
+                            format!("binding slice for {} shard is missing", binding.name)
+                        })?;
+                    for (index, offset) in shard_elements(metadata, shard)? {
+                        if u64::from(offset) + metadata.precision.bytes() > slice.size {
+                            bail!("logical element exceeds binding {} shard", binding.name);
+                        }
+                        encode_value(
+                            &mut bytes,
+                            usize::try_from(slice.file_offset + u64::from(offset))?,
+                            tensor.values[index],
+                            metadata.precision,
+                        )?;
+                        covered[index] = true;
                     }
-                    encode_value(
-                        &mut bytes,
-                        usize::try_from(slice.file_offset + u64::from(offset))?,
-                        tensor.values[index],
-                        metadata.precision,
-                    )?;
-                    covered[index] = true;
                 }
-            }
-            if let Some(missing) = covered.iter().position(|covered| !covered) {
-                bail!(
-                    "binding {} does not store logical element {missing}",
-                    binding.name
-                );
-            }
-            result.extend(bytes);
-        }
-        Ok(result)
+                if let Some(missing) = covered.iter().position(|covered| !covered) {
+                    bail!(
+                        "binding {} does not store logical element {missing}",
+                        binding.name
+                    );
+                }
+                Ok(bytes)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(packed.concat())
     };
     let weights = pack(&application.weights)?;
     let inputs = pack(&application.inputs)?;
@@ -571,7 +585,9 @@ fn repeat_values(
         .map(|id| values[id].clone())
         .collect::<Vec<_>>();
     for iteration in 0..repeat.count as usize {
-        let mut local = values.clone();
+        // A checked region can only read its explicit arguments and local
+        // results. Do not clone every layer's weights into each iteration.
+        let mut local = BTreeMap::new();
         for (argument, value) in repeat
             .body
             .arguments
@@ -684,6 +700,7 @@ fn gemm(left: &HostTensor, right: &HostTensor, options: GemmOptions) -> Result<H
 
 #[link(name = "openblas")]
 unsafe extern "C" {
+    fn openblas_set_num_threads(threads: i32);
     fn cblas_sgemm(
         layout: i32,
         transpose_a: i32,
@@ -715,6 +732,21 @@ fn host_sgemm(
     transpose_left: bool,
     transpose_right: bool,
 ) -> Result<()> {
+    static THREADS: std::sync::Once = std::sync::Once::new();
+    THREADS.call_once(|| {
+        // Tiny attention products pay heavily for a machine-wide BLAS team.
+        // Respect explicit environment settings, otherwise use a bounded team.
+        if std::env::var_os("OPENBLAS_NUM_THREADS").is_none()
+            && std::env::var_os("OMP_NUM_THREADS").is_none()
+        {
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4)) as i32;
+            // SAFETY: called once before this process issues reference GEMMs.
+            unsafe {
+                openblas_set_num_threads(threads);
+            }
+            tracing::info!(threads, "configured host reference BLAS");
+        }
+    });
     const CBLAS_ROW_MAJOR: i32 = 101;
     const CBLAS_NO_TRANSPOSE: i32 = 111;
     const CBLAS_TRANSPOSE: i32 = 112;
@@ -847,43 +879,61 @@ fn attention(
         AttentionScale::ValueBits(bits) => f32::from_bits(bits),
     };
     let mut output = vec![0.0; (*streams * *query_rows * *value_width) as usize];
-    let mut logits = vec![0.0; *key_rows as usize];
-    for stream in 0..*streams {
-        for row in 0..*query_rows {
+    let mut logits = vec![0.0; (*query_rows * *key_rows) as usize];
+    for stream in 0..*streams as usize {
+        let qsize = (*query_rows * *width) as usize;
+        let ksize = (*key_rows * *width) as usize;
+        let vsize = (*key_rows * *value_width) as usize;
+        let osize = (*query_rows * *value_width) as usize;
+        host_sgemm(
+            &query.values[stream * qsize..][..qsize],
+            &key.values[stream * ksize..][..ksize],
+            &mut logits,
+            *query_rows,
+            *key_rows,
+            *width,
+            *width,
+            *width,
+            false,
+            true,
+        )?;
+        for (row, logits) in logits.chunks_exact_mut(*key_rows as usize).enumerate() {
             let allowed = if options.causal {
-                (row + 1).min(*key_rows)
+                (row + 1).min(*key_rows as usize)
             } else {
-                *key_rows
+                *key_rows as usize
             };
-            for column in 0..allowed {
-                let mut dot = 0.0;
-                for inner in 0..*width {
-                    dot += query.values[((stream * query_rows + row) * width + inner) as usize]
-                        * key.values[((stream * key_rows + column) * width + inner) as usize];
-                }
-                logits[column as usize] = dot * scale;
+            for value in &mut logits[..allowed] {
+                *value *= scale;
             }
-            let maximum = logits[..allowed as usize]
+            let maximum = logits[..allowed]
                 .iter()
                 .copied()
                 .fold(f32::NEG_INFINITY, f32::max);
-            let sum: f32 = logits[..allowed as usize]
+            let sum: f32 = logits[..allowed]
                 .iter_mut()
-                .map(|logit| {
-                    *logit = (*logit - maximum).exp();
-                    *logit
+                .map(|value| {
+                    *value = (*value - maximum).exp();
+                    *value
                 })
                 .sum();
-            for column in 0..*value_width {
-                let mut result = 0.0;
-                for inner in 0..allowed {
-                    result += logits[inner as usize] / sum
-                        * value.values
-                            [((stream * key_rows + inner) * value_width + column) as usize];
-                }
-                output[((stream * query_rows + row) * value_width + column) as usize] = result;
+            for value in &mut logits[..allowed] {
+                *value /= sum;
             }
+            logits[allowed..].fill(0.0);
         }
+        host_sgemm(
+            &logits,
+            &value.values[stream * vsize..][..vsize],
+            &mut output[stream * osize..][..osize],
+            *query_rows,
+            *value_width,
+            *key_rows,
+            *key_rows,
+            *value_width,
+            false,
+            false,
+        )?;
     }
     Ok(HostTensor {
         shape: vec![*streams, *query_rows, *value_width],
@@ -967,6 +1017,104 @@ mod tests {
     use ipu_codegen::{AmpOrder, amp_matrix_coordinates};
 
     #[test]
+    fn repeat_reference_binds_carried_invariant_and_iterated_values() -> Result<()> {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [1])?;
+        let invariant = graph.parameter("bias", [1])?;
+        let parameters = (0..3)
+            .map(|i| graph.parameter(format!("w{i}"), [1]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let sequence = graph.value_sequence("weights", parameters.clone())?;
+        let result = graph.repeat(3, [x], [invariant], [sequence], |body, args| {
+            let x = body.add(args.carried[0], args.invariants[0])?;
+            Ok(vec![body.add(x, args.iterated[0])?])
+        })?[0];
+        graph.set_outputs([result])?;
+        let values = [(x, 1.0), (invariant, 2.0)]
+            .into_iter()
+            .chain(parameters.into_iter().zip([3.0, 4.0, 5.0]))
+            .map(|(id, value)| {
+                (
+                    id,
+                    HostTensor {
+                        shape: vec![1],
+                        values: vec![value],
+                    },
+                )
+            })
+            .collect();
+        let result_values = evaluate(&graph, values, &BTreeMap::new(), &BTreeMap::new())?;
+        assert_eq!(result_values[&result].values, vec![19.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn attention_blas_matches_scalar() -> Result<()> {
+        let mut rng = fastrand::Rng::with_seed(42);
+        for causal in [false, true] {
+            for (q, k, d, v) in [(5, 7, 3, 4), (9, 3, 8, 2)] {
+                let mut tensor = |shape: Vec<u32>| HostTensor {
+                    values: (0..product(&shape)).map(|_| rng.f32() - 0.5).collect(),
+                    shape,
+                };
+                let query = tensor(vec![2, q, d]);
+                let key = tensor(vec![2, k, d]);
+                let value = tensor(vec![2, k, v]);
+                let options = ipu_codegen::AttentionOptions {
+                    causal,
+                    scale: AttentionScale::ValueBits(0.7f32.to_bits()),
+                    ..Default::default()
+                };
+                let actual = attention(&query, &key, &value, options)?;
+                for stream in 0..2usize {
+                    for row in 0..q as usize {
+                        let allowed = if causal {
+                            (row + 1).min(k as usize)
+                        } else {
+                            k as usize
+                        };
+                        let scores: Vec<f64> = (0..allowed)
+                            .map(|col| {
+                                ((0..d as usize)
+                                    .map(|i| {
+                                        query.values[(stream * q as usize + row) * d as usize + i]
+                                            as f64
+                                            * key.values
+                                                [(stream * k as usize + col) * d as usize + i]
+                                                as f64
+                                    })
+                                    .sum::<f64>()
+                                    * 0.7f32 as f64)
+                                    .exp()
+                            })
+                            .collect();
+                        for col in 0..v as usize {
+                            let expected = scores
+                                .iter()
+                                .enumerate()
+                                .map(|(i, score)| {
+                                    score
+                                        * value.values[(stream * k as usize + i) * v as usize + col]
+                                            as f64
+                                })
+                                .sum::<f64>()
+                                / scores.iter().sum::<f64>();
+                            assert!(
+                                (actual.values[(stream * q as usize + row) * v as usize + col]
+                                    as f64
+                                    - expected)
+                                    .abs()
+                                    < 1e-6
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reference_quantizes_gemm_operands_without_changing_residuals() -> Result<()> {
         let mut graph = ComputeGraph::new();
         let x = graph.host_input("x", [1, 2])?;
@@ -991,6 +1139,10 @@ mod tests {
                 },
             ),
         ]);
+        let fp32 = evaluate(&graph, values.clone(), &BTreeMap::new(), &BTreeMap::new())?;
+        for i in 0..2 {
+            assert_eq!(fp32[&result].values[i], 2.0 * values[&x].values[i]);
+        }
         let reference = evaluate(
             &graph,
             values,

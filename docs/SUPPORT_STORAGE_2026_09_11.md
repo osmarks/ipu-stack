@@ -260,3 +260,85 @@ The one-layer hardware/reference run passes with unchanged maximum error
 0.077148 and **1026420 cycles**, versus 1026456 before tail reuse. No kernel
 instructions or plan selections changed. Artifacts:
 `artifacts/baseline-local-planner/tail-reuse-full1/` and `tail-reuse-full27/`.
+
+## Full-model validation and host reference
+
+The 27-layer, batch-one package now executes successfully. With the original
+unquantized randomized inputs and weights and FP32 reference arithmetic, the
+minimum output-embedding cosine similarity is **0.994212810**, exceeding the
+required strict **0.99** threshold. Maximum absolute error is 0.410389.
+This is one deterministic randomized model, not an accuracy result for trained
+SigLIP weights. The comparison includes quantization and device arithmetic
+approximations together.
+
+Use `--reference-run --reference-fp32` for this reference. Without
+`--reference-fp32`, the reference retains input, GEMM-operand and intermediate
+rounding to the selected device precisions. Device inputs are encoded in their
+actual storage formats in both modes. Complete ViT runs check cosine separately
+for every embedding and reject nonfinite or zero-norm results; operator tests
+retain their elementwise tolerances. Profiles are saved before numerical
+validation so that failed comparisons still leave an inspectable trace.
+
+The earlier 27-layer execution failed the old elementwise tolerance on one of
+1152 outputs (0.459961 reference versus 0.707031 device). It did not fail to
+execute. The later FP32 comparison above applies the requested whole-model
+criterion instead.
+
+The host-reference profile found excessive OpenMP/BLAS synchronization, scalar
+attention products, FP8 conversion, and needless cloning of every layer's
+weights into every Repeat iteration. Input generation and binding packing now
+run in parallel; Repeat binds only explicit region arguments; attention uses
+SGEMM; BLAS defaults to at most four threads while respecting explicit
+OPENBLAS_NUM_THREADS/OMP_NUM_THREADS settings.
+
+| Reference workload | Input preparation | Evaluation | Total |
+| --- | ---: | ---: | ---: |
+| Three layers, old device-precision reference | 10.828 s | 14.547 s | 25.375 s |
+| Three layers, accelerated device-precision reference | 1.878 s | 7.675 s | 9.553 s |
+| 27 layers, accelerated FP32 reference | 5.923 s | 20.960 s | 26.883 s |
+
+The earlier 27-layer device-precision reference took 167.53 s combined.
+That comparison changes reference precision as well as implementation;
+the three-layer comparison is the like-for-like 2.66x speedup.
+The accelerated three-layer reference passes at cosine 0.999580294.
+
+The full 27-layer profile spans **20,030,544 cycles / 13.353696 ms**, cropped
+at the renderer's normal start. Only the first Repeat iteration has detailed
+kernel samples; subsequent iterations are included in the repeat-remainder
+timing. Artifacts are in
+`artifacts/baseline-local-planner/reference-fp32-full27/` (`model.html`,
+`model.ipuprof`, `query.txt`, `run.log`).
+Before/after host measurements and the perf capture are in
+`reference-before-full3/` and `reference-after-full3/`.
+
+Tests cover independent scalar attention agreement, FP32 versus quantized GEMM
+reference behavior, Repeat argument binding, and per-embedding cosine rejection.
+All ten test-binary unit tests, workspace all-target checks and Clippy pass.
+
+## Current Repeat base-relocation audit
+
+The 27-layer package has ten repeated phases with changing source addresses.
+Six are compatible with one OUTGOING_BASE displacement per sender for the
+whole phase: phases 7, 10, 31, 37, 40 and 47 (normalization preparation, QKV,
+attention output projection, MLP normalization preparation, up and down
+projections). They account for **317350 of 317433 source-word patches** per
+Repeat transition across tiles. Downprojection alone accounts for 303323,
+with a maximum of **225 words on one tile**.
+
+The other four phases mix moving bias parameters and stationary sources:
+79 sender rows in total, each with two displacement runs. They cannot simply
+set one constant base for the entire phase. Cross-phase row-sharing patches
+are a separate category; these counts do not claim to eliminate them.
+
+These are structural eligibility counts, not a hardware validation of nonzero
+BASE with every paired/multicast encoding. The audit is
+`artifacts/repeat-address-audit/phases-bulk.rs`, with output in
+`tail-reuse-full27/base-audit.txt`.
+
+The element-tail allocator change preserves Repeat strides and these
+opportunities. A future noncontiguous Repeat representation would need to
+preserve common displacement within each sender/phase's relocation group.
+Displacements may differ between iterations without breaking BASE eligibility,
+but independently placed chunks in the same row can break it. Such placement
+can also lose arithmetic patch compression and require address tables; it is
+not needed to fit the present 27-layer package.
