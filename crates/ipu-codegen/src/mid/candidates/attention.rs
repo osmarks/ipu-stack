@@ -28,7 +28,7 @@ pub(super) fn product_variants(
     let values = inputs[2].shape.0[2];
     let grids = |columns: u32, inner: &[u16]| {
         let mut grids = Vec::new();
-        for rows in [1u16, 2, 4, 8, 16] {
+        for rows in 1u16..=16 {
             for &inner in inner {
                 if u32::from(rows) > query_rows || u32::from(inner) > keys.div_ceil(16) {
                     continue;
@@ -53,7 +53,7 @@ pub(super) fn product_variants(
     let mut pv = if policy == AttentionProducts::QkOnly {
         vec![]
     } else {
-        grids(values, &[1, 2, 4, 8])
+        grids(values, &[1, 2, 3, 4, 5, 6, 7, 8])
     };
     if matches!(
         policy,
