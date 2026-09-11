@@ -65,3 +65,53 @@ of code-span reduction would cross the next 16 KiB boundary.
 Logs are under `artifacts/baseline-local-planner/{code-packed27,support-packed27,retained-gemm27}/`.
 This does not establish that shrinking code alone will make the current baseline
 fit, nor that a different tensor layout cannot fit.
+
+## Compact exchange scheduling
+
+`--exchange-stream-words 256` selects address-ordered stream waves for package
+construction (`PipelineConfig.exchange_stream_words`). The latency-oriented
+scheduler remains the default. Cache recipes carry the selected mode through
+phase splitting, relocation, local optimization and final placement. Ordinary
+and paired candidates are ranked by maximum encoded row size, then total row
+size and latency. Compact mode does not subsequently apply latency-only ordering
+repairs that could undo its storage reduction. Hardware timing, dependency,
+Repeat-source and instruction-alignment checks are unchanged. The stream-order
+materializer is shared with offline replay.
+
+| 27-layer baseline mode | Maximum exchange-table bytes | Planning until rejection |
+|---|---:|---:|
+| Latency-oriented | 63784 | 59.90 s |
+| 256-word waves | 40488 | 32.77 s |
+| 1024-word waves | 39912 | 33.21 s |
+
+Both compact choices reserve three rather than four 16 KiB elements for the
+exchange table. Available tensor storage rises another 16384 bytes, to 464768
+bytes (453.875 KiB) per tile. Both still fail tensor placement; 1024-word waves
+save no additional element, so 256 is the preferred tested compact setting.
+These build times are individual samples, not isolated scheduling benchmarks.
+
+The full-size one-layer 256-word run passes hardware/reference validation
+(maximum absolute error 0.077148) at **1011180 cropped cycles / 0.674120 ms**,
+versus 970428 cycles for latency-oriented scheduling: **4.20% slower**. Its
+exchange tables are 40280 bytes, versus 62632 previously, and package planning
+takes 60.51 seconds. Profile:
+`artifacts/baseline-local-planner/streams256-full1/model.html`.
+The small three-layer compact run also passes (maximum absolute error 0.189453).
+219 tests, the doctest, Clippy and workspace all-target checks pass.
+
+### Further machine-code reduction candidates
+
+Inspection of the one-layer profile's called GEMM entry points and their current
+cached ELF sections finds 23 called entries across 15 objects, containing 6372
+bytes of supervisor wrappers. Used small/large row pairs contain 3112 bytes of
+second worker bodies. These are not entirely removable bytes: shared dispatch
+and row-parameter handling would need replacement instructions. A common
+supervisor and shared worker body with a small row-specific setup are concrete
+candidates; the inner AMP loop need not become an interpreter.
+
+The compact 27-layer program still reserves about 21.6 KiB for generated tile
+code and 9.1 KiB for host code. Per-word Repeat patch call sites can instead use
+bulk descriptors plus a shared patch loop, trading some data bytes for fewer
+instructions. That is separate from the already implemented bulk cross-phase
+row patching. Per-tile kernel linking/reservations offer another opportunity but
+require more changes to package address planning than sharing GEMM bodies.
