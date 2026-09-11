@@ -652,8 +652,8 @@ fn allocate_tile(
             .iter()
             .any(|root| root_requirements[root].distinct_element);
         // The current iteration's argument aliases the first member. Isolate
-        // the entire sequence from other allocations, rather than padding every
-        // member to an element. Multiple constrained members may also be used
+        // the entire sequence from other constrained allocations instead of
+        // padding every member to an element. Multiple constrained members may be used
         // together outside the loop, so retain individual separation for those.
         let separate_members = roots
             .iter()
@@ -930,25 +930,15 @@ impl Arena {
                             .max(if request.distinct_element { element } else { 1 });
                     let bytes = if region1 && let Some(stride) = request.region1_stride {
                         stride.checked_mul(u32::try_from(request.assignments.len()).ok()?)?
-                    } else if request.distinct_element {
-                        align_up(request.bytes, element).ok()?
                     } else {
                         request.bytes
                     };
                     let start = align_up(base, alignment).ok()?;
-                    let mut end = start.checked_add(bytes)?;
-                    // The loader stops partway through the last SRAM element.
-                    // Reserve all its available bytes, but require only the
-                    // actual payload/access tail to fit below the loading limit.
-                    // Never truncate at an ordinary free gap: the remainder of
-                    // that element may belong to another live allocation.
-                    if limit == IPU21_APPLICATION_MEMORY_LIMIT
-                        && request.distinct_element
-                        && request.region1_stride.is_none()
-                        && start.checked_add(request.bytes)? <= limit
-                    {
-                        end = end.min(limit);
-                    }
+                    // Element-aligned starts plus byte non-overlap keep all
+                    // constrained allocations in different elements. Unconstrained
+                    // allocations may use their tails: none is an operand that
+                    // must be separated from a constrained allocation.
+                    let end = start.checked_add(bytes)?;
                     // Ordinary buffers prefer region 0; compact addresses within
                     // each region leave long contiguous spans for later requests.
                     (end <= limit).then_some(((region1, start), index, start, end))
@@ -1178,11 +1168,12 @@ mod tests {
             arena.allocate(&constrained),
             Some(base + IPU21_INTERLEAVED_ELEMENT_SIZE)
         );
-        assert!(
-            arena
-                .allocate(&request(MemoryClass::Ipu21Standard, 8, 8, 2, 2))
-                .is_none()
+        // Unrelated live data can fill the tail of either constrained operand.
+        assert_eq!(
+            arena.allocate(&request(MemoryClass::Ipu21Standard, 8, 8, 2, 2)),
+            Some(base + 8)
         );
+        assert!(arena.allocate(&constrained).is_none());
         assert!(
             arena
                 .allocate(&request(MemoryClass::Ipu21Interleaved, 64, 8, 3, 3))
@@ -1191,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn final_partial_element_accepts_payload_but_preserves_exclusivity() {
+    fn partial_elements_accept_payload_without_truncating_it() {
         let limit = IPU21_APPLICATION_MEMORY_LIMIT;
         let base = limit / IPU21_INTERLEAVED_ELEMENT_SIZE * IPU21_INTERLEAVED_ELEMENT_SIZE;
         let mut arena = Arena::new(&[(base, limit)], 0);
@@ -1211,10 +1202,12 @@ mod tests {
         payload.lifetime.last = 5;
         assert!(arena.allocate(&payload).is_none());
 
-        // The same partial free span elsewhere may border a live allocation.
+        // A payload also fits before an unrelated live allocation in the same
+        // element. Another constrained buffer cannot start in that element.
         let base = IPU21_INTERLEAVED_MEMORY_BASE;
         let mut ordinary_gap = Arena::new(&[(base, base + 1024)], 0);
         payload.bytes = 512;
+        assert_eq!(ordinary_gap.allocate(&payload), Some(base));
         assert!(ordinary_gap.allocate(&payload).is_none());
     }
 
@@ -1230,7 +1223,7 @@ mod tests {
         for trial in 0..128 {
             let mut arena = Arena::new(&ranges, 256);
             arena.offline = trial % 2 != 0;
-            let mut placed = Vec::<(u32, u32, u32, u32)>::new();
+            let mut placed = Vec::<(u32, u32, u32, u32, bool)>::new();
             for step in 0..32 {
                 let first = if arena.offline {
                     random.u32(0..32)
@@ -1265,19 +1258,39 @@ mod tests {
                             .iter()
                             .any(|&(base, limit)| base <= address && end <= limit)
                     );
-                    for &(other, other_end, other_first, other_last) in &placed {
+                    for &(other, other_end, other_first, other_last, other_constrained) in &placed {
                         if first <= other_last && other_first <= request.lifetime.last {
                             assert!(end <= other || other_end <= address);
+                            if request.distinct_element
+                                && other_constrained
+                                && (address >= boundary) == (other >= boundary)
+                            {
+                                let element = if address >= boundary {
+                                    IPU21_INTERLEAVED_ELEMENT_SIZE
+                                } else {
+                                    TILE_MEMORY_ELEMENT_SIZE
+                                };
+                                assert!(
+                                    end.div_ceil(element) <= other / element
+                                        || other_end.div_ceil(element) <= address / element
+                                );
+                            }
                         }
                     }
-                    placed.push((address, end, first, request.lifetime.last));
+                    placed.push((
+                        address,
+                        end,
+                        first,
+                        request.lifetime.last,
+                        request.distinct_element,
+                    ));
                 }
             }
             for (base, end) in arena.unused_ranges() {
                 assert!(
                     placed
                         .iter()
-                        .all(|&(other, other_end, _, _)| end <= other || other_end <= base)
+                        .all(|&(other, other_end, _, _, _)| end <= other || other_end <= base)
                 );
             }
         }

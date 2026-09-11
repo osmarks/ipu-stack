@@ -230,3 +230,33 @@ storage, then cycles. The comparison runs disabled local optimization with
 
 Artifacts: `artifacts/baseline-local-planner/capacity-probe-full27/run.log`,
 `probe.patch`, and `memory/`. The patch is diagnostic-only and is not applied.
+
+## Reuse constrained-buffer element tails
+
+The extra-capacity estimate above described the previous allocator's rounding,
+not additional live tensor payload. `distinct_element` marked both operands of
+a GEMM/loopback separation constraint, aligned their starts, and reserved each
+buffer through the end of its last element. That unnecessarily excluded ordinary
+buffers (including unrelated weights) from the tails.
+
+Placement now retains element-aligned starts for constrained allocations but
+reserves only payload plus the declared kernel access tail. Two live constrained
+allocations still cannot share an element: the later one's aligned start would
+intersect the earlier one's occupied bytes. Ordinary allocations can use the
+remaining bytes because any operand requiring separation is itself marked and
+aligned. Repeat groups retain their existing contiguous spans and member strides.
+The special-case truncation at the final partial SRAM element is consequently
+unnecessary and removed.
+
+A diagnostic probe first confirmed all-tile placement at the actual ranges,
+without scheduling or executing the hypothetical image. The production change
+then builds the full 27-layer package, including relocated exchange schedules,
+in 65.38 seconds (one sample while a one-layer build also ran). The package was
+loaded for numerical validation. All 219 codegen tests, the doctest, Clippy and
+workspace checks pass. Randomized allocation tests now explicitly verify element
+separation between constrained live allocations alongside byte non-overlap.
+
+The one-layer hardware/reference run passes with unchanged maximum error
+0.077148 and **1026420 cycles**, versus 1026456 before tail reuse. No kernel
+instructions or plan selections changed. Artifacts:
+`artifacts/baseline-local-planner/tail-reuse-full1/` and `tail-reuse-full27/`.
