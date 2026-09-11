@@ -216,3 +216,47 @@ establish a speedup. Full-model comparisons are recorded separately below.
 The codegen suite passes 235 tests (four ignored), including cross-provenance
 copy/fill motion, aliases, shared reads and actual receive-write-send hazards.
 The workspace/all-targets check also passes.
+
+### Full-model comparison and retained implementation
+
+Both optimized 27-layer builds passed three resident hardware invocations, with
+FP32-reference cosine 0.994168165 and maximum absolute error 0.424608. They accepted
+the same sequence of operator/boundary improvements. Timings use the renderer's
+cropped range, not the entire profiling interval.
+
+| Build | Cropped cycles | Time | Reserved exchange bytes/tile | Repeat patch words, maximum list | Profiled-layer barriers |
+|---|---:|---:|---:|---:|---:|
+| Corrected base selection | 13,281,234 | 8.854156 ms | 40,880 | 2,052 total / 18 maximum | 30 |
+| Cross-operator copy/fill grouping | 13,391,934 | 8.927956 ms | 42,336 | 2,042 total / 16 maximum | 27 |
+
+Artifacts and rendered profiles are respectively
+`artifacts/exchange-boundaries-20260911/base27/model.html` and
+`artifacts/exchange-boundaries-20260911/grouped27/model.html`.
+
+The grouped version removes all three remaining internal single-tile copy
+phases. Repeat entry/exit copies remain, as do the mixed padding/cast and
+padding/packing preparation groups. Row-sharing patches fall from 1,828 words
+to 14 words per profiled layer, but this is outweighed by longer exchanges.
+The principal merged schedule horizons are:
+
+| Boundary | Separate horizons, summed | Merged horizon |
+|---|---:|---:|
+| Q/K preparation | 4,464 + 6,856 = 11,320 | 11,704 |
+| MLP-up preparation | 3,558 + 8,747 = 12,305 | 14,011 |
+| MLP-down preparation | 5,448 + 10,141 = 15,589 | 17,928 |
+
+These are the actually selected placed schedules, so the comparison includes
+placement effects and is not an isolated scheduler benchmark. Their enlarged
+horizons and changed per-tile completion times outweigh the barriers removed.
+The full grouped run is 110,700 cycles (0.83%) slower and reserves 1,456 more
+exchange bytes per tile. The two-layer run also regressed.
+
+Consequently **the cross-operator/fill grouping experiment was removed from the
+active tree**; its implementation remains in commit `9f04299`. The retained
+implementation is the same-operator copy-motion pass plus dependency-aware
+compact ordering and corrected mixed-base selection. Its validated profile is
+`base27/model.html`. It is marginally faster than the pre-fusion 8.861260 ms run,
+and fixes the 107-word patch regression of `copy-fusion-20260911/final27`.
+Further fusion needs a way to select it using actual schedule cost (including
+completion skew and setup), or an ordering algorithm that handles these merged
+streams better; removing more dependency-check restrictions alone is insufficient.
