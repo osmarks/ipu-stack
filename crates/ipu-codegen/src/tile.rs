@@ -771,6 +771,7 @@ mod tests {
             estimated_exchange_cycles: 0,
         };
         let program = LowProgram {
+            requires_finite_scratch: false,
             program: std::sync::Arc::new(graph),
             repeat_runs: vec![],
             tiles: vec![TileWorkList {

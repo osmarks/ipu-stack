@@ -226,7 +226,14 @@ fn profile(
     values: &[MidValue],
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<Profile> {
-    let program = mid::resolved_region(config.tile_count, initial, operations, outputs, values)?;
+    let mut program =
+        mid::resolved_region(config.tile_count, initial, operations, outputs, values)?;
+    for input in &mut program.inputs {
+        let origin = program.values[input.value.index() as usize].origin;
+        if let Some(source) = graph.inputs().iter().find(|source| source.value == origin) {
+            input.kind = source.kind;
+        }
+    }
     let mut timeline = Timeline::default();
     let (_, peak) = mid::analyze_observed(&program, copies, &mut timeline)?;
     let names = names(graph);
@@ -325,6 +332,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parameters_remain_live_after_their_last_operator_use() {
+        let mut graph = ComputeGraph::new();
+        let weight = graph.parameter("weight", [8, 64]).unwrap();
+        let input = graph.host_input("input", [8, 64]).unwrap();
+        let added = graph.add(input, weight).unwrap();
+        let output = graph.gelu(added).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(4)
+            .with_automatic_input(input, crate::Precision::F16)
+            .with_automatic_input(weight, crate::Precision::F16);
+        let program = crate::mid::implementation::resolve(
+            crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap(),
+        )
+        .unwrap();
+        let mut timeline = Timeline::default();
+        mid::analyze_observed(&program, &BTreeMap::new(), &mut timeline).unwrap();
+        let parameter = program
+            .inputs
+            .iter()
+            .find(|input| input.kind == crate::GraphInputKind::Parameter)
+            .unwrap()
+            .value;
+        let root = timeline
+            .values
+            .iter()
+            .find(|v| v.id == parameter.index())
+            .unwrap()
+            .root;
+        assert!(timeline.steps.len() >= 2);
+        assert!(timeline.steps.iter().all(|step| step.live.contains(&root)));
+    }
+
+    #[test]
     fn timeline_reconstructs_estimates_with_repeat_aliases_and_padding() {
         let mut graph = ComputeGraph::new();
         let input = graph.host_input("state</script>", [1, 8, 32]).unwrap();
@@ -342,7 +382,10 @@ mod tests {
         for weight in weights {
             config = config.with_automatic_input(weight, Precision::F16);
         }
-        let program = crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let program = crate::mid::implementation::resolve(
+            crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap(),
+        )
+        .unwrap();
         let initial = program
             .inputs
             .iter()
@@ -359,15 +402,7 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        let (_, expected) = mid::region_estimate(
-            &config,
-            &initial,
-            &program.operations,
-            &program.outputs,
-            &program.values,
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let (_, expected) = mid::analyze(&program, &BTreeMap::new()).unwrap();
         assert_eq!(report.peak, expected);
         let mut allocations = BTreeMap::new();
         for value in &report.timeline.values {

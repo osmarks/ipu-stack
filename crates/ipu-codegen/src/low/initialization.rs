@@ -289,6 +289,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
     for repeat in &mut program.repeat_runs {
         repeat.body.work.retain(&mut remove);
     }
+    program.requires_finite_scratch |= removed != 0;
     tracing::info!(
         removed,
         "eliminated finite GEMM padding clears using load-time SRAM initialization"
@@ -401,6 +402,7 @@ mod tests {
         };
         LowProgram {
             program: Arc::new(graph),
+            requires_finite_scratch: false,
             tiles: vec![TileWorkList {
                 tile: 0,
                 work: vec![
@@ -494,6 +496,7 @@ mod tests {
         let mut program = fixture();
         reuse_finite_padding(&mut program);
         assert_eq!(program.tiles[0].work.len(), 1);
+        assert!(program.requires_finite_scratch);
         for case in 0..5 {
             let mut program = fixture();
             let graph = Arc::make_mut(&mut program.program);

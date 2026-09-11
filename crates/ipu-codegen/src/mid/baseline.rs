@@ -515,11 +515,18 @@ impl<C: CostModel> Builder<'_, C> {
                 &mut body,
             ));
         }
+        let mut retained = yields.clone();
+        retained.extend(
+            arguments
+                .iter()
+                .copied()
+                .filter(|id| self.state.parameter_values.contains(id)),
+        );
         let peak = region_peak_memory_with_multiplicity(
             self.config,
             &arguments,
             &body,
-            &yields,
+            &retained,
             &self.state.values,
             &self.copies,
         );

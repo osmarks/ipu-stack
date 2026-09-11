@@ -102,7 +102,7 @@ function describe(a){
  return p.labels[a.label]+'\nTile '+a.tile.logical+' · physical '+a.tile.physical+' · '+(a.lane?'reuse row '+a.lane:'main row')
  +'\n'+hex(a.start)+'–'+hex(a.end)+' (end exclusive) · '+bytes(a.end-a.start)
  +'\n'+a.kind+' · '+(a.kind==='support'?'reserved capacity ':'payload ')+bytes(a.payload_end-a.start)+' · tail/padding '+bytes(a.end-a.payload_end)
- +'\nLifetime: '+(a.last===4294967295?'whole program':a.first+'–'+a.last+' (allocator events, inclusive)')
+ +'\nLifetime: '+(a.first===4294967295?'host output exchange':a.last===4294967295?(a.first===0?'whole program':a.first+'–host output exchange'):a.first+'–'+a.last+' (allocator events, inclusive)')
  +(a.shards.length?'\nShard'+(a.shards.length===1?' ':' aliases ')+a.shards.join(', '):'');
 }
 function findAt(e){

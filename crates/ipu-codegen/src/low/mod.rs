@@ -59,6 +59,9 @@ pub struct TileWorkList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LowProgram {
     pub program: Arc<TileGraph>,
+    /// Padding clears were elided using the finite-F16 arena invariant.
+    /// Such storage cannot borrow memory containing host protocol words.
+    pub requires_finite_scratch: bool,
     pub tiles: Vec<TileWorkList>,
     pub repeat_runs: Vec<RepeatRun>,
 }
@@ -157,6 +160,7 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
     );
     let mut low = LowProgram {
         program: Arc::clone(program),
+        requires_finite_scratch: false,
         tiles,
         repeat_runs,
     };

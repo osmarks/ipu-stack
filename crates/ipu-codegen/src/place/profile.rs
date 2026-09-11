@@ -184,16 +184,24 @@ fn collect(
             }
         }
         for allocation in support.allocations() {
-            tile.allocations.push(Allocation {
-                start: allocation.reserved.start,
-                end: allocation.reserved.end,
-                payload_end: allocation.range.end,
-                label: labels.intern(allocation.name.into()),
-                kind: "support",
-                first: 0,
-                last: u32::MAX,
-                shards: vec![],
-            });
+            let host_aperture = !program.requires_finite_scratch
+                && (allocation.reserved.start, allocation.reserved.end) == HOST_SCRATCH_RANGE;
+            for (first, last) in if host_aperture {
+                vec![(0, 0), (u32::MAX, u32::MAX)]
+            } else {
+                vec![(0, u32::MAX)]
+            } {
+                tile.allocations.push(Allocation {
+                    start: allocation.reserved.start,
+                    end: allocation.reserved.end,
+                    payload_end: allocation.range.end,
+                    label: labels.intern(allocation.name.into()),
+                    kind: "support",
+                    first,
+                    last,
+                    shards: vec![],
+                });
+            }
         }
         // Host descriptors can occupy otherwise unused per-tile tensor space.
         // Record image segments outside global reservations as well.
@@ -347,7 +355,37 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let report = collect(&low, &placement, &TileMemoryMap::new(), &application).unwrap();
+        let mut support = TileMemoryMap::new();
+        support
+            .reserve(
+                "host exchange aperture",
+                HOST_SCRATCH_RANGE.0..HOST_SCRATCH_RANGE.1,
+            )
+            .unwrap();
+        let report = collect(&low, &placement, &support, &application).unwrap();
+        for input in low
+            .inputs
+            .iter()
+            .filter(|input| input.kind == crate::GraphInputKind::Parameter)
+        {
+            for shard in &input.shards {
+                let tile = &report.tiles[usize::from(low.shards[shard.index() as usize].tile)];
+                let allocation = tile
+                    .allocations
+                    .iter()
+                    .find(|a| a.shards.contains(&shard.index()))
+                    .unwrap();
+                assert_eq!((allocation.first, allocation.last), (0, u32::MAX));
+                assert!(allocation.start >= HOST_SCRATCH_RANGE.1);
+                // This must also exclude deliberate writable aliases of parameters.
+                for run in &low.kernel_runs {
+                    assert!(
+                        run.outputs()
+                            .all(|out| !allocation.shards.contains(&out.shard.index()))
+                    );
+                }
+            }
+        }
         for (&shard, &address) in &placement.shard_addresses {
             let tile = usize::from(low.shards[shard.index() as usize].tile);
             let matches = report.tiles[tile]

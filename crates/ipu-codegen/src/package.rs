@@ -96,6 +96,8 @@ pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
 
 #[derive(Clone, Debug)]
 pub struct PackageConfig {
+    /// Host-triggered inference calls after a single parameter upload.
+    pub invocations: u32,
     pub toolchain: Toolchain,
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
@@ -358,7 +360,13 @@ fn build_package_artifacts(
                     }
                     Ok(objects)
                 })?;
-                build_package_from_objects(selected, &planning, &objects, &kernel_plan)
+                build_package_from_objects(
+                    selected,
+                    &planning,
+                    &objects,
+                    &kernel_plan,
+                    config.invocations,
+                )
             },
         )
     })?;
@@ -379,6 +387,7 @@ fn build_package_from_objects(
     config: &PipelineConfig,
     objects: &[Vec<u8>],
     kernel_plan: &KernelBuildPlan,
+    invocations: u32,
 ) -> PackageBuildResult<(u64, BuiltApplication)> {
     let program = &selected.program;
     let provisional_placement = &selected.placement;
@@ -572,6 +581,7 @@ fn build_package_from_objects(
                     &symbols,
                     host,
                     &CodegenOptions {
+                        invocations,
                         code_address: sizing_code_address,
                         initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
                         final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
@@ -653,8 +663,9 @@ fn build_package_from_objects(
             })
         })
         .transpose()?;
-    let available_ranges =
+    let mut available_ranges =
         memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT);
+    available_ranges.insert(0, crate::place::HOST_SCRATCH_RANGE);
     tracing::info!(
         linked_end,
         profile_bytes = profile_storage
@@ -715,7 +726,11 @@ fn build_package_from_objects(
         &physical_to_logical,
         profile_storage.as_ref().map(|storage| storage.range.start),
     )?;
-    let inactive_auxiliary_ranges = available_ranges.clone();
+    let inactive_auxiliary_ranges = available_ranges
+        .iter()
+        .copied()
+        .filter(|range| *range != crate::place::HOST_SCRATCH_RANGE)
+        .collect::<Vec<_>>();
     let mut host_data_ranges = auxiliary_ranges(
         program,
         &placement,
@@ -729,7 +744,7 @@ fn build_package_from_objects(
             ranges.sort_unstable();
         }
     }
-    let host = host::plan(
+    let mut host = host::plan(
         &weights,
         &inputs,
         &outputs,
@@ -737,6 +752,11 @@ fn build_package_from_objects(
         host_code_base,
         &host_data_ranges,
     )?;
+    for call in &mut host.protocol.calls {
+        if call.name == "run" {
+            call.invocations = invocations;
+        }
+    }
     let final_host_code_bytes = host
         .end
         .checked_sub(host_code_base)
@@ -812,6 +832,7 @@ fn build_package_from_objects(
                     &symbols,
                     host,
                     &CodegenOptions {
+                        invocations,
                         code_address,
                         initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
                         final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),

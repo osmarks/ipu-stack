@@ -78,10 +78,20 @@ impl Lifetime {
     }
 }
 
+/// The host protocol owns this range before and after device execution.
+/// It is never available to persistent support, inputs or outputs.
+pub(crate) const HOST_SCRATCH_RANGE: (u32, u32) = (
+    ipu_exchange::EXCHANGE_WINDOW_BASE,
+    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+);
+
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
     place_with_ranges(
         program,
-        &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
+        &[
+            HOST_SCRATCH_RANGE,
+            (IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT),
+        ],
     )
 }
 
@@ -102,7 +112,9 @@ pub(crate) fn place_with_offset(
         return Err(PlacementError::Overflow);
     }
     if available_ranges.iter().any(|&(start, end)| {
-        start < IPU21_DATA_BASE || end > IPU21_APPLICATION_MEMORY_LIMIT || start >= end
+        (start < IPU21_DATA_BASE && (start, end) != HOST_SCRATCH_RANGE)
+            || end > IPU21_APPLICATION_MEMORY_LIMIT
+            || start >= end
     }) || available_ranges
         .windows(2)
         .any(|pair| pair[0].1 > pair[1].0)
@@ -270,7 +282,13 @@ fn place_tile(
     // Both access classes share region 1. A single lifetime-ordered arena
     // lets ordinary storage reuse dead interleaved buffers and vice versa.
     let mut addresses = BTreeMap::new();
-    let mut arena = Arena::new(available_ranges, interleaved_offset);
+    // Host packet bits do not preserve the finite-F16 padding invariant.
+    let ranges = available_ranges
+        .iter()
+        .copied()
+        .filter(|range| !program.requires_finite_scratch || *range != HOST_SCRATCH_RANGE)
+        .collect::<Vec<_>>();
+    let mut arena = Arena::new(&ranges, interleaved_offset);
     allocate_tile(
         program,
         tile,
@@ -328,6 +346,10 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
     for input in &program.inputs {
         for shard in &input.shards {
             lifetimes[shard.index() as usize].touch(0);
+            // initialize uploads parameters once; every subsequent run needs them.
+            if input.kind == crate::GraphInputKind::Parameter {
+                lifetimes[shard.index() as usize].touch(u32::MAX);
+            }
         }
     }
     for tile in &program.tiles {
@@ -343,7 +365,8 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
             );
         }
         for shard in &outputs[usize::from(tile.tile)] {
-            lifetimes[shard.index() as usize].touch(event);
+            // The host reads outputs only after device work has finished.
+            lifetimes[shard.index() as usize].touch(u32::MAX);
         }
     }
     for (index, lifetime) in lifetimes.iter_mut().enumerate() {
@@ -920,7 +943,18 @@ impl Arena {
             .free
             .iter()
             .enumerate()
-            .flat_map(|(index, &(base, limit))| {
+            .filter_map(|(index, &(base, limit))| {
+                // These ranges cannot coalesce across the permanently reserved
+                // runtime state. Borrow the aperture only between host phases.
+                if HOST_SCRATCH_RANGE.0 <= base
+                    && limit <= HOST_SCRATCH_RANGE.1
+                    && (first == 0 || last == u32::MAX)
+                {
+                    return None;
+                }
+                Some((index, base, limit))
+            })
+            .flat_map(|(index, base, limit)| {
                 // Keep candidate spans within one address region even after free
                 // ranges coalesce across its boundary.
                 [false, true].into_iter().filter_map(move |region1| {
@@ -1005,6 +1039,10 @@ impl Arena {
         let merged = crate::memory::merge_ranges(self.occupied.clone());
         let mut unused = Vec::new();
         for &(base, limit) in &self.ranges {
+            // Even unused aperture bytes belong to the next host exchange.
+            if (base, limit) == HOST_SCRATCH_RANGE {
+                continue;
+            }
             let mut cursor = base;
             for &(occupied_base, occupied_limit) in &merged {
                 if occupied_limit <= cursor || occupied_base >= limit {
@@ -1093,6 +1131,75 @@ mod tests {
             },
             assignments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pointwise_parameter_input_is_never_overwritten() {
+        let mut graph = ComputeGraph::new();
+        let parameter = graph.parameter("p", [8, 64]).unwrap();
+        let output = graph.gelu(parameter).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(4).with_input(
+            parameter,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_sharded(4),
+            },
+        );
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+        let analysis = analyze_allocations(&low).unwrap();
+        let roots = low.inputs[0]
+            .shards
+            .iter()
+            .map(|id| analysis.root_of_member[id.index() as usize])
+            .collect::<BTreeSet<_>>();
+        for run in &low.kernel_runs {
+            assert!(
+                run.outputs().all(
+                    |out| !roots.contains(&analysis.root_of_member[out.shard.index() as usize])
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn host_aperture_is_borrowed_only_between_host_phases() {
+        let (base, end) = HOST_SCRATCH_RANGE;
+        for offline in [false, true] {
+            let mut arena = Arena::new(&[HOST_SCRATCH_RANGE], 0);
+            arena.offline = offline;
+            let standard = MemoryClass::Ipu21Standard;
+            for (first, last) in [(0, 3), (0, u32::MAX), (2, u32::MAX)] {
+                assert!(
+                    arena
+                        .allocate(&request(standard, 8, 8, first, last))
+                        .is_none()
+                );
+            }
+            assert!(
+                arena
+                    .allocate(&request(MemoryClass::Ipu21Interleaved, 8, 8, 1, 2))
+                    .is_none()
+            );
+            assert_eq!(arena.allocate(&request(standard, 8, 8, 1, 2)), Some(base));
+            // Filtering also applies to fragments of the aperture.
+            assert!(
+                arena
+                    .allocate(&request(standard, 8, 8, 2, u32::MAX))
+                    .is_none()
+            );
+            assert_eq!(
+                arena.allocate(&request(standard, end - base, 8, 3, 4)),
+                Some(base)
+            );
+            assert!(arena.unused_ranges().is_empty());
+        }
+        assert!(
+            Arena::new(&[HOST_SCRATCH_RANGE], 0)
+                .unused_ranges()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1499,10 +1606,9 @@ mod tests {
         let lifetimes = collect_lifetimes(&low);
         for &id in &low.outputs[0].shards {
             let tile = low.shards[id.index() as usize].tile;
-            let end = 1 + low.work(&low.tiles[usize::from(tile)]).count() as u32;
             assert_eq!(
                 lifetimes[id.index() as usize].last,
-                end,
+                u32::MAX,
                 "output on tile {tile}"
             );
         }

@@ -53,6 +53,9 @@ struct Arguments {
     /// Compare with unquantized FP32 inputs, weights and intermediate results.
     #[arg(long, requires = "reference_run")]
     reference_fp32: bool,
+    /// Validate successive inference calls after uploading parameters only once.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..), requires = "reference_run")]
+    reference_inferences: u32,
     /// Maximum number of logical elements checked per operator result.
     #[arg(long, default_value_t = 256)]
     diagnostic_samples: usize,
@@ -1038,6 +1041,7 @@ fn main() -> Result<()> {
     }
     pipeline.memory_profile_directory = arguments.memory_profile_directory.clone();
     let package_config = PackageConfig {
+        invocations: arguments.reference_inferences,
         tile_mapping: arguments
             .tile_mapping
             .as_ref()
@@ -1181,6 +1185,7 @@ fn main() -> Result<()> {
                         ))
                     },
                     arguments.reference_fp32,
+                    arguments.reference_inferences,
                     arguments
                         .profile_output
                         .as_deref()
@@ -1210,6 +1215,7 @@ fn main() -> Result<()> {
                     arguments.timeout_seconds,
                     ReferenceCheck::Elementwise((0.02, 0.0)),
                     false,
+                    1,
                     None,
                 )?;
                 println!(
@@ -1462,6 +1468,7 @@ fn run_reference(
     timeout_seconds: u64,
     check: ReferenceCheck,
     fp32: bool,
+    inferences: u32,
     profile: Option<(&Path, u64)>,
 ) -> Result<(Vec<u8>, f32)> {
     let started = std::time::Instant::now();
@@ -1492,10 +1499,6 @@ fn run_reference(
         elapsed_ms = started.elapsed().as_millis(),
         "evaluated host reference"
     );
-    let output = run_initialized_program(runtime, application, &weights, &inputs, timeout_seconds)?;
-    if let Some((path, clock_hz)) = profile {
-        write_profile(application, &output, clock_hz, Some(path))?;
-    }
     let tensor = package
         .outputs
         .iter()
@@ -1504,8 +1507,57 @@ fn run_reference(
     let expected = references
         .get(&tensor.value)
         .context("host reference has no graph output")?;
-    let maximum_error =
-        verify_logical_output(application, tensor, &output, &expected.values, check)?;
+    let mut maximum_error = 0.0f32;
+    let mut first_output: Option<Vec<u8>> = None;
+    let output = run_checked_inferences(
+        runtime,
+        application,
+        &weights,
+        &inputs,
+        timeout_seconds,
+        inferences,
+        |index, output| {
+            if index == 0
+                && let Some((path, clock_hz)) = profile
+            {
+                write_profile(application, output, clock_hz, Some(path))?;
+            }
+            maximum_error = maximum_error.max(verify_logical_output(
+                application,
+                tensor,
+                output,
+                &expected.values,
+                check,
+            )?);
+            // Profiles contain changing counters, so compare only logical tensor bytes.
+            if let Some(first) = &first_output {
+                let (binding, base) = output_binding(application, "output.0")?;
+                for shard in &tensor.shards {
+                    let slice = binding
+                        .slices
+                        .iter()
+                        .find(|slice| {
+                            slice.tile == u32::from(shard.physical_tile)
+                                && slice.tile_address == shard.address
+                        })
+                        .context("output binding slice is missing")?;
+                    for (_, offset) in diagnostic::shard_elements(tensor, shard)? {
+                        let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
+                        let end = start + tensor.precision.bytes() as usize;
+                        anyhow::ensure!(
+                            first[start..end] == output[start..end],
+                            "inference {} changed output with identical inputs",
+                            index + 1
+                        );
+                    }
+                }
+            } else if inferences > 1 {
+                first_output = Some(output.to_vec());
+            }
+            println!("referenceInference={} numericalTest=PASS", index + 1);
+            Ok(())
+        },
+    )?;
     Ok((output, maximum_error))
 }
 
@@ -1785,6 +1837,27 @@ fn run_initialized_program(
     input: &[u8],
     timeout_seconds: u64,
 ) -> Result<Vec<u8>> {
+    run_checked_inferences(
+        runtime,
+        application,
+        weights,
+        input,
+        timeout_seconds,
+        1,
+        |_, _| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_checked_inferences(
+    runtime: &Runtime,
+    application: &Application,
+    weights: &[u8],
+    input: &[u8],
+    timeout_seconds: u64,
+    count: u32,
+    mut check: impl FnMut(u32, &[u8]) -> Result<()>,
+) -> Result<Vec<u8>> {
     let mut session = runtime.host_session(application)?;
     session.start().inspect_err(|_| {
         eprintln!(
@@ -1796,26 +1869,32 @@ fn run_initialized_program(
         let initialized = session.invoke_streaming_deferred("initialize", weights)?;
         session.collect(&initialized)?;
     }
-    let executed = session
-        .invoke_streaming_deferred("run", input)
-        .inspect_err(|_| {
-            eprintln!(
-                "runFailureDiagnostics={}",
-                device_failure_diagnostics(runtime, application)
-            );
-        })?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds)).with_context(
-        || {
-            format!(
-                "deviceFailureDiagnostics={}",
-                device_failure_diagnostics(runtime, application)
-            )
-        },
-    )?;
-    Ok(session.collect(&executed)?)
+    let mut output = Vec::new();
+    for index in 0..count {
+        let executed = session
+            .invoke_streaming_deferred("run", input)
+            .inspect_err(|_| {
+                eprintln!(
+                    "runFailureDiagnostics={}",
+                    device_failure_diagnostics(runtime, application)
+                );
+            })?;
+        runtime
+            .device()
+            .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+        if index + 1 == count {
+            diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))
+                .with_context(|| {
+                    format!(
+                        "deviceFailureDiagnostics={}",
+                        device_failure_diagnostics(runtime, application)
+                    )
+                })?;
+        }
+        output = session.collect(&executed)?;
+        check(index, &output)?;
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1912,6 +1991,7 @@ fn run_siglip_mlp_benchmark(
         timeout_seconds,
         ReferenceCheck::Elementwise((0.03, 0.05)),
         false,
+        1,
         None,
     )?;
     if !profiling_enabled {

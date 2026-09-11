@@ -98,7 +98,7 @@ impl<'a> CandidateSearch<'a> {
             direct_consumer_layouts(self.consumers, operation.results[0], output_shape, config);
         let mut generated = Vec::new();
         for grouped_output in groupings {
-            for plan in plans(
+            for mut plan in plans(
                 operation,
                 input_types,
                 parameter_inputs,
@@ -110,6 +110,17 @@ impl<'a> CandidateSearch<'a> {
                 &direct_consumer_layouts,
                 output_demands,
             ) {
+                if let OutputAliasing::MayAliasInputs(indices) =
+                    &mut plan.requirements.output_aliasing
+                {
+                    // An input is writable only when this is its final use.
+                    // Parameters remain live across host inference calls.
+                    indices.retain(|&index| {
+                        let index = usize::from(index);
+                        !parameter_inputs[index]
+                            && self.value_uses.get(&operation.inputs[index]) == Some(&1)
+                    });
+                }
                 if !generated.contains(&plan) {
                     generated.push(plan);
                 }

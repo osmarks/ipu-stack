@@ -221,7 +221,13 @@ fn analyze_storage<const PER_TILE: bool>(
             }
         }
     }
-    for value in &program.outputs {
+    for value in program.outputs.iter().copied().chain(
+        program
+            .inputs
+            .iter()
+            .filter(|input| input.kind == crate::GraphInputKind::Parameter)
+            .map(|input| input.value),
+    ) {
         last[roots[value.index() as usize]] = steps.len();
     }
     // A region argument represents a resident sequence, not just this
