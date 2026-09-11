@@ -647,3 +647,21 @@ Profiles for the two current working builds are in
 Local search now reaches materialized attention and a wider output-projection
 candidate. That wider candidate currently traps during casting; the baseline
 above passes, and the wider isolated cast check passes. Investigation continues.
+
+### Invalid streamed conversion discovered by the fit tests
+
+The newly fitting wider projection exposed a pre-existing resolver bug. Its
+FP16 redistribution was marked `DispatchSlices`, so `resolve_region` removed it
+and recorded a deferred source. Only operator resolution consulted that mapping;
+the following local FP8 cast still read the removed conversion's output. The
+placement map made this visible: value 401 on tile 0 had a lifetime containing
+only the cast read, with no preceding write. Random SRAM bits caused the FP trap.
+The standalone cast passed 1,458 wide/tail/placement cases (10,075,536 checked
+bytes), ruling out the initially suspected wider cast loop.
+
+Resolution now preserves conversions read by casts, primitives and region
+bindings. Only consumers whose operator implementation can materialize slices
+may defer them. The regression test failed on an undefined mid value before this
+fix, then passed both mid dataflow and concrete cast-input producer checks. This
+also restores the omitted redistribution to cost and memory accounting; it does
+not add a planner retry or blacklist the wider GEMM geometry.

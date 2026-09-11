@@ -339,6 +339,19 @@ fn resolve_region(
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
 ) -> Option<Vec<MidOperation>> {
+    // Only operator implementations can consume the pre-conversion source and
+    // materialize their own slices. Casts, copies and region bindings need the
+    // declared value, even if its eventual operator requested dispatch slices.
+    let materialized = required
+        .iter()
+        .chain(
+            operations
+                .iter()
+                .filter(|op| !matches!(op.kind, MidOperationKind::Operator { .. }))
+                .flat_map(MidOperation::read_values),
+        )
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut result = Vec::new();
     let mut deferred = BTreeMap::<MidValueId, MidValueId>::new();
     for operation in operations {
@@ -439,7 +452,7 @@ fn resolve_region(
             }
             MidOperationKind::Convert(plan) => {
                 if plan.output.materialization == OperandMaterialization::DispatchSlices
-                    && !operation.results.iter().any(|id| required.contains(id))
+                    && !operation.results.iter().any(|id| materialized.contains(id))
                 {
                     let source = deferred
                         .get(&operation.inputs[0])

@@ -2236,3 +2236,117 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
     let (_, peak) = crate::estimate::analyze_mid(&resolved, &BTreeMap::new()).unwrap();
     assert!(peak.fits_ipu21_with_budget(0, 80000), "{peak:?}");
 }
+
+#[test]
+fn streamed_layout_conversion_is_materialized_before_a_cast() {
+    let formats = [
+        TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(2),
+        },
+        TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(4),
+        },
+        TensorFormat {
+            precision: Precision::F8F143 { scale_exponent: -4 },
+            layout: Layout::row_sharded(4),
+        },
+    ];
+    let mut program = MidProgram::default();
+    program.tile_count = 4;
+    program.values = formats
+        .iter()
+        .enumerate()
+        .map(|(index, format)| MidValue {
+            id: MidValueId(index as u32),
+            tile_offset: 0,
+            origin: ValueId::from_index(0),
+            storage_group: MidValueId(index as u32),
+            tensor_type: TensorType {
+                shape: TensorShape(vec![16, 64]),
+                format: format.clone(),
+            },
+        })
+        .collect();
+    program.inputs.push(MidInput {
+        name: "x".into(),
+        kind: GraphInputKind::Host,
+        value: MidValueId(0),
+    });
+    program.outputs = vec![MidValueId(2)];
+    program.operations = (0..2)
+        .map(|index| MidOperation {
+            source: None,
+            inputs: vec![MidValueId(index)],
+            results: vec![MidValueId(index + 1)],
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+            kind: MidOperationKind::Convert(ConversionPlan {
+                input: OperandRequirement::new(formats[index as usize].clone(), 8),
+                output: OperandRequirement::new(formats[index as usize + 1].clone(), 8)
+                    .with_materialization(if index == 0 {
+                        OperandMaterialization::DispatchSlices
+                    } else {
+                        OperandMaterialization::Complete
+                    }),
+                strategy: if index == 0 {
+                    ConversionStrategy::DirectRetile
+                } else {
+                    ConversionStrategy::LocalKernel
+                },
+            }),
+        })
+        .collect();
+    let resolved = implementation::resolve(program).unwrap();
+    let mut defined = BTreeSet::from([MidValueId(0)]);
+    for op in &resolved.operations {
+        assert!(
+            op.read_values().all(|input| defined.contains(input)),
+            "operation reads an unmaterialized value: {op:?}"
+        );
+        defined.extend(&op.results);
+    }
+    assert_eq!(resolved.operations.len(), 2);
+    assert_eq!(
+        resolved.operations[0]
+            .conversion_plan()
+            .unwrap()
+            .output
+            .materialization,
+        OperandMaterialization::Complete
+    );
+    let low = crate::lower_to_tiles(&crate::expand_tiles(&resolved).unwrap(), false);
+    let written = low
+        .exchange_phases
+        .iter()
+        .flat_map(|phase| &phase.transfers)
+        .flat_map(|transfer| {
+            transfer
+                .destinations
+                .iter()
+                .map(|view| crate::storage_root(&low.shards, view.shard))
+        })
+        .chain(
+            low.local_copies
+                .iter()
+                .map(|copy| crate::storage_root(&low.shards, copy.destination)),
+        )
+        .chain(
+            low.inputs
+                .iter()
+                .flat_map(|input| &input.shards)
+                .map(|&id| crate::storage_root(&low.shards, id)),
+        )
+        .collect::<BTreeSet<_>>();
+    for run in &low.kernel_runs {
+        if matches!(run.kernel, TileKernelSpec::Cast { .. }) {
+            assert!(
+                run.inputs
+                    .iter()
+                    .flat_map(|input| &input.views)
+                    .all(|view| written.contains(&crate::storage_root(&low.shards, view.shard)))
+            );
+        }
+    }
+}
