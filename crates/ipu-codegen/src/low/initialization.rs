@@ -9,6 +9,34 @@
 use super::*;
 use std::collections::BTreeSet;
 
+// A Repeat binding can expose these bytes to readers under another shard ID.
+// Scratch local to its body has no such additional readers.
+fn repeat_bound_storage(program: &LowProgram) -> BTreeSet<BlockValueId> {
+    let mut bound = BTreeSet::new();
+    let root = |id| storage_root(&program.shards, id);
+    for repeat in &program.repeat_runs {
+        for binding in &repeat.carried {
+            bound.extend(
+                [
+                    binding.initial,
+                    binding.argument,
+                    binding.yielded,
+                    binding.result,
+                ]
+                .map(root),
+            );
+        }
+        for binding in &repeat.invariants {
+            bound.extend([binding.input, binding.argument].map(root));
+        }
+        for binding in &repeat.iterated {
+            bound.insert(root(binding.argument));
+            bound.extend(binding.inputs.iter().copied().map(root));
+        }
+    }
+    bound
+}
+
 /// Row-major FP8 packing reads only logical columns/rows and writes its own
 /// output padding. Drop input padding clears when that is the sole reader.
 pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
@@ -64,23 +92,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
             .iter()
             .flat_map(|output| output.shards.iter().map(|&id| root(id))),
     );
-    for repeat in &program.repeat_runs {
-        for binding in &repeat.carried {
-            forbidden.extend(
-                [
-                    binding.initial,
-                    binding.argument,
-                    binding.yielded,
-                    binding.result,
-                ]
-                .map(root),
-            );
-        }
-        // Iterated/invariant bindings can give storage another reader role.
-        if !repeat.iterated.is_empty() || !repeat.invariants.is_empty() {
-            return;
-        }
-    }
+    forbidden.extend(repeat_bound_storage(program));
     candidates.retain(|id| !forbidden.contains(id));
     let mut removed = 0;
     let mut keep = |work: &TileWork| {
@@ -216,23 +228,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
     for output in &program.outputs {
         forbidden.extend(output.shards.iter().map(|&id| root(id)));
     }
-    // A carried/iterated binding gives the same bytes another semantic role.
-    for repeat in &program.repeat_runs {
-        for binding in &repeat.carried {
-            forbidden.extend(
-                [
-                    binding.initial,
-                    binding.argument,
-                    binding.yielded,
-                    binding.result,
-                ]
-                .map(root),
-            );
-        }
-        if !repeat.iterated.is_empty() || !repeat.invariants.is_empty() {
-            return;
-        }
-    }
+    forbidden.extend(repeat_bound_storage(program));
     candidates.retain(|shard| !forbidden.contains(shard));
     let graph = &program.program;
     let kernels = &graph.kernel_runs;
@@ -429,7 +425,7 @@ mod tests {
         };
         metadata.requirements.output.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         metadata.requirements.output.format.precision = Precision::F8F143 { scale_exponent: -4 };
-        for case in 0..7 {
+        for case in 0..11 {
             let mut program = baseline.clone();
             let graph = Arc::make_mut(&mut program.program);
             match case {
@@ -464,14 +460,46 @@ mod tests {
                             padding_only: false,
                         };
                 }
+                7..=10 => {
+                    let mut argument = graph.shards[1].clone();
+                    argument.id = BlockValueId(3);
+                    graph.shards.push(argument);
+                    program.repeat_runs.push(RepeatRun {
+                        provenance: graph.kernel_runs[1].provenance.clone(),
+                        count: 3,
+                        carried: Vec::new(),
+                        invariants: if case == 10 {
+                            vec![RepeatInvariant {
+                                input: BlockValueId(1),
+                                argument: BlockValueId(0),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        iterated: vec![RepeatIterated {
+                            inputs: vec![BlockValueId(if case == 9 { 0 } else { 1 }); 3],
+                            argument: BlockValueId(if case == 8 { 0 } else { 3 }),
+                            stride_bytes: 128,
+                            alignment: 8,
+                        }],
+                        body: Box::new(program.tiles[0].clone()),
+                    });
+                }
                 _ => {}
             }
             omit_unread_fp8_input_padding(&mut program);
             assert_eq!(
                 program.tiles[0].work.len(),
-                if case <= 1 || case == 5 { 1 } else { 2 },
+                if case <= 1 || case == 5 || case == 7 {
+                    1
+                } else {
+                    2
+                },
                 "case {case}"
             );
+            if let Some(repeat) = program.repeat_runs.first() {
+                assert_eq!(repeat.body.work.len(), program.tiles[0].work.len());
+            }
         }
     }
 
