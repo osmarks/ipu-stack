@@ -87,3 +87,10 @@ breadth. Expansion benchmarks and exchange capture inspect the baseline.
 
 The baseline policy still needs calibration; this replacement does not claim
 that every previously representable graph now has a feasible starting plan.
+
+## Subsequent support-storage work
+
+See [support storage consolidation](SUPPORT_STORAGE_2026_09_11.md): 31008 bytes
+per tile recovered, unused GEMM entry points removed, and final one-layer hardware
+validation at 970428 cropped cycles. The 27-layer baseline still fails tensor
+placement despite the improved support footprint.
