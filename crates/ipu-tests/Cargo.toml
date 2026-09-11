@@ -37,3 +37,7 @@ tracing.workspace = true
 [[bin]]
 name = "ipu-kernel-equivalence"
 path = "src/bin/kernel_equivalence.rs"
+
+[[bin]]
+name = "ipu-host-exchange-bench"
+path = "src/bin/host_exchange_bench.rs"

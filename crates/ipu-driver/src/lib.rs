@@ -462,6 +462,23 @@ impl Device {
         timeout: Duration,
         mut poll: impl FnMut(&Device) -> Result<(), DriverError>,
     ) -> Result<(), DriverError> {
+        self.wait_mark_poll(
+            register,
+            expected,
+            timeout,
+            Duration::from_micros(100),
+            &mut poll,
+        )
+    }
+
+    fn wait_mark_poll(
+        &self,
+        register: u32,
+        expected: u32,
+        timeout: Duration,
+        interval: Duration,
+        mut poll: impl FnMut(&Device) -> Result<(), DriverError>,
+    ) -> Result<(), DriverError> {
         trace!(
             register = format_args!("0x{register:x}"),
             expected,
@@ -484,7 +501,9 @@ impl Device {
                     "HSP register 0x{register:x}: expected {expected}, observed {observed}"
                 )));
             }
-            std::thread::sleep(Duration::from_micros(100));
+            if !interval.is_zero() {
+                std::thread::sleep(interval);
+            }
         }
     }
 
@@ -1390,6 +1409,7 @@ pub struct HostSession<'a> {
     storage: HostBuffer,
     pages: HashMap<u32, HostPageRange>,
     attached_pages: Vec<u32>,
+    poll_interval: Duration,
     write_jitter: Option<HostWriteJitter>,
     streamed_output: Option<(Vec<u8>, usize)>,
 }
@@ -1438,9 +1458,16 @@ impl<'a> HostSession<'a> {
             storage: HostBuffer::new(storage_size.max(1))?,
             pages,
             attached_pages: Vec::new(),
+            poll_interval: Duration::from_micros(100),
             write_jitter: None,
             streamed_output: None,
         })
+    }
+
+    /// Trade host CPU usage for streaming invocation latency. Zero busy-polls;
+    /// the default sleeps 100 microseconds between register reads.
+    pub fn set_poll_interval(&mut self, interval: Duration) {
+        self.poll_interval = interval;
     }
 
     pub fn set_write_jitter(&mut self, seed: u64, max_delay: Duration) {
@@ -1520,12 +1547,14 @@ impl<'a> HostSession<'a> {
             .is_some_and(host_call_reuses_storage)
         {
             let call = self.invoke_streaming_deferred(name, input)?;
-            return self.collect(&call);
+            return self.finish(&call);
         }
         let call = self.prepare(name, input)?;
         self.drive(call)
     }
 
+    /// Drive the prepared protocol, leaving the final output transfer deferred.
+    /// Call [`Self::finish`] before reading the result.
     pub fn invoke_deferred(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
         if self.attached_pages.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
@@ -1535,6 +1564,8 @@ impl<'a> HostSession<'a> {
         Ok(call)
     }
 
+    /// Drive a protocol that may reuse host pages between batches. Call
+    /// [`Self::finish`] to release and collect the final output transfer.
     pub fn invoke_streaming_deferred(
         &mut self,
         name: &str,
@@ -1591,10 +1622,11 @@ impl<'a> HostSession<'a> {
         let input_batches = host_batch_ranges(&call.input_batch_ends);
         let output_batches = host_batch_ranges(&call.output_batch_ends);
         for phase in 0..call.phases {
-            self.device.wait_mark_with(
+            self.device.wait_mark_poll(
                 pci::HSP_GS2_CONTROL,
                 0,
                 Duration::from_secs(10),
+                self.poll_interval,
                 &mut poll,
             )?;
             if phase & 1 == 0 {
@@ -1620,7 +1652,13 @@ impl<'a> HostSession<'a> {
             }
             self.acknowledge_device()?;
             self.device
-                .wait_mark_with(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10), &mut poll)
+                .wait_mark_poll(
+                    pci::HSP_GS2_CONTROL,
+                    0,
+                    Duration::from_secs(10),
+                    self.poll_interval,
+                    &mut poll,
+                )
                 .map_err(|error| {
                     DriverError::Timeout(format!(
                         "host call {} phase {phase}/{}: {error}",
@@ -1631,6 +1669,24 @@ impl<'a> HostSession<'a> {
         Ok(call)
     }
 
+    /// Release a deferred call's final output transfer, wait for its completion,
+    /// and collect the output. Initialization calls have no deferred output.
+    pub fn finish(&mut self, call: &HostCall) -> Result<Vec<u8>, DriverError> {
+        if !call.outputs.is_empty() && call.phases & 1 != 0 {
+            self.acknowledge_device()?;
+            self.device.wait_mark_poll(
+                pci::HSP_GS2_CONTROL,
+                0,
+                Duration::from_secs(10),
+                self.poll_interval,
+                |_| Ok(()),
+            )?;
+        }
+        self.collect(call)
+    }
+
+    /// Copy completed transfers from host storage without driving the device.
+    /// Use [`Self::finish`] if the final output transfer is still deferred.
     pub fn collect(&mut self, call: &HostCall) -> Result<Vec<u8>, DriverError> {
         if let Some(mut output) = self.streamed_output.take() {
             for slice in call.outputs.iter().skip(output.1) {
@@ -1683,7 +1739,7 @@ impl<'a> HostSession<'a> {
 
     fn drive(&mut self, call: HostCall) -> Result<Vec<u8>, DriverError> {
         self.drive_handshake(&call)?;
-        let output = self.collect(&call)?;
+        let output = self.finish(&call)?;
         info!(
             call = call.name,
             output_bytes = output.len(),
@@ -1700,11 +1756,22 @@ impl<'a> HostSession<'a> {
             "invoking host exchange call"
         );
         for phase in 0..call.phases {
-            self.device
-                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))?;
+            self.device.wait_mark_poll(
+                pci::HSP_GS2_CONTROL,
+                0,
+                Duration::from_secs(10),
+                self.poll_interval,
+                |_| Ok(()),
+            )?;
             self.acknowledge_device()?;
             self.device
-                .wait_mark(pci::HSP_GS2_CONTROL, 0, Duration::from_secs(10))
+                .wait_mark_poll(
+                    pci::HSP_GS2_CONTROL,
+                    0,
+                    Duration::from_secs(10),
+                    self.poll_interval,
+                    |_| Ok(()),
+                )
                 .map_err(|error| {
                     DriverError::Timeout(format!(
                         "host call {} phase {phase}/{}: {error}",

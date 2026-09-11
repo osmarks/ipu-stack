@@ -53,6 +53,9 @@ struct Arguments {
     /// Compare with unquantized FP32 inputs, weights and intermediate results.
     #[arg(long, requires = "reference_run")]
     reference_fp32: bool,
+    /// Save packed reference weights/input for resident host-I/O replay.
+    #[arg(long, requires = "reference_run")]
+    save_reference_inputs: Option<PathBuf>,
     /// Validate successive inference calls after uploading parameters only once.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..), requires = "reference_run")]
     reference_inferences: u32,
@@ -1206,6 +1209,7 @@ fn main() -> Result<()> {
                     },
                     arguments.reference_fp32,
                     arguments.reference_inferences,
+                    arguments.save_reference_inputs.as_deref(),
                     arguments
                         .profile_output
                         .as_deref()
@@ -1236,6 +1240,7 @@ fn main() -> Result<()> {
                     ReferenceCheck::Elementwise((0.02, 0.0)),
                     false,
                     1,
+                    None,
                     None,
                 )?;
                 println!(
@@ -1489,11 +1494,17 @@ fn run_reference(
     check: ReferenceCheck,
     fp32: bool,
     inferences: u32,
+    save_inputs: Option<&Path>,
     profile: Option<(&Path, u64)>,
 ) -> Result<(Vec<u8>, f32)> {
     let started = std::time::Instant::now();
     let (host_inputs, weights, inputs) =
         diagnostic::prepare_inputs(graph, application, &package.inputs, fp32)?;
+    if let Some(directory) = save_inputs {
+        fs::create_dir_all(directory)?;
+        fs::write(directory.join("weights.bin"), &weights)?;
+        fs::write(directory.join("input.bin"), &inputs)?;
+    }
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
         "prepared reference inputs"
@@ -1578,6 +1589,9 @@ fn run_reference(
             Ok(())
         },
     )?;
+    if let Some(directory) = save_inputs {
+        fs::write(directory.join("output.bin"), &output)?;
+    }
     Ok((output, maximum_error))
 }
 
@@ -1910,9 +1924,7 @@ fn run_checked_inferences(
                     device_failure_diagnostics(runtime, application)
                 );
             })?;
-        runtime
-            .device()
-            .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+        output = session.finish(&executed)?;
         if index + 1 == count {
             diagnose_completion(runtime, application, Duration::from_secs(timeout_seconds))
                 .with_context(|| {
@@ -1922,7 +1934,6 @@ fn run_checked_inferences(
                     )
                 })?;
         }
-        output = session.collect(&executed)?;
         check(index, &output)?;
     }
     Ok(output)
@@ -2023,6 +2034,7 @@ fn run_siglip_mlp_benchmark(
         ReferenceCheck::Elementwise((0.03, 0.05)),
         false,
         1,
+        None,
         None,
     )?;
     if !profiling_enabled {
