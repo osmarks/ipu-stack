@@ -645,8 +645,8 @@ Profiles for the two current working builds are in
 `artifacts/baseline-local-planner`.
 
 Local search now reaches materialized attention and a wider output-projection
-candidate. That wider candidate currently traps during casting; the baseline
-above passes, and the wider isolated cast check passes. Investigation continues.
+candidate. The initial wider candidate trapped during casting; the cause and
+resolver fix are described below.
 
 ### Invalid streamed conversion discovered by the fit tests
 
@@ -665,3 +665,42 @@ may defer them. The regression test failed on an undefined mid value before this
 fix, then passed both mid dataflow and concrete cast-input producer checks. This
 also restores the omitted redistribution to cost and memory accounting; it does
 not add a planner retry or blacklist the wider GEMM geometry.
+
+
+### Final batch-2 placement check
+
+With pairwise conflicts, capped balanced exchanges and the resolver fix, the
+27-layer batch-2 build still fails on the canonical baseline after 111.701 s.
+The failed allocation is a persistent QKV-weight sequence with `replicas: 1`:
+27 distinct layer shards of 3,072 bytes, totaling 82,944 bytes per owning tile.
+Batching has not duplicated these weights. Repeat currently allocates the
+sequence contiguously so each iteration can advance to its next layer's shard.
+
+On the final failed tile, alignment is 8 bytes. Excluding the host aperture,
+there are 81,996 free bytes in aggregate and a largest hole of 40,904 bytes.
+Thus this particular placement is 948 bytes short even without contiguity;
+these numbers do not establish that a different placement or layout cannot fit.
+
+Validation after the resolver fix: 228 codegen tests passed (four ignored), all
+10 `ipu-trivial-test` tests passed, and the workspace all-targets check passed.
+
+
+### Final optimized resident 27-layer run
+
+`final-pairwise-balanced-full27` uses all three fixes, automatic attention,
+FP8 weights and the default eight optimization attempts. It selects materialized
+attention and accepts seven successive local improvements after retaining the
+original tile mapping. Full planning takes 974.010 s with eight Rayon threads;
+complete candidates are still evaluated sequentially in this run.
+
+Hardware passed three successive inferences after one parameter upload, with
+identical outputs. FP32-reference minimum cosine is 0.994168165 and maximum
+absolute error is 0.424608. Renderer-cropped execution is **14,438,184 cycles /
+9.625456 ms**. This includes the whole 27-layer benchmark, with detailed profiling
+of the first layer and timing of the remaining repeated layers. The improvement
+from the 19,501,650-cycle Flash baseline includes layout/attention selection; it
+must not be attributed solely to exchange chunk balancing.
+
+Rendered runtime: `final-pairwise-balanced-full27/model.html`; exact placement:
+`final-pairwise-balanced-full27/memory/placement-67958.html`, both under
+`artifacts/baseline-local-planner`.
