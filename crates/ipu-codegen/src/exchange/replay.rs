@@ -99,13 +99,13 @@ pub(super) fn optimize_stream_schedule(
     receive_counts: &[usize],
     words: u32,
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
-    let mut schedule = materialize_stream_schedule(
+    let mut orders = vec![order::stream_wave_order(problem, words, false)];
+    let mut schedule = materialize_stream_order(
         topology,
         problem,
         incoming_bases,
         receive_counts,
-        words,
-        false,
+        &orders[0],
     )?;
     let initial_horizon = schedule.horizon;
     let mut improvements = 0;
@@ -120,14 +120,14 @@ pub(super) fn optimize_stream_schedule(
         if chunk_words == 0 {
             continue;
         }
-        let Ok(candidate) = materialize_stream_schedule(
-            topology,
-            problem,
-            incoming_bases,
-            receive_counts,
-            chunk_words,
-            balanced,
-        ) else {
+        let order = order::stream_wave_order(problem, chunk_words, balanced);
+        if orders.contains(&order) {
+            continue;
+        }
+        let candidate =
+            materialize_stream_order(topology, problem, incoming_bases, receive_counts, &order);
+        orders.push(order);
+        let Ok(candidate) = candidate else {
             continue;
         };
         if candidate.horizon > score.0 {
@@ -164,12 +164,22 @@ pub(super) fn materialize_stream_schedule(
     balanced: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     let order = order::stream_wave_order(problem, words, balanced);
+    materialize_stream_order(topology, problem, incoming_bases, receive_counts, &order)
+}
+
+fn materialize_stream_order(
+    topology: &Topology,
+    problem: &SchedulingProblem<'_>,
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    order: &[usize],
+) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     match materialize_schedule_order(
         topology,
         problem,
         incoming_bases,
         receive_counts,
-        &order,
+        order,
         false,
     ) {
         Ok(schedule) => Ok(schedule),
@@ -180,7 +190,7 @@ pub(super) fn materialize_stream_schedule(
             problem,
             incoming_bases,
             receive_counts,
-            &order,
+            order,
             true,
         ),
         Err(error) => Err(error),
