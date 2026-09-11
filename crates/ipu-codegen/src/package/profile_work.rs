@@ -32,6 +32,8 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         .map_or(0, |extent| extent.physical_end - extent.start);
     let wide_statistics = statistics_width >= 96 && statistics_width.is_multiple_of(8);
     let statistics_issue_slots = if wide_statistics { 0.875 } else { 2.0 };
+    let quad_affine = precision == Precision::F16 && statistics_width.is_multiple_of(4);
+    let affine_issue_slots = if quad_affine { 1.5 } else { 2.0 };
 
     let (useful, issued, scale, basis) = match run.kernel {
         TileKernelSpec::Gemm { multiply, .. } => {
@@ -80,27 +82,30 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         TileKernelSpec::LayerNormApply { .. } => (
             logical,
             physical,
-            2.0,
+            affine_issue_slots,
             "layernorm: normalization and affine arithmetic",
         ),
         TileKernelSpec::BiasGelu => (logical, physical, 3.25, "bias add and GeLU arithmetic"),
         TileKernelSpec::AddLayerNorm => (
             logical,
             physical,
-            if wide_statistics { 3.875 } else { 5.5 },
+            statistics_issue_slots
+                + if wide_statistics { 0.5 } else { 1.0 }
+                + affine_issue_slots
+                + if quad_affine { 0.25 } else { 0.5 },
             "residual add and layernorm arithmetic",
         ),
         TileKernelSpec::LayerNorm => (
             logical,
             physical,
             statistics_issue_slots
-                + 2.0
+                + affine_issue_slots
                 + if matches!(precision, Precision::F8F143 { .. }) {
                     0.5
                 } else {
                     0.0
                 },
-            "layernorm: FP32 statistics and affine arithmetic",
+            "layernorm: FP32 statistics/normalization and affine arithmetic",
         ),
         TileKernelSpec::Add => (
             logical,

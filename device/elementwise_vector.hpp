@@ -145,6 +145,48 @@ static inline float normInverse(float variance) {
 static inline void normApply(const half *input, const half *right,
                             const half *scale, const half *bias, half *output,
                             unsigned width, unsigned worker, float mean, float inverse) {
+  // Keep centering and normalization in FP32. Scale/bias are FP16 model
+  // parameters: applying them four-wide avoids widening both on every pair.
+  if (!(width % 4) && !((reinterpret_cast<unsigned>(input) |
+      reinterpret_cast<unsigned>(right) | reinterpret_cast<unsigned>(scale) |
+      reinterpret_cast<unsigned>(bias) | reinterpret_cast<unsigned>(output)) & 7)) {
+    if (worker >= width / 4) return;
+    input += worker * 4;
+#ifdef NORM_WITH_ADD
+    right += worker * 4;
+#endif
+    scale += worker * 4;
+    bias += worker * 4;
+    output += worker * 4;
+    const unsigned rounds = (width / 4 + 5 - worker) / 6;
+    const float constants[2] = {-mean, inverse};
+    asm volatile(
+        "ld32 $a6, %[constants], $mzero, 0\n"
+        "ld32 $a7, %[constants], $mzero, 1\n"
+        "{ rpt %[rounds], %[bundles]; fnop }\n"
+        "{ ld64step $a4:5, $mzero, %[in]+=, 6; fnop }\n"
+#ifdef NORM_WITH_ADD
+        "{ ld64step $a0:1, $mzero, %[right]+=, 6; fnop }\n"
+        "{ nop; f16v4add $a4:5, $a4:5, $a0:1 }\n"
+#endif
+        "{ nop; f16v2tof32 $a0:1, $a4 }\n"
+        "{ nop; f16v2tof32 $a2:3, $a5 }\n"
+        "{ nop; f32v2add $a0:1, $a6:B, $a0:1 }\n"
+        "{ nop; f32v2add $a2:3, $a6:B, $a2:3 }\n"
+        "{ nop; f32v2mul $a0:1, $a7:B, $a0:1 }\n"
+        "{ nop; f32v2mul $a2:3, $a7:B, $a2:3 }\n"
+        "{ ld64step $a4:5, $mzero, %[scale]+=, 6; f32v2tof16 $a0, $a0:1 }\n"
+        "{ ld64step $a2:3, $mzero, %[bias]+=, 6; f32v2tof16 $a1, $a2:3 }\n"
+        "{ nop; f16v4mul $a0:1, $a0:1, $a4:5 }\n"
+        "{ nop; f16v4add $a0:1, $a0:1, $a2:3 }\n"
+        "{ st64step $a0:1, $mzero, %[out]+=, 6; fnop }\n"
+        : [in] "+&r"(input), [right] "+&r"(right), [scale] "+&r"(scale),
+          [bias] "+&r"(bias), [out] "+&r"(output)
+        : [rounds] "r"(rounds), [constants] "r"(constants),
+          [bundles] "i"(11 + NORM_EXTRA_BUNDLES)
+        : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
+    return;
+  }
   if (worker >= width / 2) return;
   input += worker * 2;
 #ifdef NORM_WITH_ADD

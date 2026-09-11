@@ -249,9 +249,9 @@ fn norm_statistics_work(width: u64, add: bool) -> u64 {
 }
 
 /// Three worker launches per row; shared setup constants include partial
-/// reductions and the scalar inverse standard deviation. The apply body is
-/// ten bundles per pair, or twelve with a residual add.
-pub(crate) fn f16_layernorm_cycles(rows: u64, width: u64, add: bool) -> u64 {
+/// reductions and the scalar inverse standard deviation. FP16 output uses
+/// twelve bundles per quad (fourteen with add); FP8 retains the pair path.
+fn layernorm_cycles(rows: u64, width: u64, add: bool, quad_affine: bool) -> u64 {
     let setup = if width >= 96 && width.is_multiple_of(8) {
         if add { 1386 } else { 1329 }
     } else if add {
@@ -259,9 +259,17 @@ pub(crate) fn f16_layernorm_cycles(rows: u64, width: u64, add: bool) -> u64 {
     } else {
         1200
     };
-    let work = norm_statistics_work(width, add)
-        .saturating_add(width.div_ceil(12).saturating_mul(if add { 72 } else { 60 }));
+    let apply = if quad_affine && width.is_multiple_of(4) {
+        66u64.saturating_add(width.div_ceil(24).saturating_mul(if add { 84 } else { 72 }))
+    } else {
+        width.div_ceil(12).saturating_mul(if add { 72 } else { 60 })
+    };
+    let work = norm_statistics_work(width, add).saturating_add(apply);
     132u64.saturating_add(rows.saturating_mul(work.saturating_add(setup)))
+}
+
+pub(crate) fn f16_layernorm_cycles(rows: u64, width: u64, add: bool) -> u64 {
+    layernorm_cycles(rows, width, add, true)
 }
 
 pub(crate) fn f16_layernorm_moments_cycles(rows: u64, width: u64) -> u64 {
@@ -273,8 +281,13 @@ pub(crate) fn f16_layernorm_moments_cycles(rows: u64, width: u64) -> u64 {
 /// Final moments merging is small but repeats in each worker. These costs
 /// cover local application only; the mid copy prices the statistics exchange.
 pub(crate) fn f16_layernorm_apply_cycles(rows: u64, width: u64, parts: u16) -> u64 {
-    558u64.saturating_add(rows.saturating_mul(
-        (324 + u64::from(parts) * 54).saturating_add(width.div_ceil(12).saturating_mul(60)),
+    let (setup, row_setup, work) = if width.is_multiple_of(4) {
+        (774u64, 402u64, width.div_ceil(24).saturating_mul(72))
+    } else {
+        (558, 324, width.div_ceil(12).saturating_mul(60))
+    };
+    setup.saturating_add(rows.saturating_mul(
+        (row_setup + u64::from(parts) * 54).saturating_add(work),
     ))
 }
 
@@ -286,7 +299,7 @@ pub(crate) fn fp8_elementwise_cycles(gelu: bool, rows: u64, width: u64, packed: 
             rows.saturating_mul(372u64.saturating_add(width.div_ceil(192).saturating_mul(1098))),
         )
     } else {
-        f16_layernorm_cycles(rows, width, false).saturating_add(rows.saturating_mul(
+        layernorm_cycles(rows, width, false, false).saturating_add(rows.saturating_mul(
             270u64.saturating_add(width.div_ceil(24).saturating_mul(if packed && rows > 1 {
                 162
             } else {
@@ -304,10 +317,10 @@ mod tests {
     fn elementwise_models_track_device_loops_and_row_setup() {
         // Independent direct-kernel measurements from elementwise_check.
         for (rows, width, norm, fused, moments, apply) in [
-            (1, 144, 2448u64, 2778u64, 1476u64, 1656u64),
-            (1, 576, 5418, 6558, 2286, 3816),
-            (1, 1152, 9378, 11598, 3366, 6696),
-            (3, 1152, 27876, 34530, 9846, 18972),
+            (1, 144, 2226u64, 2484u64, 1476u64, 1662u64),
+            (1, 576, 4332, 5184, 2286, 2958),
+            (1, 1152, 7140, 8784, 3366, 4686),
+            (3, 1152, 21162, 26088, 9846, 12510),
         ] {
             for (estimated, measured) in [
                 (f16_layernorm_cycles(rows, width, false), norm),

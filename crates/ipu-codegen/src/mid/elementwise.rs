@@ -774,7 +774,9 @@ mod tests {
                     ..MidProgram::default()
                 };
                 let fused = program.with_elementwise_fusions();
-                assert_eq!(fused.is_some(), !norm || rows == 1);
+                // The faster FP16 affine path makes separate LN + cast
+                // cheaper at this width, even for one row.
+                assert_eq!(fused.is_some(), !norm);
                 if let Some(fused) = fused {
                     let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
                     assert_eq!(low.kernel_runs.len(), 1);
