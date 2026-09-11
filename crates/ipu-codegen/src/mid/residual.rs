@@ -252,7 +252,11 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
             let parts = u32::from(axis.partitions);
             if parts == 0
                 || width == 0
-                || !width.is_multiple_of(parts.checked_mul(axis.block_size)?)
+                || !width.is_multiple_of(
+                    parts
+                        .checked_mul(axis.block_size)?
+                        .checked_mul(u32::from(axis.padding_groups))?,
+                )
                 || !(width / parts).is_multiple_of(4)
                 || !(width / parts).is_multiple_of(axis.padding_multiple)
                 || !(width / parts).is_multiple_of(axis.shard_padding_multiple)
@@ -273,6 +277,19 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moments_reject_unequal_grouped_partitions() {
+        let mut layout = Layout::row_sharded(1);
+        layout.tiling.tile_count = 3;
+        layout.tiling.axes.push(
+            AxisTiling::new(TensorAxis::FromEnd(1), 3, 4, Padding::Zero).with_padding_groups(3),
+        );
+        // Each 40-feature group assigns 16/12/12 features to its owners.
+        // The total width being divisible by three does not make them equal.
+        let tensor = TensorType::new([1, 120], Precision::F16, layout);
+        assert!(row_moments_type(&tensor).is_none());
+    }
 
     #[test]
     fn residual_fusion_keeps_repeat_carried_results() {
@@ -457,12 +474,10 @@ mod tests {
         // Statistics retain an explicit partition axis until their small gather.
         let mut feature_layout = Layout::row_sharded(2);
         feature_layout.tiling.tile_count = 4;
-        feature_layout.tiling.axes.push(AxisTiling::new(
-            TensorAxis::FromEnd(1),
-            2,
-            576,
-            Padding::Reject,
-        ));
+        feature_layout.tiling.axes[0].tile_stride = Some(2);
+        feature_layout.tiling.axes.push(
+            AxisTiling::new(TensorAxis::FromEnd(1), 2, 4, Padding::Reject).with_tile_stride(1),
+        );
         for id in [0, 1, 4] {
             program.values[id].tensor_type.format.layout = feature_layout.clone();
         }
