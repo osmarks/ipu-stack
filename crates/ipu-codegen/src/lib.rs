@@ -160,6 +160,9 @@ pub struct ExchangeStep {
     pub active: bool,
     /// Base address used by point-to-point receive rows.
     pub incoming_base: u32,
+    /// Source base for a row encoded relative to a current Repeat parameter.
+    #[serde(default)]
+    pub outgoing_base: Option<TileAddress>,
     /// Preserve both exchange base registers on entry. Absolute-address paired
     /// rows use the two PIC streams directly and must not reset their state.
     #[serde(default)]
@@ -492,7 +495,12 @@ fn emit_steps(
                     code.put_special(INCOMING_MUXPAIR, 8)?;
                 }
                 if !exchange.preserve_base_registers {
-                    code.put_special(OUTGOING_BASE, 15)?;
+                    if let Some(base) = exchange.outgoing_base {
+                        emit_address(code, 8, base, repeat_pointer_count)?;
+                        code.put_special(OUTGOING_BASE, 8)?;
+                    } else {
+                        code.put_special(OUTGOING_BASE, 15)?;
+                    }
                 }
                 if exchange.active {
                     code.call(
@@ -626,6 +634,14 @@ fn validate_steps(
         match step {
             TileStep::Exchange(exchange) => {
                 validate_exchange_program(exchange)?;
+                if let Some(base) = exchange.outgoing_base {
+                    if exchange.preserve_base_registers || !exchange.repeat_patches.is_empty() {
+                        return Err(invalid(
+                            "exchange base relocation conflicts with patches or preserved bases",
+                        ));
+                    }
+                    validate_address(base, repeat_pointer_count)?;
+                }
                 if exchange.setup_patch.as_ref().is_some_and(|patch| {
                     patch.offsets.words.is_empty()
                         || patch.offsets.words.len() != patch.values.words.len()
@@ -1151,6 +1167,7 @@ mod tests {
                 TileStep::Exchange(ExchangeStep {
                     active: false,
                     incoming_base: 0,
+                    outgoing_base: None,
                     preserve_base_registers: false,
                     incoming_mux: None,
                     incoming_format: 0,
@@ -1199,6 +1216,7 @@ mod tests {
             steps: vec![TileStep::Exchange(ExchangeStep {
                 active: false,
                 incoming_base: 0,
+                outgoing_base: None,
                 preserve_base_registers: false,
                 incoming_mux: None,
                 incoming_format: 0,
@@ -1266,6 +1284,7 @@ mod tests {
                     body: vec![TileStep::Exchange(ExchangeStep {
                         active: true,
                         incoming_base: 0x70000,
+                        outgoing_base: None,
                         preserve_base_registers: false,
                         incoming_mux: None,
                         incoming_format: 0,

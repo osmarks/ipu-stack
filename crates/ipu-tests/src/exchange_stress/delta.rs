@@ -54,6 +54,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             steps: vec![TileStep::Exchange(ExchangeStep {
                 active: true,
                 incoming_base: 0,
+                outgoing_base: None,
                 preserve_base_registers: false,
                 incoming_mux: None,
                 incoming_format: 0,

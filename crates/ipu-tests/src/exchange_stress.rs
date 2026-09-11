@@ -72,6 +72,8 @@ pub(crate) struct PhaseReplayPackage {
     initial_origins: BTreeMap<u32, Vec<(u16, u32)>>,
 }
 
+mod base;
+pub(crate) use base::build as build_base;
 mod delta;
 pub(crate) use delta::build as build_delta;
 
@@ -176,6 +178,7 @@ pub(crate) fn build_wide(
             .push(TileStep::Exchange(ExchangeStep {
                 active: true,
                 incoming_base: 0,
+                outgoing_base: None,
                 preserve_base_registers: false,
                 incoming_mux: None,
                 incoming_format: 0,
@@ -323,6 +326,7 @@ pub(crate) fn build_wide(
                 .push(TileStep::Exchange(ExchangeStep {
                     active,
                     incoming_base: 0,
+                    outgoing_base: None,
                     preserve_base_registers: true,
                     incoming_mux: None,
                     incoming_format: if receiving && explicit_config {
@@ -758,6 +762,7 @@ pub(crate) fn build(
                 .push(TileStep::Exchange(ExchangeStep {
                     active,
                     incoming_base: 0,
+                    outgoing_base: None,
                     preserve_base_registers: false,
                     incoming_mux: None,
                     incoming_format: 0,
@@ -885,9 +890,10 @@ fn build_physical_phase_replay(
         .repeat_patches
         .iter()
         .any(|patches| !patches.is_empty())
+        || phase.outgoing_bases.iter().any(Option::is_some)
     {
         bail!(
-            "exchange phase {phase_index} uses repeat patches; replay a concrete iteration instead"
+            "exchange phase {phase_index} uses repeat relocation; replay a concrete iteration instead"
         );
     }
 
@@ -910,6 +916,7 @@ fn build_physical_phase_replay(
                         } else {
                             0
                         },
+                        outgoing_base: None,
                         preserve_base_registers: false,
                         incoming_mux: None,
                         incoming_format: 0,

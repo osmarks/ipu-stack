@@ -1063,7 +1063,6 @@ mod tests {
                 let options = ipu_codegen::AttentionOptions {
                     causal,
                     scale: AttentionScale::ValueBits(0.7f32.to_bits()),
-                    ..Default::default()
                 };
                 let actual = attention(&query, &key, &value, options)?;
                 for stream in 0..2usize {

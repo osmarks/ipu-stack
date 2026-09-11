@@ -342,3 +342,34 @@ Displacements may differ between iterations without breaking BASE eligibility,
 but independently placed chunks in the same row can break it. Such placement
 can also lose arithmetic patch compression and require address tables; it is
 not needed to fit the present 27-layer package.
+
+## Implemented OUTGOING_BASE relocation
+
+Compatible Repeat phases now encode source offsets relative to an existing
+iterated-parameter pointer and load that pointer into OUTGOING_BASE before the
+barrier. They allocate no new pointer table or runtime helper. Every sender's
+transfers, including stationary transfers, must agree on their displacement
+through every iteration; otherwise the phase retains the previous word patches.
+Paired offsets retain their eight-byte alignment. Ordinary subsequent rows
+explicitly restore OUTGOING_BASE to zero. Cross-phase receive/source setup
+patches remain independent and are preserved.
+
+The full 27-layer FP32-reference run passes with unchanged cosine 0.994212810
+and maximum error 0.410389. Cropped runtime is **19792236 cycles / 13.194824 ms**,
+down from 20030544 / 13.353696 ms: **238308 cycles, 1.19%**. This includes any
+schedule changes induced by the new row representation and placement, rather
+than isolating instruction-level patch time.
+
+The maximum generated-program reservation falls from 18884 to **18000 bytes**.
+The uncompressed per-tile Repeat table bound falls from 25380 to **324 bytes**;
+those tables were already represented arithmetically, so this is not a 25 KiB
+SRAM saving. The exchange-table reservation remains 40560 bytes. The remaining
+per-iteration instruction patches use the existing bulk path.
+
+The durable hardware test is `--workload exchange-stress --exchange-pattern base`.
+It checks distinct exact u32 payloads on all three iterations of eight cases:
+ordinary unicast, multicast, paired multicast and multicast loopback, each with
+standard and interleaved sources. Each case then executes an absolute-address
+row, checking base reset. All cases pass, including final readback of 1792 words.
+Artifacts: `outgoing-base-stress/` and `outgoing-base-full27/` under
+`artifacts/baseline-local-planner/`; the latter includes the rendered profile.

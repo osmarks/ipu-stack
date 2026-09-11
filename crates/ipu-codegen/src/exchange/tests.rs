@@ -829,26 +829,30 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
         exchanges
             .phases
             .iter()
-            .flat_map(|phase| &phase.repeat_patches)
-            .flatten()
-            .any(|patch| patch.values.len() == 27)
+            .flat_map(|p| &p.outgoing_bases)
+            .any(Option::is_some)
     );
-    let compact = crate::tile::compact_exchange_table_bytes(&exchanges.phases, 1472, 1472).unwrap();
-    let mut explicit = exchanges.phases.clone();
-    let mut changed = 0;
-    for patch in explicit
-        .iter_mut()
-        .flat_map(|phase| &mut phase.repeat_patches)
-        .flatten()
-    {
-        if crate::arithmetic_progression(&patch.values).is_some() {
-            patch.values[1] ^= 1; // Force the table fallback; this variant is never executed.
-            changed += 1;
+    for phase in &exchanges.phases {
+        for (tile, base) in phase.outgoing_bases.iter().enumerate() {
+            let Some((shard, offset)) = base else {
+                continue;
+            };
+            assert!(phase.repeat_patches[tile].is_empty());
+            let base = placement.shard_addresses[shard] + offset;
+            let row = &phase.programs[tile];
+            let groups = sender_address_instruction_groups(row).unwrap();
+            let sends = phase.activities[tile]
+                .iter()
+                .filter(|a| a.kind == ExchangeActivityKind::Send);
+            for (group, send) in groups.into_iter().zip(sends) {
+                for (word, offset) in group {
+                    let mut expected = row[word];
+                    patch_sender_instruction(&mut expected, send.address - base + offset).unwrap();
+                    assert_eq!(row[word], expected);
+                }
+            }
         }
     }
-    assert!(changed > 0);
-    let expanded = crate::tile::compact_exchange_table_bytes(&explicit, 1472, 1472).unwrap();
-    assert!(compact < expanded);
 }
 
 #[test]
@@ -925,4 +929,83 @@ fn repeat_sources_follow_execution_order_when_sends_fill_earlier_gaps() {
             assert_eq!(instruction, row[word]);
         }
     }
+}
+
+#[test]
+fn repeat_base_requires_uniform_whole_phase_relocation() {
+    let id = BlockValueId::from_index;
+    let make = |source, shard, address: u32, stride: u32| PendingTransfer {
+        source,
+        source_shard: id(shard),
+        source_offset: 8,
+        destinations: vec![(3, 0x80000)],
+        source_addresses: (0..3).map(|i| address + i * stride).collect(),
+        source_elements: vec![],
+        words: 16,
+        width: ExchangeItemWidth::Word32,
+        reserved_source: None,
+    };
+    let mut transfers = vec![
+        make(0, 0, 0x60008, 256),
+        make(0, 1, 0x64008, 256),
+        make(1, 2, 0x68008, 512),
+        make(2, 3, 0x70008, 0),
+    ];
+    let addresses = BTreeMap::from([
+        (id(0), 0x60000),
+        (id(1), 0x64000),
+        (id(2), 0x68000),
+        (id(3), 0x70000),
+    ]);
+    let expected = vec![Some((id(0), 8)), Some((id(2), 8)), None, None];
+    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    transfers.reverse();
+    assert_eq!(repeat_outgoing_bases(&transfers, &addresses, 4), expected);
+    // One sender mixing stationary data with moving weights rules out the phase.
+    transfers.push(make(0, 3, 0x70008, 0));
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &addresses, 4),
+        vec![None; 4]
+    );
+    transfers.pop();
+    // Agreement on the first two iterations is insufficient.
+    transfers[2].source_addresses[2] += 4;
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &addresses, 4),
+        vec![None; 4]
+    );
+}
+
+#[test]
+fn paired_repeat_base_preserves_encoded_alignment() {
+    let shard = BlockValueId::from_index(0);
+    let mut transfer = PendingTransfer {
+        source: 0,
+        source_shard: shard,
+        source_offset: 4,
+        source_addresses: vec![0x60004, 0x60104],
+        source_elements: vec![],
+        destinations: vec![(1, 0x80000)],
+        words: 16,
+        width: ExchangeItemWidth::Word32,
+        reserved_source: None,
+    };
+    let addresses = BTreeMap::from([(shard, 0x60000)]);
+    assert_eq!(
+        repeat_outgoing_bases(&[transfer.clone()], &addresses, 2)[0],
+        Some((shard, 4))
+    );
+    let mut paired = transfer.clone();
+    paired.source_addresses.iter_mut().for_each(|a| *a += 4);
+    paired.source_offset += 4;
+    paired.width = ExchangeItemWidth::Paired64;
+    assert_eq!(
+        repeat_outgoing_bases(&[transfer.clone(), paired.clone()], &addresses, 2),
+        vec![None; 2]
+    );
+    transfer.source_addresses.iter_mut().for_each(|a| *a += 4);
+    assert_eq!(
+        repeat_outgoing_bases(&[transfer, paired], &addresses, 2)[0],
+        Some((shard, 8))
+    );
 }

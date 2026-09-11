@@ -282,6 +282,8 @@ enum Workload {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExchangeStressPattern {
+    /// Repeat source-base relocation across ordinary, paired and loopback rows.
+    Base,
     /// Inspect exchange address deltas around a contiguous transfer.
     Delta,
     /// Random small-group transfers, including repeated and chained payloads.
@@ -555,7 +557,9 @@ fn main() -> Result<()> {
             );
         }
         let toolchain = Toolchain::from_sdk(&arguments.sdk);
-        let stress = if matches!(arguments.exchange_pattern, ExchangeStressPattern::Delta) {
+        let stress = if matches!(arguments.exchange_pattern, ExchangeStressPattern::Base) {
+            exchange_stress::build_base(&toolchain, &runtime_source)?
+        } else if matches!(arguments.exchange_pattern, ExchangeStressPattern::Delta) {
             exchange_stress::build_delta(&toolchain, &runtime_source)?
         } else if matches!(arguments.exchange_pattern, ExchangeStressPattern::Wide) {
             exchange_stress::build_wide(

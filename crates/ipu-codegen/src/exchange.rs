@@ -52,6 +52,9 @@ pub struct PhysicalExchangePhase {
     /// Per-tile replacement words which specialize a reusable row for each
     /// structured-repeat iteration.
     pub repeat_patches: Vec<Vec<ExchangeRowPatch>>,
+    /// Per-tile Repeat argument and byte offset supplying OUTGOING_BASE.
+    /// Present only when every sender in the phase has a uniform relocation.
+    pub outgoing_bases: Vec<Option<(BlockValueId, u32)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,13 +436,14 @@ pub(crate) fn lower_exchanges_cached(
                 .iter()
                 .map(Option::is_some)
                 .collect::<Vec<_>>();
-            let programs = phase_programs
+            let mut programs = phase_programs
                 .programs
                 .into_iter()
                 .map(|program| program.unwrap_or_else(inactive_exchange_program))
                 .collect::<Vec<_>>();
+            let outgoing_bases = repeat_outgoing_bases(&pending, &placement.shard_addresses, program.tile_count);
             let repeat_patches = programs
-                .iter()
+                .iter_mut()
                 .enumerate()
                 .map(|(tile, program)| {
                     let sends = activities[tile].iter()
@@ -457,7 +461,19 @@ pub(crate) fn lower_exchanges_cached(
                         ));
                     }
                     let mut patches = Vec::new();
+                    let base = outgoing_bases[tile].map(|(shard, offset)| {
+                        placement.shard_addresses[&shard] + offset
+                    });
                     for (instructions, transfer) in address_groups.into_iter().zip(sends) {
+                        if let Some(base) = base {
+                            for (word_offset, byte_offset) in instructions {
+                                let offset = transfer.source_address().checked_sub(base)
+                                    .and_then(|offset| offset.checked_add(byte_offset))
+                                    .ok_or(ExchangeLoweringError::Overflow)?;
+                                patch_sender_instruction(&mut program[word_offset], offset)?;
+                            }
+                            continue;
+                        }
                         let source_shard = transfer.source_shard;
                         let source_offset = transfer.source_offset;
                         let Some(inputs) = repeat_inputs.get(&source_shard) else {
@@ -524,6 +540,7 @@ pub(crate) fn lower_exchanges_cached(
                     event_cycles: horizon,
                     activities,
                     repeat_patches,
+                    outgoing_bases,
                 },
                 schedule_problem,
             ))
@@ -705,6 +722,67 @@ impl PendingTransfer {
         self.source_elements.sort_unstable();
         self.source_elements.dedup();
     }
+}
+
+/// Keep a single base throughout the timed phase, including all stationary sends.
+/// Reuse an existing Repeat pointer rather than creating a second relocation ABI.
+fn repeat_outgoing_bases(
+    pending: &[PendingTransfer],
+    addresses: &BTreeMap<BlockValueId, u32>,
+    tile_count: u16,
+) -> Vec<Option<(BlockValueId, u32)>> {
+    let empty = || vec![None; usize::from(tile_count)];
+    let mut first = vec![None::<&PendingTransfer>; usize::from(tile_count)];
+    let mut paired = vec![false; usize::from(tile_count)];
+    for transfer in pending {
+        let tile = usize::from(transfer.source);
+        paired[tile] |= transfer.width == ExchangeItemWidth::Paired64;
+        if let Some(previous) = first[tile] {
+            let count = previous
+                .source_addresses
+                .len()
+                .max(transfer.source_addresses.len());
+            for i in 0..count {
+                let delta = |t: &PendingTransfer| {
+                    t.source_addresses
+                        .get(i)
+                        .copied()
+                        .unwrap_or(t.source_address())
+                        .wrapping_sub(t.source_address())
+                };
+                if delta(previous) != delta(transfer) {
+                    return empty();
+                }
+            }
+            if previous.source_address() <= transfer.source_address() {
+                continue;
+            }
+        }
+        first[tile] = Some(transfer);
+    }
+    let mut bases = empty();
+    for (tile, transfer) in first.into_iter().enumerate() {
+        let Some(transfer) = transfer else { continue };
+        if transfer
+            .source_addresses
+            .iter()
+            .all(|&a| a == transfer.source_address())
+        {
+            continue;
+        }
+        // A paired row's encoded offsets must remain eight-byte aligned.
+        if paired[tile] && !transfer.source_address().is_multiple_of(8) {
+            return empty();
+        }
+        let Some(&address) = addresses.get(&transfer.source_shard) else {
+            return empty();
+        };
+        let Some(offset) = transfer.source_address().checked_sub(address) else {
+            return empty();
+        };
+        bases[tile] = Some((transfer.source_shard, offset));
+    }
+    bases
 }
 
 fn attach_repeat_source_addresses(
@@ -1262,6 +1340,7 @@ fn finish_exchange_run(
         event_cycles: horizon,
         activities,
         repeat_patches: vec![Vec::new(); usize::from(tile_count)],
+        outgoing_bases: vec![None; usize::from(tile_count)],
     };
     Ok(ExchangeScheduleRun {
         phase,
@@ -1295,6 +1374,7 @@ pub fn validate_exchange_schedule(
         ("tile horizons", phase.tile_event_cycles.len()),
         ("activities", phase.activities.len()),
         ("repeat patches", phase.repeat_patches.len()),
+        ("outgoing bases", phase.outgoing_bases.len()),
     ] {
         if length != size {
             return Err(fail(format!(
@@ -1307,9 +1387,10 @@ pub fn validate_exchange_schedule(
         .repeat_patches
         .iter()
         .any(|patches| !patches.is_empty())
+        || phase.outgoing_bases.iter().any(Option::is_some)
     {
         return Err(fail(format!(
-            "standalone phase {} unexpectedly contains repeat patches",
+            "standalone phase {} unexpectedly contains repeat relocation",
             problem.phase
         )));
     }

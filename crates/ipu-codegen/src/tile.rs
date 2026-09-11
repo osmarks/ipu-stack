@@ -216,13 +216,34 @@ fn lower_work(
     for work in program.work(tile) {
         let step = match work {
             TileWorkRef::Exchange(id) => {
-                phases.get(&id).ok_or(TileLoweringError::UnknownExchange)?;
+                let phase = phases.get(&id).ok_or(TileLoweringError::UnknownExchange)?;
                 let placed = exchange_rows
                     .get(&id)
                     .ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
                     active: placed.active,
                     incoming_base: placed.incoming_base,
+                    outgoing_base: phase
+                        .outgoing_bases
+                        .get(usize::from(tile.tile))
+                        .copied()
+                        .flatten()
+                        .map(|(shard, offset)| {
+                            let Some(TileAddress::RepeatPointer {
+                                index,
+                                offset: base_offset,
+                            }) = overrides.get(&shard)
+                            else {
+                                return Err(TileLoweringError::InvalidRepeat);
+                            };
+                            Ok(TileAddress::RepeatPointer {
+                                index: *index,
+                                offset: base_offset
+                                    .checked_add(offset)
+                                    .ok_or(TileLoweringError::Overflow)?,
+                            })
+                        })
+                        .transpose()?,
                     preserve_base_registers: false,
                     incoming_mux: None,
                     incoming_format: 0,
@@ -440,6 +461,7 @@ fn lower_inactive_work(
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 active: exchange_rows[&id].active,
                 incoming_base: exchange_rows[&id].incoming_base,
+                outgoing_base: None,
                 preserve_base_registers: false,
                 incoming_mux: None,
                 incoming_format: 0,
