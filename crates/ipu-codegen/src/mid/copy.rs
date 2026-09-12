@@ -113,10 +113,16 @@ pub(super) fn compose(
             {
                 break;
             }
-            // Keep pack-once/broadcast staging. Folding a local rearrangement
-            // into replication repeats that work on every receiving tile.
+            // Keep pack-once staging when the first conversion needs local
+            // packing. Native-panel copies can multicast straight to consumers;
+            // retaining an intermediate merely adds a receive/forward hop.
+            let source_format = &values[source.index() as usize].tensor_type.format;
+            let exchange_only = previous.view.is_none()
+                && (source_format.layout.order == intermediate.format.layout.order
+                    || source_format.supports_micro_panel_exchange(&intermediate.format));
             if destination.format.layout.tiling.replicas
                 > intermediate.format.layout.tiling.replicas
+                && !exchange_only
             {
                 break;
             }
@@ -292,6 +298,28 @@ mod tests {
     }
 
     #[test]
+    fn native_fp8_panel_materialization_composes_into_replication() {
+        let (mut operations, mut values) = chain();
+        for value in &mut values {
+            value.tensor_type.shape = TensorShape(vec![64, 16]);
+            value.tensor_type.format.precision = crate::Precision::F8F143 { scale_exponent: -4 };
+            value.tensor_type.format.layout.order =
+                crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                    row_block: 64,
+                    column_block: 16,
+                });
+        }
+        values[0].tensor_type.format.layout.order =
+            crate::ElementOrder::Amp(crate::AmpOrder::TransposedLeft);
+        values[2].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
+        values[3].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
+        compose(&mut operations, &values, &[MidValueId(3)]);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].inputs, [MidValueId(0)]);
+        assert_eq!(operations[0].results, [MidValueId(3)]);
+    }
+
+    #[test]
     fn composition_preserves_shared_results_broadcast_staging_and_padding() {
         let (mut operations, values) = chain();
         compose(&mut operations, &values, &[MidValueId(1), MidValueId(3)]);
@@ -299,6 +327,15 @@ mod tests {
         assert_eq!(operations[1].inputs, [MidValueId(1)]);
 
         let (mut operations, mut values) = chain();
+        values[2].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
+        values[3].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
+        compose(&mut operations, &values, &[MidValueId(3)]);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].inputs, [MidValueId(0)]);
+
+        let (mut operations, mut values) = chain();
+        values[0].tensor_type.format.layout.order =
+            crate::ElementOrder::Amp(crate::AmpOrder::Output);
         values[2].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
         values[3].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
         compose(&mut operations, &values, &[MidValueId(3)]);
