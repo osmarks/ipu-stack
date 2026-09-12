@@ -187,8 +187,16 @@ impl Builder {
                 v.unwrap_or_else(|| self.copy(value_panels, value_block_type, vec![0, start, 0]))
             };
             let product = if let Some(grid) = probability_value_grid {
+                // The softmax buffer also carries FP32 maximum/denominator
+                // words after key_block. Expose only probabilities and their
+                // zero padding: a distributed K grid can pad beyond key_block,
+                // and copying those statistics as FP16 yields NaNs even when
+                // the corresponding V coefficients are zero.
+                let mut probabilities = self.tensor(weights_id).clone();
+                probabilities.shape.0[2] = key_block;
+                let probabilities = self.copy(weights_id, probabilities, vec![]);
                 self.distributed_product(
-                    weights_id,
+                    probabilities,
                     v,
                     &product_type,
                     ProductAxes {
@@ -310,6 +318,64 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributed_pv_excludes_softmax_statistics_from_padding() {
+        let tensor = |shape: [u32; 3]| TensorType {
+            shape: TensorShape(shape.to_vec()),
+            format: TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::attention_output(1, 1),
+            },
+        };
+        let mut builder = Builder::new(&[
+            tensor([1, 2, 72]),
+            tensor([1, 729, 72]),
+            tensor([1, 729, 72]),
+        ]);
+        let output = builder
+            .attention(
+                &tensor([1, 2, 72]),
+                768,
+                80,
+                80,
+                true,
+                Some(ProductGrid {
+                    rows: 1,
+                    columns: 1,
+                    inner: 1,
+                }),
+                Some(ProductGrid {
+                    rows: 1,
+                    columns: 1,
+                    inner: 5,
+                }),
+                [None; 2],
+            )
+            .unwrap();
+        builder.program.outputs = vec![output];
+        builder.program.tile_count = 5;
+        let expanded = crate::expand_tiles(&builder.program).unwrap();
+        let softmax = expanded
+            .kernel_runs
+            .iter()
+            .find(|run| matches!(run.kernel, TileKernelSpec::AttentionSoftmax { .. }))
+            .unwrap()
+            .output
+            .shard;
+        // The five PV groups consume 800 columns. The first 768 are weights;
+        // [768, 784) contains FP32 metadata that can encode FP16 NaNs.
+        let mut probability_transfers = 0;
+        for phase in &expanded.exchange_phases {
+            for transfer in &phase.transfers {
+                if transfer.source.shard == softmax {
+                    assert!(transfer.source.extents[2].physical_end <= 768);
+                    probability_transfers += 1;
+                }
+            }
+        }
+        assert!(probability_transfers > 0);
+    }
 
     #[test]
     fn single_query_keeps_distributed_key_preparation() {
