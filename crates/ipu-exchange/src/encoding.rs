@@ -280,14 +280,14 @@ mod tests {
         let mut schedule = TileProgramSchedule::default();
         for offset in [3000, 1000, 2000] {
             schedule
-                .append_sender_at(&row, &sender_row_timing(&row, 0).unwrap(), offset)
+                .append_sender_at(&row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
                 .unwrap();
         }
         let before = schedule.finish().unwrap();
         for offset in [1999, 2000, 2001] {
             assert!(
                 schedule
-                    .append_sender_at(&row, &sender_row_timing(&row, 0).unwrap(), offset)
+                    .append_sender_at(&row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
                     .is_err()
             );
             assert_eq!(schedule.finish().unwrap(), before);
@@ -295,7 +295,7 @@ mod tests {
         let mut ordered = TileProgramSchedule::default();
         for offset in [1000, 2000, 3000] {
             ordered
-                .append_sender_at(&row, &sender_row_timing(&row, 0).unwrap(), offset)
+                .append_sender_at(&row, &scheduled_sender_timing(&row, 0).unwrap(), offset)
                 .unwrap();
         }
         assert_eq!(ordered.finish().unwrap(), before);

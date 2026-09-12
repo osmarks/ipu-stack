@@ -278,7 +278,7 @@ struct ScheduledSenderRow {
 /// Borrowing the rows prevents address patches from invalidating the timing.
 pub struct PreparedTransfer<'a> {
     rows: &'a MulticastPlan,
-    sender: SenderRowTiming,
+    sender: ScheduledPayloadTiming,
     receivers: Vec<ReceiveRowTiming>,
 }
 
@@ -286,7 +286,7 @@ impl MulticastPlan {
     pub fn prepare(&self) -> Result<PreparedTransfer<'_>, ExchangeError> {
         Ok(PreparedTransfer {
             rows: self,
-            sender: sender_row_timing(&self.sender, 0)?,
+            sender: scheduled_sender_timing(&self.sender, 0)?,
             receivers: self
                 .receivers
                 .iter()
@@ -693,13 +693,13 @@ impl PhaseProgramBuilder {
         let horizon = receiver_timings
             .iter()
             .map(|timing| timing.horizon)
-            .chain(std::iter::once(sender.horizon_cycles))
+            .chain(std::iter::once(sender.horizon))
             .max()
             .unwrap_or(schedule_offset);
         Ok(PhaseTransferTiming {
-            payload_start: sender.start_cycles,
-            payload_end: sender.end_cycles,
-            sender_horizon: sender.horizon_cycles,
+            payload_start: sender.payload_start,
+            payload_end: sender.payload_end,
+            sender_horizon: sender.horizon,
             receivers: receiver_timings,
             horizon,
         })
@@ -771,12 +771,12 @@ impl TileProgramSchedule {
     /// single supervisor instruction, not dual issue from independent lanes.
     fn earliest_sender_offset(
         &self,
-        base: &SenderRowTiming,
+        base: &ScheduledPayloadTiming,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
-        let mut offset = requested.max(self.reserved_sender_end.saturating_sub(base.start_cycles));
+        let mut offset = requested.max(self.reserved_sender_end.saturating_sub(base.payload_start));
         let first_start = base
-            .start_cycles
+            .payload_start
             .checked_add(offset)
             .ok_or(ExchangeError::Schedule("send offset overflow"))?;
         let mut next = self
@@ -784,11 +784,11 @@ impl TileProgramSchedule {
             .partition_point(|sender| sender.end_cycles <= first_start);
         loop {
             let start = base
-                .start_cycles
+                .payload_start
                 .checked_add(offset)
                 .ok_or(ExchangeError::Schedule("send offset overflow"))?;
             let end = base
-                .end_cycles
+                .payload_end
                 .checked_add(offset)
                 .ok_or(ExchangeError::Schedule("send offset overflow"))?;
             // Offsets only advance. Walk occupied intervals once instead of
@@ -807,7 +807,7 @@ impl TileProgramSchedule {
             if let Some(sender) = conflicting_sender {
                 offset = sender
                     .end_cycles
-                    .checked_sub(base.start_cycles)
+                    .checked_sub(base.payload_start)
                     .ok_or(ExchangeError::Schedule("send offset order"))?;
                 next += 1;
                 continue;
@@ -890,36 +890,36 @@ impl TileProgramSchedule {
     fn append_sender_at(
         &mut self,
         row: &PlanRow,
-        base: &SenderRowTiming,
+        base: &ScheduledPayloadTiming,
         schedule_offset: u32,
     ) -> Result<(), ExchangeError> {
         let timing = base.at(schedule_offset)?;
         let index = self
             .senders
-            .partition_point(|sender| sender.start_cycles < timing.start_cycles);
+            .partition_point(|sender| sender.start_cycles < timing.payload_start);
         if self
             .senders
             .get(index.wrapping_sub(1))
-            .is_some_and(|sender| sender.end_cycles > timing.start_cycles)
+            .is_some_and(|sender| sender.end_cycles > timing.payload_start)
             || self
                 .senders
                 .get(index)
-                .is_some_and(|sender| sender.start_cycles < timing.end_cycles)
+                .is_some_and(|sender| sender.start_cycles < timing.payload_end)
         {
             return Err(ExchangeError::Schedule("overlapping outgoing messages"));
         }
-        if self.receive_control_at_send_start(timing.start_cycles) {
+        if self.receive_control_at_send_start(timing.payload_start) {
             return Err(ExchangeError::Schedule("unencodable initial send control"));
         }
         self.invalidate_encoding();
         self.dirty_senders = self.dirty_senders.min(index);
-        self.event_cycles = self.event_cycles.max(timing.horizon_cycles);
+        self.event_cycles = self.event_cycles.max(timing.horizon);
         self.senders.insert(
             index,
             ScheduledSenderRow {
                 row: *row,
-                start_cycles: timing.start_cycles,
-                end_cycles: timing.end_cycles,
+                start_cycles: timing.payload_start,
+                end_cycles: timing.payload_end,
             },
         );
         Ok(())
@@ -1438,31 +1438,25 @@ fn receive_row_timing(
     })
 }
 
-struct SenderRowTiming {
-    start_cycles: u32,
-    end_cycles: u32,
-    horizon_cycles: u32,
-}
-
-impl SenderRowTiming {
-    fn at(&self, offset: u32) -> Result<Self, ExchangeError> {
-        let horizon_cycles = self
-            .horizon_cycles
-            .checked_add(offset)
-            .ok_or(ExchangeError::Schedule("sender event horizon overflow"))?;
-        Ok(Self {
-            start_cycles: self.start_cycles + offset,
-            end_cycles: self.end_cycles + offset,
-            horizon_cycles,
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScheduledPayloadTiming {
     pub payload_start: u32,
     pub payload_end: u32,
     pub horizon: u32,
+}
+
+impl ScheduledPayloadTiming {
+    fn at(&self, offset: u32) -> Result<Self, ExchangeError> {
+        let horizon = self
+            .horizon
+            .checked_add(offset)
+            .ok_or(ExchangeError::Schedule("sender event horizon overflow"))?;
+        Ok(Self {
+            payload_start: self.payload_start + offset,
+            payload_end: self.payload_end + offset,
+            horizon,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1471,18 +1465,6 @@ pub struct ScheduledReceiverTiming {
     pub pointer_event: Option<u32>,
     pub source_teardown: u32,
     pub horizon: u32,
-}
-
-pub fn scheduled_sender_timing(
-    row: &PlanRow,
-    schedule_offset: u32,
-) -> Result<ScheduledPayloadTiming, ExchangeError> {
-    let timing = sender_row_timing(row, schedule_offset)?;
-    Ok(ScheduledPayloadTiming {
-        payload_start: timing.start_cycles,
-        payload_end: timing.end_cycles,
-        horizon: timing.horizon_cycles,
-    })
 }
 
 pub fn scheduled_receiver_timing(
@@ -1504,10 +1486,10 @@ pub fn scheduled_receiver_timing(
     })
 }
 
-fn sender_row_timing(
+pub fn scheduled_sender_timing(
     row: &PlanRow,
     schedule_offset: u32,
-) -> Result<SenderRowTiming, ExchangeError> {
+) -> Result<ScheduledPayloadTiming, ExchangeError> {
     if row[0] != SYNC_SUPERVISOR_INSTRUCTION {
         return Err(ExchangeError::Schedule("sender row entry"));
     }
@@ -1531,10 +1513,10 @@ fn sender_row_timing(
                 .ok_or(ExchangeError::Schedule("sender event horizon overflow"))?;
         }
     }
-    Ok(SenderRowTiming {
-        start_cycles: start_cycles.ok_or(ExchangeError::Schedule("sender payload"))?,
-        end_cycles: end_cycles.ok_or(ExchangeError::Schedule("sender payload"))?,
-        horizon_cycles: cycles,
+    Ok(ScheduledPayloadTiming {
+        payload_start: start_cycles.ok_or(ExchangeError::Schedule("sender payload"))?,
+        payload_end: end_cycles.ok_or(ExchangeError::Schedule("sender payload"))?,
+        horizon: cycles,
     })
 }
 
@@ -3352,10 +3334,10 @@ mod tests {
             for _ in 0..16 {
                 let start_cycles = rng.u32(0..8);
                 let end_cycles = start_cycles + rng.u32(1..64);
-                let base = SenderRowTiming {
-                    start_cycles,
-                    end_cycles,
-                    horizon_cycles: end_cycles,
+                let base = ScheduledPayloadTiming {
+                    payload_start: start_cycles,
+                    payload_end: end_cycles,
+                    horizon: end_cycles,
                 };
                 let requested = rng.u32(0..end + 80);
                 let expected = (requested..)
@@ -3800,7 +3782,7 @@ mod tests {
             combined
                 .append_sender_at(
                     &plan.sender,
-                    &sender_row_timing(&plan.sender, 0).unwrap(),
+                    &scheduled_sender_timing(&plan.sender, 0).unwrap(),
                     offset,
                 )
                 .unwrap();
@@ -4160,19 +4142,19 @@ mod tests {
                 .unwrap();
             let _ = builder.finish();
             let sender_offset = builder
-                .earliest_sender_offset(&sender_row_timing(&outgoing, 0).unwrap(), 0)
+                .earliest_sender_offset(&scheduled_sender_timing(&outgoing, 0).unwrap(), 0)
                 .unwrap();
             builder
                 .append_sender_at(
                     &outgoing,
-                    &sender_row_timing(&outgoing, 0).unwrap(),
+                    &scheduled_sender_timing(&outgoing, 0).unwrap(),
                     sender_offset,
                 )
                 .unwrap();
             let expected_horizon = builder.event_cycles();
             let program = builder.finish().unwrap();
             assert_eq!(plan_event_cycles(&program).unwrap(), expected_horizon);
-            let outgoing_timing = sender_row_timing(&outgoing, sender_offset).unwrap();
+            let outgoing_timing = scheduled_sender_timing(&outgoing, sender_offset).unwrap();
 
             let base = receive_row_timing(&incoming, 0).unwrap();
             let expected = scheduled_receive_window(&base, 0, words, None)
@@ -4197,7 +4179,8 @@ mod tests {
                 } else if is_send_control(instruction) {
                     fused_programs += 1;
                     actual.push((before + 1, send_control_signature(instruction)));
-                    if before >= outgoing_timing.start_cycles && before < outgoing_timing.end_cycles
+                    if before >= outgoing_timing.payload_start
+                        && before < outgoing_timing.payload_end
                     {
                         sent_words += advance;
                     }
@@ -4218,7 +4201,8 @@ mod tests {
                             source,
                         ),
                     ));
-                    if before >= outgoing_timing.start_cycles && before < outgoing_timing.end_cycles
+                    if before >= outgoing_timing.payload_start
+                        && before < outgoing_timing.payload_end
                     {
                         sent_words += advance;
                     }
@@ -4323,12 +4307,12 @@ mod tests {
             .append_receiver_at(&receive_row_timing(&first.receivers[0], 0).unwrap(), 0, 64)
             .unwrap();
         let offset = relay
-            .earliest_sender_offset(&sender_row_timing(&second.sender, 0).unwrap(), 0)
+            .earliest_sender_offset(&scheduled_sender_timing(&second.sender, 0).unwrap(), 0)
             .unwrap();
         relay
             .append_sender_at(
                 &second.sender,
-                &sender_row_timing(&second.sender, 0).unwrap(),
+                &scheduled_sender_timing(&second.sender, 0).unwrap(),
                 offset,
             )
             .unwrap();
