@@ -250,20 +250,29 @@ def main():
     parser.add_argument('--seed', type=int, default=20260912)
     parser.add_argument('--budget', type=int, default=64)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--dump-cases', type=Path, help='export generated cases for the Rust corpus benchmark')
     args = parser.parse_args()
     results = {}
+    def save_case(name, data):
+        if args.dump_cases:
+            args.dump_cases.mkdir(parents=True, exist_ok=True)
+            (args.dump_cases / name).write_text(json.dumps(data) + '\n')
+
     for path in args.captures:
         data = json.loads(path.read_text())
         if data.get('placed'):
             roots = data['assigned_root_spans']
             validate(data, {i: tuple(roots[str(r['assignments'][0][0])])
                             for i, r in enumerate(data['requests'])})
+        save_case(path.name, data)
         results[str(path)] = evaluate(data, args.budget)
     for seed in range(args.seed, args.seed + args.random_cases):
         data = synthetic(seed)
+        save_case(f'synthetic-{seed}.json', data)
         results[f'synthetic-{seed}'] = evaluate(data, args.budget)
         if seed < args.seed + 10:
             data['ranges'][0][1] -= 32768
+            save_case(f'tight-{seed}.json', data)
             results[f'tight-{seed}'] = evaluate(data, args.budget)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({'seed': args.seed, 'budget': args.budget, 'results': results}, indent=2) + '\n')

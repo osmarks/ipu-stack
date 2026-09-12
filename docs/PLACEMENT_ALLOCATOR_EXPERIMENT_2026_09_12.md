@@ -1,8 +1,9 @@
 # Placement search experiment, 2026-09-12
 
-The standalone [prototype](../tools/placement_experiment.py) recovers a real
+The initial standalone [prototype](../tools/placement_experiment.py) recovers a real
 fragmented tile and improves on the current two-order allocator on synthetic
-bank-constrained instances. It is not integrated into production. The difficult
+bank-constrained instances. Its order-repair algorithm is not integrated into
+production; the address search described below is. The difficult
 near-capacity cases show why adding more allocation orders is insufficient.
 
 ## Inputs and reproducibility
@@ -118,3 +119,55 @@ could silently prune feasible placements. A small exact CP-SAT/MILP reference
 would help evaluate the stronger prototype, but is not a prerequisite for the
 cheap end-first order. Neither approach requires changing the model plan or
 adding another whole-model compilation retry layer.
+
+## Implemented address-domain search
+
+`place/search.rs` now runs only after both existing greedy orders fail. It
+represents legal addresses as aligned intervals and shares region eligibility,
+Repeat stride and aperture handling with the greedy arena. Each placement
+subtracts occupied byte spans from overlapping lifetimes and complete physical
+elements from bank-conflicting neighbors. Empty domains backtrack immediately.
+The next request is chosen using remaining address slack relative to its size,
+with preference for allocations surviving to model completion. Branches include
+both hole edges, element starts, and starts that end at element boundaries.
+This explicitly permits a later bank even when the first bank has space.
+
+Search is deterministic and capped at 4,096 recursive nodes and 2,000,000 domain
+filter operations per tile. There is no wall-clock timeout. Budget exhaustion
+and exhaustion of the sampled address branches are both unknown; only the
+separate live-byte lower bound proves overcapacity. This is forward propagation
+from fixed assignments, not full arc consistency between unassigned buffers.
+All existing successful greedy placements are retained.
+
+| Same corpus | Address search fit |
+| --- | ---: |
+| Real fragmented capture | 1/1 |
+| Real overcapacity capture | 0/1, rejected by byte bound |
+| 100 feasible cases with one spare element | 96/100 |
+| 10 feasible cases with no spare element | 2/10 |
+
+Release Rust timings: main set median **1.44 ms**, p95 **3.58 ms**, maximum
+**117 ms**. Tight-set maximum **161 ms**. The real fragmented tile took
+**11.5 ms**, 233 nodes; the capacity rejection took **80 µs**. These measurements
+run address search on every fixture in isolation; production invokes it only on
+failures. All returned placements also passed the independent Python validator.
+They do not establish that every tile of a full rejected model will fit.
+
+To reproduce the corpus benchmark, add `--dump-cases /tmp/placement-corpus` to
+the Python command above, then run:
+
+```sh
+IPU_STACK_PLACEMENT_CORPUS=/tmp/placement-corpus \
+  cargo test --release -p ipu-codegen --lib \
+  place::search::tests::fixture_corpus -- --ignored --nocapture
+```
+
+Permanent regressions retain the two real captures and dense seed 20260917,
+which needs backtracking and defeats the order-only experiment. Another test
+exhaustively checks domain subtraction against every aligned start in small
+intervals. The complete placement test group passes (21 tests, one external
+corpus benchmark ignored).
+
+Eight tight cases remain unknown. More sophisticated propagation of mandatory
+occupied elements across unassigned domains could improve these, but no extra
+whole-model search or budget escalation is needed for the implemented gain.

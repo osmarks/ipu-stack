@@ -3,6 +3,7 @@
 mod dump;
 mod exchange;
 pub(crate) mod profile;
+mod search;
 pub(crate) use exchange::ExchangeConflicts;
 
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
@@ -51,7 +52,7 @@ struct Requirement {
     access_tail: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Lifetime {
     first: u32,
     last: u32,
@@ -812,7 +813,7 @@ fn allocate_tile(
         Err(PlacementError::OutOfMemory { .. }) => {}
         Err(error) => return Err(error),
     }
-    *arena = initial;
+    *arena = initial.clone();
     arena.offline = true;
     addresses.clear();
     requests.sort_by_key(|request| {
@@ -824,6 +825,27 @@ fn allocate_tile(
         )
     });
     let result = allocate_requests(program, tile, &requests, members, arena, addresses);
+    if matches!(result, Err(PlacementError::OutOfMemory { .. })) {
+        let searched = search::place(&requests, &initial);
+        tracing::debug!(
+            tile,
+            nodes = searched.nodes,
+            excess_live_bytes = searched.excess_live_bytes,
+            recovered = searched.placement.is_some(),
+            "bounded tile placement search"
+        );
+        if let Some(placement) = searched.placement {
+            *arena = initial;
+            arena.offline = true;
+            addresses.clear();
+            for (request, (start, end)) in requests.iter().zip(placement) {
+                arena.record(request, start, end);
+                assign_request(request, start, members, addresses)?;
+            }
+            dump::capture(tile, &requests, arena, true);
+            return Ok(());
+        }
+    }
     dump::capture(tile, &requests, arena, result.is_ok());
     result?;
     tracing::debug!(
@@ -863,24 +885,34 @@ fn allocate_requests(
                 bytes: request.bytes,
             });
         };
-        for (index, (root, offset)) in request.assignments.iter().copied().enumerate() {
-            let offset = if base >= IPU21_INTERLEAVED_MEMORY_BASE {
-                request.region1_stride.map_or(Ok(offset), |stride| {
-                    stride
-                        .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
-                        .ok_or(PlacementError::Overflow)
-                })?
-            } else {
-                offset
-            };
-            let address = base.checked_add(offset).ok_or(PlacementError::Overflow)?;
-            assign_members(addresses, &members[&root], address)?;
-        }
+        assign_request(request, base, members, addresses)?;
     }
     Ok(())
 }
 
-#[derive(serde::Serialize)]
+fn assign_request(
+    request: &AllocationRequest,
+    base: u32,
+    members: &BTreeMap<usize, Vec<usize>>,
+    addresses: &mut BTreeMap<BlockValueId, u32>,
+) -> Result<(), PlacementError> {
+    for (index, (root, offset)) in request.assignments.iter().copied().enumerate() {
+        let offset = if base >= IPU21_INTERLEAVED_MEMORY_BASE {
+            request.region1_stride.map_or(Ok(offset), |stride| {
+                stride
+                    .checked_mul(u32::try_from(index).map_err(|_| PlacementError::Overflow)?)
+                    .ok_or(PlacementError::Overflow)
+            })?
+        } else {
+            offset
+        };
+        let address = base.checked_add(offset).ok_or(PlacementError::Overflow)?;
+        assign_members(addresses, &members[&root], address)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AllocationRequest {
     class: MemoryClass,
     /// Iterated values need a wider physical stride if placed in region 1.
@@ -975,71 +1007,22 @@ impl Arena {
                 .flat_map(|&(start, end)| element_spans(start, end))
                 .collect(),
         );
-        let interleaved_offset = self.interleaved_offset;
-        let candidate = self
-            .free
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &(base, limit))| {
-                // These ranges cannot coalesce across the permanently reserved
-                // runtime state. Borrow the aperture only between host phases.
-                if HOST_SCRATCH_RANGE.0 <= base
-                    && limit <= HOST_SCRATCH_RANGE.1
-                    && (first == 0 || last == u32::MAX)
-                {
-                    return None;
-                }
-                Some((index, base, limit))
-            })
-            .flat_map(|(index, base, limit)| {
-                // Keep candidate spans within one address region even after free
-                // ranges coalesce across its boundary.
-                let forbidden = &forbidden;
-                [false, true].into_iter().filter_map(move |region1| {
-                    let (base, limit) = if region1 {
-                        (
-                            base.max(
-                                IPU21_INTERLEAVED_MEMORY_BASE
-                                    + if request.class == MemoryClass::Ipu21Interleaved {
-                                        interleaved_offset
-                                    } else {
-                                        0
-                                    },
-                            ),
-                            limit,
-                        )
-                    } else {
-                        if request.class == MemoryClass::Ipu21Interleaved {
-                            return None;
-                        }
-                        (base, limit.min(IPU21_INTERLEAVED_MEMORY_BASE))
-                    };
-                    let element = if region1 {
-                        IPU21_INTERLEAVED_ELEMENT_SIZE
-                    } else {
-                        TILE_MEMORY_ELEMENT_SIZE
-                    };
-                    let alignment = request.alignment.max(if request.region1_stride.is_some() {
-                        element
-                    } else {
-                        1
-                    });
-                    let bytes = if region1 && let Some(stride) = request.region1_stride {
-                        stride.checked_mul(u32::try_from(request.assignments.len()).ok()?)?
-                    } else {
-                        request.bytes
-                    };
-                    let mut start = align_up(base, alignment).ok()?;
-                    for &(a, b) in forbidden {
-                        if start < b && a < start.checked_add(bytes)? {
-                            start = align_up(b, alignment).ok()?;
-                        }
+        let candidate = request
+            .domains(&self.free, self.interleaved_offset)
+            .into_iter()
+            .filter_map(|(index, domain)| {
+                let mut start = domain.first;
+                for &(a, b) in &forbidden {
+                    if start < b && a < start.checked_add(domain.bytes)? {
+                        start = align_up(b, domain.alignment).ok()?;
                     }
-                    let end = start.checked_add(bytes)?;
-                    // Ordinary buffers prefer region 0; compact addresses within
-                    // each region leave long contiguous spans for later requests.
-                    (end <= limit).then_some(((region1, start), index, start, end))
-                })
+                }
+                (start <= domain.last).then_some((
+                    (start >= IPU21_INTERLEAVED_MEMORY_BASE, start),
+                    index,
+                    start,
+                    start + domain.bytes,
+                ))
             })
             .min_by_key(|candidate| (candidate.0, candidate.1));
         if let Some((_, index, start, end)) = candidate {
@@ -1052,17 +1035,22 @@ impl Arena {
                 self.free.push((end, limit));
             }
             self.free.sort_unstable();
-            for &(root, _) in &request.assignments {
-                self.root_spans.insert(root, (start, end));
-            }
-            self.active.push((last, start, end - start));
-            self.occupied.push((start, end));
-            if self.offline {
-                self.history.push((request.lifetime, start, end));
-            }
+            self.record(request, start, end);
             return Some(start);
         }
         None
+    }
+
+    fn record(&mut self, request: &AllocationRequest, start: u32, end: u32) {
+        for &(root, _) in &request.assignments {
+            self.root_spans.insert(root, (start, end));
+        }
+        self.active
+            .push((request.lifetime.last, start, end - start));
+        self.occupied.push((start, end));
+        if self.offline {
+            self.history.push((request.lifetime, start, end));
+        }
     }
 
     fn release(&mut self, base: u32, limit: u32) {
