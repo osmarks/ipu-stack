@@ -169,5 +169,81 @@ class PackingTests(unittest.TestCase):
         self.assertEqual(packing.copy_loops([(0, 0, 8), (16, 8, 8), (32, 16, 8)]), 1)
 
 
+class GatherTests(unittest.TestCase):
+    def test_gather_pack_multicast_preserves_every_word_and_padding_hole(self):
+        spec = importlib.util.spec_from_file_location(
+            "gather", Path(__file__).with_name("exchange-gather.py")
+        )
+        gather = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gather)
+        # Each source has two adjacent rows; destinations separate the rows
+        # into batch planes, with an untouched padding row between planes.
+        phase = {
+            "phase": 0,
+            "transfers": [
+                transfer(
+                    source,
+                    [0x60000 + batch * 32],
+                    [
+                        (4, 0xA0000 + (batch * 3 + source) * 32),
+                        (5, 0xA8000 + (batch * 3 + source) * 32),
+                    ],
+                    8,
+                )
+                for source in range(2)
+                for batch in range(2)
+            ],
+        }
+        for shards in [1, 2, 4]:
+            for direct in [False, True]:
+                first, last, cases = gather.gather(phase, 16, shards, direct)
+                memory, expected = {}, {}
+                for t in phase["transfers"]:
+                    for offset in range(0, t["words"] * 4, 4):
+                        key = t["source"], t["source_addresses"][0] + offset
+                        memory[key] = key
+                        for d in t["destinations"]:
+                            expected[d["tile"], d["address"] + offset] = key
+
+                def execute(exchange, memory=memory):
+                    for t in exchange["transfers"]:
+                        for offset in range(0, t["words"] * 4, 4):
+                            token = memory[
+                                t["source"], t["source_addresses"][0] + offset
+                            ]
+                            for d in t["destinations"]:
+                                memory[d["tile"], d["address"] + offset] = token
+
+                execute(first)
+                for case in cases:
+                    for task in case["tasks"]:
+                        for row in range(task["rows"]):
+                            for offset in range(0, task["row_bytes"], 4):
+                                a = (
+                                    case["input_address"]
+                                    + task["source"]
+                                    + row * task["source_stride"]
+                                    + offset
+                                )
+                                b = (
+                                    case["output_address"]
+                                    + task["destination"]
+                                    + row * task["destination_stride"]
+                                    + offset
+                                )
+                                memory[case["tile"], b] = memory[case["tile"], a]
+                execute(last)
+                actual = {
+                    key: value for key, value in memory.items() if key[0] in [4, 5]
+                }
+                self.assertEqual(actual, expected)
+                self.assertEqual(
+                    packing.geometry(last)["received_bytes"],
+                    packing.geometry(phase)["received_bytes"],
+                )
+                self.assertFalse(packing.has_read_write_overlap(first))
+                self.assertFalse(packing.has_read_write_overlap(last))
+
+
 if __name__ == "__main__":
     unittest.main()
