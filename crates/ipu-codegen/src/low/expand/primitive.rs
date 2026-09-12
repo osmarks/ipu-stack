@@ -27,6 +27,13 @@ impl TileGraphBuilder {
                 product,
                 output_aliases,
             } => {
+                let donate_cast = matches!(
+                    kernel,
+                    TileKernelSpec::Cast {
+                        from: Precision::F16,
+                        to: Precision::F8F143 { .. }
+                    }
+                ) && output_aliases == &[(0, 0)];
                 let output = *operation
                     .results
                     .first()
@@ -70,13 +77,7 @@ impl TileGraphBuilder {
                                     == self.shards[target.index() as usize].extents
                             })
                             .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                        self.shards[target.index() as usize].definition = if matches!(
-                            kernel,
-                            TileKernelSpec::Cast {
-                                from: Precision::F16,
-                                to: Precision::F8F143 { .. }
-                            }
-                        ) {
+                        self.shards[target.index() as usize].definition = if donate_cast {
                             ShardDefinition::ShiftedAlias {
                                 source: previous,
                                 offset: -(crate::mid::cast::CAST_PREFIX_BYTES as i32),
@@ -93,9 +94,7 @@ impl TileGraphBuilder {
                                 .iter()
                                 .copied()
                                 .find(|&source| {
-                                    if matches!(kernel, TileKernelSpec::Cast { .. })
-                                        && output_aliases == &[(0, 0)]
-                                    {
+                                    if donate_cast {
                                         return self.shards[source.index() as usize].extents
                                             == self.shards[output.index() as usize].extents;
                                     }
@@ -155,14 +154,7 @@ impl TileGraphBuilder {
                                 .push(crate::KernelAccess::new(format, 8));
                             run.additional_outputs.push(view);
                         }
-                        if matches!(
-                            kernel,
-                            TileKernelSpec::Cast {
-                                from: Precision::F16,
-                                to: Precision::F8F143 { .. }
-                            }
-                        ) && output_aliases == &[(0, 0)]
-                        {
+                        if donate_cast {
                             self.append_in_place_cast(body, tile, run)?;
                         } else {
                             self.append_kernel(body, tile, run)?;

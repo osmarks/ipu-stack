@@ -93,18 +93,18 @@ fn donate(
             _ => {}
         }
     }
-    let mut users = BTreeMap::<MidValueId, Vec<usize>>::new();
+    let mut users = BTreeMap::<MidValueId, u32>::new();
     let mut producers = BTreeMap::new();
     for (index, op) in operations.iter().enumerate() {
         for &input in op.read_values() {
-            users.entry(input).or_default().push(index);
+            *users.entry(input).or_default() += 1;
         }
         for &output in &op.results {
             producers.insert(output, index);
         }
     }
     for &value in required {
-        users.entry(value).or_default().push(usize::MAX);
+        *users.entry(value).or_default() += 1;
     }
     for index in 0..operations.len() {
         if let MidOperationKind::Repeat(repeat) = &mut operations[index].kind {
@@ -132,7 +132,7 @@ fn donate(
             continue;
         };
         let (input, output) = (*input, *output);
-        if bound.contains(&output) || users.get(&input).is_none_or(|uses| uses != &[index]) {
+        if bound.contains(&output) || users.get(&input) != Some(&1) {
             continue;
         }
         let Some(&producer) = producers.get(&input).filter(|&&p| p < index) else {

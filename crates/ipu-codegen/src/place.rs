@@ -126,26 +126,7 @@ pub(crate) fn place_with_offset(
             bytes: 0,
         });
     }
-    let AllocationAnalysis {
-        iterated,
-        members,
-        root_of_member,
-        member_offsets,
-        root_requirements,
-        root_lifetimes,
-        conflicts,
-    } = analyze_allocations(program)?;
-
-    // Alias groups cannot cross tiles. Partition once rather than walking all
-    // device allocations for each tile and memory class.
-    let mut tile_members = vec![BTreeMap::new(); usize::from(program.tile_count)];
-    for (root, members) in members {
-        tile_members[usize::from(program.shards[members[0]].tile)].insert(root, members);
-    }
-    let mut tile_iterated = vec![Vec::new(); usize::from(program.tile_count)];
-    for group in iterated {
-        tile_iterated[usize::from(group.tile)].push(group);
-    }
+    let analysis = analyze_allocations(program)?;
     let tile_placements = (0..usize::from(program.tile_count))
         .into_par_iter()
         .map(|tile| {
@@ -154,13 +135,7 @@ pub(crate) fn place_with_offset(
                 u16::try_from(tile).map_err(|_| PlacementError::Overflow)?,
                 available_ranges,
                 interleaved_offset,
-                &tile_iterated[tile],
-                &tile_members[tile],
-                &root_of_member,
-                &member_offsets,
-                &root_requirements,
-                &root_lifetimes,
-                &conflicts,
+                &analysis,
             )
         })
         .collect::<Result<Vec<_>, PlacementError>>()?;
@@ -184,13 +159,18 @@ pub(crate) fn place_with_offset(
 }
 
 struct AllocationAnalysis {
-    iterated: Vec<IteratedGroup>,
-    members: BTreeMap<usize, Vec<usize>>,
+    tiles: Vec<TileAllocations>,
     root_of_member: Vec<usize>,
     member_offsets: Vec<u32>,
     root_requirements: BTreeMap<usize, Requirement>,
     root_lifetimes: BTreeMap<usize, Lifetime>,
     conflicts: BTreeMap<usize, BTreeSet<usize>>,
+}
+
+#[derive(Default)]
+struct TileAllocations {
+    iterated: Vec<IteratedGroup>,
+    members: BTreeMap<usize, Vec<usize>>,
 }
 
 fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, PlacementError> {
@@ -286,9 +266,20 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
             .include(lifetime);
     }
 
+    let mut tiles = (0..program.tile_count)
+        .map(|_| TileAllocations::default())
+        .collect::<Vec<_>>();
+    for (root, group) in members {
+        tiles[usize::from(program.shards[group[0]].tile)]
+            .members
+            .insert(root, group);
+    }
+    for group in iterated {
+        tiles[usize::from(group.tile)].iterated.push(group);
+    }
+
     Ok(AllocationAnalysis {
-        iterated,
-        members,
+        tiles,
         root_of_member,
         member_offsets,
         root_requirements,
@@ -297,32 +288,13 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn place_tile(
     program: &LowProgram,
     tile: u16,
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
-    iterated: &[IteratedGroup],
-    members: &BTreeMap<usize, Vec<usize>>,
-    root_of_member: &[usize],
-    member_offsets: &[u32],
-    root_requirements: &BTreeMap<usize, Requirement>,
-    root_lifetimes: &BTreeMap<usize, Lifetime>,
-    conflicts: &BTreeMap<usize, BTreeSet<usize>>,
+    analysis: &AllocationAnalysis,
 ) -> Result<(u16, BTreeMap<BlockValueId, u32>, Vec<(u32, u32)>), PlacementError> {
-    let mut grouped = BTreeSet::<usize>::new();
-    for group in iterated {
-        let roots = group
-            .shards
-            .iter()
-            .map(|shard| root_of_member[shard.index() as usize])
-            .collect::<Vec<_>>();
-        if roots.iter().any(|root| !grouped.insert(*root)) {
-            return Err(PlacementError::IteratedOverlap);
-        }
-    }
-
     // Both access classes share region 1. A single lifetime-ordered arena
     // lets ordinary storage reuse dead interleaved buffers and vice versa.
     let mut addresses = BTreeMap::new();
@@ -333,20 +305,7 @@ fn place_tile(
         .filter(|range| !program.requires_finite_scratch || *range != HOST_SCRATCH_RANGE)
         .collect::<Vec<_>>();
     let mut arena = Arena::new(&ranges, interleaved_offset);
-    allocate_tile(
-        program,
-        tile,
-        iterated,
-        &grouped,
-        members,
-        root_of_member,
-        member_offsets,
-        root_requirements,
-        root_lifetimes,
-        conflicts,
-        &mut arena,
-        &mut addresses,
-    )?;
+    allocate_tile(program, tile, analysis, &mut arena, &mut addresses)?;
     Ok((tile, addresses, arena.unused_ranges()))
 }
 
@@ -648,18 +607,13 @@ fn allocation_bytes(
     member_offsets: &[u32],
     requirement: Requirement,
 ) -> Result<u32, PlacementError> {
-    members
-        .iter()
-        .map(|&index| {
-            member_offsets[index]
-                .checked_add(shard_storage_bytes(&program.shards[index])?)
-                .and_then(|bytes| bytes.checked_add(requirement.access_tail))
-                .ok_or(PlacementError::Overflow)
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .ok_or(PlacementError::Overflow)
+    members.iter().try_fold(0, |maximum, &index| {
+        member_offsets[index]
+            .checked_add(shard_storage_bytes(&program.shards[index])?)
+            .and_then(|bytes| bytes.checked_add(requirement.access_tail))
+            .map(|bytes| maximum.max(bytes))
+            .ok_or(PlacementError::Overflow)
+    })
 }
 
 fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
@@ -691,18 +645,28 @@ fn assign_members(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn allocation_requests(
     program: &LowProgram,
-    iterated: &[IteratedGroup],
-    grouped: &BTreeSet<usize>,
-    members: &BTreeMap<usize, Vec<usize>>,
-    root_of_member: &[usize],
-    member_offsets: &[u32],
-    root_requirements: &BTreeMap<usize, Requirement>,
-    root_lifetimes: &BTreeMap<usize, Lifetime>,
-    conflicts: &BTreeMap<usize, BTreeSet<usize>>,
+    analysis: &AllocationAnalysis,
+    tile: u16,
 ) -> Result<Vec<AllocationRequest>, PlacementError> {
+    let TileAllocations { iterated, members } = &analysis.tiles[usize::from(tile)];
+    let AllocationAnalysis {
+        root_of_member,
+        member_offsets,
+        root_requirements,
+        root_lifetimes,
+        conflicts,
+        ..
+    } = analysis;
+    let mut grouped = BTreeSet::new();
+    for group in iterated {
+        for shard in &group.shards {
+            if !grouped.insert(root_of_member[shard.index() as usize]) {
+                return Err(PlacementError::IteratedOverlap);
+            }
+        }
+    }
     let mut requests = Vec::<AllocationRequest>::new();
     for group in iterated {
         let roots = group
@@ -808,32 +772,16 @@ fn allocation_requests(
     Ok(requests)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn allocate_tile(
     program: &LowProgram,
     tile: u16,
-    iterated: &[IteratedGroup],
-    grouped: &BTreeSet<usize>,
-    members: &BTreeMap<usize, Vec<usize>>,
-    root_of_member: &[usize],
-    member_offsets: &[u32],
-    root_requirements: &BTreeMap<usize, Requirement>,
-    root_lifetimes: &BTreeMap<usize, Lifetime>,
-    conflicts: &BTreeMap<usize, BTreeSet<usize>>,
+    analysis: &AllocationAnalysis,
     arena: &mut Arena,
     addresses: &mut BTreeMap<BlockValueId, u32>,
 ) -> Result<(), PlacementError> {
-    let mut requests = allocation_requests(
-        program,
-        iterated,
-        grouped,
-        members,
-        root_of_member,
-        member_offsets,
-        root_requirements,
-        root_lifetimes,
-        conflicts,
-    )?;
+    let members = &analysis.tiles[usize::from(tile)].members;
+    let member_offsets = &analysis.member_offsets;
+    let mut requests = allocation_requests(program, analysis, tile)?;
     requests.sort_by_key(|request| {
         (
             request.lifetime.first,
@@ -1728,12 +1676,7 @@ mod tests {
 
         // Independently constrained members still require separate elements.
         let mut analysis = analyze_allocations(&low).unwrap();
-        let group = analysis
-            .iterated
-            .iter()
-            .find(|group| group.tile == 0)
-            .unwrap()
-            .clone();
+        let group = analysis.tiles[0].iterated[0].clone();
         let second_root = analysis.root_of_member[group.shards[1].index() as usize];
         let first_root = analysis.root_of_member[group.shards[0].index() as usize];
         analysis
@@ -1746,23 +1689,12 @@ mod tests {
             .entry(second_root)
             .or_default()
             .insert(first_root);
-        let members = analysis
-            .members
-            .into_iter()
-            .filter(|(_, members)| low.shards[members[0]].tile == 0)
-            .collect();
         let (_, addresses, _) = place_tile(
             &low,
             0,
             &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
             0,
-            std::slice::from_ref(&group),
-            &members,
-            &analysis.root_of_member,
-            &analysis.member_offsets,
-            &analysis.root_requirements,
-            &analysis.root_lifetimes,
-            &analysis.conflicts,
+            &analysis,
         )
         .unwrap();
         assert_eq!(

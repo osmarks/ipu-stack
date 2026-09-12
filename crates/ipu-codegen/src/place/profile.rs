@@ -72,41 +72,16 @@ fn collect(
             allocations: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let mut members = vec![BTreeMap::new(); tiles.len()];
-    for (&root, group) in &analysis.members {
-        members[usize::from(program.shards[group[0]].tile)].insert(root, group.clone());
-    }
-    let mut iterated = vec![Vec::new(); tiles.len()];
-    for group in &analysis.iterated {
-        iterated[usize::from(group.tile)].push(group.clone());
-    }
     for tile in &mut tiles {
-        let index = usize::from(tile.logical);
-        let grouped = iterated[index]
-            .iter()
-            .flat_map(|group| {
-                group
-                    .shards
-                    .iter()
-                    .map(|shard| analysis.root_of_member[shard.index() as usize])
-            })
-            .collect();
-        let requests = allocation_requests(
-            program,
-            &iterated[index],
-            &grouped,
-            &members[index],
-            &analysis.root_of_member,
-            &analysis.member_offsets,
-            &analysis.root_requirements,
-            &analysis.root_lifetimes,
-            &analysis.conflicts,
-        )?;
+        let members = &analysis.tiles[usize::from(tile.logical)].members;
+        let requests = allocation_requests(program, &analysis, tile.logical)?;
+        let address = |root| {
+            let first = members[&root][0];
+            placement.shard_addresses[&program.shards[first].id] - analysis.member_offsets[first]
+        };
         for request in requests {
             let first_root = request.assignments[0].0;
-            let base = placement.shard_addresses
-                [&program.shards[members[index][&first_root][0]].id]
-                - analysis.member_offsets[members[index][&first_root][0]];
+            let base = address(first_root);
             let end = base
                 + if base >= IPU21_INTERLEAVED_MEMORY_BASE {
                     request.region1_stride.map_or(request.bytes, |stride| {
@@ -116,30 +91,25 @@ fn collect(
                     request.bytes
                 };
             for (i, &(root, _)) in request.assignments.iter().enumerate() {
-                let group = &members[index][&root];
+                let group = &members[&root];
                 let shard = &program.shards[group[0]];
-                let start =
-                    placement.shard_addresses[&shard.id] - analysis.member_offsets[group[0]];
-                let next = request.assignments.get(i + 1).map_or(end, |&(root, _)| {
-                    placement.shard_addresses[&program.shards[members[index][&root][0]].id]
-                        - analysis.member_offsets[members[index][&root][0]]
-                });
+                let start = address(root);
+                let next = request
+                    .assignments
+                    .get(i + 1)
+                    .map_or(end, |&(root, _)| address(root));
                 let bytes = allocation_bytes(
                     program,
                     group,
                     &analysis.member_offsets,
                     analysis.root_requirements[&root],
                 )?;
-                let payload = group
-                    .iter()
-                    .map(|&member| {
-                        shard_storage_bytes(&program.shards[member])
-                            .map(|bytes| bytes + analysis.member_offsets[member])
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .max()
-                    .unwrap_or(0);
+                let payload = allocation_bytes(
+                    program,
+                    group,
+                    &analysis.member_offsets,
+                    Requirement::default(),
+                )?;
                 let input = group
                     .iter()
                     .find_map(|&member| names.get(&program.shards[member].id));
