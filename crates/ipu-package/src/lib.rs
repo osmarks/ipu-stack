@@ -340,7 +340,12 @@ impl Application {
         if !self.host_exchange.calls.is_empty()
             && pages
                 .get(&self.host_exchange.command_page)
-                .is_none_or(|size| self.host_exchange.command_offset.checked_add(4) > Some(*size))
+                .is_none_or(|size| {
+                    self.host_exchange
+                        .command_offset
+                        .checked_add(4)
+                        .is_none_or(|end| end > *size)
+                })
         {
             return Err(PackageError::Invalid(
                 "invalid host startup protocol".into(),
@@ -362,9 +367,14 @@ impl Application {
                         call.name
                     )));
                 };
-                if slice.page_offset.checked_add(slice.size) > Some(*page_size) {
+                if slice
+                    .page_offset
+                    .checked_add(slice.size)
+                    .is_none_or(|end| end > *page_size)
+                    || slice.file_offset.checked_add(slice.size).is_none()
+                {
                     return Err(PackageError::Invalid(format!(
-                        "host call {} exceeds page bounds",
+                        "host call {} has an invalid slice range",
                         call.name
                     )));
                 }
@@ -1200,6 +1210,44 @@ mod tests {
                 value: 2,
             },
         ];
+        assert!(app.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_overflowing_host_ranges() {
+        let mut app = sample();
+        app.host_exchange.pages = vec![HostPage {
+            index: 0,
+            size: 4096,
+        }];
+        app.host_exchange.calls = vec![HostCall {
+            name: "run".into(),
+            command: 1,
+            phases: 2,
+            invocations: 1,
+            inputs: vec![HostSlice {
+                page: 0,
+                page_offset: 4092,
+                file_offset: 0,
+                size: 4,
+            }],
+            outputs: vec![],
+            input_batch_ends: vec![1],
+            output_batch_ends: vec![],
+        }];
+        app.host_exchange.command_offset = 4092;
+        app.validate().unwrap();
+        for offset in [4093, u64::MAX - 2, u64::MAX] {
+            app.host_exchange.command_offset = offset;
+            assert!(app.validate().is_err(), "command offset {offset}");
+        }
+        app.host_exchange.command_offset = 4092;
+        for offset in [4093, u64::MAX - 2, u64::MAX] {
+            app.host_exchange.calls[0].inputs[0].page_offset = offset;
+            assert!(app.validate().is_err(), "slice offset {offset}");
+        }
+        app.host_exchange.calls[0].inputs[0].page_offset = 4092;
+        app.host_exchange.calls[0].inputs[0].file_offset = u64::MAX - 2;
         assert!(app.validate().is_err());
     }
 

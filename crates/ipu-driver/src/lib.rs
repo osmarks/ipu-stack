@@ -1849,13 +1849,7 @@ fn copy_input(
         )));
     }
     for slice in &call.inputs {
-        let page = pages
-            .get(&slice.page)
-            .ok_or_else(|| DriverError::Invalid("missing input page".into()))?;
-        let destination = page.offset + slice.page_offset as usize;
-        let source = slice.file_offset as usize;
-        storage.bytes_mut()[destination..destination + slice.size as usize]
-            .copy_from_slice(&input[source..source + slice.size as usize]);
+        copy_input_slice(storage, pages, slice, input)?;
     }
     Ok(())
 }
