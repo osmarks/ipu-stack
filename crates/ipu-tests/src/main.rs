@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 mod diagnostic;
 mod exchange_stress;
+mod reference_fixture;
 mod vit;
 
 #[derive(Parser)]
@@ -53,6 +54,9 @@ struct Arguments {
     /// Compare with unquantized FP32 inputs, weights and intermediate results.
     #[arg(long, requires = "reference_run")]
     reference_fp32: bool,
+    /// Load named logical tensors and independent expected outputs from a fixture manifest.
+    #[arg(long, requires = "reference_run", conflicts_with_all = ["diagnostic_run", "save_reference_inputs", "profile_output"])]
+    reference_fixture: Option<PathBuf>,
     /// Save packed weights, input and validated output for resident inference replay.
     #[arg(long, requires = "reference_run")]
     save_reference_inputs: Option<PathBuf>,
@@ -1097,6 +1101,9 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let Some(directory) = &arguments.reference_fixture {
+        reference_fixture::validate(directory, &graph, arguments.reference_inferences)?;
+    }
     let mut compiled_package = None;
     let diagnostic_package = if arguments.diagnostic_run {
         let package = build_diagnostic_package(&graph, &package_config)?;
@@ -1189,7 +1196,20 @@ fn main() -> Result<()> {
                 Duration::from_secs(arguments.timeout_seconds),
             )?;
         } else if !matches!(arguments.workload, Workload::Diagnostic) {
-            if arguments.reference_run || matches!(arguments.workload, Workload::SiglipVitBenchmark)
+            if let Some(directory) = &arguments.reference_fixture {
+                reference_fixture::run(
+                    &runtime,
+                    &application,
+                    &graph,
+                    compiled_package
+                        .as_ref()
+                        .context("fixture needs logical storage metadata")?,
+                    directory,
+                    arguments.timeout_seconds,
+                    arguments.reference_inferences,
+                )?;
+            } else if arguments.reference_run
+                || matches!(arguments.workload, Workload::SiglipVitBenchmark)
             {
                 let (_output, maximum_error) = run_reference(
                     &runtime,
@@ -1544,7 +1564,7 @@ fn run_reference(
         runtime,
         application,
         &weights,
-        &inputs,
+        |_| Ok(inputs.clone()),
         timeout_seconds,
         inferences,
         |index, output| {
@@ -1875,7 +1895,7 @@ fn run_initialized_program(
         runtime,
         application,
         weights,
-        input,
+        |_| Ok(input.to_vec()),
         timeout_seconds,
         1,
         |_, _| Ok(()),
@@ -1887,7 +1907,7 @@ fn run_checked_inferences(
     runtime: &Runtime,
     application: &Application,
     weights: &[u8],
-    input: &[u8],
+    mut input: impl FnMut(u32) -> Result<Vec<u8>>,
     timeout_seconds: u64,
     count: u32,
     mut check: impl FnMut(u32, &[u8]) -> Result<()>,
@@ -1917,7 +1937,7 @@ fn run_checked_inferences(
     let mut output = Vec::new();
     for index in 0..count {
         let executed = session
-            .invoke_streaming_deferred("run", input)
+            .invoke_streaming_deferred("run", &input(index)?)
             .inspect_err(|_| {
                 eprintln!(
                     "runFailureDiagnostics={}",

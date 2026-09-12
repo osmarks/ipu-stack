@@ -385,57 +385,61 @@ pub(crate) fn pack_inputs(
     metadata: &[DiagnosticTensor],
     values: &BTreeMap<ValueId, HostTensor>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let pack = |bindings: &[Binding]| -> Result<Vec<u8>> {
-        let packed = bindings
-            .par_iter()
-            .map(|binding| -> Result<Vec<u8>> {
-                let metadata = metadata
+    Ok((
+        pack_bindings(&application.weights, metadata, values)?,
+        pack_bindings(&application.inputs, metadata, values)?,
+    ))
+}
+
+pub(crate) fn pack_bindings(
+    bindings: &[Binding],
+    metadata: &[DiagnosticTensor],
+    values: &BTreeMap<ValueId, HostTensor>,
+) -> Result<Vec<u8>> {
+    let packed = bindings
+        .par_iter()
+        .map(|binding| -> Result<Vec<u8>> {
+            let metadata = metadata
+                .iter()
+                .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
+                .with_context(|| format!("diagnostic metadata for {} is missing", binding.name))?;
+            let tensor = &values[&metadata.value];
+            let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
+            let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
+            for shard in &metadata.shards {
+                let slice = binding
+                    .slices
                     .iter()
-                    .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
+                    .find(|slice| {
+                        slice.tile == u32::from(shard.physical_tile)
+                            && slice.tile_address == shard.address
+                    })
                     .with_context(|| {
-                        format!("diagnostic metadata for {} is missing", binding.name)
+                        format!("binding slice for {} shard is missing", binding.name)
                     })?;
-                let tensor = &values[&metadata.value];
-                let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
-                let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
-                for shard in &metadata.shards {
-                    let slice = binding
-                        .slices
-                        .iter()
-                        .find(|slice| {
-                            slice.tile == u32::from(shard.physical_tile)
-                                && slice.tile_address == shard.address
-                        })
-                        .with_context(|| {
-                            format!("binding slice for {} shard is missing", binding.name)
-                        })?;
-                    for (index, offset) in shard_elements(metadata, shard)? {
-                        if u64::from(offset) + metadata.precision.bytes() > slice.size {
-                            bail!("logical element exceeds binding {} shard", binding.name);
-                        }
-                        encode_value(
-                            &mut bytes,
-                            usize::try_from(slice.file_offset + u64::from(offset))?,
-                            tensor.values[index],
-                            metadata.precision,
-                        )?;
-                        covered[index] = true;
+                for (index, offset) in shard_elements(metadata, shard)? {
+                    if u64::from(offset) + metadata.precision.bytes() > slice.size {
+                        bail!("logical element exceeds binding {} shard", binding.name);
                     }
+                    encode_value(
+                        &mut bytes,
+                        usize::try_from(slice.file_offset + u64::from(offset))?,
+                        tensor.values[index],
+                        metadata.precision,
+                    )?;
+                    covered[index] = true;
                 }
-                if let Some(missing) = covered.iter().position(|covered| !covered) {
-                    bail!(
-                        "binding {} does not store logical element {missing}",
-                        binding.name
-                    );
-                }
-                Ok(bytes)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(packed.concat())
-    };
-    let weights = pack(&application.weights)?;
-    let inputs = pack(&application.inputs)?;
-    Ok((weights, inputs))
+            }
+            if let Some(missing) = covered.iter().position(|covered| !covered) {
+                bail!(
+                    "binding {} does not store logical element {missing}",
+                    binding.name
+                );
+            }
+            Ok(bytes)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(packed.concat())
 }
 
 fn encode_value(bytes: &mut [u8], offset: usize, value: f32, precision: Precision) -> Result<()> {
