@@ -84,7 +84,6 @@ fn distribute_region(
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
             changed |= distribute_region(&mut repeat.body.operations, values, capacity, rows);
         }
-        let mut best = None;
         if let MidOperationKind::Primitive(Primitive::Copy { .. }) = &operation.kind
             && let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
             && values[input.index() as usize].tensor_type.format.precision == Precision::F16
@@ -113,8 +112,6 @@ fn distribute_region(
                         ..target.clone()
                     });
                 }
-                let mut gather = operation.clone();
-                gather.results = vec![logical];
                 let pack = MidOperation {
                     inputs: vec![logical],
                     results: vec![packed],
@@ -142,18 +139,13 @@ fn distribute_region(
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
-                let steps = vec![gather, pack, transfer];
-                best = Some((steps, values[start..].to_vec()));
-                values.truncate(start);
+                operation.results = vec![logical];
+                result.extend([operation, pack, transfer]);
+                changed = true;
+                continue;
             }
         }
-        if let Some((steps, temporaries)) = best {
-            values.extend(temporaries);
-            result.extend(steps);
-            changed = true;
-        } else {
-            result.push(operation);
-        }
+        result.push(operation);
     }
     *operations = result;
     changed

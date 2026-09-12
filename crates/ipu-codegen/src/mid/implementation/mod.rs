@@ -114,25 +114,10 @@ pub(super) fn pointwise_input_tiling(
         return Some(tiling.clone());
     }
     let offset = output.shape.0.len().checked_sub(input.shape.0.len())?;
-    let mut replicas = tiling.replicas;
-    let mut axes = Vec::new();
-    for (dim, stride) in tiling.axes.iter().zip(tiling.axis_strides().ok()?) {
-        let index = dim.axis.resolve(output.shape.0.len()).ok()?;
-        if let Some(input_axis) = index.checked_sub(offset)
-            && input.shape.0[input_axis] != 1
-        {
-            let mut dim = *dim;
-            dim.axis = TensorAxis::FromStart(input_axis as u16);
-            dim.tile_stride = Some(u16::try_from(stride).ok()?);
-            axes.push(dim);
-        } else {
-            replicas = replicas.checked_mul(dim.partitions)?;
-        }
-    }
-    Some(TensorTiling {
-        tile_count: tiling.tile_count,
-        replicas,
-        axes,
+    project_tiling(output, |index| {
+        index
+            .checked_sub(offset)
+            .filter(|&axis| input.shape.0[axis] != 1)
     })
 }
 
@@ -292,13 +277,8 @@ fn project_grid(
     output_axis: usize,
     operand_axis: usize,
 ) -> Option<TensorTiling> {
-    let tiling = &output.format.layout.tiling;
-    let strides = tiling.axis_strides().ok()?;
-    let mut replicas = tiling.replicas;
-    let mut axes = Vec::new();
-    for (dim, stride) in tiling.axes.iter().zip(strides) {
-        let index = dim.axis.resolve(output.shape.0.len()).ok()?;
-        let mapped = if index == output_axis {
+    project_tiling(output, |index| {
+        if index == output_axis {
             Some(operand_axis)
         } else if index + 2 < output.shape.0.len() && output_axis + 2 >= output.shape.0.len() {
             operand
@@ -308,8 +288,20 @@ fn project_grid(
                 .checked_sub(output.shape.0.len() - index)
         } else {
             None
-        };
-        if let Some(mapped) = mapped {
+        }
+    })
+}
+
+/// Keep physical tile strides while omitted distributed axes become replicas.
+fn project_tiling(
+    output: &TensorType,
+    map_axis: impl Fn(usize) -> Option<usize>,
+) -> Option<TensorTiling> {
+    let tiling = &output.format.layout.tiling;
+    let mut replicas = tiling.replicas;
+    let mut axes = Vec::new();
+    for (dim, stride) in tiling.axes.iter().zip(tiling.axis_strides().ok()?) {
+        if let Some(mapped) = map_axis(dim.axis.resolve(output.shape.0.len()).ok()?) {
             let mut dim = *dim;
             dim.axis = TensorAxis::FromStart(mapped as u16);
             dim.tile_stride = Some(u16::try_from(stride).ok()?);
@@ -328,13 +320,12 @@ fn project_grid(
 /// Inline compact operator implementations into the same whole-device IR.
 /// This is algorithm decomposition, not tile expansion or another search.
 pub(crate) fn resolve(mut program: MidProgram) -> Option<MidProgram> {
-    program.operations =
-        resolve_region(&program.operations, &mut program.values, &program.outputs)?;
+    program.operations = resolve_region(program.operations, &mut program.values, &program.outputs)?;
     Some(program)
 }
 
 fn resolve_region(
-    operations: &[MidOperation],
+    operations: Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
 ) -> Option<Vec<MidOperation>> {
@@ -353,8 +344,8 @@ fn resolve_region(
         .collect::<BTreeSet<_>>();
     let mut result = Vec::new();
     let mut deferred = BTreeMap::<MidValueId, MidValueId>::new();
-    for operation in operations {
-        match &operation.kind {
+    for mut operation in operations {
+        match &mut operation.kind {
             MidOperationKind::Operator {
                 plan,
                 implementation,
@@ -442,11 +433,11 @@ fn resolve_region(
                 }
             }
             MidOperationKind::Repeat(repeat) => {
-                let mut repeat = repeat.clone();
-                repeat.body.operations =
-                    resolve_region(&repeat.body.operations, values, &repeat.body.yields)?;
-                let mut operation = operation.clone();
-                operation.kind = MidOperationKind::Repeat(repeat);
+                repeat.body.operations = resolve_region(
+                    std::mem::take(&mut repeat.body.operations),
+                    values,
+                    &repeat.body.yields,
+                )?;
                 result.push(operation);
             }
             MidOperationKind::Convert(plan) => {
@@ -460,13 +451,10 @@ fn resolve_region(
                     deferred.insert(operation.results[0], source);
                     continue;
                 }
-                let mut operation = operation.clone();
-                let mut plan = plan.clone();
                 plan.output.materialization = OperandMaterialization::Complete;
-                operation.kind = MidOperationKind::Convert(plan);
                 result.push(operation);
             }
-            MidOperationKind::Primitive(_) => result.push(operation.clone()),
+            MidOperationKind::Primitive(_) => result.push(operation),
         }
     }
     super::copy::compose(&mut result, values, required);
