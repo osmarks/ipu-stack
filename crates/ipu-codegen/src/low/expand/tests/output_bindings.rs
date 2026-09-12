@@ -107,6 +107,57 @@ fn exported_copies_have_complete_storage_and_preserve_identity_reuse() {
 }
 
 #[test]
+fn packed_halfword_sources_are_gathered_before_word_exchange() {
+    let mut mid = copied_columns(16);
+    mid.tile_count = 4;
+    for value in &mut mid.values {
+        value.tensor_type.shape.0[0] = 1;
+        value.tensor_type.format.precision = Precision::F16;
+    }
+    let mut source_layout = Layout::amp_left(16, 1);
+    source_layout.order = ElementOrder::Amp(AmpOrder::TransposedLeft);
+    source_layout.tiling.axes[0] =
+        crate::AxisTiling::new(TensorAxis::FromEnd(2), 1, 16, crate::Padding::Zero);
+    mid.values[0].tensor_type.format.layout = source_layout;
+    mid.values[1].tensor_type.format.layout = Layout::logical_linear(4, 4);
+    let graph = expand_tiles(&mid, false).unwrap();
+    let low = crate::low::lower_to_tiles(&graph, false);
+    let placement = crate::place(&low).unwrap();
+    // Each output slice is eight bytes, but the AMP panel interleaves its
+    // useful halfwords with padded rows. Raw sends cannot read it.
+    let snapshot = crate::exchange::capture_exchange_schedule(&low, &placement).unwrap();
+    assert!(
+        snapshot
+            .phases
+            .iter()
+            .any(|phase| !phase.transfers.is_empty())
+    );
+    let source = low.inputs[0].shards[0];
+    assert!(
+        low.local_copies
+            .iter()
+            .any(|copy| copy.source == source && copy.bytes == 2)
+    );
+    assert!(
+        low.local_copies.iter().all(|copy| copy.source == source),
+        "aligned row-major receivers do not need a second staging copy"
+    );
+    for phase in &low.exchange_phases {
+        for transfer in &phase.transfers {
+            assert!(
+                view_byte_traversal(
+                    &low.shards[transfer.source.shard.index() as usize],
+                    &transfer.source,
+                    transfer.order,
+                )
+                .unwrap()
+                .word_aligned()
+            );
+        }
+    }
+}
+
+#[test]
 fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
     let mut mid = copied_columns(8);
     mid.tile_count = 2;
@@ -173,6 +224,36 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
             .all(|copy| copy.source != placeholder)
     );
     crate::place(&low).unwrap();
+}
+
+#[test]
+fn shifted_halfword_crops_pack_before_physical_exchange() {
+    let mut mid = copied_columns(8);
+    mid.tile_count = 2;
+    for value in &mut mid.values {
+        value.tensor_type.format.precision = Precision::F16;
+    }
+    mid.values[1].tensor_type.format.layout = Layout::row_sharded(2);
+    let MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) = &mut mid.operations[0].kind
+    else {
+        unreachable!()
+    };
+    mapping.offsets = vec![0, 1];
+    let graph = expand_tiles(&mid, false).unwrap();
+    let low = crate::low::lower_to_tiles(&graph, false);
+    let placement = crate::place(&low).unwrap();
+    let snapshot = crate::exchange::capture_exchange_schedule(&low, &placement).unwrap();
+    assert!(
+        snapshot
+            .phases
+            .iter()
+            .any(|phase| !phase.transfers.is_empty())
+    );
+    assert!(
+        low.local_copies
+            .iter()
+            .any(|copy| copy.source_offset % 4 == 2)
+    );
 }
 
 #[test]

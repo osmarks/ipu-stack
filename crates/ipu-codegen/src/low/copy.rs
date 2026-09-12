@@ -359,9 +359,10 @@ impl CopyPlan {
         );
         let direct_word_exchange = word_aligned && fragment_cycles < pack_cycles;
         let transform = destination_unaligned
-            || mappings.iter().any(|mapping| {
-                mapping.source.format.layout.order != destination.format.layout.order
-            });
+            || (destination.format.layout.order != ElementOrder::RowMajor
+                && mappings.iter().any(|mapping| {
+                    mapping.source.format.layout.order != destination.format.layout.order
+                }));
         let staging = (transform && !direct_word_exchange).then(|| {
             let mut extents = extents.to_vec();
             for extent in &mut extents {

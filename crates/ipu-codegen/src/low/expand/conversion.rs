@@ -247,6 +247,7 @@ impl TileGraphBuilder {
             self.resolve_read_view(&mut mapping.0)?;
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
+        let mut packed_sources = BTreeMap::new();
         for (destination_shard, mappings) in grouped {
             // A clipped boundary on one destination must not expand complete
             // panel grids on every other destination into tiny rectangles.
@@ -332,6 +333,21 @@ impl TileGraphBuilder {
                         copy_order,
                     )?;
                 } else {
+                    if exchange_order != CopyOrder::Panels
+                        && !view_byte_traversal(
+                            &self.shards[source.shard.index() as usize],
+                            &source,
+                            exchange_order,
+                        )?
+                        .word_aligned()
+                    {
+                        source = self.pack_exchange_source(
+                            source,
+                            exchange_order,
+                            &mut packed_sources,
+                            &mut batch.before,
+                        )?;
+                    }
                     transfers.entry(source).or_default().push(destination);
                 }
             }
@@ -369,6 +385,46 @@ impl TileGraphBuilder {
             }
         }
         Ok(())
+    }
+
+    // Destination packing cannot repair halfword reads from a source panel.
+    // Gather that logical slice locally before sending it as whole words.
+    fn pack_exchange_source(
+        &mut self,
+        source: ShardView,
+        order: CopyOrder,
+        packed: &mut BTreeMap<(CopyOrder, ShardView), ShardView>,
+        copies: &mut Vec<(u16, LocalCopy)>,
+    ) -> ExpansionResult<ShardView> {
+        let key = (order, source.clone());
+        if let Some(view) = packed.get(&key) {
+            return Ok(view.clone());
+        }
+        let shard = &self.shards[source.shard.index() as usize];
+        let tile = shard.tile;
+        let bytes = view_byte_traversal(shard, &source, order)?.byte_len();
+        if bytes == 0 || !bytes.is_multiple_of(4) {
+            return Err(ExpansionError::InvalidConversionPlan);
+        }
+        let precision = shard.tensor_type.format.precision;
+        let staging = self.push_packed_buffer(
+            tile,
+            u32::try_from(bytes / precision.bytes()).map_err(|_| ExpansionError::IdOverflow)?,
+            precision,
+            ShardDefinition::Staging,
+        )?;
+        let view = self.full_view(staging);
+        append_span_copies(
+            &self.cache,
+            &self.shards,
+            &source,
+            &view,
+            tile,
+            copies,
+            order,
+        )?;
+        packed.insert(key, view.clone());
+        Ok(view)
     }
 
     pub(super) fn append_materialization(
