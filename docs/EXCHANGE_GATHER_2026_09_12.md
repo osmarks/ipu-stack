@@ -240,6 +240,11 @@ target/release/ipu-host-exchange-bench "$out/model.ipuexe" "$IPU_CONFIG" \
 
 ### Full SigLIP local-optimization check
 
+The failure below is now [diagnosed and fixed](ATTENTION_PV_NAN_2026_09_12.md).
+The corrected full batch-two optimized plan passes hardware validation at
+0.99399 cosine and 15.866 ms resident batch latency. The following records the
+original failing check for comparison.
+
 The full-model results above have local optimization disabled. A subsequent
 27-layer batch-two run with the same configuration and `--optimization-steps 8`
 does **not** pass hardware validation. It must not replace the validated baseline.
