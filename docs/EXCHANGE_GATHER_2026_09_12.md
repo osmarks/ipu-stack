@@ -238,6 +238,38 @@ target/release/ipu-host-exchange-bench "$out/model.ipuexe" "$IPU_CONFIG" \
 
 ## Reproduction
 
+### Full SigLIP local-optimization check
+
+The full-model results above have local optimization disabled. A subsequent
+27-layer batch-two run with the same configuration and `--optimization-steps 8`
+does **not** pass hardware validation. It must not replace the validated baseline.
+
+The optimizer rejects its proposed tile mapping at placement, then accepts one
+layout change: encoder attention (operation 12) uses materialized scores instead
+of 64-column streaming blocks, and the Q view boundary (value 350) stays in its
+native packed format. Estimated cycles fall from 25,281,807 to 21,976,602 (13.1%),
+with 68,388 B/tile encoded exchange storage. Subsequent proposals fail placement
+of an 82,944-byte standard-memory allocation. Planning takes 493.1 s with 32
+Rayon threads. The first hardware inference returns NaNs and fails the FP32
+comparison; there is no valid measured speedup.
+
+A control with `--optimization-steps 0 --attention-strategy materialized` passes
+both resident calls (minimum cosine 0.994043410, maximum absolute error 0.454393).
+It uses 68,044 B/tile of exchange storage and estimates 22,197,354 cycles (12.2%
+below the streaming baseline). Materialized attention therefore fits and works
+for at least this full-model plan. The control has different QK/PV grids as well
+as retaining the canonical Q boundary, so the failed optimized plan's exact
+numerical defect is not isolated by this comparison. No kernel or planner code
+was changed during these checks.
+
+Logs, packages and memory profiles are under
+`artifacts/relay-big-20260912/siglip-b2-optimized/` and
+`artifacts/relay-big-20260912/siglip-b2-materialized/`. Both reuse the reproduction
+command above with the indicated flags; the materialized control does not save
+a resident replay fixture. These checks used code from `721bb30`.
+
+### Offline gather experiments
+
 `scripts/exchange-gather.py` generates the alternative snapshots and packing
 tasks, then uses the existing exchange benchmark for replay. For example:
 
