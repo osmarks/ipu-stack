@@ -41,31 +41,49 @@ impl KernelBuildPlan {
         for (configuration, rows) in rows {
             plan.add_gemm(configuration, rows);
         }
-        for (symbol, extra) in [
-            ("layer_norm_f16", None),
-            ("add_layer_norm_f16", Some("-DNORM_WITH_ADD")),
-            ("layer_norm_f8", Some("-DNORM_FP8")),
+        for (source, wrapper, vertex, variants) in [
+            (
+                "elementwise_f16.cpp",
+                "layer_norm_f16.S",
+                "LayerNormF16",
+                &[
+                    ("layer_norm_f16", None),
+                    ("add_layer_norm_f16", Some("-DNORM_WITH_ADD")),
+                    ("layer_norm_f8", Some("-DNORM_FP8")),
+                ][..],
+            ),
+            (
+                "layer_norm_distributed.cpp",
+                "layer_norm_moments.S",
+                "LayerNormMoments",
+                &[
+                    ("layer_norm_moments", None),
+                    ("add_layer_norm_moments", Some("-DNORM_STORE_SUM")),
+                ][..],
+            ),
         ] {
-            if !exact_symbols.contains(symbol) {
-                continue;
+            for &(symbol, extra) in variants {
+                if !exact_symbols.contains(symbol) {
+                    continue;
+                }
+                let flags: Vec<_> = extra.into_iter().map(str::to_owned).collect();
+                let mut codelet_flags = vec!["-O2".into(), format!("-DVERTEX_{vertex}")];
+                codelet_flags.extend(flags.clone());
+                plan.compilations.extend([
+                    KernelCompilation {
+                        source,
+                        name: format!("{symbol}_codelet"),
+                        flags: codelet_flags,
+                        retained_symbols: vec![],
+                    },
+                    KernelCompilation {
+                        source: wrapper,
+                        name: format!("{symbol}_wrapper"),
+                        flags,
+                        retained_symbols: vec![symbol.into()],
+                    },
+                ]);
             }
-            let flags = extra.into_iter().map(str::to_owned).collect::<Vec<_>>();
-            let mut codelet_flags = vec!["-O2".into(), "-DVERTEX_LayerNormF16".into()];
-            codelet_flags.extend(flags.clone());
-            plan.compilations.extend([
-                KernelCompilation {
-                    source: "elementwise_f16.cpp",
-                    name: format!("{symbol}_codelet"),
-                    flags: codelet_flags,
-                    retained_symbols: vec![],
-                },
-                KernelCompilation {
-                    source: "layer_norm_f16.S",
-                    name: format!("{symbol}_wrapper"),
-                    flags,
-                    retained_symbols: vec![symbol.into()],
-                },
-            ]);
         }
         if exact_symbols.contains("add_f16") {
             plan.add_vertex(
@@ -114,31 +132,6 @@ impl KernelBuildPlan {
                 &[3, 2, 4],
             );
         }
-        for (symbol, extra) in [
-            ("layer_norm_moments", None),
-            ("add_layer_norm_moments", Some("-DNORM_STORE_SUM")),
-        ] {
-            if !exact_symbols.contains(symbol) {
-                continue;
-            }
-            let flags: Vec<_> = extra.into_iter().map(str::to_owned).collect();
-            let mut codelet_flags = vec!["-O2".into(), "-DVERTEX_LayerNormMoments".into()];
-            codelet_flags.extend(flags.clone());
-            plan.compilations.extend([
-                KernelCompilation {
-                    source: "layer_norm_distributed.cpp",
-                    name: format!("{symbol}_codelet"),
-                    flags: codelet_flags,
-                    retained_symbols: vec![],
-                },
-                KernelCompilation {
-                    source: "layer_norm_moments.S",
-                    name: format!("{symbol}_wrapper"),
-                    flags,
-                    retained_symbols: vec![symbol.into()],
-                },
-            ]);
-        }
         if exact_symbols.contains("layer_norm_apply") {
             plan.add_vertex(
                 "layer_norm_distributed.cpp",
@@ -148,21 +141,6 @@ impl KernelBuildPlan {
                 &[3, 4, 5, 6, 2, 7, 8, 9],
             );
         }
-        let has_worker_codelets = [
-            "layer_norm_f16",
-            "layer_norm_f8",
-            "add_layer_norm_f16",
-            "layer_norm_moments",
-            "add_layer_norm_moments",
-            "layer_norm_apply",
-            "add_f16",
-            "cast_f32_f16",
-        ]
-        .iter()
-        .any(|symbol| exact_symbols.contains(symbol))
-            || !fp8_casts.is_empty()
-            || !rearrangements.is_empty()
-            || !unpacks.is_empty();
         for (from, to) in fp8_casts {
             let name = |bytes| match bytes {
                 1 => "f8",
@@ -193,7 +171,17 @@ impl KernelBuildPlan {
         for shape in rearrangements {
             plan.add_rearrangement(shape);
         }
-        if has_worker_codelets || !attention.is_empty() || !attention_stages.is_empty() {
+        for shape in attention {
+            plan.add_attention(shape);
+        }
+        plan.add_attention_stages(attention_stages)?;
+        // Only compiler-generated C++ codelets need the worker stack symbols.
+        // Derive this from the selected recipes, including assembly fast paths.
+        if plan
+            .compilations
+            .iter()
+            .any(|unit| unit.source.ends_with(".cpp"))
+        {
             plan.compilations.push(KernelCompilation {
                 source: "worker_support.S",
                 name: "worker_support".into(),
@@ -201,10 +189,6 @@ impl KernelBuildPlan {
                 retained_symbols: Vec::new(),
             });
         }
-        for shape in attention {
-            plan.add_attention(shape);
-        }
-        plan.add_attention_stages(attention_stages)?;
         Ok(plan)
     }
 

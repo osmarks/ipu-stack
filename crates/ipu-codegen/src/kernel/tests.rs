@@ -809,3 +809,37 @@ fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
         );
     }
 }
+
+#[test]
+fn worker_stack_support_follows_cpp_recipes() {
+    for (symbols, expected) in [
+        (vec![], false),
+        (vec!["gelu_f8", "reduce_sum_f16"], false),
+        (vec!["layer_norm_f16"], true),
+        (
+            vec!["layer_norm_f8", "add_layer_norm_moments", "add_f16"],
+            true,
+        ),
+    ] {
+        let plan = KernelBuildPlan::from_inventory(KernelInventory {
+            exact_symbols: symbols.into_iter().collect(),
+            ..KernelInventory::default()
+        })
+        .unwrap();
+        assert_eq!(
+            plan.compilations
+                .iter()
+                .filter(|unit| unit.source == "worker_support.S")
+                .count(),
+            usize::from(expected)
+        );
+    }
+    // The hand-written softmax worker does not use a compiler-managed stack.
+    let plan = KernelBuildPlan::from_inventory(KernelInventory {
+        attention_stages: BTreeSet::from([KernelSpecialization::Softmax(64, 32, 32)]),
+        ..KernelInventory::default()
+    })
+    .unwrap();
+    assert_eq!(plan.compilations.len(), 1);
+    assert_eq!(plan.compilations[0].source, "attention_softmax_f16.S");
+}
