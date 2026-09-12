@@ -1014,6 +1014,7 @@ fn pending_from_problem(
     tile_count: u16,
     problem: &ExchangeScheduleProblem,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
+    let topology = Topology::c600();
     problem
         .transfers
         .iter()
@@ -1047,11 +1048,8 @@ fn pending_from_problem(
                 .words
                 .checked_mul(4)
                 .ok_or(ExchangeLoweringError::Overflow)?;
+            let alignment_mask = 4 * transfer.width.item_words() - 1;
             for &address in &transfer.source_addresses {
-                let alignment_mask = match transfer.width {
-                    ExchangeItemWidth::Word32 => 0b11,
-                    ExchangeItemWidth::Paired64 => 0b111,
-                };
                 if address & alignment_mask != 0 {
                     return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                         "phase {} transfer {index} has unaligned source address {address:#x}",
@@ -1091,10 +1089,6 @@ fn pending_from_problem(
                             problem.phase, destination.tile
                         )));
                     }
-                    let alignment_mask = match transfer.width {
-                        ExchangeItemWidth::Word32 => 0b11,
-                        ExchangeItemWidth::Paired64 => 0b111,
-                    };
                     if destination.address & alignment_mask != 0 {
                         return Err(ExchangeLoweringError::InvalidSnapshot(format!(
                             "phase {} transfer {index} has unaligned destination address {:#x}",
@@ -1122,7 +1116,14 @@ fn pending_from_problem(
                 reserved_source: match transfer.width {
                     ExchangeItemWidth::Word32 => None,
                     ExchangeItemWidth::Paired64 => {
-                        Some(Topology::c600().paired_logical(transfer.source)?)
+                        let paired = topology.paired_logical(transfer.source)?;
+                        if paired >= tile_count {
+                            return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+                                "phase {} transfer {index} borrows inactive sender tile {paired}",
+                                problem.phase
+                            )));
+                        }
+                        Some(paired)
                     }
                 },
             };
@@ -1351,6 +1352,15 @@ fn improve_pending_schedule(
     })
 }
 
+fn validate_snapshot_tile_count(tile_count: u16) -> Result<(), ExchangeLoweringError> {
+    if tile_count == 0 || usize::from(tile_count) > Topology::c600().tile_count() {
+        return Err(ExchangeLoweringError::InvalidSnapshot(format!(
+            "tile count {tile_count} is outside the C600 topology"
+        )));
+    }
+    Ok(())
+}
+
 impl ExchangeScheduleSnapshot {
     pub fn validate(&self) -> Result<(), ExchangeLoweringError> {
         if self.schema_version != EXCHANGE_SCHEDULE_SNAPSHOT_VERSION {
@@ -1359,12 +1369,7 @@ impl ExchangeScheduleSnapshot {
                 self.schema_version, EXCHANGE_SCHEDULE_SNAPSHOT_VERSION
             )));
         }
-        if self.tile_count == 0 || usize::from(self.tile_count) > Topology::c600().tile_count() {
-            return Err(ExchangeLoweringError::InvalidSnapshot(format!(
-                "tile count {} is outside the C600 topology",
-                self.tile_count
-            )));
-        }
+        validate_snapshot_tile_count(self.tile_count)?;
         let mut phases = BTreeSet::new();
         for problem in &self.phases {
             if !phases.insert(problem.phase) {

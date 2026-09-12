@@ -30,11 +30,7 @@ pub fn schedule_exchange_problem_with_priority(
     problem: &ExchangeScheduleProblem,
     priority: ExchangeSchedulingPriority,
 ) -> Result<ExchangeScheduleRun, ExchangeLoweringError> {
-    if tile_count == 0 || usize::from(tile_count) > Topology::c600().tile_count() {
-        return Err(ExchangeLoweringError::InvalidSnapshot(format!(
-            "tile count {tile_count} is outside the C600 topology"
-        )));
-    }
+    validate_snapshot_tile_count(tile_count)?;
     let topology = Topology::new(
         (0..tile_count)
             .map(ipu_exchange::c600_logical_to_physical)

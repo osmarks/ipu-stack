@@ -1113,3 +1113,49 @@ fn compact_streams_order_inputs_before_ready_forwarders() {
         assert_eq!(order.last(), Some(&2));
     }
 }
+
+#[test]
+fn snapshot_rejects_inactive_paired_sender_lane() {
+    let problem = ExchangeScheduleProblem {
+        phase: 0,
+        transfers: vec![ExchangeScheduleTransfer {
+            source: 2,
+            source_addresses: vec![0x50000],
+            destinations: vec![
+                ExchangeScheduleDestination {
+                    tile: 0,
+                    address: 0x58000,
+                },
+                ExchangeScheduleDestination {
+                    tile: 1,
+                    address: 0x58000,
+                },
+            ],
+            words: 128,
+            width: ExchangeItemWidth::Paired64,
+        }],
+    };
+    for tiles in [3, 4] {
+        let snapshot = ExchangeScheduleSnapshot {
+            schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
+            tile_count: tiles,
+            phases: vec![problem.clone()],
+            phase_labels: BTreeMap::new(),
+            phase_traffic: BTreeMap::new(),
+        };
+        if tiles == 3 {
+            assert!(matches!(
+                snapshot.validate(),
+                Err(ExchangeLoweringError::InvalidSnapshot(_))
+            ));
+            assert!(matches!(
+                schedule_exchange_problem(tiles, &problem),
+                Err(ExchangeLoweringError::InvalidSnapshot(_))
+            ));
+        } else {
+            snapshot.validate().unwrap();
+            let run = schedule_exchange_problem(tiles, &problem).unwrap();
+            validate_exchange_schedule(tiles, &problem, &run.phase).unwrap();
+        }
+    }
+}

@@ -68,14 +68,7 @@ impl ExchangeScheduleCache {
         tile_count: u16,
         problem: &ExchangeScheduleProblem,
     ) -> Result<(ExchangeScheduleProblem, ExchangeScheduleRun), ExchangeLoweringError> {
-        ExchangeScheduleSnapshot {
-            schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
-            tile_count,
-            phases: Vec::new(),
-            phase_labels: BTreeMap::new(),
-            phase_traffic: BTreeMap::new(),
-        }
-        .validate()?;
+        validate_snapshot_tile_count(tile_count)?;
         let topology = Topology::new(
             (0..tile_count)
                 .map(ipu_exchange::c600_logical_to_physical)
