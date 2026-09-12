@@ -155,6 +155,9 @@ struct Arguments {
     /// Maximum ordered local improvement steps; later candidates may be built speculatively.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
+    /// Use the experimental capacity-first baseline before local optimization.
+    #[arg(long)]
+    capacity_baseline: bool,
     /// Use compact exchange rows with endpoint-balanced waves of this many words.
     #[arg(long)]
     exchange_stream_words: Option<std::num::NonZeroU32>,
@@ -719,6 +722,7 @@ fn main() -> Result<()> {
         pipeline = pipeline.with_operator_candidate_limit(width);
     }
     pipeline.optimization_steps = arguments.optimization_steps;
+    pipeline.capacity_baseline = arguments.capacity_baseline;
     pipeline.exchange_stream_words = arguments.exchange_stream_words;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {

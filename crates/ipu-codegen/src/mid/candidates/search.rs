@@ -159,6 +159,7 @@ impl<'a> CandidateSearch<'a> {
                 costs,
                 config.operator_candidate_limit.max(1),
                 self.demands.get(operation.results[0]),
+                config.capacity_baseline,
             )
         } else {
             candidate_plans

@@ -30,12 +30,31 @@ The production entry point now builds one baseline and compares at most
 built incumbent, including its final allocation and schedule. Rejection never
 starts a fresh global search. A failed baseline is reported as such.
 
-Canonical boundaries use contiguous row blocks targeting one 16 KiB SRAM
-element per owner. This is a logical distribution policy, not a reservation of
-memory elements. Parameter sequences use compact native homes and a shared
+The default baseline uses contiguous row blocks targeting one 16 KiB SRAM
+element per owner. Parameter sequences use compact native homes and a shared
 rotation. Casting initially follows redistribution; early casting is a local
-alternative. Operator selection uses existing implementation estimates and the
-conversion inserter to price the surrounding movement.
+alternative. Operator selection uses implementation estimates and the conversion
+inserter to price surrounding input movement.
+
+`--capacity-baseline` (or `PipelineConfig::capacity_baseline`) instead distributes
+whole rows over as many row owners as the shape and device permit, without
+replication or tail-row padding. It compares both cast orders using the ordinary
+conversion inserter and mid implementation/liveness analysis. Its memory score
+includes source buffers, input conversions, compute scratch and conversion back
+to the canonical output, retaining inputs that have later consumers. Automatic
+parameters are costed in their compact homes, as in actual lowering.
+
+Capacity selection prioritizes total live tensor memory, then maximum standard
+allocation, exchange-row estimate and cycles. Its operator shortlist retains a
+smallest-buffer candidate alongside the existing exchange-storage extreme. It
+uses the same lowering and local optimizer, with no automatic retry between
+baseline policies. It remains opt-in: PE batch two fits, but SigLIP encounters
+exchange storage/alignment limitations. See the
+[capacity-baseline results](CAPACITY_BASELINE_2026_09_12.md).
+
+This is still a local memory estimate: it does not model every other live graph
+value or prove joint placement. Compute operands may retain replicas when the
+existing kernels need them; bounded panel broadcasting has not been added.
 
 Proposals include operator alternatives, joint producer/store and consumer
 changes, opening canonical boundaries, cast order, packing distribution and

@@ -593,9 +593,10 @@ pub(super) fn plans(
                     else {
                         continue;
                     };
-                    if actual.format.precision != requirement.format.precision
-                        || candidate.requirements.output.format.precision
-                            != requirement.format.precision
+                    // Preserve ownership/order, not necessarily precision. The
+                    // conversion inserter supplies the kernel's operand type.
+                    if candidate.requirements.output.format.precision
+                        != requirement.format.precision
                     {
                         continue;
                     }
@@ -1466,6 +1467,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             costs,
             config.operator_candidate_limit.max(1),
             output_demands,
+            config.capacity_baseline,
         )
     };
     tracing::debug!(
@@ -1578,7 +1580,7 @@ pub(super) fn retain_operator_candidates(
     costs: &impl CostModel,
     width: usize,
 ) -> Vec<OperatorPlan> {
-    retain_operator_candidates_for_demands(candidates, inputs, output, costs, width, &[])
+    retain_operator_candidates_for_demands(candidates, inputs, output, costs, width, &[], false)
 }
 
 pub(super) fn retain_operator_candidates_for_demands(
@@ -1588,6 +1590,7 @@ pub(super) fn retain_operator_candidates_for_demands(
     costs: &impl CostModel,
     width: usize,
     demands: &[OutputDemand],
+    capacity: bool,
 ) -> Vec<OperatorPlan> {
     if candidates.len() <= width {
         return candidates;
@@ -1645,6 +1648,23 @@ pub(super) fn retain_operator_candidates_for_demands(
         .iter()
         .any(|(_, metrics, _)| metrics.memory.standard_contiguous_overflow() == 0);
     let mut selected = BTreeSet::new();
+    // Preserve the capacity extreme as well as fast implementations. Boundary
+    // conversion storage is evaluated later, using the actual source formats.
+    if capacity
+        && width > 1
+        && let Some((index, _)) = ranked
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, metrics, _))| {
+                (
+                    metrics.memory.maximum_standard_allocation,
+                    metrics.memory.total,
+                    metrics.cycles,
+                )
+            })
+    {
+        selected.insert(index);
+    }
     // Preserve the storage extreme before latency/family slots fill the pool.
     // Baseline selection adds the surrounding boundary conversion traffic.
     if width > 1

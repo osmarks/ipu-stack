@@ -40,6 +40,9 @@ produce a complete executable package.
 The planner first builds a baseline with canonical layout boundaries and compact
 parameter storage, then evaluates local improvements. Accepted changes retain a
 complete feasible package. `--optimization-steps 0` selects the baseline alone.
+The experimental `--capacity-baseline` uses more distributed activation boundaries
+and includes conversions in memory ranking. It has enabled batch-2 PE capacity
+runs, but is not a general solution to larger-batch SigLIP planning.
 See [baseline and local planning](docs/BASELINE_LOCAL_PLANNING.md) and the
 [compiler data flow](docs/COMPILER_DATA_FLOW.md).
 

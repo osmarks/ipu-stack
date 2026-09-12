@@ -107,7 +107,12 @@ pub(crate) fn select(
                 layout: if input.kind == GraphInputKind::Parameter {
                     flat(&input.shape, precision, config.tile_count)
                 } else {
-                    canonical(&input.shape, precision, config.tile_count)
+                    canonical(
+                        &input.shape,
+                        precision,
+                        config.tile_count,
+                        config.capacity_baseline,
+                    )
                 },
             }),
         };
@@ -158,22 +163,24 @@ pub(crate) fn select(
     })
 }
 
-fn canonical(shape: &TensorShape, precision: Precision, tiles: u16) -> Layout {
+fn canonical(shape: &TensorShape, precision: Precision, tiles: u16, capacity: bool) -> Layout {
     if shape.0.len() < 2 {
         return flat(shape, precision, tiles);
     }
-    // Coarse contiguous row blocks avoid turning every row into an exchange
-    // endpoint. Aim for one SRAM element per owner, without reserving elements
-    // or imposing a separate persistent/scratch partition on placement.
+    // Keep whole rows local, but use every available row owner. Coarse
+    // element-sized boundaries concentrate residuals and conversion buffers on
+    // the same small tile group, even when most of the device is free.
     let rows = shape.0[shape.0.len() - 2];
-    let row_bytes = shape.elements() / u64::from(rows) * precision.bytes();
-    let capacity = (u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
-    let block = (1u32 << capacity.min(u64::from(u32::MAX)).ilog2())
-        .min(rows)
-        .max(rows.div_ceil(u32::from(tiles)));
-    let owners = rows.div_ceil(block) as u16;
-    // Boundaries do not require blocked rows. Balance whole logical rows over
-    // these owners without introducing tail padding that needs separate clears.
+    let owners = if capacity {
+        rows.min(u32::from(tiles)) as u16
+    } else {
+        let row_bytes = shape.elements() / u64::from(rows) * precision.bytes();
+        let capacity = (u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
+        let block = (1u32 << capacity.min(u64::from(u32::MAX)).ilog2())
+            .min(rows)
+            .max(rows.div_ceil(u32::from(tiles)));
+        rows.div_ceil(block) as u16
+    };
     Layout::row_major(TensorTiling {
         tile_count: owners,
         replicas: 1,
@@ -270,47 +277,165 @@ impl<C: CostModel> Builder<'_, C> {
             {
                 plans.retain(|plan| matches!(plan.dispatch, OperatorDispatch::Attention { .. }));
             }
-            let selected = if let Some(plan) = self.recipe.plans.get(&operation.id) {
-                plan.clone()
+            let (selected, early_cast) = if let Some(plan) = self.recipe.plans.get(&operation.id) {
+                (
+                    plan.clone(),
+                    self.recipe.early_casts.contains(&operation.id),
+                )
             } else {
                 plans
                     .iter()
-                    .filter_map(|plan| {
-                        let (inputs, output) = plan.tensor_types(&types, shape);
-                        let implementation = self.costs.implementation(plan, &inputs, &output)?;
-                        let memory = implementation.peak_memory;
-                        let mut cycles = self
-                            .costs
-                            .operator_cycle_override(plan, &inputs, &output)
-                            .unwrap_or(implementation.estimated_cycles);
-                        // Use the conversion inserter itself to price boundaries;
-                        // a cheap kernel can require an expensive redistribution.
+                    .flat_map(|plan| [(plan, false), (plan, true)])
+                    .filter(|(plan, early)| {
+                        !early
+                            || self.config.capacity_baseline
+                                && types.iter().zip(&plan.requirements.inputs).any(
+                                    |(input, requirement)| {
+                                        input.format.precision != requirement.format.precision
+                                    },
+                                )
+                    })
+                    .filter_map(|(plan, early_cast)| {
+                        let early_cast =
+                            early_cast || self.recipe.early_casts.contains(&operation.id);
+                        if !self.config.capacity_baseline {
+                            let (inputs, output) = plan.tensor_types(&types, shape);
+                            let implementation =
+                                self.costs.implementation(plan, &inputs, &output)?;
+                            let mut state = LoweringState::default();
+                            let mut conversions = Vec::new();
+                            for ((source, requirement), &automatic) in
+                                types.iter().zip(&plan.requirements.inputs).zip(&automatic)
+                            {
+                                let id = state.value(operation.results[0], source.clone());
+                                if automatic {
+                                    state.automatic_inputs.insert(id);
+                                }
+                                ensure_format(
+                                    id,
+                                    requirement.format.clone(),
+                                    requirement.materialization,
+                                    early_cast,
+                                    operation.id,
+                                    self.costs,
+                                    &mut state,
+                                    &mut conversions,
+                                );
+                            }
+                            let memory = implementation.peak_memory;
+                            let cycles = self
+                                .costs
+                                .operator_cycle_override(plan, &inputs, &output)
+                                .unwrap_or(implementation.estimated_cycles)
+                                .saturating_add(
+                                    conversions
+                                        .iter()
+                                        .map(|op| op.estimated_cycles)
+                                        .sum::<u64>(),
+                                );
+                            return Some((
+                                (
+                                    if self.optimizing {
+                                        cycles
+                                    } else {
+                                        memory.total
+                                    },
+                                    0,
+                                    memory.exchange_rows,
+                                    if self.optimizing {
+                                        memory.total
+                                    } else {
+                                        cycles
+                                    },
+                                ),
+                                (plan, early_cast),
+                            ));
+                        }
+                        // Lower the actual boundary -> operator -> boundary sequence.
+                        // The operator alone omits live source buffers and cast/pack
+                        // temporaries, which can be larger than its own scratch.
                         let mut state = LoweringState::default();
-                        let mut conversions = Vec::new();
-                        for ((source, requirement), &automatic) in
-                            types.iter().zip(&plan.requirements.inputs).zip(&automatic)
+                        let mut values = BTreeMap::new();
+                        let mut initial = Vec::new();
+                        for (index, (&origin, source)) in
+                            operation.inputs.iter().zip(&types).enumerate()
                         {
-                            let id = state.value(operation.results[0], source.clone());
-                            if automatic {
+                            let mut source = source.clone();
+                            if automatic[index] && parameters[index] {
+                                source.format.layout.order =
+                                    plan.requirements.inputs[index].format.layout.order;
+                                source.format.layout = ownership::compact_parameter_layout(
+                                    &source,
+                                    self.copies.get(&ids[index]).copied().unwrap_or(1),
+                                    self.config,
+                                )?;
+                            }
+                            let id = state.value(origin, source);
+                            if automatic[index] && !parameters[index] {
                                 state.automatic_inputs.insert(id);
                             }
-                            ensure_format(
-                                id,
-                                requirement.format.clone(),
-                                requirement.materialization,
-                                self.recipe.early_casts.contains(&operation.id),
+                            initial.push(id);
+                            values.insert(origin, id);
+                        }
+                        let mut sequence = Vec::new();
+                        apply_selected_plan(
+                            operation,
+                            shape.clone(),
+                            plan.clone(),
+                            &vec![early_cast; ids.len()],
+                            &operation
+                                .inputs
+                                .iter()
+                                .map(|id| uses.get(id) == Some(&1))
+                                .collect::<Vec<_>>(),
+                            self.costs,
+                            &mut values,
+                            &mut state,
+                            &mut sequence,
+                        );
+                        let mut result = values[&operation.results[0]];
+                        if !self.recipe.open_boundaries.contains(&operation.results[0]) {
+                            let precision = state.get(result).tensor_type.format.precision;
+                            result = ensure_format(
+                                result,
+                                TensorFormat {
+                                    precision,
+                                    layout: canonical(
+                                        shape,
+                                        precision,
+                                        self.config.tile_count,
+                                        self.config.capacity_baseline,
+                                    ),
+                                },
+                                OperandMaterialization::Complete,
+                                false,
                                 operation.id,
                                 self.costs,
                                 &mut state,
-                                &mut conversions,
+                                &mut sequence,
                             );
                         }
-                        cycles = cycles.saturating_add(
-                            conversions
+                        // Inputs with later consumers remain live through conversion.
+                        let mut live = vec![result];
+                        live.extend(
+                            initial
                                 .iter()
-                                .map(|op| op.estimated_cycles)
-                                .sum::<u64>(),
+                                .zip(&operation.inputs)
+                                .filter(|(_, origin)| uses.get(origin) != Some(&1))
+                                .map(|(&id, _)| id),
                         );
+                        let memory = crate::estimate::region_peak_memory_with_multiplicity(
+                            self.config,
+                            &initial,
+                            &sequence,
+                            &live,
+                            &state.values,
+                            &BTreeMap::new(),
+                        );
+                        if memory.total == u64::MAX {
+                            return None;
+                        }
+                        let cycles = sequence.iter().map(|op| op.estimated_cycles).sum::<u64>();
 
                         Some((
                             (
@@ -319,6 +444,7 @@ impl<C: CostModel> Builder<'_, C> {
                                 } else {
                                     memory.total
                                 },
+                                memory.maximum_standard_allocation,
                                 memory.exchange_rows,
                                 if self.optimizing {
                                     memory.total
@@ -326,13 +452,16 @@ impl<C: CostModel> Builder<'_, C> {
                                     cycles
                                 },
                             ),
-                            plan,
+                            (plan, early_cast),
                         ))
                     })
                     .min_by_key(|(score, _)| *score)
-                    .map(|(_, plan)| plan.clone())
+                    .map(|(_, (plan, early_cast))| (plan.clone(), early_cast))
                     .ok_or(LoweringError::NoCandidate(operation.id))?
             };
+            if early_cast {
+                self.recipe.early_casts.insert(operation.id);
+            }
             if !self.recipe.plans.contains_key(&operation.id) {
                 self.alternatives.insert(operation.id, plans);
             }
@@ -390,6 +519,7 @@ impl<C: CostModel> Builder<'_, C> {
                         shape,
                         value.tensor_type.format.precision,
                         self.config.tile_count,
+                        self.config.capacity_baseline,
                     ),
                 };
                 let id = ensure_format(
@@ -636,7 +766,9 @@ mod tests {
         for precision in [Precision::F16, Precision::F8F143 { scale_exponent: -4 }] {
             for shape in [[1, 729, 1152], [2, 729, 3456], [8, 729, 4304]] {
                 let shape = TensorShape(shape.to_vec());
-                let layout = canonical(&shape, precision, 1472);
+                let layout = canonical(&shape, precision, 1472, true);
+                assert_eq!(layout.tiling.replicas, 1);
+                assert_eq!(layout.tiling.tile_count, 729);
                 assert_eq!(layout.padded_shape(&shape).unwrap(), shape);
                 let resolved = layout.resolve(&shape).unwrap();
                 assert!(!resolved.has_empty_shards());
@@ -657,6 +789,7 @@ mod tests {
             let mut graph = ComputeGraph::new();
             let input = graph.host_input("x", [16, 64]).unwrap();
             let mut config = PipelineConfig::new(8).with_automatic_input(input, Precision::F16);
+            config.capacity_baseline = count == 3;
             let weights = (0..count)
                 .map(|i| {
                     let id = graph.parameter(format!("w{i}"), [64, 64]).unwrap();

@@ -1,5 +1,10 @@
 # PE-Core L/14 capacity check — September 12, 2026
 
+**Follow-up:** the experimental capacity-first baseline now runs batch two on
+hardware, including all 24 resident layers. See
+[the capacity-baseline results](CAPACITY_BASELINE_2026_09_12.md).
+The original sweep below records the previous baseline's failures.
+
 Source: `../perception_models`, commit
 `3e352cca660658d4b5c90f42a7808b11469e4c66`, specifically
 `core/vision_encoder/config.py`, `pe.py` and `rope.py`.

@@ -92,6 +92,9 @@ pub struct PipelineConfig {
     /// Parallel speculation can validate later proposals that an earlier
     /// improvement invalidates; these do not advance the search.
     pub optimization_steps: usize,
+    /// Prefer distributed boundaries and conversion-inclusive memory costs.
+    /// Experimental: smaller tensor peaks can still require larger exchange rows.
+    pub capacity_baseline: bool,
     /// Compact endpoint-balanced exchange waves; None uses latency-oriented scheduling.
     pub exchange_stream_words: Option<std::num::NonZeroU32>,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
@@ -196,6 +199,7 @@ impl PipelineConfig {
             gemm_precisions: BTreeMap::new(),
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
+            capacity_baseline: false,
             exchange_stream_words: None,
             operator_candidate_limit: 64,
             exchange_table_budget_bytes: 80 * 1024,
