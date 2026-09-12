@@ -1,77 +1,126 @@
 # ipu-stack
 
-`ipu-stack` is a small collection of runtime, packaging, code-generation, and
-early graph-lowering components for Graphcore IPU21 devices. It does not yet
-contain the allocator or complete graph-to-device compiler.
+`ipu-stack` is an experimental graph compiler, runtime, and profiling toolkit for
+Graphcore IPU21 devices. It lowers tensor graphs to executable `.ipuexe`
+packages, including layout selection, SRAM allocation, kernel generation,
+exchange scheduling, and repeated execution with resident parameters.
+
+The full pretrained SigLIP So400m/14 384 vision tower (27 encoder layers and MAP
+head, batch size 1) runs on hardware. On six real photographs, its embeddings
+achieved **0.994614–0.997866 cosine similarity** against an independent FP32
+Hugging Face reference. Weights were uploaded once and retained across all six
+inferences. This is a small numerical validation, not a task-accuracy evaluation
+or a timing benchmark; see the [validation report](docs/SIGLIP_PRETRAINED_VALIDATION_2026_09_12.md).
 
 ## Components
 
-- `ipu-exchange` generates and encodes device and host exchange programs.
-- `ipu-codegen` emits straight-line supervisor code from caller-resolved tile
-  programs.
-- `ipu-elf` compiles Graphcore tile sources and links Colossus ELF objects.
-- `ipu-package` reads, writes, and validates `.ipuexe` application packages and
-  cycle profiles.
-- `ipu-profile` queries cycle profiles.
-- `ipu-driver` initializes hardware, loads packages, and drives host exchange.
-- `ipu-runtime` is a thin device/load/session wrapper.
-- `ipu-tests` builds and runs the explicit hardware diagnostic package.
-- `ipu-cli` exposes generic compile, link, inspect, profile, load, and host-run
-  operations.
+- `ipu-codegen`: tensor graph lowering, layout planning, allocation, device
+  kernels, and package construction.
+- `ipu-exchange`: device and host exchange scheduling and encoding.
+- `ipu-elf`: Graphcore tile compilation and ELF linking.
+- `ipu-package`: `.ipuexe` packages and cycle-profile serialization.
+- `ipu-profile`: cycle-profile queries and interactive HTML rendering.
+- `ipu-driver`: hardware initialization, package loading, and host exchange.
+- `ipu-runtime`: device, load, and session interfaces.
+- `ipu-tests`: hardware diagnostics, model benchmarks, and reference validation.
+- `ipu-cli`: compile, link, inspect, profile, load, and host-run commands.
 
-The `device/` directory retains the static runtime support and generic FP16 and
-FP32 GEMM kernels. Workload-specific kernels and planners are intentionally out
-of scope.
+`device/` contains assembly runtime support and kernels. Generated kernels and
+operator implementations live in `ipu-codegen`.
 
-## Design boundary
+## Compilation
 
-`ipu-codegen::build_package` accepts a `ComputeGraph` and `PackageConfig`. The
-graph is shaped structured SSA. Its separate mid-level lowering selects
-precision and layout with a toy cost model and inserts explicit casts and
-rearrangements. Mid-to-low lowering then produces logical per-tile shard work,
-kernel runs, synchronized exchanges, and structured repeats. Package
-construction produces completion-only tile programs until SRAM placement,
-exchange encoding, and kernel-symbol selection are implemented. The config
-uses one shared `PipelineConfig` for target, tile count, input formats, operator
-catalog, scheduling, and profiling. `PackageConfig` adds the toolchain, static
-runtime source, and build directory.
+`ipu-codegen::build_package` accepts a `ComputeGraph` and `PackageConfig`.
+High-level graphs describe tensor operations and structured repeats. Mid-level
+plans select whole-device implementations, precisions, and layouts, with
+explicit conversions and reductions. Low-level expansion produces per-tile
+kernel work and exchanges. Allocation, scheduling, linking, and encoding then
+produce a complete executable package.
 
-`TileProgram` remains the finalized lower representation. Its exchange rows,
-addresses, kernel symbols, operands, arguments, and profile destinations are
-all explicit rather than inferred by codegen.
+The planner first builds a baseline with canonical layout boundaries and compact
+parameter storage, then evaluates local improvements. Accepted changes retain a
+complete feasible package. `--optimization-steps 0` selects the baseline alone.
+See [baseline and local planning](docs/BASELINE_LOCAL_PLANNING.md) and the
+[compiler data flow](docs/COMPILER_DATA_FLOW.md).
 
-## Build
+## Build and hardware setup
+
+Host tools use Rust 2024 and the Cap'n Proto compiler (`capnp`). Device compilation
+requires the Poplar SDK toolchain; execution requires an accessible IPU device
+and an `IPUCFG1` configuration capture. Host Rust compilation uses the native CPU
+ISA through `.cargo/config.toml`.
 
 ```sh
+cargo build --release --workspace
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The hardware test builds and round-trips its own package before loading it:
+Set the SDK and configuration paths, then run the hardware diagnostic:
 
 ```sh
-IPU_CONFIG=config.bin \
-POPLAR_SDK_ENABLED=/path/to/poplar \
+export IPU_CONFIG=/path/to/config.bin
+export POPLAR_SDK_ENABLED=/path/to/poplar
 scripts/hardware-e2e.sh
 ```
 
-The test checks that every supervisor and worker context halts after the
+The diagnostic builds and round-trips a package, loads it, and checks supervisor
+completion and inactive workers. See [hardware bring-up](docs/BRINGUP.md) for
+numerical GEMM smoke tests and configuration details.
 
-## CLI
+## Pretrained SigLIP validation
+
+The validated precision policy uses an FP16 input projection and F143 FP8
+operands with FP16 accumulation/results for encoder and MAP dense GEMMs.
+Calibration selects one fixed scale per GEMM position, shared by both operands
+and across all encoder layers. The run uses nearest weight rounding, without
+GPTQ or per-block scales. A single global scale of −4 clips learned activations
+and is unsuitable for this checkpoint. See [FP8 support](docs/FP8.md).
+
+Create a Python environment with PyTorch, Transformers, SafeTensors,
+`huggingface_hub`, Pillow, and NumPy, then export the pinned checkpoint and demo
+images and calibrate the scales:
 
 ```sh
-ipu-stack kernel-compile device/static_runtime.S /tmp/runtime \
-  --sdk "$POPLAR_SDK_ENABLED"
-ipu-stack object-inspect kernel.o
-ipu-stack package-inspect application.ipuexe --bindings
-ipu-stack profile-render profile.capnp -o profile.html
-ipu-stack profile-query profile.capnp --group-by kernel
-ipu-stack host-run application.ipuexe bootloader.elf config.bin graph
+python scripts/siglip-pretrained-fixture.py artifacts/pretrained/fixture
+python tools/calibrate_siglip_fixture.py artifacts/pretrained/fixture \
+  --fp16-embedding --scale-sharing repeat-role --shared-operand-scale \
+  --nearest-only --report artifacts/pretrained/calibration.json
 ```
 
-New profiles include [kernel useful-work estimates](docs/PROFILE_USEFUL_WORK.md)
-in the renderer and query output, separating arithmetic efficiency from padding
-and tile occupancy.
+Calibration uses CUDA by default and the first three images; the other three
+are held out. The fixture applies the checkpoint's RGB bicubic resize to
+384×384 and normalization, then packs the top-left 378×378 pixels into patches.
+Resizing directly to 378×378 would change the input.
 
-The CLI intentionally excludes graph construction, allocation, model commands,
-diagnostic workload generation, and format-conversion experiments.
+Build and run all six images with the weights resident:
+
+```sh
+RAYON_NUM_THREADS=16 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
+  --sdk "$POPLAR_SDK_ENABLED" --runtime-source device/static_runtime.S \
+  --workload siglip-vit-benchmark --vit-layers 27 --vit-batch 1 \
+  --fuse-qkv --optimization-steps 8 --exchange-stream-words 1024 \
+  --reference-run --reference-fp32 --reference-inferences 6 \
+  --reference-fixture artifacts/pretrained/fixture \
+  --reference-calibration artifacts/pretrained/calibration.json \
+  --no-profile --package artifacts/pretrained/model.ipuexe
+```
+
+The runner fails if any image's cosine similarity does not exceed 0.99. The
+[validation report](docs/SIGLIP_PRETRAINED_VALIDATION_2026_09_12.md) records the
+checkpoint revision, per-image results, and original artifacts. Earlier
+randomized-model timings use a different precision configuration and do not
+measure this calibrated pretrained run.
+
+## Inspection and profiling
+
+```sh
+target/release/ipu-stack package-inspect application.ipuexe --bindings
+target/release/ipu-stack profile-render profile.capnp -o profile.html
+target/release/ipu-stack profile-query profile.capnp --group-by kernel
+```
+
+The runtime profile viewer shows tile timelines, exchange modes, synchronization,
+and [estimated useful kernel work](docs/PROFILE_USEFUL_WORK.md). The benchmark
+runner also accepts `--memory-profile-directory PATH` for memory reports,
+including exact per-tile placement and allocation reuse. See
+[cycle profiling](docs/PROFILING.md) and [memory profiling](docs/MEMORY_PROFILING.md).
