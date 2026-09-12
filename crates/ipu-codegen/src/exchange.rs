@@ -20,9 +20,9 @@ use crate::{
     BlockValueId, ExchangePhaseId, LogicalExchange, LowProgram, Placement, ShardDefinition,
 };
 use ipu_exchange::{
-    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, RETURN_M10_INSTRUCTION, Topology,
-    finalize_point_receiver, patch_receiver_address, patch_sender_address,
-    patch_sender_instruction, sender_address_instruction_groups,
+    MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
+    RETURN_M10_INSTRUCTION, Topology, finalize_point_receiver, patch_receiver_address,
+    patch_sender_address, patch_sender_instruction, sender_address_instruction_groups,
 };
 use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
@@ -2255,89 +2255,72 @@ impl MaterializedSchedule {
             &mut self.builder,
             validate_encoding,
         )?;
-        let payload_end = timing.sender_end;
+        let payload_end = timing.payload_end;
         self.memory_accesses[usize::from(transfer.source)]
             .sends
             .record(
                 &transfer.source_elements,
-                timing.start,
-                timing.sender_memory_end,
+                timing.payload_start,
+                timing.sender_horizon,
             );
-        for ((&(tile, address), &start), &memory_end) in transfer
-            .destinations
-            .iter()
-            .zip(&timing.receiver_starts)
-            .zip(&timing.receiver_memory_ends)
-        {
-            self.memory_accesses[usize::from(tile)].receives.record(
-                &effective_memory_elements(address, transfer.words),
-                start,
-                memory_end,
-            );
-        }
-        self.activities[usize::from(transfer.source)].push(ExchangeActivity {
+        let activity = ExchangeActivity {
             fanout: transfer.destinations.len() as u16,
             paired: transfer.width == ExchangeItemWidth::Paired64,
             transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
             kind: ExchangeActivityKind::Send,
-            start_cycle: timing.start,
+            start_cycle: timing.payload_start,
             end_cycle: payload_end,
-            memory_end_cycle: timing.sender_memory_end,
+            memory_end_cycle: timing.sender_horizon,
             address: transfer.source_address(),
             words: transfer.words,
-        });
+        };
+        self.activities[usize::from(transfer.source)].push(activity);
         if let Some(tile) = transfer.reserved_source {
             self.activities[usize::from(tile)].push(ExchangeActivity {
-                fanout: transfer.destinations.len() as u16,
-                paired: transfer.width == ExchangeItemWidth::Paired64,
-                transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 kind: ExchangeActivityKind::PartnerBusy,
-                start_cycle: timing.start,
-                end_cycle: timing.sender_memory_end,
-                memory_end_cycle: timing.sender_memory_end,
-                address: transfer.source_address(),
-                words: transfer.words,
+                end_cycle: timing.sender_horizon,
+                ..activity
             });
         }
+        let mut completion = payload_end;
         for (((&(tile, address), &start_cycle), &end_cycle), &memory_end_cycle) in transfer
             .destinations
             .iter()
-            .zip(&timing.receiver_starts)
-            .zip(&timing.receiver_ends)
-            .zip(&timing.receiver_memory_ends)
+            .zip(&timing.receiver_payload_starts)
+            .zip(&timing.receiver_payload_ends)
+            .zip(&timing.receiver_horizons)
         {
+            self.memory_accesses[usize::from(tile)].receives.record(
+                &effective_memory_elements(address, transfer.words),
+                start_cycle,
+                memory_end_cycle,
+            );
             self.activities[usize::from(tile)].push(ExchangeActivity {
-                fanout: transfer.destinations.len() as u16,
-                paired: transfer.width == ExchangeItemWidth::Paired64,
-                transfer: u32::try_from(index).map_err(|_| ExchangeLoweringError::Overflow)?,
                 kind: ExchangeActivityKind::Receive,
                 start_cycle,
                 end_cycle,
                 memory_end_cycle,
                 address,
-                words: transfer.words,
+                ..activity
             });
+            self.tile_availability[usize::from(tile)].receive = end_cycle;
+            last_transfer[usize::from(tile)].receive = Some(index);
+            completion = completion.max(end_cycle);
         }
-        self.tile_availability[usize::from(transfer.source)].send = timing.sender_end;
+        self.tile_availability[usize::from(transfer.source)].send = timing.payload_end;
         if let Some(tile) = transfer.reserved_source {
-            self.tile_availability[usize::from(tile)].send = timing.sender_memory_end;
+            self.tile_availability[usize::from(tile)].send = timing.sender_horizon;
             last_transfer[usize::from(tile)].send = Some(index);
         }
-        for (&(tile, _), &receiver_end) in transfer.destinations.iter().zip(&timing.receiver_ends) {
-            self.tile_availability[usize::from(tile)].receive = receiver_end;
-        }
         last_transfer[usize::from(transfer.source)].send = Some(index);
-        for &(tile, _) in &transfer.destinations {
-            last_transfer[usize::from(tile)].receive = Some(index);
-        }
         self.order.push(index);
         self.timings[index] = Some(MaterializedTiming {
-            start: timing.start,
-            end: timing.end,
+            start: timing.payload_start,
+            end: completion,
             blocking_tile,
             predecessor,
         });
-        Ok(timing.end)
+        Ok(completion)
     }
 
     fn finish_horizon(&mut self) {
@@ -2435,6 +2418,36 @@ fn materialize_greedy_schedule_impl(
     debug_assert!(scheduler.is_complete());
     schedule.finish_horizon();
     Ok(schedule)
+}
+
+fn materialize_valid_schedule_order(
+    topology: &Topology,
+    problem: &SchedulingProblem<'_>,
+    incoming_bases: &[u32],
+    receive_counts: &[usize],
+    order: &[usize],
+) -> Result<MaterializedSchedule, ExchangeLoweringError> {
+    match materialize_schedule_order(
+        topology,
+        problem,
+        incoming_bases,
+        receive_counts,
+        order,
+        false,
+    ) {
+        Ok(schedule) => Ok(schedule),
+        Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
+            "SENDPICP instruction alignment",
+        ))) => materialize_schedule_order(
+            topology,
+            problem,
+            incoming_bases,
+            receive_counts,
+            order,
+            true,
+        ),
+        Err(error) => Err(error),
+    }
 }
 
 fn materialize_schedule_order(
@@ -2538,9 +2551,6 @@ fn endpoint_work_lower_bound(pending: &[PendingTransfer], tile_count: u16) -> u3
         .min(u64::from(u32::MAX)) as u32
 }
 
-/// Orders a balanced point-to-point phase as maximum-cardinality waves over
-/// its send and receive buses. The result remains only a candidate: the exact
-/// row builder decides whether it improves the incumbent schedule.
 fn append_transfer(
     topology: &Topology,
     memory_accesses: &[TileMemorySchedule],
@@ -2549,7 +2559,7 @@ fn append_transfer(
     transfer: ScheduledTransfer<'_>,
     builder: &mut PhaseProgramBuilder,
     validate_encoding: bool,
-) -> Result<ScheduledTransferTiming, ExchangeLoweringError> {
+) -> Result<PhaseTransferTiming, ExchangeLoweringError> {
     let ScheduledTransfer {
         source,
         destinations,
@@ -2652,29 +2662,14 @@ fn append_transfer(
             break;
         }
     }
-    let timing = builder.append_transfer_at(
+    Ok(builder.append_transfer_at(
         source,
         reserved_tiles,
         &tiles,
         &plan,
         schedule_offset,
         item_count,
-    )?;
-    Ok(ScheduledTransferTiming {
-        start: timing.payload_start,
-        end: timing
-            .receiver_payload_ends
-            .iter()
-            .copied()
-            .chain(std::iter::once(timing.payload_end))
-            .max()
-            .unwrap_or(timing.payload_end),
-        sender_end: timing.payload_end,
-        sender_memory_end: timing.sender_horizon,
-        receiver_starts: timing.receiver_payload_starts,
-        receiver_ends: timing.receiver_payload_ends,
-        receiver_memory_ends: timing.receiver_horizons,
-    })
+    )?)
 }
 
 fn memory_safe_transfer_offset(
@@ -2748,16 +2743,6 @@ pub(crate) fn effective_memory_elements(address: u32, words: u32) -> Vec<Exchang
         cursor = boundary.min(end);
     }
     elements
-}
-
-struct ScheduledTransferTiming {
-    start: u32,
-    end: u32,
-    sender_end: u32,
-    sender_memory_end: u32,
-    receiver_starts: Vec<u32>,
-    receiver_ends: Vec<u32>,
-    receiver_memory_ends: Vec<u32>,
 }
 
 pub fn inactive_exchange_program() -> Vec<u32> {

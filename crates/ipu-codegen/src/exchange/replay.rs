@@ -127,35 +127,5 @@ pub(super) fn materialize_stream_schedule(
     balanced: bool,
 ) -> Result<MaterializedSchedule, ExchangeLoweringError> {
     let order = order::stream_wave_order(problem, words, balanced);
-    materialize_stream_order(topology, problem, incoming_bases, receive_counts, &order)
-}
-
-fn materialize_stream_order(
-    topology: &Topology,
-    problem: &SchedulingProblem<'_>,
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    order: &[usize],
-) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    match materialize_schedule_order(
-        topology,
-        problem,
-        incoming_bases,
-        receive_counts,
-        order,
-        false,
-    ) {
-        Ok(schedule) => Ok(schedule),
-        Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
-            "SENDPICP instruction alignment",
-        ))) => materialize_schedule_order(
-            topology,
-            problem,
-            incoming_bases,
-            receive_counts,
-            order,
-            true,
-        ),
-        Err(error) => Err(error),
-    }
+    materialize_valid_schedule_order(topology, problem, incoming_bases, receive_counts, &order)
 }

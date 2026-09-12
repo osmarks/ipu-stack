@@ -2789,50 +2789,12 @@ impl Topology {
             return Err(ExchangeError::Schedule("sender delay"));
         }
 
-        let mut sender_row = [0; PLAN_WORDS];
-        sender_row[0] = SYNC_SUPERVISOR_INSTRUCTION;
-        let mut cursor = 1;
-        if sender_delay >= 0 {
-            sender_row[cursor] = delay(sender_delay as u32);
-            cursor += 1;
-        }
-        let first_packet = count.min(64);
-        sender_row[cursor] = encode_send(first_packet - 1, direction, 0)?;
-        cursor += 1;
-        if count > 64 {
-            sender_row[cursor] = send_off(count - 65, direction, 0);
-            cursor += 1;
-        }
-        let trailing_delay = 4 - sender_delay - count as i32;
-        if trailing_delay >= 0 {
-            sender_row[cursor] = delay(trailing_delay as u32);
-            cursor += 1;
-        }
-        sender_row[cursor] = RETURN_M10_INSTRUCTION;
-
+        let sender_row = primitive_sender_row(count, direction, sender_delay)?;
         let mut receiver_row = [0; PLAN_WORDS];
         receiver_row[0] = 1;
         receiver_row[1] = SYNC_SUPERVISOR_INSTRUCTION;
         receiver_row[2] = delay_xpic(112, 0, 0);
-        if count <= 51 {
-            receiver_row[3] = delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE);
-            receiver_row[4] = delay_pic(51 - count + receiver_phase, 0, 0);
-            receiver_row[5] = delay(count + 4);
-            receiver_row[6] = RETURN_M10_INSTRUCTION;
-        } else if count == 52 {
-            // Keep PIC at the first payload arrival, as in the other rows.
-            // Programming it early works alone but understates the write
-            // window when this primitive is composed with another receive.
-            receiver_row[3] = delay_pic(51 + receiver_phase, 0, 0);
-            receiver_row[4] = delay_xpic(0, 0, TILE_MUX_EXCHANGE);
-            receiver_row[5] = delay(56);
-            receiver_row[6] = RETURN_M10_INSTRUCTION;
-        } else {
-            receiver_row[3] = delay_pic(51 + receiver_phase, 0, 0);
-            receiver_row[4] = delay_xpic(count - 53, 0, TILE_MUX_EXCHANGE);
-            receiver_row[5] = delay(56);
-            receiver_row[6] = RETURN_M10_INSTRUCTION;
-        }
+        receiver_row[3..7].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0));
         debug!(
             sender_logical,
             receiver_logical, count, "assembled point-to-point exchange"
@@ -2878,14 +2840,6 @@ impl Topology {
             .ok_or(ExchangeError::Schedule("multicast start cycle"))?;
         let sender_delay = start_cycle as i32 - 1;
 
-        let mut sender = [0; PLAN_WORDS];
-        let mut cursor = 0;
-        sender[cursor] = SYNC_SUPERVISOR_INSTRUCTION;
-        cursor += 1;
-        if sender_delay >= 0 {
-            sender[cursor] = delay(sender_delay as u32);
-            cursor += 1;
-        }
         let send_direction = if receiver_logical.len() == 1 {
             direction(
                 source_physical,
@@ -2894,18 +2848,7 @@ impl Topology {
         } else {
             3
         };
-        sender[cursor] = encode_send(count.min(64) - 1, send_direction, 0)?;
-        cursor += 1;
-        if count > 64 {
-            sender[cursor] = send_off(count - 65, send_direction, 0);
-            cursor += 1;
-        }
-        let trailing_delay = 4 - sender_delay - count as i32;
-        if trailing_delay >= 0 {
-            sender[cursor] = delay(trailing_delay as u32);
-            cursor += 1;
-        }
-        sender[cursor] = RETURN_M10_INSTRUCTION;
+        let sender = primitive_sender_row(count, send_direction, sender_delay)?;
 
         let mut receivers = Vec::with_capacity(receiver_logical.len());
         for (logical, mux_time) in receiver_logical.iter().zip(mux_times) {
@@ -2918,24 +2861,7 @@ impl Topology {
             let mut row = [0; PLAN_WORDS];
             row[0] = SYNC_SUPERVISOR_INSTRUCTION;
             row[1] = delay_xpic(receive_cycle as u32, 0, source_physical);
-            if count <= 51 {
-                // The one-word case still needs this event: without it the
-                // tile remains connected to the source after the phase ends.
-                row[2] = delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE);
-                row[3] = delay_pic(51 - count + receiver_phase, 0, 0) | 0x0001_4000;
-                row[4] = delay(count + 4);
-                row[5] = RETURN_M10_INSTRUCTION;
-            } else if count == 52 {
-                row[2] = delay_pic(51 + receiver_phase, 0, 0) | 0x0001_4000;
-                row[3] = delay_xpic(0, 0, TILE_MUX_EXCHANGE);
-                row[4] = delay(56);
-                row[5] = RETURN_M10_INSTRUCTION;
-            } else {
-                row[2] = delay_pic(51 + receiver_phase, 0, 0) | 0x0001_4000;
-                row[3] = delay_xpic(count - 53, 0, TILE_MUX_EXCHANGE);
-                row[4] = delay(56);
-                row[5] = RETURN_M10_INSTRUCTION;
-            }
+            row[2..6].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0x14000));
             receivers.push(row);
         }
         debug!(
@@ -2949,9 +2875,57 @@ impl Topology {
     }
 }
 
+fn primitive_sender_row(
+    count: u32,
+    direction: u32,
+    sender_delay: i32,
+) -> Result<PlanRow, ExchangeError> {
+    let mut row = [0; PLAN_WORDS];
+    row[0] = SYNC_SUPERVISOR_INSTRUCTION;
+    let mut cursor = 1;
+    if sender_delay >= 0 {
+        row[cursor] = delay(sender_delay as u32);
+        cursor += 1;
+    }
+    row[cursor] = encode_send(count.min(64) - 1, direction, 0)?;
+    cursor += 1;
+    if count > 64 {
+        row[cursor] = send_off(count - 65, direction, 0);
+        cursor += 1;
+    }
+    let trailing_delay = 4 - sender_delay - count as i32;
+    if trailing_delay >= 0 {
+        row[cursor] = delay(trailing_delay as u32);
+        cursor += 1;
+    }
+    row[cursor] = RETURN_M10_INSTRUCTION;
+    Ok(row)
+}
+
+fn ordinary_receiver_tail(count: u32, receiver_phase: u32, address: u32) -> [u32; 4] {
+    if count <= 51 {
+        // Even a one-word transfer must disconnect its source after the payload.
+        [
+            delay_xpic(count - 1, 0, TILE_MUX_EXCHANGE),
+            delay_pic(51 - count + receiver_phase, 0, address),
+            delay(count + 4),
+            RETURN_M10_INSTRUCTION,
+        ]
+    } else {
+        // Keep PIC at the first payload arrival, including the 52-word boundary.
+        // Programming it early understates the write window when rows compose.
+        [
+            delay_pic(51 + receiver_phase, 0, address),
+            delay_xpic(count.saturating_sub(53), 0, TILE_MUX_EXCHANGE),
+            delay(56),
+            RETURN_M10_INSTRUCTION,
+        ]
+    }
+}
+
 /// Selects double-width items in every outgoing instruction in a primitive
 /// sender row. Counts and absolute source operands both become 64-bit-item
-/// units; use [`patch_sender_address_64`] after selecting this control.
+/// units; use [`patch_sender_address`] after selecting this control.
 pub fn set_sender_control(row: &mut PlanRow, send_control: u8) -> Result<(), ExchangeError> {
     if !(1..=7).contains(&send_control) {
         return Err(ExchangeError::Schedule("send control"));

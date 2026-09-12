@@ -200,22 +200,13 @@ impl ScheduleRecipe {
         // The original greedy schedule may have needed incremental encoding
         // validation. Replay must use the same fallback before comparing rows.
         let problem = SchedulingProblem::new(&pending, tile_count);
-        let replay = |validate_encoding| {
-            materialize_schedule_order(
-                topology,
-                &problem,
-                &incoming_bases,
-                &receive_counts,
-                &self.order,
-                validate_encoding,
-            )
-        };
-        let schedule = match replay(false) {
-            Err(ExchangeLoweringError::Exchange(ipu_exchange::ExchangeError::Schedule(
-                "SENDPICP instruction alignment",
-            ))) => replay(true)?,
-            result => result?,
-        };
+        let schedule = materialize_valid_schedule_order(
+            topology,
+            &problem,
+            &incoming_bases,
+            &receive_counts,
+            &self.order,
+        )?;
         // Identical normalized rows preserve compact table sharing and the
         // provisional code-size reservation, not just the total cycle count.
         if normalized_rows(&schedule)? != self.rows {
