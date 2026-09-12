@@ -225,3 +225,114 @@ mod tests {
         result
     }
 }
+
+/// Apply calibrated fixed scales to graph parameters and their GEMM consumers.
+/// Repeat binds parameter sequences to body arguments; every instance must agree.
+pub(crate) fn configure(
+    graph: &ComputeGraph,
+    pipeline: &mut ipu_codegen::PipelineConfig,
+    path: &Path,
+) -> Result<()> {
+    use ipu_codegen::{
+        MidOperator, Operation, OperationKind, OperatorCandidate, Precision, ValueId,
+    };
+    let report: Value = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        report["shared_operand_scale"] == true && report["fp16_embedding"] == true,
+        "hardware calibration requires shared operand scales and FP16 embedding"
+    );
+    ensure!(
+        report["nearest"].is_array() && report.get("gptq").is_none(),
+        "use nearest calibration with original fixture parameters; reconstructed weights require a separate fixture"
+    );
+    let mut parameters = BTreeMap::new();
+    for input in graph
+        .inputs()
+        .iter()
+        .filter(|i| i.kind == GraphInputKind::Parameter && i.name.ends_with(".weight"))
+    {
+        let name = input
+            .name
+            .strip_prefix("vit.")
+            .context("calibration expects named ViT parameters")?
+            .strip_suffix(".weight")
+            .unwrap();
+        let precision = if name == "embedding" {
+            Precision::F16
+        } else {
+            let scales = &report["scales"][name];
+            let exponent = scales["weight"]
+                .as_i64()
+                .with_context(|| format!("missing scale for {name}"))?;
+            ensure!(
+                scales["activation"].as_i64() == Some(exponent),
+                "different operand scales for {name}"
+            );
+            ensure!(
+                (-16..=15).contains(&exponent),
+                "GEMM product scale out of range for {name}"
+            );
+            Precision::F8F143 {
+                scale_exponent: exponent as i8,
+            }
+        };
+        pipeline.automatic_inputs.insert(input.value, precision);
+        parameters.insert(input.value, precision);
+    }
+    fn visit(
+        operations: &[Operation],
+        graph: &ComputeGraph,
+        parameters: &mut BTreeMap<ValueId, Precision>,
+        choices: &mut BTreeMap<ipu_codegen::OperationId, Precision>,
+    ) -> Result<()> {
+        for operation in operations {
+            match &operation.kind {
+                OperationKind::Gemm(_) => {
+                    let precision = parameters.get(&operation.inputs[1]).with_context(|| {
+                        format!("GEMM {:?} has no calibrated weight", operation.id)
+                    })?;
+                    choices.insert(operation.id, *precision);
+                }
+                OperationKind::Repeat(repeat) => {
+                    for (&argument, &input) in repeat.body.arguments.iter().zip(&operation.inputs) {
+                        if let Some(&precision) = parameters.get(&input) {
+                            parameters.insert(argument, precision);
+                        }
+                    }
+                    for (&argument, sequence) in repeat
+                        .body
+                        .arguments
+                        .iter()
+                        .skip(repeat.carried_inputs + repeat.invariant_inputs)
+                        .zip(&repeat.iterated_inputs)
+                    {
+                        let values = &graph.sequences()[sequence.index() as usize].values;
+                        if let Some(&precision) = parameters.get(&values[0]) {
+                            ensure!(
+                                values.iter().all(|v| parameters.get(v) == Some(&precision)),
+                                "calibrated scales vary within a repeated parameter sequence"
+                            );
+                            parameters.insert(argument, precision);
+                        }
+                    }
+                    visit(&repeat.body.operations, graph, parameters, choices)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    visit(
+        graph.operations(),
+        graph,
+        &mut parameters,
+        &mut pipeline.gemm_precisions,
+    )?;
+    pipeline
+        .operator_candidates
+        .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+    pipeline
+        .operator_candidates
+        .push(OperatorCandidate::parallel_gemm(pipeline.tile_count));
+    Ok(())
+}

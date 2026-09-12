@@ -102,6 +102,8 @@ pub struct PipelineConfig {
     /// Signatures available independently to each operation. Earlier entries
     /// of the appropriate operation kind win when costs are equal.
     pub operator_candidates: Vec<OperatorCandidate>,
+    /// Fixed operand precision for individual GEMMs, including operations inside Repeat.
+    pub gemm_precisions: BTreeMap<OperationId, Precision>,
     /// Add near-capacity tile counts derived from graph tensor extents.
     pub shape_aware_active_tile_counts: bool,
     /// Per-operator catalogue breadth before local neighborhood evaluation.
@@ -191,6 +193,7 @@ impl PipelineConfig {
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
             operator_candidates: default_operator_candidates(tile_count),
+            gemm_precisions: BTreeMap::new(),
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
             exchange_stream_words: None,

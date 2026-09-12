@@ -2378,3 +2378,59 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         }
     }
 }
+
+#[test]
+fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [32, 64]).unwrap();
+    let w0 = graph.parameter("w0", [64, 64]).unwrap();
+    let w1 = graph.parameter("w1", [64, 64]).unwrap();
+    let x = graph.gemm(x, w0).unwrap();
+    let y = graph
+        .repeat(2, [x], [w1], [], |body, args| {
+            Ok(vec![body.gemm(args.carried[0], args.invariants[0])?])
+        })
+        .unwrap()[0];
+    graph.set_outputs([y]).unwrap();
+    let OperationKind::Repeat(repeat) = &graph.operations()[1].kind else {
+        unreachable!()
+    };
+    let fp8 = Precision::F8F143 { scale_exponent: 1 };
+    let mut config = PipelineConfig::new(8);
+    for input in graph.inputs() {
+        config.automatic_inputs.insert(
+            input.value,
+            if input.value == w1 {
+                fp8
+            } else {
+                Precision::F16
+            },
+        );
+    }
+    config.operator_candidates = vec![OperatorCandidate::parallel_gemm(8)];
+    config
+        .gemm_precisions
+        .insert(repeat.body.operations[0].id, fp8);
+    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let resolved = implementation::resolve(mid).unwrap();
+    fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
+        for op in ops {
+            match &op.kind {
+                MidOperationKind::Primitive(Primitive::Compute {
+                    kernel: TileKernelSpec::Gemm { multiply, .. },
+                    ..
+                }) => {
+                    assert!(op.inputs.iter().take(2).all(|id| {
+                        values[id.index() as usize].tensor_type.format.precision == *multiply
+                    }));
+                    found.insert(*multiply);
+                }
+                MidOperationKind::Repeat(repeat) => collect(&repeat.body.operations, values, found),
+                _ => {}
+            }
+        }
+    }
+    let mut found = BTreeSet::new();
+    collect(&resolved.operations, &resolved.values, &mut found);
+    assert_eq!(found, BTreeSet::from([Precision::F16, fp8]));
+}

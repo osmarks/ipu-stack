@@ -140,6 +140,22 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                         scalar_values(run, &validate_kernel_run(run).unwrap()).unwrap(),
                         vec![(-8i32) as u32]
                     );
+                    let mut rescaled = run.clone();
+                    let metadata = std::sync::Arc::make_mut(&mut rescaled.metadata);
+                    if let TileKernelSpec::Gemm { multiply, .. } = &mut metadata.kernel {
+                        *multiply = Precision::F8F143 { scale_exponent: 1 };
+                    }
+                    for input in &mut metadata.requirements.inputs {
+                        input.format.precision = Precision::F8F143 { scale_exponent: 1 };
+                    }
+                    assert_eq!(
+                        KernelSpecialization::from_run(run).unwrap(),
+                        KernelSpecialization::from_run(&rescaled).unwrap()
+                    );
+                    assert_eq!(
+                        scalar_values(&rescaled, &validate_kernel_run(&rescaled).unwrap()).unwrap(),
+                        vec![2]
+                    );
                 }
                 _ => {}
             }

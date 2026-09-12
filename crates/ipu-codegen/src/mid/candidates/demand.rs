@@ -96,15 +96,20 @@ impl OutputDemands {
                 continue;
             }
             if matches!(operation.kind, OperationKind::Gemm(_))
-                && config.operator_candidates.iter().any(|candidate| {
-                    matches!(
-                        candidate.operator(),
-                        MidOperator::Gemm {
-                            multiply: Precision::F8F143 { .. },
-                            ..
-                        }
-                    )
-                })
+                && config.gemm_precisions.get(&operation.id).map_or_else(
+                    || {
+                        config.operator_candidates.iter().any(|candidate| {
+                            matches!(
+                                candidate.operator(),
+                                MidOperator::Gemm {
+                                    multiply: Precision::F8F143 { .. },
+                                    ..
+                                }
+                            )
+                        })
+                    },
+                    |precision| matches!(precision, Precision::F8F143 { .. }),
+                )
             {
                 for (index, &input) in operation.inputs.iter().enumerate() {
                     requests.insert(

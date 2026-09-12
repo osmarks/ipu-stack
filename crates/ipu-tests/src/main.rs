@@ -57,6 +57,9 @@ struct Arguments {
     /// Load named logical tensors and independent expected outputs from a fixture manifest.
     #[arg(long, requires = "reference_run", conflicts_with_all = ["diagnostic_run", "save_reference_inputs", "profile_output"])]
     reference_fixture: Option<PathBuf>,
+    /// Fixed shared-operand scales produced by calibrate_siglip_fixture.py.
+    #[arg(long, requires = "reference_fixture", conflicts_with = "fp8_scale")]
+    reference_calibration: Option<PathBuf>,
     /// Save packed weights, input and validated output for resident inference replay.
     #[arg(long, requires = "reference_run")]
     save_reference_inputs: Option<PathBuf>,
@@ -1065,6 +1068,9 @@ fn main() -> Result<()> {
                 },
             );
         }
+    }
+    if let Some(path) = &arguments.reference_calibration {
+        reference_fixture::configure(&graph, &mut pipeline, path)?;
     }
     pipeline.memory_profile_directory = arguments.memory_profile_directory.clone();
     let package_config = PackageConfig {

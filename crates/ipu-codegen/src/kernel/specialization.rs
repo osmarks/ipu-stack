@@ -117,7 +117,11 @@ impl KernelSpecialization {
                 mode,
                 ..
             } => Self::Gemm(
-                *multiply,
+                // Scales are call arguments; they do not specialize machine code.
+                match multiply {
+                    Precision::F8F143 { .. } => Precision::F8F143 { scale_exponent: 0 },
+                    precision => *precision,
+                },
                 *weights,
                 *inner_block,
                 *output_columns,

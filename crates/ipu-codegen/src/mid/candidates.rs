@@ -479,9 +479,23 @@ pub(super) fn plans(
         .iter()
         .filter(|candidate| operator_matches(&operation.kind, candidate.operator()))
     {
+        let requested_precision = config.gemm_precisions.get(&operation.id).copied();
+        let operator = match (candidate.operator(), requested_precision) {
+            (MidOperator::Gemm { options, .. }, Some(multiply)) => MidOperator::Gemm {
+                options,
+                multiply,
+                accumulate: gemm_accumulation_precision(multiply),
+            },
+            (operator, _) => operator,
+        };
+        // Concrete storage requirements already fix precision. Shape-dependent
+        // GEMM families construct their requirements from the requested precision.
+        if matches!(candidate, OperatorCandidate::Concrete(_)) && operator != candidate.operator() {
+            continue;
+        }
         let mut variants = match candidate {
             OperatorCandidate::ParallelGemm { tile_count, .. } => parallel_reduction_candidates(
-                candidate.operator(),
+                operator,
                 *tile_count,
                 inputs,
                 output,
