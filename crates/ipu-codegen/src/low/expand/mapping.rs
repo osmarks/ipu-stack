@@ -84,7 +84,9 @@ pub(super) fn split_mapping_at_panel_boundaries(
     let aligned_ranges = |source: ShardExtent,
                           source_shard: ShardExtent,
                           destination: ShardExtent,
-                          destination_shard: ShardExtent|
+                          destination_shard: ShardExtent,
+                          source_panel: u32,
+                          destination_panel: u32|
      -> ExpansionResult<Vec<(ShardExtent, ShardExtent)>> {
         let logical_width = source.logical_end - source.start;
         if logical_width != destination.logical_end - destination.start {
@@ -107,8 +109,9 @@ pub(super) fn split_mapping_at_panel_boundaries(
                 .checked_sub(destination_shard.start)
                 .and_then(|start| start.checked_add(offset))
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            let source_remaining = AMP_COLUMN_MICRO - source_position % AMP_COLUMN_MICRO;
-            let destination_remaining = AMP_COLUMN_MICRO - destination_position % AMP_COLUMN_MICRO;
+            let source_remaining = source_panel - source_position % source_panel;
+            let destination_remaining =
+                destination_panel - destination_position % destination_panel;
             let length = (width - offset)
                 .min(source_remaining)
                 .min(destination_remaining);
@@ -151,17 +154,32 @@ pub(super) fn split_mapping_at_panel_boundaries(
         &mut destination,
     );
 
+    let source_panel = source_shard
+        .tensor_type
+        .format
+        .exchange_panel_shape()
+        .ok_or(ExpansionError::InvalidOperatorPlan)?;
+    let destination_panel = destination_shard
+        .tensor_type
+        .format
+        .exchange_panel_shape()
+        .ok_or(ExpansionError::InvalidOperatorPlan)?;
+
     let rows = aligned_ranges(
         source.extents[source_row_axis],
         source_shard.extents[source_row_axis],
         destination.extents[destination_row_axis],
         destination_shard.extents[destination_row_axis],
+        source_panel[0],
+        destination_panel[0],
     )?;
     let columns = aligned_ranges(
         source.extents[source_column_axis],
         source_shard.extents[source_column_axis],
         destination.extents[destination_column_axis],
         destination_shard.extents[destination_column_axis],
+        source_panel[1],
+        destination_panel[1],
     )?;
     let mut pieces = Vec::with_capacity(rows.len().saturating_mul(columns.len()));
     for (source_row, destination_row) in rows {
@@ -197,6 +215,12 @@ pub(super) fn extend_panel_row_padding(
     if source.extents.len() < 2 || destination.extents.len() < 2 {
         return;
     }
+    let (Some(source_panel), Some(destination_panel)) = (
+        source_shard.tensor_type.format.exchange_panel_shape(),
+        destination_shard.tensor_type.format.exchange_panel_shape(),
+    ) else {
+        return;
+    };
     let source_row_axis = source.extents.len() - 2;
     let destination_row_axis = destination.extents.len() - 2;
     // The global row tail can finish part-way through a micro-panel while
@@ -211,15 +235,15 @@ pub(super) fn extend_panel_row_padding(
         && destination_rows.logical_end
             == destination_shard.tensor_type.shape.0[destination_row_axis]
     {
-        let source_panel_tail = (AMP_COLUMN_MICRO
+        let source_panel_tail = (source_panel[0]
             - (source_rows.logical_end - source_shard.extents[source_row_axis].start)
-                % AMP_COLUMN_MICRO)
-            % AMP_COLUMN_MICRO;
-        let destination_panel_tail = (AMP_COLUMN_MICRO
+                % source_panel[0])
+            % source_panel[0];
+        let destination_panel_tail = (destination_panel[0]
             - (destination_rows.logical_end
                 - destination_shard.extents[destination_row_axis].start)
-                % AMP_COLUMN_MICRO)
-            % AMP_COLUMN_MICRO;
+                % destination_panel[0])
+            % destination_panel[0];
         let padding = source_panel_tail
             .min(destination_panel_tail)
             .min(source_shard.extents[source_row_axis].physical_end - source_rows.logical_end)

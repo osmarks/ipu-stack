@@ -1223,8 +1223,13 @@ fn randomized_gemm_grid_orders_align_operands_and_pair_shared_payloads() {
 fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
     let mut random = fastrand::Rng::with_seed(0x7061_6464_6564_5f72);
     for case in 0..CASES * 8 {
+        let (precision, micro) = if case % 2 == 0 {
+            (Precision::F16, 16)
+        } else {
+            (Precision::F8F143 { scale_exponent: -4 }, 32)
+        };
         let rows = random.u32(1..=AMP_INNER_BLOCK);
-        let panel_rows = rows.div_ceil(AMP_COLUMN_MICRO) * AMP_COLUMN_MICRO;
+        let panel_rows = rows.div_ceil(micro) * micro;
         let source_rows = if random.bool() {
             panel_rows
         } else {
@@ -1235,7 +1240,7 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             tile: 0,
             tensor_type: TensorType::new(
                 [rows, AMP_COLUMN_MICRO],
-                Precision::F16,
+                precision,
                 Layout {
                     order: ElementOrder::Amp(AmpOrder::TransposedLeft),
                     tiling: TensorTiling::replicated(1),
@@ -1263,7 +1268,7 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             tile: 1,
             tensor_type: TensorType::new(
                 [rows, AMP_COLUMN_MICRO],
-                Precision::F16,
+                precision,
                 Layout {
                     order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                         row_block: AMP_INNER_BLOCK as u16,
@@ -1339,7 +1344,7 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             .flat_map(|(_, view)| view_byte_spans(&destination, view).unwrap())
             .map(|span| span.bytes)
             .sum::<u32>();
-        assert_eq!(source_bytes, panel_rows * AMP_COLUMN_MICRO * 2);
+        assert_eq!(source_bytes, panel_rows * AMP_COLUMN_MICRO * precision.bytes() as u32);
         assert_eq!(destination_bytes, source_bytes, "case {case}, rows {rows}");
     }
 }
@@ -2246,4 +2251,109 @@ fn complete_panel_grid_stays_one_logical_exchange() {
         pairs(transfer.span_order(&state.shards)),
         pairs(CopyOrder::Semantic)
     );
+}
+
+#[test]
+fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
+    let mut state = TileGraphBuilder::new(&MidProgram {
+        tile_count: 3,
+        ..MidProgram::default()
+    })
+    .unwrap();
+    for tile in 0..3 {
+        let mut layout = Layout::row_sharded(1);
+        layout.order = if tile == 0 {
+            ElementOrder::Amp(crate::AmpOrder::TransposedLeft)
+        } else {
+            ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                row_block: 64,
+                column_block: 16,
+            })
+        };
+        state
+            .push_shard(BlockValue {
+                id: BlockValueId(0),
+                tile,
+                tensor_type: TensorType::new(
+                    [64, 16],
+                    Precision::F8F143 { scale_exponent: -4 },
+                    layout,
+                ),
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: 0,
+                        logical_end: 64,
+                        physical_end: 64,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: 0,
+                        logical_end: 16,
+                        physical_end: 16,
+                    },
+                ],
+                definition: ShardDefinition::Staging,
+            })
+            .unwrap();
+    }
+    let source = state.full_view(BlockValueId(0));
+    let target = state.full_view(BlockValueId(1));
+    let clipped_source = state.narrow_view(BlockValueId(0), &[(1, 0, 12)]).unwrap();
+    let clipped_target = state.narrow_view(BlockValueId(2), &[(1, 0, 12)]).unwrap();
+    let parts = super::mapping::split_mapping_at_panel_boundaries(
+        &state.shards[0],
+        clipped_source.clone(),
+        &state.shards[2],
+        clipped_target.clone(),
+    )
+    .unwrap();
+    assert_eq!(parts.len(), 2, "32x12 FP8 panels, not four 16x12 halves");
+    let mut actual = BTreeSet::new();
+    for (a, b) in &parts {
+        let a = view_byte_traversal(&state.shards[0], a, CopyOrder::Physical).unwrap();
+        let b = view_byte_traversal(&state.shards[2], b, CopyOrder::Physical).unwrap();
+        assert_eq!(a.spans().count(), 1);
+        actual.extend(
+            a.spans()
+                .flat_map(|s| s.offset..s.offset + s.bytes)
+                .zip(b.spans().flat_map(|s| s.offset..s.offset + s.bytes)),
+        );
+    }
+    let a = view_byte_traversal(&state.shards[0], &clipped_source, CopyOrder::Semantic).unwrap();
+    let b = view_byte_traversal(&state.shards[2], &clipped_target, CopyOrder::Semantic).unwrap();
+    let expected = a
+        .spans()
+        .flat_map(|s| s.offset..s.offset + s.bytes)
+        .zip(b.spans().flat_map(|s| s.offset..s.offset + s.bytes))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected);
+    let provenance = WorkProvenance {
+        operation: None,
+        value: None,
+        reason: WorkReason::LayoutRearrangement,
+    };
+    let mut batch = conversion::MaterializationBatch::default();
+    let mut body = BlockRegion::default();
+    state
+        .prepare_mapped_views(
+            vec![(source, target), (clipped_source, clipped_target)],
+            CopyOrder::Semantic,
+            CopyOrder::Semantic,
+            provenance,
+            &mut batch,
+            &mut body,
+        )
+        .unwrap();
+    state
+        .append_materialization(batch, provenance, &mut body)
+        .unwrap();
+    let regular = state
+        .phases
+        .iter()
+        .flat_map(|p| &p.transfers)
+        .filter(|t| t.destinations.iter().any(|d| d.shard == BlockValueId(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(regular.len(), 1);
+    assert_eq!(regular[0].order, CopyOrder::Panels);
 }

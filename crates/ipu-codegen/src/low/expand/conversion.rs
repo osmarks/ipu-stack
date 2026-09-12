@@ -223,21 +223,23 @@ impl TileGraphBuilder {
         batch: &mut MaterializationBatch,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        let physical = if copy_order == CopyOrder::Semantic {
-            self.micro_panel_mappings(mappings.clone())?
-        } else {
-            None
-        };
-        let (mappings, copy_order, exchange_order) = physical.map_or(
-            (mappings, copy_order, exchange_order),
-            |(mappings, order)| (mappings, order, order),
-        );
-        let transfers = batch.transfers.entry(exchange_order).or_default();
         let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
         for mapping in mappings {
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
-        for (destination_shard, mut mappings) in grouped {
+        for (destination_shard, mappings) in grouped {
+            // A clipped boundary on one destination must not expand complete
+            // panel grids on every other destination into tiny rectangles.
+            let physical = if copy_order == CopyOrder::Semantic {
+                self.micro_panel_mappings(mappings.clone())?
+            } else {
+                None
+            };
+            let (mut mappings, copy_order, exchange_order) = physical.map_or(
+                (mappings, copy_order, exchange_order),
+                |(mappings, order)| (mappings, order, order),
+            );
+            let transfers = batch.transfers.entry(exchange_order).or_default();
             let plan = self.copy_plan(&mappings, destination_shard, copy_order)?;
             self.append_copy_clears(tiles, destination_shard, &plan.clear_ranges, provenance)?;
             let staging = if let Some(staging) = &plan.staging {
