@@ -243,7 +243,8 @@ impl TileGraphBuilder {
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
-        for mapping in mappings {
+        for mut mapping in mappings {
+            self.resolve_read_view(&mut mapping.0)?;
             grouped.entry(mapping.1.shard).or_default().push(mapping);
         }
         for (destination_shard, mappings) in grouped {

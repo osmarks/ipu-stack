@@ -163,9 +163,29 @@ fn repeat_yield_can_alias(
     // A repeat reuses the carried allocation on its next iteration. A fresh
     // yield may overwrite it when every read of the previous iteration's
     // value has completed before the yielding operation begins.
-    !operations[definition..]
-        .iter()
-        .any(|operation| operation.inputs.contains(&carried))
+    let mut aliases = BTreeSet::from([carried]);
+    for (index, operation) in operations.iter().enumerate() {
+        if index >= definition && operation.read_values().any(|input| aliases.contains(input)) {
+            return false;
+        }
+        match &operation.kind {
+            MidOperationKind::Primitive(crate::Primitive::Copy {
+                reuse_local: true, ..
+            }) if operation.inputs.iter().any(|input| aliases.contains(input)) => {
+                // Internal copies may become local views during expansion.
+                aliases.extend(operation.results.iter().copied());
+            }
+            MidOperationKind::Primitive(crate::Primitive::Compute { output_aliases, .. }) => {
+                for &(output, input) in output_aliases {
+                    if aliases.contains(&operation.inputs[input]) {
+                        aliases.insert(operation.results[output]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (u32, u32) {
@@ -189,4 +209,48 @@ fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (
         }
     }
     (alignment, access_tail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CoordinateMapping, OperandWindow, Primitive};
+
+    #[test]
+    fn carried_storage_remains_live_through_reused_copy_inputs() {
+        let id = MidValueId::from_index;
+        let op = |input, output, kind| MidOperation {
+            source: None,
+            inputs: vec![id(input)],
+            results: vec![id(output)],
+            kind: MidOperationKind::Primitive(kind),
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        };
+        let gelu = || Primitive::Compute {
+            kernel: TileKernelSpec::Gelu,
+            operands: vec![OperandWindow::default()],
+            product: None,
+            output_aliases: vec![],
+        };
+        for reuse_local in [false, true] {
+            let operations = vec![
+                op(
+                    0,
+                    2,
+                    Primitive::Copy {
+                        mapping: CoordinateMapping::default(),
+                        reuse_local,
+                    },
+                ),
+                op(1, 3, gelu()),
+                op(2, 4, gelu()),
+            ];
+            assert_eq!(
+                repeat_yield_can_alias(id(3), id(0), &operations),
+                !reuse_local,
+                "the later reader needs the previous carried value unless its copy was materialized"
+            );
+        }
+    }
 }

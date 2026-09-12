@@ -29,6 +29,8 @@ impl TileGraphBuilder {
         };
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*output)?.to_vec();
+        // Whole-buffer bindings require canonical storage with its own strides.
+        let reuse_local = reuse_local && !self.required_storage.contains(output);
         let source_order = self.shards[inputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
@@ -150,9 +152,19 @@ impl TileGraphBuilder {
             {
                 let mut view = self.full_view(*source);
                 view.extents = extents.clone();
-                self.materialized_views.insert(output, view);
-                self.shards[output.index() as usize].definition = ShardDefinition::Unmaterialized;
-                continue;
+                if !self.exported_values.contains(&operation.results[0]) {
+                    self.borrowed_views.insert(output, view);
+                    self.shards[output.index() as usize].definition =
+                        ShardDefinition::Unmaterialized;
+                    continue;
+                }
+                // Host bindings export the canonical shard's complete storage,
+                // not a ShardView. Preserve its shape and address with an alias
+                // only when the reused allocation has exactly these bounds.
+                if view.extents == self.shards[view.shard.index() as usize].extents {
+                    self.alias_shard(output, view.shard);
+                    continue;
+                }
             }
             if intersections.is_empty() {
                 self.append_fill_zero(body, output, operation_provenance(operation))?;
@@ -162,7 +174,7 @@ impl TileGraphBuilder {
                 offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                 mappings.push((
                     ShardView {
-                        shard: self.full_view(source).shard,
+                        shard: source,
                         extents: source_extents,
                     },
                     ShardView {
@@ -238,7 +250,7 @@ impl TileGraphBuilder {
                             offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                             mappings.push((
                                 ShardView {
-                                    shard: self.full_view(source).shard,
+                                    shard: source,
                                     extents: source_extents,
                                 },
                                 ShardView {
@@ -285,7 +297,7 @@ impl TileGraphBuilder {
                     }
                     offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                     let source_view = ShardView {
-                        shard: self.full_view(source).shard,
+                        shard: source,
                         extents: source_extents,
                     };
                     let destination_view = ShardView {
@@ -307,6 +319,7 @@ impl TileGraphBuilder {
         mut mappings: Vec<(ShardView, ShardView)>,
     ) -> ExpansionResult<Option<(Vec<(ShardView, ShardView)>, CopyOrder)>> {
         for (source, destination) in &mut mappings {
+            self.resolve_read_view(source)?;
             extend_panel_row_padding(
                 &self.shards[source.shard.index() as usize],
                 source,

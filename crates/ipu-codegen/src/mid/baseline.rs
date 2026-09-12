@@ -238,7 +238,7 @@ impl<C: CostModel> Builder<'_, C> {
         let demands = OutputDemands::new(source, shapes, self.config);
         for (index, operation) in source.iter().enumerate() {
             if let OperationKind::Repeat(repeat) = &operation.kind {
-                self.repeat(operation, repeat, &mut operations)?;
+                self.repeat(operation, repeat, &uses, &mut operations)?;
                 continue;
             }
             let ids = operation
@@ -530,6 +530,7 @@ impl<C: CostModel> Builder<'_, C> {
         &mut self,
         operation: &Operation,
         repeat: &Repeat,
+        uses: &BTreeMap<ValueId, usize>,
         operations: &mut Vec<MidOperation>,
     ) -> LoweringResult<()> {
         let mut inputs = operation
@@ -537,10 +538,12 @@ impl<C: CostModel> Builder<'_, C> {
             .iter()
             .map(|id| lookup(&self.values, *id))
             .collect::<LoweringResult<Vec<_>>>()?;
-        // Repeat updates carried storage in place. A resident parameter can
-        // seed that state, but must not become its writable backing allocation.
-        for input in inputs.iter_mut().take(repeat.carried_inputs) {
-            if self.state.parameter_values.contains(input) {
+        // Repeat updates carried storage in place. Parameters and values used
+        // elsewhere can seed that state, but cannot donate their allocation.
+        for (index, input) in inputs.iter_mut().take(repeat.carried_inputs).enumerate() {
+            if self.state.parameter_values.contains(input)
+                || uses.get(&operation.inputs[index]) != Some(&1)
+            {
                 let source = self.state.get(*input).clone();
                 let result = self.state.value(source.origin, source.tensor_type);
                 self.state.values[result.index() as usize].tile_offset = source.tile_offset;
@@ -565,6 +568,7 @@ impl<C: CostModel> Builder<'_, C> {
                 self.graph.sequences()[id.index() as usize]
                     .values
                     .iter()
+                    .take(repeat.count as usize)
                     .map(|id| lookup(&self.values, *id))
                     .collect::<LoweringResult<Vec<_>>>()
             })

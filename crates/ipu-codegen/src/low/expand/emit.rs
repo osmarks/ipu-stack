@@ -7,9 +7,12 @@ impl TileGraphBuilder {
         &mut self,
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
-        inputs: Vec<KernelOperand>,
+        mut inputs: Vec<KernelOperand>,
         output: ShardView,
     ) -> ExpansionResult<KernelRun> {
+        for view in inputs.iter_mut().flat_map(|operand| &mut operand.views) {
+            self.resolve_read_view(view)?;
+        }
         // Intern the contract before allocating its formats/requirements. Operand
         // views vary by tile; the kernel and storage contracts usually do not.
         let format = |operand: &KernelOperand| -> ExpansionResult<&TensorFormat> {

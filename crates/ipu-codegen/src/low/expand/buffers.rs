@@ -42,13 +42,42 @@ impl TileGraphBuilder {
     }
 
     pub(super) fn full_view(&self, shard: BlockValueId) -> ShardView {
-        if let Some(view) = self.materialized_views.get(&shard) {
+        if let Some(view) = self.borrowed_views.get(&shard) {
             return view.clone();
         }
         ShardView {
             shard,
             extents: self.shards[shard.index() as usize].extents.clone(),
         }
+    }
+
+    /// Resolve a logical read before inspecting its physical storage. Borrowed
+    /// copies preserve coordinates, but their backing allocation can have a
+    /// larger extent (and therefore a different row or panel stride).
+    pub(super) fn resolve_read_view(&self, view: &mut ShardView) -> ExpansionResult<()> {
+        if let Some(source) = self.borrowed_views.get(&view.shard) {
+            if view.extents.len() != source.extents.len()
+                || view
+                    .extents
+                    .iter()
+                    .zip(&source.extents)
+                    .any(|(read, source)| {
+                        read.axis != source.axis
+                            || read.start < source.start
+                            || read.logical_end > source.logical_end
+                            || read.physical_end > source.physical_end
+                    })
+            {
+                return Err(ExpansionError::InvalidOperatorPlan);
+            }
+            view.shard = source.shard;
+        }
+        if self.shards[self.storage_root(view.shard).index() as usize].definition
+            == ShardDefinition::Unmaterialized
+        {
+            return Err(ExpansionError::InvalidOperatorPlan);
+        }
+        Ok(())
     }
 
     pub(super) fn narrow_view(

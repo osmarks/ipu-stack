@@ -163,7 +163,12 @@ pub(super) fn operation_graph_inputs(operation: &Operation, graph: &ComputeGraph
     let mut inputs = operation.inputs.clone();
     if let OperationKind::Repeat(repeat) = &operation.kind {
         for sequence in &repeat.iterated_inputs {
-            inputs.extend(&graph.sequences()[sequence.index() as usize].values);
+            inputs.extend(
+                graph.sequences()[sequence.index() as usize]
+                    .values
+                    .iter()
+                    .take(repeat.count as usize),
+            );
         }
     }
     inputs

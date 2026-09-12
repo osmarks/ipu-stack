@@ -246,7 +246,7 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
     placeholder.definition = ShardDefinition::Unmaterialized;
     let reused = builder.push_shard(placeholder).unwrap();
     builder
-        .materialized_views
+        .borrowed_views
         .insert(reused, builder.full_view(source));
     let view = crate::AxisFactorView::new(2, 0, 2);
     let mut destination = builder.shards[0].clone();
@@ -260,7 +260,53 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
         .window_view_mappings(&[reused], &[output], view, &[])
         .unwrap();
     assert_eq!(mappings.len(), 2);
-    assert!(mappings.iter().all(|(input, _)| input.shard == source));
+    // Logical mapping retains the canonical identity; the shared physical
+    // planning boundary resolves it before deriving byte strides and copies.
+    assert!(mappings.iter().all(|(input, _)| input.shard == reused));
+    let provenance = WorkProvenance {
+        operation: None,
+        value: None,
+        reason: WorkReason::LayoutRearrangement,
+    };
+    let mut region = BlockRegion::default();
+    builder
+        .build_mapped_views(
+            mappings,
+            CopyOrder::Semantic,
+            CopyOrder::Semantic,
+            provenance,
+            &mut region,
+        )
+        .unwrap();
+    assert!(!builder.local_copies.is_empty());
+    assert!(
+        builder
+            .local_copies
+            .iter()
+            .all(|copy| copy.source == source)
+    );
+
+    let logical = ShardView {
+        shard: reused,
+        extents: builder.shards[reused.index() as usize].extents.clone(),
+    };
+    let run = builder
+        .kernel_run(
+            provenance,
+            TileKernelSpec::Gelu,
+            vec![KernelOperand {
+                views: vec![logical.clone()],
+            }],
+            builder.full_view(source),
+        )
+        .unwrap();
+    assert_eq!(run.inputs[0].views[0], builder.full_view(source));
+    let mut already_resolved = run.inputs[0].views[0].clone();
+    builder.resolve_read_view(&mut already_resolved).unwrap();
+    assert_eq!(already_resolved, run.inputs[0].views[0]);
+    let mut outside = logical;
+    outside.extents[2].physical_end += 1;
+    assert!(builder.resolve_read_view(&mut outside).is_err());
 }
 
 fn format(tiles: u16) -> TensorFormat {
@@ -1797,7 +1843,8 @@ fn randomized_repeats_remain_structured_per_tile() {
         let width = u32::from(tiles) * random.u32(1..=8);
         let mut graph = ComputeGraph::new();
         let carried = graph.host_input("carried", [width, 16]).unwrap();
-        let parameters = (0..count)
+        // A sequence may contain more values than this invocation consumes.
+        let parameters = (0..count + random.u32(0..=3))
             .map(|index| graph.parameter(format!("parameter.{index}"), [width, 16]))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -1973,6 +2020,183 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
             );
         }
     }
+}
+
+#[test]
+fn repeat_copy_yield_reaches_the_carried_allocation() {
+    use crate::{CoordinateMapping, MidInput, MidRegion, MidValue, OperandWindow, Primitive};
+    let id = MidValueId::from_index;
+    let tensor_type = TensorType::new([8, 16], Precision::F16, Layout::row_sharded(1));
+    let operation = |inputs: &[u32], result, kind| MidOperation {
+        source: None,
+        inputs: inputs.iter().copied().map(id).collect(),
+        results: vec![id(result)],
+        kind,
+        estimated_cycles: 0,
+        estimated_exchange_cycles: 0,
+    };
+    let mid = MidProgram {
+        tile_count: 1,
+        values: (0..5)
+            .map(|index| MidValue {
+                id: id(index),
+                tile_offset: 0,
+                origin: crate::ValueId::from_index(index),
+                storage_group: id(index),
+                tensor_type: tensor_type.clone(),
+            })
+            .collect(),
+        inputs: vec![MidInput {
+            name: "input".into(),
+            kind: crate::GraphInputKind::Host,
+            value: id(0),
+        }],
+        outputs: vec![id(4)],
+        operations: vec![operation(
+            &[0],
+            4,
+            MidOperationKind::Repeat(MidRepeat {
+                count: 2,
+                carried_inputs: 1,
+                invariant_inputs: 0,
+                iterated_inputs: vec![],
+                body: MidRegion {
+                    arguments: vec![id(1)],
+                    yields: vec![id(3)],
+                    operations: vec![
+                        operation(
+                            &[1],
+                            2,
+                            MidOperationKind::Primitive(Primitive::Compute {
+                                kernel: TileKernelSpec::Gelu,
+                                operands: vec![OperandWindow::default()],
+                                product: None,
+                                output_aliases: vec![],
+                            }),
+                        ),
+                        operation(
+                            &[2],
+                            3,
+                            MidOperationKind::Primitive(Primitive::Copy {
+                                mapping: CoordinateMapping::default(),
+                                reuse_local: true,
+                            }),
+                        ),
+                    ],
+                    estimated_cycles: 0,
+                    peak_memory: Default::default(),
+                },
+            }),
+        )],
+        ..MidProgram::default()
+    };
+    let low = lower_to_tiles(&mid, false).unwrap();
+    let placement = crate::place(&low).unwrap();
+    let repeat = &low.repeat_runs[0];
+    let target = placement.shard_addresses[&repeat.carried[0].result];
+    assert!(
+        low.work(&repeat.body).any(|work| match work {
+            TileWorkRef::Kernel(run) => placement.shard_addresses[&run.output.shard] == target,
+            TileWorkRef::LocalCopy(copy) => placement.shard_addresses[&copy.destination] == target,
+            _ => false,
+        }),
+        "the body must write the allocation carried into its next iteration"
+    );
+}
+
+#[test]
+fn repeat_preserves_shared_initial_values() {
+    for case in 0..6 {
+        let mut graph = ComputeGraph::new();
+        let input = if case == 5 {
+            graph.parameter("input", [8, 16]).unwrap()
+        } else {
+            graph.host_input("input", [8, 16]).unwrap()
+        };
+        let carried = if case == 2 {
+            vec![input; 2]
+        } else {
+            vec![input]
+        };
+        let invariants = if case == 3 { vec![input] } else { vec![] };
+        let results = graph
+            .repeat(2, carried, invariants, [], |body, args| {
+                args.carried
+                    .iter()
+                    .map(|&x| match args.invariants.first() {
+                        Some(&bias) => body.add(x, bias),
+                        None => body.gelu(x),
+                    })
+                    .collect()
+            })
+            .unwrap();
+        let mut outputs = results.clone();
+        if case == 0 {
+            outputs.push(input);
+        } else if case == 1 {
+            outputs.push(graph.add(input, results[0]).unwrap());
+        }
+        graph.set_outputs(outputs).unwrap();
+        let config = PipelineConfig::new(1).with_input(input, format(1));
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let low = lower_to_tiles(&mid, false).unwrap();
+        let placement = crate::place(&low).unwrap();
+        let initial = placement.shard_addresses[&low.inputs[0].shards[0]];
+        let repeat = &low.repeat_runs[0];
+        for binding in &repeat.carried {
+            let result = placement.shard_addresses[&binding.result];
+            if case == 4 {
+                assert_eq!(initial, result, "an unshared host input can be donated");
+            } else {
+                assert_ne!(
+                    initial, result,
+                    "case {case}: Repeat overwrites shared input"
+                );
+            }
+        }
+        if case == 2 {
+            assert_ne!(
+                placement.shard_addresses[&repeat.carried[0].result],
+                placement.shard_addresses[&repeat.carried[1].result],
+                "two carried states must evolve independently"
+            );
+        }
+    }
+}
+
+#[test]
+fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
+    let mut graph = ComputeGraph::new();
+    let a = graph.host_input("a", [8, 16]).unwrap();
+    let b = graph.host_input("b", [8, 16]).unwrap();
+    let output = graph
+        .repeat(2, [a, b], [], [], |body, args| {
+            let t = body.gelu(args.carried[0])?;
+            let y = body.gelu(args.carried[1])?;
+            let z = body.gelu(t)?;
+            Ok(vec![y, z])
+        })
+        .unwrap();
+    graph.set_outputs(output).unwrap();
+    let tensor_format = format(1);
+    let mut candidate = ConcreteOperatorCandidate::new(
+        MidOperator::Gelu,
+        [OperandRequirement::new(tensor_format.clone())],
+        OperandRequirement::new(tensor_format.clone()),
+    );
+    candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
+    let mut config = PipelineConfig::new(1)
+        .with_input(a, tensor_format.clone())
+        .with_input(b, tensor_format);
+    config.operator_candidates = vec![OperatorCandidate::Concrete(candidate)];
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    // y cannot overwrite a: t still lives there and is read by z afterwards.
+    // Such cross-coupled state updates need a separate copy-back plan, which
+    // this in-place Repeat representation does not support.
+    assert_eq!(
+        lower_to_tiles(&mid, false),
+        Err(ExpansionError::RepeatRequiresInPlace(0))
+    );
 }
 
 fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhaseId) -> bool {

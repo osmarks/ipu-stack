@@ -28,7 +28,8 @@ impl TileGraphBuilder {
         if source_view.extents == output_extents {
             return Some(source_view);
         }
-        let source = source_view.shard;
+        // Broadcasting follows the value's shape, even when it borrows a
+        // singleton slice of a larger backing allocation.
         let source_shard = &self.shards[source.index() as usize];
         let output_shard = &self.shards[output.index() as usize];
         let source_rank = source_shard.extents.len();
@@ -58,7 +59,7 @@ impl TileGraphBuilder {
             }
         }
         Some(ShardView {
-            shard: source,
+            shard: source_view.shard,
             extents,
         })
     }

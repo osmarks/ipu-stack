@@ -192,11 +192,13 @@ struct TileGraphBuilder {
     storage_groups: Vec<MidValueId>,
     shards: Vec<BlockValue>,
     canonical: Vec<Vec<BlockValueId>>,
+    exported_values: BTreeSet<MidValueId>,
+    required_storage: BTreeSet<MidValueId>,
     phases: Vec<ExchangePhase>,
     kernel_runs: Vec<KernelRun>,
     local_copies: Vec<LocalCopy>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
-    materialized_views: BTreeMap<BlockValueId, ShardView>,
+    borrowed_views: BTreeMap<BlockValueId, ShardView>,
 }
 
 impl TileGraphBuilder {
@@ -212,11 +214,13 @@ impl TileGraphBuilder {
                 .collect(),
             shards: Vec::new(),
             canonical: vec![Vec::new(); graph.values.len()],
+            exported_values: graph.outputs.iter().copied().collect(),
+            required_storage: BTreeSet::new(),
             phases: Vec::new(),
             kernel_runs: Vec::new(),
             local_copies: Vec::new(),
             kernel_metadata: Vec::new(),
-            materialized_views: BTreeMap::new(),
+            borrowed_views: BTreeMap::new(),
         };
         let mut used = graph
             .inputs
@@ -224,14 +228,36 @@ impl TileGraphBuilder {
             .map(|input| input.value)
             .chain(graph.outputs.iter().copied())
             .collect::<BTreeSet<_>>();
-        fn uses(operations: &[MidOperation], used: &mut BTreeSet<MidValueId>) {
+        fn uses(
+            operations: &[MidOperation],
+            used: &mut BTreeSet<MidValueId>,
+            bindings: &mut BTreeSet<MidValueId>,
+        ) {
             for operation in operations {
-                used.extend(operation.inputs.iter().chain(&operation.results).copied());
+                used.extend(operation.read_values().chain(&operation.results).copied());
                 for deferred in operation.deferred_inputs().iter().flatten() {
                     used.extend([deferred.source, deferred.producer]);
                 }
+                // These ABIs bind or reshape an entire canonical allocation;
+                // a borrowed view with different backing strides is insufficient.
+                match &operation.kind {
+                    MidOperationKind::Primitive(crate::Primitive::Compute {
+                        output_aliases,
+                        ..
+                    }) => {
+                        bindings.extend(
+                            output_aliases
+                                .iter()
+                                .filter_map(|&(_, input)| operation.inputs.get(input))
+                                .copied(),
+                        );
+                    }
+                    MidOperationKind::Primitive(crate::Primitive::Sum { .. }) => {
+                        bindings.extend(operation.inputs.iter().copied());
+                    }
+                    _ => {}
+                }
                 if let MidOperationKind::Repeat(repeat) = &operation.kind {
-                    used.extend(repeat.iterated_inputs.iter().flatten().copied());
                     used.extend(
                         repeat
                             .body
@@ -240,11 +266,19 @@ impl TileGraphBuilder {
                             .chain(&repeat.body.yields)
                             .copied(),
                     );
-                    uses(&repeat.body.operations, used);
+                    bindings.extend(
+                        operation
+                            .read_values()
+                            .chain(&operation.results)
+                            .chain(&repeat.body.arguments)
+                            .chain(&repeat.body.yields)
+                            .copied(),
+                    );
+                    uses(&repeat.body.operations, used, bindings);
                 }
             }
         }
-        uses(&graph.operations, &mut used);
+        uses(&graph.operations, &mut used, &mut state.required_storage);
         for value in &graph.values {
             if !used.contains(&value.id) {
                 continue;
@@ -488,3 +522,7 @@ fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/output_bindings.rs"]
+mod output_binding_tests;
