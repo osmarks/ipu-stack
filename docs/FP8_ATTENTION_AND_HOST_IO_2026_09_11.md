@@ -192,3 +192,17 @@ of that counter instrumentation remains in the code.
 
 Implementation commits: `82d0a84` (FP8 product experiments) and `68ddd71`
 (resident loop fixture and host output completion).
+
+## Matched execution and memory profiles for the blog
+
+`artifacts/blog-profile-20260912/full27/model.html` and `memory.html` are a
+paired execution timeline and exact per-tile allocation map. The executable
+rebuilt with memory diagnostics is byte-identical to the original profiled
+`artifacts/attention-residual-20260911/full27/model.ipuexe` (SHA-256
+`62fb94a8754c5e03bc1f90696f44c78eb8396f30b55e739df037be504cf74069`).
+The fresh capture measures 12,836,412 cropped cycles / 8.557608 ms, six cycles
+longer than the original capture. All three resident checks pass at cosine
+0.994102280. The allocation map includes profiling reservations; it describes
+the profiled executable, not the unprofiled host-loop package. Both HTML files
+are standalone. The artifact directory includes the raw profile, memory JSON,
+a checked Chromium screenshot and reproduction instructions in `README.md`.
