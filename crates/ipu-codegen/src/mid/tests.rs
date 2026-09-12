@@ -197,16 +197,17 @@ fn fp8_mlp_can_quantize_before_replication() {
     let mid = baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe)
         .unwrap()
         .program;
-    assert!(
-        mid.operations
+    // Casts may now be fused with the producer. Check the typed data flow,
+    // rather than requiring a standalone conversion operation to survive.
+    assert!(mid.operations.iter().any(|op| {
+        op.inputs
             .iter()
-            .filter_map(|op| op.conversion_plan())
-            .any(|plan| {
-                plan.input.format.precision == Precision::F16
-                    && plan.output.format.precision == fp8
-                    && plan.output.format.layout.tiling.replicas == 1
+            .any(|id| value(&mid, *id).tensor_type.format.precision == Precision::F16)
+            && op.results.iter().any(|id| {
+                let output = &value(&mid, *id).tensor_type;
+                output.format.precision == fp8 && output.format.layout.tiling.replicas == 1
             })
-    );
+    }));
 }
 
 #[test]
@@ -1506,6 +1507,49 @@ fn uneven_mlp_products_preserve_global_coordinates() {
             "right/output columns {run:?}"
         );
     }
+}
+
+#[test]
+fn blocked_attention_reserves_online_state_between_accumulator_rows() {
+    let mut graph = ComputeGraph::new();
+    let q = graph.host_input("q", [2, 13, 64]).unwrap();
+    let k = graph.host_input("k", [2, 129, 64]).unwrap();
+    let v = graph.host_input("v", [2, 129, 64]).unwrap();
+    let output = graph.flash_attention(q, k, v).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let config = PipelineConfig::new(16)
+        .with_attention_strategy(AttentionStrategy::Flash)
+        .with_automatic_input(q, Precision::F16)
+        .with_automatic_input(k, Precision::F16)
+        .with_automatic_input(v, Precision::F16);
+    let mid = baseline::lower(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &baseline::Recipe::default(),
+    )
+    .unwrap()
+    .program;
+    let low = crate::expand_tiles(&mid).unwrap();
+    let mut intermediate = 0;
+    for run in &low.kernel_runs {
+        if let TileKernelSpec::AttentionMerge {
+            value_dimension,
+            final_block: false,
+            ..
+        } = run.kernel
+        {
+            let columns = run.output.extents.last().unwrap();
+            assert!(columns.logical_end - columns.start >= value_dimension + 2);
+            assert!(columns.physical_end - columns.start >= 80);
+            intermediate += 1;
+        }
+    }
+    assert!(intermediate > 0);
+    assert_eq!(
+        value(&mid, mid.outputs[0]).tensor_type.shape,
+        TensorShape::new([2, 13, 64])
+    );
 }
 
 #[test]

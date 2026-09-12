@@ -24,6 +24,7 @@
 	.allow_optimizations
 
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
+	.set ATTENTION_ACCUMULATOR_STRIDE, ((ATTENTION_VALUE_DIMENSION + 2 + 15) / 16) * 16
 	.set ATTENTION_VALUE_FULL_PANELS, ATTENTION_VALUE_DIMENSION / 16
 	.set ATTENTION_VALUE_TAIL_PAIRS, (ATTENTION_VALUE_DIMENSION % 16 + 1) / 2
 
@@ -113,11 +114,12 @@
 	mul $m8, $m9, $m8
 	add $m0, $m0, $m8
 	ld32 $m3, $mvertex_base, $m15, 6
-	shl $m8, $m8, 1
+	setzi $m8, ATTENTION_ACCUMULATOR_STRIDE * 4
+	mul $m8, $m9, $m8
 	add $m3, $m3, $m8
 	add $m8, $m3, ATTENTION_VALUE_DIMENSION * 4
 #else
-	setzi $m8, ATTENTION_PADDED_VALUE_DIMENSION * 4
+	setzi $m8, ATTENTION_ACCUMULATOR_STRIDE * 4
 	mul $m8, $m9, $m8
 	add $m0, $m0, $m8
 	// Address of the persistent online-softmax scalars.

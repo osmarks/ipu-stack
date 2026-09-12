@@ -22,6 +22,9 @@ impl Builder {
         let final_output = output;
         let mut accumulator = output.clone();
         accumulator.format.precision = Precision::F32;
+        // Online merging stores the running maximum and denominator after
+        // each value row. These are real storage, not disposable AMP padding.
+        accumulator.shape.0[2] += 2;
         let output = &accumulator;
         let product = |inner_block, output_columns| TileKernelSpec::Gemm {
             multiply: Precision::F16,
@@ -69,7 +72,7 @@ impl Builder {
         };
         let pv_axes = ProductAxes {
             valid_inner: None,
-            valid_columns: Some(output.shape.0[2]),
+            valid_columns: Some(final_output.shape.0[2]),
             left_inner: TensorAxis::FromEnd(1),
             right_inner: TensorAxis::FromEnd(2),
             output_column: TensorAxis::FromEnd(1),
@@ -228,7 +231,7 @@ impl Builder {
                     output.clone()
                 },
                 TileKernelSpec::AttentionMerge {
-                    value_dimension: output.shape.0[2],
+                    value_dimension: final_output.shape.0[2],
                     padded_value_dimension: value_width,
                     key_block_columns: key_block,
                     initial: start == 0,
@@ -239,7 +242,8 @@ impl Builder {
                 vec![],
             ));
         }
-        Some(self.cast(result?, final_output.format.precision))
+        let result = self.cast(result?, final_output.format.precision);
+        Some(self.copy(result, final_output.clone(), vec![]))
     }
 
     /// Pack once on a small distributed owner grid, then broadcast native
