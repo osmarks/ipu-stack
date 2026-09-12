@@ -155,6 +155,30 @@ pub(super) fn compose(
 mod tests {
     use super::*;
 
+    #[test]
+    fn linear_identity_copies_do_not_pay_for_an_exchange() {
+        let (operations, mut values) = chain();
+        for value in &mut values {
+            value.tensor_type.format.layout = Layout::logical_linear(3, 4);
+        }
+        let (price, _, _) = crate::estimate::operation_cost(&operations[0], &values).unwrap();
+        assert_eq!(price.exchange, 0);
+        assert!(super::super::rewrite::same_storage(&values[0], &values[1]));
+
+        values[1].tensor_type.shape.0[0] += 1;
+        assert!(!super::super::rewrite::same_storage(&values[0], &values[1]));
+        values[1].tensor_type = values[0].tensor_type.clone();
+        values[1].tile_offset = 1;
+        assert!(!super::super::rewrite::same_storage(&values[0], &values[1]));
+
+        for value in &mut values {
+            value.tile_offset = 0;
+            value.tensor_type.format.layout = Layout::row_sharded(1);
+        }
+        values[1].tensor_type.format.layout.tiling.axes[0].shard_padding_multiple = 8;
+        assert!(!super::super::rewrite::same_storage(&values[0], &values[1]));
+    }
+
     fn coordinate(
         mapping: &CoordinateMapping,
         source: &TensorShape,

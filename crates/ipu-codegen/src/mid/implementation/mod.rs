@@ -469,10 +469,12 @@ pub(crate) fn same_distribution(a: &TensorType, b: &TensorType) -> bool {
             .resolve(&a.shape)
             .ok()
             .zip(b.format.layout.resolve(&b.shape).ok())
-            .is_some_and(|(a, b)| {
-                a.padded_shape == b.padded_shape
-                    && a.axes().zip(b.axes()).is_some_and(|(a, b)| {
-                        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.same_partitioning(b))
-                    })
+            .is_some_and(|(left, right)| {
+                left.padded_shape == right.padded_shape
+                    && (a.format.layout.tiling == b.format.layout.tiling
+                        || left.axes().zip(right.axes()).is_some_and(|(a, b)| {
+                            a.len() == b.len()
+                                && a.iter().zip(b).all(|(a, b)| a.same_partitioning(b))
+                        }))
             })
 }
