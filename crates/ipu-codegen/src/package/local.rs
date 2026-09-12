@@ -11,7 +11,7 @@ pub(super) fn optimize<T: Send>(
     tile_mapping: Option<&[u16]>,
     finalize: impl Fn(&mut ScheduledPlan) -> PackageBuildResult<(u64, T)> + Sync,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
-    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, config.tile_count);
+    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
     let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
     let mut schedules =
         crate::ExchangeScheduleCache::with_stream_words(config.exchange_stream_words);
@@ -370,6 +370,20 @@ mod tests {
             .with_automatic_input(up, Precision::F16)
             .with_automatic_input(down, Precision::F16);
         (graph, config)
+    }
+
+    #[test]
+    fn memoization_does_not_change_baseline_selection() {
+        let (graph, mut config) = mlp();
+        let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
+        for capacity in [false, true] {
+            config.capacity_baseline = capacity;
+            let recipe = Recipe::default();
+            let direct = baseline::lower(&graph, &config, &Ipu21CostModel, &recipe).unwrap();
+            let memoized = baseline::lower(&graph, &config, &costs, &recipe).unwrap();
+            assert_eq!(direct.program, memoized.program);
+            assert!(direct.recipe == memoized.recipe);
+        }
     }
 
     #[test]

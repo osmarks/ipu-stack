@@ -792,7 +792,7 @@ mod tests {
                 })
                 .unwrap()[0];
             graph.set_outputs([output]).unwrap();
-            let costs = MemoizedCostModel::new(&Ipu21CostModel, config.tile_count);
+            let costs = MemoizedCostModel::new(&Ipu21CostModel);
             let baseline = lower(&graph, &config, &costs, &Recipe::default()).unwrap();
             let repeat = baseline
                 .program

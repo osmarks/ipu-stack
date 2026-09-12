@@ -117,14 +117,11 @@ pub(super) struct PlanMetrics {
 
 impl PlanMetrics {
     pub(super) fn dominates(self, other: Self) -> bool {
+        let memory = self.memory.objectives();
+        let other_memory = other.memory.objectives();
         let no_worse = self.cycles <= other.cycles
-            && self
-                .memory
-                .objectives()
-                .into_iter()
-                .zip(other.memory.objectives())
-                .all(|(a, b)| a <= b);
-        no_worse && self != other
+            && memory.into_iter().zip(other_memory).all(|(a, b)| a <= b);
+        no_worse && (self.cycles < other.cycles || memory != other_memory)
     }
 }
 

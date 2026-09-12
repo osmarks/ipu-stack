@@ -3,6 +3,28 @@ use super::*;
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn saturated_objectives_do_not_mutually_dominate() {
+    let first = PlanMetrics {
+        cycles: 100,
+        memory: MemoryPeaks {
+            standard: u64::MAX,
+            total: u64::MAX,
+            exchange_rows: 16,
+            ..MemoryPeaks::default()
+        },
+    };
+    let mut second = first;
+    second.memory.standard -= 8;
+    second.memory.total -= 8;
+    assert_eq!(first.memory.objectives(), second.memory.objectives());
+    assert!(!first.dominates(second));
+    assert!(!second.dominates(first));
+    second.cycles -= 1;
+    assert!(second.dominates(first));
+    assert!(!first.dominates(second));
+}
+
+#[test]
 fn short_layernorm_selects_feature_shards_and_fp32_moments() {
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [2, 1, 1152]).unwrap();
@@ -1634,7 +1656,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
             }
         }
     }
-    let costs = MemoizedCostModel::new(&Ipu21CostModel, 1472);
+    let costs = MemoizedCostModel::new(&Ipu21CostModel);
     for (operation, inner, columns, grid) in
         [(0, 1152, 4304, (4, 92, 4)), (2, 4304, 1152, (4, 24, 15))]
     {

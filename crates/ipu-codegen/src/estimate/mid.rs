@@ -238,7 +238,14 @@ fn analyze_storage<const PER_TILE: bool>(
             last[roots[value.index() as usize]] = index;
         }
         if let MidOperationKind::Repeat(repeat) = &operation.kind {
-            for value in repeat.iterated_inputs.iter().flatten() {
+            // Yields are read at the backedge, after all body work, even when
+            // their producing operation had no later consumer inside the body.
+            for value in repeat
+                .iterated_inputs
+                .iter()
+                .flatten()
+                .chain(&repeat.body.yields)
+            {
                 last[roots[value.index() as usize]] = index;
             }
         }
@@ -266,12 +273,24 @@ fn analyze_storage<const PER_TILE: bool>(
     let mut cycles = ProgramCycles::default();
     let mut peak = MemoryPeaks::default();
     let mut rows = 0u64;
-    let mut accounted = vec![false; live.len()];
+    let mut accounted = live.clone();
     let mut tile_live = vec![MemoryUsage::default(); tiles];
     let maximum_sizes = bytes
         .iter()
         .map(|sizes| sizes.iter().copied().max().unwrap_or(0))
         .collect::<Vec<_>>();
+    let mut initial_standard = 0;
+    for id in (0..live.len()).filter(|&id| live[id]) {
+        for (usage, &size) in tile_live.iter_mut().zip(&bytes[id]) {
+            usage.add_class(classes[id], size);
+        }
+        if classes[id] == MemoryClass::Ipu21Standard {
+            initial_standard = initial_standard.max(maximum_sizes[id]);
+        }
+    }
+    for &usage in &tile_live {
+        peak.observe(usage, initial_standard);
+    }
 
     for (index, (operation, count)) in steps.into_iter().enumerate() {
         for value in operation.inputs.iter().chain(&operation.results) {

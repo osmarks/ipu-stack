@@ -89,7 +89,6 @@ impl ExchangeFootprint {
 
 pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
-    spatial_capacity: u16,
     rearrangements: Mutex<RearrangementCache>,
     implementations:
         Mutex<HashMap<(OperatorPlan, Vec<TensorType>, TensorType), Arc<crate::MidProgram>>>,
@@ -99,10 +98,9 @@ type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Lay
 type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
-    pub(crate) fn new(inner: &'a C, spatial_capacity: u16) -> Self {
+    pub(crate) fn new(inner: &'a C) -> Self {
         Self {
             inner,
-            spatial_capacity,
             rearrangements: Mutex::new(HashMap::default()),
             implementations: Mutex::new(HashMap::default()),
         }
@@ -163,18 +161,8 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
             .or_default()
             .clone();
         *cached.get_or_init(|| {
-            let mut cost = self
-                .inner
-                .rearrangement_cost(shape, precision, strategy, from, to);
-            let active_tiles = from.tiling.tile_count.max(to.tiling.tile_count);
-            // The inner model reports occupied work. Reduced-grid conversions
-            // leave spatial issue slots idle, so convert that work into a phase
-            // horizon using the occupancy of this particular planning target.
-            cost.cycles = cost
-                .cycles
-                .saturating_mul(u64::from(self.spatial_capacity))
-                .div_ceil(u64::from(active_tiles));
-            cost
+            self.inner
+                .rearrangement_cost(shape, precision, strategy, from, to)
         })
     }
 }
@@ -396,6 +384,73 @@ mod tests {
     };
 
     const CASES: usize = 32;
+
+    #[test]
+    fn memoized_rearrangements_preserve_critical_path_costs() {
+        let costs = MemoizedCostModel::new(&Ipu21CostModel);
+        // The underlying model already charges the longest local copy, so
+        // fewer owners increase latency without a second occupancy multiplier.
+        for (shape, owners, cycles) in [
+            ([64, 128], 1, 2336),
+            ([64, 128], 8, 544),
+            ([64, 128], 64, 320),
+            ([729, 1152], 96, 2592),
+            ([729, 1152], 729, 576),
+            ([729, 1152], 1472, 576),
+        ] {
+            let source = Layout::row_sharded(owners);
+            let mut target = source.clone();
+            target.memory_class = crate::MemoryClass::Ipu21Interleaved;
+            assert_eq!(
+                costs.rearrangement_cost(
+                    &TensorShape::new(shape),
+                    Precision::F16,
+                    ConversionStrategy::DirectRetile,
+                    &source,
+                    &target,
+                ),
+                RearrangementCost {
+                    cycles,
+                    exchange_cycles: 0
+                },
+            );
+        }
+        let shape = TensorShape::new([64, 128]);
+        for source_tiles in [1, 2, 8, 64] {
+            for target_tiles in [1, 4, 32, 64] {
+                let source = Layout::row_sharded(source_tiles);
+                let target = Layout::row_major(crate::TensorTiling::sharded(
+                    crate::TensorAxis::FromEnd(1),
+                    target_tiles,
+                ));
+                for strategy in [
+                    ConversionStrategy::DirectRetile,
+                    ConversionStrategy::StageLogicalThenTransform,
+                ] {
+                    let expected = Ipu21CostModel.rearrangement_cost(
+                        &shape,
+                        Precision::F16,
+                        strategy,
+                        &source,
+                        &target,
+                    );
+                    assert!(expected.cycles > 0);
+                    for _ in 0..2 {
+                        assert_eq!(
+                            costs.rearrangement_cost(
+                                &shape,
+                                Precision::F16,
+                                strategy,
+                                &source,
+                                &target,
+                            ),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn pointwise_dispatch() -> OperatorDispatch {
         OperatorDispatch::Pointwise {

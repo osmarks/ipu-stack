@@ -221,7 +221,7 @@ pub fn plan_region(
         .map(|i| i.value)
         .collect::<BTreeSet<_>>();
     let demands = OutputDemands::new(ops, graph.value_shapes(), config);
-    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, config.tile_count);
+    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
     let mut conversion_cache = ConversionCache::new();
     let mut beam = vec![initial];
     let mut report = SearchReport::default();

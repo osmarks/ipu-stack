@@ -389,3 +389,82 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     let (_, resident) = analyze_mid(&program, &BTreeMap::from([(id(0), 3)])).unwrap();
     assert_eq!(resident.total, 6 * 256);
 }
+
+#[test]
+fn memory_retains_repeat_yields_until_the_backedge() {
+    use crate::{
+        CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidOperationKind, MidProgram,
+        MidRegion, MidRepeat, MidValue, Primitive, ValueId,
+    };
+    let id = MidValueId::from_index;
+    let copy = |input, output| MidOperation {
+        source: None,
+        inputs: vec![id(input)],
+        results: vec![id(output)],
+        kind: MidOperationKind::Primitive(Primitive::Copy {
+            mapping: CoordinateMapping::default(),
+            reuse_local: false,
+        }),
+        estimated_cycles: 0,
+        estimated_exchange_cycles: 0,
+    };
+    let mut program = MidProgram {
+        tile_count: 1,
+        values: (0..9)
+            .map(|i| MidValue {
+                id: id(i),
+                origin: ValueId::from_index(i),
+                storage_group: id(i),
+                tile_offset: 0,
+                tensor_type: TensorType::new([256], Precision::F16, Layout::logical_linear(1, 4)),
+            })
+            .collect(),
+        inputs: (0..2)
+            .map(|i| MidInput {
+                name: format!("input{i}"),
+                kind: GraphInputKind::Host,
+                value: id(i),
+            })
+            .collect(),
+        outputs: vec![id(7), id(8)],
+        ..MidProgram::default()
+    };
+    for count in [1, 3] {
+        program.operations = vec![MidOperation {
+            source: None,
+            inputs: vec![id(0), id(1)],
+            results: program.outputs.clone(),
+            kind: MidOperationKind::Repeat(MidRepeat {
+                count,
+                carried_inputs: 2,
+                invariant_inputs: 0,
+                iterated_inputs: vec![],
+                body: MidRegion {
+                    arguments: vec![id(2), id(3)],
+                    operations: vec![copy(2, 4), copy(3, 5), copy(5, 6)],
+                    yields: vec![id(4), id(6)],
+                    estimated_cycles: 0,
+                    peak_memory: MemoryPeaks::default(),
+                },
+            }),
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        }];
+        let (_, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
+        // Both carried buffers, the earlier yield, and the final copy's input
+        // and output coexist. The earlier yield is used by the loop backedge.
+        assert_eq!(peak.total, 5 * 512, "repeat count {count}");
+    }
+
+    program.operations.clear();
+    program.outputs = vec![id(0), id(1)];
+    program.values.truncate(2);
+    let (cycles, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
+    assert_eq!(cycles.total, 0);
+    assert_eq!(
+        peak.total,
+        2 * 512,
+        "an identity graph still has resident storage"
+    );
+    assert_eq!(peak.maximum_standard_allocation, 512);
+}
