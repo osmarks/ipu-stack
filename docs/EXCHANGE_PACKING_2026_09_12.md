@@ -1,5 +1,59 @@
 # Local packing versus fragmented exchanges — 12 September 2026
 
+## Follow-up: in-place feasibility and a missing control
+
+**The first staging experiment missed receive-then-forward dependencies within a
+phase. Its scheduler checks validate the transformed graph, not equivalence to
+the original graph. Counterfactual staging timings for such phases are invalid.**
+The tool now detects read/write overlap across every captured Repeat source
+address and refuses to export transformed fixtures for those phases. The selected
+HTML/JSON reports flag affected results and remove their scheduler timings. The
+affected phases are PE 58 and SigLIP 16, 50 and 55. The
+original tables below preserve the investigation history; affected staging rows
+must not be used as performance predictions.
+
+Receiver staging need not require a second full-sized allocation. In the SigLIP
+weight phase (55), 1,463 of 1,472 receivers have contiguous, nonoverlapping final
+write coverage. The busiest receiver has exactly 27,648 bytes of both payload and
+final coverage. PE phase 62 has contiguous coverage on 1,200 of 1,440 receivers;
+its busiest receiver has exactly 56,448 bytes of both. Provided the allocator
+reserves the destination region through receive and rearrangement, packed data
+can occupy that region and be permuted in place afterward. Gaps require individual
+allocation boundaries/liveness checks; an address span alone does not establish
+that intervening memory is available.
+
+More surprisingly, 1,463 SigLIP weight receivers have an **identity** relative
+address mapping after the proposed packing: no permutation would be needed if
+the packed receive base were their final destination base. The busiest tile (8)
+has 6,912 identity 32-bit words. Thus much of the supposed rearrangement was a
+missed coalescing opportunity.
+
+The phase contains 302,674 independent weight transfers followed by 368 forwarding
+transfers. Read/write interval checks across all Repeat addresses find overlap
+only in that forwarding tail. Sorting/coalescing just the independent prefix,
+while retaining the tail afterward and every original address, gives:
+
+| | Original | Coalesced independent prefix |
+|---|---:|---:|
+| Transfers | 303,042 | 4,326 |
+| Maximum row bytes/tile | 7,936 | 1,324 |
+| Modelled exchange cycles | 14,672 | 14,171 |
+| Added copying or staging | 0 | 0 |
+
+Scheduler invariants pass. This is still an offline fixture, not a production
+coalescer change or hardware validation. Blindly sorting the whole phase instead
+changes dependency direction and is invalid, even though scheduler invariants
+pass. `phase-55-coalesced-prefix.*` is the dependency-preserving control;
+`phase-55-reordered.*` is the rejected whole-phase control.
+
+For actual permutations, cycle rotation needs one temporary element; a visited
+bitmap or a structured permutation algorithm determines which cycles to traverse.
+It need not require a full-sized scratch tensor, but can lose the efficient
+streaming behavior of an out-of-place copy. A per-word descriptor table would
+undermine the memory saving. Source-side in-place packing additionally requires
+that no later consumer needs the original layout, particularly resident weights.
+
+
 `scripts/exchange-packing.py` analyzes captured exchange phases without building
 another executable model. It compares source packing, receiver staging, and both.
 Every alternative preserves the source tile, multicast recipient sets and payload
@@ -68,7 +122,7 @@ address/order-sensitive scheduling opportunity, but does not establish that a
 packing kernel is needed to obtain it. The synthetic placement changes both
 addresses and ordering, and a real allocator has not been tested here.
 
-## What to implement first
+## Initial prioritization (superseded for dependent phases by the follow-up)
 
 1. A bounded, regular receiver-staging alternative for weight-format conversions,
    represented in mid planning with its scratch and local-copy costs. This is the
@@ -148,7 +202,7 @@ Artifacts: `artifacts/exchange-packing-20260912/`, with PE results in
 in `pe/` and `siglip/` were exploratory; use the selected reports for encoded row
 comparisons (they also enforce the exchange snapshot's transfer-length limit).
 
-Validation: six Python tests cover payload reconstruction through gather/transport/
+Validation: eight Python tests cover payload reconstruction through gather/transport/
 scatter, multicast recipients, Repeat contiguity, transfer-length limits and copy
 loop grouping. The Rust randomized capture replay test passes. All 36 selected scheduler replays
 (three PE and six SigLIP phases, four modes each) pass scheduler invariants.

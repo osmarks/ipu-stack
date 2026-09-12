@@ -108,6 +108,32 @@ class PackingTests(unittest.TestCase):
         both, _ = packing.transform(phase, "both")
         self.assertEqual(len(both["transfers"]), 1)
 
+    def test_coalescing_control_keeps_addresses_and_needs_no_copies(self):
+        phase = {
+            "phase": 0,
+            "transfers": [
+                transfer(0, [0x50008], [(1, 0x60008)]),
+                transfer(0, [0x50000], [(1, 0x60000)]),
+            ],
+        }
+        result, info = packing.transform(phase, "coalesced")
+        self.assertEqual(
+            result["transfers"], [transfer(0, [0x50000], [(1, 0x60000)], words=4)]
+        )
+        self.assertEqual(info["combined_staging_max_bytes"], 0)
+        self.assertEqual(info["copy_cycles_floor"], 0)
+
+    def test_detects_receive_then_forward_and_repeat_aliases(self):
+        first = transfer(0, [0x50000, 0x60000], [(1, 0x70000)])
+        second = transfer(1, [0x70000], [(2, 0x80000)])
+        self.assertTrue(packing.has_read_write_overlap({"transfers": [first, second]}))
+        self.assertFalse(packing.has_read_write_overlap({"transfers": [first]}))
+        self.assertTrue(
+            packing.has_read_write_overlap(
+                {"transfers": [transfer(0, [0x50000, 0x60000], [(0, 0x60000)])]}
+            )
+        )
+
     def test_large_runs_respect_snapshot_word_limit(self):
         phase = {
             "phase": 0,

@@ -6,6 +6,7 @@ Synthetic snapshots are for scheduler experiments, not executable model plans.
 """
 
 import argparse
+import bisect
 import html
 import json
 import os
@@ -15,6 +16,35 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 MAX_TRANSFER_WORDS = 4148  # ipu_exchange::MAX_TRANSFER_WORDS
+
+
+def has_read_write_overlap(phase):
+    """A whole-phase gather/scatter cannot assume these transfers independent."""
+    writes = defaultdict(list)
+    for transfer in phase["transfers"]:
+        for destination in transfer["destinations"]:
+            start = destination["address"]
+            writes[destination["tile"]].append((start, start + 4 * transfer["words"]))
+    for tile, intervals in writes.items():
+        merged = []
+        for start, end in sorted(intervals):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        writes[tile] = merged
+    ends = {tile: [end for _, end in intervals] for tile, intervals in writes.items()}
+    for transfer in phase["transfers"]:
+        tile = transfer["source"]
+        intervals = writes.get(tile, [])
+        for address in transfer["source_addresses"]:
+            index = bisect.bisect_right(ends.get(tile, []), address)
+            if (
+                index < len(intervals)
+                and intervals[index][0] < address + 4 * transfer["words"]
+            ):
+                return True
+    return False
 
 
 def route(t):
@@ -236,6 +266,8 @@ def render(rows, output):
     cells = []
     for row in rows:
         label = html.escape(row["label"])
+        if row.get("read_write_overlap"):
+            label = "READ/WRITE DEPENDENCIES: staging results invalid. " + label
         cells.append(
             f"<tr><td>{row['phase']}</td><td>{row['mode']}</td>"
             f"<td>{row['transfers']:,}</td><td>{row['maximum_endpoint_fragments']:,}</td>"
@@ -302,11 +334,15 @@ def main():
             continue
         # By default analyze every phase; only export selected replay fixtures.
         original = geometry(phase)
-        for mode in ("original", "source", "destination", "both"):
+        dependent = has_read_write_overlap(phase)
+        for mode in ("original", "coalesced", "source", "destination", "both"):
+            if dependent and mode != "original":
+                continue
             transformed, extra = transform(phase, mode)
             row = {
                 "phase": phase["phase"],
                 "mode": mode,
+                "read_write_overlap": dependent,
                 "label": snapshot.get("phase_labels", {}).get(str(phase["phase"]), ""),
                 **geometry(transformed),
                 **extra,
@@ -325,7 +361,10 @@ def main():
     render([r for r in rows if r["phase"] in selected], args.output)
     print(
         json.dumps(
-            {"selected_phases": sorted(selected), "analyzed_phases": len(rows) // 4}
+            {
+                "selected_phases": sorted(selected),
+                "analyzed_phases": len(ranked) if not args.phase else len(selected),
+            }
         )
     )
 
