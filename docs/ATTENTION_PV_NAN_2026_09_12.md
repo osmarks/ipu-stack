@@ -77,6 +77,12 @@ Estimated exchange cycles fell from 6,017,366 to 5,063,733, and encoded exchange
 storage from 39,864 to 30,504 B/tile. Thus neither the comparable host timing nor
 the detailed estimates support a batch-one performance regression.
 
+Busy-poll replay of the validated batch-two package (`bs2-fixed/busy.log`) also
+passes both exact output checks. The two batches take 15.640 and 15.346 ms,
+averaging 15.494 ms/batch, or 129.1 images/s (7.747 ms/image). This is 2.3% below
+the 15.866 ms default-poll mean. Weights remain resident, and the timer includes
+image upload and embedding download.
+
 The batch-one build started before the padding fix, alongside its diagnosis. Its
 PV grid pads to 768 and does not read the statistics; it passed both hardware
 calls and replay. The batch-two build uses the fix and reselects the formerly
