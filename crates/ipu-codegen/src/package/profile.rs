@@ -146,6 +146,7 @@ fn instrument_active_steps(
     for (index, (&work, step)) in schedule.iter().zip(steps.iter_mut()).enumerate() {
         if let (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(finalized)) =
             (work, &mut *step)
+            && !repeat.body.work.is_empty()
         {
             let first = plans.len();
             let schedule = program.work(&repeat.body).collect::<Vec<_>>();
@@ -266,7 +267,11 @@ pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkLis
         if previous.is_none_or(|previous| !profile_work_can_merge(previous, work)) {
             count += match work {
                 crate::TileWorkRef::Repeat(repeat) => {
-                    profile_step_count(program, &repeat.body) + usize::from(repeat.count > 1)
+                    if repeat.body.work.is_empty() {
+                        1 // The loop executes, but has no first-iteration body samples.
+                    } else {
+                        profile_step_count(program, &repeat.body) + usize::from(repeat.count > 1)
+                    }
                 }
                 _ => 1,
             };
@@ -425,13 +430,20 @@ fn profile_step(
                 })
             }
         }
-        (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => profile_description(
-            index,
-            u32::try_from(index)?,
-            &repeat.provenance,
-            ProfileStepKind::Compute,
-            "repeat",
-        ),
+        (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => {
+            let mut description = profile_description(
+                index,
+                u32::try_from(index)?,
+                &repeat.provenance,
+                ProfileStepKind::Idle,
+                "repeat",
+            )?;
+            description.metadata.push(ProfileMetadata {
+                name: "iterations".into(),
+                value: repeat.count.to_string(),
+            });
+            Ok(description)
+        }
         (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) => {
             Ok(ProfileStep {
                 local_index: u32::try_from(index)?,
@@ -538,6 +550,69 @@ fn profile_address(base: u32, index: usize) -> PackageBuildResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_tiles_with_empty_repeat_bodies_have_complete_samples() {
+        for count in [1, 3] {
+            let mut graph = crate::ComputeGraph::new();
+            let input = graph.host_input("input", [8, 16]).unwrap();
+            let output = graph
+                .repeat(count, [input], [], [], |body, args| {
+                    Ok(vec![body.gelu(args.carried[0])?])
+                })
+                .unwrap()[0];
+            graph.set_outputs([output]).unwrap();
+            let config = crate::PipelineConfig::new(1).with_input(
+                input,
+                crate::TensorFormat {
+                    precision: crate::Precision::F16,
+                    layout: crate::Layout::row_sharded(1),
+                },
+            );
+            let mut mid = crate::lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+            // A valid whole-device program may leave active tiles unused by a region.
+            mid.tile_count = 2;
+            let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+            let placement = crate::place(&low).unwrap();
+            let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
+            let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600(), false)
+                .unwrap()
+                .phases;
+            let lowering = crate::TileProgramLowering::new(
+                &low, &placement, &exchanges, &kernels, 0x60000, 2, false,
+            )
+            .unwrap();
+            for tile in 0..2 {
+                let mut program = lowering.lower_tile(tile).unwrap();
+                let expected_count = profile_step_count(&low, &low.tiles[tile as usize]);
+                let base = 0x58000;
+                let profile =
+                    instrument_profile(&low, &exchanges, tile, u32::from(tile), &mut program, base)
+                        .unwrap();
+                assert_eq!(profile.steps.len(), expected_count);
+                fn samples(steps: &mut [crate::TileStep], addresses: &mut BTreeSet<u32>) {
+                    for step in steps {
+                        let profile = *step_profile(step);
+                        addresses.extend(profile.before);
+                        addresses.extend(profile.after);
+                        if let crate::TileStep::Repeat(repeat) = step {
+                            samples(&mut repeat.body, addresses);
+                        }
+                    }
+                }
+                let mut written = BTreeSet::new();
+                samples(&mut program.steps, &mut written);
+                let expected = (0..=expected_count)
+                    .map(|i| base + i as u32 * 4)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(written, expected, "count={count} tile={tile}");
+                assert!(
+                    expected_count > 0,
+                    "an empty repeat still executes on the tile"
+                );
+            }
+        }
+    }
 
     #[test]
     fn repeat_profiles_first_iteration_and_aggregates_remainder() {
