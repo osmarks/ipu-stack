@@ -526,3 +526,11 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/output_bindings.rs"]
 mod output_binding_tests;
+
+#[cfg(test)]
+#[path = "tests/mapping_semantics.rs"]
+mod mapping_semantics;
+
+#[cfg(test)]
+#[path = "tests/primitive_fragments.rs"]
+mod primitive_fragments;

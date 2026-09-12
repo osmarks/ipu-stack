@@ -98,13 +98,23 @@ impl TileGraphBuilder {
                                         return self.shards[source.index() as usize].extents
                                             == self.shards[output.index() as usize].extents;
                                     }
-                                    !matches!(
-                                        kernel,
-                                        TileKernelSpec::Gelu
-                                            | TileKernelSpec::Add
-                                            | TileKernelSpec::BiasGelu
-                                            | TileKernelSpec::AddLayerNorm
-                                    ) || self.broadcast_view(source, output).is_some()
+                                    // A tile can own several row fragments. Equal-shape
+                                    // pointwise operands must match this output's coordinates;
+                                    // product axes need not match even when shapes coincide.
+                                    let same_shape = product.is_none()
+                                        && self.shards[source.index() as usize].tensor_type.shape
+                                            == self.shards[output.index() as usize]
+                                                .tensor_type
+                                                .shape;
+                                    !(same_shape
+                                        || matches!(
+                                            kernel,
+                                            TileKernelSpec::Gelu
+                                                | TileKernelSpec::Add
+                                                | TileKernelSpec::BiasGelu
+                                                | TileKernelSpec::AddLayerNorm
+                                        ))
+                                        || self.broadcast_view(source, output).is_some()
                                 })
                                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
                             if matches!(

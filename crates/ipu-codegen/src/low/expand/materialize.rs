@@ -75,7 +75,6 @@ impl TileGraphBuilder {
                 &outputs,
                 &mapping.offsets,
                 reuse_local,
-                body,
             )?;
             (
                 mappings,
@@ -86,6 +85,20 @@ impl TileGraphBuilder {
                 },
             )
         };
+        let covered = mappings
+            .iter()
+            .map(|(_, destination)| destination.shard)
+            .collect::<BTreeSet<_>>();
+        for output in outputs {
+            if !covered.contains(&output)
+                && matches!(
+                    self.shards[output.index() as usize].definition,
+                    ShardDefinition::Value(_)
+                )
+            {
+                self.append_fill_zero(body, output, operation_provenance(operation))?;
+            }
+        }
         self.prepare_mapped_views(
             mappings,
             order,
@@ -103,7 +116,6 @@ impl TileGraphBuilder {
         outputs: &[BlockValueId],
         offsets: &[u32],
         reuse_local: bool,
-        body: &mut BlockRegion,
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
         let mut regions = CopyRegions::new(&self.shards, inputs);
         let mut mappings = Vec::new();
@@ -166,9 +178,6 @@ impl TileGraphBuilder {
                     continue;
                 }
             }
-            if intersections.is_empty() {
-                self.append_fill_zero(body, output, operation_provenance(operation))?;
-            }
             for (source_extents, source) in intersections {
                 let mut destination_extents = source_extents.clone();
                 offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
@@ -208,6 +217,12 @@ impl TileGraphBuilder {
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
             for (extent, &size) in output_extents.iter_mut().zip(&output_shape.0) {
                 extent.logical_end = extent.logical_end.min(size);
+            }
+            if output_extents
+                .iter()
+                .any(|extent| extent.start >= extent.logical_end)
+            {
+                continue;
             }
             let split = view.split_axis;
             let merge = view.merge_axis;
