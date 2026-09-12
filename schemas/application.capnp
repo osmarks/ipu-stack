@@ -72,43 +72,14 @@ struct DeviceConfigWrite {
   value @1 :UInt32;
 }
 
-struct ProfileMetadata {
-  name @0 :Text;
-  value @1 :Text;
-}
-
-enum ProfileStepKind {
-  exchange @0;
-  compute @1;
-  synchronization @2;
-  idle @3;
-}
-
-enum ProfileExchangeActivityKind {
-  send @0;
-  receive @1;
-  partnerBusy @2;
-}
-
-struct ProfileExchangeActivity {
-  kind @0 :ProfileExchangeActivityKind;
-  startCycle @1 :UInt32;
-  endCycle @2 :UInt32;
-  fanout @3 :UInt16; # Zero means unavailable in older profiles.
-  paired @4 :Bool;
-}
-
-struct ProfileStepPlan {
-  localIndex @0 :UInt32;
-  phase @1 :UInt32;
-  epoch @2 :UInt32;
-  operation @3 :Text;
-  kind @4 :ProfileStepKind;
-  kernel @5 :Text;
-  metadata @6 :List(ProfileMetadata);
-  exchangeActivities @7 :List(ProfileExchangeActivity);
-  exchangeEventCycles @8 :UInt32;
-}
+# Package plans and measured profiles carry the same records. These aliases
+# preserve the old schema names and field encodings.
+using Profile = import "profile.capnp";
+using ProfileMetadata = Profile.MetadataEntry;
+using ProfileStepKind = Profile.StepKind;
+using ProfileExchangeActivityKind = Profile.ExchangeActivityKind;
+using ProfileExchangeActivity = Profile.ExchangeActivity;
+using ProfileStepPlan = Profile.ProfileStep;
 
 struct TileProfilePlan {
   physicalTile @0 :UInt32;

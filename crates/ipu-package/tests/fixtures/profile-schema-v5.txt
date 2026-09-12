@@ -1,0 +1,13 @@
+(schemaVersion = 5, target = "ipu21", tileMemoryBase = 311296, tileMemorySize = 638976,
+ tiles = [(physicalTile = 0, entryPoint = 311296)],
+ profileTiles = [(physicalTile = 0, steps = [
+ (localIndex = 0, phase = 7, epoch = 3, operation = "operation.4", kind = exchange,
+ kernel = "multicast", metadata = [(name = "reason", value = "LayoutRearrangement")],
+ exchangeActivities = [
+ (kind = send, startCycle = 2, endCycle = 8, fanout = 3, paired = true),
+ (kind = receive, startCycle = 4, endCycle = 10, fanout = 2, paired = false),
+ (kind = partnerBusy, startCycle = 1, endCycle = 12, fanout = 3, paired = true)],
+ exchangeEventCycles = 13),
+ (localIndex = 1, kind = compute),
+ (localIndex = 2, kind = synchronization),
+ (localIndex = 3, kind = idle)])])
