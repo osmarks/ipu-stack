@@ -2016,7 +2016,7 @@ fn estimated_exchange_rows_rank_plans_without_proving_tensor_overflow() {
     assert!(peaks.fits_ipu21_with_budget(reservation, 512 * 1024));
     assert!(!peaks.fits_ipu21_with_budget(reservation, 400 * 1024));
     // Keep the table estimate in the resource objectives used by the catalogue.
-    assert_eq!(peaks.objectives()[5], 187_196);
+    assert_eq!(peaks.objectives()[4], 187_196);
 }
 
 #[test]

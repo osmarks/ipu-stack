@@ -43,16 +43,13 @@ pub struct MemoryPeaks {
 }
 
 impl MemoryPeaks {
-    pub(crate) const OBJECTIVE_COUNT: usize = 6;
-
     /// Shared Pareto dimensions for operator and region shortlists.
-    pub(crate) fn objectives(self) -> [u64; Self::OBJECTIVE_COUNT] {
+    pub(crate) fn objectives(self) -> [u64; 5] {
         [
             self.standard.saturating_add(self.exchange_rows),
             self.interleaved,
             self.total_with_exchange(),
             self.maximum_standard_allocation,
-            self.standard_contiguous_overflow(),
             self.exchange_rows,
         ]
     }
