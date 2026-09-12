@@ -1365,7 +1365,8 @@ pub fn capture_exchange_baseline(
 ) -> PackageBuildResult<crate::ExchangeScheduleSnapshot> {
     let planning = &config.pipeline;
     validate_tile_count(u32::from(planning.tile_count))?;
-    let mid = lower_baseline(graph, planning, &Ipu21CostModel)?;
+    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel, planning.tile_count);
+    let mid = lower_baseline(graph, planning, &costs)?;
     let (low, placement, _) =
         validation::expand_and_place(&mid, planning, config.tile_mapping.as_deref())?;
     Ok(crate::exchange::capture_exchange_schedule(

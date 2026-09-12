@@ -102,6 +102,9 @@ pub struct ExchangeScheduleSnapshot {
     pub schema_version: u32,
     pub tile_count: u16,
     pub phases: Vec<ExchangeScheduleProblem>,
+    /// Optional compiler provenance for offline diagnostics; ignored by scheduling.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_labels: BTreeMap<u32, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +285,40 @@ pub(crate) fn capture_exchange_schedule(
         schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
         tile_count: program.tile_count,
         phases,
+        phase_labels: program
+            .exchange_phases
+            .iter()
+            .map(|phase| {
+                let tensors = phase
+                    .transfers
+                    .first()
+                    .and_then(|transfer| {
+                        let source =
+                            &program.shards[transfer.source.shard.index() as usize].tensor_type;
+                        let destination = &program.shards
+                            [transfer.destinations.first()?.shard.index() as usize]
+                            .tensor_type;
+                        Some(format!(
+                            "{:?} {:?} {:?} -> {:?} {:?}",
+                            source.shape,
+                            source.format.precision,
+                            source.format.layout.order,
+                            destination.shape,
+                            destination.format.layout.order
+                        ))
+                    })
+                    .unwrap_or_default();
+                (
+                    phase.id.index(),
+                    format!(
+                        "op {:?} {:?}: {}",
+                        phase.provenance.operation.map(|op| op.index()),
+                        phase.provenance.reason,
+                        tensors
+                    ),
+                )
+            })
+            .collect(),
     })
 }
 
@@ -546,6 +583,7 @@ pub(crate) fn lower_exchanges_cached(
                 schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
                 tile_count: program.tile_count,
                 phases: schedule_phases,
+                phase_labels: BTreeMap::new(),
             },
         }
     })

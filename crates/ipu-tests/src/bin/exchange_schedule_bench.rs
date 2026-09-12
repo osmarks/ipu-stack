@@ -324,6 +324,7 @@ fn main() -> Result<()> {
                 schema_version: snapshot.schema_version,
                 tile_count: snapshot.tile_count,
                 phases: selected_problems,
+                phase_labels: snapshot.phase_labels.clone(),
             },
         )?;
     }

@@ -72,6 +72,7 @@ impl ExchangeScheduleCache {
             schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
             tile_count,
             phases: Vec::new(),
+            phase_labels: BTreeMap::new(),
         }
         .validate()?;
         let topology = Topology::new(
