@@ -70,8 +70,20 @@ impl TileGraphBuilder {
                                     == self.shards[target.index() as usize].extents
                             })
                             .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                        self.shards[target.index() as usize].definition =
-                            ShardDefinition::WritableAlias(previous);
+                        self.shards[target.index() as usize].definition = if matches!(
+                            kernel,
+                            TileKernelSpec::Cast {
+                                from: Precision::F16,
+                                to: Precision::F8F143 { .. }
+                            }
+                        ) {
+                            ShardDefinition::ShiftedAlias {
+                                source: previous,
+                                offset: -(crate::mid::cast::CAST_PREFIX_BYTES as i32),
+                            }
+                        } else {
+                            ShardDefinition::WritableAlias(previous)
+                        };
                     }
                     let inputs = inputs_by_tile
                         .iter()
@@ -81,6 +93,12 @@ impl TileGraphBuilder {
                                 .iter()
                                 .copied()
                                 .find(|&source| {
+                                    if matches!(kernel, TileKernelSpec::Cast { .. })
+                                        && output_aliases == &[(0, 0)]
+                                    {
+                                        return self.shards[source.index() as usize].extents
+                                            == self.shards[output.index() as usize].extents;
+                                    }
                                     !matches!(
                                         kernel,
                                         TileKernelSpec::Gelu
@@ -137,7 +155,18 @@ impl TileGraphBuilder {
                                 .push(crate::KernelAccess::new(format, 8));
                             run.additional_outputs.push(view);
                         }
-                        self.append_kernel(body, tile, run)?;
+                        if matches!(
+                            kernel,
+                            TileKernelSpec::Cast {
+                                from: Precision::F16,
+                                to: Precision::F8F143 { .. }
+                            }
+                        ) && output_aliases == &[(0, 0)]
+                        {
+                            self.append_in_place_cast(body, tile, run)?;
+                        } else {
+                            self.append_kernel(body, tile, run)?;
+                        }
                     }
                 }
                 Ok(())

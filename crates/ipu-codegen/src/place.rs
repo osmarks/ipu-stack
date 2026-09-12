@@ -130,6 +130,7 @@ pub(crate) fn place_with_offset(
         iterated,
         members,
         root_of_member,
+        member_offsets,
         root_requirements,
         root_lifetimes,
         conflicts,
@@ -156,6 +157,7 @@ pub(crate) fn place_with_offset(
                 &tile_iterated[tile],
                 &tile_members[tile],
                 &root_of_member,
+                &member_offsets,
                 &root_requirements,
                 &root_lifetimes,
                 &conflicts,
@@ -185,6 +187,7 @@ struct AllocationAnalysis {
     iterated: Vec<IteratedGroup>,
     members: BTreeMap<usize, Vec<usize>>,
     root_of_member: Vec<usize>,
+    member_offsets: Vec<u32>,
     root_requirements: BTreeMap<usize, Requirement>,
     root_lifetimes: BTreeMap<usize, Lifetime>,
     conflicts: BTreeMap<usize, BTreeSet<usize>>,
@@ -193,11 +196,19 @@ struct AllocationAnalysis {
 fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, PlacementError> {
     let mut sets = DisjointSets::new(program.shards.len());
     for shard in &program.shards {
-        if let ShardDefinition::Alias(target) | ShardDefinition::WritableAlias(target) =
-            shard.definition
+        let (target, offset) = match shard.definition {
+            ShardDefinition::Alias(target) | ShardDefinition::WritableAlias(target) => (target, 0),
+            ShardDefinition::ShiftedAlias { source, offset } => (source, i64::from(offset)),
+            _ => continue,
+        };
+        if program
+            .shards
+            .get(target.index() as usize)
+            .is_none_or(|other| other.tile != shard.tile)
         {
-            checked_union(program, &mut sets, shard.id, target)?;
+            return Err(PlacementError::InvalidAlias(target.index()));
         }
+        sets.union_offset(shard.id.index() as usize, target.index() as usize, offset)?;
     }
     let mut iterated = Vec::<IteratedGroup>::new();
     for tile in &program.tiles {
@@ -225,10 +236,16 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         }
     }
     let mut root_requirements = BTreeMap::<usize, Requirement>::new();
-    for (index, requirement) in requirements.into_iter().enumerate() {
+    for (index, requirement) in requirements.iter().copied().enumerate() {
         let root = sets.find(index);
         let combined = root_requirements.entry(root).or_default();
         combined.alignment = combined.alignment.max(requirement.alignment);
+        if matches!(
+            program.shards[index].definition,
+            ShardDefinition::ShiftedAlias { .. }
+        ) {
+            combined.alignment = combined.alignment.max(32768);
+        }
         combined.access_tail = combined.access_tail.max(requirement.access_tail);
     }
 
@@ -238,6 +255,17 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         let root = sets.find(index);
         *root_slot = root;
         members.entry(root).or_default().push(index);
+    }
+    let mut member_offsets = vec![0; program.shards.len()];
+    for group in members.values() {
+        let minimum = group.iter().map(|&i| sets.offsets[i]).min().unwrap_or(0);
+        for &i in group {
+            member_offsets[i] =
+                u32::try_from(sets.offsets[i] - minimum).map_err(|_| PlacementError::Overflow)?;
+            if !member_offsets[i].is_multiple_of(requirements[i].alignment.max(1)) {
+                return Err(PlacementError::IncompatibleAlias);
+            }
+        }
     }
     validate_alias_groups(program, &members)?;
     let mut conflicts = BTreeMap::<usize, BTreeSet<usize>>::new();
@@ -262,6 +290,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         iterated,
         members,
         root_of_member,
+        member_offsets,
         root_requirements,
         root_lifetimes,
         conflicts,
@@ -277,6 +306,7 @@ fn place_tile(
     iterated: &[IteratedGroup],
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
+    member_offsets: &[u32],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
     conflicts: &BTreeMap<usize, BTreeSet<usize>>,
@@ -310,6 +340,7 @@ fn place_tile(
         &grouped,
         members,
         root_of_member,
+        member_offsets,
         root_requirements,
         root_lifetimes,
         conflicts,
@@ -590,8 +621,7 @@ fn checked_union(
     if left_shard.tile != right_shard.tile {
         return Err(PlacementError::IncompatibleAlias);
     }
-    sets.union(left.index() as usize, right.index() as usize);
-    Ok(())
+    sets.union_offset(left.index() as usize, right.index() as usize, 0)
 }
 
 fn validate_alias_groups(
@@ -615,13 +645,15 @@ fn validate_alias_groups(
 fn allocation_bytes(
     program: &LowProgram,
     members: &[usize],
+    member_offsets: &[u32],
     requirement: Requirement,
 ) -> Result<u32, PlacementError> {
     members
         .iter()
         .map(|&index| {
-            shard_storage_bytes(&program.shards[index])?
-                .checked_add(requirement.access_tail)
+            member_offsets[index]
+                .checked_add(shard_storage_bytes(&program.shards[index])?)
+                .and_then(|bytes| bytes.checked_add(requirement.access_tail))
                 .ok_or(PlacementError::Overflow)
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -645,12 +677,15 @@ fn memory_element_size(program: &LowProgram, members: &[usize]) -> u32 {
 fn assign_members(
     addresses: &mut BTreeMap<BlockValueId, u32>,
     members: &[usize],
+    member_offsets: &[u32],
     address: u32,
 ) -> Result<(), PlacementError> {
     for &member in members {
         addresses.insert(
             BlockValueId::from_index(u32::try_from(member).map_err(|_| PlacementError::Overflow)?),
-            address,
+            address
+                .checked_add(member_offsets[member])
+                .ok_or(PlacementError::Overflow)?,
         );
     }
     Ok(())
@@ -663,6 +698,7 @@ fn allocation_requests(
     grouped: &BTreeSet<usize>,
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
+    member_offsets: &[u32],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
     conflicts: &BTreeMap<usize, BTreeSet<usize>>,
@@ -709,6 +745,7 @@ fn allocation_requests(
             stride = stride.max(allocation_bytes(
                 program,
                 &members[root],
+                member_offsets,
                 root_requirements[root],
             )?);
         }
@@ -752,7 +789,7 @@ fn allocation_requests(
             continue;
         }
         let requirement = root_requirements.get(&root).copied().unwrap_or_default();
-        let bytes = allocation_bytes(program, root_members, requirement)?;
+        let bytes = allocation_bytes(program, root_members, member_offsets, requirement)?;
         requests.push(AllocationRequest {
             class: representative.tensor_type.format.layout.memory_class,
             region1_stride: None,
@@ -779,6 +816,7 @@ fn allocate_tile(
     grouped: &BTreeSet<usize>,
     members: &BTreeMap<usize, Vec<usize>>,
     root_of_member: &[usize],
+    member_offsets: &[u32],
     root_requirements: &BTreeMap<usize, Requirement>,
     root_lifetimes: &BTreeMap<usize, Lifetime>,
     conflicts: &BTreeMap<usize, BTreeSet<usize>>,
@@ -791,6 +829,7 @@ fn allocate_tile(
         grouped,
         members,
         root_of_member,
+        member_offsets,
         root_requirements,
         root_lifetimes,
         conflicts,
@@ -805,7 +844,15 @@ fn allocate_tile(
         )
     });
     let initial = arena.clone();
-    match allocate_requests(program, tile, &requests, members, arena, addresses) {
+    match allocate_requests(
+        program,
+        tile,
+        &requests,
+        members,
+        member_offsets,
+        arena,
+        addresses,
+    ) {
         Ok(()) => {
             dump::capture(tile, &requests, arena, true);
             return Ok(());
@@ -824,7 +871,15 @@ fn allocate_tile(
             request.lifetime.first,
         )
     });
-    let result = allocate_requests(program, tile, &requests, members, arena, addresses);
+    let result = allocate_requests(
+        program,
+        tile,
+        &requests,
+        members,
+        member_offsets,
+        arena,
+        addresses,
+    );
     if matches!(result, Err(PlacementError::OutOfMemory { .. })) {
         let searched = search::place(&requests, &initial);
         tracing::debug!(
@@ -840,7 +895,7 @@ fn allocate_tile(
             addresses.clear();
             for (request, (start, end)) in requests.iter().zip(placement) {
                 arena.record(request, start, end);
-                assign_request(request, start, members, addresses)?;
+                assign_request(request, start, members, member_offsets, addresses)?;
             }
             dump::capture(tile, &requests, arena, true);
             return Ok(());
@@ -860,6 +915,7 @@ fn allocate_requests(
     tile: u16,
     requests: &[AllocationRequest],
     members: &BTreeMap<usize, Vec<usize>>,
+    member_offsets: &[u32],
     arena: &mut Arena,
     addresses: &mut BTreeMap<BlockValueId, u32>,
 ) -> Result<(), PlacementError> {
@@ -885,7 +941,7 @@ fn allocate_requests(
                 bytes: request.bytes,
             });
         };
-        assign_request(request, base, members, addresses)?;
+        assign_request(request, base, members, member_offsets, addresses)?;
     }
     Ok(())
 }
@@ -894,6 +950,7 @@ fn assign_request(
     request: &AllocationRequest,
     base: u32,
     members: &BTreeMap<usize, Vec<usize>>,
+    member_offsets: &[u32],
     addresses: &mut BTreeMap<BlockValueId, u32>,
 ) -> Result<(), PlacementError> {
     for (index, (root, offset)) in request.assignments.iter().copied().enumerate() {
@@ -907,7 +964,7 @@ fn assign_request(
             offset
         };
         let address = base.checked_add(offset).ok_or(PlacementError::Overflow)?;
-        assign_members(addresses, &members[&root], address)?;
+        assign_members(addresses, &members[&root], member_offsets, address)?;
     }
     Ok(())
 }
@@ -1128,12 +1185,14 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, PlacementError> {
 
 struct DisjointSets {
     parents: Vec<usize>,
+    offsets: Vec<i64>,
 }
 
 impl DisjointSets {
     fn new(length: usize) -> Self {
         Self {
             parents: (0..length).collect(),
+            offsets: vec![0; length],
         }
     }
 
@@ -1141,16 +1200,30 @@ impl DisjointSets {
         let parent = self.parents[value];
         if parent != value {
             self.parents[value] = self.find(parent);
+            self.offsets[value] += self.offsets[parent];
         }
         self.parents[value]
     }
 
-    fn union(&mut self, left: usize, right: usize) {
-        let left = self.find(left);
-        let right = self.find(right);
-        if left != right {
-            self.parents[right] = left;
+    /// Require address(left) = address(right) + displacement.
+    fn union_offset(
+        &mut self,
+        left: usize,
+        right: usize,
+        displacement: i64,
+    ) -> Result<(), PlacementError> {
+        let a = self.find(left);
+        let b = self.find(right);
+        let delta = self.offsets[right] + displacement - self.offsets[left];
+        if a == b {
+            if delta != 0 {
+                return Err(PlacementError::IncompatibleAlias);
+            }
+        } else {
+            self.parents[b] = a;
+            self.offsets[b] = -delta;
         }
+        Ok(())
     }
 }
 
@@ -1161,6 +1234,27 @@ mod tests {
         ComputeGraph, Ipu21CostModel, KernelBuildPlan, Layout, PipelineConfig, Precision,
         TensorFormat, lower, lower_to_tiles, materialize_kernel_run,
     };
+
+    #[test]
+    fn displaced_alias_constraints_preserve_repeat_equalities_and_reject_cycles() {
+        let mut sets = DisjointSets::new(5);
+        sets.union_offset(1, 0, -32768).unwrap();
+        // Repeat invariant/result IDs bind to the shifted value's address.
+        sets.union_offset(2, 1, 0).unwrap();
+        sets.union_offset(3, 2, 0).unwrap();
+        sets.union_offset(4, 0, 0).unwrap();
+        for i in 0..5 {
+            sets.find(i);
+        }
+        assert_eq!(sets.offsets[0] - sets.offsets[1], 32768);
+        assert_eq!(sets.offsets[1], sets.offsets[2]);
+        assert_eq!(sets.offsets[1], sets.offsets[3]);
+        assert_eq!(sets.offsets[0], sets.offsets[4]);
+        assert_eq!(
+            sets.union_offset(0, 3, 0),
+            Err(PlacementError::IncompatibleAlias)
+        );
+    }
 
     fn request(
         class: MemoryClass,
@@ -1665,6 +1759,7 @@ mod tests {
             std::slice::from_ref(&group),
             &members,
             &analysis.root_of_member,
+            &analysis.member_offsets,
             &analysis.root_requirements,
             &analysis.root_lifetimes,
             &analysis.conflicts,

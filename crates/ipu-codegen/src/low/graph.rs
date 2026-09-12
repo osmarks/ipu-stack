@@ -54,6 +54,12 @@ pub enum ShardDefinition {
     Alias(BlockValueId),
     /// Alias intentionally used as an in-place operation destination.
     WritableAlias(BlockValueId),
+    /// Writable storage donation at a signed byte displacement from its source.
+    /// Placement reserves the union and preserves this offset through aliases.
+    ShiftedAlias {
+        source: BlockValueId,
+        offset: i32,
+    },
     /// Canonical format placeholder replaced by dispatch-local staging.
     Unmaterialized,
 }
@@ -271,14 +277,30 @@ pub struct TileGraph {
     pub estimated_exchange_cycles: u64,
 }
 
-pub(crate) fn storage_root(shards: &[BlockValue], mut shard: BlockValueId) -> BlockValueId {
+pub(crate) fn storage_root(shards: &[BlockValue], shard: BlockValueId) -> BlockValueId {
+    storage_location(shards, shard).0
+}
+
+/// Byte origin relative to the ultimate backing value, before placement.
+pub(crate) fn storage_location(
+    shards: &[BlockValue],
+    mut shard: BlockValueId,
+) -> (BlockValueId, i64) {
+    let mut offset = 0i64;
     let mut remaining = shards.len().saturating_add(1);
     while remaining != 0 {
         remaining -= 1;
         shard = match shards[shard.index() as usize].definition {
             ShardDefinition::Alias(source) | ShardDefinition::WritableAlias(source) => source,
-            _ => return shard,
+            ShardDefinition::ShiftedAlias {
+                source,
+                offset: delta,
+            } => {
+                offset += i64::from(delta);
+                source
+            }
+            _ => return (shard, offset),
         };
     }
-    shard
+    (shard, offset)
 }

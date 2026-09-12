@@ -1,81 +1,89 @@
 # Partial-overlap FP16 to FP8 casts
 
-Partial overlap is compatible with the ISA's fast cast instructions in principle.
-It is not supported by the current cast/placement contract.
+Implemented using a shifted shared buffer. The earlier same-base experiment,
+which protected a prefix in temporary storage, is replaced.
 
-## Hardware and current implementation
+## Address and execution contract
 
 The local IPU21 ISA manual, `TileVertexISA-IPU21-1.3.1.pdf`, sections 2.9.10.2,
-2.9.12 and 3.7.5.1.1, requires the simultaneous accesses of `ldst64pace` to
-address different memory elements. It does not require disjoint whole buffers.
-The instruction has independent load/store pointers and increments.
+2.9.12 and 3.7.5.1.1, requires simultaneous `ldst64pace` accesses to use different
+memory elements. Whole tensors can overlap if each invocation reads and writes
+separate elements and never overwrites unread input.
 
-`device/cast_f8.cpp` checks whole input/output ranges, conservatively treating
-each 32 KiB address group as inseparable. Its pipelined linear and packed-row
-loops run only when that check succeeds. Overlapping ranges currently fail it.
-`low/call.rs` does not impose a hard distinct-elements requirement on casts:
-separate ordinary allocations may share an element and use the slower kernel.
-This is different from GEMM's mandatory output/left-input element separation.
+The output starts at a 32 KiB-aligned address; the input starts 32 KiB later.
+Low expansion divides the cast into complete FP16 panel pairs (AMP-left) or
+complete rows/vectors (row-major). Each chunk is the largest prefix whose output
+ends before the input's first 32 KiB group. Workers join locally between chunks.
+This passes the existing kernel's conservative whole-range bank check, preserves
+its simultaneous load/store path, and needs no prefix copy or device-wide barrier.
 
-Dropping the cast's range check would be incorrect. Besides possible instruction
-clashes, six workers process independent row/vector streams. Output writes need
-to avoid every worker's unread input, including padding initialization and panel
-permutations. No arbitrary cross-worker progress assumption should establish
-this safety property.
+For 164 rows by 384 columns in AMP-left order, offsets from the allocation base:
 
-## A fast path without rewriting the assembly loop
-
-Convert complete chunks in order, joining the workers locally between chunks.
-Position the output 32 KiB before a 32 KiB-aligned input. Each chunk reads and
-writes separate element groups; later chunks overwrite only previously consumed
-input. These are local tile dependencies, not additional device-wide exchanges
-or synchronization phases.
-
-A checked address example uses 164 rows and 384 columns in AMP-left order,
-matching the captured staging byte count. Each FP8 panel consumes two contiguous
-FP16 16-column panels: 10,496 input bytes become 5,248 output bytes. Process three
-such pairs per chunk, four chunks in total. This preserves the existing packed
-cast's two-stream ordering and its six-worker distribution within each chunk.
-
-With input base `S` and output base `S - 32768`:
-
-| Chunk | Input relative to S | Output relative to S |
+| Call | FP16 reads | FP8 writes |
 |---|---|---|
-| 0 | [0, 31488) | [-32768, -17024) |
-| 1 | [31488, 62976) | [-17024, -1280) |
-| 2 | [62976, 94464) | [-1280, 14464) |
-| 3 | [94464, 125952) | [14464, 30208) |
+| 0 | [32,768, 95,744) | [0, 31,488) |
+| 1 | [95,744, 158,720) | [31,488, 62,976) |
 
-All four pass the current whole-range 32 KiB separation test. Every output
-ends before its chunk's input begins. The source allocation plus the preceding
-32 KiB occupies 158,720 bytes, versus 188,936 bytes for separate allocations
-including the FP8 consumer's eight-byte access tail: **30,216 bytes saved**.
-The final output tail lies within already consumed input storage.
+The second call overwrites only input consumed by the first. Independent worker
+progress within either call cannot violate this property. The 62,976-byte FP8
+allocation is replaced by a 32,768-byte prefix: **29.5 KiB saved** before access
+tails/alignment. There are two worker launches instead of one.
 
-This is an address/ordering feasibility example, not a measured hardware run
-or proof that a particular full-model placement admits the required span.
-Contiguous row-major input followed by AMP packing requires different chunk
-geometry; one cannot apply this panel slicing to it without checking its reads.
+## Compiler integration
 
-## Required compiler changes
+- Mid selects storage donation only for a fresh, last-use FP16 result with the
+  same shape, order, ownership and memory class as its FP8 output. Resident
+  parameters, region arguments and existing input aliases cannot donate.
+- Compatible source copies are forced to materialize so donation cannot
+  accidentally overwrite their original source.
+- Casts internal to Repeat can donate. Carried outputs and their possible
+  zero-copy aliases cannot: Repeat would bind the shifted allocation to the
+  previous iteration's input before that input was necessarily consumed.
+- Low represents the displacement explicitly with `ShiftedAlias`. Placement
+  resolves alias and Repeat address equalities together, rejects inconsistent
+  offsets, aligns the backing allocation, and reserves its full union.
+- The allocator retains the whole union for the combined lifetime and applies
+  bank conflicts to it conservatively. Consumed-tail release and member-specific
+  bank conflicts are not implemented. The memory profile displays this actual
+  reservation, including the prefix.
+- Mid memory accounting includes one prefix per physical shard and retains the
+  aliased input's full size/lifetime. Compute estimates sum the chunk calls.
+- Capacity baselines enable eligible donation. Local search compares both
+  policies for layout proposals, since a slightly slower cast may enable a
+  faster complete plan. Saved recipes retain the choice; older states load
+  with the previous schema's defaults.
 
-1. Allow storage donation only at the input's last use, with compatible memory
-   addressing classes. Surviving aliases and additional consumers forbid it.
-2. Represent the relative source/output offsets and their overlapping backing
-   storage explicitly. Current alias groups share a base and reserve their
-   maximum extent across the combined lifetime; that is insufficient for the
-   shifted view and precise release of consumed input.
-3. Lower compatible casts into sequential complete-panel chunks, with descriptors
-   adjusted for chunk extents and padding. Keep the existing disjoint variant.
-4. Account for launch/join/setup costs and alignment. Requiring a 32 KiB-aligned
-   union can itself worsen fragmentation. A more flexible offset/chunk selection
-   could relax that requirement, but is not needed to demonstrate feasibility.
-5. Preserve downstream GEMM element-separation requirements on the live FP8
-   output, rather than unnecessarily excluding every element ever occupied by
-   the FP16 input. Retaining the whole union to the output's last use would be
-   correct but could lose memory opportunities elsewhere.
+This supports row-major-to-row-major and AMP-left-to-AMP-left conversion.
+It does not implement overlapping row-major-to-AMP packing. The previously
+rejected late-cast BS2 plan uses that combined conversion and is not fixed by
+this implementation. Shapes whose FP8 allocation is at most 32 KiB are excluded
+because the prefix would not save space.
 
-The device arithmetic change is small or unnecessary. The main work is a precise
-storage-overlap contract and chunk lowering, followed by hardware correctness and
-cycle tests. This is broader than relaxing a placement alignment or changing one
-cast branch, but does not require an arbitrary in-place permutation engine.
+## Hardware measurements
+
+Command (with the SDK environment loaded):
+
+```sh
+target/release/cast_check --sdk "$POPLAR_SDK_ENABLED" --in-place-only   --output artifacts/shifted-cast-20260912/hardware
+```
+
+36 cases cover three matrix shapes, both orders, three aligned base addresses,
+and disjoint/shifted execution. **3,797,568 checked bytes passed bitwise**,
+including guards and input bytes outside the overwritten output. Arithmetic is
+unchanged; no modified device kernel is required.
+
+| Shape | Order | Disjoint cycles | Shifted cycles | Overhead |
+|---|---|---:|---:|---:|
+| 164 × 384 | Row-major | 16,458 | 17,112 | 4.0% |
+| 164 × 384 | AMP-left | 24,174 | 25,464 | 5.3% |
+| 97 × 512 | Row-major | 13,134 | 13,788 | 5.0% |
+| 97 × 512 | AMP-left | 23,334 | 24,624 | 5.5% |
+| 128 × 512 | Row-major | 17,106 | 17,760 | 3.8% |
+| 128 × 512 | AMP-left | 27,174 | 28,464 | 4.7% |
+
+All three base addresses gave identical cycles. The replaced same-base
+164 × 384 AMP-left version took 34,836 cycles, versus 25,464 now.
+
+Compiler tests check physical offsets, bank separation of every generated call,
+complete output coverage, parameter preservation, multiple shards per tile,
+legacy conversion selection, Repeat exclusions, and inconsistent alias cycles.

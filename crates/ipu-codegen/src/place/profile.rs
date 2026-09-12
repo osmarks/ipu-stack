@@ -97,14 +97,16 @@ fn collect(
             &grouped,
             &members[index],
             &analysis.root_of_member,
+            &analysis.member_offsets,
             &analysis.root_requirements,
             &analysis.root_lifetimes,
             &analysis.conflicts,
         )?;
         for request in requests {
             let first_root = request.assignments[0].0;
-            let base =
-                placement.shard_addresses[&program.shards[members[index][&first_root][0]].id];
+            let base = placement.shard_addresses
+                [&program.shards[members[index][&first_root][0]].id]
+                - analysis.member_offsets[members[index][&first_root][0]];
             let end = base
                 + if base >= IPU21_INTERLEAVED_MEMORY_BASE {
                     request.region1_stride.map_or(request.bytes, |stride| {
@@ -116,14 +118,24 @@ fn collect(
             for (i, &(root, _)) in request.assignments.iter().enumerate() {
                 let group = &members[index][&root];
                 let shard = &program.shards[group[0]];
-                let start = placement.shard_addresses[&shard.id];
+                let start =
+                    placement.shard_addresses[&shard.id] - analysis.member_offsets[group[0]];
                 let next = request.assignments.get(i + 1).map_or(end, |&(root, _)| {
                     placement.shard_addresses[&program.shards[members[index][&root][0]].id]
+                        - analysis.member_offsets[members[index][&root][0]]
                 });
-                let bytes = allocation_bytes(program, group, analysis.root_requirements[&root])?;
+                let bytes = allocation_bytes(
+                    program,
+                    group,
+                    &analysis.member_offsets,
+                    analysis.root_requirements[&root],
+                )?;
                 let payload = group
                     .iter()
-                    .map(|&member| shard_storage_bytes(&program.shards[member]))
+                    .map(|&member| {
+                        shard_storage_bytes(&program.shards[member])
+                            .map(|bytes| bytes + analysis.member_offsets[member])
+                    })
                     .collect::<Result<Vec<_>, _>>()?
                     .into_iter()
                     .max()

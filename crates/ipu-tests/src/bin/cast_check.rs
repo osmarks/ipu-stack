@@ -19,6 +19,9 @@ struct Arguments {
     /// Compare a historical kernel which cannot pack row-major input.
     #[arg(long)]
     existing_layouts_only: bool,
+    /// Compare shifted overlapping casts with disjoint casts, including guards.
+    #[arg(long)]
+    in_place_only: bool,
     #[arg(long, default_value = "c600-init.ipucfg")]
     configuration: PathBuf,
     #[arg(long, default_value = "artifacts/fp8-cast/check")]
@@ -94,6 +97,9 @@ fn main() -> Result<()> {
         (184, 96), // Largest cast in the full B1 ViT profile.
         (7, 1024), // Row-major stride exceeds packed-stride encoding.
     ] {
+        if args.in_place_only {
+            break;
+        }
         for mode in 0..10 {
             if (mode == 6 && rows > 97)
                 || (mode >= 7 && (columns != 64 || !(5..=7).contains(&rows)))
@@ -245,7 +251,134 @@ fn main() -> Result<()> {
                             },
                         })],
                     });
-                    cases.push((rows, columns, mode, placement, scale));
+                    cases.push((rows, columns, mode, placement, i32::from(scale)));
+                }
+            }
+        }
+    }
+    if args.in_place_only {
+        for (rows, columns) in [(164u32, 384u32), (97, 512), (128, 512)] {
+            for packed in [false, true] {
+                for offset in [0, 32768, 65536] {
+                    for in_place in [false, true] {
+                        let tile = programs.len() as u16;
+                        let input_address = 0x88000 + offset;
+                        let output_address = if in_place {
+                            input_address - 32768
+                        } else {
+                            0xc0000
+                        };
+                        let count = rows * columns;
+                        let logical = (0..count).map(|_| rng.u8(0..128)).collect::<Vec<_>>();
+                        let mut input = vec![0u16; count as usize];
+                        let mut result = vec![0u8; count as usize];
+                        for row in 0..rows {
+                            for col in 0..columns {
+                                let x = logical[(row * columns + col) as usize];
+                                let src = if packed {
+                                    col / 16 * rows * 16 + row * 16 + col % 16
+                                } else {
+                                    row * columns + col
+                                };
+                                let dst = if packed {
+                                    col / 32 * rows * 32 + row * 32 + col % 32
+                                } else {
+                                    row * columns + col
+                                };
+                                input[src as usize] =
+                                    half::f16::from_f32(ipu_codegen::f143::f143_to_f32(x, 0))
+                                        .to_bits();
+                                result[dst as usize] = x;
+                            }
+                        }
+                        let input = input
+                            .into_iter()
+                            .flat_map(u16::to_le_bytes)
+                            .collect::<Vec<_>>();
+                        let span = if in_place {
+                            32768 + input.len()
+                        } else {
+                            result.len()
+                        };
+                        let mut initial = vec![0xa5; span + 16];
+                        if in_place {
+                            initial[8 + 32768..8 + 32768 + input.len()].copy_from_slice(&input);
+                        } else {
+                            data.push(TileProgramData {
+                                tile,
+                                address: input_address,
+                                data: input,
+                            });
+                        }
+                        let mut wanted = initial.clone();
+                        wanted[8..8 + result.len()].copy_from_slice(&result);
+                        data.push(TileProgramData {
+                            tile,
+                            address: output_address - 8,
+                            data: initial,
+                        });
+                        data.push(TileProgramData {
+                            tile,
+                            address: 0x7f000,
+                            data: vec![0; 8],
+                        });
+                        slices.push(RegionSlice {
+                            tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                            tile_address: output_address - 8,
+                            file_offset: expected.len() as u64,
+                            size: wanted.len() as u64,
+                        });
+                        expected.extend(wanted);
+                        let cast = |src, dst, elements, first: bool, last: bool| {
+                            TileStep::Compute(ComputeStep {
+                                symbol: "cast_check".into(),
+                                input_addresses: vec![TileAddress::Absolute(src)],
+                                output_address: TileAddress::Absolute(dst),
+                                arguments: vec![
+                                    elements,
+                                    0,
+                                    0,
+                                    if packed { rows } else { 0 },
+                                    elements,
+                                    0,
+                                ],
+                                profile: StepProfile {
+                                    before: first.then_some(0x7f000),
+                                    after: last.then_some(0x7f004),
+                                },
+                            })
+                        };
+                        let mut steps = Vec::new();
+                        if in_place {
+                            let atom = if packed { rows * 64 } else { columns * 2 };
+                            let mut consumed = 0;
+                            while consumed < count * 2 {
+                                let input_start = 32768 + consumed;
+                                let output_start = consumed / 2;
+                                let available = (input_start / 32768 * 32768 - output_start) * 2;
+                                let bytes = (available / atom * atom).min(count * 2 - consumed);
+                                assert!(bytes > 0);
+                                steps.push(cast(
+                                    input_address + consumed,
+                                    output_address + consumed / 2,
+                                    bytes / 2,
+                                    consumed == 0,
+                                    consumed + bytes == count * 2,
+                                ));
+                                consumed += bytes;
+                            }
+                        } else {
+                            steps.push(cast(input_address, output_address, count, true, true));
+                        }
+                        programs.push(TileProgram { tile, steps });
+                        cases.push((
+                            rows,
+                            columns,
+                            u32::from(packed),
+                            if in_place { "shifted" } else { "disjoint" },
+                            offset as i32,
+                        ));
+                    }
                 }
             }
         }

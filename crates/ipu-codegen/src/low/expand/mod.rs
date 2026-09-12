@@ -10,6 +10,7 @@ mod materialize;
 
 mod buffers;
 mod conversion;
+mod cast;
 mod copies;
 mod gemm;
 mod mapping;

@@ -106,6 +106,13 @@ impl TileGraphBuilder {
         if self.storage_root(shard) != self.storage_root(view.shard) {
             return Ok(false);
         }
+        // Different alias origins need translated byte coordinates. Conservatively
+        // retain ordering here; these casts already form a compute boundary.
+        if crate::storage_location(&self.shards, shard).1
+            != crate::storage_location(&self.shards, view.shard).1
+        {
+            return Ok(true);
+        }
         let (rows, bytes, stride) = match copy.pattern {
             CopyPattern::Contiguous => (1, copy.bytes, 0),
             CopyPattern::Strided {

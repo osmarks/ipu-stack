@@ -111,6 +111,7 @@ pub(super) fn optimize<T: Send>(
             )
             .collect::<Vec<_>>();
         pending.sort_by_key(|candidate| candidate.program.estimated_cycles);
+        pending.dedup_by(|a, b| a.program == b.program);
         pending.truncate(budget_end - state.attempts);
         if pending.is_empty() {
             break;
@@ -261,7 +262,9 @@ fn proposals(graph: &ComputeGraph, config: &PipelineConfig, incumbent: &Baseline
     }
     let mut operations = Vec::new();
     visit(graph.operations(), &mut operations);
-    let mut candidates = Vec::new();
+    // Include the incumbent so its opposite cast-storage policy is considered
+    // alongside the paired layout changes below. Visited recipes are filtered.
+    let mut candidates = vec![incumbent.recipe.clone()];
     for rows in [32, 64, 128, 256] {
         if incumbent.recipe.packing_rows != Some(rows) {
             let mut recipe = incumbent.recipe.clone();
@@ -335,7 +338,18 @@ fn proposals(graph: &ComputeGraph, config: &PipelineConfig, incumbent: &Baseline
             candidates.push(recipe);
         }
     }
+    // Storage donation can enable a faster layout even though the cast itself
+    // is slower. Evaluate it with each layout proposal, not only as an isolated
+    // change that the cycle-improvement screen would always discard.
     candidates
+        .into_iter()
+        .flat_map(|recipe| {
+            let mut alternate = recipe.clone();
+            alternate.in_place_casts =
+                Some(!recipe.in_place_casts.unwrap_or(config.capacity_baseline));
+            [recipe, alternate]
+        })
+        .collect()
 }
 
 #[cfg(test)]

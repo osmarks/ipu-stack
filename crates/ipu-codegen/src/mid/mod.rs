@@ -3,6 +3,7 @@
 
 pub(crate) mod baseline;
 mod copy;
+pub(crate) mod cast;
 mod elementwise;
 pub mod optimistic;
 mod packing;

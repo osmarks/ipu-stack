@@ -10,6 +10,8 @@ pub(crate) struct Recipe {
     pub packing_rows: Option<u16>,
     pub parallel_reductions: usize,
     pub disjoint_copy_sources: bool,
+    #[serde(default)]
+    pub in_place_casts: Option<bool>,
 }
 
 pub(crate) struct Baseline {
@@ -49,6 +51,9 @@ pub(crate) fn lower(
         selected.program = program
             .with_disjoint_copy_sources(config.diagnostic_checkpoints)
             .unwrap_or(program);
+    }
+    if recipe.in_place_casts.unwrap_or(config.capacity_baseline) && !config.diagnostic_checkpoints {
+        selected.program.reuse_cast_inputs();
     }
     let (cycles, peak) = crate::estimate::analyze_mid(&selected.program, &BTreeMap::new())
         .ok_or(LoweringError::InvalidImplementation)?;

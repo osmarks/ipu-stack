@@ -173,6 +173,8 @@ pub enum Primitive {
         product: Option<ProductAxes>,
         /// (Result index, input index) pairs sharing an allocation. Inputs may
         /// include lifetime dependencies beyond the kernel's explicit operands.
+        /// Shrinking casts donate storage with a displacement chosen in low;
+        /// other kernels use the same byte origin.
         output_aliases: Vec<(usize, usize)>,
     },
     /// Independent partials occupy an explicit tensor axis. The selected

@@ -150,6 +150,16 @@ fn analyze_storage<const PER_TILE: bool>(
     } else {
         1
     };
+    let shifted_inputs = steps
+        .iter()
+        .filter_map(|(operation, _)| {
+            matches!(&operation.kind, MidOperationKind::Primitive(Primitive::Compute {
+            kernel: TileKernelSpec::Cast { from: Precision::F16, to: Precision::F8F143 { .. } },
+            output_aliases, ..
+        }) if output_aliases == &[(0, 0)])
+            .then(|| operation.inputs[0])
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     let mut bytes = vec![vec![0u64; tiles]; parent.len()];
     let mut classes = vec![MemoryClass::Ipu21Standard; parent.len()];
     for value in &program.values {
@@ -178,6 +188,12 @@ fn analyze_storage<const PER_TILE: bool>(
         } else {
             1
         };
+        let mut prefixes = vec![0u64; usize::from(layout.tiling.tile_count)];
+        if shifted_inputs.contains(&value.id) {
+            for (owner, _) in resolved.shard_extents().ok()? {
+                prefixes[usize::from(owner)] += u64::from(crate::mid::cast::CAST_PREFIX_BYTES);
+            }
+        }
         for owner in 0..owners {
             let elements = if PER_TILE {
                 resolved.tile_elements(owner)
@@ -189,7 +205,13 @@ fn analyze_storage<const PER_TILE: bool>(
                 continue;
             }
             let tile = (usize::from(owner) + usize::from(value.tile_offset)) % tiles;
+            let prefix = if PER_TILE {
+                prefixes[usize::from(owner)]
+            } else {
+                prefixes.iter().copied().max().unwrap_or(0)
+            };
             let size = shard
+                .checked_add(prefix)?
                 .checked_add(tail[id])?
                 .div_ceil(alignment)
                 .checked_mul(alignment)?;
@@ -286,8 +308,7 @@ fn analyze_storage<const PER_TILE: bool>(
             }
             accounted[id] = live[id];
         }
-        // Reduction and conversion scratch in operation_cost is proportional
-        // to the output shard, and resides on that output's owners.
+        // Ordinary kernel scratch scales with output ownership.
         let mut tile_scratch = vec![MemoryUsage::default(); tiles];
         if !PER_TILE {
             tile_scratch[0] = scratch;
@@ -369,7 +390,7 @@ pub(crate) fn operation_cost(
             kernel,
             operands,
             product,
-            ..
+            output_aliases,
         }) => {
             let mut inputs = operation
                 .inputs
@@ -419,6 +440,27 @@ pub(crate) fn operation_cost(
                 super::primitive::Geometry::Tensor(&out),
             )
             .saturating_mul(calls);
+            if matches!(
+                kernel,
+                TileKernelSpec::Cast {
+                    from: Precision::F16,
+                    to: Precision::F8F143 { .. }
+                }
+            ) && output_aliases == &[(0, 0)]
+            {
+                let chunks =
+                    crate::mid::cast::CastChunks::new(out.format.layout.order, &out.shape.0)?;
+                price.total = 0;
+                for (start, end) in chunks.ranges {
+                    out.shape.0[chunks.axis] = end - start;
+                    inputs[0].shape.0[chunks.axis] = end - start;
+                    price.total += super::primitive::kernel_cycles(
+                        &kernel,
+                        |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
+                        super::primitive::Geometry::Tensor(&out),
+                    );
+                }
+            }
         }
         MidOperationKind::Primitive(Primitive::Sum { axis, staging }) => {
             let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);
