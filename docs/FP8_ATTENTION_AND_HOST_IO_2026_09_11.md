@@ -206,3 +206,27 @@ longer than the original capture. All three resident checks pass at cosine
 the profiled executable, not the unprofiled host-loop package. Both HTML files
 are standalone. The artifact directory includes the raw profile, memory JSON,
 a checked Chromium screenshot and reproduction instructions in `README.md`.
+
+## Batch-two follow-up (September 12)
+
+The 27-layer batch-two configuration still fails before local optimization, both
+with profiling (56.327 s) and without it (52.342 s). Settings match the preceding
+full-model checks, with batch changed to two. Neither reaches hardware execution.
+Logs and the initial memory estimates are in
+`artifacts/batch2-check-20260912/{full27,unprofiled27}/`.
+
+In the unprofiled run, logical tile 506 first fails to allocate a 62,984-byte
+replicated FP8 activation in lifetime order. Its size-ordered retry fails on an
+82,944-byte persistent QKV-weight sequence: 27 layer shards of 3,072 bytes,
+with one weight replica. Persistent-eligible free ranges total 83,632 bytes,
+but the largest hole is 42,408 bytes. An additional 4,344 bytes in the host
+aperture cannot hold persistent weights. This is a failure of this partial
+placement, not proof that a different complete placement or layout cannot fit.
+The optimizer requires a successfully packaged initial plan before searching.
+
+The optimized batch-one map does contain real headroom: counting address ranges
+never occupied at any phase, the minimum is 62,160 bytes, the median 97,068,
+and the maximum 469,732. Stacked reuse rows do not add capacity. They are packed
+by address overlap, not globally ordered by execution time. For example, tile
+0's end-of-execution host aperture reservation occupies row 26, while rows
+27–32 contain earlier allocations at different addresses, used at steps 237–301.
