@@ -1,203 +1,248 @@
 //! Select ownership rotations before expanding the low schedule.
-
 use super::*;
 
 impl MidProgram {
-    /// Offer independent reduction results on disjoint owner sets when their
-    /// immediately grouped copies need local preparation. Keep this a candidate:
-    /// moving the reduction roots can increase exchange or SRAM costs.
+    /// Rotate independent preparation sources, including inside Repeat bodies.
     pub(super) fn with_disjoint_copy_sources(&self, checkpoints: bool) -> Option<Self> {
-        let storage_groups = self
-            .values
-            .iter()
-            .map(|value| value.storage_group)
-            .collect::<Vec<_>>();
-        let mut uses = vec![0; self.values.len()];
-        let mut sums = BTreeSet::new();
-        for operation in &self.operations {
-            for input in operation.read_values() {
-                uses[storage_groups[input.index() as usize].index() as usize] += 1;
-            }
-            if matches!(
-                operation.kind,
-                MidOperationKind::Primitive(Primitive::Sum { .. })
-            ) {
-                sums.extend(operation.results.iter().copied());
-            }
-        }
-        let mut result = self.clone();
-        let mut changed = false;
-        let mut index = 0;
-        while index < self.operations.len() {
-            let count =
-                independent_copy_prefix(&self.operations[index..], checkpoints, &storage_groups);
-            let sources = self.operations[index..index + count]
-                .iter()
-                .filter_map(|operation| {
-                    let MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) =
-                        &operation.kind
-                    else {
-                        return None;
-                    };
-                    let input = *operation.inputs.first()?;
-                    let value = &self.values[input.index() as usize];
-                    (mapping.view.is_some()
-                        && sums.contains(&input)
-                        && uses[value.storage_group.index() as usize] == 1
-                        && !self.outputs.iter().any(|output| {
-                            self.values[output.index() as usize].storage_group
-                                == value.storage_group
-                        })
-                        && value.tensor_type.format.layout.order
-                            == ElementOrder::Amp(AmpOrder::TransposedLeft))
-                    .then_some(input)
-                })
-                .collect::<Vec<_>>();
-            let total = sources.iter().map(|&id| self.owner_count(id)).sum::<u32>();
-            if sources.len() > 1 && total <= u32::from(self.tile_count) {
-                changed |= result.rotate_owners(
-                    &sources,
-                    self.values[sources[0].index() as usize].tile_offset,
-                );
-            }
-            index += count.max(1);
-        }
-        changed.then_some(result)
+        self.with_owner_changes(|ops, values, required| {
+            disjoint_sources(ops, values, required, self.tile_count, checkpoints)
+        })
     }
 
-    /// Delay independent sums until their producers have all run. Only move
-    /// results consumed through explicit copies: direct compute operands retain
-    /// the owner alignment selected by their implementation.
+    /// Group independent reductions without crossing a region boundary.
     pub(super) fn with_overlapped_reductions(&self, limit: usize) -> Option<Self> {
-        let groups = self
-            .values
-            .iter()
-            .map(|v| v.storage_group)
-            .collect::<Vec<_>>();
-        let accesses = |ids: &[MidValueId]| {
-            ids.iter()
-                .map(|id| groups[id.index() as usize])
-                .collect::<BTreeSet<_>>()
-        };
-        let conflicts = |a: &MidOperation, b: &MidOperation| {
-            let ar = accesses(&a.inputs);
-            let aw = accesses(&a.results);
-            let br = accesses(&b.inputs);
-            let bw = accesses(&b.results);
-            !aw.is_disjoint(&br) || !aw.is_disjoint(&bw) || !ar.is_disjoint(&bw)
-        };
-        let eligible = |op: &MidOperation| {
-            let [output] = op.results.as_slice() else {
-                return false;
-            };
-            if !matches!(op.kind, MidOperationKind::Primitive(Primitive::Sum { .. })) {
-                return false;
-            }
-            let group = groups[output.index() as usize];
-            if self
-                .outputs
-                .iter()
-                .any(|id| groups[id.index() as usize] == group)
-            {
-                return false;
-            }
-            let mut used = false;
-            for consumer in &self.operations {
-                if consumer
-                    .read_values()
-                    .any(|id| groups[id.index() as usize] == group)
-                {
-                    used = true;
-                    if !matches!(
-                        consumer.kind,
-                        MidOperationKind::Primitive(Primitive::Copy { .. })
-                    ) {
-                        return false;
-                    }
+        self.with_owner_changes(|ops, values, required| {
+            overlap_reductions(ops, values, required, self.tile_count, limit)
+        })
+    }
+
+    fn with_owner_changes(
+        &self,
+        mut change: impl FnMut(&mut Vec<MidOperation>, &mut [MidValue], &[MidValueId]) -> bool,
+    ) -> Option<Self> {
+        fn region(
+            operations: &mut Vec<MidOperation>,
+            values: &mut [MidValue],
+            required: &[MidValueId],
+            change: &mut impl FnMut(&mut Vec<MidOperation>, &mut [MidValue], &[MidValueId]) -> bool,
+        ) -> bool {
+            let mut changed = false;
+            for op in operations.iter_mut() {
+                if let MidOperationKind::Repeat(repeat) = &mut op.kind {
+                    changed |= region(
+                        &mut repeat.body.operations,
+                        values,
+                        &repeat.body.yields,
+                        change,
+                    );
                 }
             }
-            used
-        };
+            change(operations, values, required) || changed
+        }
         let mut result = self.clone();
-        let mut changed = false;
-        let mut start = 0;
-        while start < result.operations.len() {
-            if !eligible(&result.operations[start]) {
-                start += 1;
-                continue;
+        region(
+            &mut result.operations,
+            &mut result.values,
+            &result.outputs,
+            &mut change,
+        )
+        .then_some(result)
+    }
+}
+
+fn disjoint_sources(
+    operations: &[MidOperation],
+    values: &mut [MidValue],
+    required: &[MidValueId],
+    tile_count: u16,
+    checkpoints: bool,
+) -> bool {
+    let storage_groups = values
+        .iter()
+        .map(|value| value.storage_group)
+        .collect::<Vec<_>>();
+    let mut uses = vec![0; values.len()];
+    let mut sums = BTreeSet::new();
+    for operation in operations.iter() {
+        for input in operation.read_values() {
+            uses[storage_groups[input.index() as usize].index() as usize] += 1;
+        }
+        if matches!(
+            operation.kind,
+            MidOperationKind::Primitive(Primitive::Sum { .. })
+        ) {
+            sums.extend(operation.results.iter().copied());
+        }
+    }
+    let mut changed = false;
+    let mut index = 0;
+    while index < operations.len() {
+        let count = independent_copy_prefix(&operations[index..], checkpoints, &storage_groups);
+        let sources = operations[index..index + count]
+            .iter()
+            .filter_map(|operation| {
+                let MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) = &operation.kind
+                else {
+                    return None;
+                };
+                let input = *operation.inputs.first()?;
+                let value = &values[input.index() as usize];
+                (mapping.view.is_some()
+                    && sums.contains(&input)
+                    && uses[value.storage_group.index() as usize] == 1
+                    && !required.iter().any(|output| {
+                        values[output.index() as usize].storage_group == value.storage_group
+                    })
+                    && value.tensor_type.format.layout.order
+                        == ElementOrder::Amp(AmpOrder::TransposedLeft))
+                .then_some(input)
+            })
+            .collect::<Vec<_>>();
+        let total = sources
+            .iter()
+            .map(|&id| owner_count(values, id))
+            .sum::<u32>();
+        if sources.len() > 1 && total <= u32::from(tile_count) {
+            let offset = values[sources[0].index() as usize].tile_offset;
+            changed |= rotate_owners(values, tile_count, &sources, offset);
+        }
+        index += count.max(1);
+    }
+    changed
+}
+
+fn overlap_reductions(
+    operations: &mut Vec<MidOperation>,
+    values: &mut [MidValue],
+    required: &[MidValueId],
+    tile_count: u16,
+    limit: usize,
+) -> bool {
+    let groups = values.iter().map(|v| v.storage_group).collect::<Vec<_>>();
+    let accesses = |ids: &[MidValueId]| {
+        ids.iter()
+            .map(|id| groups[id.index() as usize])
+            .collect::<BTreeSet<_>>()
+    };
+    let conflicts = |a: &MidOperation, b: &MidOperation| {
+        let ar = accesses(&a.inputs);
+        let aw = accesses(&a.results);
+        let br = accesses(&b.inputs);
+        let bw = accesses(&b.results);
+        !aw.is_disjoint(&br) || !aw.is_disjoint(&bw) || !ar.is_disjoint(&bw)
+    };
+    let mut eligible = BTreeSet::new();
+    let mut used = BTreeSet::new();
+    let mut forbidden = required
+        .iter()
+        .map(|id| groups[id.index() as usize])
+        .collect::<BTreeSet<_>>();
+    for op in operations.iter() {
+        if matches!(op.kind, MidOperationKind::Primitive(Primitive::Sum { .. }))
+            && op.results.len() == 1
+        {
+            eligible.insert(groups[op.results[0].index() as usize]);
+        }
+        for input in op.read_values() {
+            let group = groups[input.index() as usize];
+            used.insert(group);
+            if !matches!(op.kind, MidOperationKind::Primitive(Primitive::Copy { .. })) {
+                forbidden.insert(group);
             }
-            let mut selected = vec![start];
-            let owners = |op: &MidOperation| self.owner_count(op.results[0]);
-            let mut total = owners(&result.operations[start]);
-            for next in start + 1..result.operations.len() {
-                let operation = &result.operations[next];
-                if selected.len() >= limit
-                    || !(matches!(
-                        operation.kind,
-                        MidOperationKind::Primitive(Primitive::Copy { .. } | Primitive::Sum { .. })
-                    ) || matches!(&operation.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, product: Some(_), .. }) if output_aliases.is_empty()))
-                    || selected
-                        .iter()
-                        .any(|&index| conflicts(&result.operations[index], operation))
-                {
+        }
+    }
+    eligible.retain(|group| used.contains(group) && !forbidden.contains(group));
+    let eligible = |op: &MidOperation| {
+        op.results.len() == 1
+            && matches!(op.kind, MidOperationKind::Primitive(Primitive::Sum { .. }))
+            && eligible.contains(&groups[op.results[0].index() as usize])
+    };
+    let mut changed = false;
+    let mut start = 0;
+    while start < operations.len() {
+        if !eligible(&operations[start]) {
+            start += 1;
+            continue;
+        }
+        let mut selected = vec![start];
+        let owners = |op: &MidOperation| owner_count(values, op.results[0]);
+        let mut total = owners(&operations[start]);
+        for next in start + 1..operations.len() {
+            let operation = &operations[next];
+            if selected.len() >= limit
+                || !(matches!(
+                    operation.kind,
+                    MidOperationKind::Primitive(Primitive::Copy { .. } | Primitive::Sum { .. })
+                ) || matches!(&operation.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, product: Some(_), .. }) if output_aliases.is_empty()))
+                || selected
+                    .iter()
+                    .any(|&index| conflicts(&operations[index], operation))
+            {
+                break;
+            }
+            if eligible(operation) {
+                total += owners(operation);
+                if total > u32::from(tile_count) {
                     break;
                 }
-                if eligible(operation) {
-                    total += owners(operation);
-                    if total > u32::from(self.tile_count) {
-                        break;
-                    }
-                    selected.push(next);
-                }
+                selected.push(next);
             }
-            if selected.len() < 2 {
-                start += 1;
-                continue;
-            }
-            let insertion = selected.last().copied().unwrap() + 1 - selected.len();
-            let mut sums = Vec::new();
-            for index in selected.into_iter().rev() {
-                sums.push(result.operations.remove(index));
-            }
-            sums.reverse();
-            result.rotate_owners(
-                &sums.iter().map(|sum| sum.results[0]).collect::<Vec<_>>(),
-                self.values[sums[0].results[0].index() as usize].tile_offset,
-            );
-            start = insertion + sums.len();
-            result.operations.splice(insertion..insertion, sums);
-            changed = true;
         }
-        changed.then_some(result)
-    }
-
-    fn owner_count(&self, value: MidValueId) -> u32 {
-        u32::from(
-            self.values[value.index() as usize]
-                .tensor_type
-                .format
-                .layout
-                .tiling
-                .tile_count,
-        )
-    }
-
-    /// Rotate complete alias groups together; callers check the combined owner count.
-    fn rotate_owners(&mut self, sources: &[MidValueId], mut offset: u16) -> bool {
-        let mut changed = false;
-        for &source in sources {
-            let group = self.values[source.index() as usize].storage_group;
-            for alias in &mut self.values {
-                if alias.storage_group == group {
-                    changed |= alias.tile_offset != offset;
-                    alias.tile_offset = offset;
-                }
-            }
-            offset = ((u32::from(offset) + self.owner_count(source)) % u32::from(self.tile_count))
-                as u16;
+        if selected.len() < 2 {
+            start += 1;
+            continue;
         }
-        changed
+        let insertion = selected.last().copied().unwrap() + 1 - selected.len();
+        let mut sums = Vec::new();
+        for index in selected.into_iter().rev() {
+            sums.push(operations.remove(index));
+        }
+        sums.reverse();
+        let offset = values[sums[0].results[0].index() as usize].tile_offset;
+        rotate_owners(
+            values,
+            tile_count,
+            &sums.iter().map(|sum| sum.results[0]).collect::<Vec<_>>(),
+            offset,
+        );
+        start = insertion + sums.len();
+        operations.splice(insertion..insertion, sums);
+        changed = true;
     }
+    changed
+}
+
+fn owner_count(values: &[MidValue], value: MidValueId) -> u32 {
+    u32::from(
+        values[value.index() as usize]
+            .tensor_type
+            .format
+            .layout
+            .tiling
+            .tile_count,
+    )
+}
+
+/// Rotate complete alias groups together; callers check the combined owner count.
+fn rotate_owners(
+    values: &mut [MidValue],
+    tile_count: u16,
+    sources: &[MidValueId],
+    mut offset: u16,
+) -> bool {
+    let mut changed = false;
+    for &source in sources {
+        let group = values[source.index() as usize].storage_group;
+        for alias in values
+            .iter_mut()
+            .filter(|alias| alias.storage_group == group)
+        {
+            changed |= alias.tile_offset != offset;
+            alias.tile_offset = offset;
+        }
+        offset = ((u32::from(offset) + owner_count(values, source)) % u32::from(tile_count)) as u16;
+    }
+    changed
 }
 
 /// Keep small broadcasts in transfer-sized chunks rather than eight-byte
@@ -583,6 +628,54 @@ mod tests {
         assert_eq!(overlapped.operations[1].results, [MidValueId(0)]);
         assert_eq!(overlapped.operations[2].results, [MidValueId(1)]);
         assert_eq!(overlapped.values[1].tile_offset, 4);
+        // The same transformations must work in the repeated encoder, while
+        // treating its yields as externally live values.
+        let wrap = |mut body: MidProgram, yields: Vec<MidValueId>| {
+            let operations = std::mem::take(&mut body.operations);
+            body.outputs.clear();
+            body.operations.push(MidOperation {
+                source: None,
+                inputs: vec![],
+                results: vec![],
+                kind: MidOperationKind::Repeat(MidRepeat {
+                    count: 27,
+                    carried_inputs: 0,
+                    invariant_inputs: 0,
+                    iterated_inputs: vec![],
+                    body: MidRegion {
+                        arguments: vec![],
+                        operations,
+                        yields,
+                        estimated_cycles: 0,
+                        peak_memory: MemoryPeaks::default(),
+                    },
+                }),
+                estimated_cycles: 0,
+                estimated_exchange_cycles: 0,
+            });
+            body
+        };
+        let repeated = wrap(program.clone(), vec![]);
+        let rotated_repeat = repeated.with_disjoint_copy_sources(true).unwrap();
+        assert_eq!(rotated_repeat.values, rotated.values);
+        let repeated = wrap(delayed.clone(), vec![]);
+        let grouped_repeat = repeated.with_overlapped_reductions(2).unwrap();
+        let MidOperationKind::Repeat(repeat) = &grouped_repeat.operations[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(repeat.body.operations, overlapped.operations);
+        assert_eq!(grouped_repeat.values, overlapped.values);
+        assert!(
+            wrap(program.clone(), vec![MidValueId(1)])
+                .with_disjoint_copy_sources(true)
+                .is_none()
+        );
+        assert!(
+            wrap(delayed.clone(), vec![MidValueId(1)])
+                .with_overlapped_reductions(2)
+                .is_none()
+        );
+
         assert!(delayed.with_overlapped_reductions(1).is_none());
         delayed.operations[1].kind = MidOperationKind::Primitive(Primitive::Compute {
             kernel: TileKernelSpec::Gelu,
