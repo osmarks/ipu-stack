@@ -53,6 +53,30 @@ previous unoptimized resident latency was 18.455 ms, so the optimized measured
 latency is 14.0% lower. These are short host-timed samples, not cycle captures.
 The two compiler runs overlapped on the host, with 24 Rayon threads each.
 
+### Historical timing comparison
+
+The earlier [resident benchmark](FP8_ATTENTION_AND_HOST_IO_2026_09_11.md#full-model-measurements)
+used two polling modes. Comparing its busy-poll figure with the new default-poll
+figure incorrectly suggests a regression:
+
+| Host polling | Historical full batch-one model | New batch-one model |
+|---|---:|---:|
+| 100 µs sleep | 9.635 ms | 9.054 ms |
+| Busy polling | 8.720 ms | 8.017 ms |
+
+The new busy-poll replay (`bs1/busy.log`) takes 8.040 and 7.992 ms and passes exact
+output comparisons, averaging 124.7 images/s. It is 8.1% faster than the earlier
+busy-poll mean. Historical timings cover twenty calls; the new timings cover two,
+so these host-wall-time percentages should not be read as precise cycle deltas.
+The historical 8.558 ms cropped execution profile also excludes host I/O and
+belongs to a separate profiled package.
+
+Consistently, the final placed-program estimate fell from 13,382,689 cycles in
+`artifacts/fp8-attention-20260911/resident27/run.log` to 12,062,025 now (9.9%).
+Estimated exchange cycles fell from 6,017,366 to 5,063,733, and encoded exchange
+storage from 39,864 to 30,504 B/tile. Thus neither the comparable host timing nor
+the detailed estimates support a batch-one performance regression.
+
 The batch-one build started before the padding fix, alongside its diagnosis. Its
 PV grid pads to 768 and does not read the statistics; it passed both hardware
 calls and replay. The batch-two build uses the fix and reselects the formerly
