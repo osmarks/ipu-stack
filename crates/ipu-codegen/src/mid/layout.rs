@@ -1,9 +1,10 @@
 //! Tensor formats, ownership, padding, and logical shard geometry.
 
 use super::*;
+use serde::{Deserialize, Serialize};
 
 /// In-memory representation of one tensor element.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Precision {
     /// F143 values scaled by a tensor-wide power of two.
     F8F143 {
@@ -28,7 +29,9 @@ impl Precision {
 /// The order is part of the operand and output layouts because it determines
 /// which tensor coordinates occupy adjacent logical (and therefore paired
 /// physical) tiles.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub enum GridOrder {
     #[default]
     ColumnsFast,
@@ -36,7 +39,7 @@ pub enum GridOrder {
 }
 
 /// AMP packing role. Block dimensions are recorded by [`AxisTiling`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AmpOrder {
     Left,
     /// A semantic `[K, N]` matrix packed as the left operand `[N, K]`.
@@ -54,7 +57,7 @@ pub enum AmpOrder {
 /// Unlike [`AmpOrder`], this is an SRAM storage layout rather than an AMP
 /// operand micro-layout. Kernels route each naturally ordered group into the
 /// required AMP register slots with `ld*putcs` destination permutations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BlockMajorOrder {
     /// The final two semantic axes are `[rows, columns]`.
     Matrix { row_block: u16, column_block: u16 },
@@ -68,7 +71,7 @@ pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
 pub(super) const AMP_WIDE_OUTPUT_COLUMN_BLOCK: u32 = 128;
 pub const AMP_COLUMN_MICRO: u32 = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ElementOrder {
     RowMajor,
     BlockMajor(BlockMajorOrder),
@@ -178,7 +181,7 @@ impl ElementOrder {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryClass {
     Ipu21Standard,
     Ipu21Interleaved,
@@ -187,7 +190,7 @@ pub enum MemoryClass {
 /// Maximum per-tile bytes attributed to each address/load class. The classes
 /// share physical tile SRAM, so feasibility must check both the individual
 /// interleaved-region limit and their combined size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorAxis {
     FromStart(u16),
     FromEnd(u16),
@@ -207,14 +210,14 @@ impl TensorAxis {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Padding {
     Reject,
     Zero,
 }
 
 /// Blocking and distribution of one logical tensor axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AxisTiling {
     pub axis: TensorAxis,
     /// Number of contiguous partitions distributed across the tile group.
@@ -278,7 +281,7 @@ impl AxisTiling {
 }
 
 /// Logical tile group and the tensor axes distributed or blocked within it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TensorTiling {
     pub tile_count: u16,
     pub replicas: u16,
@@ -325,7 +328,7 @@ impl TensorTiling {
 
 /// Layout decisions which constrain operators and exchange generation without
 /// assigning physical tile identities or SRAM addresses.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Layout {
     pub order: ElementOrder,
     pub tiling: TensorTiling,
@@ -866,7 +869,7 @@ pub enum LayoutError {
     InvalidTileMapping,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TensorFormat {
     pub precision: Precision,
     pub layout: Layout,

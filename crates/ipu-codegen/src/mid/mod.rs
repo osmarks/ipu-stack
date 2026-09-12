@@ -92,6 +92,10 @@ pub struct PipelineConfig {
     /// Parallel speculation can validate later proposals that an earlier
     /// improvement invalidates; these do not advance the search.
     pub optimization_steps: usize,
+    /// Resume a compatible mid-plan search checkpoint; steps are additional.
+    pub load_search_state: Option<std::path::PathBuf>,
+    /// Atomically save completed search progress after each selection.
+    pub save_search_state: Option<std::path::PathBuf>,
     /// Prefer distributed boundaries and conversion-inclusive memory costs.
     /// Experimental: smaller tensor peaks can still require larger exchange rows.
     pub capacity_baseline: bool,
@@ -199,6 +203,8 @@ impl PipelineConfig {
             gemm_precisions: BTreeMap::new(),
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
+            load_search_state: None,
+            save_search_state: None,
             capacity_baseline: false,
             exchange_stream_words: None,
             operator_candidate_limit: 64,

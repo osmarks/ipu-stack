@@ -1,7 +1,8 @@
 //! Deterministic whole-device lowering with explicit, canonical boundaries.
 use super::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
     pub open_boundaries: BTreeSet<ValueId>,

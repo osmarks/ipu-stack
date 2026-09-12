@@ -1,14 +1,15 @@
 //! Executable operator and conversion contracts, plus their validation.
 
 use super::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccumulationPrecision {
     F16,
     F32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MidOperator {
     Gemm {
         options: GemmOptions,
@@ -27,7 +28,7 @@ pub enum MidOperator {
 }
 
 /// A tile-local callable selected by a whole-device operator plan.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileKernelSpec {
     /// Physical byte range initialized during tile expansion.
     FillZero {
@@ -86,20 +87,22 @@ pub enum TileKernelSpec {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GemmKernelMode {
     Initialize,
     Accumulate,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GemmWeightLoad {
     Standard,
     Interleaved,
 }
 
 /// Physical matrix orientation used by a blocked GEMM implementation.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub enum GemmOrientation {
     #[default]
     Normal,
@@ -128,7 +131,7 @@ impl GemmOrientation {
 
 /// Shape-independent recipe which expands into ordered device-wide exchange
 /// and tile-kernel phases after concrete shards are known.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OperatorDispatch {
     LayerNorm {
         parts: u16,
@@ -157,7 +160,7 @@ pub enum OperatorDispatch {
     View,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeferredOutputPlan {
     pub source_input: usize,
     pub transform: AxisFactorView,
@@ -175,7 +178,7 @@ pub struct DeferredInputPlan {
 }
 
 /// Which operand remains resident while a blocked whole-device GEMM is run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GemmDistribution {
     #[default]
     OutputStationary,
@@ -198,7 +201,7 @@ pub enum GemmDistribution {
 
 /// Per-batch product partition counts. Physical tile identities and local calls
 /// remain the responsibility of low expansion.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProductGrid {
     pub rows: u16,
     pub columns: u16,
@@ -206,7 +209,9 @@ pub struct ProductGrid {
 }
 
 /// Lifetime policy for partials reduced across a GEMM's K partitions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub enum ReductionStaging {
     /// Receive every remote partial into one packed buffer, then reduce once.
     #[default]
@@ -311,7 +316,7 @@ impl OperatorDispatch {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperandRequirement {
     pub format: TensorFormat,
     pub alignment: u32,
@@ -325,14 +330,16 @@ pub struct OperandRequirement {
     pub materialization: OperandMaterialization,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 pub enum LocalOperandStaging {
     #[default]
     Direct,
     MatchRemote,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum OperandMaterialization {
     #[default]
     Complete,
@@ -366,13 +373,13 @@ impl OperandRequirement {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OutputAliasing {
     Fresh,
     MayAliasInputs(Vec<u16>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryOperand {
     Output,
     Input(u16),
@@ -437,7 +444,7 @@ pub(super) fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -
 
 /// Operand storage and access constraints, shared by operator plans and
 /// concrete kernel calls. A call binds formats to its actual operand buffers.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StorageRequirements {
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
@@ -445,7 +452,7 @@ pub struct StorageRequirements {
     pub distinct_elements: Vec<Vec<MemoryOperand>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,

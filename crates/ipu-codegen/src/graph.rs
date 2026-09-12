@@ -36,6 +36,7 @@ mod builder;
 mod view;
 pub use view::AxisFactorView;
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Logical tensor dimensions. Shapes are semantic graph information; storage
@@ -54,7 +55,7 @@ impl TensorShape {
 }
 
 /// Stable identity of an operation, used for diagnostics and transformations.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationId(u32);
 
 impl OperationId {
@@ -67,7 +68,7 @@ impl OperationId {
 ///
 /// Consumers refer to values rather than operations because an operation may
 /// have zero, one, or several results.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId(u32);
 
 impl ValueId {
@@ -134,7 +135,7 @@ pub enum OperationKind {
 }
 
 /// A contiguous logical window along one tensor axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AxisSlice {
     pub axis: usize,
     pub start: u32,
@@ -152,13 +153,13 @@ impl AxisSlice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GemmOptions {
     pub transpose_left: bool,
     pub transpose_right: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AttentionScale {
     #[default]
     InverseSqrtQueryWidth,
@@ -178,7 +179,7 @@ impl AttentionScale {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AttentionOptions {
     pub causal: bool,
     pub scale: AttentionScale,

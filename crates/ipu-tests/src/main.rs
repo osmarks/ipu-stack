@@ -155,6 +155,12 @@ struct Arguments {
     /// Maximum ordered local improvement steps; later candidates may be built speculatively.
     #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
     optimization_steps: usize,
+    /// Resume saved mid-plan search; optimization steps are additional on resume.
+    #[arg(long, conflicts_with = "reuse_package")]
+    load_search_state: Option<PathBuf>,
+    /// Save completed search progress atomically, including after each improvement.
+    #[arg(long, conflicts_with = "reuse_package")]
+    save_search_state: Option<PathBuf>,
     /// Use the experimental capacity-first baseline before local optimization.
     #[arg(long)]
     capacity_baseline: bool,
@@ -730,6 +736,8 @@ fn main() -> Result<()> {
         pipeline = pipeline.with_operator_candidate_limit(width);
     }
     pipeline.optimization_steps = arguments.optimization_steps;
+    pipeline.load_search_state = arguments.load_search_state.clone();
+    pipeline.save_search_state = arguments.save_search_state.clone();
     pipeline.capacity_baseline = arguments.capacity_baseline;
     pipeline.exchange_stream_words = arguments.exchange_stream_words;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;

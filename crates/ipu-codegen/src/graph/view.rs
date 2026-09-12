@@ -1,13 +1,14 @@
 //! Logical view geometry, shared by materialization and bounded dispatch slices.
 
 use super::TensorShape;
+use serde::{Deserialize, Serialize};
 
 /// Move a factor from one axis into another, preserving the other axes.
 /// For example `(split_axis=2, merge_axis=0, factor=H)` maps
 /// `[B, R, H*C]` to `[B*H, R, C]`. Its inverse joins heads back into
 /// contiguous column groups; swapping the two axes instead interleaves columns.
 /// Axis positions and rank are unrestricted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AxisFactorView {
     pub split_axis: usize,
     pub merge_axis: usize,

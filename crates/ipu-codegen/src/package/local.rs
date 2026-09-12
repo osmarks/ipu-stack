@@ -1,4 +1,6 @@
 //! One validated incumbent; bounded proposals replace it only after packaging.
+mod checkpoint;
+
 use super::*;
 use crate::mid::baseline::{self, Baseline, Recipe};
 use std::sync::Arc;
@@ -13,20 +15,43 @@ pub(super) fn optimize<T: Send>(
     let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
     let mut schedules =
         crate::ExchangeScheduleCache::with_stream_words(config.exchange_stream_words);
-    let mut incumbent = baseline::lower(graph, config, &costs, &Recipe::default())?;
+    let mut state = checkpoint::State::load(graph, config, tile_mapping)?;
+    let mut fixed = config.clone();
+    let resuming = config.load_search_state.is_some();
+    if resuming {
+        fixed.inputs = state.inputs.clone();
+    }
+    let mut incumbent = baseline::lower(graph, &fixed, &costs, &state.recipe)?;
+    if resuming {
+        incumbent.alternatives = state.alternatives.clone();
+    }
     memory_profile(graph, config, &incumbent.program, "baseline")?;
     let (mut selected, mut cycles, mut artifact) = validate(
         &incumbent.program,
         config,
-        tile_mapping,
+        state.mapping.as_deref(),
         Arc::clone(&expansions),
         &mut schedules,
         &finalize,
     )?;
-    tracing::info!(cycles, "validated canonical baseline");
-    let mut mapping = tile_mapping.map(<[u16]>::to_vec);
-    let mut attempts_used = 0;
-    if config.optimization_steps != 0 && mapping.is_none() {
+    tracing::info!(cycles, resuming, "validated search incumbent");
+    let budget_end = state
+        .attempts
+        .checked_add(config.optimization_steps)
+        .ok_or_else(|| invalid("search step budget overflow"))?;
+    // Fix logical homes once, including on a baseline-only checkpoint.
+    for (input, planned) in graph.inputs().iter().zip(&incumbent.program.inputs) {
+        fixed.inputs.insert(
+            input.value,
+            incumbent.program.values[planned.value.index() as usize]
+                .tensor_type
+                .format
+                .clone(),
+        );
+    }
+    state.save(config, &incumbent, &fixed)?;
+    if config.optimization_steps != 0 && !state.mapping_checked && state.mapping.is_none() {
+        state.mapping_checked = true;
         let challenger =
             match placement::model_mapping(&selected.program, &selected.placement, true) {
                 Ok((_, challenger)) => challenger,
@@ -36,7 +61,7 @@ pub(super) fn optimize<T: Send>(
                 }
             };
         if let Some(challenger) = challenger {
-            attempts_used += 1;
+            state.attempts += 1;
             match validate(
                 &incumbent.program,
                 config,
@@ -54,7 +79,7 @@ pub(super) fn optimize<T: Send>(
                     selected = plan;
                     cycles = improved;
                     artifact = built;
-                    mapping = Some(challenger);
+                    state.mapping = Some(challenger);
                 }
                 Ok(_) => tracing::info!("retained incumbent tile mapping"),
                 Err(error) => tracing::info!(%error, "retained feasible tile mapping"),
@@ -62,28 +87,16 @@ pub(super) fn optimize<T: Send>(
         }
     }
 
-    // Preserve logical homes, not their physical addresses. All proposals use
-    // joint placement after support reservations; scratch has no separate arena.
-    let mut fixed = config.clone();
-    for (input, planned) in graph.inputs().iter().zip(&incumbent.program.inputs) {
-        fixed.inputs.insert(
-            input.value,
-            incumbent.program.values[planned.value.index() as usize]
-                .tensor_type
-                .format
-                .clone(),
-        );
-    }
-    let mut visited = Vec::<Recipe>::new();
-    while attempts_used < config.optimization_steps {
+    state.save(config, &incumbent, &fixed)?;
+    while state.attempts < budget_end {
         // Indexed collection preserves proposal order for equal-cost ties.
         let mut pending = proposals(graph, config, &incumbent)
             .par_iter()
-            .filter(|recipe| !visited.contains(recipe))
+            .filter(|recipe| !state.visited.contains(recipe))
             .filter_map(
                 |recipe| match baseline::lower(graph, &fixed, &costs, recipe) {
                     Ok(candidate)
-                        if !visited.contains(&candidate.recipe)
+                        if !state.visited.contains(&candidate.recipe)
                             && candidate.program.estimated_cycles
                                 < incumbent.program.estimated_cycles =>
                     {
@@ -98,7 +111,7 @@ pub(super) fn optimize<T: Send>(
             )
             .collect::<Vec<_>>();
         pending.sort_by_key(|candidate| candidate.program.estimated_cycles);
-        pending.truncate(config.optimization_steps - attempts_used);
+        pending.truncate(budget_end - state.attempts);
         if pending.is_empty() {
             break;
         }
@@ -107,7 +120,7 @@ pub(super) fn optimize<T: Send>(
                 graph,
                 &fixed,
                 &candidate.program,
-                &format!("local-{}-candidate-{index}", attempts_used),
+                &format!("local-{}-candidate-{index}", state.attempts),
             )?;
         }
         tracing::info!(
@@ -123,13 +136,13 @@ pub(super) fn optimize<T: Send>(
             .par_iter()
             .enumerate()
             .map(|(index, candidate)| {
-                let attempt = attempts_used + index;
+                let attempt = state.attempts + index;
                 let span = tracing::info_span!("local_candidate", attempt);
                 let _entered = span.enter();
                 let result = validate(
                     &candidate.program,
                     &fixed,
-                    mapping.as_deref(),
+                    state.mapping.as_deref(),
                     Arc::clone(&expansions),
                     &mut schedules.clone(),
                     &finalize,
@@ -151,16 +164,22 @@ pub(super) fn optimize<T: Send>(
             .find_first(Option::is_some)
             .flatten();
         let Some((index, plan, candidate_cycles, built)) = winner else {
-            break;
+            state.attempts += pending.len();
+            state
+                .visited
+                .extend(pending.into_iter().map(|candidate| candidate.recipe));
+            state.save(config, &incumbent, &fixed)?;
+            // A truncated shortlist may have further unevaluated proposals.
+            continue;
         };
-        visited.extend(
+        state.visited.extend(
             pending[..=index]
                 .iter()
                 .map(|candidate| candidate.recipe.clone()),
         );
         let mut candidate = pending.swap_remove(index);
         tracing::info!(
-            attempt = attempts_used + index,
+            attempt = state.attempts + index,
             before = cycles,
             after = candidate_cycles,
             changed_operations = ?candidate.recipe.plans.iter().filter_map(|(id, plan)|
@@ -169,7 +188,7 @@ pub(super) fn optimize<T: Send>(
                 .map(|id| id.index()).collect::<Vec<_>>(),
             "accepted local layout improvement"
         );
-        attempts_used += index + 1;
+        state.attempts += index + 1;
         for (id, alternatives) in incumbent.alternatives {
             candidate.alternatives.entry(id).or_insert(alternatives);
         }
@@ -178,6 +197,7 @@ pub(super) fn optimize<T: Send>(
         selected = plan;
         cycles = candidate_cycles;
         artifact = built;
+        state.save(config, &incumbent, &fixed)?;
     }
     Ok((selected, artifact))
 }
@@ -336,6 +356,77 @@ mod tests {
             .with_automatic_input(up, Precision::F16)
             .with_automatic_input(down, Precision::F16);
         (graph, config)
+    }
+
+    #[test]
+    fn saved_search_resumes_the_same_ordered_path() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                let (graph, mut config) = mlp();
+                let path =
+                    std::env::temp_dir().join(format!("ipu-search-{}.json", fastrand::u64(..)));
+                let cost = |plan: &mut ScheduledPlan| Ok((plan.program.estimated_cycles, ()));
+                config.optimization_steps = 4;
+                let uninterrupted = optimize(&graph, &config, None, cost).unwrap().0;
+                config.optimization_steps = 2;
+                config.save_search_state = Some(path.clone());
+                optimize(&graph, &config, None, cost).unwrap();
+                let before = checkpoint::State::load(
+                    &graph,
+                    &PipelineConfig {
+                        load_search_state: Some(path.clone()),
+                        ..config.clone()
+                    },
+                    None,
+                )
+                .unwrap();
+                assert!(before.attempts > 0);
+                config.load_search_state = Some(path.clone());
+                let resumed = optimize(&graph, &config, None, cost).unwrap().0;
+                assert_eq!(resumed.program, uninterrupted.program);
+                assert_eq!(resumed.placement, uninterrupted.placement);
+                assert_eq!(resumed.phases, uninterrupted.phases);
+                // A zero-step load still rebuilds and validates the saved winner.
+                config.optimization_steps = 0;
+                let rebuilt = optimize(&graph, &config, None, cost).unwrap().0;
+                assert_eq!(rebuilt.program, resumed.program);
+                config.exchange_table_budget_bytes += 4;
+                assert!(
+                    optimize::<()>(&graph, &config, None, |_| panic!(
+                        "incompatible state reached validation"
+                    ))
+                    .is_err()
+                );
+                std::fs::remove_file(path).unwrap();
+            });
+    }
+
+    #[test]
+    fn rejected_recipes_survive_checkpoint_resume() {
+        let (graph, mut config) = mlp();
+        let path = std::env::temp_dir().join(format!("ipu-search-{}.json", fastrand::u64(..)));
+        config.optimization_steps = 1;
+        config.save_search_state = Some(path.clone());
+        for _ in 0..2 {
+            let first = std::sync::atomic::AtomicBool::new(true);
+            optimize(&graph, &config, None, |_| {
+                if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    Ok((1, ()))
+                } else {
+                    Err(invalid("test candidate fails placement"))
+                }
+            })
+            .unwrap();
+            config.load_search_state = Some(path.clone());
+        }
+        let state = checkpoint::State::load(&graph, &config, None).unwrap();
+        assert_eq!(state.attempts, 2);
+        assert_eq!(state.visited.len(), 2);
+        assert!(state.visited[0] != state.visited[1]);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
