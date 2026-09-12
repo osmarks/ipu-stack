@@ -105,6 +105,21 @@ pub struct ExchangeScheduleSnapshot {
     /// Optional compiler provenance for offline diagnostics; ignored by scheduling.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub phase_labels: BTreeMap<u32, String>,
+    /// All movement classes in a fused phase, before physical span expansion.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_traffic: BTreeMap<u32, BTreeMap<String, ExchangeTrafficSummary>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExchangeTrafficSummary {
+    pub logical_transfers: u64,
+    /// Source payload counted once per movement class. A multicast spanning
+    /// different destination classes contributes to each; do not sum as wire traffic.
+    pub transmitted_bytes: u64,
+    /// Payload delivered to all receivers in this class; additive across classes.
+    pub received_bytes: u64,
+    pub source_tiles: BTreeSet<u16>,
+    pub destination_tiles: BTreeSet<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +300,54 @@ pub(crate) fn capture_exchange_schedule(
         schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
         tile_count: program.tile_count,
         phases,
+        phase_traffic: program
+            .exchange_phases
+            .iter()
+            .map(|phase| {
+                let mut groups = BTreeMap::<String, ExchangeTrafficSummary>::new();
+                for transfer in &phase.transfers {
+                    let source = &program.shards[transfer.source.shard.index() as usize];
+                    let order = transfer.span_order(&program.shards);
+                    let bytes =
+                        crate::view_byte_traversal(source, &transfer.source, order)?.byte_len();
+                    let describe = |shard: &crate::BlockValue, view: &crate::ShardView| {
+                        let widths = |extents: &[crate::ShardExtent]| {
+                            extents
+                                .iter()
+                                .map(|e| e.physical_end - e.start)
+                                .collect::<Vec<_>>()
+                        };
+                        format!(
+                            "{:?} {:?}; shard={:?}; view={:?}",
+                            shard.tensor_type.shape,
+                            shard.tensor_type.format,
+                            widths(&shard.extents),
+                            widths(&view.extents)
+                        )
+                    };
+                    let source_label = describe(source, &transfer.source);
+                    let mut receivers = BTreeMap::<String, Vec<u16>>::new();
+                    for view in &transfer.destinations {
+                        let target = &program.shards[view.shard.index() as usize];
+                        receivers
+                            .entry(describe(target, view))
+                            .or_default()
+                            .push(target.tile);
+                    }
+                    for (target, tiles) in receivers {
+                        let entry = groups
+                            .entry(format!("{order:?}: {source_label} -> {target}"))
+                            .or_default();
+                        entry.logical_transfers += 1;
+                        entry.transmitted_bytes += bytes;
+                        entry.received_bytes += bytes * tiles.len() as u64;
+                        entry.source_tiles.insert(source.tile);
+                        entry.destination_tiles.extend(tiles);
+                    }
+                }
+                Ok((phase.id.index(), groups))
+            })
+            .collect::<Result<_, ExchangeLoweringError>>()?,
         phase_labels: program
             .exchange_phases
             .iter()
@@ -584,6 +647,7 @@ pub(crate) fn lower_exchanges_cached(
                 tile_count: program.tile_count,
                 phases: schedule_phases,
                 phase_labels: BTreeMap::new(),
+                phase_traffic: BTreeMap::new(),
             },
         }
     })

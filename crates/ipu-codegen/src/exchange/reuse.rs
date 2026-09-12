@@ -73,6 +73,7 @@ impl ExchangeScheduleCache {
             tile_count,
             phases: Vec::new(),
             phase_labels: BTreeMap::new(),
+            phase_traffic: BTreeMap::new(),
         }
         .validate()?;
         let topology = Topology::new(

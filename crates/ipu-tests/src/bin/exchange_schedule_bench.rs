@@ -325,6 +325,7 @@ fn main() -> Result<()> {
                 tile_count: snapshot.tile_count,
                 phases: selected_problems,
                 phase_labels: snapshot.phase_labels.clone(),
+                phase_traffic: snapshot.phase_traffic.clone(),
             },
         )?;
     }
