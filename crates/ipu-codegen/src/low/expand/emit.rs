@@ -45,25 +45,9 @@ impl TileGraphBuilder {
         }
         let formats = inputs
             .iter()
-            .map(|operand| {
-                let view = operand
-                    .views
-                    .first()
-                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                Ok(self.shards[view.shard.index() as usize]
-                    .tensor_type
-                    .format
-                    .clone())
-            })
+            .map(|operand| format(operand).cloned())
             .collect::<ExpansionResult<Vec<_>>>()?;
-        let requirements = KernelRequirements::new(
-            &kernel,
-            formats,
-            self.shards[output.shard.index() as usize]
-                .tensor_type
-                .format
-                .clone(),
-        );
+        let requirements = KernelRequirements::new(&kernel, formats, output_format.clone());
         let run = KernelRun::new(provenance, kernel, inputs, output, requirements);
         self.kernel_metadata.push(Arc::clone(&run.metadata));
         Ok(run)
@@ -85,24 +69,12 @@ impl TileGraphBuilder {
         order: CopyOrder,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        let transfers = transfers
-            .into_iter()
-            .map(|(source, mut destinations)| {
-                destinations.sort_unstable();
-                destinations.dedup();
-                LogicalExchange {
-                    source,
-                    destinations,
-                    order,
-                }
-            })
-            .collect::<Vec<_>>();
-        self.append_exchange_phase(transfers, provenance, tiles)
+        self.append_mixed_phase(std::iter::once((order, transfers)), provenance, tiles)
     }
 
     pub(super) fn append_mixed_phase(
         &mut self,
-        mappings: BTreeMap<CopyOrder, BTreeMap<ShardView, Vec<ShardView>>>,
+        mappings: impl IntoIterator<Item = (CopyOrder, BTreeMap<ShardView, Vec<ShardView>>)>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
