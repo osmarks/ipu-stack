@@ -1,4 +1,5 @@
 //! Preserve live residuals while fusing their addition with local statistics.
+use super::rewrite::{apply_edits, producer_through_copies, same_storage};
 use super::*;
 
 pub(super) fn fuse(
@@ -34,12 +35,9 @@ pub(super) fn fuse(
         let Some(&input) = current.inputs.first() else {
             continue;
         };
-        let Some((sum, previous, identity_copies)) = super::elementwise::producer_through_copies(
-            input,
-            &operations[..index],
-            values,
-            !ordinary,
-        ) else {
+        let Some((sum, previous, identity_copies)) =
+            producer_through_copies(input, &operations[..index], values, !ordinary)
+        else {
             continue;
         };
         if removed.contains(&previous) {
@@ -64,7 +62,7 @@ pub(super) fn fuse(
             || tensor.format.layout.order != ElementOrder::RowMajor
             || add.inputs[..2]
                 .iter()
-                .any(|v| !super::elementwise::same_storage(&values[v.index() as usize], value))
+                .any(|v| !same_storage(&values[v.index() as usize], value))
         {
             continue;
         }
@@ -81,14 +79,13 @@ pub(super) fn fuse(
         {
             continue;
         }
-        let redistributed =
-            !super::elementwise::same_storage(value, &values[input.index() as usize]);
+        let redistributed = !same_storage(value, &values[input.index() as usize]);
         let old_value_count = values.len();
         let mut stats_value = None;
         let mut statistic_parts = 1;
         let stats = if ordinary {
             if current.results.len() != 1
-                || !super::elementwise::same_storage(
+                || !same_storage(
                     &values[current.results[0].index() as usize],
                     &values[input.index() as usize],
                 )
@@ -214,7 +211,7 @@ pub(super) fn fuse(
             }
         }
         if let Some(copy) = stats_copy {
-            preparation.insert(index, copy);
+            preparation.insert(index, vec![copy]);
         }
         operations[previous] = fused;
         if ordinary {
@@ -224,16 +221,7 @@ pub(super) fn fuse(
         }
         changed = true;
     }
-    *operations = std::mem::take(operations)
-        .into_iter()
-        .enumerate()
-        .flat_map(|(index, op)| {
-            preparation
-                .remove(&index)
-                .into_iter()
-                .chain((!removed.contains(&index)).then_some(op))
-        })
-        .collect();
+    apply_edits(operations, &removed, preparation);
     changed
 }
 

@@ -148,12 +148,7 @@ pub(super) fn compose(
         }
         producers.insert(output, index);
     }
-    let mut index = 0;
-    operations.retain(|_| {
-        let keep = !removed.contains(&index);
-        index += 1;
-        keep
-    });
+    super::rewrite::apply_edits(operations, &removed, BTreeMap::new());
 }
 
 #[cfg(test)]

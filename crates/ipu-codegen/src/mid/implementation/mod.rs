@@ -98,10 +98,7 @@ pub(crate) fn implement(
         .iter()
         .map(|v| v.tensor_type.format.layout.tiling.tile_count)
         .max()?;
-    let (cycles, peak) = crate::estimate::analyze_mid(&b.program, &BTreeMap::new())?;
-    b.program.estimated_cycles = cycles.total;
-    b.program.estimated_exchange_cycles = cycles.exchange;
-    b.program.peak_memory = peak;
+    b.program.refresh_estimates()?;
     Some(Arc::new(b.program))
 }
 

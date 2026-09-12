@@ -12,10 +12,7 @@ impl MidProgram {
         ) {
             return None;
         }
-        let (cycles, peak) = crate::estimate::analyze_mid(&result, &BTreeMap::new())?;
-        result.estimated_cycles = cycles.total;
-        result.estimated_exchange_cycles = cycles.exchange;
-        result.peak_memory = peak;
+        result.refresh_estimates()?;
         Some(result)
     }
 }

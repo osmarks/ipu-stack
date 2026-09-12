@@ -1,4 +1,5 @@
 //! Fuse compatible whole-device primitives before physical expansion.
+use super::rewrite::{apply_edits, producer_through_copies, same_storage, single_use_producers};
 use super::*;
 
 impl MidProgram {
@@ -10,13 +11,10 @@ impl MidProgram {
             return None;
         }
         let (before, _) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
-        let (after, peak) = crate::estimate::analyze_mid(&result, &BTreeMap::new())?;
-        if after.total >= before.total {
+        result.refresh_estimates()?;
+        if result.estimated_cycles >= before.total {
             return None;
         }
-        result.estimated_cycles = after.total;
-        result.estimated_exchange_cycles = after.exchange;
-        result.peak_memory = peak;
         Some(result)
     }
 }
@@ -32,19 +30,7 @@ fn fuse_region(
             changed |= fuse_region(&mut repeat.body.operations, values, &repeat.body.yields);
         }
     }
-    let mut users = BTreeMap::<MidValueId, BTreeSet<usize>>::new();
-    let mut producers = BTreeMap::new();
-    for (index, operation) in operations.iter().enumerate() {
-        for &input in operation.read_values() {
-            users.entry(input).or_default().insert(index);
-        }
-        for &output in &operation.results {
-            producers.insert(output, index);
-        }
-    }
-    for &output in required {
-        users.entry(output).or_default().insert(usize::MAX);
-    }
+    let producers = single_use_producers(operations, required);
     let mut removed = BTreeSet::new();
     for index in 0..operations.len() {
         let current = &operations[index];
@@ -71,7 +57,7 @@ fn fuse_region(
         let Some(&previous) = producers.get(&input) else {
             continue;
         };
-        if previous >= index || users.get(&input).is_none_or(|uses| uses.len() != 1) {
+        if previous >= index {
             continue;
         }
         let add = &operations[previous];
@@ -157,62 +143,8 @@ fn fuse_region(
         removed.insert(previous);
         changed = true;
     }
-    let mut index = 0;
-    operations.retain(|_| {
-        let keep = !removed.contains(&index);
-        index += 1;
-        keep
-    });
+    apply_edits(operations, &removed, BTreeMap::new());
     changed
-}
-
-pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
-    a.tile_offset == b.tile_offset
-        && a.tensor_type.format.precision == b.tensor_type.format.precision
-        && a.tensor_type.format.layout.order == b.tensor_type.format.layout.order
-        && a.tensor_type.format.layout.memory_class == b.tensor_type.format.layout.memory_class
-        && implementation::same_distribution(&a.tensor_type, &b.tensor_type)
-}
-
-/// Walk coordinate-preserving copies, optionally requiring identical storage.
-/// Callers check extra readers and intervening writes before rewriting them.
-pub(super) fn producer_through_copies(
-    mut value: MidValueId,
-    operations: &[MidOperation],
-    values: &[MidValue],
-    identity_only: bool,
-) -> Option<(MidValueId, usize, Vec<usize>)> {
-    let mut copies = vec![];
-    loop {
-        let index = operations.iter().rposition(|op| op.results == [value])?;
-        let op = &operations[index];
-        let identity = match &op.kind {
-            MidOperationKind::Convert(_) => true,
-            MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => {
-                *mapping == CoordinateMapping::default()
-            }
-            _ => false,
-        };
-        if !identity
-            || op.inputs.len() != 1
-            || values[value.index() as usize].tensor_type.shape
-                != values[op.inputs[0].index() as usize].tensor_type.shape
-            || values[value.index() as usize].tensor_type.format.precision
-                != values[op.inputs[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .precision
-            || (identity_only
-                && !same_storage(
-                    &values[value.index() as usize],
-                    &values[op.inputs[0].index() as usize],
-                ))
-        {
-            return Some((value, index, copies));
-        }
-        copies.push(index);
-        value = op.inputs[0];
-    }
 }
 
 // A producer may write a cast's explicit result when its F16 intermediate
@@ -226,32 +158,7 @@ fn fuse_fp8_outputs(
     let mut preparation = BTreeMap::<usize, Vec<MidOperation>>::new();
     for index in 0..operations.len() {
         let cast = operations[index].clone();
-        let local_cast = match &cast.kind {
-            MidOperationKind::Convert(plan) => plan.strategy == ConversionStrategy::LocalKernel,
-            MidOperationKind::Primitive(Primitive::Compute {
-                kernel: TileKernelSpec::Cast { .. },
-                operands,
-                product: None,
-                output_aliases,
-            }) => operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty(),
-            _ => false,
-        };
-        if !local_cast
-            || cast.inputs.len() != 1
-            || cast.results.len() != 1
-            || values[cast.inputs[0].index() as usize]
-                .tensor_type
-                .format
-                .precision
-                != Precision::F16
-            || !matches!(
-                values[cast.results[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .precision,
-                Precision::F8F143 { .. }
-            )
-        {
+        if super::rewrite::fp8_cast(&cast, values).is_none() {
             continue;
         }
         let Some((intermediate, previous, identity_copies)) =
@@ -484,17 +391,7 @@ fn fuse_fp8_outputs(
         removed.insert(previous);
     }
     let changed = !removed.is_empty();
-    *operations = std::mem::take(operations)
-        .into_iter()
-        .enumerate()
-        .flat_map(|(index, op)| {
-            let mut prefix = preparation.remove(&index).unwrap_or_default();
-            if !removed.contains(&index) {
-                prefix.push(op);
-            }
-            prefix
-        })
-        .collect();
+    apply_edits(operations, &removed, preparation);
     changed
 }
 

@@ -585,7 +585,6 @@ fn build_package_from_objects(
                         code_address: sizing_code_address,
                         initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
                         final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
-                        ..CodegenOptions::default()
                     },
                 )?;
                 Ok::<_, PackageBuildError>(u32::try_from(generated.bytes.len())?)
@@ -836,7 +835,6 @@ fn build_package_from_objects(
                         code_address,
                         initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
                         final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
-                        ..CodegenOptions::default()
                     },
                 )?)
             })

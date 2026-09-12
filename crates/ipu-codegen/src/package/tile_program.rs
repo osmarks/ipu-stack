@@ -226,7 +226,7 @@ pub fn build_tile_program_package(
         .ok_or_else(|| invalid("host program size underflow"))?;
     let host_code = allocate_package_code(&mut memory, "host programs", host_code_bytes, 8, 0)?;
     protect_executable_elements(&mut memory, [host_code.range.clone()])?;
-    let host_ranges = memory.free_ranges(host_bounds.clone());
+    let host_ranges = memory.free_ranges(host_bounds);
     let host = host::plan(
         &[],
         std::slice::from_ref(&launch),

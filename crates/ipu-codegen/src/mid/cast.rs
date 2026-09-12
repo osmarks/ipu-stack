@@ -93,19 +93,7 @@ fn donate(
             _ => {}
         }
     }
-    let mut users = BTreeMap::<MidValueId, u32>::new();
-    let mut producers = BTreeMap::new();
-    for (index, op) in operations.iter().enumerate() {
-        for &input in op.read_values() {
-            *users.entry(input).or_default() += 1;
-        }
-        for &output in &op.results {
-            producers.insert(output, index);
-        }
-    }
-    for &value in required {
-        *users.entry(value).or_default() += 1;
-    }
+    let producers = super::rewrite::single_use_producers(operations, required);
     for index in 0..operations.len() {
         if let MidOperationKind::Repeat(repeat) = &mut operations[index].kind {
             donate(
@@ -116,23 +104,10 @@ fn donate(
             );
             continue;
         }
-        let op = &operations[index];
-        let local_cast = matches!(&op.kind, MidOperationKind::Primitive(Primitive::Compute {
-            kernel: TileKernelSpec::Cast { from: Precision::F16, to: Precision::F8F143 { .. } },
-            product: None, operands, output_aliases,
-        }) if operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty())
-            || matches!(&op.kind, MidOperationKind::Convert(plan)
-                if plan.strategy == ConversionStrategy::LocalKernel
-                && plan.input.format.precision == Precision::F16
-                && matches!(plan.output.format.precision, Precision::F8F143 { .. }));
-        if !local_cast {
-            continue;
-        }
-        let ([input], [output]) = (op.inputs.as_slice(), op.results.as_slice()) else {
+        let Some((input, output)) = super::rewrite::fp8_cast(&operations[index], values) else {
             continue;
         };
-        let (input, output) = (*input, *output);
-        if bound.contains(&output) || users.get(&input) != Some(&1) {
+        if bound.contains(&output) {
             continue;
         }
         let Some(&producer) = producers.get(&input).filter(|&&p| p < index) else {

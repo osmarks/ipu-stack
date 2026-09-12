@@ -77,7 +77,7 @@ impl Builder {
                     .iter_mut()
                     .find(|dim| dim.axis.resolve(output.shape.0.len()) == Ok(output_row))?;
                 *target = rows;
-                let mut right_staging = right_type.clone();
+                let mut right_staging = right_type;
                 let mut inner = *axis(&left_type, left_inner)?;
                 inner.axis = TensorAxis::FromStart(right_inner as u16);
                 inner.tile_stride = Some(column_partitions);

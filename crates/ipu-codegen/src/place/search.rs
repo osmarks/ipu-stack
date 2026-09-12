@@ -157,7 +157,6 @@ fn solve(
         .map(|request| {
             request
                 .domains(&arena.ranges, arena.interleaved_offset)
-                .into_iter()
                 .map(|(_, d)| d)
                 .collect()
         })

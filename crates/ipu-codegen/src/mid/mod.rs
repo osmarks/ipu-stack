@@ -2,12 +2,13 @@
 //! Tile enumeration occurs only after selection, in low expansion.
 
 pub(crate) mod baseline;
-mod copy;
 pub(crate) mod cast;
+mod copy;
 mod elementwise;
 pub mod optimistic;
 mod packing;
 mod residual;
+mod rewrite;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 mod primitive;
@@ -445,6 +446,17 @@ pub enum LoweringError {
 }
 
 pub type LoweringResult<T> = std::result::Result<T, LoweringError>;
+
+impl MidProgram {
+    /// Refresh derived costs after constructing or rewriting a complete program.
+    pub(super) fn refresh_estimates(&mut self) -> Option<()> {
+        let (cycles, peak) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
+        self.estimated_cycles = cycles.total;
+        self.estimated_exchange_cycles = cycles.exchange;
+        self.peak_memory = peak;
+        Some(())
+    }
+}
 
 #[cfg(test)]
 mod tests;

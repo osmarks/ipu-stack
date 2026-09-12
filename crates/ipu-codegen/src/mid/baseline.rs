@@ -55,11 +55,10 @@ pub(crate) fn lower(
     if recipe.in_place_casts.unwrap_or(config.capacity_baseline) && !config.diagnostic_checkpoints {
         selected.program.reuse_cast_inputs();
     }
-    let (cycles, peak) = crate::estimate::analyze_mid(&selected.program, &BTreeMap::new())
+    selected
+        .program
+        .refresh_estimates()
         .ok_or(LoweringError::InvalidImplementation)?;
-    selected.program.estimated_cycles = cycles.total;
-    selected.program.estimated_exchange_cycles = cycles.exchange;
-    selected.program.peak_memory = peak;
     Ok(selected)
 }
 
@@ -283,6 +282,28 @@ impl<C: CostModel> Builder<'_, C> {
             {
                 plans.retain(|plan| matches!(plan.dispatch, OperatorDispatch::Attention { .. }));
             }
+            let single_use_inputs = operation
+                .inputs
+                .iter()
+                .map(|id| uses.get(id) == Some(&1))
+                .collect::<Vec<_>>();
+            let rank = |cycles, memory: MemoryPeaks| {
+                let (first, last) = if self.optimizing {
+                    (cycles, memory.total)
+                } else {
+                    (memory.total, cycles)
+                };
+                (
+                    first,
+                    if self.config.capacity_baseline {
+                        memory.maximum_standard_allocation
+                    } else {
+                        0
+                    },
+                    memory.exchange_rows,
+                    last,
+                )
+            };
             let (selected, early_cast) = if let Some(plan) = self.recipe.plans.get(&operation.id) {
                 (
                     plan.clone(),
@@ -339,23 +360,7 @@ impl<C: CostModel> Builder<'_, C> {
                                         .map(|op| op.estimated_cycles)
                                         .sum::<u64>(),
                                 );
-                            return Some((
-                                (
-                                    if self.optimizing {
-                                        cycles
-                                    } else {
-                                        memory.total
-                                    },
-                                    0,
-                                    memory.exchange_rows,
-                                    if self.optimizing {
-                                        memory.total
-                                    } else {
-                                        cycles
-                                    },
-                                ),
-                                (plan, early_cast),
-                            ));
+                            return Some((rank(cycles, memory), (plan, early_cast)));
                         }
                         // Lower the actual boundary -> operator -> boundary sequence.
                         // The operator alone omits live source buffers and cast/pack
@@ -389,11 +394,7 @@ impl<C: CostModel> Builder<'_, C> {
                             shape.clone(),
                             plan.clone(),
                             &vec![early_cast; ids.len()],
-                            &operation
-                                .inputs
-                                .iter()
-                                .map(|id| uses.get(id) == Some(&1))
-                                .collect::<Vec<_>>(),
+                            &single_use_inputs,
                             self.costs,
                             &mut values,
                             &mut state,
@@ -443,23 +444,7 @@ impl<C: CostModel> Builder<'_, C> {
                         }
                         let cycles = sequence.iter().map(|op| op.estimated_cycles).sum::<u64>();
 
-                        Some((
-                            (
-                                if self.optimizing {
-                                    cycles
-                                } else {
-                                    memory.total
-                                },
-                                memory.maximum_standard_allocation,
-                                memory.exchange_rows,
-                                if self.optimizing {
-                                    memory.total
-                                } else {
-                                    cycles
-                                },
-                            ),
-                            (plan, early_cast),
-                        ))
+                        Some((rank(cycles, memory), (plan, early_cast)))
                     })
                     .min_by_key(|(score, _)| *score)
                     .map(|(_, (plan, early_cast))| (plan.clone(), early_cast))
@@ -497,11 +482,7 @@ impl<C: CostModel> Builder<'_, C> {
                 shape.clone(),
                 selected,
                 &vec![self.recipe.early_casts.contains(&operation.id); ids.len()],
-                &operation
-                    .inputs
-                    .iter()
-                    .map(|id| uses.get(id) == Some(&1))
-                    .collect::<Vec<_>>(),
+                &single_use_inputs,
                 self.costs,
                 &mut self.values,
                 &mut self.state,

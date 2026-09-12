@@ -77,8 +77,8 @@ impl Builder {
             right_inner: TensorAxis::FromEnd(2),
             output_column: TensorAxis::FromEnd(1),
         };
-        let mut packed_key = key.clone();
-        let mut packed_value = value.clone();
+        let mut packed_key = key;
+        let mut packed_value = value;
         for (tensor, width) in [
             (&mut packed_key, query_width),
             (&mut packed_value, value_width),
