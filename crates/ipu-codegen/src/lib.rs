@@ -150,7 +150,7 @@ pub enum TileAddress {
     /// The current base of an enclosing repeat plus a constant byte offset.
     RepeatPointer {
         index: u16,
-        offset: u32,
+        offset: i32,
     },
 }
 
@@ -869,7 +869,7 @@ fn emit_address(
                 return Err(invalid("repeat pointer index is out of range"));
             }
             code.ld32(register, 11, 15, index + 1)?;
-            code.add_unsigned(register, offset)
+            code.add_offset(register, i64::from(offset))
         }
     }
 }
@@ -934,7 +934,7 @@ fn emit_repeat(
     for (index, pointer) in repeat.iterated_pointers.iter().enumerate() {
         let slot = u16::try_from(index + 1).map_err(|_| invalid("too many repeat pointers"))?;
         code.ld32(0, 11, 15, slot)?;
-        code.add_unsigned(0, pointer.stride_bytes)?;
+        code.add_offset(0, i64::from(pointer.stride_bytes))?;
         code.st32(0, 11, 15, slot)?;
     }
     if has_profile {
@@ -1108,9 +1108,9 @@ impl TileCode {
         Ok(())
     }
 
-    fn add_unsigned(&mut self, register: u8, mut immediate: u32) -> Result<()> {
+    fn add_offset(&mut self, register: u8, mut immediate: i64) -> Result<()> {
         while immediate != 0 {
-            let part = immediate.min(i16::MAX as u32);
+            let part = immediate.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
             self.add_immediate(register, register, part as i32)?;
             immediate -= part;
         }

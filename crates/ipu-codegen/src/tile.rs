@@ -1,5 +1,9 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
+#[cfg(test)]
+#[path = "tile/tests/iterated_aliases.rs"]
+mod iterated_aliases;
+
 use crate::{
     BlockValueId, ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep,
     KernelBuildPlan, LowProgram, PhysicalExchangePhase, PlacedExchangeRow, Placement,
@@ -174,33 +178,6 @@ impl<'a> TileProgramLowering<'a> {
     }
 }
 
-fn placed_local_copy(
-    program: &LowProgram,
-    placement: &Placement,
-    copy: &crate::LocalCopy,
-) -> Result<(u32, u32), TileLoweringError> {
-    let source_shard = &program.shards[copy.source.index() as usize];
-    let invalid = || TileLoweringError::InvalidLocalCopy {
-        tile: source_shard.tile,
-        source_shard: copy.source,
-        source_offset: copy.source_offset,
-        destination_shard: copy.destination,
-        destination_offset: copy.destination_offset,
-        bytes: copy.bytes,
-    };
-    let source = placement
-        .shard_addresses
-        .get(&copy.source)
-        .and_then(|address| address.checked_add(copy.source_offset))
-        .ok_or_else(&invalid)?;
-    let destination = placement
-        .shard_addresses
-        .get(&copy.destination)
-        .and_then(|address| address.checked_add(copy.destination_offset))
-        .ok_or_else(&invalid)?;
-    Ok((source, destination))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn lower_work(
     program: &LowProgram,
@@ -229,19 +206,16 @@ fn lower_work(
                         .copied()
                         .flatten()
                         .map(|(shard, offset)| {
-                            let Some(TileAddress::RepeatPointer {
-                                index,
-                                offset: base_offset,
-                            }) = overrides.get(&shard)
-                            else {
+                            let base = crate::kernel::resolve_shard_address(
+                                &program.shards,
+                                &placement.shard_addresses,
+                                overrides,
+                                shard,
+                            )?;
+                            if !matches!(base, TileAddress::RepeatPointer { .. }) {
                                 return Err(TileLoweringError::InvalidRepeat);
-                            };
-                            Ok(TileAddress::RepeatPointer {
-                                index: *index,
-                                offset: base_offset
-                                    .checked_add(offset)
-                                    .ok_or(TileLoweringError::Overflow)?,
-                            })
+                            }
+                            Ok(crate::kernel::add_address_offset(base, offset)?)
                         })
                         .transpose()?,
                     preserve_base_registers: false,
@@ -261,32 +235,29 @@ fn lower_work(
                 })
             }
             TileWorkRef::LocalCopy(copy) => {
-                let (source, destination) = placed_local_copy(program, placement, copy)?;
-                let (symbol, arguments) =
-                    local_copy_call(copy).ok_or(TileLoweringError::InvalidLocalCopy {
-                        tile: tile.tile,
-                        source_shard: copy.source,
-                        source_offset: copy.source_offset,
-                        destination_shard: copy.destination,
-                        destination_offset: copy.destination_offset,
-                        bytes: copy.bytes,
-                    })?;
-                let resolve = |shard, offset, address| {
-                    overrides
-                        .get(&shard)
-                        .copied()
-                        .map_or(Ok(TileAddress::Absolute(address)), |base| {
-                            crate::kernel::add_address_offset(base, offset)
-                        })
+                let invalid = || TileLoweringError::InvalidLocalCopy {
+                    tile: tile.tile,
+                    source_shard: copy.source,
+                    source_offset: copy.source_offset,
+                    destination_shard: copy.destination,
+                    destination_offset: copy.destination_offset,
+                    bytes: copy.bytes,
+                };
+                let (symbol, arguments) = local_copy_call(copy).ok_or_else(invalid)?;
+                let resolve = |shard, offset| {
+                    crate::kernel::resolve_shard_address(
+                        &program.shards,
+                        &placement.shard_addresses,
+                        overrides,
+                        shard,
+                    )
+                    .and_then(|base| crate::kernel::add_address_offset(base, offset))
+                    .map_err(|_| invalid())
                 };
                 TileStep::Compute(crate::ComputeStep {
                     symbol: symbol.into(),
-                    output_address: resolve(
-                        copy.destination,
-                        copy.destination_offset,
-                        destination,
-                    )?,
-                    input_addresses: vec![resolve(copy.source, copy.source_offset, source)?],
+                    output_address: resolve(copy.destination, copy.destination_offset)?,
+                    input_addresses: vec![resolve(copy.source, copy.source_offset)?],
                     arguments,
                     profile: StepProfile::default(),
                 })

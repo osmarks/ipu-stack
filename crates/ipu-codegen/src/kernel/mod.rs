@@ -119,18 +119,7 @@ pub fn materialize_kernel_run(
                 spans: spans.span_count() as usize,
             });
         };
-        let base = overrides
-            .get(&view.shard)
-            .copied()
-            .or_else(|| {
-                shard_addresses
-                    .get(&view.shard)
-                    .copied()
-                    .map(TileAddress::Absolute)
-            })
-            .ok_or(KernelMaterializationError::UnplacedShard(
-                view.shard.index(),
-            ))?;
+        let base = resolve_shard_address(shards, shard_addresses, overrides, view.shard)?;
         add_address_offset(base, span.offset)
     };
     let mut output_address = resolve(&run.output, packed_group.is_some())?;
@@ -176,20 +165,48 @@ pub(crate) fn add_address_offset(
     address: TileAddress,
     offset: u32,
 ) -> Result<TileAddress, KernelMaterializationError> {
+    add_address_displacement(address, i64::from(offset))
+}
+
+pub(crate) fn resolve_shard_address(
+    shards: &[BlockValue],
+    addresses: &BTreeMap<BlockValueId, u32>,
+    overrides: &BTreeMap<BlockValueId, TileAddress>,
+    shard: BlockValueId,
+) -> Result<TileAddress, KernelMaterializationError> {
+    if !overrides.is_empty()
+        && let Some((base, displacement)) = crate::storage_chain(shards, shard)
+            .find_map(|(source, offset)| overrides.get(&source).map(|&base| (base, offset)))
+    {
+        return add_address_displacement(base, displacement);
+    }
+    addresses
+        .get(&shard)
+        .copied()
+        .map(TileAddress::Absolute)
+        .ok_or(KernelMaterializationError::UnplacedShard(shard.index()))
+}
+
+fn add_address_displacement(
+    address: TileAddress,
+    displacement: i64,
+) -> Result<TileAddress, KernelMaterializationError> {
+    let offset = |base: i64| {
+        base.checked_add(displacement)
+            .ok_or(KernelMaterializationError::AddressOverflow)
+    };
     Ok(match address {
         TileAddress::Absolute(address) => TileAddress::Absolute(
-            address
-                .checked_add(offset)
-                .ok_or(KernelMaterializationError::AddressOverflow)?,
+            u32::try_from(offset(i64::from(address))?)
+                .map_err(|_| KernelMaterializationError::AddressOverflow)?,
         ),
         TileAddress::RepeatPointer {
             index,
             offset: existing,
         } => TileAddress::RepeatPointer {
             index,
-            offset: existing
-                .checked_add(offset)
-                .ok_or(KernelMaterializationError::AddressOverflow)?,
+            offset: i32::try_from(offset(i64::from(existing))?)
+                .map_err(|_| KernelMaterializationError::AddressOverflow)?,
         },
     })
 }

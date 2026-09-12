@@ -227,9 +227,10 @@ pub(crate) fn lower_exchanges(
     )
 }
 
-fn repeat_inputs(
+fn repeat_source_bases(
     program: &LowProgram,
-) -> Result<BTreeMap<BlockValueId, Vec<BlockValueId>>, ExchangeLoweringError> {
+    placement: &Placement,
+) -> Result<BTreeMap<BlockValueId, Vec<u32>>, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<BlockValueId, Vec<BlockValueId>>::new();
     for repeat in &program.repeat_runs {
         for iterated in &repeat.iterated {
@@ -248,14 +249,40 @@ fn repeat_inputs(
             }
         }
     }
-    Ok(repeat_inputs)
+    if repeat_inputs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    program
+        .shards
+        .iter()
+        .filter_map(|shard| {
+            crate::storage_chain(&program.shards, shard.id)
+                .find_map(|(source, offset)| {
+                    repeat_inputs.get(&source).map(|inputs| (inputs, offset))
+                })
+                .map(|(inputs, offset)| {
+                    let addresses = inputs
+                        .iter()
+                        .map(|input| {
+                            let address = placement
+                                .shard_addresses
+                                .get(input)
+                                .ok_or(ExchangeLoweringError::UnplacedShard)?;
+                            u32::try_from(i64::from(*address) + offset)
+                                .map_err(|_| ExchangeLoweringError::Overflow)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((shard.id, addresses))
+                })
+        })
+        .collect()
 }
 
 fn prepare_phase(
     program: &LowProgram,
     placement: &Placement,
     phase: &crate::low::ExchangePhase,
-    repeat_inputs: &BTreeMap<BlockValueId, Vec<BlockValueId>>,
+    repeat_inputs: &BTreeMap<BlockValueId, Vec<u32>>,
 ) -> Result<Vec<PendingTransfer>, ExchangeLoweringError> {
     let mut pending: Vec<PendingTransfer> = phase
         .transfers
@@ -268,6 +295,8 @@ fn prepare_phase(
                     transfer = index,
                     provenance = ?phase.provenance,
                     source = ?transfer.source,
+                    source_storage = ?program.shards[transfer.source.shard.index() as usize],
+                    order = ?transfer.order,
                     destinations = ?transfer.destinations,
                     ?error,
                     "failed to prepare logical exchange transfer"
@@ -278,7 +307,7 @@ fn prepare_phase(
         .into_iter()
         .flatten()
         .collect();
-    attach_repeat_source_addresses(&mut pending, repeat_inputs, placement)?;
+    attach_repeat_source_addresses(&mut pending, repeat_inputs)?;
     Ok(coalesce_pending_transfers(pending))
 }
 
@@ -286,7 +315,7 @@ pub(crate) fn capture_exchange_schedule(
     program: &LowProgram,
     placement: &Placement,
 ) -> Result<ExchangeScheduleSnapshot, ExchangeLoweringError> {
-    let repeat_inputs = repeat_inputs(program)?;
+    let repeat_inputs = repeat_source_bases(program, placement)?;
     let phases = program
         .exchange_phases
         .par_iter()
@@ -393,7 +422,7 @@ pub(crate) fn lower_exchanges_cached(
     enable_diagnostics: bool,
     cache: &mut ExchangeScheduleCache,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
-    let repeat_inputs = repeat_inputs(program)?;
+    let repeat_inputs = repeat_source_bases(program, placement)?;
     // Each barrier-delimited phase has independent scheduling state. Keep its
     // relocation recipe local to the worker, then restore the cache in order.
     let mut phase_caches = program
@@ -561,8 +590,8 @@ pub(crate) fn lower_exchanges_cached(
                         .map(|(shard, offset)| {
                             repeat_inputs[&shard]
                                 .iter()
-                                .map(|input| {
-                                    placement.shard_addresses[input]
+                                .map(|address| {
+                                    address
                                         .checked_add(offset)
                                         .ok_or(ExchangeLoweringError::Overflow)
                                 })
@@ -889,19 +918,14 @@ fn repeat_source_address(transfer: &PendingTransfer, iteration: usize) -> u32 {
 
 fn attach_repeat_source_addresses(
     pending: &mut [PendingTransfer],
-    repeat_inputs: &BTreeMap<BlockValueId, Vec<BlockValueId>>,
-    placement: &Placement,
+    repeat_inputs: &BTreeMap<BlockValueId, Vec<u32>>,
 ) -> Result<(), ExchangeLoweringError> {
     for transfer in pending {
         if let Some(inputs) = repeat_inputs.get(&transfer.source_shard) {
             let addresses = inputs
                 .iter()
-                .map(|input| {
-                    placement
-                        .shard_addresses
-                        .get(input)
-                        .copied()
-                        .ok_or(ExchangeLoweringError::UnplacedShard)?
+                .map(|address| {
+                    address
                         .checked_add(transfer.source_offset)
                         .ok_or(ExchangeLoweringError::Overflow)
                 })
