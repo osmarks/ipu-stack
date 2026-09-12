@@ -1564,7 +1564,7 @@ fn run_reference(
         runtime,
         application,
         &weights,
-        |_| Ok(inputs.clone()),
+        |_| Ok(inputs.as_slice()),
         timeout_seconds,
         inferences,
         |index, output| {
@@ -1895,7 +1895,7 @@ fn run_initialized_program(
         runtime,
         application,
         weights,
-        |_| Ok(input.to_vec()),
+        |_| Ok(input),
         timeout_seconds,
         1,
         |_, _| Ok(()),
@@ -1903,11 +1903,11 @@ fn run_initialized_program(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_checked_inferences(
+fn run_checked_inferences<I: AsRef<[u8]>>(
     runtime: &Runtime,
     application: &Application,
     weights: &[u8],
-    mut input: impl FnMut(u32) -> Result<Vec<u8>>,
+    mut input: impl FnMut(u32) -> Result<I>,
     timeout_seconds: u64,
     count: u32,
     mut check: impl FnMut(u32, &[u8]) -> Result<()>,
@@ -1937,7 +1937,7 @@ fn run_checked_inferences(
     let mut output = Vec::new();
     for index in 0..count {
         let executed = session
-            .invoke_streaming_deferred("run", &input(index)?)
+            .invoke_streaming_deferred("run", input(index)?.as_ref())
             .inspect_err(|_| {
                 eprintln!(
                     "runFailureDiagnostics={}",

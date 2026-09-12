@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::diagnostic::{HostTensor, pack_bindings};
 
-fn tensor(root: &Path, entry: &Value, shape: &[u32]) -> Result<HostTensor> {
+fn tensor_path(root: &Path, entry: &Value, shape: &[u32]) -> Result<std::path::PathBuf> {
     let declared: Vec<u32> = serde_json::from_value(entry["shape"].clone())?;
     ensure!(
         declared == shape,
@@ -20,16 +20,21 @@ fn tensor(root: &Path, entry: &Value, shape: &[u32]) -> Result<HostTensor> {
             .as_str()
             .context("fixture tensor has no file")?,
     );
-    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let elements = shape
+    let bytes = shape
         .iter()
-        .try_fold(1usize, |n, &d| n.checked_mul(d as usize))
+        .try_fold(4u64, |n, &d| n.checked_mul(u64::from(d)))
         .context("fixture tensor size overflow")?;
     ensure!(
-        bytes.len() == elements * 4,
+        fs::metadata(&path)?.len() == bytes,
         "wrong tensor length: {}",
         path.display()
     );
+    Ok(path)
+}
+
+fn tensor(root: &Path, entry: &Value, shape: &[u32]) -> Result<HostTensor> {
+    let path = tensor_path(root, entry, shape)?;
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let values: Vec<_> = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
@@ -40,7 +45,7 @@ fn tensor(root: &Path, entry: &Value, shape: &[u32]) -> Result<HostTensor> {
         path.display()
     );
     Ok(HostTensor {
-        shape: declared,
+        shape: shape.to_vec(),
         values,
     })
 }
@@ -63,24 +68,19 @@ pub(crate) fn validate(root: &Path, graph: &ComputeGraph, count: u32) -> Result<
             cases.iter().map(|c| &c["inputs"][&input.name]).collect()
         };
         for entry in entries {
-            let shape: Vec<u32> = serde_json::from_value(entry["shape"].clone())
+            tensor_path(root, entry, &input.shape.0)
                 .with_context(|| format!("fixture tensor {}", input.name))?;
-            ensure!(
-                shape == input.shape.0,
-                "fixture shape mismatch for {}",
-                input.name
-            );
-            let path = root.join(
-                entry["file"]
-                    .as_str()
-                    .context("fixture tensor has no file")?,
-            );
-            ensure!(
-                fs::metadata(&path)?.len() == input.shape.elements() * 4,
-                "wrong tensor length: {}",
-                path.display()
-            );
         }
+    }
+    ensure!(
+        graph.outputs().len() == 1,
+        "fixture requires one graph output"
+    );
+    let shape = graph
+        .value_shape(graph.outputs()[0])
+        .context("missing graph output")?;
+    for case in cases {
+        tensor_path(root, &case["expected"], &shape.0).context("fixture expected output")?;
     }
     Ok(())
 }
@@ -180,4 +180,48 @@ pub(crate) fn run(
         "fixture cases failed cosine >0.99: {failures:?}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rejects_incomplete_or_mismatched_fixture_before_planning() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ipu-fixture-{}", fastrand::u64(..)));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let mut graph = ComputeGraph::new();
+            let x = graph.host_input("image", [1, 2])?;
+            let w = graph.parameter("weight", [1, 2])?;
+            let output = graph.add(x, w)?;
+            graph.set_outputs([output])?;
+            fs::write(
+                root.join("values.f32"),
+                [1.0f32.to_le_bytes(), 2.0f32.to_le_bytes()].concat(),
+            )?;
+            let entry = json!({"file": "values.f32", "shape": [1, 2]});
+            let manifest = json!({"parameters": {"weight": entry}, "cases": [{
+                "name": "sample", "inputs": {"image": entry}, "expected": entry
+            }]});
+            fs::write(root.join("manifest.json"), serde_json::to_vec(&manifest)?)?;
+            validate(&root, &graph, 1)?;
+            assert_eq!(tensor(&root, &entry, &[1, 2])?.values, [1.0, 2.0]);
+            assert!(validate(&root, &graph, 2).is_err());
+            assert!(tensor(&root, &entry, &[2, 1]).is_err());
+            fs::write(root.join("values.f32"), [0; 4])?;
+            assert!(validate(&root, &graph, 1).is_err());
+            fs::write(
+                root.join("values.f32"),
+                [f32::NAN.to_le_bytes(), 0.0f32.to_le_bytes()].concat(),
+            )?;
+            assert!(tensor(&root, &entry, &[1, 2]).is_err());
+            fs::remove_file(root.join("values.f32"))?;
+            assert!(validate(&root, &graph, 1).is_err());
+            Ok(())
+        })();
+        fs::remove_dir_all(root)?;
+        result
+    }
 }
