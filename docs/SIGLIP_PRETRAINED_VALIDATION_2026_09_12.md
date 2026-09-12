@@ -117,3 +117,49 @@ fixed precision/scale choice per GEMM position and an FP16 input projection.
 It does not require changing Repeat's runtime arguments or the GEMM scale ABI.
 Device accumulation accuracy and placement still need validation before making
 an IPU accuracy/performance claim.
+
+## Hardware port (2026-09-12)
+
+Implemented in `4aefbd2`. `PipelineConfig::gemm_precisions` fixes the operand
+precision of an individual graph GEMM, including operations inside Repeat.
+The benchmark's `--reference-calibration REPORT` loads the shared scale policy
+and binds weight precision accordingly. It rejects mismatched scales within a
+repeated parameter sequence. The runtime ABI is unchanged.
+
+FP8 GEMM specialization keys now ignore scale exponents, which remain call
+arguments. Previously different scales could generate duplicate definitions of
+the same specialization symbol. Row variants are now grouped together before
+code generation, and calls still receive their own product scale.
+
+The canonical, unoptimized full 27-layer plan **passed on IPU hardware**:
+
+| Image | IPU cosine against independent FP32 reference |
+| --- | ---: |
+| authors | 0.994614293 |
+| siglip | 0.997865842 |
+| caffeine | 0.997627423 |
+| robosign | 0.996131927 |
+| fried_fish | 0.997170216 |
+| cow_beach2 | 0.996680336 |
+
+All weights were uploaded once and remained resident across the six distinct
+image calls. Each invocation uploaded its preprocessed image and downloaded its
+MAP embedding. The maximum absolute error across all images was 0.283580.
+The reference was the original pretrained FP32 Hugging Face model, not an
+already-quantized reference.
+
+Baseline package, complete log and raw outputs:
+`artifacts/pretrained-siglip-20260912/calibrated27-baseline/`.
+Tests: 238 enabled codegen tests passed (four ignored), and all 12 runner tests
+passed. Regression coverage includes independent fixed precision choices within
+Repeat and shared kernel code with distinct FP8 scale arguments.
+
+The hardware build command uses the same configuration as above, except replace
+`--fp8-scale=-4` with:
+
+```sh
+--reference-calibration artifacts/pretrained-siglip-20260912/role-shared.json
+```
+
+Use `--optimization-steps 0` for this baseline. The normal optimized build uses
+`--optimization-steps 8` and writes to `calibrated27/`.

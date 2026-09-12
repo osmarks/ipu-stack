@@ -293,3 +293,10 @@ write reconstructed floating-point parameters; their calibrated choices are not 
 into the benchmark planner. Fixed scales shared across all layers and both
 operands also passed the host experiment, so dynamic Repeat scale arguments
 are not currently required.
+
+The fixed shared-scale policy is now selectable with
+`--reference-fixture DIRECTORY --reference-calibration REPORT` in the benchmark.
+The full 27-layer baseline passes pretrained-image hardware validation with
+cosine 0.994614–0.997866 against independent FP32 embeddings. It uses an FP16
+input projection and the fixed FP8 encoder/MAP scales documented in the report.
+No dynamic Repeat scale arguments or independent operand-scale ABI were added.
