@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MemoryOperand {
+    Output,
+    Input(u16),
+}
+
 /// Access contract of an actual kernel buffer, without candidate planning policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelAccess {

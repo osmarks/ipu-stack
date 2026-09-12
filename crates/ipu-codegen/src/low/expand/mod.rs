@@ -25,7 +25,7 @@ use crate::storage::{ByteSpan, StorageError};
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, ConversionStrategy, CopyOrder, ElementOrder,
     KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
-    MidProgram, MidRepeat, MidValueId, OutputAliasing, Precision, ShardExtent, TensorTiling,
+    MidProgram, MidRepeat, MidValueId, Precision, ShardExtent, TensorTiling,
     TensorType, TileKernelSpec,
 };
 #[cfg(test)]

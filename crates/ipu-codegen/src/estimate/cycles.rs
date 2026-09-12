@@ -405,10 +405,9 @@ mod tests {
 
     fn pointwise_requirements(format: TensorFormat) -> StorageRequirements {
         StorageRequirements {
-            inputs: vec![OperandRequirement::new(format.clone(), 8)],
-            output: OperandRequirement::new(format, 8),
+            inputs: vec![OperandRequirement::new(format.clone())],
+            output: OperandRequirement::new(format),
             output_aliasing: OutputAliasing::Fresh,
-            distinct_elements: Vec::new(),
         }
     }
 

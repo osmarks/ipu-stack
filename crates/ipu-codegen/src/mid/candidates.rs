@@ -156,16 +156,12 @@ pub(super) fn plans(
                 operator: MidOperator::View(view),
                 dispatch: OperatorDispatch::View,
                 requirements: StorageRequirements {
-                    inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
-                    output: OperandRequirement::new(
-                        TensorFormat {
-                            precision: input.format.precision,
-                            layout,
-                        },
-                        8,
-                    ),
+                    inputs: vec![OperandRequirement::new(input.format.clone())],
+                    output: OperandRequirement::new(TensorFormat {
+                        precision: input.format.precision,
+                        layout,
+                    }),
                     output_aliasing: OutputAliasing::Fresh,
-                    distinct_elements: Vec::new(),
                 },
                 deferred_output: Some(DeferredOutputPlan {
                     source_input: 0,
@@ -211,16 +207,12 @@ pub(super) fn plans(
             operator: MidOperator::View(view),
             dispatch: OperatorDispatch::View,
             requirements: StorageRequirements {
-                inputs: vec![OperandRequirement::new(source, 8)],
-                output: OperandRequirement::new(
-                    TensorFormat {
-                        precision: input.format.precision,
-                        layout: row_major(output),
-                    },
-                    8,
-                ),
+                inputs: vec![OperandRequirement::new(source)],
+                output: OperandRequirement::new(TensorFormat {
+                    precision: input.format.precision,
+                    layout: row_major(output),
+                }),
                 output_aliasing: OutputAliasing::Fresh,
-                distinct_elements: Vec::new(),
             },
             deferred_output: None,
         });
@@ -240,16 +232,12 @@ pub(super) fn plans(
                 operator: MidOperator::Slice(slice),
                 dispatch: OperatorDispatch::View,
                 requirements: StorageRequirements {
-                    inputs: vec![OperandRequirement::new(input.format.clone(), 8)],
-                    output: OperandRequirement::new(
-                        TensorFormat {
-                            precision: input.format.precision,
-                            layout,
-                        },
-                        8,
-                    ),
+                    inputs: vec![OperandRequirement::new(input.format.clone())],
+                    output: OperandRequirement::new(TensorFormat {
+                        precision: input.format.precision,
+                        layout,
+                    }),
                     output_aliasing: OutputAliasing::Fresh,
-                    distinct_elements: Vec::new(),
                 },
                 deferred_output: None,
             });
@@ -319,13 +307,12 @@ pub(super) fn plans(
                         inputs: [&query_format, &key_format, &value_format]
                             .into_iter()
                             .map(|format| {
-                                OperandRequirement::new(format.clone(), 8)
+                                OperandRequirement::new(format.clone())
                                     .with_materialization(OperandMaterialization::DispatchSlices)
                             })
                             .collect(),
-                        output: OperandRequirement::new(output_format.clone(), 8),
+                        output: OperandRequirement::new(output_format.clone()),
                         output_aliasing: OutputAliasing::Fresh,
-                        distinct_elements: Vec::new(),
                     },
                     deferred_output: None,
                 };
@@ -375,10 +362,9 @@ pub(super) fn plans(
                         == input.format.precision
             })
         {
-            let grain = candidate.plan.requirements.inputs[0]
-                .alignment
-                .div_ceil(input.format.precision.bytes() as u32);
-            if grain == 0 || !output.elements().is_multiple_of(u64::from(grain)) {
+            // Elementwise codelets and local copy paths access 64-bit words.
+            let grain = 8 / input.format.precision.bytes() as u32;
+            if !output.elements().is_multiple_of(u64::from(grain)) {
                 continue;
             }
             let tiles = candidate
@@ -461,10 +447,9 @@ pub(super) fn plans(
                     operator: candidate.operator,
                     dispatch: candidate.dispatch.clone(),
                     requirements: StorageRequirements {
-                        inputs: vec![OperandRequirement::new(format.clone(), 8)],
-                        output: OperandRequirement::new(format, 8),
+                        inputs: vec![OperandRequirement::new(format.clone())],
+                        output: OperandRequirement::new(format),
                         output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
-                        distinct_elements: Vec::new(),
                     },
                     deferred_output: None,
                 };
@@ -1405,7 +1390,6 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                                     input_layouts[1].clone(),
                                     result_layout.clone(),
                                 ],
-                                16,
                                 dispatch,
                             );
                             staged.requirements.inputs[physical_right_index].local_staging =

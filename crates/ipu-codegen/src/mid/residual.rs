@@ -159,9 +159,8 @@ pub(super) fn fuse(
                 kind: MidOperationKind::Convert(ConversionPlan {
                     input: OperandRequirement::new(
                         values[stats.index() as usize].tensor_type.format.clone(),
-                        8,
                     ),
-                    output: OperandRequirement::new(tensor_type.format.clone(), 8),
+                    output: OperandRequirement::new(tensor_type.format.clone()),
                     strategy: ConversionStrategy::DirectRetile,
                 }),
                 estimated_cycles: 0,
@@ -428,8 +427,8 @@ mod tests {
                 inputs: vec![source],
                 results: vec![value.id],
                 kind: MidOperationKind::Convert(ConversionPlan {
-                    input: OperandRequirement::new(tensor.format.clone(), 8),
-                    output: OperandRequirement::new(value.tensor_type.format.clone(), 8),
+                    input: OperandRequirement::new(tensor.format.clone()),
+                    output: OperandRequirement::new(value.tensor_type.format.clone()),
                     strategy: ConversionStrategy::DirectRetile,
                 }),
                 estimated_cycles: 0,

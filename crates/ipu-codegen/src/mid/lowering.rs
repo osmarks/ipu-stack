@@ -548,8 +548,8 @@ pub(super) fn ensure_format(
             inputs: vec![value],
             results: vec![result],
             kind: MidOperationKind::Convert(ConversionPlan {
-                input: OperandRequirement::new(input.format, 8),
-                output: OperandRequirement::new(output.format, 8).with_materialization(if cast {
+                input: OperandRequirement::new(input.format),
+                output: OperandRequirement::new(output.format).with_materialization(if cast {
                     OperandMaterialization::Complete
                 } else {
                     materialization

@@ -1560,7 +1560,7 @@ impl<'a> HostSession<'a> {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
         let call = self.prepare(name, input)?;
-        self.drive_handshake(&call)?;
+        self.drive_handshake(&call, |_| Ok(()), |_, _| Ok(()))?;
         Ok(call)
     }
 
@@ -1613,59 +1613,32 @@ impl<'a> HostSession<'a> {
         self.streamed_output = Some((vec![0; output_size], 0));
         self.write_command(&call)?;
 
-        info!(
-            call = call.name,
-            command = call.command,
-            phases = call.phases,
-            "invoking streaming host exchange call"
-        );
         let input_batches = host_batch_ranges(&call.input_batch_ends);
         let output_batches = host_batch_ranges(&call.output_batch_ends);
-        for phase in 0..call.phases {
-            self.device.wait_mark_poll(
-                pci::HSP_GS2_CONTROL,
-                0,
-                Duration::from_secs(10),
-                self.poll_interval,
-                &mut poll,
-            )?;
+        self.drive_handshake(&call, &mut poll, |session, phase| {
             if phase & 1 == 0 {
                 let batch = usize::try_from(phase / 2).unwrap();
                 if let Some(range) = input_batches.get(batch) {
                     for slice in &call.inputs[range.clone()] {
-                        copy_input_slice(&mut self.storage, &self.pages, slice, input)?;
+                        copy_input_slice(&mut session.storage, &session.pages, slice, input)?;
                     }
                 } else {
                     let output = batch - input_batches.len();
                     if output != 0 {
                         for slice in &call.outputs[output_batches[output - 1].clone()] {
                             capture_output_slice(
-                                &mut self.storage,
-                                &self.pages,
+                                &mut session.storage,
+                                &session.pages,
                                 slice,
-                                self.streamed_output.as_mut().unwrap(),
+                                session.streamed_output.as_mut().unwrap(),
                             )?;
                         }
                     }
                 }
                 fence(Ordering::SeqCst);
             }
-            self.acknowledge_device()?;
-            self.device
-                .wait_mark_poll(
-                    pci::HSP_GS2_CONTROL,
-                    0,
-                    Duration::from_secs(10),
-                    self.poll_interval,
-                    &mut poll,
-                )
-                .map_err(|error| {
-                    DriverError::Timeout(format!(
-                        "host call {} phase {phase}/{}: {error}",
-                        call.name, call.phases
-                    ))
-                })?;
-        }
+            Ok(())
+        })?;
         Ok(call)
     }
 
@@ -1738,7 +1711,7 @@ impl<'a> HostSession<'a> {
     }
 
     fn drive(&mut self, call: HostCall) -> Result<Vec<u8>, DriverError> {
-        self.drive_handshake(&call)?;
+        self.drive_handshake(&call, |_| Ok(()), |_, _| Ok(()))?;
         let output = self.finish(&call)?;
         info!(
             call = call.name,
@@ -1748,7 +1721,14 @@ impl<'a> HostSession<'a> {
         Ok(output)
     }
 
-    fn drive_handshake(&mut self, call: &HostCall) -> Result<(), DriverError> {
+    /// Wait for the device before staging each phase, then acknowledge it.
+    /// Both prepared and streaming calls use the same rendezvous sequence.
+    fn drive_handshake(
+        &mut self,
+        call: &HostCall,
+        mut poll: impl FnMut(&Device) -> Result<(), DriverError>,
+        mut before_ack: impl FnMut(&mut Self, u32) -> Result<(), DriverError>,
+    ) -> Result<(), DriverError> {
         info!(
             call = call.name,
             command = call.command,
@@ -1761,8 +1741,9 @@ impl<'a> HostSession<'a> {
                 0,
                 Duration::from_secs(10),
                 self.poll_interval,
-                |_| Ok(()),
+                &mut poll,
             )?;
+            before_ack(self, phase)?;
             self.acknowledge_device()?;
             self.device
                 .wait_mark_poll(
@@ -1770,7 +1751,7 @@ impl<'a> HostSession<'a> {
                     0,
                     Duration::from_secs(10),
                     self.poll_interval,
-                    |_| Ok(()),
+                    &mut poll,
                 )
                 .map_err(|error| {
                     DriverError::Timeout(format!(

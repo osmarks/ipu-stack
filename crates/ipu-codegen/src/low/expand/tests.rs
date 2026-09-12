@@ -17,7 +17,7 @@ use super::*;
 use crate::{
     AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution, GridOrder,
     Ipu21CostModel, Layout, MemoryClass, MidOperator, OperandRequirement, OperatorCandidate,
-    OperatorDispatch, Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling,
+    OperatorDispatch, OutputAliasing, Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling,
     TileKernelSpec, lower,
 };
 use std::collections::BTreeSet;
@@ -456,10 +456,10 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let candidate = ConcreteOperatorCandidate::new(
             operator,
             [
-                OperandRequirement::new(left_format.clone(), 32),
-                OperandRequirement::new(right_format.clone(), 32),
+                OperandRequirement::new(left_format.clone()),
+                OperandRequirement::new(right_format.clone()),
             ],
-            OperandRequirement::new(output_format, 32),
+            OperandRequirement::new(output_format),
         )
         .with_dispatch(OperatorDispatch::BlockedGemm {
             inner_block: 64,
@@ -626,10 +626,10 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
                 accumulate: crate::AccumulationPrecision::F16,
             },
             [
-                OperandRequirement::new(left_format, 32).with_access_tail(16),
-                OperandRequirement::new(right_format, 32),
+                OperandRequirement::new(left_format),
+                OperandRequirement::new(right_format),
             ],
-            OperandRequirement::new(output_format, 32),
+            OperandRequirement::new(output_format),
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -676,8 +676,8 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let mut config = PipelineConfig::new(tiles).with_input(input, tensor_format.clone());
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
-            [OperandRequirement::new(tensor_format.clone(), 8)],
-            OperandRequirement::new(tensor_format, 8),
+            [OperandRequirement::new(tensor_format.clone())],
+            OperandRequirement::new(tensor_format),
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -862,8 +862,8 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
-            [OperandRequirement::new(input_format, 8)],
-            OperandRequirement::new(output_format, 8),
+            [OperandRequirement::new(input_format)],
+            OperandRequirement::new(output_format),
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -931,8 +931,8 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format);
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
-            [OperandRequirement::new(target_format.clone(), 8)],
-            OperandRequirement::new(target_format, 8),
+            [OperandRequirement::new(target_format.clone())],
+            OperandRequirement::new(target_format),
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -1763,10 +1763,10 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
                 accumulate: crate::AccumulationPrecision::F32,
             },
             [
-                crate::OperandRequirement::new(left_format, 32).with_access_tail(16),
-                crate::OperandRequirement::new(right_format, 32).with_local_staging(local_staging),
+                crate::OperandRequirement::new(left_format),
+                crate::OperandRequirement::new(right_format).with_local_staging(local_staging),
             ],
-            crate::OperandRequirement::new(output_format, 32),
+            crate::OperandRequirement::new(output_format),
         )]
         .into_iter()
         .map(OperatorCandidate::Concrete)
@@ -2152,8 +2152,8 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     graph.set_outputs([output]).unwrap();
     let mut candidate = ConcreteOperatorCandidate::new(
         MidOperator::Gelu,
-        [OperandRequirement::new(format.clone(), 8)],
-        OperandRequirement::new(format.clone(), 8),
+        [OperandRequirement::new(format.clone())],
+        OperandRequirement::new(format.clone()),
     );
     candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
     let mut config = PipelineConfig::new(4).with_input(input, format);

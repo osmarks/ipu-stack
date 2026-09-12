@@ -1716,8 +1716,8 @@ mod tests {
         let mut config = PipelineConfig::new(4).with_input(input, format.clone());
         config.operator_candidates = vec![crate::ConcreteOperatorCandidate::new(
             crate::MidOperator::Gelu,
-            [crate::OperandRequirement::new(format.clone(), 8)],
-            crate::OperandRequirement::new(format, 8),
+            [crate::OperandRequirement::new(format.clone())],
+            crate::OperandRequirement::new(format),
         )]
         .into_iter()
         .map(crate::OperatorCandidate::Concrete)

@@ -475,12 +475,11 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
         let dispatch = default_dispatch(operator);
         let requirements = StorageRequirements {
             inputs: vec![
-                OperandRequirement::new(left.format.clone(), 32),
-                OperandRequirement::new(standard.format.clone(), 32),
+                OperandRequirement::new(left.format.clone()),
+                OperandRequirement::new(standard.format.clone()),
             ],
-            output: OperandRequirement::new(output.format.clone(), 8),
+            output: OperandRequirement::new(output.format.clone()),
             output_aliasing: OutputAliasing::Fresh,
-            distinct_elements: Vec::new(),
         };
         let plan = OperatorPlan {
             operator,
@@ -514,7 +513,6 @@ fn randomized_parameter_storage_balances_one_copy_independently_of_compute_grids
         let candidate = amp_grid_gemm_operator_candidate(
             Precision::F16,
             64,
-            16,
             AMP_OUTPUT_COLUMN_BLOCK,
             grid,
             AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
@@ -728,10 +726,10 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
                 accumulate,
             },
             [
-                OperandRequirement::new(left_format.clone(), 32),
-                OperandRequirement::new(right_format.clone(), 32),
+                OperandRequirement::new(left_format.clone()),
+                OperandRequirement::new(right_format.clone()),
             ],
-            OperandRequirement::new(output_format.clone(), 32),
+            OperandRequirement::new(output_format.clone()),
         );
         let mut left_shape = batches.clone();
         left_shape.extend([rows, inner]);
@@ -886,60 +884,10 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             )
         }) {
             let requirements = &operation.operator_plan().unwrap().requirements;
-            assert!(
-                requirements
-                    .inputs
-                    .iter()
-                    .chain([&requirements.output])
-                    .all(|requirement| requirement.alignment == 32)
-            );
             assert_eq!(
                 requirements.output.format.layout.memory_class,
                 MemoryClass::Ipu21Interleaved
             );
-            let orientation = match operation.operator_plan().map(|plan| &plan.dispatch) {
-                Some(OperatorDispatch::BlockedGemm { orientation, .. }) => *orientation,
-                _ => unreachable!(),
-            };
-            let physical_left = match orientation {
-                GemmOrientation::Normal => 0usize,
-                GemmOrientation::Swapped => 1usize,
-            };
-            assert_eq!(
-                requirements.distinct_elements,
-                [vec![
-                    MemoryOperand::Output,
-                    MemoryOperand::Input(physical_left as u16),
-                ]]
-            );
-            let expected_tail = match operation.kind {
-                MidOperationKind::Operator {
-                    plan:
-                        OperatorPlan {
-                            operator:
-                                MidOperator::Gemm {
-                                    multiply: Precision::F16,
-                                    ..
-                                },
-                            ..
-                        },
-                    ..
-                } => 16,
-                MidOperationKind::Operator {
-                    plan:
-                        OperatorPlan {
-                            operator:
-                                MidOperator::Gemm {
-                                    multiply: Precision::F32,
-                                    ..
-                                },
-                            ..
-                        },
-                    ..
-                } => 32,
-                _ => unreachable!(),
-            };
-            assert_eq!(requirements.inputs[0].access_tail_bytes, expected_tail);
         }
     }
 }
@@ -997,17 +945,17 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
         config.operator_candidates = vec![
             ConcreteOperatorCandidate::new(
                 MidOperator::Gelu,
-                [OperandRequirement::new(gelu_input.clone(), 8)],
-                OperandRequirement::new(gelu_output.clone(), 8),
+                [OperandRequirement::new(gelu_input.clone())],
+                OperandRequirement::new(gelu_output.clone()),
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
             ConcreteOperatorCandidate::new(
                 MidOperator::Add,
                 [
-                    OperandRequirement::new(add_left.clone(), 8),
-                    OperandRequirement::new(add_right.clone(), 8),
+                    OperandRequirement::new(add_left.clone()),
+                    OperandRequirement::new(add_right.clone()),
                 ],
-                OperandRequirement::new(add_output.clone(), 8),
+                OperandRequirement::new(add_output.clone()),
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
             ConcreteOperatorCandidate::new(
@@ -1016,11 +964,11 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
                     accumulate: attention_accumulate,
                 },
                 [
-                    OperandRequirement::new(attention_query.clone(), 8),
-                    OperandRequirement::new(attention_key.clone(), 8),
-                    OperandRequirement::new(attention_value_format.clone(), 8),
+                    OperandRequirement::new(attention_query.clone()),
+                    OperandRequirement::new(attention_key.clone()),
+                    OperandRequirement::new(attention_value_format.clone()),
                 ],
-                OperandRequirement::new(attention_output.clone(), 8),
+                OperandRequirement::new(attention_output.clone()),
             ),
         ]
         .into_iter()
@@ -1794,31 +1742,18 @@ fn parallel_gemm_family_does_not_depend_on_concrete_templates() {
         }
     )));
     for orientation in [GemmOrientation::Normal, GemmOrientation::Swapped] {
-        let plan = parallel.iter().find(|plan| matches!(plan.dispatch,
-            OperatorDispatch::BlockedGemm { orientation: actual, .. } if actual == orientation
-        )).expect("both GEMM orientations remain available");
-        let (left, right) = orientation.operand_indices();
-        assert_eq!(plan.requirements.inputs[left].access_tail_bytes, 16);
-        assert_eq!(plan.requirements.inputs[right].access_tail_bytes, 0);
-        assert_eq!(
-            plan.requirements.distinct_elements,
-            vec![vec![
-                MemoryOperand::Output,
-                MemoryOperand::Input(left as u16)
-            ]]
+        assert!(
+            parallel.iter().any(|plan| matches!(plan.dispatch,
+                OperatorDispatch::BlockedGemm { orientation: actual, .. } if actual == orientation
+            )),
+            "both GEMM orientations remain available"
         );
     }
     // The former C64 trigger now offers only the explicitly configured plan.
-    config.operator_candidates = vec![amp_gemm_operator_candidate(
-        Precision::F16,
-        64,
-        16,
-        64,
-        tiles,
-    )]
-    .into_iter()
-    .map(OperatorCandidate::Concrete)
-    .collect();
+    config.operator_candidates = vec![amp_gemm_operator_candidate(Precision::F16, 64, 64, tiles)]
+        .into_iter()
+        .map(OperatorCandidate::Concrete)
+        .collect();
     let concrete = generate(&config);
     assert!(!concrete.is_empty());
     assert!(concrete.iter().all(|plan| matches!(
@@ -2286,10 +2221,10 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
             accumulate: crate::AccumulationPrecision::F16,
         },
         [
-            OperandRequirement::new(input_format, 32).with_access_tail(16),
-            OperandRequirement::new(weight_format, 32),
+            OperandRequirement::new(input_format),
+            OperandRequirement::new(weight_format),
         ],
-        OperandRequirement::new(output_format, 32),
+        OperandRequirement::new(output_format),
     ))];
     config.standard_memory_reservation_bytes = 0;
     config.tile_memory_budget_bytes = 80000;
@@ -2355,8 +2290,8 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
             kind: MidOperationKind::Convert(ConversionPlan {
-                input: OperandRequirement::new(formats[index as usize].clone(), 8),
-                output: OperandRequirement::new(formats[index as usize + 1].clone(), 8)
+                input: OperandRequirement::new(formats[index as usize].clone()),
+                output: OperandRequirement::new(formats[index as usize + 1].clone())
                     .with_materialization(if index == 0 {
                         OperandMaterialization::DispatchSlices
                     } else {

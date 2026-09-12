@@ -319,9 +319,6 @@ impl OperatorDispatch {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperandRequirement {
     pub format: TensorFormat,
-    pub alignment: u32,
-    /// Bytes the kernel may access beyond the logical tensor payload.
-    pub access_tail_bytes: u32,
     /// How a locally resident operand should be consumed when other tiles use
     /// an operator-local staging buffer for the same operand.
     pub local_staging: LocalOperandStaging,
@@ -347,19 +344,12 @@ pub enum OperandMaterialization {
 }
 
 impl OperandRequirement {
-    pub fn new(format: TensorFormat, alignment: u32) -> Self {
+    pub fn new(format: TensorFormat) -> Self {
         Self {
             format,
-            alignment,
-            access_tail_bytes: 0,
             local_staging: LocalOperandStaging::Direct,
             materialization: OperandMaterialization::Complete,
         }
-    }
-
-    pub fn with_access_tail(mut self, bytes: u32) -> Self {
-        self.access_tail_bytes = bytes;
-        self
     }
 
     pub fn with_local_staging(mut self, staging: LocalOperandStaging) -> Self {
@@ -377,12 +367,6 @@ impl OperandRequirement {
 pub enum OutputAliasing {
     Fresh,
     MayAliasInputs(Vec<u16>),
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum MemoryOperand {
-    Output,
-    Input(u16),
 }
 
 pub(super) fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
@@ -432,24 +416,16 @@ pub(super) fn alias_compatible(
 }
 
 pub(super) fn valid_requirement(requirement: &OperandRequirement, shape: &TensorShape) -> bool {
-    requirement.alignment.is_power_of_two() && requirement.format.layout.resolve(shape).is_ok()
+    requirement.format.layout.resolve(shape).is_ok()
 }
 
-pub(super) fn valid_memory_operand(operand: MemoryOperand, input_count: usize) -> bool {
-    match operand {
-        MemoryOperand::Output => true,
-        MemoryOperand::Input(index) => usize::from(index) < input_count,
-    }
-}
-
-/// Operand storage and access constraints, shared by operator plans and
-/// concrete kernel calls. A call binds formats to its actual operand buffers.
+/// Planned formats, materialization and reuse of whole-device operands.
+/// Kernel access tails and bank constraints belong to the emitted calls.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StorageRequirements {
     pub inputs: Vec<OperandRequirement>,
     pub output: OperandRequirement,
     pub output_aliasing: OutputAliasing,
-    pub distinct_elements: Vec<Vec<MemoryOperand>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
@@ -559,18 +535,7 @@ impl OperatorPlan {
                     })
             }
         };
-        let requirements_valid = alias_valid
-            && self.requirements.distinct_elements.iter().all(|operands| {
-                operands.len() >= 2
-                    && operands
-                        .iter()
-                        .all(|operand| valid_memory_operand(*operand, inputs.len()))
-                    && operands
-                        .iter()
-                        .enumerate()
-                        .all(|(index, operand)| !operands[..index].contains(operand))
-            });
-        if !requirements_valid {
+        if !alias_valid {
             return false;
         }
         let (planned_inputs, planned_output) = self.tensor_types(inputs, output);

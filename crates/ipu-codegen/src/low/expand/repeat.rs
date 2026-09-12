@@ -166,19 +166,7 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
                 && value_can_alias(operation.inputs[input], target, operations)
         });
     }
-    let Some(plan) = operation.operator_plan() else {
-        return false;
-    };
-    let indices = match &plan.requirements.output_aliasing {
-        OutputAliasing::Fresh => return false,
-        OutputAliasing::MayAliasInputs(indices) => indices.as_slice(),
-    };
-    indices.iter().any(|index| {
-        operation
-            .inputs
-            .get(usize::from(*index))
-            .is_some_and(|input| value_can_alias(*input, target, operations))
-    })
+    false
 }
 
 fn repeat_yield_can_alias(
@@ -220,14 +208,6 @@ fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (
                 if index == 0 {
                     access_tail = access_tail.max(8 * multiply.bytes() as u32);
                 }
-            }
-            let requirement = operation
-                .operator_plan()
-                .and_then(|plan| plan.requirements.inputs.get(index))
-                .or_else(|| operation.conversion_plan().map(|plan| &plan.input));
-            if let Some(requirement) = requirement {
-                alignment = alignment.max(requirement.alignment);
-                access_tail = access_tail.max(requirement.access_tail_bytes);
             }
         }
     }

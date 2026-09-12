@@ -100,7 +100,6 @@ impl ConcreteOperatorCandidate {
                     inputs: inputs.into_iter().collect(),
                     output,
                     output_aliasing: OutputAliasing::Fresh,
-                    distinct_elements: Vec::new(),
                 },
                 deferred_output: None,
             },
@@ -120,11 +119,6 @@ impl ConcreteOperatorCandidate {
 
     pub fn with_output_aliasing(mut self, aliasing: OutputAliasing) -> Self {
         self.plan.requirements.output_aliasing = aliasing;
-        self
-    }
-
-    pub fn with_distinct_elements(mut self, operands: Vec<MemoryOperand>) -> Self {
-        self.plan.requirements.distinct_elements.push(operands);
         self
     }
 }
@@ -215,17 +209,14 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             let mut placements = vec![
                 (
                     Precision::F16,
-                    16,
                     AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
                 ),
                 (
                     Precision::F16,
-                    16,
                     AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
                 ),
                 (
                     Precision::F32,
-                    32,
                     AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
                 ),
             ];
@@ -233,17 +224,14 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                 placements.extend([
                     (
                         Precision::F16,
-                        16,
                         AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
                     ),
                     (
                         Precision::F16,
-                        16,
                         AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Interleaved),
                     ),
                     (
                         Precision::F32,
-                        32,
                         AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
                     ),
                 ]);
@@ -254,11 +242,10 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             if rows > 2 && rows.is_multiple_of(2) {
                 placements.push((
                     Precision::F16,
-                    16,
                     AmpWeightPlacement::sharded(2, MemoryClass::Ipu21Interleaved),
                 ));
             }
-            for (precision, left_tail, weights) in placements {
+            for (precision, weights) in placements {
                 for &output_columns in amp_output_column_blocks(precision) {
                     // A narrow resident interleaved shard can avoid streaming
                     // when a 64-column shard would exceed region capacity.
@@ -273,7 +260,6 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                     let candidate = amp_grid_gemm_operator_candidate(
                         precision,
                         64,
-                        left_tail,
                         output_columns,
                         grid_shape,
                         weights,
@@ -292,7 +278,7 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             grid
         })
         .collect::<Vec<_>>();
-    for (precision, left_tail) in [(Precision::F16, 16), (Precision::F32, 32)] {
+    for precision in [Precision::F16, Precision::F32] {
         for &output_columns in amp_output_column_blocks(precision)
             .iter()
             .filter(|&&columns| columns >= AMP_OUTPUT_COLUMN_BLOCK)
@@ -300,7 +286,6 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             candidates.push(amp_gemm_operator_candidate(
                 precision,
                 64,
-                left_tail,
                 output_columns,
                 tile_count,
             ));
@@ -378,8 +363,8 @@ pub(super) fn pointwise_operator_candidate(
         operator,
         inputs
             .into_iter()
-            .map(|format| OperandRequirement::new(format, 8)),
-        OperandRequirement::new(output, 8),
+            .map(|format| OperandRequirement::new(format)),
+        OperandRequirement::new(output),
     )
 }
 
@@ -395,7 +380,6 @@ pub(super) fn format_preserving_unary_candidate(
 pub(super) fn gemm_plan(
     operator: MidOperator,
     layouts: [Layout; 3],
-    left_tail: u32,
     dispatch: OperatorDispatch,
 ) -> OperatorPlan {
     let MidOperator::Gemm {
@@ -406,36 +390,28 @@ pub(super) fn gemm_plan(
         unreachable!("GEMM operand contract requires a GEMM operator");
     };
     let [left, right, output] = layouts;
-    let operand = |layout| OperandRequirement::new(TensorFormat { precision, layout }, 32);
+    let operand = |layout| OperandRequirement::new(TensorFormat { precision, layout });
     let orientation = match dispatch {
         OperatorDispatch::BlockedGemm { orientation, .. } => orientation,
         _ => unreachable!("GEMM operand contract requires a GEMM dispatch"),
     };
     let left_index = orientation.operand_indices().0;
     let mut inputs = vec![operand(left), operand(right)];
-    inputs[left_index].access_tail_bytes = left_tail;
     inputs[left_index].materialization = OperandMaterialization::DispatchSlices;
     OperatorPlan {
         operator,
         dispatch,
         requirements: StorageRequirements {
             inputs,
-            output: OperandRequirement::new(
-                TensorFormat {
-                    precision: if matches!(precision, Precision::F8F143 { .. }) {
-                        Precision::F16
-                    } else {
-                        precision
-                    },
-                    layout: output,
+            output: OperandRequirement::new(TensorFormat {
+                precision: if matches!(precision, Precision::F8F143 { .. }) {
+                    Precision::F16
+                } else {
+                    precision
                 },
-                32,
-            ),
+                layout: output,
+            }),
             output_aliasing: OutputAliasing::Fresh,
-            distinct_elements: vec![vec![
-                MemoryOperand::Output,
-                MemoryOperand::Input(left_index as u16),
-            ]],
         },
         deferred_output: None,
     }
@@ -444,7 +420,6 @@ pub(super) fn gemm_plan(
 pub(super) fn amp_gemm_operator_candidate(
     precision: Precision,
     inner: u16,
-    left_tail: u32,
     output_columns: u32,
     tile_count: u16,
 ) -> ConcreteOperatorCandidate {
@@ -472,7 +447,6 @@ pub(super) fn amp_gemm_operator_candidate(
                     Layout::amp_output(tile_count)
                 },
             ],
-            left_tail,
             blocked_gemm_dispatch(output_columns),
         ),
         format_policy: OperatorFormatPolicy::Concrete,
@@ -482,7 +456,6 @@ pub(super) fn amp_gemm_operator_candidate(
 pub(super) fn amp_grid_gemm_operator_candidate(
     precision: Precision,
     inner: u16,
-    left_tail: u32,
     output_columns: u32,
     grid: AmpGridShape,
     weights: AmpWeightPlacement,
@@ -540,7 +513,6 @@ pub(super) fn amp_grid_gemm_operator_candidate(
                     )
                 },
             ],
-            left_tail,
             blocked_gemm_dispatch(output_columns),
         ),
         format_policy: OperatorFormatPolicy::Concrete,

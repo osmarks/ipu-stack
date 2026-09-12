@@ -422,14 +422,12 @@ mod tests {
                         .tensor_type
                         .format
                         .clone(),
-                    8,
                 ),
                 output: OperandRequirement::new(
                     mid.values[op.results[0].index() as usize]
                         .tensor_type
                         .format
                         .clone(),
-                    8,
                 ),
                 strategy: ConversionStrategy::LocalKernel,
             });
