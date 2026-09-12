@@ -1,5 +1,10 @@
 # Capacity-first baseline — September 12, 2026
 
+Later [full-model relay revalidation](EXCHANGE_GATHER_2026_09_12.md#full-model-revalidation)
+supersedes the capacity results below: both SigLIP 27-layer and PE 24-layer
+batch-two builds now fit and pass two resident hardware inference calls under
+the normal exchange limits.
+
 The experimental `--capacity-baseline` uses the existing operator catalogue,
 conversion inserter, mid implementations and liveness estimator. It does not add
 a retry planner or panel-streaming GEMM implementation. The established baseline

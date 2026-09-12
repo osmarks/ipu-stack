@@ -172,10 +172,69 @@ multicast, with scratch, exchange rows and execution cost included. An ordinary
 identity-copy composition pass would otherwise erase the relay and recreate the
 original exchange.
 
-The 27-layer batch-two model has not been rebuilt or run with these relays.
-Its live allocation compatibility and final row sharing/patching still need
-validation; the production tests above cover one and two layers.
+Full batch-two builds and resident hardware validation now pass for both models,
+as recorded below.
 Relay selection here is deterministic and simple; it is not a search optimum.
+
+## Full-model revalidation
+
+Built from `5e02c88` with the normal 80 KiB/tile exchange-table and 16,384-fragment
+limits. Both use the capacity baseline, zero local optimization steps, fused QKV,
+FP8 F143 dense operands at scale −4, FP16 attention, and B1024 scheduling.
+Profiling is disabled for these capacity tests; exact placement profiles are saved.
+Host builds ran concurrently with 12 Rayon threads each; device access was serialized.
+
+| Batch-two model | Result | Maximum encoded exchange storage | FP32-reference minimum cosine | Estimated device cycles | Measured resident batch latency |
+|---|---|---:|---:|---:|---:|
+| SigLIP So400m, 27 layers | PASS | 61,316 B/tile | 0.993968791 | 25,281,807 | 18.455 ms |
+| PE L/14 capacity probe, 24 layers | PASS | 50,652 B/tile | 0.993687455 | 22,689,775 | 15.991 ms |
+
+Each reference test uploads all layer parameters once and checks two consecutive
+inference calls. Both calls pass with the same cosine; maximum absolute errors
+are 0.411731 and 0.394768 respectively. These are randomized-weight numerical
+tests, not pretrained-model accuracy tests. The PE probe still omits RoPE and
+uses layernorm epsilon 1e−6 rather than 1e−5.
+
+Resident latency is a separate replay of the saved input/weight/output fixture:
+image upload, inference, and embedding download, excluding initial weight upload
+and device attachment. Both returned outputs match the saved hardware output
+exactly. The two SigLIP calls take 18.280 and 18.627 ms; PE takes 16.043 and
+15.937 ms, with 100 µs host polling. Aggregate throughput is approximately
+108.4 and 125.1 images/s respectively. These short host-timed samples are not
+cycle-profile measurements.
+
+SigLIP previously failed the exchange-storage limit; the complete model now
+places and runs without increasing it. PE's previous full capacity build used
+74,628 B/tile, versus 50,652 now (32.1% less). Its previous cycle estimate was
+19,758,901, versus 22,689,775 now (14.8% higher): the storage improvement is
+not a demonstrated speedup. There is no matched previous resident timing in
+this comparison. Package planning took 132.3 s for SigLIP and 88.8 s for PE
+while the two builds shared the host.
+
+Artifacts: `artifacts/relay-big-20260912/{siglip-b2,pe-b2}/` contains each package,
+`build-run.log`, `latency.log`, saved `resident/` fixture and memory profiles.
+Exact placement: [SigLIP](../artifacts/relay-big-20260912/siglip-b2/memory/placement-466697.html)
+and [PE](../artifacts/relay-big-20260912/pe-b2/memory/placement-466699.html).
+
+Reproduce each build after sourcing `.env` (use `LAYERS=27`, `MODEL=()` for
+SigLIP; `LAYERS=24`, `MODEL=(--vit-model pe-core-l14-capacity)` for PE):
+
+```bash
+out=artifacts/relay-big-recheck/siglip-b2
+mkdir -p "$out"
+RAYON_NUM_THREADS=12 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
+  --sdk "$POPLAR_SDK_ENABLED" --runtime-source device/static_runtime.S \
+  --workload siglip-vit-benchmark "${MODEL[@]}" --vit-layers "$LAYERS" \
+  --vit-batch 2 --fuse-qkv --fp8-scale=-4 --capacity-baseline \
+  --optimization-steps 0 --exchange-stream-words 1024 --no-profile \
+  --reference-run --reference-fp32 --reference-inferences 2 \
+  --device-lock artifacts/layout-sweep/device.lock \
+  --memory-profile-directory "$out/memory" --save-reference-inputs "$out/resident" \
+  --package "$out/model.ipuexe" > "$out/build-run.log" 2>&1
+target/release/ipu-host-exchange-bench "$out/model.ipuexe" "$IPU_CONFIG" \
+  --data "$out/resident" --sdk "$POPLAR_SDK_ENABLED" \
+  --device-lock artifacts/layout-sweep/device.lock > "$out/latency.log" 2>&1
+```
 
 ## Reproduction
 
