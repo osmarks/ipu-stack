@@ -275,3 +275,21 @@ Small cases can still pay extra setup (the 16-element padded case increases
 from 960 to 1,170 cycles). These are kernel measurements, not a rebuilt full ViT
 profile. Raw cases, assembly, packages and comparison logs are retained under
 `artifacts/fp8-cast/packed-pipeline/` and `artifacts/fp8-cast/packed-baseline/`.
+
+## Pretrained calibration follow-up (2026-09-12)
+
+The global bring-up scale −4 is insufficient for real SigLIP weights: some learned
+layernorm outputs exceed 300, whereas that scale represents at most 15.
+[Pretrained validation and calibration](SIGLIP_PRETRAINED_VALIDATION_2026_09_12.md)
+records the image preprocessing, independent FP32 references, tensor-scale
+experiments, historical GPTQ reconstruction and the remaining compiler work.
+
+`tools/quantize_siglip_f143.py --scale-granularity tensor` now retains one scale
+per weight matrix while still using small Hessian blocks for GPTQ. Its default
+`block` behavior remains available for reproducing historical experiments.
+`tools/calibrate_siglip_fixture.py` additionally models independent activation
+scales, fused QKV/KV tensors, and the complete MAP embedding output. These tools
+write reconstructed floating-point parameters; their calibrated choices are not yet wired
+into the benchmark planner. Fixed scales shared across all layers and both
+operands also passed the host experiment, so dynamic Repeat scale arguments
+are not currently required.

@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
         help="Image processed with the model's official processor; may be repeated",
     )
     parser.add_argument("--block-size", type=int, default=64)
+    parser.add_argument("--scale-granularity", choices=("block", "tensor"), default="block")
     parser.add_argument("--damp", type=float, default=0.01)
     parser.add_argument("--algorithm", choices=("nearest", "gptq"), default="gptq")
     parser.add_argument("--layers", type=int)
@@ -76,6 +77,8 @@ def load_model(path: Path) -> tuple[SiglipVisionModel, SiglipConfig]:
             for name in source.keys()
             if name.startswith("vision_model.")
         }
+    if not hasattr(model, "vision_model"):
+        state = {name.removeprefix("vision_model."): value for name, value in state.items()}
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         raise RuntimeError(f"weight mismatch: missing={missing}, unexpected={unexpected}")
@@ -102,7 +105,9 @@ def calibration_pixels(
 
 def encoder_linears(model: SiglipVisionModel, layers: int) -> dict[str, torch.nn.Linear]:
     selected = {}
-    for name, module in model.named_modules():
+    vision = getattr(model, "vision_model", model)
+    for name, module in vision.named_modules():
+        name = "vision_model." + name
         if not isinstance(module, torch.nn.Linear) or not name.startswith("vision_model.encoder.layers."):
             continue
         layer = int(name.split(".")[3])
@@ -149,6 +154,11 @@ def collect_block_hessians(
     for hook in hooks:
         hook.remove()
     return hessians, sums, counts
+
+
+def f143_tensor_scale(values: torch.Tensor) -> int:
+    maximum = values.abs().max().item()
+    return max(-32, min(31, math.ceil(math.log2(maximum / 240.)))) if maximum else 0
 
 
 def f143_scales_by_row_block(values: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -208,7 +218,9 @@ def gptq_block(
     return output
 
 
-def nearest_f143_weight(weight: torch.Tensor, block_size: int) -> torch.Tensor:
+def nearest_f143_weight(weight: torch.Tensor, block_size: int, tensor_scale: float | None = None) -> torch.Tensor:
+    if tensor_scale is not None:
+        return project_f143(weight, tensor_scale)
     output = torch.empty_like(weight)
     for start in range(0, weight.shape[1], block_size):
         block = weight[:, start : start + block_size]
@@ -221,7 +233,7 @@ def layernorm_consumer_groups(
     model: SiglipVisionModel, layers: int
 ) -> list[tuple[str, torch.nn.LayerNorm, list[torch.nn.Linear]]]:
     groups = []
-    for index, layer in enumerate(model.vision_model.encoder.layers[:layers]):
+    for index, layer in enumerate(getattr(model, "vision_model", model).encoder.layers[:layers]):
         groups.append(
             (
                 f"encoder_layer_{index:02}.norm1_qkv",
@@ -235,12 +247,51 @@ def layernorm_consumer_groups(
     return groups
 
 
+def equalize_layernorm_group(norm, consumers, moment, block_size, scale_limit, tensor_scales=False):
+    """Historical bounded channel equalization, optionally priced with tensor scales."""
+    activation_rms = moment.sqrt().clamp_min(1e-8)
+    weight_rms = torch.cat([consumer.weight for consumer in consumers])
+    weight_rms = weight_rms.float().square().mean(dim=0).sqrt().clamp_min(1e-8)
+    baseline = 0.0
+    candidates = []
+    for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
+        scale = activation_rms.pow(alpha) / weight_rms.pow(1.0 - alpha)
+        scale /= (scale.min() * scale.max()).sqrt()
+        scale.clamp_(1.0 / scale_limit, scale_limit)
+        objective = 0.0
+        for consumer in consumers:
+            transformed = consumer.weight.float() * scale
+            quantized = nearest_f143_weight(transformed, block_size,
+                    f143_tensor_scale(transformed) if tensor_scales else None)
+            error = transformed - quantized
+            objective += torch.sum(error.square() * (moment / scale.square())).item()
+            if alpha == 0.0:
+                unscaled = nearest_f143_weight(consumer.weight.float(), block_size,
+                        f143_tensor_scale(consumer.weight) if tensor_scales else None)
+                baseline += torch.sum(
+                    (consumer.weight.float() - unscaled).square() * moment
+                ).item()
+        candidates.append((objective, alpha, scale))
+    objective, alpha, scale = min(candidates, key=lambda candidate: candidate[0])
+    norm.weight.div_(scale.to(norm.weight.dtype))
+    norm.bias.div_(scale.to(norm.bias.dtype))
+    for consumer in consumers:
+        consumer.weight.mul_(scale.to(consumer.weight.dtype))
+    return {
+        "alpha": alpha,
+        "objective_ratio": objective / baseline if baseline else 0.0,
+        "scale_minimum": scale.min().item(),
+        "scale_maximum": scale.max().item(),
+    }
+
+
 def equalize_layernorm_consumers(
     model: SiglipVisionModel,
     batches: list[torch.Tensor],
     layers: int,
     block_size: int,
     scale_limit: float,
+    tensor_scales: bool = False,
 ) -> dict[str, dict[str, float]]:
     groups = layernorm_consumer_groups(model, layers)
     second_moments = {
@@ -269,38 +320,7 @@ def equalize_layernorm_consumers(
     with torch.no_grad():
         for name, norm, consumers in groups:
             moment = second_moments.pop(name) / counts.pop(name)
-            activation_rms = moment.sqrt().clamp_min(1e-8)
-            weight_rms = torch.cat([consumer.weight for consumer in consumers])
-            weight_rms = weight_rms.float().square().mean(dim=0).sqrt().clamp_min(1e-8)
-            baseline = 0.0
-            candidates = []
-            for alpha in (0.0, 0.25, 0.5, 0.75, 1.0):
-                scale = activation_rms.pow(alpha) / weight_rms.pow(1.0 - alpha)
-                scale /= (scale.min() * scale.max()).sqrt()
-                scale.clamp_(1.0 / scale_limit, scale_limit)
-                objective = 0.0
-                for consumer in consumers:
-                    transformed = consumer.weight.float() * scale
-                    quantized = nearest_f143_weight(transformed, block_size)
-                    error = transformed - quantized
-                    objective += torch.sum(error.square() * (moment / scale.square())).item()
-                    if alpha == 0.0:
-                        unscaled = nearest_f143_weight(consumer.weight.float(), block_size)
-                        baseline += torch.sum(
-                            (consumer.weight.float() - unscaled).square() * moment
-                        ).item()
-                candidates.append((objective, alpha, scale))
-            objective, alpha, scale = min(candidates, key=lambda candidate: candidate[0])
-            norm.weight.div_(scale.to(norm.weight.dtype))
-            norm.bias.div_(scale.to(norm.bias.dtype))
-            for consumer in consumers:
-                consumer.weight.mul_(scale.to(consumer.weight.dtype))
-            report[name] = {
-                "alpha": alpha,
-                "objective_ratio": objective / baseline if baseline else 0.0,
-                "scale_minimum": scale.min().item(),
-                "scale_maximum": scale.max().item(),
-            }
+            report[name] = equalize_layernorm_group(norm, consumers, moment, block_size, scale_limit, tensor_scales)
     return report
 
 
@@ -311,6 +331,7 @@ def reconstruct_linear(
     damp: float,
     algorithm: str,
     input_mean: torch.Tensor | None,
+    tensor_scale: float | None = None,
 ) -> tuple[float, float, float]:
     original = module.weight.detach()
     reconstructed = torch.empty_like(original)
@@ -323,7 +344,11 @@ def reconstruct_linear(
             inverse_hessian_factor(hessian, damp) if algorithm == "gptq" else None
         )
         block = original[:, input_start:input_end]
-        scales = f143_scales_by_row_block(block, block_size)
+        scales = (
+            f143_scales_by_row_block(block, block_size)
+            if tensor_scale is None
+            else torch.full((module.out_features,), tensor_scale, device=block.device)
+        )
         nearest = project_f143(block, scales[:, None])
         rebuilt = (
             gptq_block(block, inverse_factor, scales)
@@ -382,6 +407,10 @@ def reconstruct_modules(
                 args.damp,
                 args.algorithm,
                 input_mean,
+                tensor_scale=(
+                    f143_tensor_scale(module.weight)
+                    if args.scale_granularity == "tensor" else None
+                ),
             )
             objectives[name] = {
                 "nearest": nearest,
@@ -435,6 +464,7 @@ def main() -> None:
             layer_count,
             args.block_size,
             args.equalization_scale_limit,
+            tensor_scales=args.scale_granularity == "tensor",
         )
         if args.equalize_layernorm
         else {}
@@ -473,6 +503,7 @@ def main() -> None:
     report = {
         "algorithm": f"block-diagonal-f143-{args.algorithm}",
         "block_size": args.block_size,
+        "scale_granularity": args.scale_granularity,
         "calibration": [str(path) for path in args.calibration],
         "images": [str(path) for path in args.image],
         "damp": args.damp,
@@ -492,7 +523,7 @@ def main() -> None:
         shutil.copy2(args.model / "config.json", args.output / "config.json")
         save_file(
             {
-                name: value.detach().cpu().contiguous()
+                (name if name.startswith("vision_model.") else "vision_model." + name): value.detach().cpu().contiguous()
                 for name, value in model.state_dict().items()
             },
             args.output / "model.safetensors",
