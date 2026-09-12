@@ -475,6 +475,14 @@ fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     ipu_runtime::init_tracing();
     let arguments = Arguments::parse();
+    if !arguments.reuse_package
+        && let Some(parent) = arguments
+            .package
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
     if arguments.reference_run
         && matches!(
             arguments.workload,
