@@ -1487,7 +1487,7 @@ impl StressPackage {
             .filter(|transfer| transfer.case == case)
             .map(|transfer| {
                 format!(
-                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={} requestedOffset={} encodedOffset={} sender={}..{} receivers={:?}..{:?}",
+                    "source={} address=0x{:x} destinations={:?} addresses={:?} words={} requestedOffset={} encodedOffset={} sender={}..{} receivers={:?}",
                     transfer.source,
                     transfer.source_address,
                     transfer.destinations,
@@ -1497,8 +1497,7 @@ impl StressPackage {
                     transfer.schedule_offset,
                     transfer.timing.payload_start,
                     transfer.timing.payload_end,
-                    transfer.timing.receiver_payload_starts,
-                    transfer.timing.receiver_payload_ends,
+                    transfer.timing.receivers,
                 )
             })
             .collect::<Vec<_>>()
@@ -1682,7 +1681,7 @@ fn overlap_specs(
         0,
         words,
     )?;
-    let incoming_start = incoming_base.receiver_payload_starts[0];
+    let incoming_start = incoming_base.receivers[0].payload_start;
     let outgoing_start = outgoing_base.payload_start;
     let anchor = incoming_start.max(outgoing_start);
     let maximum_delta = words.saturating_sub(1);

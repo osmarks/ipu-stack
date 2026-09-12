@@ -21,8 +21,9 @@ use crate::{
 };
 use ipu_exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
-    RETURN_M10_INSTRUCTION, Topology, finalize_point_receiver, patch_receiver_address,
-    patch_sender_address, patch_sender_instruction, sender_address_instruction_groups,
+    RETURN_M10_INSTRUCTION, ScheduledPayloadTiming, Topology, finalize_point_receiver,
+    patch_receiver_address, patch_sender_address, patch_sender_instruction,
+    sender_address_instruction_groups,
 };
 use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
@@ -487,15 +488,6 @@ pub(crate) fn lower_exchanges_cached(
                     "optimized physical exchange schedule"
                 );
             }
-            let MaterializedSchedule {
-                builder,
-                horizon,
-                tile_availability,
-                activities,
-                order,
-                timings,
-                ..
-            } = schedule;
             let mut diagnostics =
                 enable_diagnostics.then(|| PhaseDiagnostics::new(program.tile_count));
             if let Some(diagnostics) = &mut diagnostics {
@@ -504,9 +496,9 @@ pub(crate) fn lower_exchanges_cached(
                     endpoint_roles[usize::from(tile)] += 1;
                 }
                 diagnostics.maximum_endpoint_roles = endpoint_roles.into_iter().max().unwrap_or(0);
-                for &index in &order {
+                for &index in &schedule.order {
                     let transfer = &pending[index];
-                    let timing = timings[index].ok_or(ExchangeLoweringError::Overflow)?;
+                    let timing = schedule.timings[index].ok_or(ExchangeLoweringError::Overflow)?;
                     diagnostics.record(
                         transfer.source,
                         transfer.source_address(),
@@ -522,30 +514,22 @@ pub(crate) fn lower_exchanges_cached(
                 diagnostics.emit(
                     phase.id.index(),
                     &phase.provenance,
-                    horizon,
-                    &tile_availability,
-                    &builder,
+                    schedule.horizon,
+                    &schedule.tile_availability,
+                    &schedule.builder,
                 );
             }
-            let phase_programs = builder.finish()?;
-            debug_assert_eq!(phase_programs.event_cycles, horizon);
-            let tile_event_cycles = phase_programs.tile_event_cycles;
-            let active = phase_programs
+            let mut physical = schedule.into_phase(phase.id, incoming_bases)?;
+            let address_groups = physical
                 .programs
                 .iter()
-                .map(Option::is_some)
-                .collect::<Vec<_>>();
-            let mut programs = phase_programs
-                .programs
-                .into_iter()
-                .map(|program| program.unwrap_or_else(inactive_exchange_program))
-                .collect::<Vec<_>>();
-            let address_groups = programs.iter()
                 .map(|program| sender_address_instruction_groups(program))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut patch_words = vec![0; pending.len()];
-            for (groups, activity) in address_groups.iter().zip(&activities) {
-                let sends = activity.iter().filter(|a| a.kind == ExchangeActivityKind::Send);
+            for (groups, activity) in address_groups.iter().zip(&physical.activities) {
+                let sends = activity
+                    .iter()
+                    .filter(|a| a.kind == ExchangeActivityKind::Send);
                 if groups.len() != sends.clone().count() {
                     return Err(ExchangeLoweringError::IncompatibleRepeatRows(
                         "send instruction groups do not match scheduled messages",
@@ -555,38 +539,64 @@ pub(crate) fn lower_exchanges_cached(
                     patch_words[send.transfer as usize] = group.len();
                 }
             }
-            let outgoing_bases = repeat_outgoing_bases(&pending, &patch_words, &placement.shard_addresses, program.tile_count);
-            let repeat_patches = programs
+            physical.outgoing_bases = repeat_outgoing_bases(
+                &pending,
+                &patch_words,
+                &placement.shard_addresses,
+                program.tile_count,
+            );
+            physical.repeat_patches = physical
+                .programs
                 .iter_mut()
                 .enumerate()
                 .zip(address_groups)
                 .map(|((tile, program), address_groups)| {
-                    let sends = activities[tile].iter()
+                    let sends = physical.activities[tile]
+                        .iter()
                         .filter(|activity| activity.kind == ExchangeActivityKind::Send)
                         .map(|activity| &pending[activity.transfer as usize])
                         .collect::<Vec<_>>();
                     let mut patches = Vec::new();
-                    let bases = outgoing_bases[tile].map(|(shard, offset)| {
-                        repeat_inputs[&shard].iter().map(|input| {
-                            placement.shard_addresses[input].checked_add(offset)
-                                .ok_or(ExchangeLoweringError::Overflow)
-                        }).collect::<Result<Vec<_>, ExchangeLoweringError>>()
-                    }).transpose()?;
+                    let bases = physical.outgoing_bases[tile]
+                        .map(|(shard, offset)| {
+                            repeat_inputs[&shard]
+                                .iter()
+                                .map(|input| {
+                                    placement.shard_addresses[input]
+                                        .checked_add(offset)
+                                        .ok_or(ExchangeLoweringError::Overflow)
+                                })
+                                .collect::<Result<Vec<_>, ExchangeLoweringError>>()
+                        })
+                        .transpose()?;
                     for (instructions, transfer) in address_groups.into_iter().zip(sends) {
-                        if bases.is_none() && transfer.source_addresses.iter().all(|&a| a == transfer.source_address()) {
+                        if bases.is_none()
+                            && transfer
+                                .source_addresses
+                                .iter()
+                                .all(|&a| a == transfer.source_address())
+                        {
                             continue;
                         }
-                        let count = transfer.source_addresses.len().max(bases.as_ref().map_or(1, Vec::len));
+                        let count = transfer
+                            .source_addresses
+                            .len()
+                            .max(bases.as_ref().map_or(1, Vec::len));
                         for (word_offset, byte_offset) in instructions {
-                            let values = (0..count).map(|i| {
-                                let base = bases.as_ref().map_or(0, |b| b.get(i).copied().unwrap_or(b[0]));
-                                let address = repeat_source_address(transfer, i).checked_sub(base)
-                                    .and_then(|a| a.checked_add(byte_offset))
-                                    .ok_or(ExchangeLoweringError::Overflow)?;
-                                let mut instruction = program[word_offset];
-                                patch_sender_instruction(&mut instruction, address)?;
-                                Ok(instruction)
-                            }).collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
+                            let values = (0..count)
+                                .map(|i| {
+                                    let base = bases
+                                        .as_ref()
+                                        .map_or(0, |b| b.get(i).copied().unwrap_or(b[0]));
+                                    let address = repeat_source_address(transfer, i)
+                                        .checked_sub(base)
+                                        .and_then(|a| a.checked_add(byte_offset))
+                                        .ok_or(ExchangeLoweringError::Overflow)?;
+                                    let mut instruction = program[word_offset];
+                                    patch_sender_instruction(&mut instruction, address)?;
+                                    Ok(instruction)
+                                })
+                                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
                             if bases.is_none() && values[0] != program[word_offset] {
                                 return Err(ExchangeLoweringError::IncompatibleRepeatRows(
                                     "relocation changes the first iteration",
@@ -595,7 +605,8 @@ pub(crate) fn lower_exchanges_cached(
                             program[word_offset] = values[0];
                             if values.iter().any(|&v| v != values[0]) {
                                 patches.push(ExchangeRowPatch {
-                                    word_offset: u32::try_from(word_offset).map_err(|_| ExchangeLoweringError::Overflow)?,
+                                    word_offset: u32::try_from(word_offset)
+                                        .map_err(|_| ExchangeLoweringError::Overflow)?,
                                     values,
                                 });
                             }
@@ -605,7 +616,8 @@ pub(crate) fn lower_exchanges_cached(
                 })
                 .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             if pending.len() > 1_000 {
-                let (tile, words) = programs
+                let (tile, words) = physical
+                    .programs
                     .iter()
                     .enumerate()
                     .map(|(tile, row)| (tile, row.len()))
@@ -615,24 +627,11 @@ pub(crate) fn lower_exchanges_cached(
                     phase = phase.id.index(),
                     tile,
                     row_words = words,
-                    horizon,
+                    horizon = physical.event_cycles,
                     "finished large physical exchange phase"
                 );
             }
-            Ok((
-                PhysicalExchangePhase {
-                    id: phase.id,
-                    active,
-                    programs,
-                    incoming_bases,
-                    tile_event_cycles,
-                    event_cycles: horizon,
-                    activities,
-                    repeat_patches,
-                    outgoing_bases,
-                },
-                schedule_problem,
-            ))
+            Ok((physical, schedule_problem))
         })
         .collect::<Result<Vec<_>, ExchangeLoweringError>>();
     for phase_cache in phase_caches {
@@ -1387,7 +1386,6 @@ impl ExchangeScheduleSnapshot {
 /// Runs the same ordering, timing, full-duplex code generation, and row
 /// validation used by package lowering on one captured phase.
 fn finish_exchange_run(
-    tile_count: u16,
     phase_id: u32,
     incoming_bases: Vec<u32>,
     optimized: OptimizedSchedule,
@@ -1399,41 +1397,7 @@ fn finish_exchange_run(
         neighborhood_improvements,
         selected_kind,
     } = optimized;
-    let MaterializedSchedule {
-        builder,
-        horizon,
-        activities,
-        ..
-    } = schedule;
-    let phase_programs = builder.finish()?;
-    if phase_programs.event_cycles != horizon {
-        return Err(ExchangeLoweringError::Invariant(format!(
-            "phase {} row horizon {} differs from scheduled horizon {horizon}",
-            phase_id, phase_programs.event_cycles
-        )));
-    }
-    let tile_event_cycles = phase_programs.tile_event_cycles;
-    let active = phase_programs
-        .programs
-        .iter()
-        .map(Option::is_some)
-        .collect::<Vec<_>>();
-    let programs = phase_programs
-        .programs
-        .into_iter()
-        .map(|program| program.unwrap_or_else(inactive_exchange_program))
-        .collect::<Vec<_>>();
-    let phase = PhysicalExchangePhase {
-        id: ExchangePhaseId::from_index(phase_id),
-        active,
-        programs,
-        incoming_bases,
-        tile_event_cycles,
-        event_cycles: horizon,
-        activities,
-        repeat_patches: vec![Vec::new(); usize::from(tile_count)],
-        outgoing_bases: vec![None; usize::from(tile_count)],
-    };
+    let phase = schedule.into_phase(ExchangePhaseId::from_index(phase_id), incoming_bases)?;
     Ok(ExchangeScheduleRun {
         phase,
         initial_horizon,
@@ -2288,29 +2252,23 @@ impl MaterializedSchedule {
             });
         }
         let mut completion = payload_end;
-        for (((&(tile, address), &start_cycle), &end_cycle), &memory_end_cycle) in transfer
-            .destinations
-            .iter()
-            .zip(&timing.receiver_payload_starts)
-            .zip(&timing.receiver_payload_ends)
-            .zip(&timing.receiver_horizons)
-        {
+        for (&(tile, address), receiver) in transfer.destinations.iter().zip(&timing.receivers) {
             self.memory_accesses[usize::from(tile)].receives.record(
                 &effective_memory_elements(address, transfer.words),
-                start_cycle,
-                memory_end_cycle,
+                receiver.payload_start,
+                receiver.horizon,
             );
             self.activities[usize::from(tile)].push(ExchangeActivity {
                 kind: ExchangeActivityKind::Receive,
-                start_cycle,
-                end_cycle,
-                memory_end_cycle,
+                start_cycle: receiver.payload_start,
+                end_cycle: receiver.payload_end,
+                memory_end_cycle: receiver.horizon,
                 address,
                 ..activity
             });
-            self.tile_availability[usize::from(tile)].receive = end_cycle;
+            self.tile_availability[usize::from(tile)].receive = receiver.payload_end;
             last_transfer[usize::from(tile)].receive = Some(index);
-            completion = completion.max(end_cycle);
+            completion = completion.max(receiver.payload_end);
         }
         self.tile_availability[usize::from(transfer.source)].send = timing.payload_end;
         if let Some(tile) = transfer.reserved_source {
@@ -2326,6 +2284,38 @@ impl MaterializedSchedule {
             predecessor,
         });
         Ok(completion)
+    }
+
+    fn into_phase(
+        self,
+        id: ExchangePhaseId,
+        incoming_bases: Vec<u32>,
+    ) -> Result<PhysicalExchangePhase, ExchangeLoweringError> {
+        let encoded = self.builder.finish()?;
+        if encoded.event_cycles != self.horizon {
+            return Err(ExchangeLoweringError::Invariant(format!(
+                "phase {} row horizon {} differs from scheduled horizon {}",
+                id.index(),
+                encoded.event_cycles,
+                self.horizon
+            )));
+        }
+        let tile_count = encoded.programs.len();
+        Ok(PhysicalExchangePhase {
+            id,
+            active: encoded.programs.iter().map(Option::is_some).collect(),
+            programs: encoded
+                .programs
+                .into_iter()
+                .map(|program| program.unwrap_or_else(inactive_exchange_program))
+                .collect(),
+            incoming_bases,
+            tile_event_cycles: encoded.tile_event_cycles,
+            event_cycles: self.horizon,
+            activities: self.activities,
+            repeat_patches: vec![Vec::new(); tile_count],
+            outgoing_bases: vec![None; tile_count],
+        })
     }
 
     fn finish_horizon(&mut self) {
@@ -2646,12 +2636,6 @@ fn append_transfer(
         };
         let timing =
             builder.transfer_timing_at(source, &tiles, &plan, schedule_offset, item_count)?;
-        let receiver_intervals = timing
-            .receiver_payload_starts
-            .iter()
-            .copied()
-            .zip(timing.receiver_horizons.iter().copied())
-            .collect::<Vec<_>>();
         schedule_offset = schedule_offset.max(memory_safe_transfer_offset(
             memory_accesses,
             source,
@@ -2660,7 +2644,7 @@ fn append_transfer(
             words,
             timing.payload_start,
             timing.sender_horizon,
-            &receiver_intervals,
+            &timing.receivers,
             schedule_offset,
         )?);
         if schedule_offset == previous {
@@ -2685,7 +2669,7 @@ fn memory_safe_transfer_offset(
     words: u32,
     payload_start: u32,
     payload_end: u32,
-    receiver_intervals: &[(u32, u32)],
+    receivers: &[ScheduledPayloadTiming],
     schedule_offset: u32,
 ) -> Result<u32, ExchangeLoweringError> {
     let mut safe_offset = schedule_offset;
@@ -2696,12 +2680,16 @@ fn memory_safe_transfer_offset(
     );
     let receiver_clash = destinations
         .iter()
-        .zip(receiver_intervals)
-        .filter_map(|(&(tile, address), &(start, end))| {
+        .zip(receivers)
+        .filter_map(|(&(tile, address), receiver)| {
             memory_accesses[usize::from(tile)]
                 .sends
-                .conflict_end(&effective_memory_elements(address, words), start, end)
-                .map(|conflict| conflict.saturating_sub(start))
+                .conflict_end(
+                    &effective_memory_elements(address, words),
+                    receiver.payload_start,
+                    receiver.horizon,
+                )
+                .map(|conflict| conflict.saturating_sub(receiver.payload_start))
         })
         .max();
     let source_delay = source_clash.map(|end| end.saturating_sub(payload_start));

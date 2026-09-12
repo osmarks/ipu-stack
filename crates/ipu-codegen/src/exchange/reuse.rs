@@ -90,12 +90,7 @@ impl ExchangeScheduleCache {
             tile_count,
         )?;
         let problem = schedule_problem(problem.phase, &selected.pending);
-        let run = finish_exchange_run(
-            tile_count,
-            problem.phase,
-            selected.incoming_bases,
-            selected.optimized,
-        )?;
+        let run = finish_exchange_run(problem.phase, selected.incoming_bases, selected.optimized)?;
         Ok((problem, run))
     }
 

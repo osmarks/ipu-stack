@@ -335,9 +335,7 @@ pub struct PhaseTransferTiming {
     pub payload_start: u32,
     pub payload_end: u32,
     pub sender_horizon: u32,
-    pub receiver_payload_starts: Vec<u32>,
-    pub receiver_payload_ends: Vec<u32>,
-    pub receiver_horizons: Vec<u32>,
+    pub receivers: Vec<ScheduledPayloadTiming>,
     pub horizon: u32,
 }
 
@@ -679,12 +677,17 @@ impl PhaseProgramBuilder {
                     .tile_states
                     .get(usize::from(receiver))
                     .ok_or(ExchangeError::Tile(receiver))?;
-                scheduled_receive_window(
+                let timing = scheduled_receive_window(
                     row,
                     schedule_offset,
                     words,
                     schedule.receive_stream.as_ref(),
-                )
+                )?;
+                Ok(ScheduledPayloadTiming {
+                    payload_start: timing.payload_start,
+                    payload_end: timing.payload_end,
+                    horizon: timing.horizon,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let horizon = receiver_timings
@@ -697,18 +700,7 @@ impl PhaseProgramBuilder {
             payload_start: sender.start_cycles,
             payload_end: sender.end_cycles,
             sender_horizon: sender.horizon_cycles,
-            receiver_payload_starts: receiver_timings
-                .iter()
-                .map(|timing| timing.payload_start)
-                .collect(),
-            receiver_payload_ends: receiver_timings
-                .iter()
-                .map(|timing| timing.payload_end)
-                .collect(),
-            receiver_horizons: receiver_timings
-                .iter()
-                .map(|timing| timing.horizon)
-                .collect(),
+            receivers: receiver_timings,
             horizon,
         })
     }
@@ -1467,7 +1459,7 @@ impl SenderRowTiming {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScheduledSenderTiming {
+pub struct ScheduledPayloadTiming {
     pub payload_start: u32,
     pub payload_end: u32,
     pub horizon: u32,
@@ -1484,9 +1476,9 @@ pub struct ScheduledReceiverTiming {
 pub fn scheduled_sender_timing(
     row: &PlanRow,
     schedule_offset: u32,
-) -> Result<ScheduledSenderTiming, ExchangeError> {
+) -> Result<ScheduledPayloadTiming, ExchangeError> {
     let timing = sender_row_timing(row, schedule_offset)?;
-    Ok(ScheduledSenderTiming {
+    Ok(ScheduledPayloadTiming {
         payload_start: timing.start_cycles,
         payload_end: timing.end_cycles,
         horizon: timing.horizon_cycles,

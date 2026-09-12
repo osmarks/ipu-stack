@@ -85,7 +85,7 @@ pub fn schedule_exchange_problem_with_priority(
             "full-duplex",
         )?
     };
-    finish_exchange_run(tile_count, problem.phase, incoming_bases, optimized)
+    finish_exchange_run(problem.phase, incoming_bases, optimized)
 }
 
 pub(super) fn balanced_stream_schedule(

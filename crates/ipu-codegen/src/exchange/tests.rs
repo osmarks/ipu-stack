@@ -401,7 +401,7 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
         let (new_maximum, new_total) = encoded_row_storage(&optimized.schedule).unwrap();
         assert_eq!((new_maximum, new_total), (maximum, total));
         assert_eq!(optimized.schedule.horizon, baseline.horizon);
-        let run = finish_exchange_run(tile_count, phase, incoming_bases, optimized).unwrap();
+        let run = finish_exchange_run(phase, incoming_bases, optimized).unwrap();
         validate_exchange_schedule(tile_count, &problem, &run.phase).unwrap();
     }
 }
@@ -1158,4 +1158,14 @@ fn snapshot_rejects_inactive_paired_sender_lane() {
             validate_exchange_schedule(tiles, &problem, &run.phase).unwrap();
         }
     }
+}
+
+#[test]
+fn phase_finalization_rejects_a_stale_schedule_horizon() {
+    let mut schedule = MaterializedSchedule::new(4, &[]);
+    schedule.horizon = 1;
+    assert!(matches!(
+        schedule.into_phase(ExchangePhaseId::from_index(0), vec![0; 4]),
+        Err(ExchangeLoweringError::Invariant(_))
+    ));
 }
