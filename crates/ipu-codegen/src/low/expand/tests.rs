@@ -17,8 +17,8 @@ use super::*;
 use crate::{
     AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution, GridOrder,
     Ipu21CostModel, Layout, MemoryClass, MidOperator, OperandRequirement, OperatorCandidate,
-    OperatorDispatch, OutputAliasing, Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling,
-    TileKernelSpec, lower,
+    OperatorDispatch, OutputAliasing, Padding, PipelineConfig, Precision, TensorAxis, TensorFormat,
+    TensorTiling, TileKernelSpec, lower,
 };
 use std::collections::BTreeSet;
 
@@ -1344,7 +1344,10 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
             .flat_map(|(_, view)| view_byte_spans(&destination, view).unwrap())
             .map(|span| span.bytes)
             .sum::<u32>();
-        assert_eq!(source_bytes, panel_rows * AMP_COLUMN_MICRO * precision.bytes() as u32);
+        assert_eq!(
+            source_bytes,
+            panel_rows * AMP_COLUMN_MICRO * precision.bytes() as u32
+        );
         assert_eq!(destination_bytes, source_bytes, "case {case}, rows {rows}");
     }
 }
@@ -1853,6 +1856,81 @@ fn randomized_repeats_remain_structured_per_tile() {
 }
 
 #[test]
+fn repeat_binds_every_linear_fragment_including_rotated_owners() {
+    let mut graph = ComputeGraph::new();
+    let carried = graph.host_input("carried", [8, 16]).unwrap();
+    let invariant = graph.parameter("invariant", [8, 16]).unwrap();
+    let parameters = (0..2)
+        .map(|index| {
+            graph
+                .parameter(format!("parameter.{index}"), [8, 16])
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let sequence = graph
+        .value_sequence("parameters", parameters.clone())
+        .unwrap();
+    let result = graph
+        .repeat(2, [carried], [invariant], [sequence], |body, arguments| {
+            let first = body.add(arguments.carried[0], arguments.invariants[0])?;
+            Ok(vec![body.add(first, arguments.iterated[0])?])
+        })
+        .unwrap()[0];
+    graph.set_outputs([result]).unwrap();
+    let format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::logical_linear(2, 16),
+    };
+    let mut candidate = ConcreteOperatorCandidate::new(
+        MidOperator::Add,
+        vec![OperandRequirement::new(format.clone()); 2],
+        OperandRequirement::new(format.clone()),
+    );
+    candidate.plan.requirements.output_aliasing = OutputAliasing::MayAliasInputs(vec![0]);
+    let mut config = PipelineConfig::new(2);
+    for input in [carried, invariant].into_iter().chain(parameters) {
+        config.inputs.insert(input, format.clone());
+    }
+    config.operator_candidates = vec![OperatorCandidate::Concrete(candidate)];
+    let mut mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    for offset in 0..2 {
+        for value in &mut mid.values {
+            value.tile_offset = offset;
+        }
+        let low = lower_to_tiles(&mid, false).unwrap();
+        let placement = crate::place(&low).unwrap();
+        for repeat in &low.repeat_runs {
+            assert_eq!(repeat.carried.len(), 4);
+            assert_eq!(repeat.invariants.len(), 4);
+            assert_eq!(repeat.iterated.len(), 4);
+            for binding in &repeat.carried {
+                let initial = placement.shard_addresses[&binding.initial];
+                for shard in [binding.argument, binding.yielded, binding.result] {
+                    assert_eq!(placement.shard_addresses[&shard], initial);
+                }
+            }
+            for binding in &repeat.invariants {
+                assert_eq!(
+                    placement.shard_addresses[&binding.input],
+                    placement.shard_addresses[&binding.argument]
+                );
+            }
+            for binding in &repeat.iterated {
+                assert_eq!(
+                    placement.shard_addresses[&binding.inputs[0]],
+                    placement.shard_addresses[&binding.argument]
+                );
+                assert_eq!(binding.inputs.len(), 2);
+                assert!(
+                    placement.shard_addresses[&binding.inputs[1]]
+                        > placement.shard_addresses[&binding.inputs[0]]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
     let mut random = fastrand::Rng::with_seed(0x696e_706c);
     for case in 0..CASES {
@@ -2170,6 +2248,50 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
             panic!("expected in-place GeLU: {result:?}");
         };
         assert_eq!(low.shards[source.index() as usize].extents, result.extents);
+    }
+}
+
+#[test]
+fn local_casts_pair_corresponding_linear_fragments() {
+    let mut graph = ComputeGraph::new();
+    let input = graph.host_input("input", [8, 16]).unwrap();
+    let output = graph.gelu(input).unwrap();
+    graph.set_outputs([output]).unwrap();
+    let target = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::logical_linear(2, 16),
+    };
+    let candidate = ConcreteOperatorCandidate::new(
+        MidOperator::Gelu,
+        [OperandRequirement::new(target.clone())],
+        OperandRequirement::new(target.clone()),
+    );
+    let mut config = PipelineConfig::new(2).with_input(
+        input,
+        TensorFormat {
+            precision: Precision::F32,
+            ..target
+        },
+    );
+    config.operator_candidates = vec![OperatorCandidate::Concrete(candidate)];
+    let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let low = lower_to_tiles(&mid, false).unwrap();
+    let casts = low
+        .kernel_runs
+        .iter()
+        .filter(|run| {
+            matches!(
+                run.kernel,
+                TileKernelSpec::Cast {
+                    from: Precision::F32,
+                    to: Precision::F16
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(casts.len(), 8);
+    for run in casts {
+        assert_eq!(run.inputs[0].views[0].extents, run.output.extents);
     }
 }
 

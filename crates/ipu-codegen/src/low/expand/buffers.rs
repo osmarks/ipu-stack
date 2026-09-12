@@ -76,18 +76,6 @@ impl TileGraphBuilder {
         self.shards[shard.index() as usize].definition = ShardDefinition::Alias(target);
     }
 
-    pub(super) fn find_local_shard(
-        &self,
-        value: MidValueId,
-        tile: u16,
-    ) -> ExpansionResult<Option<BlockValueId>> {
-        Ok(self
-            .value_shards(value)?
-            .iter()
-            .copied()
-            .find(|shard| self.shards[shard.index() as usize].tile == tile))
-    }
-
     pub(super) fn corresponding_shard(
         &self,
         value: MidValueId,

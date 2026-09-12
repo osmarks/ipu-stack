@@ -43,14 +43,16 @@ impl TileGraphBuilder {
             })
             .collect::<Vec<_>>();
         let body = self.build_region(&repeat.body.operations, false)?;
-        let mut bindings = Vec::new();
-        for tile in 0..self.tile_count {
-            let mut carried = Vec::with_capacity(repeat.carried_inputs);
-            for index in 0..repeat.carried_inputs {
-                let Some(argument) = self.find_local_shard(repeat.body.arguments[index], tile)?
-                else {
-                    continue;
-                };
+        let mut bindings = (0..self.tile_count)
+            .map(|tile| BlockRepeatBinding {
+                tile,
+                carried: Vec::new(),
+                invariants: Vec::new(),
+                iterated: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        for index in 0..repeat.carried_inputs {
+            for argument in self.value_shards(repeat.body.arguments[index])?.to_vec() {
                 let initial = self.corresponding_shard(operation.inputs[index], argument)?;
                 let yielded = self.corresponding_shard(repeat.body.yields[index], argument)?;
                 let result = self.corresponding_shard(operation.results[index], argument)?;
@@ -60,77 +62,52 @@ impl TileGraphBuilder {
                         ShardDefinition::WritableAlias(argument);
                 }
                 self.alias_shard(result, initial);
-                carried.push(RepeatCarried {
+                let tile = self.shards[argument.index() as usize].tile;
+                bindings[usize::from(tile)].carried.push(RepeatCarried {
                     initial,
                     argument,
                     yielded,
                     result,
                 });
             }
-            let invariants = (0..repeat.invariant_inputs)
-                .filter_map(|index| {
-                    let input_index = repeat.carried_inputs + index;
-                    let argument =
-                        match self.find_local_shard(repeat.body.arguments[input_index], tile) {
-                            Ok(Some(argument)) => argument,
-                            Ok(None) => return None,
-                            Err(error) => return Some(Err(error)),
-                        };
-                    Some(
-                        self.corresponding_shard(operation.inputs[input_index], argument)
-                            .map(|input| RepeatInvariant { input, argument }),
-                    )
-                })
-                .collect::<ExpansionResult<_>>()?;
-            let iterated = repeat
-                .iterated_inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, values)| {
-                    let argument = match self
-                        .find_local_shard(repeat.body.arguments[expected_inputs + index], tile)
-                    {
-                        Ok(Some(argument)) => argument,
-                        Ok(None) => return None,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let inputs = values
-                        .iter()
-                        .map(|value| self.corresponding_shard(*value, argument))
-                        .collect::<ExpansionResult<Vec<_>>>();
-                    let inputs = match inputs {
-                        Ok(inputs) => inputs,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let (alignment, access_tail) = iterated_requirements[index];
-                    let strides = inputs
-                        .iter()
-                        .map(|shard| self.shard_stride(*shard, alignment, access_tail))
-                        .collect::<ExpansionResult<Vec<_>>>();
-                    let strides = match strides {
-                        Ok(strides) => strides,
-                        Err(error) => return Some(Err(error)),
-                    };
-                    let Some(&stride_bytes) = strides.first() else {
-                        return Some(Err(ExpansionError::InvalidIteratedBlocks(index)));
-                    };
-                    if strides.iter().any(|stride| *stride != stride_bytes) {
-                        return Some(Err(ExpansionError::InvalidIteratedBlocks(index)));
-                    }
-                    Some(Ok(RepeatIterated {
-                        inputs,
+        }
+        for index in repeat.carried_inputs..expected_inputs {
+            for &argument in self.value_shards(repeat.body.arguments[index])? {
+                let tile = self.shards[argument.index() as usize].tile;
+                bindings[usize::from(tile)]
+                    .invariants
+                    .push(RepeatInvariant {
+                        input: self.corresponding_shard(operation.inputs[index], argument)?,
                         argument,
-                        stride_bytes,
-                        alignment,
-                    }))
-                })
-                .collect::<ExpansionResult<_>>()?;
-            bindings.push(BlockRepeatBinding {
-                tile,
-                carried,
-                invariants,
-                iterated,
-            });
+                    });
+            }
+        }
+        for (index, values) in repeat.iterated_inputs.iter().enumerate() {
+            for &argument in self.value_shards(repeat.body.arguments[expected_inputs + index])? {
+                let inputs = values
+                    .iter()
+                    .map(|value| self.corresponding_shard(*value, argument))
+                    .collect::<ExpansionResult<Vec<_>>>()?;
+                let (alignment, access_tail) = iterated_requirements[index];
+                let mut strides = inputs
+                    .iter()
+                    .map(|shard| self.shard_stride(*shard, alignment, access_tail));
+                let stride_bytes = strides
+                    .next()
+                    .ok_or(ExpansionError::InvalidIteratedBlocks(index))??;
+                for stride in strides {
+                    if stride? != stride_bytes {
+                        return Err(ExpansionError::InvalidIteratedBlocks(index));
+                    }
+                }
+                let tile = self.shards[argument.index() as usize].tile;
+                bindings[usize::from(tile)].iterated.push(RepeatIterated {
+                    inputs,
+                    argument,
+                    stride_bytes,
+                    alignment,
+                });
+            }
         }
         tiles
             .operations

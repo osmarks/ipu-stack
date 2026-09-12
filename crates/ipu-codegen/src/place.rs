@@ -416,42 +416,16 @@ fn touch_work(
             }
         }
         TileWorkRef::Repeat(repeat) => {
-            for carried in &repeat.carried {
-                touch(carried.initial);
-                touch(carried.argument);
-                touch(carried.yielded);
-                touch(carried.result);
-            }
-            for invariant in &repeat.invariants {
-                touch(invariant.input);
-                touch(invariant.argument);
-            }
-            for iterated in &repeat.iterated {
-                for input in &iterated.inputs {
-                    touch(*input);
-                }
-                touch(iterated.argument);
+            for shard in repeat.bound_shards() {
+                touch(shard);
             }
             *event = event.saturating_add(1);
             for nested in program.work(&repeat.body) {
                 touch_work(program, nested, tile, event, lifetimes, exchanges);
             }
             let end = *event;
-            for carried in &repeat.carried {
-                lifetimes[carried.initial.index() as usize].touch(end);
-                lifetimes[carried.argument.index() as usize].touch(end);
-                lifetimes[carried.yielded.index() as usize].touch(end);
-                lifetimes[carried.result.index() as usize].touch(end);
-            }
-            for invariant in &repeat.invariants {
-                lifetimes[invariant.input.index() as usize].touch(end);
-                lifetimes[invariant.argument.index() as usize].touch(end);
-            }
-            for iterated in &repeat.iterated {
-                for input in &iterated.inputs {
-                    lifetimes[input.index() as usize].touch(end);
-                }
-                lifetimes[iterated.argument.index() as usize].touch(end);
+            for shard in repeat.bound_shards() {
+                lifetimes[shard.index() as usize].touch(end);
             }
             *event = event.saturating_add(1);
             return;

@@ -31,6 +31,30 @@ pub struct RepeatRun {
     pub body: Box<TileWorkList>,
 }
 
+impl RepeatRun {
+    /// Storage exposed by bindings on either side of the body boundary.
+    pub(crate) fn bound_shards(&self) -> impl Iterator<Item = BlockValueId> + '_ {
+        self.carried
+            .iter()
+            .flat_map(|binding| {
+                [
+                    binding.initial,
+                    binding.argument,
+                    binding.yielded,
+                    binding.result,
+                ]
+            })
+            .chain(
+                self.invariants
+                    .iter()
+                    .flat_map(|binding| [binding.input, binding.argument]),
+            )
+            .chain(self.iterated.iter().flat_map(|binding| {
+                std::iter::once(binding.argument).chain(binding.inputs.iter().copied())
+            }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TileWork {
     /// All tiles encounter a phase marker, including tiles without transfers.

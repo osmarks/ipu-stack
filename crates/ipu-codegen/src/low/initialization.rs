@@ -12,29 +12,12 @@ use std::collections::BTreeSet;
 // A Repeat binding can expose these bytes to readers under another shard ID.
 // Scratch local to its body has no such additional readers.
 fn repeat_bound_storage(program: &LowProgram) -> BTreeSet<BlockValueId> {
-    let mut bound = BTreeSet::new();
-    let root = |id| storage_root(&program.shards, id);
-    for repeat in &program.repeat_runs {
-        for binding in &repeat.carried {
-            bound.extend(
-                [
-                    binding.initial,
-                    binding.argument,
-                    binding.yielded,
-                    binding.result,
-                ]
-                .map(root),
-            );
-        }
-        for binding in &repeat.invariants {
-            bound.extend([binding.input, binding.argument].map(root));
-        }
-        for binding in &repeat.iterated {
-            bound.insert(root(binding.argument));
-            bound.extend(binding.inputs.iter().copied().map(root));
-        }
-    }
-    bound
+    program
+        .repeat_runs
+        .iter()
+        .flat_map(RepeatRun::bound_shards)
+        .map(|id| storage_root(&program.shards, id))
+        .collect()
 }
 
 /// Row-major FP8 packing reads only logical columns/rows and writes its own

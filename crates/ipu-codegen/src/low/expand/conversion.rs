@@ -108,30 +108,49 @@ impl TileGraphBuilder {
         let [result] = operation.results.as_slice() else {
             return Err(ExpansionError::ResultArity);
         };
-        for output in self.value_shards(*result)?.to_vec() {
-            let tile = self.shards[output.index() as usize].tile;
-            let input = self.local_shard(*input, tile)?;
+        let inputs = self.value_shards(*input)?;
+        let outputs = self.value_shards(*result)?;
+        if inputs.len() != outputs.len() {
+            return Err(ExpansionError::InvalidConversionPlan);
+        }
+        let shards = inputs
+            .iter()
+            .copied()
+            .zip(outputs.iter().copied())
+            .collect::<Vec<_>>();
+        for (input, output) in shards {
+            let source = &self.shards[input.index() as usize];
+            let destination = &self.shards[output.index() as usize];
+            if source.tile != destination.tile
+                || source.extents.len() != destination.extents.len()
+                || source
+                    .extents
+                    .iter()
+                    .zip(&destination.extents)
+                    .any(|(a, b)| a.start != b.start || a.logical_end != b.logical_end)
             {
-                let run = self.kernel_run(
-                    operation_provenance(operation),
-                    if plan.input.format.precision != plan.output.format.precision {
-                        TileKernelSpec::Cast {
-                            from: plan.input.format.precision,
-                            to: plan.output.format.precision,
-                        }
-                    } else {
-                        TileKernelSpec::Rearrange {
-                            from: plan.input.format.layout.clone(),
-                            to: plan.output.format.layout.clone(),
-                        }
-                    },
-                    vec![KernelOperand {
-                        views: vec![self.full_view(input)],
-                    }],
-                    self.full_view(output),
-                )?;
-                self.append_kernel(tiles, tile, run)
-            }?;
+                return Err(ExpansionError::InvalidConversionPlan);
+            }
+            let tile = destination.tile;
+            let run = self.kernel_run(
+                operation_provenance(operation),
+                if plan.input.format.precision != plan.output.format.precision {
+                    TileKernelSpec::Cast {
+                        from: plan.input.format.precision,
+                        to: plan.output.format.precision,
+                    }
+                } else {
+                    TileKernelSpec::Rearrange {
+                        from: plan.input.format.layout.clone(),
+                        to: plan.output.format.layout.clone(),
+                    }
+                },
+                vec![KernelOperand {
+                    views: vec![self.full_view(input)],
+                }],
+                self.full_view(output),
+            )?;
+            self.append_kernel(tiles, tile, run)?;
         }
         Ok(())
     }
