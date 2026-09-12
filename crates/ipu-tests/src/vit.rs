@@ -1,9 +1,19 @@
-//! Big Vision ViT, including its learned-query MAP pool.
+//! ViT benchmarks and explicitly approximate model-capacity probes.
 use anyhow::{Result, ensure};
 use ipu_codegen::{AxisFactorView, ComputeGraph, GraphInput, ValueId};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Model {
+    #[default]
+    SiglipSo400m,
+    /// PE-Core-L14-336 dimensions and bookends; omits RoPE and retains epsilon 1e-6.
+    PeCoreL14Capacity,
+}
+
 #[derive(clap::Args)]
 pub(crate) struct Options {
+    #[arg(long, value_enum, default_value_t = Model::SiglipSo400m)]
+    pub vit_model: Model,
     #[arg(long, default_value_t = 1)]
     pub vit_batch: u32,
     /// Distinct encoder layers, represented by one structured Repeat when >1.
@@ -18,12 +28,19 @@ pub(crate) struct Options {
 }
 
 pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
-    let (image, patch, width, hidden, heads) = if options.vit_small {
+    let pe = options.vit_model == Model::PeCoreL14Capacity;
+    let (image, patch, width, hidden, heads) = match (pe, options.vit_small) {
+        (false, false) => (378, 14, 1152, 4304, 16),
         // Retain So400m's 72-wide heads, including their packed-layout tails.
-        (28, 14, 144, 288, 2)
-    } else {
-        (378, 14, 1152, 4304, 16)
+        (false, true) => (28, 14, 144, 288, 2),
+        (true, false) => (336, 14, 1024, 4096, 16),
+        (true, true) => (28, 14, 128, 512, 2),
     };
+    if pe {
+        tracing::warn!(
+            "PE capacity probe: RoPE omitted; layernorm epsilon remains 1e-6 instead of PE's 1e-5; numerical results are not PE model accuracy"
+        );
+    }
     ensure!(options.vit_batch > 0, "--vit-batch must be nonzero");
     ensure!(options.vit_layers > 0, "--vit-layers must be nonzero");
     let image = options.vit_image_size.unwrap_or(image);
@@ -34,16 +51,31 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
     let tokens = (image / patch)
         .checked_mul(image / patch)
         .ok_or_else(|| anyhow::anyhow!("ViT token count overflow"))?;
+    let tokens = tokens + u32::from(pe);
     let mut g = ComputeGraph::new();
     // Nonoverlapping convolution is GEMM on host-packed NHWC image patches.
     // The host supplies every pixel, in [patch_y, patch_x, y, x, channel] order.
     let image = g.host_input(
-        "vit.image.patches",
+        if pe {
+            "vit.pe.image.patches"
+        } else {
+            "vit.image.patches"
+        },
         [options.vit_batch, tokens, patch * patch * 3],
     )?;
-    let mut x = dense(&mut g, image, "embedding", patch * patch * 3, width)?;
+    let mut x = if pe {
+        // A zero patch represents the class slot. With a bias-free projection,
+        // folding the learned class embedding into position[0] is exact.
+        let weight = g.parameter("vit.embedding.weight", [patch * patch * 3, width])?;
+        g.gemm(image, weight)?
+    } else {
+        dense(&mut g, image, "embedding", patch * patch * 3, width)?
+    };
     let position = g.parameter("vit.position", [1, tokens, width])?;
     x = g.add(x, position)?;
+    if pe {
+        x = norm(&mut g, x, "embedding.norm", width)?;
+    }
     x = if options.vit_layers == 1 {
         encoder(&mut g, x, width, hidden, heads, fuse_qkv)?
     } else {
@@ -92,10 +124,22 @@ pub(crate) fn build(options: &Options, fuse_qkv: bool) -> Result<ComputeGraph> {
     // A replicated probe is expressed as a batch-shaped parameter. Input
     // generation repeats the same learned vector across batches.
     let probe = g.parameter("vit.map.probe", [options.vit_batch, 1, width])?;
-    x = attention(&mut g, probe, x, "map.attention", width, heads, fuse_qkv)?;
+    x = attention(
+        &mut g,
+        probe,
+        x,
+        "map.attention",
+        width,
+        if pe { 8 } else { heads },
+        fuse_qkv,
+    )?;
     let normalized = norm(&mut g, x, "map.norm", width)?;
     let update = mlp(&mut g, normalized, "map.mlp", width, hidden)?;
     x = g.add(x, update)?;
+    if pe {
+        let projection = g.parameter("vit.projection.weight", [width, width])?;
+        x = g.gemm(x, projection)?;
+    }
     g.set_outputs([x])?; // [batch, 1, width], singleton probe axis retained.
     Ok(g)
 }
@@ -187,6 +231,12 @@ pub(crate) fn random_input(input: &GraphInput, seed: u64, index: u64) -> Option<
     if !input.name.starts_with("vit.") {
         return None;
     }
+    if input.name == "vit.pe.image.patches"
+        && index % (u64::from(input.shape.0[1]) * u64::from(input.shape.0[2]))
+            < u64::from(input.shape.0[2])
+    {
+        return Some(0.0);
+    }
     let width = *input.shape.0.last().unwrap();
     if input.name.ends_with(".scale") {
         return Some(1.0);
@@ -224,10 +274,71 @@ mod tests {
     use ipu_codegen::OperationKind;
 
     #[test]
+    fn pe_capacity_includes_class_token_and_different_bookends() -> Result<()> {
+        let graph = build(
+            &Options {
+                vit_model: Model::PeCoreL14Capacity,
+                vit_batch: 2,
+                vit_layers: 24,
+                vit_small: false,
+                vit_image_size: None,
+            },
+            true,
+        )?;
+        let image = &graph.inputs()[0];
+        assert_eq!(image.shape.0, [2, 577, 588]);
+        for batch in 0..2 {
+            let start = batch * 577 * 588;
+            assert_eq!(random_input(image, 7, start), Some(0.0));
+            assert_eq!(random_input(image, 7, start + 587), Some(0.0));
+            assert_ne!(random_input(image, 7, start + 588), Some(0.0));
+        }
+        assert_eq!(
+            graph.value_shape(graph.outputs()[0]).unwrap().0,
+            [2, 1, 1024]
+        );
+        assert!(
+            !graph
+                .inputs()
+                .iter()
+                .any(|i| i.name == "vit.embedding.bias")
+        );
+        assert!(
+            graph
+                .inputs()
+                .iter()
+                .any(|i| i.name == "vit.embedding.norm.scale")
+        );
+        assert!(
+            graph
+                .inputs()
+                .iter()
+                .any(|i| i.name == "vit.projection.weight")
+        );
+        let pool = graph
+            .operations()
+            .iter()
+            .find(|op| matches!(op.kind, OperationKind::FlashAttention(_)))
+            .unwrap();
+        // Eight pool heads (128 channels), versus sixteen encoder heads (64).
+        assert_eq!(graph.value_shape(pool.inputs[0]).unwrap().0, [16, 1, 128]);
+        // Includes the deliberately batch-expanded probe; class+position are folded.
+        let parameters: u64 = graph
+            .inputs()
+            .iter()
+            .filter(|i| i.kind == ipu_codegen::GraphInputKind::Parameter)
+            .map(|i| i.shape.elements())
+            .sum();
+        assert_eq!(parameters, 317_151_232);
+        Ok(())
+    }
+
+    #[test]
     fn repeated_encoder_has_distinct_parameters_and_one_time_bookends() -> Result<()> {
         for fused in [false, true] {
             let graph = build(
                 &Options {
+                    vit_model: Model::SiglipSo400m,
                     vit_batch: 1,
                     vit_layers: 2,
                     vit_small: true,
@@ -280,6 +391,7 @@ mod tests {
         for fused in [false, true] {
             let g = build(
                 &Options {
+                    vit_model: Model::SiglipSo400m,
                     vit_batch: 1,
                     vit_layers: 1,
                     vit_small: false,
