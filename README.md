@@ -136,3 +136,5 @@ and [estimated useful kernel work](docs/PROFILE_USEFUL_WORK.md). The benchmark
 runner also accepts `--memory-profile-directory PATH` for memory reports,
 including exact per-tile placement and allocation reuse. See
 [cycle profiling](docs/PROFILING.md) and [memory profiling](docs/MEMORY_PROFILING.md).
+For standalone allocator experiments, set `IPU_STACK_PLACEMENT_DUMP=PATH` to
+capture failing tiles' [complete placement constraints](docs/PLACEMENT_CONSTRAINT_DUMPS.md).

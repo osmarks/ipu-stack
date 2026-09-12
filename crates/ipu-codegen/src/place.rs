@@ -1,5 +1,6 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
+mod dump;
 mod exchange;
 pub(crate) mod profile;
 pub(crate) use exchange::ExchangeConflicts;
@@ -50,7 +51,7 @@ struct Requirement {
     access_tail: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 struct Lifetime {
     first: u32,
     last: u32,
@@ -804,7 +805,10 @@ fn allocate_tile(
     });
     let initial = arena.clone();
     match allocate_requests(program, tile, &requests, members, arena, addresses) {
-        Ok(()) => return Ok(()),
+        Ok(()) => {
+            dump::capture(tile, &requests, arena, true);
+            return Ok(());
+        }
         Err(PlacementError::OutOfMemory { .. }) => {}
         Err(error) => return Err(error),
     }
@@ -819,7 +823,9 @@ fn allocate_tile(
             request.lifetime.first,
         )
     });
-    allocate_requests(program, tile, &requests, members, arena, addresses)?;
+    let result = allocate_requests(program, tile, &requests, members, arena, addresses);
+    dump::capture(tile, &requests, arena, result.is_ok());
+    result?;
     tracing::debug!(
         tile,
         "recovered fragmented tile with size-ordered placement"
@@ -874,6 +880,7 @@ fn allocate_requests(
     Ok(())
 }
 
+#[derive(serde::Serialize)]
 struct AllocationRequest {
     class: MemoryClass,
     /// Iterated values need a wider physical stride if placed in region 1.
