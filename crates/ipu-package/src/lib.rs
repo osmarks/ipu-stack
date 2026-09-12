@@ -433,9 +433,9 @@ impl Application {
                 "unaligned or duplicate device configuration write".into(),
             ));
         }
-        let mut seen = HashMap::new();
+        let mut tile_ids = std::collections::HashSet::new();
         for tile in &self.tiles {
-            if seen.insert(tile.physical_tile, ()).is_some() {
+            if !tile_ids.insert(tile.physical_tile) {
                 return Err(PackageError::Invalid(format!(
                     "duplicate physical tile {}",
                     tile.physical_tile
@@ -474,8 +474,6 @@ impl Application {
                 )));
             }
         }
-        let tile_ids: std::collections::HashSet<_> =
-            self.tiles.iter().map(|tile| tile.physical_tile).collect();
         let mut profile_tile_ids = std::collections::HashSet::new();
         for tile in &self.profile_tiles {
             if !tile_ids.contains(&tile.physical_tile)

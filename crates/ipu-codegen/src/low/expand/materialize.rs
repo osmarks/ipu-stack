@@ -109,21 +109,7 @@ impl TileGraphBuilder {
             let destination = &self.shards[output.index() as usize];
             let tile = destination.tile;
             let mut source_region = destination.extents.clone();
-            for (axis, extent) in source_region.iter_mut().enumerate() {
-                let offset = offsets.get(axis).copied().unwrap_or(0);
-                extent.start = extent
-                    .start
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-                extent.logical_end = extent
-                    .logical_end
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-                extent.physical_end = extent
-                    .physical_end
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-            }
+            offset_extents(&mut source_region, offsets, u32::checked_add)?;
             let intersections = regions
                 .intersections(&source_region, tile)
                 .into_iter()
@@ -173,12 +159,7 @@ impl TileGraphBuilder {
             }
             for (source_extents, source) in intersections {
                 let mut destination_extents = source_extents.clone();
-                for (axis, extent) in destination_extents.iter_mut().enumerate() {
-                    let offset = offsets.get(axis).copied().unwrap_or(0);
-                    extent.start -= offset;
-                    extent.logical_end -= offset;
-                    extent.physical_end -= offset;
-                }
+                offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                 mappings.push((
                     ShardView {
                         shard: self.full_view(source).shard,
@@ -205,21 +186,7 @@ impl TileGraphBuilder {
         let mut mappings = Vec::new();
         for &output in output_shards {
             let mut output_extents = self.shards[output.index() as usize].extents.clone();
-            for (axis, extent) in output_extents.iter_mut().enumerate() {
-                let offset = offsets.get(axis).copied().unwrap_or(0);
-                extent.start = extent
-                    .start
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-                extent.logical_end = extent
-                    .logical_end
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-                extent.physical_end = extent
-                    .physical_end
-                    .checked_add(offset)
-                    .ok_or(ExpansionError::IdOverflow)?;
-            }
+            offset_extents(&mut output_extents, offsets, u32::checked_add)?;
             let tile = self.shards[output.index() as usize].tile;
             let source_shape = &self.shards[source_shards[0].index() as usize]
                 .tensor_type
@@ -268,12 +235,7 @@ impl TileGraphBuilder {
                             destination_extents[split].start += base;
                             destination_extents[split].logical_end += base;
                             destination_extents[split].physical_end += base;
-                            for (axis, extent) in destination_extents.iter_mut().enumerate() {
-                                let offset = offsets.get(axis).copied().unwrap_or(0);
-                                extent.start -= offset;
-                                extent.logical_end -= offset;
-                                extent.physical_end -= offset;
-                            }
+                            offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                             mappings.push((
                                 ShardView {
                                     shard: self.full_view(source).shard,
@@ -321,12 +283,7 @@ impl TileGraphBuilder {
                         source_extents[split].physical_end += padding;
                         destination_extents[split].physical_end += padding;
                     }
-                    for (axis, extent) in destination_extents.iter_mut().enumerate() {
-                        let offset = offsets.get(axis).copied().unwrap_or(0);
-                        extent.start -= offset;
-                        extent.logical_end -= offset;
-                        extent.physical_end -= offset;
-                    }
+                    offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
                     let source_view = ShardView {
                         shard: self.full_view(source).shard,
                         extents: source_extents,
@@ -419,4 +376,22 @@ impl TileGraphBuilder {
         }
         Ok(Some((split, CopyOrder::Physical)))
     }
+}
+
+/// Translate a window to or from the source coordinate system.
+fn offset_extents(
+    extents: &mut [ShardExtent],
+    offsets: &[u32],
+    shift: fn(u32, u32) -> Option<u32>,
+) -> ExpansionResult<()> {
+    for (extent, &offset) in extents.iter_mut().zip(offsets) {
+        for coordinate in [
+            &mut extent.start,
+            &mut extent.logical_end,
+            &mut extent.physical_end,
+        ] {
+            *coordinate = shift(*coordinate, offset).ok_or(ExpansionError::IdOverflow)?;
+        }
+    }
+    Ok(())
 }
