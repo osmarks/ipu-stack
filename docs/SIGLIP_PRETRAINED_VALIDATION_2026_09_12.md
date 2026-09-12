@@ -112,11 +112,11 @@ artifacts/pretrained-siglip-20260912/venv/bin/python tools/calibrate_siglip_fixt
 **Neither independent operand scales nor per-layer Repeat arguments have been
 shown necessary for this model.** Those changes would be needed to realize the
 fully independent experiment exactly, but the simpler scheme has sufficient
-margin in these host measurements. The remaining compiler integration is a
+margin in these host measurements. The compiler integration below uses a
 fixed precision/scale choice per GEMM position and an FP16 input projection.
 It does not require changing Repeat's runtime arguments or the GEMM scale ABI.
-Device accumulation accuracy and placement still need validation before making
-an IPU accuracy/performance claim.
+The host experiments alone do not establish device accumulation accuracy or fit;
+those are checked separately below.
 
 ## Hardware port (2026-09-12)
 
@@ -131,7 +131,8 @@ arguments. Previously different scales could generate duplicate definitions of
 the same specialization symbol. Row variants are now grouped together before
 code generation, and calls still receive their own product scale.
 
-The canonical, unoptimized full 27-layer plan **passed on IPU hardware**:
+Both the canonical baseline and the normal eight-step optimized full 27-layer
+plan **passed on IPU hardware**, with byte-identical host outputs:
 
 | Image | IPU cosine against independent FP32 reference |
 | --- | ---: |
@@ -163,3 +164,15 @@ The hardware build command uses the same configuration as above, except replace
 
 Use `--optimization-steps 0` for this baseline. The normal optimized build uses
 `--optimization-steps 8` and writes to `calibrated27/`.
+
+The optimized result is complete under
+`artifacts/pretrained-siglip-20260912/calibrated27/`: `model.ipuexe`, `run.log`,
+`results.json` and `outputs/device-0.bin` through `device-5.bin`. Its package
+SHA256 is `34b100dd7ef6ddfbf5e35891f700797b130837a8051990d57bed059b2f5044df`.
+It made one `initialize` call and six `run` calls. Every image exceeded the
+required cosine threshold of 0.99, including the three held-out images.
+
+This test validates the complete input projection, 27-layer encoder and MAP
+head with the actual pretrained checkpoint and official image preprocessing.
+It is not an IPU timing benchmark: profiling is off, and the fixture prepares
+and checks host buffers between calls.

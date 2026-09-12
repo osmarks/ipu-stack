@@ -289,14 +289,13 @@ per weight matrix while still using small Hessian blocks for GPTQ. Its default
 `block` behavior remains available for reproducing historical experiments.
 `tools/calibrate_siglip_fixture.py` additionally models independent activation
 scales, fused QKV/KV tensors, and the complete MAP embedding output. These tools
-write reconstructed floating-point parameters; their calibrated choices are not yet wired
-into the benchmark planner. Fixed scales shared across all layers and both
-operands also passed the host experiment, so dynamic Repeat scale arguments
-are not currently required.
+write reconstructed floating-point parameters. Fixed scales shared across all
+layers and both operands passed the host experiment and are now supported by
+the hardware integration below; dynamic Repeat scale arguments are not required.
 
 The fixed shared-scale policy is now selectable with
 `--reference-fixture DIRECTORY --reference-calibration REPORT` in the benchmark.
-The full 27-layer baseline passes pretrained-image hardware validation with
+Both baseline and optimized full 27-layer plans pass pretrained-image hardware validation with
 cosine 0.994614–0.997866 against independent FP32 embeddings. It uses an FP16
 input projection and the fixed FP8 encoder/MAP scales documented in the report.
 No dynamic Repeat scale arguments or independent operand-scale ABI were added.
