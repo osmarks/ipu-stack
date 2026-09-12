@@ -129,3 +129,10 @@ allocation. These failures therefore reflect placement/contiguity pressure, not
 an exchange-table-budget rejection. No allocator policy or memory limit was
 changed for this diagnosis. Extracted examples and the original log lines are
 saved in `artifacts/nan-20260912/placement-failures.json`.
+
+Subsequent [exact-request replay](BATCH2_FRAGMENTATION_2026_09_12.md) refines this
+diagnosis: the mapping failure is recoverable on the captured tile by changing
+allocation order, but the late-cast candidate has a 515,200-byte live peak against
+498,872 available bytes. The remaining holes at one failed request do not prove
+that all the other requests can fit. That case needs less live storage, not
+merely a less fragmented placement.
