@@ -37,6 +37,11 @@ explicit conversions and reductions. Low-level expansion produces per-tile
 kernel work and exchanges. Allocation, scheduling, linking, and encoding then
 produce a complete executable package.
 
+Copy lowering compares direct multicast with receiving native panels once on
+relay tiles and forwarding them in the same exchange. It uses the existing
+cycle and row-storage estimates, includes relay scratch in placement, and adds
+no tuning option or packing kernel. See the [relay measurements](docs/EXCHANGE_GATHER_2026_09_12.md).
+
 The planner first builds a baseline with canonical layout boundaries and compact
 parameter storage, then evaluates local improvements. Accepted changes retain a
 complete feasible package. `--optimization-steps 0` selects the baseline alone.

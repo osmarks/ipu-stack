@@ -36,6 +36,51 @@ In the second variant, gathering and forwarding can be one physical exchange.
 Concatenating their transfer lists expresses the receive-before-send dependence;
 production dependency analysis and scheduler validation check the resulting row.
 
+## Production integration
+
+Implemented in `low/expand/relay.rs`, after ordinary tile expansion and before
+costing/placement. There is one alternative to direct multicast, derived from
+contiguous native panels and individual outer-axis coordinates. There is no
+relay-count knob, new mid operation, kernel, scheduling mode, or package retry.
+The existing cast-order and local-packing choices address different conversions
+and remain unchanged.
+
+The pass requires complete, nonoverlapping coordinate-preserving gathers, equal
+replica extents, and enough distinct relay tiles. Existing receive/forward
+dependencies and unsupported or incomplete panels stay direct. It never adds
+padding initialization. Relay buffers are ordinary `ExchangeStaging` shards,
+so allocation, liveness, Repeat handling and address patching see them normally.
+
+Selection reuses the same geometry, cycle calibration and per-tile row accounting
+as complete-plan costing. It accepts the alternative only if modeled cycles do
+not increase and the worst tile's estimated row storage plus relay scratch is
+smaller. This is a ranking rule, not a placement guarantee; final package
+validation still accounts for the other live tensors and exact encoded rows.
+
+The batch-two capacity baseline selects relays in phases 16, 34, 50 and 61.
+Low expansion took roughly 10–13 seconds; the detailed whole-program row estimate
+fell from 142,912 to 88,048 bytes and the fragment maximum from 15,017 to 10,445.
+
+Hardware validation:
+
+| SigLIP batch-two run | Encoded table maximum | Minimum cosine against FP32 |
+|---|---:|---:|
+| One layer, profiled | 61,148 B | 0.997085087 |
+| Two layers through Repeat, unprofiled | 61,116 B | 0.996864709 |
+
+Both run under the default 80 KiB exchange-table budget. The preceding one-layer
+build needed 99,228 bytes and a diagnostic 128 KiB budget. The final placed
+one-layer cycle estimate changes only slightly, from 1,389,300 to 1,385,584;
+the principal verified improvement is table storage. The new profiled run spans
+1,388,640 cycles (0.92576 ms) using the renderer's normal leading-interval cutoff.
+There is no matching old profiled run here from which to claim a measured speedup.
+
+The [rendered profile](../artifacts/relay-integration-20260912/profile.html),
+package, profile capture and hardware logs are in
+`artifacts/relay-integration-20260912/`. The complete codegen suite passes with
+244 enabled tests and four ignored tests. New tests reconstruct bytes through
+the selected relay graph and reject missing coverage, overlaps and dependencies.
+
 ## Local packing cost
 
 Packing was executed on hardware using the actual affine task lists and the
@@ -127,9 +172,9 @@ multicast, with scratch, exchange rows and execution cost included. An ordinary
 identity-copy composition pass would otherwise erase the relay and recreate the
 original exchange.
 
-The full model has not been rebuilt or run with these relays. Whole-model live
-allocation compatibility, final row sharing/patching, and hardware timing of
-the forwarded exchange remain to be validated before claiming a model speedup.
+The 27-layer batch-two model has not been rebuilt or run with these relays.
+Its live allocation compatibility and final row sharing/patching still need
+validation; the production tests above cover one and two layers.
 Relay selection here is deterministic and simple; it is not a search optimum.
 
 ## Reproduction
@@ -157,7 +202,7 @@ measured packing cycles. The original root-level preliminary phase-50 broadcast
 used an aliasing scratch address; it is superseded by the checked `s1` result
 and is excluded from every table above.
 
-Validation: nine Python reconstruction/analysis tests pass, including symbolic
+Offline validation: nine Python reconstruction/analysis tests pass, including symbolic
 source-word reconstruction through gather, packing and multicast with padding
-holes. Rust fixture compilation and Python lint pass. No production compiler or
-runtime behavior was changed by this experiment.
+holes. Rust fixture compilation and Python lint pass. The offline experiment
+itself did not change production behavior; integration is described above.
