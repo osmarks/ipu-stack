@@ -17,7 +17,8 @@ pub(crate) use mid::{
     analyze as analyze_mid, operation_cost, region_peak_memory_with_multiplicity,
 };
 pub(crate) use program::{
-    ProgramCycles, program_cycles, program_cycles_analyzed, program_footprint_analyzed,
+    ProgramCycles, exchange_phase_estimate, program_cycles, program_cycles_analyzed,
+    program_footprint_analyzed,
     scheduled_program_cycles,
 };
 mod movement;

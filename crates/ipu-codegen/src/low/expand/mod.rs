@@ -16,6 +16,7 @@ mod mapping;
 mod ownership;
 mod pointwise;
 mod reduce;
+mod relay;
 mod repeat;
 use crate::graph::OperationId;
 use crate::low::*;
@@ -169,6 +170,7 @@ pub(crate) fn expand_tiles_analyzed(
     crate::low::passes::simplify(&mut program);
     let simplify_time = start.elapsed();
     let start = Instant::now();
+    relay::select(&mut program, analysis)?;
     let cycles = crate::estimate::program_cycles_analyzed(&program, None, analysis)?;
     tracing::debug!(
         shards = program.shards.len(),

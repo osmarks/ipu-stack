@@ -163,14 +163,7 @@ pub(crate) fn program_cycles_analyzed(
             .iter()
             .map(|phase| {
                 let traffic = geometry_traffic(program, phase, true, None, geometry)?;
-                // Fragmented transfers also consume routing/pointer events.
-                // Use the same calibration as materialization selection;
-                // bandwidth alone makes scattered views look nearly free.
-                Ok(super::cycles::exchange_endpoint_cycles(&traffic, 1).max(
-                    traffic
-                        .maximum_fragments()
-                        .saturating_mul(super::IPU21_LOGICAL_FRAGMENT_CYCLES),
-                ))
+                Ok(phase_cycles(&traffic))
             })
             .collect::<ExpansionResult<Vec<_>>>()?
     };
@@ -231,6 +224,27 @@ pub(crate) fn program_cycles_analyzed(
         &mut std::collections::HashMap::new(),
     )
     .cycles())
+}
+
+fn phase_cycles(traffic: &ExchangeEndpointTraffic) -> u64 {
+    super::cycles::exchange_endpoint_cycles(traffic, 1).max(
+        traffic
+            .maximum_fragments()
+            .saturating_mul(super::IPU21_LOGICAL_FRAGMENT_CYCLES),
+    )
+}
+
+/// Compare transport realizations with the same geometry and row accounting
+/// used by complete-plan costing. Row storage is per tile, before row sharing.
+pub(crate) fn exchange_phase_estimate(
+    program: &TileGraph,
+    phase: &crate::ExchangePhase,
+    geometry: &mut GeometryAnalysis,
+) -> ExpansionResult<(u64, Vec<u64>)> {
+    let mut storage = ExchangeStoragePhase::new(program.tile_count);
+    geometry_traffic(program, phase, false, Some(&mut storage), geometry)?;
+    let traffic = geometry_traffic(program, phase, true, None, geometry)?;
+    Ok((phase_cycles(&traffic), storage.finish()))
 }
 
 fn geometry_traffic(
