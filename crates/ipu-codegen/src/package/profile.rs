@@ -4,7 +4,7 @@ use super::*;
 pub(super) fn profile_binding(
     program: &LowProgram,
     physical_to_logical: &[u16],
-    address: u32,
+    addresses: &[u32],
 ) -> PackageBuildResult<Binding> {
     let mut file_offset = 0u64;
     let mut sample_count = 0u32;
@@ -17,16 +17,16 @@ pub(super) fn profile_binding(
             } else {
                 inactive_profile_work(program).len()
             };
-            (steps != 0).then_some((physical, steps))
+            (steps != 0).then_some((physical, logical, steps))
         })
-        .map(|(physical, steps)| {
+        .map(|(physical, logical, steps)| {
             let samples = u32::try_from(steps + 1)?;
             let size = u64::from(samples)
                 .checked_mul(4)
                 .ok_or_else(|| invalid("profile binding size overflow"))?;
             let slice = RegionSlice {
                 tile: u32::try_from(physical)?,
-                tile_address: address,
+                tile_address: addresses[usize::from(logical)],
                 file_offset,
                 size,
             };
@@ -243,7 +243,7 @@ fn instrument_active_steps(
     Ok(())
 }
 
-fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
+pub(super) fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
     program
         .tiles
         .first()
@@ -573,6 +573,21 @@ mod tests {
             // A valid whole-device program may leave active tiles unused by a region.
             mid.tile_count = 2;
             let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+            // Readback is ordered physically, while allocation is indexed logically.
+            // Include an inactive execution tile as well as both active tiles.
+            let addresses = [0x58000, 0x60000, 0x68000];
+            let binding = profile_binding(&low, &[2, 0, 1], &addresses).unwrap();
+            for slice in &binding.slices {
+                let logical = [2, 0, 1][slice.tile as usize];
+                assert_eq!(slice.tile_address, addresses[logical]);
+                let steps = if logical < 2 {
+                    profile_step_count(&low, &low.tiles[logical])
+                } else {
+                    inactive_profile_work(&low).len()
+                };
+                assert_eq!(slice.size, (steps as u64 + 1) * 4);
+            }
+            assert_eq!(binding.slices.len(), 3);
             let placement = crate::place(&low).unwrap();
             let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600(), false)

@@ -22,6 +22,26 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Placement {
     pub shard_addresses: BTreeMap<BlockValueId, u32>,
     pub tile_auxiliary_ranges: Vec<Vec<(u32, u32)>>,
+    pub auxiliary_allocations: Vec<Vec<AuxiliaryAllocation>>,
+}
+
+/// Non-tensor storage participating in the same lifetime/geometry search.
+#[derive(Clone, Debug)]
+pub(crate) struct AuxiliaryRequest {
+    pub name: String,
+    pub bytes: u32,
+    pub alignment: u32,
+    pub first: u32,
+    pub last: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxiliaryAllocation {
+    pub name: String,
+    pub address: u32,
+    pub bytes: u32,
+    pub first: u32,
+    pub last: u32,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -108,7 +128,23 @@ pub(crate) fn place_with_offset(
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
 ) -> Result<Placement, PlacementError> {
+    place_with_auxiliary(program, available_ranges, interleaved_offset, &[])
+}
+
+pub(crate) fn place_with_auxiliary(
+    program: &LowProgram,
+    available_ranges: &[(u32, u32)],
+    interleaved_offset: u32,
+    auxiliary: &[Vec<AuxiliaryRequest>],
+) -> Result<Placement, PlacementError> {
     let started = std::time::Instant::now();
+    if auxiliary
+        .iter()
+        .flatten()
+        .any(|r| r.bytes == 0 || !r.alignment.is_power_of_two() || r.first > r.last)
+    {
+        return Err(PlacementError::Overflow);
+    }
     if interleaved_offset >= IPU21_INTERLEAVED_ELEMENT_SIZE {
         return Err(PlacementError::Overflow);
     }
@@ -126,8 +162,12 @@ pub(crate) fn place_with_offset(
             bytes: 0,
         });
     }
-    let analysis = analyze_allocations(program)?;
-    let tile_placements = (0..usize::from(program.tile_count))
+    let mut analysis = analyze_allocations(program)?;
+    let tile_count = usize::from(program.tile_count).max(auxiliary.len());
+    analysis
+        .tiles
+        .resize_with(tile_count, TileAllocations::default);
+    let tile_placements = (0..tile_count)
         .into_par_iter()
         .map(|tile| {
             place_tile(
@@ -136,12 +176,15 @@ pub(crate) fn place_with_offset(
                 available_ranges,
                 interleaved_offset,
                 &analysis,
+                auxiliary.get(tile).map(Vec::as_slice).unwrap_or(&[]),
             )
         })
         .collect::<Result<Vec<_>, PlacementError>>()?;
     let mut addresses = BTreeMap::new();
-    let mut tile_auxiliary_ranges = vec![Vec::new(); usize::from(program.tile_count)];
-    for (tile, tile_addresses, unused) in tile_placements {
+    let mut tile_auxiliary_ranges = vec![Vec::new(); tile_count];
+    let mut auxiliary_allocations = vec![Vec::new(); tile_count];
+    for (tile, tile_addresses, unused, allocations) in tile_placements {
+        auxiliary_allocations[usize::from(tile)] = allocations;
         addresses.extend(tile_addresses);
         tile_auxiliary_ranges[usize::from(tile)] = unused;
     }
@@ -155,6 +198,7 @@ pub(crate) fn place_with_offset(
     Ok(Placement {
         shard_addresses: addresses,
         tile_auxiliary_ranges,
+        auxiliary_allocations,
     })
 }
 
@@ -294,7 +338,16 @@ fn place_tile(
     available_ranges: &[(u32, u32)],
     interleaved_offset: u32,
     analysis: &AllocationAnalysis,
-) -> Result<(u16, BTreeMap<BlockValueId, u32>, Vec<(u32, u32)>), PlacementError> {
+    auxiliary: &[AuxiliaryRequest],
+) -> Result<
+    (
+        u16,
+        BTreeMap<BlockValueId, u32>,
+        Vec<(u32, u32)>,
+        Vec<AuxiliaryAllocation>,
+    ),
+    PlacementError,
+> {
     // Both access classes share region 1. A single lifetime-ordered arena
     // lets ordinary storage reuse dead interleaved buffers and vice versa.
     let mut addresses = BTreeMap::new();
@@ -305,8 +358,26 @@ fn place_tile(
         .filter(|range| !program.requires_finite_scratch || *range != HOST_SCRATCH_RANGE)
         .collect::<Vec<_>>();
     let mut arena = Arena::new(&ranges, interleaved_offset);
-    allocate_tile(program, tile, analysis, &mut arena, &mut addresses)?;
-    Ok((tile, addresses, arena.unused_ranges()))
+    allocate_tile(
+        program,
+        tile,
+        analysis,
+        &mut arena,
+        &mut addresses,
+        auxiliary,
+    )?;
+    let allocations = auxiliary
+        .iter()
+        .enumerate()
+        .map(|(index, request)| AuxiliaryAllocation {
+            name: request.name.clone(),
+            address: arena.auxiliary_addresses[&index],
+            bytes: request.bytes,
+            first: request.first,
+            last: request.last,
+        })
+        .collect();
+    Ok((tile, addresses, arena.unused_ranges(), allocations))
 }
 
 fn shards_by_tile(
@@ -703,6 +774,7 @@ fn allocation_requests(
             ));
         }
         requests.push(AllocationRequest {
+            auxiliary: None,
             class: group_class,
             region1_stride: separate_members
                 .then(|| align_up(stride, IPU21_INTERLEAVED_ELEMENT_SIZE))
@@ -729,6 +801,7 @@ fn allocation_requests(
         let requirement = root_requirements.get(&root).copied().unwrap_or_default();
         let bytes = allocation_bytes(program, root_members, member_offsets, requirement)?;
         requests.push(AllocationRequest {
+            auxiliary: None,
             class: representative.tensor_type.format.layout.memory_class,
             region1_stride: None,
             conflicts: conflicts
@@ -752,10 +825,30 @@ fn allocate_tile(
     analysis: &AllocationAnalysis,
     arena: &mut Arena,
     addresses: &mut BTreeMap<BlockValueId, u32>,
+    auxiliary: &[AuxiliaryRequest],
 ) -> Result<(), PlacementError> {
     let members = &analysis.tiles[usize::from(tile)].members;
     let member_offsets = &analysis.member_offsets;
     let mut requests = allocation_requests(program, analysis, tile)?;
+    requests.extend(
+        auxiliary
+            .iter()
+            .enumerate()
+            .map(|(index, request)| AllocationRequest {
+                auxiliary: Some(index),
+                class: MemoryClass::Ipu21Standard,
+                region1_stride: None,
+                lifetime: Lifetime {
+                    first: request.first,
+                    last: request.last,
+                    seen: true,
+                },
+                bytes: request.bytes,
+                alignment: request.alignment,
+                assignments: Vec::new(),
+                conflicts: Vec::new(),
+            }),
+    );
     requests.sort_by_key(|request| {
         (
             request.lifetime.first,
@@ -844,7 +937,10 @@ fn allocate_requests(
     for request in requests {
         let class = request.class;
         let Some(base) = arena.allocate(request) else {
-            let representative = &program.shards[members[&request.assignments[0].0][0]];
+            let representative = request
+                .assignments
+                .first()
+                .map(|(root, _)| &program.shards[members[root][0]]);
             tracing::debug!(
                 tile,
                 ?class,
@@ -854,7 +950,7 @@ fn allocate_requests(
                 last = request.lifetime.last,
                 free = ?arena.free,
                 active = ?arena.active,
-                tensor_type = ?representative.tensor_type,
+                tensor_type = ?representative.map(|shard| &shard.tensor_type),
                 "tile allocation does not fit"
             );
             return Err(PlacementError::OutOfMemory {
@@ -893,6 +989,8 @@ fn assign_request(
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AllocationRequest {
+    #[serde(default)]
+    auxiliary: Option<usize>,
     class: MemoryClass,
     /// Iterated values need a wider physical stride if placed in region 1.
     region1_stride: Option<u32>,
@@ -916,6 +1014,7 @@ struct Arena {
     offline: bool,
     history: Vec<(Lifetime, u32, u32)>,
     root_spans: BTreeMap<usize, (u32, u32)>,
+    auxiliary_addresses: BTreeMap<usize, u32>,
     ranges: Vec<(u32, u32)>,
     free: Vec<(u32, u32)>,
     active: Vec<(u32, u32, u32)>,
@@ -929,6 +1028,7 @@ impl Arena {
             offline: false,
             history: Vec::new(),
             root_spans: BTreeMap::new(),
+            auxiliary_addresses: BTreeMap::new(),
             ranges: ranges.to_vec(),
             free: ranges.to_vec(),
             active: Vec::new(),
@@ -1021,6 +1121,9 @@ impl Arena {
     }
 
     fn record(&mut self, request: &AllocationRequest, start: u32, end: u32) {
+        if let Some(index) = request.auxiliary {
+            self.auxiliary_addresses.insert(index, start);
+        }
         for &(root, _) in &request.assignments {
             self.root_spans.insert(root, (start, end));
         }
@@ -1186,6 +1289,7 @@ mod tests {
         last: u32,
     ) -> AllocationRequest {
         AllocationRequest {
+            auxiliary: None,
             class,
             region1_stride: None,
             bytes,
@@ -1198,6 +1302,71 @@ mod tests {
             },
             assignments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn auxiliary_storage_joins_tensor_placement_and_survives_readback() {
+        let mut graph = ComputeGraph::new();
+        let parameter = graph.parameter("p", [1, 128]).unwrap();
+        let output = graph.gelu(parameter).unwrap();
+        graph.set_outputs([output]).unwrap();
+        let config = PipelineConfig::new(1).with_input(
+            parameter,
+            TensorFormat {
+                precision: Precision::F16,
+                layout: Layout::row_sharded(1),
+            },
+        );
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
+        let requests = [64, 128].map(|bytes| {
+            vec![AuxiliaryRequest {
+                name: "samples".into(),
+                bytes,
+                alignment: 4,
+                first: 0,
+                last: u32::MAX,
+            }]
+        });
+        let base = IPU21_INTERLEAVED_MEMORY_BASE;
+        let placement = place_with_auxiliary(&low, &[(base, base + 576)], 0, &requests).unwrap();
+        assert_ne!(
+            placement.auxiliary_allocations[0][0].address,
+            placement.auxiliary_allocations[1][0].address
+        );
+        for (tile, allocations) in placement.auxiliary_allocations.iter().enumerate() {
+            let allocation = &allocations[0];
+            assert_eq!(allocation.bytes, requests[tile][0].bytes);
+            for shard in low
+                .shards
+                .iter()
+                .filter(|shard| usize::from(shard.tile) == tile)
+            {
+                if let Some(&address) = placement.shard_addresses.get(&shard.id) {
+                    assert!(
+                        address + shard_storage_bytes(shard).unwrap() <= allocation.address
+                            || allocation.address + allocation.bytes <= address
+                    );
+                }
+            }
+            assert!(
+                placement.tile_auxiliary_ranges[tile]
+                    .iter()
+                    .all(|&(start, end)| end <= allocation.address
+                        || start >= allocation.address + allocation.bytes)
+            );
+        }
+        // A sample output must not borrow the host aperture, even when that
+        // would make an otherwise undersized data arena fit.
+        assert!(
+            place_with_auxiliary(
+                &low,
+                &[HOST_SCRATCH_RANGE, (base, base + 512)],
+                0,
+                &requests
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1663,12 +1832,13 @@ mod tests {
             .entry(second_root)
             .or_default()
             .insert(first_root);
-        let (_, addresses, _) = place_tile(
+        let (_, addresses, _, _) = place_tile(
             &low,
             0,
             &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
             0,
             &analysis,
+            &[],
         )
         .unwrap();
         assert_eq!(

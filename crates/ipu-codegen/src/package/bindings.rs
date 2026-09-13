@@ -14,7 +14,7 @@ impl PackageBindings {
         placement: &crate::Placement,
         topology: &Topology,
         physical_to_logical: &[u16],
-        profile_address: Option<u32>,
+        profile_addresses: Option<&[u32]>,
     ) -> PackageBuildResult<Self> {
         let mut inputs = Vec::new();
         let mut weights = Vec::new();
@@ -45,14 +45,14 @@ impl PackageBindings {
                 )
             })
             .collect::<PackageBuildResult<Vec<_>>>()?;
-        if let Some(address) = profile_address {
+        if let Some(addresses) = profile_addresses {
             outputs.push(cycle_binding(
                 "profile.start-cycle",
                 PROFILE_START_CYCLE,
                 program.tile_count,
                 topology,
             ));
-            outputs.push(profile_binding(program, physical_to_logical, address)?);
+            outputs.push(profile_binding(program, physical_to_logical, addresses)?);
             outputs.push(cycle_binding(
                 "profile.end-cycle",
                 PROFILE_END_CYCLE,
@@ -69,16 +69,14 @@ impl PackageBindings {
 }
 
 pub(super) fn auxiliary_ranges(
-    program: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
     execution_tile_count: u16,
     inactive_ranges: &[(u32, u32)],
 ) -> PackageBuildResult<Vec<Vec<(u32, u32)>>> {
     let mut ranges = vec![inactive_ranges.to_vec(); usize::from(execution_tile_count)];
-    for logical in 0..program.tile_count {
-        ranges[usize::from(topology.physical(logical)?)] =
-            placement.tile_auxiliary_ranges[usize::from(logical)].clone();
+    for (logical, unused) in placement.tile_auxiliary_ranges.iter().enumerate() {
+        ranges[usize::from(topology.physical(u16::try_from(logical)?)?)] = unused.clone();
     }
     Ok(ranges)
 }

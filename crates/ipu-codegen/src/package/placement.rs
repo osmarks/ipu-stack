@@ -106,6 +106,7 @@ pub(super) fn map_tiles(
 pub(super) fn improve_exchange_placement(
     program: &LowProgram,
     available_ranges: &[(u32, u32)],
+    auxiliary: &[Vec<crate::place::AuxiliaryRequest>],
     topology: &Topology,
     baseline: crate::Placement,
     exchanges: crate::exchange::LoweredExchanges,
@@ -122,7 +123,12 @@ pub(super) fn improve_exchange_placement(
     }
     let mut candidates = Vec::new();
     for offset in (4096..ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE).step_by(4096) {
-        let candidate = match crate::place::place_with_offset(program, available_ranges, offset) {
+        let candidate = match crate::place::place_with_auxiliary(
+            program,
+            available_ranges,
+            offset,
+            auxiliary,
+        ) {
             Ok(candidate) => candidate,
             Err(crate::PlacementError::OutOfMemory { .. }) => continue,
             Err(error) => return Err(error.into()),

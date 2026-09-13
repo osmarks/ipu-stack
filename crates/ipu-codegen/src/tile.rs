@@ -797,6 +797,7 @@ mod tests {
             }],
         };
         let placement = Placement {
+            auxiliary_allocations: Vec::new(),
             shard_addresses: BTreeMap::from([(id(0), 0x60000), (id(1), 0x70000)]),
             tile_auxiliary_ranges: vec![],
         };

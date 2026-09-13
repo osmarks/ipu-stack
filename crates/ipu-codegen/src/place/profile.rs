@@ -58,7 +58,10 @@ fn collect(
     support: &TileMemoryMap,
     application: &Application,
 ) -> PackageBuildResult<Profile> {
-    let analysis = analyze_allocations(program)?;
+    let mut analysis = analyze_allocations(program)?;
+    analysis
+        .tiles
+        .resize_with(application.tiles.len(), TileAllocations::default);
     let names = program
         .inputs
         .iter()
@@ -165,6 +168,23 @@ fn collect(
                     });
                 }
             }
+        }
+        for allocation in placement
+            .auxiliary_allocations
+            .get(usize::from(tile.logical))
+            .into_iter()
+            .flatten()
+        {
+            tile.allocations.push(Allocation {
+                start: allocation.address,
+                end: allocation.address + allocation.bytes,
+                payload_end: allocation.address + allocation.bytes,
+                label: labels.intern(allocation.name.clone()),
+                kind: "support",
+                first: allocation.first,
+                last: allocation.last,
+                shards: vec![],
+            });
         }
         for allocation in support.allocations() {
             let host_aperture = !program.requires_finite_scratch

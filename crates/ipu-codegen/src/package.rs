@@ -440,35 +440,34 @@ fn build_package_from_objects(
         "exchange table and repeat patch storage"
     );
     validation::check_exchange_budget(u64::from(exchange_table_bytes), config)?;
-    let profile_samples = config.profiling.then(|| {
-        program
-            .tiles
-            .iter()
-            .map(|tile| profile_step_count(program, tile))
-            .max()
-            .unwrap_or(0)
-            .max(program.exchange_phases.len())
-            + 1
+    let profile_requests = if config.profiling {
+        (0..execution_tile_count)
+            .map(|logical| {
+                let steps = if logical < program.tile_count {
+                    profile_step_count(program, &program.tiles[usize::from(logical)])
+                } else {
+                    profile::inactive_profile_work(program).len()
+                };
+                let bytes = u32::try_from(steps + 1)?
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("profile storage size overflow"))?;
+                Ok(vec![crate::place::AuxiliaryRequest {
+                    name: "cycle profile samples".into(),
+                    bytes,
+                    alignment: 4,
+                    first: 0,
+                    last: u32::MAX,
+                }])
+            })
+            .collect::<PackageBuildResult<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    // Addresses do not affect instruction sizing. Final emission and host
+    // bindings use the auxiliary allocations chosen alongside tensors.
+    let provisional_profile_addresses = config.profiling.then(|| {
+        vec![ipu_package::IPU21_INTERLEAVED_MEMORY_BASE; usize::from(execution_tile_count)]
     });
-    let profile_storage = profile_samples
-        .map(|samples| -> PackageBuildResult<_> {
-            let bytes = u32::try_from(samples)?
-                .checked_mul(4)
-                .ok_or_else(|| invalid("profile storage size overflow"))?;
-            Ok(memory.allocate(MemoryRequest {
-                name: "cycle profile samples",
-                bytes,
-                // Samples are data. Region 1 leaves scarce instruction-fetch
-                // elements for code and exchange rows, and cannot conflict with
-                // instruction fetch during host readback.
-                alignment: 4,
-                bounds: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
-                    ..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
-                end_alignment: 4,
-                guard_after: 0,
-            })?)
-        })
-        .transpose()?;
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
     for logical in 0..execution_tile_count {
@@ -484,7 +483,7 @@ fn build_package_from_objects(
         provisional_placement,
         &topology,
         &physical_to_logical,
-        profile_storage.as_ref().map(|storage| storage.range.start),
+        provisional_profile_addresses.as_deref(),
     )?;
     let sizing_host_base = memory.next_free(
         RUNTIME_EXECUTABLE_START,
@@ -563,14 +562,14 @@ fn build_package_from_objects(
             .map(|(physical, &logical)| {
                 let host = &provisional_host.programs[physical];
                 let mut tile_program = provisional_finalizer.lower_tile(logical)?;
-                if let Some(storage) = &profile_storage {
+                if let Some(addresses) = &provisional_profile_addresses {
                     instrument_profile(
                         program,
                         provisional_exchanges,
                         logical,
                         u32::try_from(physical)?,
                         &mut tile_program,
-                        storage.range.start,
+                        addresses[usize::from(logical)],
                     )?;
                 }
                 // Row sharing can change after final placement. Reserve its
@@ -667,9 +666,12 @@ fn build_package_from_objects(
     available_ranges.insert(0, crate::place::HOST_SCRATCH_RANGE);
     tracing::info!(
         linked_end,
-        profile_bytes = profile_storage
-            .as_ref()
-            .map_or(0, |allocation| allocation.range.len()),
+        profile_bytes = profile_requests
+            .iter()
+            .flatten()
+            .map(|r| r.bytes)
+            .max()
+            .unwrap_or(0),
         exchange_table_bytes,
         host_code_bytes,
         host_data_bytes,
@@ -679,7 +681,12 @@ fn build_package_from_objects(
         "allocated package support memory"
     );
     let placement = build_phase("place_storage", || {
-        Ok(crate::place::place_with_ranges(program, &available_ranges)?)
+        Ok(crate::place::place_with_auxiliary(
+            program,
+            &available_ranges,
+            0,
+            &profile_requests,
+        )?)
     })?;
     let lowered_exchanges = build_phase("lower_exchanges", || {
         Ok(crate::exchange::lower_exchanges_cached(
@@ -694,6 +701,7 @@ fn build_package_from_objects(
         placement::improve_exchange_placement(
             program,
             &available_ranges,
+            &profile_requests,
             &topology,
             placement,
             lowered_exchanges,
@@ -714,6 +722,13 @@ fn build_package_from_objects(
     );
     let exchange_schedule = lowered_exchanges.schedule_snapshot;
     let exchanges = lowered_exchanges.phases;
+    let profile_addresses = config.profiling.then(|| {
+        placement
+            .auxiliary_allocations
+            .iter()
+            .map(|allocations| allocations[0].address)
+            .collect::<Vec<_>>()
+    });
     let PackageBindings {
         inputs,
         weights,
@@ -723,7 +738,7 @@ fn build_package_from_objects(
         &placement,
         &topology,
         &physical_to_logical,
-        profile_storage.as_ref().map(|storage| storage.range.start),
+        profile_addresses.as_deref(),
     )?;
     let inactive_auxiliary_ranges = available_ranges
         .iter()
@@ -731,9 +746,8 @@ fn build_package_from_objects(
         .filter(|range| *range != crate::place::HOST_SCRATCH_RANGE)
         .collect::<Vec<_>>();
     let mut host_data_ranges = auxiliary_ranges(
-        program,
         &placement,
-        &topology,
+        &execution_topology,
         execution_tile_count,
         &inactive_auxiliary_ranges,
     )?;
@@ -804,16 +818,16 @@ fn build_package_from_objects(
             .enumerate()
             .map(|(physical_tile, &logical)| {
                 let mut tile_program = finalizer.lower_tile(logical)?;
-                let profile = profile_storage
+                let profile = profile_addresses
                     .as_ref()
-                    .map(|storage| {
+                    .map(|addresses| {
                         instrument_profile(
                             program,
                             &exchanges,
                             logical,
                             u32::try_from(physical_tile)?,
                             &mut tile_program,
-                            storage.range.start,
+                            addresses[usize::from(logical)],
                         )
                     })
                     .transpose()?;

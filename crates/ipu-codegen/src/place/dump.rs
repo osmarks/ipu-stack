@@ -63,6 +63,7 @@ mod tests {
     #[test]
     fn dump_preserves_region_stride_and_conflict_constraints() {
         let requests = [AllocationRequest {
+            auxiliary: None,
             class: MemoryClass::Ipu21Standard,
             region1_stride: Some(IPU21_INTERLEAVED_ELEMENT_SIZE),
             lifetime: Lifetime {
