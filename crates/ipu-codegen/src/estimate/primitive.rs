@@ -82,8 +82,9 @@ pub(crate) fn kernel_cycles<'a>(
         .widths()
         .take(output.rank().saturating_sub(1))
         .fold(1u64, |n, width| n.saturating_mul(u64::from(width)));
-    if matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::LayerNorm)
-        && matches!(output.format().precision, Precision::F8F143 { .. })
+    if kernel
+        .output_capability(output.format().precision)
+        .is_some()
     {
         let Some(input) = inputs(0) else {
             return u64::MAX;

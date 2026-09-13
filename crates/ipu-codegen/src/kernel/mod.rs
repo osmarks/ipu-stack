@@ -5,6 +5,7 @@ mod attention;
 mod build;
 pub(crate) mod cost;
 mod gemm;
+mod output;
 mod rearrange;
 mod specialization;
 #[cfg(test)]

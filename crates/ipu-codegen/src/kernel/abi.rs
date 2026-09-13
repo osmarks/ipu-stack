@@ -685,21 +685,21 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::RequirementMismatch);
         }
     }
-    let fp8_producer = matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::LayerNorm)
-        && matches!(
-            run.requirements.output.format.precision,
-            Precision::F8F143 { .. }
-        );
-    if fp8_producer {
+    let output_capability = kernel.output_capability(run.requirements.output.format.precision);
+    let fp8_producer = output_capability.is_some();
+    if let Some(capability) = output_capability {
         let input = &run.inputs[0].views[0];
         let width = input_matrix_extent(run, false, true)?;
         let columns = matrix_extent(run, false, true)?;
         let packed =
             run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left);
         if width == 0
-            || !width.is_multiple_of(4)
+            || !width.is_multiple_of(capability.column_multiple)
+            || run.inputs.len() != capability.operands
             || input_matrix_extent(run, true, true)? != width
-            || (!packed && run.requirements.output.format.layout.order != ElementOrder::RowMajor)
+            || !capability
+                .output_orders
+                .contains(&run.requirements.output.format.layout.order)
             || columns
                 != if packed {
                     width.next_multiple_of(32)
@@ -711,7 +711,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                 != run.output.extents[..run.output.extents.len() - 1]
             || run.requirements.inputs.iter().any(|r| {
                 r.format.precision != Precision::F16
-                    || r.format.layout.order != ElementOrder::RowMajor
+                    || r.format.layout.order != capability.input_order
             })
         {
             return Err(KernelAbiError::RequirementMismatch);

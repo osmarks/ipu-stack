@@ -196,7 +196,15 @@ fn fuse_fp8_outputs(
         else {
             continue;
         };
-        if !matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::LayerNorm)
+        let Some(capability) = kernel.output_capability(
+            values[cast.results[0].index() as usize]
+                .tensor_type
+                .format
+                .precision,
+        ) else {
+            continue;
+        };
+        if producer.inputs.len() != capability.operands
             || operands.iter().any(|window| !window.0.is_empty())
         {
             continue;
@@ -228,7 +236,10 @@ fn fuse_fp8_outputs(
             consumer = ?cast.source, ?kernel, input_layout = ?input.tensor_type.format.layout,
             output_layout = ?output.tensor_type.format.layout, "considering direct FP8 output");
         if input.tile_offset != output.tile_offset
-            || input.tensor_type.format.layout.order != ElementOrder::RowMajor
+            || input.tensor_type.format.layout.order != capability.input_order
+            || !capability
+                .output_orders
+                .contains(&output.tensor_type.format.layout.order)
         {
             continue;
         }
@@ -263,7 +274,7 @@ fn fuse_fp8_outputs(
                 resolved
                     .axes()
                     .and_then(|a| a.last())
-                    .map(|a| a.extents_are_multiple_of(4))
+                    .map(|a| a.extents_are_multiple_of(capability.column_multiple))
             })
             != Some(true)
         {
@@ -307,13 +318,14 @@ fn fuse_fp8_outputs(
         });
         let mut new_values = values.clone();
         let mut copies = vec![];
-        if redistributed && *kernel == TileKernelSpec::LayerNorm {
-            // LN commutes only with redistribution of complete rows. Use the
-            // normal broadcast tiling to place affine parameters on those owners.
+        if redistributed {
+            // Row reductions require complete rows; pointwise families may
+            // move across column shards. Place every row parameter on the
+            // selected owners using the same broadcast rules as normal lowering.
             let rank = input.tensor_type.shape.0.len();
             let width = *input.tensor_type.shape.0.last().unwrap();
-            if producer.inputs.len() != 3
-                || input
+            if capability.complete_rows
+                && input
                     .tensor_type
                     .format
                     .layout
