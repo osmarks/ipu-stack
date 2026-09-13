@@ -134,6 +134,10 @@ fn fuse_region(
         let prices = crate::estimate::operation_cost(add, values)
             .zip(crate::estimate::operation_cost(current, values))
             .zip(crate::estimate::operation_cost(&replacement, values));
+        tracing::debug!(source = ?current.source, kernel = ?replacement.kind,
+            separate_cycles = ?prices.map(|(((a, _, _), (b, _, _)), _)| a.total.saturating_add(b.total)),
+            fused_cycles = ?prices.map(|(_, (cost, _, _))| cost.total),
+            "priced elementwise fusion");
         if prices.is_none_or(|(((a, _, _), (b, _, _)), (fused, _, _))| {
             fused.total >= a.total.saturating_add(b.total)
         }) {

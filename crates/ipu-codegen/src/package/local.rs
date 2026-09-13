@@ -95,14 +95,21 @@ pub(super) fn optimize<T: Send>(
             .filter(|recipe| !state.visited.contains(recipe))
             .filter_map(
                 |recipe| match baseline::lower(graph, &fixed, &costs, recipe) {
-                    Ok(candidate)
-                        if !state.visited.contains(&candidate.recipe)
-                            && candidate.program.estimated_cycles
-                                < incumbent.program.estimated_cycles =>
-                    {
-                        Some(candidate)
+                    Ok(candidate) => {
+                        let visited = state.visited.contains(&candidate.recipe);
+                        tracing::debug!(
+                            incumbent_cycles = incumbent.program.estimated_cycles,
+                            candidate_cycles = candidate.program.estimated_cycles,
+                            visited,
+                            changed_operations = ?candidate.recipe.plans.iter().filter_map(|(id, plan)|
+                                (incumbent.recipe.plans.get(id) != Some(plan)).then_some(id.index())).collect::<Vec<_>>(),
+                            opened_boundaries = ?candidate.recipe.open_boundaries.difference(&incumbent.recipe.open_boundaries)
+                                .map(|id| id.index()).collect::<Vec<_>>(),
+                            "screened local recipe"
+                        );
+                        (!visited && candidate.program.estimated_cycles < incumbent.program.estimated_cycles)
+                            .then_some(candidate)
                     }
-                    Ok(_) => None,
                     Err(error) => {
                         tracing::debug!(%error, "discarded invalid local recipe");
                         None
