@@ -53,6 +53,7 @@ pub use package::{
     ExpansionTiming, PackageConfig, TileProgramData, benchmark_mid_expansion,
     build_diagnostic_package, build_package, build_tile_program_package, capture_exchange_baseline,
 };
+pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
 pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};

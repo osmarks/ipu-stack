@@ -3,29 +3,29 @@ use super::*;
 use crate::memory::TileMemoryMap;
 use crate::package::{PackageBuildError, PackageBuildResult};
 use ipu_package::{Application, TILE_MEMORY_BASE, TILE_MEMORY_SIZE};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Allocation {
     start: u32,
     end: u32,
     payload_end: u32,
     label: usize,
-    kind: &'static str,
+    kind: String,
     first: u32,
     last: u32,
     shards: Vec<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Tile {
     logical: u16,
     physical: u16,
     allocations: Vec<Allocation>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Profile {
     schema_version: u32,
     start: u32,
@@ -147,7 +147,7 @@ fn collect(
                     end: start + bytes,
                     payload_end: start + payload,
                     label,
-                    kind,
+                    kind: kind.into(),
                     first: request.lifetime.first,
                     last: request.lifetime.last,
                     shards: group
@@ -161,7 +161,7 @@ fn collect(
                         end: next,
                         payload_end: start + bytes,
                         label: labels.intern("Repeat stride padding".into()),
-                        kind: "padding",
+                        kind: "padding".into(),
                         first: request.lifetime.first,
                         last: request.lifetime.last,
                         shards: vec![],
@@ -180,7 +180,7 @@ fn collect(
                 end: allocation.address + allocation.bytes,
                 payload_end: allocation.address + allocation.bytes,
                 label: labels.intern(allocation.name.clone()),
-                kind: "support",
+                kind: "support".into(),
                 first: allocation.first,
                 last: allocation.last,
                 shards: vec![],
@@ -199,7 +199,7 @@ fn collect(
                     end: allocation.reserved.end,
                     payload_end: allocation.range.end,
                     label: labels.intern(allocation.name.into()),
-                    kind: "support",
+                    kind: "support".into(),
                     first,
                     last,
                     shards: vec![],
@@ -227,7 +227,7 @@ fn collect(
                         end,
                         payload_end: end,
                         label: labels.intern("Per-tile image data / host descriptors".into()),
-                        kind: "support",
+                        kind: "support".into(),
                         first: 0,
                         last: u32::MAX,
                         shards: vec![],
@@ -243,7 +243,7 @@ fn collect(
             end: TILE_MEMORY_BASE + TILE_MEMORY_SIZE,
             payload_end: IPU21_APPLICATION_MEMORY_LIMIT,
             label: labels.intern("Outside application load range".into()),
-            kind: "padding",
+            kind: "padding".into(),
             first: 0,
             last: u32::MAX,
             shards: vec![],
@@ -288,16 +288,88 @@ pub(crate) fn write(
     application: &Application,
 ) -> PackageBuildResult<()> {
     let profile = collect(program, placement, support, application)?;
-    let json =
-        serde_json::to_string(&profile).map_err(|e| PackageBuildError::Invalid(e.to_string()))?;
     std::fs::create_dir_all(directory)?;
     let path = directory.join(format!("placement-{}", std::process::id()));
-    std::fs::write(path.with_extension("json"), &json)?;
-    std::fs::write(
-        path.with_extension("html"),
-        include_str!("profile.html").replace("__PROFILE_JSON__", &json.replace('<', "\\u003c")),
-    )?;
+    write_json(&path.with_extension("json"), &profile)?;
+    write_html(&profile, &path.with_extension("html"))?;
     tracing::info!(path = %path.with_extension("html").display(), "wrote exact tile placement profile");
+    Ok(())
+}
+
+const TILES_PER_CHUNK: usize = 16;
+
+fn write_json(path: &Path, value: &impl Serialize) -> PackageBuildResult<()> {
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|e| PackageBuildError::Invalid(e.to_string()))?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Render an existing exact placement JSON report without rebuilding a package.
+/// The HTML loads visible tiles from an adjacent `.data` directory over HTTP.
+pub fn render_memory_profile(input: impl std::io::Read, output: &Path) -> PackageBuildResult<()> {
+    let profile: Profile = serde_json::from_reader(std::io::BufReader::new(input))
+        .map_err(|e| PackageBuildError::Invalid(e.to_string()))?;
+    if profile.schema_version != 1 || profile.start >= profile.end {
+        return Err(PackageBuildError::Invalid(
+            "unsupported memory profile".into(),
+        ));
+    }
+    write_html(&profile, output)
+}
+
+// First-use order puts later occupants below earlier allocations. Preserve this
+// geometry in the index so unloaded tiles occupy their exact scroll positions.
+fn allocation_lanes(tile: &Tile) -> Vec<Vec<&Allocation>> {
+    let mut lanes: Vec<Vec<&Allocation>> = vec![Vec::new()];
+    for allocation in &tile.allocations {
+        let mut placed = false;
+        for lane in &mut lanes {
+            let i = lane.partition_point(|a| a.start < allocation.start);
+            if (i == 0 || lane[i - 1].end <= allocation.start)
+                && (i == lane.len() || allocation.end <= lane[i].start)
+            {
+                lane.insert(i, allocation);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            lanes.push(vec![allocation]);
+        }
+    }
+    lanes
+}
+
+fn write_html(profile: &Profile, output: &Path) -> PackageBuildResult<()> {
+    let directory = output.with_extension("data");
+    std::fs::create_dir_all(&directory)?;
+    let mut tiles = Vec::new();
+    for (chunk_id, chunk) in profile.tiles.chunks(TILES_PER_CHUNK).enumerate() {
+        let lanes = chunk.iter().map(allocation_lanes).collect::<Vec<_>>();
+        for (tile, lanes) in chunk.iter().zip(&lanes) {
+            tiles.push(serde_json::json!({
+                "logical": tile.logical, "physical": tile.physical,
+                "lane_count": lanes.len(), "allocation_count": tile.allocations.len(),
+                "reused_count": tile.allocations.len() - lanes[0].len(),
+            }));
+        }
+        write_json(&directory.join(format!("tiles-{chunk_id}.json")), &lanes)?;
+    }
+    let index = serde_json::json!({
+        "start": profile.start, "end": profile.end, "labels": profile.labels,
+        "tiles": tiles, "chunk_size": TILES_PER_CHUNK,
+        "directory": directory.file_name().unwrap().to_string_lossy(),
+    });
+    std::fs::write(
+        output,
+        include_str!("profile.html").replace(
+            "__PROFILE_JSON__",
+            &index.to_string().replace('<', "\\u003c"),
+        ),
+    )?;
     Ok(())
 }
 
@@ -305,6 +377,47 @@ pub(crate) fn write(
 mod tests {
     use super::*;
     use crate::{ComputeGraph, Ipu21CostModel, PipelineConfig};
+
+    #[test]
+    fn rendering_splits_tiles_and_retains_reuse_geometry() {
+        let directory = std::env::temp_dir().join(format!(
+            "ipu-memory-render-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let allocation = serde_json::json!({
+            "start": 100, "end": 120, "payload_end": 116,
+            "label": 0, "kind": "activation", "first": 0, "last": 1, "shards": [5],
+        });
+        let mut reused = allocation.clone();
+        reused["first"] = 2.into();
+        reused["last"] = 3.into();
+        let input = serde_json::json!({
+            "schema_version": 1, "start": 100, "end": 200,
+            "labels": ["input</script>"],
+            "tiles": (0..17).map(|tile| serde_json::json!({
+                "logical": tile, "physical": 16-tile,
+                "allocations": [allocation, reused],
+            })).collect::<Vec<_>>(),
+        })
+        .to_string();
+        let output = directory.join("memory report.html");
+        render_memory_profile(input.as_bytes(), &output).unwrap();
+        let html = std::fs::read_to_string(&output).unwrap();
+        assert!(html.contains("input\\u003c/script>"));
+        assert!(!html.contains("\"shards\""));
+        let chunk: Vec<Vec<Vec<Allocation>>> = serde_json::from_reader(
+            std::fs::File::open(directory.join("memory report.data/tiles-1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chunk.len(), 1);
+        assert_eq!(chunk[0].len(), 2);
+        assert_eq!(chunk[0][0][0].first, 0);
+        assert_eq!(chunk[0][1][0].first, 2);
+        assert_eq!(chunk[0][1][0].shards, [5]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn image_gaps_do_not_duplicate_tensor_or_support_allocations() {
@@ -404,6 +517,14 @@ mod tests {
             );
         }
         for tile in &report.tiles {
+            let lanes = allocation_lanes(tile);
+            assert_eq!(
+                lanes.iter().map(Vec::len).sum::<usize>(),
+                tile.allocations.len()
+            );
+            for lane in lanes {
+                assert!(lane.windows(2).all(|pair| pair[0].end <= pair[1].start));
+            }
             for (i, a) in tile.allocations.iter().enumerate() {
                 assert!(a.start <= a.payload_end && a.payload_end <= a.end);
                 for b in &tile.allocations[i + 1..] {

@@ -4,7 +4,7 @@
 <style>
 :root{color-scheme:light}*{box-sizing:border-box}body{margin:0;background:#fff;color:#050505;font:13px/1.45 ui-sans-serif,system-ui,sans-serif}header,main{padding:16px 20px}header{border-bottom:1px solid #000}h1{margin:0;font-size:20px}main{display:grid;gap:14px}.controls,.stats,.legend{display:flex;gap:8px 16px;align-items:center;flex-wrap:wrap}.stats{color:#303030;margin-top:4px}.controls{margin-bottom:12px}input,button,select{font:inherit;border:1px solid #000;border-radius:0;background:#fff;color:#000;height:30px;padding:0 8px}button{cursor:pointer}button:hover{background:#eee}input[type=number]{width:80px}input[type=checkbox]{height:auto;accent-color:#000}label{display:inline-flex;align-items:center;gap:6px}section{border:1px solid #000}.section-head{padding:10px 12px;border-bottom:1px solid #000;display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}.legend{font-size:11px}.legend span{display:inline-flex;align-items:center;gap:5px}.swatch{width:12px;height:12px;border:1px solid #000}#ruler{touch-action:none;cursor:crosshair;display:block;width:100%;height:28px;border-bottom:1px solid #000}#viewport{height:68vh;min-height:300px;position:relative;overflow:auto;background:#fff}#spacer{position:absolute;left:0;top:0;pointer-events:none}#map{position:sticky;left:0;top:0;display:block;image-rendering:pixelated;cursor:crosshair;touch-action:none}#detail{padding:10px 12px;min-height:100px;white-space:pre-wrap;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}#tooltip{position:fixed;display:none;z-index:10;pointer-events:none;border:1px solid #000;background:#fff;padding:8px 10px;max-width:480px;white-space:pre-wrap;box-shadow:3px 3px 0 #bbb;font-size:12px}#selection{font-weight:700}#address{width:100px}#filter{width:230px}button:focus-visible,input:focus-visible{outline:2px solid #000;outline-offset:2px}
 </style>
-<header><h1>IPU memory placement</h1><div id="summary" class="stats"></div></header>
+<header><h1>IPU memory placement</h1><div id="summary" class="stats"></div><div class="stats"><span id="loading"></span><button id="retry" hidden>Retry loading</button></div></header>
 <main>
 <div class="controls">
 <label>Tile <input id="tile" type="number" value="0" min="0"></label><button id="jump">Go</button>
@@ -41,25 +41,40 @@ const rows=[], zoomHistory=[];
 let drag=null,suppressClick=false;
 function overlap(a,b){return a.start<b.end&&b.start<a.end;}
 function lowerBound(items,start){let lo=0,hi=items.length;while(lo<hi){const m=(lo+hi)>>1;if(items[m].start<start)lo=m+1;else hi=m;}return lo;}
-// First-use order puts subsequent occupants below the original allocation.
-// Alias groups are a single allocation in the backend, not false reuse rows.
-for(const tile of tiles){
- tile.lanes=[];
- for(const allocation of tile.allocations){
-  let lane=0;
-  for(;lane<tile.lanes.length;lane++){
-   const items=tile.lanes[lane],i=lowerBound(items,allocation.start);
-   if((i===0||!overlap(items[i-1],allocation))&&(i===items.length||!overlap(items[i],allocation)))break;
-  }
-  if(lane===tile.lanes.length)tile.lanes.push([]);
-  const items=tile.lanes[lane];items.splice(lowerBound(items,allocation.start),0,allocation);
-  allocation.tile=tile;allocation.lane=lane;
- }
- if(!tile.lanes.length)tile.lanes.push([]);
+// Only visible tile chunks are fetched and processed. Lane counts in the
+// index keep scrolling and tile jumps stable before their allocations arrive.
+const chunks=new Map(), loading=new Set(), failed=new Set();
+const maxChunks=8, maxRequests=4;
+function showLoadStatus(message){
+ $('loading').textContent=message||(loading.size?'Loading '+loading.size+' tile chunks…':failed.size?'Some tile data could not be loaded.':'');
+ $('retry').hidden=!failed.size;
 }
+function ensureTile(tile){
+ const index=Math.floor(tiles.indexOf(tile)/p.chunk_size);
+ if(chunks.has(index)){const data=chunks.get(index);chunks.delete(index);chunks.set(index,data);return;}
+ if(loading.has(index)||failed.has(index)||loading.size>=maxRequests)return;
+ loading.add(index);showLoadStatus();
+ const url=new URL(encodeURIComponent(p.directory)+'/tiles-'+index+'.json',location.href);
+ fetch(url).then(response=>{if(!response.ok)throw Error('HTTP '+response.status);return response.json();}).then(data=>{
+  for(let i=0;i<data.length;i++){
+   const t=tiles[index*p.chunk_size+i];t.lanes=data[i];
+   t.lanes.forEach((lane,laneIndex)=>lane.forEach(a=>{a.tile=t;a.lane=laneIndex;}));
+  }
+  chunks.set(index,data);
+  while(chunks.size>maxChunks){
+   const oldest=chunks.keys().next().value;
+   for(let i=oldest*p.chunk_size;i<Math.min(tiles.length,(oldest+1)*p.chunk_size);i++)tiles[i].lanes=null;
+   chunks.delete(oldest);
+  }
+ }).catch(error=>{
+  failed.add(index);
+  showLoadStatus(location.protocol==='file:'?'Serve this folder over HTTP, for example with python3 -m http.server.':'Tile data unavailable: '+error.message);
+ }).finally(()=>{loading.delete(index);if(!failed.size)showLoadStatus();schedule();});
+}
+$('retry').onclick=()=>{failed.clear();showLoadStatus();schedule();};
 function layout(){
  rows.length=0;height=0;
- for(const tile of tiles){tile.y=height;const count=$('reuse').checked?tile.lanes.length:1;for(let lane=0;lane<count;lane++){rows.push({tile,lane,y:height});height+=band;}height+=gap;}
+ for(const tile of tiles){tile.y=height;const count=$('reuse').checked?tile.lane_count:1;for(let lane=0;lane<count;lane++){rows.push({tile,lane,y:height});height+=band;}height+=gap;}
  $('spacer').style.height=height+'px';
  $('spacer').style.width=(label+span/bpp)+'px';
 }
@@ -76,6 +91,8 @@ function draw(){
  const query=$('filter').value.toLowerCase();
  for(const row of rows){
   const y=row.y-view.scrollTop;if(y+band<0)continue;if(y>h)break;
+  ensureTile(row.tile);
+  if(!row.tile.lanes){ctx.fillStyle='#eee';ctx.fillRect(label,y,w-label,band-1);continue;}
   const items=row.tile.lanes[row.lane];
   let i=Math.max(0,lowerBound(items,left)-1);
   for(;i<items.length&&items[i].start<right;i++){
@@ -111,6 +128,7 @@ function findAt(e){
  let lo=0,hi=rows.length;
  while(lo<hi){const m=(lo+hi)>>1;if(rows[m].y+band<=py)lo=m+1;else hi=m;}
  const row=rows[lo];if(!row||py<row.y||py>=row.y+band-1)return null;
+ if(!row.tile.lanes){ensureTile(row.tile);return null;}
  const address=p.start+(px-label+view.scrollLeft)*bpp,items=row.tile.lanes[row.lane];
  const i=lowerBound(items,address);
  for(const j of [i-1,i]){const a=items[j];if(a&&a.start<address+bpp&&a.end>address)return a;}
@@ -168,7 +186,7 @@ $('filter').oninput=schedule;view.onscroll=()=>{$('tooltip').style.display='none
 $('reset').onclick=()=>{cancelDrag();zoomHistory.length=0;pinned=hover=null;band=16;$('rowHeight').value='16';$('filter').value='';$('reuse').checked=true;$('tile').value=0;$('clear').click();view.scrollTop=view.scrollLeft=0;fitMode=true;resize();};
 window.onkeydown=e=>{if(e.key==='Escape'){cancelDrag();$('clear').click();}};
 new ResizeObserver(resize).observe(view);
-const allocations=tiles.reduce((n,t)=>n+t.allocations.length,0),reused=tiles.reduce((n,t)=>n+t.lanes.slice(1).reduce((n,l)=>n+l.length,0),0);
+const allocations=tiles.reduce((n,t)=>n+t.allocation_count,0),reused=tiles.reduce((n,t)=>n+t.reused_count,0);
 $('summary').textContent=tiles.length+' tiles · '+allocations.toLocaleString()+' allocations/reservations · '+reused.toLocaleString()+' reused placements · '+hex(p.start)+'–'+hex(p.end);
 resize();
 </script></html>
