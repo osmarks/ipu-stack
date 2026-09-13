@@ -619,8 +619,9 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                 .map(|copy| copy.destination)
                 .collect::<BTreeSet<_>>();
             assert!(
-                output_shards.is_subset(&copied_outputs),
-                "case {case}: every distributed result shard must receive a packed result"
+                output_shards.iter().all(|output|
+                    copied_outputs.contains(output) || packed_results.contains(output)),
+                "case {case}: every distributed result shard must be written by a reduction or its copy"
             );
         }
     }

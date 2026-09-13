@@ -136,12 +136,35 @@ impl TileGraphBuilder {
                     Precision::F16,
                     ShardDefinition::ExchangeStaging,
                 )?;
-                let result = self.push_packed_buffer(
-                    owner.tile,
-                    elements,
-                    Precision::F16,
-                    ShardDefinition::Staging,
-                )?;
+                let destination = ShardView {
+                    shard: output,
+                    extents: intersection.clone(),
+                };
+                // The packed reducer can write a physical slice directly. Keep
+                // aliases on the deferred-copy path: an earlier output write
+                // must not overwrite a contributor needed by another group.
+                let direct_output = matches!(
+                    owner.definition,
+                    ShardDefinition::Value(_)
+                        | ShardDefinition::Staging
+                        | ShardDefinition::ExchangeStaging
+                ) && !contributors.iter().any(|view| view.shard == output)
+                    && view_byte_traversal(&owner, &destination, CopyOrder::Physical)?
+                        .contiguous_span()
+                        .is_some_and(|span| {
+                            span.offset.is_multiple_of(8)
+                                && u64::from(span.bytes) == u64::from(elements) * 2
+                        });
+                let result = if direct_output && reduction_stages == 1 {
+                    output
+                } else {
+                    self.push_packed_buffer(
+                        owner.tile,
+                        elements,
+                        Precision::F16,
+                        ShardDefinition::Staging,
+                    )?
+                };
                 let seed = contributors
                     .iter()
                     .position(|view| self.shards[view.shard.index() as usize].tile == owner.tile)
@@ -220,27 +243,30 @@ impl TileGraphBuilder {
                                     views: vec![self.full_view(remote)],
                                 },
                             ],
-                            self.full_view(stage_result),
+                            if direct_output && stage + 1 == reduction_stages {
+                                destination.clone()
+                            } else {
+                                self.full_view(stage_result)
+                            },
                         )?,
                     ));
                 }
-                let final_result = if reduction_stages.is_multiple_of(2) {
-                    initial
-                } else {
-                    result
-                };
-                append_span_copies(
-                    &self.cache,
-                    &self.shards,
-                    &self.full_view(final_result),
-                    &ShardView {
-                        shard: output,
-                        extents: intersection,
-                    },
-                    owner.tile,
-                    result_copies,
-                    CopyOrder::Physical,
-                )?;
+                if !direct_output {
+                    let final_result = if reduction_stages.is_multiple_of(2) {
+                        initial
+                    } else {
+                        result
+                    };
+                    append_span_copies(
+                        &self.cache,
+                        &self.shards,
+                        &self.full_view(final_result),
+                        &destination,
+                        owner.tile,
+                        result_copies,
+                        CopyOrder::Physical,
+                    )?;
+                }
                 reduction_roots += 1;
             }
             if covered != expected {
@@ -315,7 +341,7 @@ mod tests {
             let mut groups = Vec::new();
             let mut outputs = Vec::new();
             let mut initial_values = BTreeMap::new();
-            for (group, count) in [1u32, 2, 4].into_iter().enumerate() {
+            for (group, count) in [1u32, 2, 3, 4].into_iter().enumerate() {
                 let start = group as u32 * 16;
                 let mut block = |tile| {
                     builder
@@ -323,7 +349,7 @@ mod tests {
                             id: BlockValueId(0),
                             tile,
                             tensor_type: TensorType {
-                                shape: crate::graph::TensorShape(vec![48]),
+                                shape: crate::graph::TensorShape(vec![64]),
                                 format: format.clone(),
                             },
                             extents: vec![ShardExtent {
@@ -344,7 +370,16 @@ mod tests {
                         id
                     })
                     .collect::<Vec<_>>();
-                outputs.push(block(3));
+                let output = block(3);
+                // Leave guards on either side of the destination slice. This
+                // exercises nonzero output offsets as well as whole-buffer writes.
+                builder.shards[output.index() as usize].extents[0] = ShardExtent {
+                    axis: 0,
+                    start: 0,
+                    logical_end: 64,
+                    physical_end: 64,
+                };
+                outputs.push(output);
                 groups.push(
                     sources
                         .into_iter()
@@ -446,15 +481,127 @@ mod tests {
                                         .map(|part| remote[part * initial.len() + element])
                                         .sum::<u32>()
                             })
-                            .collect();
-                        memory[run.output.shard.index() as usize] = result;
+                            .collect::<Vec<_>>();
+                        let span = view_byte_traversal(
+                            &builder.shards[run.output.shard.index() as usize],
+                            &run.output,
+                            CopyOrder::Physical,
+                        )
+                        .unwrap()
+                        .contiguous_span()
+                        .unwrap();
+                        let offset = span.offset as usize / 2;
+                        memory[run.output.shard.index() as usize][offset..offset + result.len()]
+                            .copy_from_slice(&result);
                     }
                     _ => panic!("unexpected sum operation"),
                 }
             }
-            for (output, expected) in outputs.into_iter().zip([1, 3, 10]) {
-                assert_eq!(memory[output.index() as usize], vec![expected; 16]);
+            for (group, (output, expected)) in outputs.into_iter().zip([1, 3, 6, 10]).enumerate() {
+                let mut expected_values = vec![0; 64];
+                expected_values[group * 16..(group + 1) * 16].fill(expected);
+                assert_eq!(memory[output.index() as usize], expected_values);
+                if group != 0 {
+                    assert!(
+                        builder
+                            .kernel_runs
+                            .iter()
+                            .any(|run| run.output.shard == output)
+                    );
+                    assert!(
+                        !builder
+                            .local_copies
+                            .iter()
+                            .any(|copy| copy.destination == output)
+                    );
+                }
             }
         }
+    }
+    #[test]
+    fn fragmented_sum_output_keeps_packed_result_copy() {
+        let mut builder = TileGraphBuilder::new(&MidProgram {
+            tile_count: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut block = |tile, columns| {
+            builder
+                .push_shard(BlockValue {
+                    id: BlockValueId(0),
+                    tile,
+                    tensor_type: TensorType::new([2, 32], Precision::F16, Layout::row_sharded(1)),
+                    extents: vec![
+                        ShardExtent {
+                            axis: 0,
+                            start: 0,
+                            logical_end: 2,
+                            physical_end: 2,
+                        },
+                        ShardExtent {
+                            axis: 1,
+                            start: 0,
+                            logical_end: columns,
+                            physical_end: columns,
+                        },
+                    ],
+                    definition: ShardDefinition::Staging,
+                })
+                .unwrap()
+        };
+        let left = block(0, 16);
+        let right = block(1, 16);
+        let output = block(2, 32);
+        let mut batch = SumBatch::default();
+        // The two groups cover all output columns; each is strided across rows.
+        let first = vec![builder.full_view(left), builder.full_view(right)];
+        let mut second = first.clone();
+        for view in &mut second {
+            view.extents[1].start = 16;
+            view.extents[1].logical_end = 32;
+            view.extents[1].physical_end = 32;
+        }
+        // Sources cover the complete rows; group views select column halves.
+        for id in [left, right] {
+            builder.shards[id.index() as usize].extents[1].logical_end = 32;
+            builder.shards[id.index() as usize].extents[1].physical_end = 32;
+        }
+        let mut region = BlockRegion::default();
+        builder
+            .prepare_sum_partials(
+                [first, second],
+                &[output],
+                ReductionStaging::Complete,
+                WorkProvenance {
+                    operation: None,
+                    value: None,
+                    reason: WorkReason::OperatorKernel,
+                },
+                &mut batch,
+            )
+            .unwrap();
+        builder
+            .append_sum_batch(
+                batch,
+                WorkProvenance {
+                    operation: None,
+                    value: None,
+                    reason: WorkReason::OperatorKernel,
+                },
+                &mut region,
+            )
+            .unwrap();
+        assert!(
+            builder
+                .kernel_runs
+                .iter()
+                .all(|run| run.output.shard != output)
+        );
+        assert!(
+            builder
+                .local_copies
+                .iter()
+                .any(|copy| copy.destination == output)
+        );
     }
 }
