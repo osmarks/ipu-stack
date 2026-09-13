@@ -2,6 +2,9 @@
 
 Artifacts and executable build scripts are under
 `artifacts/full-qk-20260913/`. The production default is unchanged.
+With matched MLP decisions, FP8 QK is
+0.11% slower for BS1 and 0.85% faster for BS2. Real-weight/image checks pass
+for both batch sizes against the original FP32 model.
 
 ## Controlled setup
 
@@ -24,6 +27,12 @@ Controls:
 - BS2: `artifacts/full-qk-20260913/bs2-baseline/`, refreshed with current cast
   motion, 16,746,138 cycles. The older 16,985,046-cycle result is not the
   matched control.
+
+The package-planning portions took 559.925 seconds for BS1 and 2,071.589
+seconds for BS2 with 16 Rayon threads. The eight-step BS2 budget dispatched
+batches of 8, 7, 6 and 3 candidates: the limit counts ordered attempts through
+each accepted winner, not all speculative work already dispatched in parallel.
+These are observed concurrent-run times, not isolated compiler benchmarks.
 
 ## Real inputs and calibration
 
@@ -59,8 +68,8 @@ not one cosine over a concatenated batch. Parameter files are shared by path.
 ## Hardware performance
 
 Controlled FP8-QK cast choices retain all other decisions from the matched
-FP16-QK control. Both outputs and parameters survive a second resident
-inference. All times below include the complete 27-layer model and MAP head.
+FP16-QK control. Each package passes two inferences with parameters remaining
+resident. All times below include the complete 27-layer model and MAP head.
 
 | QK implementation / cast placement | BS1 cycles | BS2 cycles |
 |---|---:|---:|
@@ -69,7 +78,7 @@ inference. All times below include the complete 27-layer model and MAP head.
 | FP8 QK, early Q only | 10,142,796 | 16,722,798 |
 | FP8 QK, early K only | 10,462,992 | 16,766,628 |
 | FP8 QK, early Q and K | 10,254,720 | 16,600,566 |
-| FP8 QK, eight-step search | 10,099,464 | pending |
+| FP8 QK, eight-step search | 10,099,464 | 16,065,444 |
 
 The BS1 search selected early Q but retained late K. It also selected early
 casting at the MLP up-projection (operation 18), so the 0.32% improvement over
@@ -81,8 +90,21 @@ not QK quantization.
 The BS2 search first changed the MLP down-projection (operation 21) from a
 20x6x12 compute grid with a 1x12 result grid to 8x8x23 with a 23x1 result
 grid, opening output boundary 361. A matched FP16-QK replay takes 16,202,412
-cycles: 3.25% faster than the starting control. Subsequent search decisions
-and their final hardware timing are pending.
+cycles: 3.25% faster than the starting control. The search then selected early
+K followed by early Q. The final recipe differs from the MLP control only in
+encoder QK precision and those two cast choices; the attention grids and all
+other plans remain identical. The final hardware run takes 16,065,444 cycles
+(10.710296 ms): 0.85% faster than the matched 16,202,412-cycle FP16-QK
+control, and 4.06% faster than the original 16,746,138-cycle starting plan.
+
+The best BS1 result from this experiment retains FP16 QK and uses the earlier
+MLP cast: 10,088,124 cycles (6.725416 ms), 0.43% faster than the starting plan.
+All four fixed FP8-QK cast placements produce identical randomized-reference
+cosines within each batch size (BS1 0.994179673; BS2 0.993945443), as expected
+when the cast moves without changing its arithmetic. The final searched
+BS1/BS2 recipes reach 0.994366413 and 0.994154827 respectively; their MLP
+changes alter rounding. These randomized checks are separate from the
+pretrained checks.
 
 In the controlled BS1 early-Q profile, the largest QK kernel falls from
 12,402 to 7,674 cycles (38.1% less). Its FP8 inner panel is padded to 96 rather
@@ -138,6 +160,7 @@ FP32 references and raw device outputs are in `fixture-bs2/`.
 - `bs1-search/model.html` and its adjacent data directory: searched FP8-QK BS1 profile.
 - `bs2-both/model.html`: controlled early-Q-and-K BS2 profile.
 - `bs2-mlp-control/model.html`: improved MLP layout with FP16 QK.
+- `bs2-search/model.html`: final searched BS2 FP8-QK profile.
 - `bs1-q/attention.json` and `bs1-baseline-attention.json`: kernel comparison.
 - `results.json`: hardware status, numerical checks, cycles, and saved decisions.
 - Each build directory retains its build script, compiler log, package and
