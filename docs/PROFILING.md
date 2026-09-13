@@ -25,6 +25,42 @@ ipu-stack profile-query profile.capnp --kind exchange --group-by phase
 The profile schema supports operation names, phases, epochs, kernel symbols,
 and metadata for the query layer.
 
+## Viewing large reports
+
+`profile-render` writes a small HTML page and an adjacent `profile.data/`
+directory. Serve both over ordinary HTTP; neither range requests nor a database
+server is required:
+
+```sh
+python3 -m http.server 8000
+# Open http://localhost:8000/profile.html
+```
+
+Sample timing, metadata, flamegraph and kernel-work accounting load first.
+Transfer shapes initially use a 32-bin overview per stream, labelled as an
+overview in the viewer. Those bins retain the dominant transfer mode and texture;
+they are not exact transfer occupancy measurements. Zoom into a time range to
+load the original lossless transfer events, or hover a tile to load its stream.
+The viewer bounds its detailed-event working set and leaves very broad ranges
+in overview mode. The full-range occupancy chart stays an overview when zoomed.
+`profile-query` and `profile-barriers` continue to use the original full report.
+
+Keep the HTML and its `.data` directory together when copying or publishing.
+Opening the chunked report directly with `file://` displays a serving instruction.
+For a portable, potentially very large single-file runtime report, use:
+
+```sh
+ipu-stack profile-render profile.capnp -o portable.html --single-file
+```
+
+Exact memory placement reports similarly load allocation data only for visible
+tiles. They retain the full diagnostic JSON alongside the viewer. Existing dumps
+can be rendered without rebuilding the model:
+
+```sh
+ipu-stack memory-profile-render placement.json -o memory.html
+```
+
 ## Kernel cycle calibration
 
 Generate a source-identified database of per-kernel hardware measurements with:

@@ -182,8 +182,22 @@ canvas {
   </section>
 </main>
 <div id="tooltip"></div>
-<script>
-const DATA = __PROFILE_JSON__;
+<div id="loadStatus" role="status" style="position:fixed;bottom:0;right:0;background:#fff;border:1px solid #000;padding:5px 10px;z-index:5">Loading profile…</div>
+<script type="module">
+const SOURCE = __PROFILE_JSON__;
+const status = document.getElementById("loadStatus");
+const resourceUrl = path => path.split("/").map(encodeURIComponent).join("/");
+async function readJson(path) {
+  const response = await fetch(resourceUrl(path));
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+  return response.json();
+}
+let DATA;
+try { DATA = SOURCE.index ? await readJson(SOURCE.index) : SOURCE; }
+catch (error) {
+  status.textContent = `Cannot load profile: ${error.message}. Serve this folder over HTTP (python3 -m http.server).`;
+  throw error;
+}
 const metadataSets = DATA.metadataSets.map(([start, count]) => {
   const entries = [];
   for (let index = start; index < start + count * 2; index += 2) {
@@ -192,12 +206,74 @@ const metadataSets = DATA.metadataSets.map(([start, count]) => {
   return entries;
 });
 const exchangeActivityKinds = ["send", "receive", "partnerBusy"];
-const activitySets = DATA.activitySets.map(activities => activities.map(([kind, start, end, fanout = 0, paired = 0]) => ({
-  kind: exchangeActivityKinds[kind] || "exchangeIdle",
-  fanout, paired: !!paired,
-  start,
-  end,
-})));
+function decodeActivities(activities) {
+  return activities.map(([kind, start, end, fanout = 0, paired = 0]) => ({
+    kind: exchangeActivityKinds[kind] || "exchangeIdle", fanout, paired: !!paired, start, end,
+  }));
+}
+const activitySets = DATA.activitySets.map(decodeActivities);
+const activitySummaries = DATA.activitySummaries || [];
+const chunks = (DATA.activityChunks || []).map(([begin, end, count, file]) => ({ begin, end, count, file }));
+const activityChunk = [];
+for (const chunk of chunks) for (let i = chunk.begin; i < chunk.end; i++) activityChunk[i] = chunk;
+const chunkCache = new Map();
+let chunkEvents = 0, detailGeneration = 0;
+async function loadChunk(chunk) {
+  if (chunkCache.has(chunk)) {
+    const promise = chunkCache.get(chunk);
+    chunkCache.delete(chunk); chunkCache.set(chunk, promise);
+    return promise;
+  }
+  const promise = readJson(`${DATA.dataDirectory}/${chunk.file}`).then(values => {
+    for (let i = 0; i < values.length; i++) activitySets[chunk.begin + i] = decodeActivities(values[i]);
+    chunkEvents += chunk.count;
+    // Retain a bounded working set, including the most recently requested chunk.
+    for (const [old] of chunkCache) {
+      if (chunkEvents <= 400000) break;
+      if (old === chunk || !old.loaded) continue;
+      for (let i = old.begin; i < old.end; i++) delete activitySets[i];
+      chunkEvents -= old.count; old.loaded = false; chunkCache.delete(old);
+    }
+    chunk.loaded = true;
+  }).catch(error => { chunkCache.delete(chunk); throw error; });
+  chunkCache.set(chunk, promise);
+  return promise;
+}
+function activitiesFor(sample) { return activitySets[sample.activitySet] || []; }
+let detailTimer, hoverDetailTimer;
+function requestVisibleDetails() {
+  clearTimeout(detailTimer);
+  if (!chunks.length) { status.hidden = true; return; }
+  const generation = ++detailGeneration;
+  detailTimer = setTimeout(async () => {
+    const selected = new Set();
+    const start = state.viewStart, end = state.viewEnd || fullEnd();
+    const rect = timeline.getBoundingClientRect();
+    const firstTile = Math.max(0, Math.floor(-rect.top / state.timelineRowHeight));
+    const lastTile = Math.min(tiles.length, Math.ceil((window.innerHeight - rect.top) / state.timelineRowHeight));
+    for (const tile of tiles.slice(firstTile, lastTile)) for (const sample of tile.samples) {
+      if (sample.kind !== "exchange" || sample.offset + sample.duration < start || sample.offset > end) continue;
+      selected.add(activityChunk[sample.activitySet]);
+    }
+    selected.delete(undefined);
+    const count = [...selected].reduce((sum, chunk) => sum + chunk.count, 0);
+    if (count > 250000) {
+      status.textContent = "Transfer overview · zoom in or hover a tile for exact transfers";
+      return;
+    }
+    try {
+      let loaded = 0;
+      for (const chunk of selected) {
+        if (generation !== detailGeneration) return;
+        status.textContent = `Loading transfer detail · ${loaded}/${selected.size}`;
+        await loadChunk(chunk); loaded++;
+        // Yield between bounded chunks, and show useful partial results.
+        if (generation === detailGeneration) { drawTimeline(); await new Promise(requestAnimationFrame); }
+      }
+      if (generation === detailGeneration) status.textContent = "Exact transfers in visible timeline rows";
+    } catch (error) { status.textContent = `Transfer detail unavailable: ${error.message}`; }
+  }, 100);
+}
 const kindNames = ["exchange", "compute", "synchronization", "idle"];
 const steps = DATA.steps.map(([phase, epoch, operation, kernel, metadata, kind, exchangeEventCycles]) => {
   const entries = metadataSets[metadata];
@@ -221,7 +297,7 @@ for (const tile of DATA.tiles) {
     rawDuration: duration,
     offset,
     duration,
-    exchangeActivities: activitySets[activities],
+    activitySet: activities,
   }));
 }
 const state = { query: "", kind: "all", focus: null, time: null, viewStart: 0, viewEnd: null, timelineRowHeight: 1, cropInitialEntry: true, timelineOrigin: 0 };
@@ -353,7 +429,7 @@ function accountingSamples(sample) {
       kind: "synchronization",
       kernel: "exchange boundary wait",
       duration: beforeEnd - sample.offset,
-      exchangeActivities: [],
+      activitySet: undefined,
     });
   }
   const exchangeStart = Math.max(sample.offset, bounds.start);
@@ -369,16 +445,43 @@ function accountingSamples(sample) {
       kernel: "exchange boundary sampling",
       offset: afterStart,
       duration: sampleEnd - afterStart,
-      exchangeActivities: [],
+      activitySet: undefined,
     });
   }
   return result.length ? result : [sample];
 }
-function displaySegments(sample) {
+function displaySegments(sample, overview = false, pixelsPerCycle = Infinity) {
   const sampleEnd = sample.offset + sample.duration;
-  if (sample.kind !== "exchange" || !sample.exchangeActivities?.length) {
-    return [{ kind: sample.kind, start: sample.offset, end: sampleEnd }];
+  if (sample.kind !== "exchange") return [{ kind: sample.kind, start: sample.offset, end: sampleEnd }];
+  if ((overview || !activitySets[sample.activitySet]) && activitySummaries[sample.activitySet]) {
+    const [horizon, codes] = activitySummaries[sample.activitySet];
+    if (codes.length) {
+      const bounds = scheduledExchangeBounds(sample);
+      const origin = bounds?.eventStart ?? sample.offset;
+      const exchangeStart = Math.max(sample.offset, bounds?.start ?? sample.offset);
+      const exchangeEnd = Math.min(sampleEnd, bounds?.end ?? sampleEnd);
+      const names = ["exchangeIdle", "send", "receive", "sendReceive", "partnerBusy"];
+      const segments = [];
+      if (sample.offset < exchangeStart) segments.push({kind: "synchronization", start: sample.offset, end: exchangeStart});
+      if (exchangeStart < origin) segments.push({kind: "exchangeIdle", start: exchangeStart, end: Math.min(origin, exchangeEnd)});
+      const count = Math.max(1, Math.min(codes.length, Math.ceil(horizon * pixelsPerCycle)));
+      for (let i = 0; i < count; i++) {
+        const code = codes.charCodeAt(Math.min(codes.length - 1, Math.floor((i + 0.5) * codes.length / count))) - 64;
+        const start = Math.max(exchangeStart, origin + horizon * i / count);
+        const end = Math.min(exchangeEnd, origin + horizon * (i + 1) / count);
+        if (end > start) {
+          const kind = names[code & 7], multicast = !!(code & 8), paired = !!(code & 16);
+          const previous = segments[segments.length - 1];
+          if (previous?.kind === kind && previous.multicast === multicast && previous.paired === paired && previous.end === start) previous.end = end;
+          else segments.push({kind, multicast, paired, start, end});
+        }
+      }
+      if (origin + horizon < exchangeEnd) segments.push({kind: "exchangeIdle", start: Math.max(exchangeStart, origin + horizon), end: exchangeEnd});
+      if (exchangeEnd < sampleEnd) segments.push({kind: "synchronization", start: exchangeEnd, end: sampleEnd});
+      return segments;
+    }
   }
+  if (!activitiesFor(sample).length) return [{ kind: sample.kind, start: sample.offset, end: sampleEnd }];
   const eventCycles = exchangeEventCycles(sample);
   if (!eventCycles) return [{ kind: "exchange", start: sample.offset, end: sampleEnd }];
   const bounds = scheduledExchangeBounds(sample);
@@ -389,7 +492,7 @@ function displaySegments(sample) {
     segments.push({ kind: "synchronization", start: sample.offset, end: exchangeStart });
   }
   const events = [];
-  for (const activity of sample.exchangeActivities) {
+  for (const activity of activitiesFor(sample)) {
     const start = Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.start));
     const end = Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.end));
     if (end <= start) continue;
@@ -452,7 +555,7 @@ function transferTexture(multicast, paired) {
 }
 function exchangeDetailsAt(sample, time) {
   const origin = scheduledExchangeBounds(sample)?.eventStart ?? sample.offset;
-  return sample.exchangeActivities.filter(activity => time >= origin + activity.start && time < origin + activity.end).map(activity => {
+  return activitiesFor(sample).filter(activity => time >= origin + activity.start && time < origin + activity.end).map(activity => {
     const role = { send: "TX", receive: "RX", partnerBusy: "partner TX lane" }[activity.kind];
     const route = activity.fanout === 0 ? "route/width unknown (older profile)" : `${activity.paired ? "paired " : ""}${activity.fanout > (activity.paired ? 2 : 1) ? `multicast to ${activity.fanout} tiles` : activity.paired ? "unicast to a tile pair" : "unicast"}`;
     return `${role}: ${route}`;
@@ -689,7 +792,7 @@ function drawOverview() {
   };
   for (const tile of tiles) {
     for (const sample of tile.samples) {
-      for (const segment of displaySegments(sample)) {
+      for (const segment of displaySegments(sample, true)) {
         addCoverage(segment.kind, segment.start, segment.end);
       }
     }
@@ -754,8 +857,9 @@ function drawTimeline() {
   tiles.forEach((tile, index) => {
     const y = top + index * rowH;
     for (const sample of tile.samples) {
+      if (sample.offset + sample.duration < viewStart || sample.offset > viewEnd) continue;
       const selected = matches(sample);
-      for (const segment of displaySegments(sample)) {
+      for (const segment of displaySegments(sample, false, plotW / (viewEnd - viewStart))) {
         if (segment.end < viewStart || segment.start > viewEnd) continue;
         const clippedStart = Math.max(segment.start, viewStart);
         const clippedEnd = Math.min(segment.end, viewEnd);
@@ -930,6 +1034,7 @@ function render() {
   drawTimeline();
   drawDetails();
   updateStats();
+  requestVisibleDetails();
 }
 function timelineHit(event) {
   const rect = timeline.getBoundingClientRect();
@@ -945,6 +1050,15 @@ function timelineHit(event) {
   const sample = tile.samples
     .flatMap(accountingSamples)
     .find(candidate => activeAt(candidate, time));
+  if (sample && chunks.length && sample.kind === "exchange" && !activitySets[sample.activitySet]) {
+    const chunk = activityChunk[sample.activitySet];
+    clearTimeout(hoverDetailTimer);
+    if (chunk && !chunkCache.has(chunk)) hoverDetailTimer = setTimeout(() => {
+      loadChunk(chunk).then(() => drawTimeline()).catch(error => {
+        status.textContent = `Transfer detail unavailable: ${error.message}`;
+      });
+    }, 100);
+  }
   if (sample) return { tile: tile.physicalTile, sample, time, kind: displayKindAt(sample, time) };
   return null;
 }
@@ -1189,7 +1303,10 @@ window.addEventListener("keydown", event => {
   }
 });
 window.addEventListener("resize", render);
+window.addEventListener("scroll", requestVisibleDetails, {passive: true});
+timeline.parentElement.addEventListener("scroll", requestVisibleDetails, {passive: true});
 render();
+performance.mark("profile-ready");
 </script>
 </body>
 </html>

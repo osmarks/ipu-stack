@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 hex.workspace = true
+ipu-codegen = { path = "../ipu-codegen" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }

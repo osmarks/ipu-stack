@@ -131,6 +131,11 @@ target/release/ipu-stack profile-render profile.capnp -o profile.html
 target/release/ipu-stack profile-query profile.capnp --group-by kernel
 ```
 
+Runtime and exact placement viewers load data incrementally from an adjacent
+`.data` directory; serve
+the HTML and that directory together with `python3 -m http.server`. Runtime
+`profile-render --single-file` retains the portable embedded format.
+
 The runtime profile viewer shows tile timelines, exchange modes, synchronization,
 and [estimated useful kernel work](docs/PROFILE_USEFUL_WORK.md). The benchmark
 runner also accepts `--memory-profile-directory PATH` for memory reports,

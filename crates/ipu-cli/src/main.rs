@@ -1,10 +1,11 @@
+mod profile_report;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
-use ipu_package::{Application, ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
+use ipu_package::{Application, ProfileReport};
 use ipu_profile::{
-    GroupBy, Query, SortBy, StepKind, calibrate_profiles, cycle_origin, exchange_activity_summary,
+    GroupBy, Query, SortBy, StepKind, calibrate_profiles, exchange_activity_summary,
     exchange_boundaries, phase_work, query,
 };
 use ipu_runtime::Runtime;
@@ -76,6 +77,15 @@ enum Command {
         clock_hz: u64,
     },
     ProfileRender {
+        profile: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Embed all transfer details for a portable (potentially large) HTML file.
+        #[arg(long)]
+        single_file: bool,
+    },
+    /// Render an exact tile placement dump with lazily loaded tile data.
+    MemoryProfileRender {
         profile: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
@@ -319,15 +329,23 @@ fn main() -> Result<()> {
                 output.display(),
             );
         }
-        Command::ProfileRender { profile, output } => {
+        Command::ProfileRender {
+            profile,
+            output,
+            single_file,
+        } => {
             let report = ProfileReport::read(fs::File::open(&profile)?)?;
-            fs::write(&output, render_profile_html(&report)?)?;
+            profile_report::write(&report, &output, single_file)?;
             println!(
                 "profile={} tiles={} output={}",
                 profile.display(),
                 report.tiles.len(),
                 output.display()
             );
+        }
+        Command::MemoryProfileRender { profile, output } => {
+            ipu_codegen::render_memory_profile(fs::File::open(&profile)?, &output)?;
+            println!("profile={} output={}", profile.display(), output.display());
         }
         Command::ProfileCalibrate {
             profiles,
@@ -723,179 +741,6 @@ fn parse_named_path(value: &str) -> Result<(String, PathBuf), String> {
     }
     Ok((name.into(), path.into()))
 }
-
-fn render_profile_html(report: &ProfileReport) -> Result<String> {
-    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-    struct StepKey {
-        phase: u32,
-        epoch: u32,
-        operation: u32,
-        kernel: u32,
-        metadata: u32,
-        kind: u8,
-        exchange_event_cycles: u32,
-    }
-
-    fn intern_string(
-        values: &mut Vec<String>,
-        indices: &mut HashMap<String, u32>,
-        value: &str,
-    ) -> u32 {
-        if let Some(index) = indices.get(value) {
-            return *index;
-        }
-        let index = values.len() as u32;
-        values.push(value.into());
-        indices.insert(value.into(), index);
-        index
-    }
-
-    let mut strings = Vec::new();
-    let mut string_indices = HashMap::new();
-    let mut metadata_sets = Vec::<Vec<[u32; 2]>>::new();
-    let mut metadata_indices = HashMap::<Vec<[u32; 2]>, u32>::new();
-    let mut activity_sets = Vec::<Vec<[u32; 5]>>::new();
-    let mut activity_indices = HashMap::<Vec<[u32; 5]>, u32>::new();
-    let mut steps = Vec::<StepKey>::new();
-    let mut step_indices = HashMap::<StepKey, u32>::new();
-    let base_cycle = cycle_origin(report);
-    let tiles = report
-        .tiles
-        .iter()
-        .map(|tile| {
-            let samples = tile
-                .samples
-                .iter()
-                .map(|sample| {
-                    let metadata = sample
-                        .step
-                        .metadata
-                        .iter()
-                        .map(|entry| {
-                            [
-                                intern_string(&mut strings, &mut string_indices, &entry.name),
-                                intern_string(&mut strings, &mut string_indices, &entry.value),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let metadata = *metadata_indices.entry(metadata.clone()).or_insert_with(|| {
-                        let index = metadata_sets.len() as u32;
-                        metadata_sets.push(metadata);
-                        index
-                    });
-                    let step = StepKey {
-                        phase: sample.step.phase,
-                        epoch: sample.step.epoch,
-                        operation: intern_string(
-                            &mut strings,
-                            &mut string_indices,
-                            &sample.step.operation,
-                        ),
-                        kernel: intern_string(
-                            &mut strings,
-                            &mut string_indices,
-                            &sample.step.kernel,
-                        ),
-                        metadata,
-                        kind: match sample.step.kind {
-                            ProfileStepKind::Exchange => 0,
-                            ProfileStepKind::Compute => 1,
-                            ProfileStepKind::Synchronization => 2,
-                            ProfileStepKind::Idle => 3,
-                        },
-                        exchange_event_cycles: sample.step.exchange_event_cycles,
-                    };
-                    let step = *step_indices.entry(step).or_insert_with(|| {
-                        let index = steps.len() as u32;
-                        steps.push(step);
-                        index
-                    });
-                    let activities = sample
-                        .step
-                        .exchange_activities
-                        .iter()
-                        .map(|activity| {
-                            [
-                                match activity.kind {
-                                    ProfileExchangeActivityKind::Send => 0,
-                                    ProfileExchangeActivityKind::Receive => 1,
-                                    ProfileExchangeActivityKind::PartnerBusy => 2,
-                                },
-                                activity.start_cycle,
-                                activity.end_cycle,
-                                u32::from(activity.fanout),
-                                u32::from(activity.paired),
-                            ]
-                        })
-                        .collect::<Vec<_>>();
-                    let activities =
-                        *activity_indices
-                            .entry(activities.clone())
-                            .or_insert_with(|| {
-                                let index = activity_sets.len() as u32;
-                                activity_sets.push(activities);
-                                index
-                            });
-                    serde_json::json!([
-                        step,
-                        sample.start_cycle.wrapping_sub(base_cycle),
-                        sample.end_cycle.wrapping_sub(sample.start_cycle),
-                        activities,
-                    ])
-                })
-                .collect::<Vec<_>>();
-            serde_json::json!({
-                "physicalTile": tile.physical_tile,
-                "samples": samples,
-            })
-        })
-        .collect::<Vec<_>>();
-    let total_samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
-    let mut metadata = Vec::new();
-    let metadata_sets = metadata_sets
-        .into_iter()
-        .map(|entries| {
-            let start = metadata.len() as u32;
-            let count = entries.len() as u32;
-            for [name, value] in entries {
-                metadata.extend([name, value]);
-            }
-            [start, count]
-        })
-        .collect::<Vec<_>>();
-    let steps = steps
-        .into_iter()
-        .map(|step| {
-            serde_json::json!([
-                step.phase,
-                step.epoch,
-                step.operation,
-                step.kernel,
-                step.metadata,
-                step.kind,
-                step.exchange_event_cycles,
-            ])
-        })
-        .collect::<Vec<_>>();
-    let payload = serde_json::json!({
-        "clockHz": report.clock_hz,
-        "tileCount": report.tiles.len(),
-        "sampleCount": total_samples,
-        "strings": strings,
-        "metadata": metadata,
-        "metadataSets": metadata_sets,
-        "activitySets": activity_sets,
-        "steps": steps,
-        "tiles": tiles,
-    });
-    let payload = serde_json::to_string(&payload)?
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026");
-    Ok(PROFILE_REPORT_HTML.replace("__PROFILE_JSON__", &payload))
-}
-
-const PROFILE_REPORT_HTML: &str = include_str!("profile_report.html");
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
