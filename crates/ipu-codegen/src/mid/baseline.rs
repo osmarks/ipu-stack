@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
     pub open_boundaries: BTreeSet<ValueId>,
+    /// Initial capacity-baseline or legacy checkpoint requests; converted to
+    /// individual cast sites after expansion and never saved in this form.
+    #[serde(default, skip_serializing)]
     pub early_casts: BTreeSet<OperationId>,
+    #[serde(default)]
+    pub cast_before_copies: BTreeSet<super::cast_order::CastSite>,
     pub packing_rows: Option<u16>,
     pub parallel_reductions: usize,
     pub disjoint_copy_sources: bool,
@@ -18,6 +23,7 @@ pub(crate) struct Baseline {
     pub program: MidProgram,
     pub recipe: Recipe,
     pub alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
+    pub cast_sites: BTreeSet<super::cast_order::CastSite>,
 }
 
 pub(crate) fn lower(
@@ -27,8 +33,19 @@ pub(crate) fn lower(
     recipe: &Recipe,
 ) -> LoweringResult<Baseline> {
     let mut selected = select(graph, config, costs, recipe)?;
-    let program =
-        implementation::resolve(selected.program).ok_or(LoweringError::InvalidImplementation)?;
+    let program = implementation::resolve_rewriting(selected.program, |program| {
+        selected.cast_sites = program.reorder_casts(
+            &selected.recipe.cast_before_copies,
+            &selected.recipe.early_casts,
+        );
+    })
+    .ok_or(LoweringError::InvalidImplementation)?;
+    selected.recipe.cast_before_copies.extend(
+        selected.cast_sites.iter().copied().filter(|(source, _)| {
+            source.is_some_and(|id| selected.recipe.early_casts.contains(&id))
+        }),
+    );
+    selected.recipe.early_casts.clear();
     selected.program = if config.diagnostic_checkpoints {
         program
     } else {
@@ -162,6 +179,7 @@ pub(crate) fn select(
         peak_memory: MemoryPeaks::default(),
     };
     Ok(Baseline {
+        cast_sites: BTreeSet::new(),
         program,
         recipe: builder.recipe,
         alternatives: builder.alternatives,
@@ -342,7 +360,6 @@ impl<C: CostModel> Builder<'_, C> {
                                     id,
                                     requirement.format.clone(),
                                     requirement.materialization,
-                                    early_cast,
                                     operation.id,
                                     self.costs,
                                     &mut state,
@@ -393,7 +410,6 @@ impl<C: CostModel> Builder<'_, C> {
                             operation,
                             shape.clone(),
                             plan.clone(),
-                            &vec![early_cast; ids.len()],
                             &single_use_inputs,
                             self.costs,
                             &mut values,
@@ -415,7 +431,6 @@ impl<C: CostModel> Builder<'_, C> {
                                     ),
                                 },
                                 OperandMaterialization::Complete,
-                                false,
                                 operation.id,
                                 self.costs,
                                 &mut state,
@@ -431,18 +446,27 @@ impl<C: CostModel> Builder<'_, C> {
                                 .filter(|(_, origin)| uses.get(origin) != Some(&1))
                                 .map(|(&id, _)| id),
                         );
-                        let memory = crate::estimate::region_peak_memory_with_multiplicity(
-                            self.config,
+                        let fragment = crate::estimate::region_program(
+                            self.config.tile_count,
                             &initial,
                             &sequence,
                             &live,
                             &state.values,
-                            &BTreeMap::new(),
                         );
-                        if memory.total == u64::MAX {
-                            return None;
-                        }
-                        let cycles = sequence.iter().map(|op| op.estimated_cycles).sum::<u64>();
+                        let fragment = implementation::resolve_rewriting(fragment, |fragment| {
+                            if early_cast {
+                                fragment.reorder_casts(
+                                    &BTreeSet::new(),
+                                    &BTreeSet::from([operation.id]),
+                                );
+                            }
+                        })?;
+                        let (cycles, memory) = crate::estimate::analyze_with_budget(
+                            &fragment,
+                            &BTreeMap::new(),
+                            self.config,
+                        )?;
+                        let cycles = cycles.total;
 
                         Some((rank(cycles, memory), (plan, early_cast)))
                     })
@@ -481,7 +505,6 @@ impl<C: CostModel> Builder<'_, C> {
                 operation,
                 shape.clone(),
                 selected,
-                &vec![self.recipe.early_casts.contains(&operation.id); ids.len()],
                 &single_use_inputs,
                 self.costs,
                 &mut self.values,
@@ -513,7 +536,6 @@ impl<C: CostModel> Builder<'_, C> {
                     id,
                     target,
                     OperandMaterialization::Complete,
-                    false,
                     operation.id,
                     self.costs,
                     &mut self.state,
@@ -613,7 +635,6 @@ impl<C: CostModel> Builder<'_, C> {
                 *input,
                 target,
                 OperandMaterialization::Complete,
-                false,
                 operation.id,
                 self.costs,
                 &mut self.state,
@@ -635,7 +656,6 @@ impl<C: CostModel> Builder<'_, C> {
                         id,
                         target.clone(),
                         OperandMaterialization::Complete,
-                        false,
                         operation.id,
                         self.costs,
                         &mut self.state,
@@ -652,7 +672,6 @@ impl<C: CostModel> Builder<'_, C> {
                 value,
                 self.state.get(inputs[index]).tensor_type.format.clone(),
                 OperandMaterialization::Complete,
-                false,
                 operation.id,
                 self.costs,
                 &mut self.state,

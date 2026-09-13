@@ -216,9 +216,10 @@ fn fp8_mlp_can_quantize_before_replication() {
     recipe
         .early_casts
         .extend(graph.operations().iter().map(|op| op.id));
-    let mid = baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe)
-        .unwrap()
-        .program;
+    let lowered = baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe).unwrap();
+    assert!(lowered.recipe.early_casts.is_empty());
+    assert!(!lowered.recipe.cast_before_copies.is_empty());
+    let mid = lowered.program;
     // Casts may now be fused with the producer. Check the typed data flow,
     // rather than requiring a standalone conversion operation to survive.
     assert!(mid.operations.iter().any(|op| {
@@ -255,20 +256,28 @@ fn fp8_conversion_precedes_operand_replication() {
         input,
         target.clone(),
         OperandMaterialization::Complete,
-        true,
         graph.operations()[0].id,
         &crate::Ipu21CostModel,
         &mut state,
         &mut operations,
     );
-    assert_eq!(operations.len(), 2);
-    let cast = operations[0].conversion_plan().unwrap();
-    assert_eq!(cast.input.format.layout, input_layout);
-    assert_eq!(cast.output.format.layout, input_layout);
-    assert_eq!(cast.output.format.precision, target.precision);
-    let exchange = operations[1].conversion_plan().unwrap();
-    assert_eq!(exchange.input.format.precision, target.precision);
-    assert_eq!(exchange.output.format, target);
+    let mut mid = MidProgram {
+        values: state.values,
+        operations,
+        ..MidProgram::default()
+    };
+    let sites = mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+    assert_eq!(sites.len(), 1);
+    mid.reorder_casts(&sites, &BTreeSet::new());
+    assert_eq!(mid.operations.len(), 2);
+    let cast = &mid.operations[0];
+    assert!(rewrite::fp8_cast(cast, &mid.values).is_some());
+    let packed = &value(&mid, cast.results[0]).tensor_type.format;
+    assert_eq!(packed.layout, input_layout);
+    assert_eq!(packed.precision, target.precision);
+    let exchange = &mid.operations[1];
+    assert_eq!(exchange.inputs, cast.results);
+    assert_eq!(value(&mid, exchange.results[0]).tensor_type.format, target);
 }
 
 #[test]
@@ -2087,7 +2096,6 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
                 input,
                 target.clone(),
                 OperandMaterialization::Complete,
-                true,
                 graph.operations()[0].id,
                 &crate::Ipu21CostModel,
                 &mut state,
@@ -2095,20 +2103,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
             ));
         }
         assert_ne!(results[0], results[1]);
-        assert_eq!(
-            operations.len(),
-            3,
-            "one shared cast and two consumer exchanges: {operations:#?}"
-        );
-        assert_eq!(operations[1].inputs, operations[2].inputs);
-        let cast = operations[0].conversion_plan().unwrap();
-        assert_eq!(cast.input.format.layout.order, ElementOrder::RowMajor);
-        assert_eq!(
-            cast.output.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Left)
-        );
-        assert_eq!(cast.output.format.layout.tiling.tile_count, 1);
-        let mid = MidProgram {
+        let mut mid = MidProgram {
             tile_count: 64,
             values: state.values,
             operations,
@@ -2117,9 +2112,26 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
                 kind: GraphInputKind::Host,
                 value: input,
             }],
-            outputs: vec![results[0]],
+            outputs: results.clone(),
             ..MidProgram::default()
         };
+        let sites = mid.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(sites.len(), 2);
+        mid.reorder_casts(&sites, &BTreeSet::new());
+        assert_eq!(
+            mid.operations.len(),
+            3,
+            "one shared cast and two exchanges: {:#?}",
+            mid.operations
+        );
+        assert_eq!(mid.operations[1].inputs, mid.operations[2].inputs);
+        let cast = &mid.operations[0];
+        let packed = &value(&mid, cast.results[0]).tensor_type;
+        assert_eq!(
+            packed.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Left)
+        );
+        assert_eq!(packed.format.layout.tiling.tile_count, 1);
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
         let build = crate::KernelBuildPlan::from_program(&low).unwrap();
         let calls: Vec<_> = low
@@ -2455,4 +2467,72 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
     let mut found = BTreeSet::new();
     collect(&resolved.operations, &resolved.values, &mut found);
     assert_eq!(found, BTreeSet::from([Precision::F16, fp8]));
+}
+
+#[test]
+fn internal_qk_cast_order_is_searchable_and_replayable() {
+    let mut graph = ComputeGraph::new();
+    let q = graph.host_input("q", [4, 17, 72]).unwrap();
+    let k = graph.host_input("k", [4, 73, 72]).unwrap();
+    let v = graph.host_input("v", [4, 73, 72]).unwrap();
+    let result = graph.flash_attention(q, k, v).unwrap();
+    graph.set_outputs([result]).unwrap();
+    let mut config = PipelineConfig::new(64)
+        .with_attention_products(AttentionProducts::Independent)
+        .with_automatic_input(q, Precision::F16)
+        .with_automatic_input(k, Precision::F16)
+        .with_automatic_input(v, Precision::F16);
+    config.attention_fp8_scales = [Some(-4), None];
+    for packed_key in [false, true] {
+        let mut config = config.clone();
+        if packed_key {
+            let mut layout = Layout::attention_key(4, 2);
+            for axis in &mut layout.tiling.axes {
+                if axis.axis.resolve(3).unwrap() == 2 {
+                    axis.shard_padding_multiple = 32;
+                    axis.padding = Padding::Zero;
+                }
+            }
+            config.inputs.insert(
+                k,
+                TensorFormat {
+                    precision: Precision::F16,
+                    layout,
+                },
+            );
+        }
+        let late = baseline::lower(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &baseline::Recipe::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            late.cast_sites.len(),
+            2,
+            "both internal QK casts must be exposed"
+        );
+        if packed_key {
+            assert_eq!(
+                late.cast_sites.len(),
+                2,
+                "native K panels expose the K cast too"
+            );
+        }
+        for site in &late.cast_sites {
+            let mut recipe = late.recipe.clone();
+            recipe.cast_before_copies.insert(*site);
+            let serialized = serde_json::to_vec(&recipe).unwrap();
+            let recipe: baseline::Recipe = serde_json::from_slice(&serialized).unwrap();
+            let early = baseline::lower(&graph, &config, &Ipu21CostModel, &recipe).unwrap();
+            assert_ne!(early.program.operations, late.program.operations);
+            assert_eq!(early.recipe.cast_before_copies, recipe.cast_before_copies);
+            let tiles = crate::expand_tiles(&early.program).unwrap();
+            let low = crate::lower_to_tiles(&tiles, false);
+            crate::KernelBuildPlan::from_program(&low).unwrap();
+            let replay = baseline::lower(&graph, &config, &Ipu21CostModel, &early.recipe).unwrap();
+            assert_eq!(replay.program, early.program);
+        }
+    }
 }

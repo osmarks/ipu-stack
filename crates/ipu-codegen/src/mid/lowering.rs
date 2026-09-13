@@ -178,7 +178,6 @@ pub(super) fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,
     mut plan: OperatorPlan,
-    cast_orders: &[bool],
     single_use_inputs: &[bool],
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
@@ -193,17 +192,12 @@ pub(super) fn apply_selected_plan(
     let original_input_ids = input_ids.clone();
     let mut source_types = Vec::with_capacity(input_ids.len());
     let mut converted = Vec::with_capacity(input_ids.len());
-    for ((value, requirement), &cast_before) in input_ids
-        .into_iter()
-        .zip(&plan.requirements.inputs)
-        .zip(cast_orders)
-    {
+    for (value, requirement) in input_ids.into_iter().zip(&plan.requirements.inputs) {
         let conversion_start = operations.len();
         let converted_value = ensure_format(
             value,
             requirement.format.clone(),
             requirement.materialization,
-            cast_before,
             operation.id,
             costs,
             state,
@@ -394,27 +388,10 @@ fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValue
     .then(|| operation.results[0])
 }
 
-// Eligibility only: baseline selection also costs the surrounding conversions.
-fn early_cast_format(input: &TensorType, target: &TensorFormat) -> Option<TensorFormat> {
-    if input.format.precision != Precision::F16
-        || !matches!(target.precision, Precision::F8F143 { .. })
-    {
-        return None;
-    }
-    let quantized = TensorFormat {
-        precision: target.precision,
-        layout: input.fp8_producer_layout(target)?,
-    };
-    (quantized.layout.order == target.layout.order
-        || quantized.supports_micro_panel_exchange(target))
-    .then_some(quantized)
-}
-
 pub(super) fn ensure_format(
     mut value: MidValueId,
     target: TensorFormat,
     materialization: OperandMaterialization,
-    cast_before: bool,
     source: OperationId,
     costs: &impl CostModel,
     state: &mut LoweringState,
@@ -441,7 +418,7 @@ pub(super) fn ensure_format(
     // For late FP8 conversion, compare packing F16 before the cast with
     // receiving row-major F16 and constructing the FP8 panels directly.
     // Ownership stays fixed; this chooses a local conversion implementation.
-    if packed_cast && !cast_before && target.layout.order == ElementOrder::Amp(AmpOrder::Left) {
+    if packed_cast && target.layout.order == ElementOrder::Amp(AmpOrder::Left) {
         let input = &state.get(value).tensor_type;
         let mut row_layout = initial_layout.clone();
         row_layout.order = ElementOrder::RowMajor;
@@ -482,28 +459,21 @@ pub(super) fn ensure_format(
     } else {
         state.get(value).tensor_type.format.layout.clone()
     };
-    let early_cast = cast_before
-        .then(|| early_cast_format(&state.get(value).tensor_type, &target))
-        .flatten();
-    let formats = if let Some(quantized) = early_cast {
-        vec![quantized, target]
-    } else {
-        vec![
-            TensorFormat {
-                precision: from,
-                layout: cast_layout.clone(),
+    let formats = [
+        TensorFormat {
+            precision: from,
+            layout: cast_layout.clone(),
+        },
+        TensorFormat {
+            precision: target.precision,
+            layout: if packed_cast {
+                target.layout.clone()
+            } else {
+                cast_layout
             },
-            TensorFormat {
-                precision: target.precision,
-                layout: if packed_cast && !cast_before {
-                    target.layout.clone()
-                } else {
-                    cast_layout
-                },
-            },
-            target,
-        ]
-    };
+        },
+        target,
+    ];
     for format in formats {
         let input = state.get(value).tensor_type.clone();
         if input.format == format {

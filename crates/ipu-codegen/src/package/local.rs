@@ -103,6 +103,7 @@ pub(super) fn optimize<T: Send>(
                             visited,
                             changed_operations = ?candidate.recipe.plans.iter().filter_map(|(id, plan)|
                                 (incumbent.recipe.plans.get(id) != Some(plan)).then_some(id.index())).collect::<Vec<_>>(),
+                            changed_casts = ?candidate.recipe.cast_before_copies.symmetric_difference(&incumbent.recipe.cast_before_copies).collect::<Vec<_>>(),
                             opened_boundaries = ?candidate.recipe.open_boundaries.difference(&incumbent.recipe.open_boundaries)
                                 .map(|id| id.index()).collect::<Vec<_>>(),
                             "screened local recipe"
@@ -192,6 +193,7 @@ pub(super) fn optimize<T: Send>(
             after = candidate_cycles,
             changed_operations = ?candidate.recipe.plans.iter().filter_map(|(id, plan)|
                 (incumbent.recipe.plans.get(id) != Some(plan)).then_some(id.index())).collect::<Vec<_>>(),
+            changed_casts = ?candidate.recipe.cast_before_copies.symmetric_difference(&incumbent.recipe.cast_before_copies).collect::<Vec<_>>(),
             opened_boundaries = ?candidate.recipe.open_boundaries.difference(&incumbent.recipe.open_boundaries)
                 .map(|id| id.index()).collect::<Vec<_>>(),
             "accepted local layout improvement"
@@ -292,6 +294,14 @@ fn proposals(graph: &ComputeGraph, config: &PipelineConfig, incumbent: &Baseline
         candidates.push(recipe);
     }
 
+    for &site in &incumbent.cast_sites {
+        let mut recipe = incumbent.recipe.clone();
+        if !recipe.cast_before_copies.insert(site) {
+            recipe.cast_before_copies.remove(&site);
+        }
+        candidates.push(recipe);
+    }
+
     for operation in &operations {
         if let Some(alternatives) = incumbent.alternatives.get(&operation.id) {
             for plan in alternatives
@@ -304,11 +314,6 @@ fn proposals(graph: &ComputeGraph, config: &PipelineConfig, incumbent: &Baseline
                 candidates.push(recipe);
             }
         }
-        let mut recipe = incumbent.recipe.clone();
-        if !recipe.early_casts.insert(operation.id) {
-            recipe.early_casts.remove(&operation.id);
-        }
-        candidates.push(recipe);
         for &output in &operation.results {
             if graph.outputs().contains(&output)
                 || incumbent.recipe.open_boundaries.contains(&output)

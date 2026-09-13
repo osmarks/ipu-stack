@@ -68,6 +68,19 @@ fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool)> {
     }
 }
 
+pub(super) fn compose_region(
+    operations: &mut Vec<MidOperation>,
+    values: &[MidValue],
+    required: &[MidValueId],
+) {
+    for op in &mut *operations {
+        if let MidOperationKind::Repeat(repeat) = &mut op.kind {
+            compose_region(&mut repeat.body.operations, values, &repeat.body.yields);
+        }
+    }
+    compose(operations, values, required);
+}
+
 pub(super) fn compose(
     operations: &mut Vec<MidOperation>,
     values: &[MidValue],

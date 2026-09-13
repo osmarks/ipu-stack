@@ -319,8 +319,18 @@ fn project_tiling(
 
 /// Inline compact operator implementations into the same whole-device IR.
 /// This is algorithm decomposition, not tile expansion or another search.
-pub(crate) fn resolve(mut program: MidProgram) -> Option<MidProgram> {
+pub(crate) fn resolve(program: MidProgram) -> Option<MidProgram> {
+    resolve_rewriting(program, |_| {})
+}
+
+/// Expose all materialization boundaries to rewrites before composing copies.
+pub(crate) fn resolve_rewriting(
+    mut program: MidProgram,
+    rewrite: impl FnOnce(&mut MidProgram),
+) -> Option<MidProgram> {
     program.operations = resolve_region(program.operations, &mut program.values, &program.outputs)?;
+    rewrite(&mut program);
+    super::copy::compose_region(&mut program.operations, &program.values, &program.outputs);
     Some(program)
 }
 
@@ -457,7 +467,6 @@ fn resolve_region(
             MidOperationKind::Primitive(_) => result.push(operation),
         }
     }
-    super::copy::compose(&mut result, values, required);
     Some(result)
 }
 

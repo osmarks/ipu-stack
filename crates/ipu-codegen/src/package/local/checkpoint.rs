@@ -40,13 +40,24 @@ impl State {
                 ..Self::default()
             });
         };
-        let state: Self = serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
+        let mut state: Self = serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
         if state.version != 1 || state.context != context {
             return Err(invalid(
                 "search state does not match this graph/configuration or schema",
             ));
+        }
+        if !state.recipe.early_casts.is_empty()
+            || state
+                .visited
+                .iter()
+                .any(|recipe| !recipe.early_casts.is_empty())
+        {
+            // Old visits describe outer-input cast ordering, not choices on
+            // the expanded graph. Preserve the incumbent and search budget.
+            state.visited.clear();
+            tracing::info!("migrating legacy cast choices; cleared obsolete search visits");
         }
         tracing::info!(path = %path.display(), attempts = state.attempts, "loaded mid-plan search state");
         Ok(state)

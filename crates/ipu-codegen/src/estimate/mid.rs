@@ -51,7 +51,7 @@ pub(super) fn analyze_observed(
 
 /// A fitting upper bound needs no refinement. Every failed capacity screen is
 /// checked on actual owners before it can discard a candidate.
-fn analyze_with_budget(
+pub(crate) fn analyze_with_budget(
     program: &MidProgram,
     copies: &BTreeMap<MidValueId, u32>,
     config: &crate::PipelineConfig,
@@ -166,7 +166,7 @@ fn analyze_storage<const PER_TILE: bool>(
         let id = roots[value.id.index() as usize];
         let class = value.tensor_type.format.layout.memory_class;
         let layout = &value.tensor_type.format.layout;
-        let resolved = layout.resolve(&value.tensor_type.shape).ok()?;
+        let resolved = layout.resolve(&value.tensor_type.shape).map_err(|error| { tracing::debug!(value = ?value.id, tensor = ?value.tensor_type, %error, "invalid mid storage geometry"); }).ok()?;
         if layout.tiling.tile_count > program.tile_count || program.tile_count == 0 {
             return None;
         }
@@ -655,6 +655,18 @@ pub(super) fn resolved_region(
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> Option<MidProgram> {
+    crate::mid::implementation::resolve(region_program(
+        tile_count, initial, operations, outputs, values,
+    ))
+}
+
+pub(crate) fn region_program(
+    tile_count: u16,
+    initial: &[MidValueId],
+    operations: &[MidOperation],
+    outputs: &[MidValueId],
+    values: &[MidValue],
+) -> MidProgram {
     let mut outputs = outputs.to_vec();
     // A pending view still needs its source storage at the region boundary.
     for operation in operations.iter().rev() {
@@ -669,7 +681,7 @@ pub(super) fn resolved_region(
             outputs.push(operation.inputs[offer.source_input]);
         }
     }
-    let candidate = crate::MidProgram {
+    crate::MidProgram {
         tile_count,
         inputs: initial
             .iter()
@@ -683,7 +695,5 @@ pub(super) fn resolved_region(
         operations: operations.to_vec(),
         outputs,
         ..crate::MidProgram::default()
-    };
-
-    crate::mid::implementation::resolve(candidate)
+    }
 }

@@ -925,6 +925,7 @@ impl TensorType {
                     .find(|axis| axis.axis.resolve(rank) == Ok(rank - 1))
                 {
                     axis.shard_padding_multiple = axis.shard_padding_multiple.max(32);
+                    axis.padding = Padding::Zero;
                 } else {
                     layout.tiling.axes.push(
                         AxisTiling::new(TensorAxis::FromEnd(1), 1, 1, Padding::Zero)
@@ -938,6 +939,7 @@ impl TensorType {
             precision: target.precision,
             layout: layout.clone(),
         };
+        layout.resolve(&self.shape).ok()?;
         (layout.order == target.layout.order || quantized.supports_micro_panel_exchange(target))
             .then_some(layout)
     }
