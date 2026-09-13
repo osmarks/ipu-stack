@@ -1,6 +1,6 @@
 # Full-model FP8 QK evaluation
 
-Work in progress. Artifacts and executable build scripts are under
+Artifacts and executable build scripts are under
 `artifacts/full-qk-20260913/`. The production default is unchanged.
 
 ## Controlled setup
@@ -56,5 +56,51 @@ independent FP32 reference embeddings, and replicates the learned MAP probe.
 The runtime verifier checks the minimum cosine across individual embeddings,
 not one cosine over a concatenated batch. Parameter files are shared by path.
 
-Remaining at this checkpoint: finish both searches and controlled cast-order
-runs, collect/render their profiles, and complete calibrated BS2 validation.
+## Hardware performance
+
+Controlled FP8-QK cast choices retain all other decisions from the matched
+FP16-QK control. Both outputs and parameters survive a second resident
+inference. All times below include the complete 27-layer model and MAP head.
+
+| QK implementation / cast placement | BS1 cycles | BS2 cycles |
+|---|---:|---:|
+| FP16 QK control | 10,131,456 | 16,746,138 |
+| FP8 QK, early Q only | 10,142,796 | pending |
+| FP8 QK, early K only | 10,462,992 | pending |
+| FP8 QK, early Q and K | 10,254,720 | 16,600,566 |
+| FP8 QK, eight-step search | 10,099,464 | pending |
+
+The BS1 search selected early Q but retained late K. It also selected early
+casting at the MLP up-projection (operation 18), so the 0.32% improvement over
+the initial control is not attributable solely to QK. A separate FP16-QK
+replay with that MLP decision takes 10,088,124 cycles. FP8 QK is therefore
+0.11% slower with either MLP cast choice; the search gain came from the MLP,
+not QK quantization.
+
+In the controlled BS1 early-Q profile, the largest QK kernel falls from
+12,402 to 7,674 cycles (38.1% less). Its FP8 inner panel is padded to 96 rather
+than FP16's 80. Despite that padding, arithmetic is much faster. Casting and
+preparation offset the saving: the complete model is 0.11% slower. Kernel
+phase totals overlap and must not be summed to infer wall time.
+
+The default precision policy is unchanged. These results do not justify
+unconditionally enabling FP8 QK from its standalone kernel speed.
+
+## BS2 real-weight limitation
+
+The calibrated BS2 control, with QK still FP16, does not fit. At a 96 KiB
+exchange budget it needs 103,396 bytes on the worst tile; with 112 KiB allowed,
+placement fails for a 2,048-byte standard allocation on tile 740. This is a
+failure to place the real-weight baseline, not a failed cosine check. No BS2
+real-weight accuracy result is claimed. Both logs are retained in
+`real-bs2-baseline/` (`budget96.log` and `build.log`).
+
+## Artifacts
+
+- `bs1-search/model.html` and its adjacent data directory: searched BS1 profile.
+- `bs2-both/model.html`: controlled early-Q-and-K BS2 profile.
+- `bs1-q/attention.json` and `bs1-baseline-attention.json`: kernel comparison.
+- `results.json`: hardware status, numerical checks, cycles, and saved decisions.
+- Each build directory retains its build script, compiler log, package and
+  search state; performance builds also retain profile input and extraction.
+
