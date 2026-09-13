@@ -225,7 +225,11 @@ async function loadChunk(chunk) {
     return promise;
   }
   const promise = readJson(`${DATA.dataDirectory}/${chunk.file}`).then(values => {
-    for (let i = 0; i < values.length; i++) activitySets[chunk.begin + i] = decodeActivities(values[i]);
+    for (let i = 0; i < values.length; i++) {
+      const activities = decodeActivities(values[i]);
+      activitySets[chunk.begin + i] = activities;
+      segmentsFor(activities);
+    }
     chunkEvents += chunk.count;
     // Retain a bounded working set, including the most recently requested chunk.
     for (const [old] of chunkCache) {
@@ -242,6 +246,7 @@ async function loadChunk(chunk) {
 function activitiesFor(sample) { return activitySets[sample.activitySet] || []; }
 let detailTimer, hoverDetailTimer;
 function requestVisibleDetails() {
+  cancelHoverDetail();
   clearTimeout(detailTimer);
   if (!chunks.length) { status.hidden = true; return; }
   const generation = ++detailGeneration;
@@ -258,7 +263,7 @@ function requestVisibleDetails() {
     selected.delete(undefined);
     const count = [...selected].reduce((sum, chunk) => sum + chunk.count, 0);
     if (count > 250000) {
-      status.textContent = "Transfer overview · zoom in or hover a tile for exact transfers";
+      status.textContent = "Transfer overview · zoom for exact timeline, hover for transfer details";
       return;
     }
     try {
@@ -450,6 +455,52 @@ function accountingSamples(sample) {
   }
   return result.length ? result : [sample];
 }
+// Weak keys tie processed intervals to the bounded decoded-stream cache.
+// Hit tests and repainting share these intervals instead of sorting per sample.
+const streamSegments = new WeakMap();
+function segmentsFor(activities) {
+  let segments = streamSegments.get(activities);
+  if (segments) return segments;
+  const events = [];
+  for (const activity of activities) {
+    const send = activity.kind === "send" ? 1 : 0;
+    const receive = activity.kind === "receive" ? 1 : 0;
+    const partnerBusy = activity.kind === "partnerBusy" ? 1 : 0;
+    const multicast = activity.fanout > (activity.paired ? 2 : 1) ? 1 : 0, paired = activity.paired ? 1 : 0;
+    events.push({time: activity.start, send, receive, partnerBusy, multicast, paired});
+    events.push({time: activity.end, send: -send, receive: -receive, partnerBusy: -partnerBusy, multicast: -multicast, paired: -paired});
+  }
+  events.sort((a, b) => a.time - b.time);
+  segments = [];
+  let cursor = 0, send = 0, receive = 0, partnerBusy = 0, multicast = 0, paired = 0, event = 0;
+  const append = end => {
+    const kind = send ? (receive ? "sendReceive" : "send") : receive ? "receive" : partnerBusy ? "partnerBusy" : "exchangeIdle";
+    segments.push({kind, multicast: multicast > 0, paired: paired > 0, start: cursor, end});
+  };
+  while (event < events.length) {
+    const time = events[event].time;
+    if (time > cursor) append(time);
+    while (event < events.length && events[event].time === time) {
+      send += events[event].send; receive += events[event].receive;
+      partnerBusy += events[event].partnerBusy;
+      multicast += events[event].multicast; paired += events[event].paired;
+      event++;
+    }
+    cursor = time;
+  }
+  append(Infinity);
+  streamSegments.set(activities, segments);
+  return segments;
+}
+function intervalAt(items, time, startKey = "start") {
+  let lo = 0, hi = items.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (items[mid][startKey] <= time) lo = mid + 1;
+    else hi = mid;
+  }
+  return items[lo - 1];
+}
 function displaySegments(sample, overview = false, pixelsPerCycle = Infinity) {
   const sampleEnd = sample.offset + sample.duration;
   if (sample.kind !== "exchange") return [{ kind: sample.kind, start: sample.offset, end: sampleEnd }];
@@ -491,41 +542,13 @@ function displaySegments(sample, overview = false, pixelsPerCycle = Infinity) {
   if (sample.offset < exchangeStart) {
     segments.push({ kind: "synchronization", start: sample.offset, end: exchangeStart });
   }
-  const events = [];
-  for (const activity of activitiesFor(sample)) {
-    const start = Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.start));
-    const end = Math.max(exchangeStart, Math.min(exchangeEnd, (bounds?.eventStart ?? sample.offset) + activity.end));
-    if (end <= start) continue;
-    const send = activity.kind === "send" ? 1 : 0;
-    const receive = activity.kind === "receive" ? 1 : 0;
-    const partnerBusy = activity.kind === "partnerBusy" ? 1 : 0;
-    const multicast = activity.fanout > (activity.paired ? 2 : 1) ? 1 : 0, paired = activity.paired ? 1 : 0;
-    events.push({ time: start, send, receive, partnerBusy, multicast, paired });
-    events.push({ time: end, send: -send, receive: -receive, partnerBusy: -partnerBusy, multicast: -multicast, paired: -paired });
+  const origin = bounds?.eventStart ?? sample.offset;
+  if (exchangeStart < origin) segments.push({kind: "exchangeIdle", start: exchangeStart, end: Math.min(origin, exchangeEnd)});
+  for (const segment of segmentsFor(activitiesFor(sample))) {
+    const start = Math.max(exchangeStart, origin + segment.start);
+    const end = Math.min(exchangeEnd, origin + segment.end);
+    if (end > start) segments.push({...segment, start, end});
   }
-  events.sort((a, b) => a.time - b.time);
-  const activityKind = (send, receive, partnerBusy) => {
-    if (send && receive) return "sendReceive";
-    if (send) return "send";
-    if (receive) return "receive";
-    if (partnerBusy) return "partnerBusy";
-    return "exchangeIdle";
-  };
-  let cursor = exchangeStart, send = 0, receive = 0, partnerBusy = 0, multicast = 0, paired = 0, event = 0;
-  while (event < events.length) {
-    const time = events[event].time;
-    if (time > cursor) segments.push({ kind: activityKind(send, receive, partnerBusy), multicast: multicast > 0, paired: paired > 0, start: cursor, end: time });
-    while (event < events.length && events[event].time === time) {
-      send += events[event].send;
-      receive += events[event].receive;
-      partnerBusy += events[event].partnerBusy;
-      multicast += events[event].multicast;
-      paired += events[event].paired;
-      event++;
-    }
-    cursor = time;
-  }
-  if (cursor < exchangeEnd) segments.push({ kind: activityKind(send, receive, partnerBusy), multicast: multicast > 0, paired: paired > 0, start: cursor, end: exchangeEnd });
   if (exchangeEnd < sampleEnd) {
     segments.push({ kind: "synchronization", start: exchangeEnd, end: sampleEnd });
   }
@@ -562,8 +585,22 @@ function exchangeDetailsAt(sample, time) {
   });
 }
 function displayKindAt(sample, time) {
-  const segment = displaySegments(sample).find(segment => time >= segment.start && time < segment.end);
-  return segment?.kind || sample.kind;
+  if (sample.kind !== "exchange") return sample.kind;
+  const bounds = scheduledExchangeBounds(sample);
+  if (bounds && (time < bounds.start || time >= bounds.end)) return "synchronization";
+  const relative = time - (bounds?.eventStart ?? sample.offset);
+  const activities = activitySets[sample.activitySet];
+  if (activities?.length && exchangeEventCycles(sample)) {
+    return intervalAt(segmentsFor(activities), relative)?.kind || "exchangeIdle";
+  }
+  const summary = activitySummaries[sample.activitySet];
+  if (summary?.[1].length) {
+    const [horizon, codes] = summary;
+    if (relative < 0 || relative >= horizon) return "exchangeIdle";
+    const code = codes.charCodeAt(Math.floor(relative * codes.length / horizon)) - 64;
+    return ["exchangeIdle", "send", "receive", "sendReceive", "partnerBusy"][code & 7];
+  }
+  return "exchange";
 }
 function fullEnd() {
   return tiles.reduce((maxEnd, tile) => Math.max(maxEnd, ...tile.samples.map(sample => sample.offset + sample.duration)), 1);
@@ -1018,6 +1055,7 @@ function drawDetails() {
   details.innerHTML = items.map(([key, value]) => `<div class="detail"><b>${escapeHtml(key)}</b>${renderValue(value)}</div>`).join("");
 }
 function render() {
+  cancelHoverDetail();
   state.query = document.getElementById("search").value.trim().toLowerCase();
   state.kind = document.getElementById("kind").value;
   state.timelineRowHeight = Number(document.getElementById("timelineRowHeight").value);
@@ -1047,19 +1085,10 @@ function timelineHit(event) {
   if (!tile) return null;
   const time = timelineGeom.viewStart
     + (x - timelineGeom.left) * (timelineGeom.viewEnd - timelineGeom.viewStart) / timelineGeom.plotW;
-  const sample = tile.samples
-    .flatMap(accountingSamples)
-    .find(candidate => activeAt(candidate, time));
-  if (sample && chunks.length && sample.kind === "exchange" && !activitySets[sample.activitySet]) {
-    const chunk = activityChunk[sample.activitySet];
-    clearTimeout(hoverDetailTimer);
-    if (chunk && !chunkCache.has(chunk)) hoverDetailTimer = setTimeout(() => {
-      loadChunk(chunk).then(() => drawTimeline()).catch(error => {
-        status.textContent = `Transfer detail unavailable: ${error.message}`;
-      });
-    }, 100);
-  }
-  if (sample) return { tile: tile.physicalTile, sample, time, kind: displayKindAt(sample, time) };
+  const raw = intervalAt(tile.samples, time, "offset");
+  const sample = raw && activeAt(raw, time)
+    ? accountingSamples(raw).find(candidate => activeAt(candidate, time)) : null;
+  if (sample) return { tile: tile.physicalTile, sample, time };
   return null;
 }
 function flameHit(event) {
@@ -1182,24 +1211,43 @@ document.addEventListener("click", event => {
     focusFlame(link.closest("#kernelWork") && sameFocus(state.focus, focus) ? null : focus);
   }
 });
-timeline.addEventListener("mousemove", event => {
-  if (drag?.suppressClick) {
-    hideTip();
-    return;
-  }
-  const hit = timelineHit(event);
-  if (!hit) { hideTip(); return; }
+let hoverGeneration = 0, hoverLoad = Promise.resolve();
+function showTimelineTip(event, hit) {
   showTip(event, [
     `tile ${hit.tile}`,
     sampleTitle(hit.sample),
-    `${hit.kind} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
+    `${displayKindAt(hit.sample, hit.time)} phase ${hit.sample.phase} epoch ${hit.sample.epoch}`,
     ...exchangeDetailsAt(hit.sample, hit.time),
     ...workTooltip(hit.sample),
     `range ${formatRange(hit.sample)}`,
     formatMetadata(hit.sample),
   ]);
+}
+function cancelHoverDetail() {
+  hoverGeneration++;
+  clearTimeout(hoverDetailTimer);
+}
+timeline.addEventListener("mousemove", event => {
+  cancelHoverDetail();
+  if (drag?.suppressClick) { hideTip(); return; }
+  const hit = timelineHit(event);
+  if (!hit) { hideTip(); return; }
+  showTimelineTip(event, hit);
+  const chunk = activityChunk[hit.sample.activitySet];
+  if (!chunk || activitySets[hit.sample.activitySet] || hit.sample.kind !== "exchange") return;
+  const generation = hoverGeneration;
+  hoverDetailTimer = setTimeout(() => {
+    // Serialize hover loads; discarded pointer positions never queue more work.
+    hoverLoad = hoverLoad.catch(() => {}).then(async () => {
+      if (generation !== hoverGeneration) return;
+      await loadChunk(chunk);
+      if (generation === hoverGeneration) showTimelineTip(event, hit);
+    }).catch(error => {
+      if (generation === hoverGeneration) status.textContent = `Transfer detail unavailable: ${error.message}`;
+    });
+  }, 150);
 });
-timeline.addEventListener("mouseleave", hideTip);
+timeline.addEventListener("mouseleave", () => { cancelHoverDetail(); hideTip(); });
 timeline.addEventListener("click", event => {
   if (drag?.suppressClick) {
     drag = null;

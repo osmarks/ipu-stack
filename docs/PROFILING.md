@@ -40,7 +40,8 @@ Sample timing, metadata, flamegraph and kernel-work accounting load first.
 Transfer shapes initially use a 32-bin overview per stream, labelled as an
 overview in the viewer. Those bins retain the dominant transfer mode and texture;
 they are not exact transfer occupancy measurements. Zoom into a time range to
-load the original lossless transfer events, or hover a tile to load its stream.
+load the original lossless transfer events. Hovering a tile loads exact transfer
+details for its tooltip without repainting the timeline.
 The viewer bounds its detailed-event working set and leaves very broad ranges
 in overview mode. The full-range occupancy chart stays an overview when zoomed.
 `profile-query` and `profile-barriers` continue to use the original full report.
