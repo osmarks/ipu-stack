@@ -1,5 +1,9 @@
 #include "arch/gc_tile_defines.h"
 
+#ifndef ATTENTION_WEIGHT_BYTES
+#define ATTENTION_WEIGHT_BYTES 2
+#endif
+
 #ifndef ATTENTION_MERGE_OUTPUT_F16
 #define ATTENTION_MERGE_OUTPUT_F16 0
 #endif
@@ -126,7 +130,7 @@
 	add $m8, $m0, ATTENTION_VALUE_DIMENSION * 4
 #endif
 	ld32 $m4, $mvertex_base, $m15, 2
-	setzi $m2, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	setzi $m2, ATTENTION_KEY_BLOCK_COLUMNS * ATTENTION_WEIGHT_BYTES
 	mul $m2, $m5, $m2
 	add $m4, $m4, $m2
 	shl $m2, $m9, 2

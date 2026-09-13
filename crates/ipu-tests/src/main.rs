@@ -209,7 +209,7 @@ struct Arguments {
     /// Experimental materialized QK operand scale (native F143/F16 accumulation).
     #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-16..=15))]
     attention_qk_fp8_scale: Option<i8>,
-    /// Experimental materialized PV operand scale (softmax remains F16/F32).
+    /// Experimental materialized PV scale, with fused FP8 probability output and FP32 softmax statistics.
     #[arg(long, allow_hyphen_values = true, value_parser = clap::value_parser!(i8).range(-16..=15))]
     attention_pv_fp8_scale: Option<i8>,
     /// Compare native and packed GEMM stores, or force one for diagnostics.

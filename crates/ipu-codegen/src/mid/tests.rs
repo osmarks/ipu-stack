@@ -1923,6 +1923,27 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
                 .iter()
                 .any(|c| c.name.starts_with("gemm_f8"))
         );
+        if scales[1].is_some() {
+            assert!(tiles.kernel_runs.iter().any(|run| matches!(
+                run.kernel,
+                TileKernelSpec::AttentionSoftmax { .. }
+            ) && matches!(
+                run.requirements.output.format.precision,
+                Precision::F8F143 { .. }
+            )));
+            // Quantization precedes query replication on unreplicated V panels.
+            assert!(tiles.kernel_runs.iter().any(|run| matches!(
+                run.kernel,
+                TileKernelSpec::Cast {
+                    from: Precision::F16,
+                    to: Precision::F8F143 { .. }
+                }
+            ) && matches!(
+                run.requirements.output.format.layout.order,
+                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block: 64, .. })
+            )
+                && run.requirements.output.format.layout.tiling.replicas == 1));
+        }
     }
 }
 

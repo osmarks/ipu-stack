@@ -296,8 +296,9 @@ impl Builder {
         // others. Keep the left padding addressable (softmax stores zero weights
         // there), while the right operand retains the true logical K bound.
         l.shape.0[li] = inner_width.checked_mul(u32::from(grid.inner))?;
-        l.format.precision = Precision::F16;
-        r.format.precision = Precision::F16;
+        // A fused producer may already provide the selected operand precision.
+        l.format.precision = self.tensor(left).format.precision;
+        r.format.precision = self.tensor(right).format.precision;
         l.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         l.format.layout.tiling = TensorTiling {
             tile_count: tiles,

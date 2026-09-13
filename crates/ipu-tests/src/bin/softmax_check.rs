@@ -14,6 +14,8 @@ use std::{fs, path::PathBuf};
 struct Arguments {
     #[arg(long)]
     split_rows: bool,
+    #[arg(long)]
+    fp8_output: bool,
     #[arg(long, default_value = "random", value_parser = ["random", "constant", "extreme"])]
     pattern: String,
     #[arg(long, value_delimiter = ',', default_value = "1,2,5,6,7,8,12,17")]
@@ -86,7 +88,8 @@ fn main() -> Result<()> {
         let padded = if keys == 729 {
             768
         } else {
-            keys.div_ceil(16) * 16
+            keys.div_ceil(if args.fp8_output { 32 } else { 16 })
+                * if args.fp8_output { 32 } else { 16 }
         };
         for (tag, path) in [("old", &args.reference), ("new", &args.kernel)] {
             for (name, value) in [
@@ -100,7 +103,10 @@ fn main() -> Result<()> {
             ] {
                 source += &format!("#undef ATTENTION_{name}\n#define ATTENTION_{name} {value}\n");
             }
-            source += "#undef SOFTMAX_FRAME_BYTES\n";
+            source += "#undef SOFTMAX_FRAME_BYTES\n#undef ATTENTION_OUTPUT_F8\n";
+            if args.fp8_output && tag == "new" {
+                source += "#define ATTENTION_OUTPUT_F8\n#define ATTENTION_OUTPUT_SCALE -4\n";
+            }
             source += &softmax_source(path)?
                 .replace(".Lsoftmax_", &format!(".L{tag}_{keys}_"))
                 .replace("SOFTMAX_MAX_PANEL", &format!("MAXP_{tag}_{keys}"))
@@ -108,7 +114,12 @@ fn main() -> Result<()> {
                 .replace("SOFTMAX_SPLIT_INIT", &format!("INIT_{tag}_{keys}"))
                 .replace("SOFTMAX_SPLIT_ROW", &format!("ROW_{tag}_{keys}"))
                 .replace("SOFTMAX_EXP_PAIR", &format!("EXP_{tag}_{keys}"))
-                .replace("SOFTMAX_STORE_QUAD", &format!("QUAD_{tag}_{keys}"));
+                .replace("SOFTMAX_STORE_QUAD", &format!("QUAD_{tag}_{keys}"))
+                .replace("SOFTMAX_CONFIG_OUTPUT", &format!("CONFIG_{tag}_{keys}"))
+                .replace("SOFTMAX_NEXT_OUTPUT", &format!("NEXT_{tag}_{keys}"))
+                .replace("SOFTMAX_FP8_STORE_EIGHT", &format!("EIGHT_{tag}_{keys}"))
+                .replace("SOFTMAX_BEGIN_TAIL", &format!("BEGIN_{tag}_{keys}"))
+                .replace("SOFTMAX_END_TAIL", &format!("END_{tag}_{keys}"));
             source.push('\n');
         }
         for &rows in &args.rows {
@@ -117,7 +128,7 @@ fn main() -> Result<()> {
                 "test shape exceeds reserved memory"
             );
             let tile = cases.len() as u16;
-            let size = rows * (padded + 16) * 2;
+            let size = rows * (padded * 2 + 64);
             let mut scores = vec![0x7e00u16; (rows * padded) as usize];
             for r in 0..rows {
                 for k in 0..keys {
@@ -301,7 +312,7 @@ fn main() -> Result<()> {
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
         offset += 16;
-        let size = (rows * (padded + 16) * 2) as usize;
+        let size = (rows * (padded * 2 + 64)) as usize;
         let mut errors = [0.0f64; 2];
         for (variant, error) in errors.iter_mut().enumerate() {
             ensure!(
@@ -319,6 +330,17 @@ fn main() -> Result<()> {
             };
             let readfloat =
                 |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as f64;
+            let fp8 = args.fp8_output && variant == 1;
+            let read_probability = |r: u32, k: u32| {
+                if fp8 {
+                    ipu_codegen::f143::f143_to_f32(
+                        bytes[(k / 32 * rows * 32 + r * 32 + k % 32) as usize],
+                        -4,
+                    ) as f64
+                } else {
+                    readhalf((k / 16 * rows * 16 + r * 16 + k % 16) as usize)
+                }
+            };
             for r in 0..rows {
                 let index = |k: u32| (k / 16 * rows * 16 + r * 16 + k % 16) as usize;
                 let maximum = (0..keys)
@@ -330,21 +352,24 @@ fn main() -> Result<()> {
                     })
                     .collect();
                 let sum: f64 = expected.iter().sum();
-                let denominator = readfloat((rows * padded * 2 + rows * 4 + r * 4) as usize);
-                let max = readfloat((rows * padded * 2 + r * 4) as usize);
+                let denominator = readfloat(
+                    (rows * padded * if fp8 { 1 } else { 2 } + rows * 4 + r * 4) as usize,
+                );
+                let max = readfloat((rows * padded * if fp8 { 1 } else { 2 } + r * 4) as usize);
                 ensure!(
                     denominator.is_finite()
                         && denominator > 0.0
                         && (max - maximum / 72f64.sqrt()).abs() < 0.01,
                     "bad row state rows={rows} keys={keys} variant={variant} max={max} denominator={denominator}"
                 );
-                let actual_sum: f64 = (0..keys).map(|k| readhalf(index(k))).sum();
+                let actual_sum: f64 = (0..keys).map(|k| read_probability(r, k)).sum();
                 ensure!(
-                    (actual_sum - denominator).abs() < 0.001 + 0.002 * actual_sum,
+                    (actual_sum - denominator).abs()
+                        < 0.001 + if fp8 { 0.07 } else { 0.002 } * actual_sum,
                     "bad sum {actual_sum} {denominator}"
                 );
                 for k in 0..padded {
-                    let actual = readhalf(index(k));
+                    let actual = read_probability(r, k);
                     if k >= keys {
                         ensure!(
                             actual == 0.0,
@@ -353,7 +378,7 @@ fn main() -> Result<()> {
                     } else {
                         let delta = (actual / denominator - expected[k as usize] / sum).abs();
                         ensure!(
-                            delta.is_finite() && delta < 0.001,
+                            delta.is_finite() && delta < if fp8 { 0.02 } else { 0.001 },
                             "probability rows={rows} keys={keys} variant={variant} r={r} k={k} delta={delta}"
                         );
                         *error = error.max(delta);

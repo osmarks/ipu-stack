@@ -59,7 +59,16 @@ impl Builder {
         scores_type.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         scores_type.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
         let mut weights_type = scores_type.clone();
-        weights_type.shape.0[2] = key_block + AMP_COLUMN_MICRO;
+        if let Some(scale_exponent) = fp8_scales[1] {
+            if !materialized || !key_block.is_multiple_of(32) {
+                return None;
+            }
+            weights_type.format.precision = Precision::F8F143 { scale_exponent };
+            // FP32 max/sum, segmented statistics and a 16-half masked tail.
+            weights_type.shape.0[2] = key_block + 64;
+        } else {
+            weights_type.shape.0[2] = key_block + AMP_COLUMN_MICRO;
+        }
         weights_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
         let mut product_type = scores_type.clone();
         product_type.shape.0[2] = value_width;
@@ -102,12 +111,24 @@ impl Builder {
         }
         packed_key.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
         packed_value.format.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-            row_block: u16::try_from(key_block).ok()?,
+            row_block: u16::try_from(if fp8_scales[1].is_some() {
+                key_block.min(AMP_INNER_BLOCK)
+            } else {
+                key_block
+            })
+            .ok()?,
             column_block: AMP_COLUMN_MICRO as u16,
         });
         let key_panels = self.prepare_attention_operand(MidValueId(1), &packed_key, key_block)?;
         let value_panels =
             self.prepare_attention_operand(MidValueId(2), &packed_value, key_block)?;
+        // Quantize each unreplicated native panel once, before PV ownership
+        // replicates it across query partitions.
+        let value_panels = if let Some(scale_exponent) = fp8_scales[1] {
+            self.cast(value_panels, Precision::F8F143 { scale_exponent })
+        } else {
+            value_panels
+        };
         let mut weights = None;
         let mut result = None;
         for start in (0..key_rows).step_by(key_block as usize) {
@@ -265,12 +286,13 @@ impl Builder {
         // K consists of independent 64-row AMP panels even when the consumer
         // uses the entire key matrix. Distribute preparation by panel instead
         // of tying its ownership to the consumer's GEMM block size.
-        let preparation_rows =
-            if resident.format.layout.order == ElementOrder::Amp(AmpOrder::TransposedRight) {
-                key_block.min(AMP_INNER_BLOCK)
-            } else {
-                key_block
-            };
+        let preparation_rows = match resident.format.layout.order {
+            ElementOrder::Amp(AmpOrder::TransposedRight) => key_block.min(AMP_INNER_BLOCK),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block, .. }) => {
+                u32::from(row_block)
+            }
+            _ => key_block,
+        };
         // A short query (MAP pooling has one row) may use far fewer tiles than
         // K/V preparation. Keep the input's distributed owner budget rather
         // than concentrating the entire key sequence on the query owners.

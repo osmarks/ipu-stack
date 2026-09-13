@@ -74,8 +74,8 @@ pub(super) enum KernelSpecialization {
         u32,
     ),
     Attention(AttentionKernelShape),
-    Softmax(u32, u32, u32),
-    Merge(u32, u32, u32, Precision),
+    Softmax(u32, u32, u32, Precision),
+    Merge(u32, u32, u32, Precision, Precision),
     Rearrange((RearrangeTarget, u32, u32, u32, u32)),
     Unpack((UnpackSource, u32, u32, u32, u32)),
 }
@@ -84,13 +84,14 @@ impl KernelSpecialization {
     pub(super) fn stage(
         kernel: &TileKernelSpec,
         output: Precision,
+        weights: Precision,
     ) -> Result<Self, KernelAbiError> {
         Ok(match kernel {
             TileKernelSpec::AttentionSoftmax {
                 head_dimension,
                 key_columns,
                 padded_key_columns,
-            } => Self::Softmax(*head_dimension, *key_columns, *padded_key_columns),
+            } => Self::Softmax(*head_dimension, *key_columns, *padded_key_columns, output),
             TileKernelSpec::AttentionMerge {
                 value_dimension,
                 padded_value_dimension,
@@ -101,6 +102,7 @@ impl KernelSpecialization {
                 *padded_value_dimension,
                 *key_block_columns,
                 output,
+                weights,
             ),
             _ => return Err(KernelAbiError::RequirementMismatch),
         })
@@ -137,7 +139,14 @@ impl KernelSpecialization {
             ),
             TileKernelSpec::FlashAttention { .. } => Self::Attention(attention_shape(run)?),
             TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. } => {
-                Self::stage(kernel, run.requirements.output.format.precision)?
+                Self::stage(
+                    kernel,
+                    run.requirements.output.format.precision,
+                    run.requirements
+                        .inputs
+                        .get(1)
+                        .map_or(Precision::F16, |r| r.format.precision),
+                )?
             }
             TileKernelSpec::Rearrange { from, to } if from.order == ElementOrder::RowMajor => {
                 Self::Rearrange(rearrangement_specialization(

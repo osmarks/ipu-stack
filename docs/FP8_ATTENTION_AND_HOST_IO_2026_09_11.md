@@ -1,5 +1,9 @@
 # FP8 attention and resident image/embedding transfers
 
+The later [fused PV preparation experiment](FP8_PV_FUSION_2026_09_13.md)
+replaces the late probability/V casts discussed below. These tables describe
+the earlier implementation.
+
 Experiments use native F143 operands and FP16 AMP accumulation for selected
 attention products. Softmax, score storage, attention outputs, and existing
 FP32 merge state retain their previous precision. The default remains FP16

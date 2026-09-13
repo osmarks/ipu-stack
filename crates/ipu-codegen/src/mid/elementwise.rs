@@ -1,5 +1,5 @@
 //! Fuse compatible whole-device primitives before physical expansion.
-use super::rewrite::{apply_edits, same_storage, single_use_producers};
+use super::rewrite::{apply_edits, single_use_producers};
 use super::*;
 
 impl MidProgram {

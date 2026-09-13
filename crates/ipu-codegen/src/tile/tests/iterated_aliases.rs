@@ -96,7 +96,7 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
         let lowering =
             TileProgramLowering::new(&low, &placement, &phases, &kernels, 0x100, partials, false)
                 .unwrap();
-        let mut moving_copies = 0;
+        let mut moving_reads = 0;
         let mut moving_sends = 0;
         for tile in 0..partials {
             let program = lowering.lower_tile(tile).unwrap();
@@ -107,17 +107,22 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
             assert_eq!(repeat.iterated_pointers[0].stride_bytes, 256);
             for step in &repeat.body {
                 match step {
-                    TileStep::Compute(copy)
-                        if copy.symbol == COPY_U64_SYMBOL
+                    TileStep::Compute(compute)
+                        if compute.symbol
+                            == if partials == 1 {
+                                COPY_U64_SYMBOL
+                            } else {
+                                "reduce_sum_f16"
+                            }
                             && matches!(
-                                copy.input_addresses[0],
+                                compute.input_addresses[0],
                                 TileAddress::RepeatPointer {
                                     index: 0,
                                     offset: 0
                                 }
                             ) =>
                     {
-                        moving_copies += 1
+                        moving_reads += 1
                     }
                     TileStep::Exchange(exchange)
                         if matches!(
@@ -135,7 +140,7 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
             }
         }
         assert_eq!(
-            moving_copies, 1,
+            moving_reads, 1,
             "the locally owned partial must change each iteration"
         );
         assert_eq!(

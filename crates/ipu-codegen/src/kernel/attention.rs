@@ -43,33 +43,58 @@ impl KernelBuildPlan {
         let mut compiled = BTreeSet::new();
         for key in stages {
             let (name, symbol, source, flags) = match key {
-                KernelSpecialization::Softmax(head, keys, padded) => {
+                KernelSpecialization::Softmax(head, keys, padded, precision) => {
                     let full = keys == padded;
                     let name = format!(
                         "attention_softmax_d{head}_p{padded}_{}",
                         if full { "full" } else { "tail" }
                     );
-                    let symbol = format!("{name}_f16");
+                    let symbol = match precision {
+                        Precision::F16 => format!("{name}_f16"),
+                        Precision::F8F143 { scale_exponent } => {
+                            format!("{name}_f8_s{scale_exponent}")
+                        }
+                        _ => return Err(KernelAbiError::RequirementMismatch),
+                    };
+                    let name = symbol.replace('-', "m");
+                    let symbol = name.clone();
                     let scale_bits = (1.0_f32 / (head as f32).sqrt()).to_bits();
-                    let flags = vec![
+                    let mut flags = vec![
                         format!("-DATTENTION_HEAD_DIMENSION={head}"),
                         format!("-DATTENTION_FULL_BLOCK={}", u8::from(full)),
                         format!("-DATTENTION_KEY_BLOCK_COLUMNS={padded}"),
                         format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
                         format!("-DATTENTION_SOFTMAX_SYMBOL={symbol}"),
                     ];
+                    if let Precision::F8F143 { scale_exponent } = precision {
+                        if !padded.is_multiple_of(32) {
+                            return Err(KernelAbiError::RequirementMismatch);
+                        }
+                        flags.extend([
+                            "-DATTENTION_OUTPUT_F8".into(),
+                            format!("-DATTENTION_OUTPUT_SCALE={scale_exponent}"),
+                        ]);
+                    }
                     (name, symbol, "attention_softmax_f16.S", flags)
                 }
-                KernelSpecialization::Merge(values, padded, keys, output) => {
+                KernelSpecialization::Merge(values, padded, keys, output, weights) => {
                     let suffix = match output {
                         Precision::F16 => "out16",
                         Precision::F32 => "out32",
                         _ => return Err(KernelAbiError::RequirementMismatch),
                     };
-                    let name = format!("attention_merge_v{values}_p{padded}_k{keys}_{suffix}");
+                    let name = format!(
+                        "attention_merge_v{values}_p{padded}_k{keys}_{suffix}{}",
+                        if matches!(weights, Precision::F8F143 { .. }) {
+                            "_p8"
+                        } else {
+                            ""
+                        }
+                    );
                     let symbol = format!("{name}_f16");
                     let flags = vec![
                         format!("-DATTENTION_VALUE_DIMENSION={values}"),
+                        format!("-DATTENTION_WEIGHT_BYTES={}", weights.bytes()),
                         format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded}"),
                         format!("-DATTENTION_KEY_BLOCK_COLUMNS={keys}"),
                         format!("-DATTENTION_MERGE_SYMBOL={symbol}"),

@@ -21,7 +21,7 @@
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
 	// Three FP32 maxima and three sums use the existing extra 16 halves/row.
-	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * 2 + 8
+	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES + 8
 	mul $m6, $m5, $m0
 	add $m6, $m6, $m2
 	setzi $m0, 3
@@ -53,8 +53,19 @@
 	shl $m0, $m0, 1
 	shl $m1, $m4, 5
 	add $m0, $m0, $m1
-	add $m2, $m2, $m0
 	add $m3, $m3, $m0
+#ifdef ATTENTION_OUTPUT_F8
+	// m0 is the score byte offset. Recover panel and row independently.
+	setzi $m0, ((ATTENTION_KEY_BLOCK_COLUMNS + 47) / 48) * 16
+	mul $m0, $m9, $m0
+	and $m1, $m0, 31
+	shr $m0, $m0, 5
+	mul $m0, $m0, $m5
+	add $m0, $m0, $m4
+	shl $m0, $m0, 5
+	add $m0, $m0, $m1
+#endif
+	add $m2, $m2, $m0
 	.endm
 
 	.worker
@@ -99,6 +110,7 @@
 
 	.p2align 3
 .Lsoftmax_split_exp:
+	SOFTMAX_CONFIG_OUTPUT
 	SOFTMAX_SPLIT_INIT
 .Lsoftmax_split_exp_row:
 	cmpult $m0, $m4, $m5
@@ -117,7 +129,7 @@
 	ldconst $a1, ATTENTION_SCALE_BITS
 	f32mul $a2, $a0, $a1
 	ld32 $m0, $mvertex_base, $m15, 0
-	setzi $m1, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	setzi $m1, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES
 	mul $m1, $m5, $m1
 	add $m0, $m0, $m1
 	shl $m1, $m4, 2
@@ -138,11 +150,12 @@
 .Lsoftmax_split_exp_panel:
 	SOFTMAX_EXP_PANEL
 	add $m3, $m3, $m8
-	add $m2, $m2, $m8
+	SOFTMAX_NEXT_OUTPUT
 	brnzdec $m7, .Lsoftmax_split_exp_panel
 .Lsoftmax_split_exp_tail:
 	and $m7, $m10, 15
 	brz $m7, .Lsoftmax_split_padding
+	SOFTMAX_BEGIN_TAIL
 	f16v2tof32 $a2:3, $a4
 	ldconst $a4, ATTENTION_SCALE_BITS
 	f32mul $a5, $a2, $a4
@@ -180,7 +193,8 @@
 	st32step $mzero, $mzero, $m2+=, 1
 	brnzdec $m7, .Lsoftmax_split_zero_pair
 .Lsoftmax_split_after_tail:
-	add $m2, $m2, $m8
+	SOFTMAX_END_TAIL
+	SOFTMAX_NEXT_OUTPUT
 .Lsoftmax_split_padding:
 	setzi $m7, ((ATTENTION_KEY_BLOCK_COLUMNS + 47) / 48) * 16
 	mul $m0, $m9, $m7
@@ -197,10 +211,10 @@
 	brz $m7, .Lsoftmax_split_store_sum
 	sub $m7, $m7, 1
 .Lsoftmax_split_zero_panel:
-	.rept 8
+	.rept (4 * SOFTMAX_ELEMENT_BYTES)
 	st32step $mzero, $mzero, $m2+=, 1
 	.endr
-	add $m2, $m2, $m8
+	SOFTMAX_NEXT_OUTPUT
 	brnzdec $m7, .Lsoftmax_split_zero_panel
 .Lsoftmax_split_store_sum:
 	setzi $m0, 12
@@ -215,7 +229,7 @@
 .Lsoftmax_split_sum:
 	ld32 $m5, $mvertex_base, $m15, 2
 	ld32 $m2, $mvertex_base, $m15, 0
-	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * 2 + 4
+	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES + 4
 	mul $m0, $m5, $m0
 	add $m2, $m2, $m0
 	get $m4, $WSR

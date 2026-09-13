@@ -467,7 +467,18 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     plan.add_attention_stages(
         stages
             .iter()
-            .map(|(kernel, _)| KernelSpecialization::stage(kernel, Precision::F32).unwrap())
+            .map(|(kernel, _)| {
+                KernelSpecialization::stage(
+                    kernel,
+                    if matches!(kernel, TileKernelSpec::AttentionSoftmax { .. }) {
+                        Precision::F16
+                    } else {
+                        Precision::F32
+                    },
+                    Precision::F16,
+                )
+                .unwrap()
+            })
             .collect(),
     )
     .unwrap();
@@ -516,7 +527,16 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             output,
             KernelRequirements {
                 additional_outputs: Vec::new(),
-                inputs: vec![KernelAccess::new(format.clone(), 8); inputs],
+                inputs: vec![
+                    KernelAccess::new(
+                        TensorFormat {
+                            precision: Precision::F16,
+                            ..format.clone()
+                        },
+                        8
+                    );
+                    inputs
+                ],
                 output: KernelAccess::new(format, 8),
                 distinct_elements: Vec::new(),
             },
@@ -836,7 +856,12 @@ fn worker_stack_support_follows_cpp_recipes() {
     }
     // The hand-written softmax worker does not use a compiler-managed stack.
     let plan = KernelBuildPlan::from_inventory(KernelInventory {
-        attention_stages: BTreeSet::from([KernelSpecialization::Softmax(64, 32, 32)]),
+        attention_stages: BTreeSet::from([KernelSpecialization::Softmax(
+            64,
+            32,
+            32,
+            Precision::F16,
+        )]),
         ..KernelInventory::default()
     })
     .unwrap();

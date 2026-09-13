@@ -140,6 +140,26 @@ pub(crate) fn f16_softmax_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 
     ))
 }
 
+/// The FP8 epilogue keeps the same row schedule, with two eight-value casts
+/// per score panel, half-panel addressing and a bounded masked-tail drain.
+pub(crate) fn softmax_output_cycles(rows: u64, keys: u64, padded_keys: u64, fp8: bool) -> u64 {
+    let base = f16_softmax_cycles(rows, keys, padded_keys);
+    if !fp8 {
+        return base;
+    }
+    let split = f16_softmax_split_rows(rows, keys, padded_keys);
+    base.saturating_add(
+        rows.div_ceil(if split { 2 } else { 6 })
+            .saturating_mul(6)
+            .saturating_mul(
+                padded_keys
+                    .div_ceil(if split { 48 } else { 16 })
+                    .saturating_mul(7)
+                    .saturating_add(8),
+            ),
+    )
+}
+
 /// Merge preserves FP32 state. Pair loops issue four groups for initialization
 /// and six for updates; final normalization is folded into the row coefficients.
 pub(crate) fn f16_attention_merge_cycles(

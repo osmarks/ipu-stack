@@ -1,7 +1,8 @@
 #include "arch/gc_tile_defines.h"
+#include "attention_softmax_fp8.inc"
 #include "attention_softmax_panels.inc"
 
-// AMP-left panel order; FP16 probabilities with FP32 maxima and sums.
+// AMP-left panel order; FP16/FP8 probabilities with FP32 maxima and sums.
 // m2 weights, m3 scores, m4 query rows, m5 valid keys, m6 split-row flag.
 #if ATTENTION_FULL_BLOCK
 #define SOFTMAX_FRAME_BYTES 12
@@ -51,6 +52,7 @@ ATTENTION_SOFTMAX_SYMBOL:
 	.worker
 	.p2align 3
 .Lsoftmax_worker:
+	SOFTMAX_CONFIG_OUTPUT
 	ld32 $m5, $mvertex_base, $m15, 2
 #if !ATTENTION_FULL_BLOCK
 	ld32 $m10, $mvertex_base, $m15, 3
@@ -107,7 +109,7 @@ ATTENTION_SOFTMAX_SYMBOL:
 	f32mul $a7, $a6, $a4
 	// Persistent maxima/denominators follow the packed weight matrix.
 	ld32 $m6, $mvertex_base, $m15, 0
-	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * 2
+	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES
 	mul $m0, $m5, $m0
 	add $m6, $m6, $m0
 	shl $m0, $m4, 2
@@ -138,10 +140,11 @@ ATTENTION_SOFTMAX_SYMBOL:
 .Lsoftmax_exp_panel:
 	SOFTMAX_EXP_PANEL
 	add $m3, $m3, $m8
-	add $m2, $m2, $m8
+	SOFTMAX_NEXT_OUTPUT
 	brnzdec $m7, .Lsoftmax_exp_panel
 #if !ATTENTION_FULL_BLOCK
 .Lsoftmax_exp_tail:
+	SOFTMAX_BEGIN_TAIL
 	ldconst $a4, ATTENTION_SCALE_BITS
 	ld32 $a5, $m6, $m15, 0
 	f32sub $a5, $azero, $a5
@@ -180,17 +183,18 @@ ATTENTION_SOFTMAX_SYMBOL:
 	st32step $mzero, $mzero, $m2+=, 1
 	brnzdec $m7, .Lsoftmax_zero_pair
 .Lsoftmax_zero_panels_setup:
-	add $m2, $m2, $m8
+	SOFTMAX_END_TAIL
+	SOFTMAX_NEXT_OUTPUT
 	shr $m0, $m10, 4
 	setzi $m7, ATTENTION_KEY_BLOCK_COLUMNS / 16 - 1
 	sub $m7, $m7, $m0
 	brz $m7, .Lsoftmax_sum_ready
 	sub $m7, $m7, 1
 .Lsoftmax_zero_panel:
-	.rept 8
+	.rept (4 * SOFTMAX_ELEMENT_BYTES)
 	st32step $mzero, $mzero, $m2+=, 1
 	.endr
-	add $m2, $m2, $m8
+	SOFTMAX_NEXT_OUTPUT
 	brnzdec $m7, .Lsoftmax_zero_panel
 .Lsoftmax_sum_ready:
 #endif

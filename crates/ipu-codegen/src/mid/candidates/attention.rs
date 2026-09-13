@@ -85,6 +85,14 @@ pub(super) fn product_variants(
     if pv_fp8.is_some() {
         pv.retain(Option::is_some);
     }
+    // Rounding each K shard to the operand grain can otherwise leave the
+    // final shard empty (729 keys, seven FP8 shards => 128 * 6 >= 729).
+    let groups = keys.div_ceil(if pv_fp8.is_some() { 32 } else { 16 });
+    pv.retain(|grid| {
+        grid.is_none_or(|grid| {
+            groups.div_ceil(u32::from(grid.inner)) * u32::from(grid.inner - 1) < groups
+        })
+    });
     let mut result = Vec::new();
     for &query_key in &qk {
         for &probability_value in &pv {

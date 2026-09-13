@@ -22,6 +22,26 @@
 	// then accumulate the panel in FP32. Store the unchanged exponentials.
 	// The caller clears accumulators once; previous panels leave finite values.
 	// MIX then returns each preceding quad while starting the next one.
+#ifdef ATTENTION_OUTPUT_F8
+	ld64step $a2:3, $mzero, $m3+=, 1
+	f16v4mix $a0:1, $a2:3, $a4:5
+	ld64step $a2:3, $mzero, $m3+=, 1
+	f16v4mix $a0:1, $a2:3, $a4:5
+	f16v2exp $a0, $a0
+	{ ld64step $a2:3, $mzero, $m3+=, 1; f16v2exp $a1, $a1 }
+	f16v4mix $a2:3, $a2:3, $a4:5
+	f16v2exp $a2, $a2
+	f16v2exp $a3, $a3
+	SOFTMAX_FP8_STORE_EIGHT
+	ld64step $a2:3, $mzero, $m3+=, 1
+	f16v4mix $a0:1, $a2:3, $a4:5
+	f16v2exp $a0, $a0
+	f16v2exp $a1, $a1
+	f16v4gacc $a2:3
+	f16v2exp $a2, $a2
+	f16v2exp $a3, $a3
+	SOFTMAX_FP8_STORE_EIGHT
+#else
 	ld64step $a0:1, $mzero, $m3+=, 1
 	f16v4mix $a2:3, $a0:1, $a4:5
 	.rept 3
@@ -31,6 +51,7 @@
 	.endr
 	f16v4gacc $a2:3
 	SOFTMAX_STORE_QUAD
+#endif
 	f16v2tof32 $a0:1, $a6
 	f32add $a0, $a0, $a1
 	f32add $a7, $a7, $a0

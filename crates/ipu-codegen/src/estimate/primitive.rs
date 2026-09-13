@@ -176,10 +176,11 @@ pub(crate) fn kernel_cycles<'a>(
             padded_key_columns,
             ..
         } => {
-            return crate::kernel::cost::f16_softmax_cycles(
+            return crate::kernel::cost::softmax_output_cycles(
                 rows,
                 u64::from(*key_columns),
                 u64::from(*padded_key_columns),
+                matches!(output.format().precision, Precision::F8F143 { .. }),
             );
         }
         TileKernelSpec::Gelu => elements.saturating_mul(10),
