@@ -567,6 +567,7 @@ pub(super) fn stream_wave_order(
     for (index, transfer) in problem.transfers.iter().enumerate() {
         streams
             .entry((
+                !transfer.moving_source(),
                 transfer.source,
                 transfer.reserved_source,
                 transfer
@@ -614,16 +615,26 @@ pub(super) fn stream_wave_order(
     let mut ready = BinaryHeap::new();
     for (index, &degree) in indegrees.iter().enumerate() {
         if degree == 0 {
-            ready.push(Reverse((depth[index], rank[index], index)));
+            ready.push(Reverse((
+                depth[index],
+                !problem.transfers[index].moving_source(),
+                rank[index],
+                index,
+            )));
         }
     }
     let mut order = Vec::with_capacity(rank.len());
-    while let Some(Reverse((_, _, index))) = ready.pop() {
+    while let Some(Reverse((_, _, _, index))) = ready.pop() {
         order.push(index);
         for &next in &problem.dependents[index] {
             indegrees[next] -= 1;
             if indegrees[next] == 0 {
-                ready.push(Reverse((depth[next], rank[next], next)));
+                ready.push(Reverse((
+                    depth[next],
+                    !problem.transfers[next].moving_source(),
+                    rank[next],
+                    next,
+                )));
             }
         }
     }

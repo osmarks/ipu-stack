@@ -10,6 +10,7 @@ fn compare_ready_heaps() {
         let mut rng = fastrand::Rng::with_seed(0x68656170);
         let keys: Vec<_> = (0..count)
             .map(|index| ReadyTransfer {
+                moving_source: false,
                 earliest_start: Reverse(0),
                 endpoint_pressure: rng.u64(1..100_000),
                 fanout: rng.u16(1..8),

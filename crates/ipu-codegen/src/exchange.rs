@@ -12,8 +12,8 @@ mod replay;
 pub use replay::{
     ExchangeSchedulingPriority, schedule_exchange_problem, schedule_exchange_problem_with_priority,
 };
+mod relocation;
 mod reuse;
-mod sections;
 mod traffic;
 pub use reuse::ExchangeScheduleCache;
 pub(crate) use traffic::MappingTraffic;
@@ -439,15 +439,13 @@ pub(crate) fn lower_exchanges_cached(
         .map(|(phase, cache)| {
             let _entered = span.enter();
             let pending = prepare_phase(program, placement, phase, &repeat_inputs)?;
-            let section_candidate = sections::has_mixed_sources(&pending, program.tile_count)
-                .then(|| pending.clone());
             let ScheduledPending {
                 pending,
                 receive_counts,
                 incoming_bases,
                 optimized,
             } = cache.select(phase.id, topology, pending, program.tile_count)?;
-            let mut schedule_problem = schedule_problem(phase.id.index(), &pending);
+            let schedule_problem = schedule_problem(phase.id.index(), &pending);
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
                 for &(tile, address) in &transfer.destinations {
@@ -552,17 +550,12 @@ pub(crate) fn lower_exchanges_cached(
                 );
             }
             let mut physical = schedule.into_phase(phase.id, incoming_bases)?;
-            sections::relocate_repeat_rows(&mut physical, &pending, placement, &repeat_inputs)?;
-            if let Some(pending) = section_candidate {
-                match sections::try_separate(&physical, pending, placement, &repeat_inputs, topology, cache) {
-                    Ok(Some((sectioned, problem))) => {
-                        physical = sectioned;
-                        schedule_problem = problem;
-                    }
-                    Ok(None) => {}
-                    Err(error) => tracing::debug!(phase = phase.id.index(), %error, "fixed/moving exchange sections are not encodable"),
-                }
-            }
+            relocation::relocate_repeat_rows(
+                &mut physical,
+                &pending,
+                &placement.shard_addresses,
+                &repeat_inputs,
+            )?;
             if pending.len() > 1_000 {
                 let (tile, words) = physical
                     .programs
@@ -725,6 +718,12 @@ struct PendingTransfer {
 }
 
 impl PendingTransfer {
+    fn moving_source(&self) -> bool {
+        self.source_addresses
+            .iter()
+            .any(|&a| a != self.source_address())
+    }
+
     fn tiles(&self) -> impl Iterator<Item = u16> + '_ {
         std::iter::once(self.source)
             .chain(self.reserved_source)
@@ -772,7 +771,9 @@ fn repeat_outgoing_bases(
 ) -> Vec<Option<(BlockValueId, u32)>> {
     let mut tiles = vec![Vec::new(); usize::from(tile_count)];
     for (transfer, &words) in pending.iter().zip(patch_words) {
-        tiles[usize::from(transfer.source)].push((transfer, words));
+        if transfer.moving_source() {
+            tiles[usize::from(transfer.source)].push((transfer, words));
+        }
     }
     tiles
         .into_iter()
@@ -783,17 +784,12 @@ fn repeat_outgoing_bases(
                 .max()
                 .unwrap_or(1);
             let mut patterns = BTreeMap::<Vec<u32>, (usize, &PendingTransfer)>::new();
-            let mut stationary_words = 0;
             for &(transfer, words) in &transfers {
                 let deltas = (0..count)
                     .map(|i| {
                         repeat_source_address(transfer, i).wrapping_sub(transfer.source_address())
                     })
                     .collect::<Vec<_>>();
-                if deltas.iter().all(|&d| d == 0) {
-                    stationary_words += words;
-                    continue;
-                }
                 let entry = patterns.entry(deltas).or_insert((0, transfer));
                 entry.0 += words;
                 if transfer.source_address() < entry.1.source_address() {
@@ -805,11 +801,8 @@ fn repeat_outgoing_bases(
                 .any(|(t, _)| t.width == ExchangeItemWidth::Paired64);
             patterns
                 .into_values()
-                .filter(|&(uses, base)| {
-                    // Zero base already leaves stationary sends unpatched.
-                    // Relocation must eliminate more words than it introduces.
-                    uses > stationary_words
-                        && (!paired || base.source_address().is_multiple_of(8))
+                .filter(|&(_, base)| {
+                    (!paired || base.source_address().is_multiple_of(8))
                         && transfers.iter().all(|(t, _)| {
                             (0..count).all(|i| {
                                 repeat_source_address(t, i) >= repeat_source_address(base, i)
@@ -1664,6 +1657,7 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ReadyTransfer {
+    moving_source: bool,
     earliest_start: Reverse<u32>,
     endpoint_pressure: u64,
     fanout: u16,
@@ -1840,6 +1834,7 @@ impl<'a> TransferScheduler<'a> {
             .map(|tile| self.word_pressure[tile])
             .sum::<u64>();
         self.ready.push(ReadyTransfer {
+            moving_source: transfer.moving_source(),
             earliest_start: Reverse(earliest_start),
             endpoint_pressure,
             fanout: u16::try_from(transfer.destinations.len()).expect("receivers fit tile count"),
@@ -2079,6 +2074,7 @@ struct MaterializedSchedule {
     activities: Vec<Vec<ExchangeActivity>>,
     order: Vec<usize>,
     timings: Vec<Option<MaterializedTiming>>,
+    moving_base: Vec<bool>,
 }
 
 impl MaterializedSchedule {
@@ -2110,6 +2106,13 @@ impl MaterializedSchedule {
             activities: vec![Vec::new(); usize::from(tile_count)],
             order: Vec::with_capacity(transfer_count),
             timings: vec![None; transfer_count],
+            moving_base: {
+                let mut moving = vec![false; usize::from(tile_count)];
+                for transfer in transfers {
+                    moving[usize::from(transfer.source)] |= transfer.moving_source();
+                }
+                moving
+            },
         }
     }
 
@@ -2125,6 +2128,14 @@ impl MaterializedSchedule {
         last_transfer: &mut [TilePredecessor],
     ) -> Result<u32, ExchangeLoweringError> {
         let transfer = &pending[index];
+        let moving = transfer.moving_source();
+        let current = &mut self.moving_base[usize::from(transfer.source)];
+        if *current != moving {
+            self.builder
+                .switch_outgoing_base(transfer.source, if moving { 6 } else { 15 })?;
+            *current = moving;
+        }
+
         let (blocking_tile, latest_availability) = std::iter::once((
             transfer.source,
             self.tile_availability[usize::from(transfer.source)].send,

@@ -1089,17 +1089,16 @@ fn repeat_base_selects_tile_local_displacements_with_exceptions() {
         repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
         expected
     );
-    // A stationary send gets an inverse relocation patch on this tile.
+    // Stationary sends use zero base independently of the moving group.
     transfers.push(make(0, 3, 0x70008, 0));
     assert_eq!(
         repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
         expected
     );
-    // One stationary send can contain more encoded address words than both
-    // moving sends. Keep zero base when inverse patches would cost more.
+    // More stationary address words no longer discourage relocation.
     assert_eq!(
         repeat_outgoing_bases(&transfers, &[1, 1, 1, 1, 3], &addresses, 4),
-        vec![None, Some((id(2), 8)), None, None]
+        expected
     );
     transfers.pop();
     // An irregular exception is patched, not treated as sharing the base.
@@ -1108,11 +1107,11 @@ fn repeat_base_selects_tile_local_displacements_with_exceptions() {
         repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
         expected
     );
-    // A low stationary address prevents relative encoding on tile 0 alone.
+    // A low stationary address no longer prevents relative moving addresses.
     transfers.push(make(0, 3, 0x50008, 0));
     assert_eq!(
         repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
-        vec![None, Some((id(2), 8)), None, None]
+        expected
     );
 }
 

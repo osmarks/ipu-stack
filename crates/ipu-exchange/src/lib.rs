@@ -250,6 +250,8 @@ struct TileProgramSchedule {
     senders: Chunked<ScheduledSenderRow>,
     /// Borrowed transmit lane; no instruction or SRAM access on this tile.
     reserved_sender_end: u32,
+    /// Later sends cannot cross a committed outgoing-base transition.
+    base_switches: Vec<u32>,
     // Chronological, with stable ordering among controls at the same cycle.
     receive_events: Chunked<ReceiveEvent>,
     event_cycles: u32,
@@ -378,6 +380,67 @@ impl PhaseProgramBuilder {
     pub fn with_validation_budget(mut self, entries: u64) -> Self {
         self.validation_budget = Some(Arc::new(AtomicU64::new(entries)));
         self
+    }
+
+    /// Commit a base transition after the last send, using a free control interval.
+    /// Receive payload can continue while the supervisor writes OUTGOING_BASE.
+    /// Future RX controls may fill earlier gaps, but cannot occupy this write.
+    pub fn switch_outgoing_base(&mut self, tile: u16, register: u8) -> Result<(), ExchangeError> {
+        let instruction = encode_put_special_m(0xa7, register)?;
+        self.staged = None;
+        let state = self
+            .tile_states
+            .get_mut(usize::from(tile))
+            .ok_or(ExchangeError::Tile(tile))?;
+        let mut start = state
+            .senders
+            .get(state.senders.len().wrapping_sub(1))
+            .map_or(0, |sender| sender.end_cycles)
+            .max(state.base_switches.last().copied().unwrap_or(0));
+        let mut index = state
+            .receive_events
+            .partition_point(|event| event.cycles <= start);
+        // A control insertion can change the parity of later SENDPICP words.
+        // Validate it here: moving a subsequent transfer cannot repair an
+        // already committed misaligned instruction earlier in the row.
+        state.encoded()?;
+        loop {
+            let end = start
+                .checked_add(EXCHANGE_BASE_WRITE_CYCLES)
+                .ok_or(ExchangeError::Schedule("base switch horizon overflow"))?;
+            if let Some(event) = state.receive_events.get(index)
+                && event.cycles <= end
+            {
+                start = event.cycles;
+                index += 1;
+                continue;
+            }
+            let mut candidate = state.clone();
+            candidate.invalidate_encoding();
+            candidate.dirty_events = candidate.dirty_events.min(index);
+            candidate.receive_events.insert(
+                index,
+                ReceiveEvent {
+                    cycles: end,
+                    instruction,
+                    kind: ReceiveEventKind::OutgoingBase,
+                },
+            );
+            candidate.event_cycles = candidate.event_cycles.max(end);
+            candidate.base_switches.push(end);
+            match candidate.encoded() {
+                Ok(_) => {
+                    *state = candidate;
+                    return Ok(());
+                }
+                Err(ExchangeError::Schedule("SENDPICP instruction alignment")) => {
+                    start = start
+                        .checked_add(1)
+                        .ok_or(ExchangeError::Schedule("base switch horizon overflow"))?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn tile_count(&self) -> u16 {
@@ -778,8 +841,9 @@ impl TileProgramSchedule {
             .receive_events
             .partition_point(|event| event.cycles < start);
         self.receive_events
-            .get(index)
-            .is_some_and(|event| event.cycles <= start.saturating_add(1))
+            .range(index..self.receive_events.len())
+            .take_while(|event| event.cycles <= start.saturating_add(1))
+            .any(|event| event.kind != ReceiveEventKind::OutgoingBase)
     }
 
     /// Advances a requested transfer offset until its outgoing message does
@@ -791,7 +855,11 @@ impl TileProgramSchedule {
         base: &ScheduledPayloadTiming,
         requested: u32,
     ) -> Result<u32, ExchangeError> {
-        let mut offset = requested.max(self.reserved_sender_end.saturating_sub(base.payload_start));
+        let mut offset = requested.max(
+            self.reserved_sender_end
+                .max(self.base_switches.last().copied().unwrap_or(0))
+                .saturating_sub(base.payload_start),
+        );
         let first_start = base
             .payload_start
             .checked_add(offset)
@@ -877,6 +945,24 @@ impl TileProgramSchedule {
                 received_words,
                 self.receive_stream.as_ref(),
             )?;
+            if let Some(end) = timing
+                .events
+                .iter()
+                .filter_map(|new| {
+                    self.base_switches
+                        .iter()
+                        .find(|&&end| {
+                            new.cycles > end - EXCHANGE_BASE_WRITE_CYCLES && new.cycles <= end
+                        })
+                        .map(|&end| end + 1 - new.cycles)
+                })
+                .max()
+            {
+                offset = offset
+                    .checked_add(end)
+                    .ok_or(ExchangeError::Schedule("base control collision overflow"))?;
+                continue;
+            }
             let collision = timing.events.iter().any(|new| {
                 self.receive_events_at(new.cycles).any(|existing| {
                     !self.receive_stream.as_ref().is_some_and(|previous| {
@@ -911,6 +997,16 @@ impl TileProgramSchedule {
         schedule_offset: u32,
     ) -> Result<(), ExchangeError> {
         let timing = base.at(schedule_offset)?;
+        if self
+            .base_switches
+            .last()
+            .is_some_and(|&end| timing.payload_start < end)
+        {
+            return Err(ExchangeError::Schedule(
+                "send crosses outgoing base transition",
+            ));
+        }
+
         let index = self
             .senders
             .partition_point(|sender| sender.start_cycles < timing.payload_start);
@@ -1068,6 +1164,7 @@ enum ReceiveEventKind {
     PairedPointer,
     Pointer,
     Format,
+    OutgoingBase,
 }
 
 impl ReceiveEventKind {
@@ -1094,6 +1191,19 @@ struct ReceiveEvent {
     cycles: u32,
     instruction: u32,
     kind: ReceiveEventKind,
+}
+
+impl ReceiveEvent {
+    // Latest instruction start for this timed control. PIC/XPIC writes may
+    // absorb earlier idle cycles; an ordinary CSR write has fixed duration.
+    fn issue_start(&self) -> u32 {
+        self.cycles
+            .saturating_sub(if self.kind == ReceiveEventKind::OutgoingBase {
+                EXCHANGE_BASE_WRITE_CYCLES
+            } else {
+                1
+            })
+    }
 }
 
 fn receive_events_can_share_instruction(left: ReceiveEvent, right: ReceiveEvent) -> bool {
@@ -1265,6 +1375,9 @@ fn scheduled_receive_window(
             ReceiveEventKind::PairedSource
             | ReceiveEventKind::PairedNeutral
             | ReceiveEventKind::Format => Some(event),
+            ReceiveEventKind::OutgoingBase => {
+                unreachable!("base writes are not primitive receive events")
+            }
         })
         .collect::<Vec<_>>();
     events.sort_by_key(|event| event.cycles);
@@ -1401,6 +1514,9 @@ fn receive_row_timing(
                 {
                     return Err(ExchangeError::Schedule("multiple receive pointers"));
                 }
+            }
+            ReceiveEventKind::OutgoingBase => {
+                unreachable!("base writes are not primitive receive events")
             }
             ReceiveEventKind::Format => {
                 let value = event.instruction & PIC_RECEIVE_ADDRESS_MASK;
@@ -1614,7 +1730,7 @@ fn append_sender_message(
 
         let next_boundary = controls
             .get(end)
-            .map_or(sender.end_cycles, |next| next.cycles.saturating_sub(1));
+            .map_or(sender.end_cycles, |next| next.issue_start());
         let mut available = next_boundary
             .checked_sub(*event_cycles)
             .ok_or(ExchangeError::Schedule("send control order"))?;
@@ -1764,6 +1880,9 @@ fn encode_send_control(count_minus_one: u32, event: ReceiveEvent) -> Result<u32,
         return Err(ExchangeError::Schedule("SENDPIC count"));
     }
     let (selector, operand) = match event.kind {
+        ReceiveEventKind::OutgoingBase => {
+            return Err(ExchangeError::Schedule("base switch inside send"));
+        }
         ReceiveEventKind::OrdinarySource
         | ReceiveEventKind::OrdinaryNeutral
         | ReceiveEventKind::PairedSource
@@ -1813,8 +1932,22 @@ fn append_receive_events_record(
         let group = &events[cursor..end];
         let next_start = events
             .get(end)
-            .map_or(horizon_cycles, |next| next.cycles.saturating_sub(1));
-        if group.len() == 2 {
+            .map_or(horizon_cycles, |next| next.issue_start());
+        if group[0].kind == ReceiveEventKind::OutgoingBase {
+            if group.len() != 1 {
+                return Err(ExchangeError::Schedule(
+                    "base write overlaps receive control",
+                ));
+            }
+            let event = group[0];
+            append_plain_delay(
+                words,
+                event_cycles,
+                event.cycles - EXCHANGE_BASE_WRITE_CYCLES,
+            )?;
+            words.push(event.instruction);
+            *event_cycles = event.cycles;
+        } else if group.len() == 2 {
             let instruction_start = group[0]
                 .cycles
                 .checked_sub(1)
@@ -1980,6 +2113,10 @@ fn is_neutral_mux_teardown(instruction: u32) -> bool {
 fn instruction_advance(instruction: u32) -> u32 {
     if instruction & DELAY_OPCODE_MASK == DELAY_OPCODE {
         (instruction & 0x7_ffff) + 1
+    } else if instruction & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa7
+        || instruction & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa4
+    {
+        EXCHANGE_BASE_WRITE_CYCLES
     } else {
         match instruction & OPCODE_MASK {
             DELAY_PIC_OPCODE => ((instruction >> 19) & 0x7f) + 1,

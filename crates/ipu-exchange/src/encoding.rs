@@ -73,7 +73,15 @@ impl Checkpoint {
             && self.lookahead.is_none_or(|previous| {
                 let next = next_event
                     .filter(|event| event.cycles < sender_start)
-                    .map_or(sender_start, |event| event.cycles.saturating_sub(1));
+                    .map_or(sender_start, |event| {
+                        event.cycles.saturating_sub(
+                            if event.kind == ReceiveEventKind::OutgoingBase {
+                                EXCHANGE_BASE_WRITE_CYCLES
+                            } else {
+                                1
+                            },
+                        )
+                    });
                 next == previous
             })
     }
@@ -186,6 +194,57 @@ pub(super) fn build_scheduled_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outgoing_base_uses_control_gaps_and_preserves_incremental_encoding() {
+        let topology = Topology::c600();
+        let mut builder = PhaseProgramBuilder::new(4);
+        for round in 0..32 {
+            let (source, receivers) = if round % 2 == 0 { (0, [2]) } else { (1, [0]) };
+            let mut plan = topology.multicast(source, &receivers, 64, 0).unwrap();
+            patch_sender_address(&mut plan.sender, 0x10000 + round * 256).unwrap();
+            patch_receiver_address(&mut plan.receivers[0], 0x50000 + round * 256).unwrap();
+            let prepared = plan.prepare().unwrap();
+            let offset = builder
+                .earliest_transfer_offset(source, &[], &receivers, &prepared, 64, 0)
+                .unwrap();
+            builder
+                .append_transfer_at(source, &[], &receivers, &prepared, offset, 64)
+                .unwrap();
+            builder.finish().unwrap();
+            if round % 2 == 1 {
+                builder
+                    .switch_outgoing_base(0, if round % 4 == 1 { 15 } else { 6 })
+                    .unwrap();
+            }
+            for state in &builder.tile_states {
+                let incremental = state.encoded().unwrap();
+                let full = build_scheduled_program(
+                    &state.senders,
+                    &state.receive_events,
+                    state.event_cycles,
+                    None,
+                )
+                .unwrap();
+                assert!(incremental.same_words(&full));
+                state.finish().unwrap();
+            }
+        }
+        let mut builder = PhaseProgramBuilder::new(4);
+        let plan = topology.multicast(1, &[0], 256, 0).unwrap();
+        let plan = plan.prepare().unwrap();
+        let offset = builder
+            .earliest_transfer_offset(1, &[], &[0], &plan, 256, 0)
+            .unwrap();
+        builder
+            .append_transfer_at(1, &[], &[0], &plan, offset, 256)
+            .unwrap();
+        let receive_horizon = builder.tile_event_cycles(0).unwrap();
+        builder.switch_outgoing_base(0, 15).unwrap();
+        assert!(builder.tile_states[0].base_switches[0] < receive_horizon);
+        assert_eq!(builder.tile_event_cycles(0).unwrap(), receive_horizon);
+        builder.finish().unwrap();
+    }
 
     #[test]
     fn validated_transfer_commits_its_encoded_trial_and_rejects_stale_trials() {

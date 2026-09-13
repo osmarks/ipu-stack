@@ -333,6 +333,25 @@ pub(super) fn validate_tile_program(
         ));
     }
 
+    let actual_bases = diagnostic
+        .instructions
+        .iter()
+        .filter_map(|i| match i.operation {
+            PlanOperation::WriteBase {
+                incoming: false, ..
+            } => Some((i.end_cycle, words[i.word_offset as usize])),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_bases = schedule
+        .receive_events
+        .iter()
+        .filter(|e| e.kind == ReceiveEventKind::OutgoingBase)
+        .map(|e| (e.cycles, e.instruction))
+        .collect::<Vec<_>>();
+    if actual_bases != expected_bases {
+        return Err(ExchangeError::Schedule("encoded outgoing base mismatch"));
+    }
     let mut actual_controls = Vec::new();
     let mut actual_sends = Vec::new();
     for instruction in &diagnostic.instructions {
@@ -364,8 +383,9 @@ pub(super) fn validate_tile_program(
     let mut expected_controls = schedule
         .receive_events
         .iter()
-        .map(|event| {
+        .filter_map(|event| {
             let control = match event.kind {
+                ReceiveEventKind::OutgoingBase => return None,
                 ReceiveEventKind::Pointer
                 | ReceiveEventKind::PairedPointer
                 | ReceiveEventKind::Format => IncomingControl {
@@ -381,7 +401,7 @@ pub(super) fn validate_tile_program(
                     value: (((event.instruction >> 13) & 1) << 13) | (event.instruction & 0x1fff),
                 },
             };
-            (event.cycles, control)
+            Some((event.cycles, control))
         })
         .collect::<Vec<_>>();
     expected_controls.sort_unstable_by_key(|entry| (entry.0, control_key(entry.1)));

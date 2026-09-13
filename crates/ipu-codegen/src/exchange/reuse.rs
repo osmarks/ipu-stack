@@ -6,16 +6,8 @@ use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct ExchangeScheduleCache {
-    phases: BTreeMap<(ExchangePhaseId, ScheduleSection), Arc<ScheduleRecipe>>,
+    phases: BTreeMap<ExchangePhaseId, Arc<ScheduleRecipe>>,
     pub(super) stream_words: Option<std::num::NonZeroU32>,
-}
-
-/// Independent recipes within one barrier-delimited exchange.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum ScheduleSection {
-    Combined,
-    Fixed,
-    Moving,
 }
 
 #[derive(Clone)]
@@ -36,6 +28,7 @@ fn structure_fingerprint(pending: &[PendingTransfer], tile_count: u16) -> u64 {
         transfer.source.hash(&mut hash);
         transfer.words.hash(&mut hash);
         transfer.source_addresses.len().hash(&mut hash);
+        transfer.moving_source().hash(&mut hash);
         transfer.destinations.len().hash(&mut hash);
         for &(tile, _) in &transfer.destinations {
             tile.hash(&mut hash);
@@ -105,17 +98,12 @@ impl ExchangeScheduleCache {
     pub(super) fn take_phase(&mut self, phase: ExchangePhaseId) -> Self {
         Self {
             stream_words: self.stream_words,
-            phases: [
-                ScheduleSection::Combined,
-                ScheduleSection::Fixed,
-                ScheduleSection::Moving,
-            ]
-            .into_iter()
-            .filter_map(|section| {
-                let key = (phase, section);
-                self.phases.remove(&key).map(|recipe| (key, recipe))
-            })
-            .collect(),
+            phases: self
+                .phases
+                .remove(&phase)
+                .map(|recipe| (phase, recipe))
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -130,27 +118,9 @@ impl ExchangeScheduleCache {
         pending: Vec<PendingTransfer>,
         tile_count: u16,
     ) -> Result<ScheduledPending, ExchangeLoweringError> {
-        self.select_section(
-            phase,
-            ScheduleSection::Combined,
-            topology,
-            pending,
-            tile_count,
-        )
-    }
-
-    pub(super) fn select_section(
-        &mut self,
-        phase: ExchangePhaseId,
-        section: ScheduleSection,
-        topology: &Topology,
-        pending: Vec<PendingTransfer>,
-        tile_count: u16,
-    ) -> Result<ScheduledPending, ExchangeLoweringError> {
-        let key = (phase, section);
         let pending = packet::split_self_receive_conflicts(topology, pending)?;
         let structure = structure_fingerprint(&pending, tile_count);
-        if let Some(recipe) = self.phases.get(&key)
+        if let Some(recipe) = self.phases.get(&phase)
             && recipe.structure == structure
         {
             match recipe.replay(topology, &pending, tile_count) {
@@ -175,7 +145,7 @@ impl ExchangeScheduleCache {
             self.stream_words,
         )?;
         self.phases.insert(
-            key,
+            phase,
             Arc::new(ScheduleRecipe {
                 structure,
                 widths: selected
