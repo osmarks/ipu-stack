@@ -283,11 +283,13 @@ mod tests {
 
     #[test]
     fn residual_fusion_keeps_repeat_carried_results() {
+        // Wide rows amortize the extra apply launch. The pipelined standalone
+        // add/norm kernels are faster than this fusion for 1152-column rows.
         let mut graph = ComputeGraph::new();
-        let x = graph.host_input("x", [4, 1152]).unwrap();
-        let r = graph.host_input("residual", [4, 1152]).unwrap();
-        let gamma = graph.parameter("gamma", [1, 1152]).unwrap();
-        let beta = graph.parameter("beta", [1, 1152]).unwrap();
+        let x = graph.host_input("x", [4, 9216]).unwrap();
+        let r = graph.host_input("residual", [4, 9216]).unwrap();
+        let gamma = graph.parameter("gamma", [1, 9216]).unwrap();
+        let beta = graph.parameter("beta", [1, 9216]).unwrap();
         let outputs = graph
             .repeat(3, [x, r], [gamma, beta], [], |body, args| {
                 let sum = body.add(args.carried[0], args.carried[1])?;
@@ -327,7 +329,7 @@ mod tests {
 
     #[test]
     fn live_residual_and_statistics_have_independent_allocations() {
-        let tensor = TensorType::new([4, 1152], Precision::F16, Layout::row_sharded(4));
+        let tensor = TensorType::new([4, 9216], Precision::F16, Layout::row_sharded(4));
         let mut program = MidProgram {
             tile_count: 4,
             ..MidProgram::default()
@@ -402,7 +404,7 @@ mod tests {
                 assert_eq!(run.additional_outputs.len(), 1);
                 assert_eq!(call.input_addresses.len(), 3);
                 assert_ne!(call.output_address, call.input_addresses[2]);
-                assert_eq!(call.arguments, vec![1, 1152]);
+                assert_eq!(call.arguments, vec![1, 9216]);
                 assert!(
                     call.input_addresses[..2]
                         .iter()
@@ -497,7 +499,7 @@ mod tests {
             )
             .unwrap();
             if run.kernel == (TileKernelSpec::LayerNormApply { parts: 2 }) {
-                assert_eq!(call.arguments, vec![2, 1152, 2]);
+                assert_eq!(call.arguments, vec![2, 9216, 2]);
                 applied += 1;
             }
         }

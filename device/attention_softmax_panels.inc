@@ -20,10 +20,8 @@
 	.macro SOFTMAX_EXP_PANEL
 	// Sum only eight nonnegative exponentials per FP16 lane (each <= 1),
 	// then accumulate the panel in FP32. Store the unchanged exponentials.
-	// Prime with zero accumulators so the discarded readout is finite.
+	// The caller clears accumulators once; previous panels leave finite values.
 	// MIX then returns each preceding quad while starting the next one.
-	setzi $a0, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
-	uput $FP_CLR, $a0
 	ld64step $a0:1, $mzero, $m3+=, 1
 	f16v4mix $a2:3, $a0:1, $a4:5
 	.rept 3

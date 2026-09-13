@@ -128,6 +128,8 @@
 	f32sub $a1, $azero, $a0
 	f32v2tof16 $a0, $a0:1
 	uput $TAS, $a0
+	setzi $a0, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
+	uput $FP_CLR, $a0
 	setzi $a6, 0
 	setzi $a7, 0
 	shr $m7, $m10, 4

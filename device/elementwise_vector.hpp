@@ -11,15 +11,20 @@ static inline void addQuads(const half *left, const half *right, half *output,
   right += worker * 4;
   output += worker * 4;
   const unsigned rounds = (quads + 5 - worker) / 6;
+  // Consume the old operands while loading the next quad. The final quad
+  // drains outside the repeat, without reading past the end of either input.
   asm volatile(
-      "{ rpt %[rounds], 3; fnop }\n"
       "{ ld64step $a0:1, $mzero, %[left]+=, 6; fnop }\n"
       "{ ld64step $a2:3, $mzero, %[right]+=, 6; fnop }\n"
-      "{ nop; f16v4add $a0:1, $a0:1, $a2:3 }\n"
-      "{ st64step $a0:1, $mzero, %[out]+=, 6; fnop }\n"
+      "{ rpt %[rounds], 2; fnop }\n"
+      "{ ld64step $a0:1, $mzero, %[left]+=, 6; f16v4add $a4:5, $a0:1, $a2:3 }\n"
+      "{ ld64step $a2:3, $mzero, %[right]+=, 6; fnop }\n"
+      "{ st64step $a4:5, $mzero, %[out]+=, 6; fnop }\n"
+      "{ nop; f16v4add $a4:5, $a0:1, $a2:3 }\n"
+      "{ st64step $a4:5, $mzero, %[out]+=, 6; fnop }\n"
       : [left] "+&r"(left), [right] "+&r"(right), [out] "+&r"(output)
-      : [rounds] "r"(rounds)
-      : "$a0:1", "$a2:3", "memory");
+      : [rounds] "r"(rounds - 1)
+      : "$a0:1", "$a2:3", "$a4:5", "memory");
 }
 
 #ifdef NORM_WITH_ADD
@@ -34,7 +39,8 @@ static inline void addQuads(const half *left, const half *right, half *output,
 
 // Accumulate aligned groups directly in FP32 AACC registers. Centering
 // remains FP32; only the sum pass consumes halves directly. GINA reads the
-// active lanes before any later kernel can reuse the accumulators.
+// active lanes before any later kernel can reuse the accumulators. Prime and
+// drain each pass so loads overlap arithmetic without reading a following group.
 static inline float2 normSumWide(const half *input, const half *right,
                                  unsigned width, unsigned worker, float mean,
                                  bool centered) {
@@ -50,8 +56,17 @@ static inline float2 normSumWide(const half *input, const half *right,
         "setzi $a0, (1 << 3)\n"
         "uput $FP_CLR, $a0\n"
         "mov $a6, %[mean]\n"
-        "{ rpt %[rounds], %[bundles]; fnop }\n"
         "{ ld64step $a4:5, $mzero, %[in]+=, 6; fnop }\n"
+#ifdef NORM_WITH_ADD
+        "{ ld64step $a0:1, $mzero, %[right]+=, 6; fnop }\n"
+        "{ nop; f16v4add $a4:5, $a4:5, $a0:1 }\n"
+#endif
+        "{ rpt %[rounds], %[bundles]; fnop }\n"
+        "{ nop; f16v2tof32 $a0:1, $a4 }\n"
+        "{ ld64step $a4:5, $mzero, %[in]+=, 6; f16v2tof32 $a2:3, $a5 }\n"
+        "{ nop; f32v2add $a0:1, $a6:B, $a0:1 }\n"
+        "{ nop; f32v2add $a2:3, $a6:B, $a2:3 }\n"
+        "{ nop; f32v4sqacc $a0:3 }\n"
 #ifdef NORM_WITH_ADD
         "{ ld64step $a0:1, $mzero, %[right]+=, 6; fnop }\n"
         "{ nop; f16v4add $a4:5, $a4:5, $a0:1 }\n"
@@ -66,14 +81,21 @@ static inline float2 normSumWide(const half *input, const half *right,
         "f32v2add $a0:1, $a0:1, $a2:3\n"
         "st64 $a0:1, %[sum], $mzero, 0\n"
         : [in] "+&r"(input), [right] "+&r"(right)
-        : [sum] "r"(&sum), [rounds] "r"(rounds), [mean] "r"(-mean), [bundles] "i"(5 + NORM_EXTRA_BUNDLES)
+        : [sum] "r"(&sum), [rounds] "r"(rounds - 1), [mean] "r"(-mean), [bundles] "i"(4 + NORM_EXTRA_BUNDLES)
         : "$a0:1", "$a2:3", "$a4:5", "$a6", "memory");
   } else {
     asm volatile(
         "setzi $a0, (1 << 3)\n"
         "uput $FP_CLR, $a0\n"
-        "{ rpt %[rounds], %[bundles]; fnop }\n"
         "{ ld64step $a0:1, $mzero, %[in]+=, 1; fnop }\n"
+        "{ ld64step $a2:3, $mzero, %[in]+=, 11; fnop }\n"
+#ifdef NORM_WITH_ADD
+        "{ ld64step $a4:5, $mzero, %[right]+=, 1; fnop }\n"
+        "{ ld64step $a6:7, $mzero, %[right]+=, 11; f16v4add $a0:1, $a0:1, $a4:5 }\n"
+        "{ nop; f16v4add $a2:3, $a2:3, $a6:7 }\n"
+#endif
+        "{ rpt %[rounds], %[bundles]; fnop }\n"
+        "{ ld64step $a0:1, $mzero, %[in]+=, 1; f16v8acc $a0:3 }\n"
         "{ ld64step $a2:3, $mzero, %[in]+=, 11; fnop }\n"
 #ifdef NORM_WITH_ADD
         "{ ld64step $a4:5, $mzero, %[right]+=, 1; fnop }\n"
@@ -90,7 +112,7 @@ static inline float2 normSumWide(const half *input, const half *right,
         "f32v2add $a0:1, $a0:1, $a2:3\n"
         "st64 $a0:1, %[sum], $mzero, 0\n"
         : [in] "+&r"(input), [right] "+&r"(right)
-        : [sum] "r"(&sum), [rounds] "r"(rounds), [bundles] "i"(2 + NORM_EXTRA_BUNDLES * 3 / 2)
+        : [sum] "r"(&sum), [rounds] "r"(rounds - 1), [bundles] "i"(1 + NORM_EXTRA_BUNDLES * 3 / 2)
         : "$a0:1", "$a2:3", "$a4:5", "$a6:7", "memory");
   }
   return sum;
@@ -234,13 +256,12 @@ static inline float2 normAddAndStore(const half *left, const half *right, half *
   asm volatile("setzi $a0, (1 << 3)\nuput $FP_CLR, $a0" : : : "$a0", "memory");
   if (rounds) {
     asm volatile(
-        "{ rpt %[rounds], 6; fnop }\n"
+        "{ rpt %[rounds], 5; fnop }\n"
         "{ ld64step $a0:1, $mzero, %[left]+=, 1; fnop }\n"
         "{ ld64step $a2:3, $mzero, %[left]+=, 11; fnop }\n"
         "{ ld64step $a4:5, $mzero, %[right]+=, 1; fnop }\n"
         "{ ld64step $a6:7, $mzero, %[right]+=, 11; f16v4add $a0:1, $a0:1, $a4:5 }\n"
-        "{ nop; f16v4add $a2:3, $a2:3, $a6:7 }\n"
-        "{ st64step $a0:1, $mzero, %[out]+=, 1; fnop }\n"
+        "{ st64step $a0:1, $mzero, %[out]+=, 1; f16v4add $a2:3, $a2:3, $a6:7 }\n"
         "{ st64step $a2:3, $mzero, %[out]+=, 11; f16v8acc $a0:3 }\n"
         : [left] "+&r"(left), [right] "+&r"(right), [out] "+&r"(output)
         : [rounds] "r"(rounds)

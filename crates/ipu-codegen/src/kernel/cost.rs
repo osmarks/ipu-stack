@@ -77,7 +77,7 @@ pub(crate) fn f16_packed_gemm_cycles(
     )
 }
 
-/// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 43
+/// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 41
 /// issue groups per full 16-key panel. Masked pairs and zero padding use short
 /// scalar loops; no tile program needs to be constructed to price them.
 fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
@@ -85,7 +85,9 @@ fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
         return 0;
     }
     let full_panels = keys / 16;
-    let mut row = 31u64.saturating_add(full_panels.saturating_mul(43));
+    let mut row = 31u64
+        .saturating_add(2 * u64::from(full_panels != 0))
+        .saturating_add(full_panels.saturating_mul(41));
     let launch = if keys == padded_keys {
         row = row.saturating_add(7);
         216u64
@@ -108,7 +110,7 @@ fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
 }
 
 // Three local stages: partial maxima, exponentials/partial sums, final sums.
-// A segment has ceil(padded_keys / 48) panels. 128 groups account for each
+// A segment has ceil(padded_keys / 48) panels. 130 groups account for each
 // segment's setup, row-state reductions, and address calculations; 408 cycles
 // cover the launches and 21 groups per final worker wave reduce the sums.
 fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
@@ -117,8 +119,8 @@ fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
     }
     let segment = padded_keys
         .div_ceil(48)
-        .saturating_mul(43)
-        .saturating_add(128);
+        .saturating_mul(41)
+        .saturating_add(130);
     408u64
         .saturating_add(rows.div_ceil(2).saturating_mul(6).saturating_mul(segment))
         .saturating_add(rows.div_ceil(6).saturating_mul(126))
@@ -242,8 +244,8 @@ fn gelu_row_cycles(elements: u64, bias: bool) -> u64 {
         .unwrap_or(0)
 }
 
-/// Four-half add: two 64-bit loads, one vector add and one store per
-/// six-worker wave. Repeated suffix broadcasts reset the pointers per row.
+/// Four-half add: two loads and one store per six-worker wave; arithmetic
+/// overlaps the next load. Setup includes priming and draining the pipeline. Repeated suffix broadcasts reset the pointers per row.
 /// Allocation bases are eight-byte aligned; irregular widths use the pair loop.
 pub(crate) fn f16_add_cycles(elements: u64, left: u64, right: u64) -> u64 {
     let width = left.min(right);
@@ -257,8 +259,8 @@ pub(crate) fn f16_add_cycles(elements: u64, left: u64, right: u64) -> u64 {
     {
         let rows = if dense { 1 } else { elements / width };
         let columns = if dense { elements } else { width };
-        492u64
-            .saturating_add(rows.saturating_mul(columns.div_ceil(24).saturating_mul(24)))
+        504u64
+            .saturating_add(rows.saturating_mul(columns.div_ceil(24).saturating_mul(18)))
             .saturating_add(rows.saturating_sub(1).saturating_mul(234))
     } else {
         450u64.saturating_add(elements.div_ceil(12).saturating_mul(54))
@@ -266,14 +268,15 @@ pub(crate) fn f16_add_cycles(elements: u64, left: u64, right: u64) -> u64 {
 }
 
 /// Mean and centered variance retain FP32 precision. Aligned full groups use
-/// F16V8ACC (3 bundles / 8 values) and F32V4SQACC (6 / 4). The fused variant
+/// pipelined F16V8ACC (2 bundles / 8 values) and F32V4SQACC (5 / 4). The fused variant
 /// adds three and two bundles respectively to read/add the residual operand.
 fn norm_statistics_work(width: u64, add: bool) -> u64 {
     if width >= 96 && width.is_multiple_of(8) {
         width
             .div_ceil(48)
-            .saturating_mul(if add { 36 } else { 18 })
-            .saturating_add(width.div_ceil(24).saturating_mul(if add { 48 } else { 36 }))
+            .saturating_mul(if add { 30 } else { 12 })
+            .saturating_add(width.div_ceil(24).saturating_mul(if add { 42 } else { 30 }))
+            .saturating_add(24) // Prime/drain both passes.
     } else {
         width.div_ceil(12).saturating_mul(if add { 72 } else { 48 })
     }
@@ -348,10 +351,10 @@ mod tests {
     fn elementwise_models_track_device_loops_and_row_setup() {
         // Independent direct-kernel measurements from elementwise_check.
         for (rows, width, norm, fused, moments, apply) in [
-            (1, 144, 2226u64, 2484u64, 1476u64, 1662u64),
-            (1, 576, 4332, 5184, 2286, 2958),
-            (1, 1152, 7140, 8784, 3366, 4686),
-            (3, 1152, 21162, 26088, 9846, 12510),
+            (1, 144, 2196u64, 2454u64, 1464u64, 1620u64),
+            (1, 576, 4140, 4992, 2112, 2916),
+            (1, 1152, 6732, 8376, 2976, 4644),
+            (3, 1152, 19938, 24864, 8676, 12468),
         ] {
             for (estimated, measured) in [
                 (f16_layernorm_cycles(rows, width, false), norm),
@@ -365,8 +368,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(f16_add_cycles(1728, 1728, 1728), 2220);
-        assert_eq!(f16_add_cycles(3456, 3456, 1152), 4416);
+        assert_eq!(f16_add_cycles(1728, 1728, 1728), 1800);
+        assert_eq!(f16_add_cycles(3456, 3456, 1152), 3564);
         assert_eq!(f16_layernorm_cycles(u64::MAX, u64::MAX, true), u64::MAX);
         assert_eq!(f16_layernorm_moments_cycles(u64::MAX, u64::MAX), u64::MAX);
         assert_eq!(f16_layernorm_apply_cycles(u64::MAX, u64::MAX, 2), u64::MAX);
@@ -375,7 +378,7 @@ mod tests {
     #[test]
     fn attention_row_models_match_hardware() {
         for rows in [7, 8] {
-            assert_eq!(f16_softmax_cycles(rows, 64, 64), 2736);
+            assert_eq!(f16_softmax_cycles(rows, 64, 64), 2664);
             assert_eq!(f16_softmax_cycles(rows, 25, 64), 2634);
             assert_eq!(
                 f16_attention_merge_cycles(rows, 72, true, false, false),
@@ -407,7 +410,7 @@ mod tests {
         for rows in [7, 8] {
             assert!(f16_softmax_split_rows(rows, 729, 768));
             // Uniform-input device measurements: 20,226 / 20,244 cycles.
-            assert_eq!(f16_softmax_cycles(rows, 729, 768), 20_244);
+            assert_eq!(f16_softmax_cycles(rows, 729, 768), 19_524);
         }
     }
 

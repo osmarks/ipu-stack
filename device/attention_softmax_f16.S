@@ -131,6 +131,8 @@ ATTENTION_SOFTMAX_SYMBOL:
 	f32sub $a1, $azero, $a4
 	f32v2tof16 $a0, $a0:1
 	uput $TAS, $a0
+	setzi $a0, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
+	uput $FP_CLR, $a0
 	mov $a4, $a2
 	mov $a5, $a2
 .Lsoftmax_exp_panel:
