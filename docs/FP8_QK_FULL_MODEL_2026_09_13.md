@@ -65,8 +65,9 @@ inference. All times below include the complete 27-layer model and MAP head.
 | QK implementation / cast placement | BS1 cycles | BS2 cycles |
 |---|---:|---:|
 | FP16 QK control | 10,131,456 | 16,746,138 |
-| FP8 QK, early Q only | 10,142,796 | pending |
-| FP8 QK, early K only | 10,462,992 | pending |
+| FP8 QK, both casts late | 10,303,668 | 16,880,580 |
+| FP8 QK, early Q only | 10,142,796 | 16,722,798 |
+| FP8 QK, early K only | 10,462,992 | 16,766,628 |
 | FP8 QK, early Q and K | 10,254,720 | 16,600,566 |
 | FP8 QK, eight-step search | 10,099,464 | pending |
 
@@ -77,11 +78,23 @@ replay with that MLP decision takes 10,088,124 cycles. FP8 QK is therefore
 0.11% slower with either MLP cast choice; the search gain came from the MLP,
 not QK quantization.
 
+The BS2 search first changed the MLP down-projection (operation 21) from a
+20x6x12 compute grid with a 1x12 result grid to 8x8x23 with a 23x1 result
+grid, opening output boundary 361. A matched FP16-QK replay takes 16,202,412
+cycles: 3.25% faster than the starting control. Subsequent search decisions
+and their final hardware timing are pending.
+
 In the controlled BS1 early-Q profile, the largest QK kernel falls from
 12,402 to 7,674 cycles (38.1% less). Its FP8 inner panel is padded to 96 rather
 than FP16's 80. Despite that padding, arithmetic is much faster. Casting and
 preparation offset the saving: the complete model is 0.11% slower. Kernel
 phase totals overlap and must not be summed to infer wall time.
+
+For BS2 the corresponding maximum QK kernel drops from 22,998 to 14,058
+cycles. Even before preparation, the kernel saving multiplied by 27 layers
+is only about 1.4% of the complete baseline runtime (about 1.3% for BS1).
+This is an approximate arithmetic contribution, not a prediction of the
+whole preparation/exchange/compute sequence.
 
 The default precision policy is unchanged. These results do not justify
 unconditionally enabling FP8 QK from its standalone kernel speed.
@@ -97,8 +110,10 @@ real-weight accuracy result is claimed. Both logs are retained in
 
 ## Artifacts
 
-- `bs1-search/model.html` and its adjacent data directory: searched BS1 profile.
+- `bs1-mlp-control/model.html`: improved FP16-QK BS1 control.
+- `bs1-search/model.html` and its adjacent data directory: searched FP8-QK BS1 profile.
 - `bs2-both/model.html`: controlled early-Q-and-K BS2 profile.
+- `bs2-mlp-control/model.html`: improved MLP layout with FP16 QK.
 - `bs1-q/attention.json` and `bs1-baseline-attention.json`: kernel comparison.
 - `results.json`: hardware status, numerical checks, cycles, and saved decisions.
 - Each build directory retains its build script, compiler log, package and
