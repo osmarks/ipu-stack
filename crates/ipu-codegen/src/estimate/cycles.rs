@@ -192,20 +192,25 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     kernel_launch_cycles: 11,
 };
 
-// Fragmented logical conversions spend most of their critical path changing
-// endpoints and receive pointers rather than moving payload. Current IPU21
-// schedules sustain about 160 event cycles per independent fragment once
-// routing and pointer cutovers are included. This is used to choose between a
-// direct word-fragment exchange and one local packed staging pass.
-pub(crate) const IPU21_LOGICAL_FRAGMENT_CYCLES: u64 = 160;
+// An ordinary receive needs source selection, neutralization and (unless
+// contiguous) a pointer write. These issue alongside the independent payload
+// stream, not as a route-latency penalty per fragment. Mid geometry cannot yet
+// prove pointer continuation; low geometry counts it explicitly.
+pub(crate) const EXCHANGE_FRAGMENT_CONTROLS: u64 = 3;
+
+// Resource-work estimate, not a conflict-free schedule or a guaranteed bound:
+// route latency, bank conflicts and dependency chains remain unpriced here.
+pub(crate) fn exchange_work_cycles(bytes: u64, controls: u64) -> u64 {
+    bytes
+        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+        .max(controls)
+}
 
 pub(super) fn exchange_endpoint_cycles(traffic: &ExchangeEndpointTraffic, phases: u64) -> u64 {
     if traffic.is_empty() || phases == 0 {
         return 0;
     }
-    traffic
-        .maximum_payload_bytes()
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
+    exchange_work_cycles(traffic.maximum_payload_bytes(), traffic.maximum_controls())
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles))
 }
 
@@ -214,9 +219,7 @@ pub(super) fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -
         return (0, 0);
     }
     let fragments = fragments.max(phases);
-    let cycles = bytes
-        .div_ceil(IPU21_TARGET_COSTS.exchange_bytes_per_cycle)
-        .max(fragments.saturating_mul(IPU21_LOGICAL_FRAGMENT_CYCLES))
+    let cycles = exchange_work_cycles(bytes, fragments.saturating_mul(EXCHANGE_FRAGMENT_CONTROLS))
         .saturating_add(phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles));
     let rows = ExchangeFootprint {
         phases,
@@ -498,6 +501,26 @@ mod tests {
             let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");
         }
+    }
+
+    #[test]
+    fn exchange_controls_overlap_payload_but_share_issue_slots() {
+        let mut traffic = ExchangeEndpointTraffic::default();
+        // Many short writes: source+neutral controls, one initial pointer.
+        traffic.add_receive(0, 400, 100, 1);
+        assert_eq!(exchange_endpoint_cycles(&traffic, 1), 600 + 201);
+        traffic.add_outgoing(0, 400, 100);
+        assert_eq!(exchange_endpoint_cycles(&traffic, 1), 600 + 401);
+        // A neighbor has its own TX lane and its own issue slots.
+        traffic.add_outgoing(1, 1600, 1);
+        assert_eq!(exchange_endpoint_cycles(&traffic, 1), 600 + 401);
+        // Strided writes require a pointer for each receive.
+        let mut strided = ExchangeEndpointTraffic::default();
+        strided.add_receive(0, 400, 100, 100);
+        assert_eq!(exchange_endpoint_cycles(&strided, 1), 600 + 300);
+        // Long payloads hide these control costs, rather than paying them serially.
+        strided.add_receive(0, 4000, 1, 1);
+        assert_eq!(exchange_endpoint_cycles(&strided, 1), 600 + 1100);
     }
 
     #[test]

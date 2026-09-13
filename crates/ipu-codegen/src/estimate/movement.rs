@@ -286,7 +286,20 @@ mod tests {
         );
         assert_eq!(
             cost.exchange_cycles,
-            888 * IPU21_LOGICAL_FRAGMENT_CYCLES + IPU21_TARGET_COSTS.exchange_phase_cycles
+            super::exchange_fragment_price(
+                conversion_traffic(
+                    &input.shape,
+                    input.format.precision,
+                    &input.format.layout,
+                    &output.format.layout
+                )
+                .unwrap()
+                .exchange
+                .maximum_payload_bytes(),
+                1,
+                888
+            )
+            .0
         );
         let local = Ipu21CostModel.rearrangement_cost(
             &input.shape,

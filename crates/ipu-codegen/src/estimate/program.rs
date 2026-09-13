@@ -162,11 +162,11 @@ pub(crate) fn program_cycles_analyzed(
             .exchange_phases
             .iter()
             .map(|phase| {
-                let traffic = geometry_traffic(program, phase, true, None, geometry)?;
-                let cycles = phase_cycles(&traffic);
+                let traffic = geometry_traffic(program, phase, None, geometry)?;
+                let cycles = super::cycles::exchange_endpoint_cycles(&traffic, 1);
                 tracing::debug!(phase = phase.id.index(), source = ?phase.provenance.operation,
                     bytes = traffic.maximum_payload_bytes(), fragments = traffic.maximum_fragments(),
-                    cycles, "estimated logical exchange");
+                    controls = traffic.maximum_controls(), cycles, "estimated logical exchange");
                 Ok(cycles)
             })
             .collect::<ExpansionResult<Vec<_>>>()?
@@ -230,14 +230,6 @@ pub(crate) fn program_cycles_analyzed(
     .cycles())
 }
 
-fn phase_cycles(traffic: &ExchangeEndpointTraffic) -> u64 {
-    super::cycles::exchange_endpoint_cycles(traffic, 1).max(
-        traffic
-            .maximum_fragments()
-            .saturating_mul(super::IPU21_LOGICAL_FRAGMENT_CYCLES),
-    )
-}
-
 /// Compare transport realizations with the same geometry and row accounting
 /// used by complete-plan costing. Row storage is per tile, before row sharing.
 pub(crate) fn exchange_phase_estimate(
@@ -246,21 +238,23 @@ pub(crate) fn exchange_phase_estimate(
     geometry: &mut GeometryAnalysis,
 ) -> ExpansionResult<(u64, Vec<u64>)> {
     let mut storage = ExchangeStoragePhase::new(program.tile_count);
-    geometry_traffic(program, phase, false, Some(&mut storage), geometry)?;
-    let traffic = geometry_traffic(program, phase, true, None, geometry)?;
-    Ok((phase_cycles(&traffic), storage.finish()))
+    let traffic = geometry_traffic(program, phase, Some(&mut storage), geometry)?;
+    Ok((
+        super::cycles::exchange_endpoint_cycles(&traffic, 1),
+        storage.finish(),
+    ))
 }
 
 fn geometry_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
-    shared_tx_lane: bool,
     mut storage: Option<&mut ExchangeStoragePhase>,
     geometry: &mut GeometryAnalysis,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
     #[cfg(test)]
     let mut expected_storage = storage.as_deref().cloned();
     let mut traffic = ExchangeEndpointTraffic::default();
+    let mut receive_end = vec![None; usize::from(program.tile_count)];
     for transfer in &phase.transfers {
         let source = &program.shards[transfer.source.shard.index() as usize];
         let order = transfer.span_order(&program.shards);
@@ -287,27 +281,33 @@ fn geometry_traffic(
             }
             outgoing_fragments = outgoing_fragments.max(copy.fragments);
             outgoing_long_fragments = outgoing_long_fragments.max(copy.long_fragments);
-            traffic.add_incoming(target.tile, bytes, copy.fragments);
+            // Relative allocation/offset identities expose pointer continuation
+            // without placement. This follows the supplied transfer order;
+            // scheduling can change that order, pairing and control overlap.
+            let mut resets = 0;
+            for row in &copy.receives {
+                let address = (u64::from(destination.shard.index()) << 32) + u64::from(row.offset);
+                let end = &mut receive_end[usize::from(target.tile)];
+                resets += u64::from(*end != Some(address))
+                    + u64::from(row.rows.saturating_sub(1)) * u64::from(row.stride != row.bytes);
+                *end = Some(
+                    address
+                        + u64::from(row.rows - 1) * u64::from(row.stride)
+                        + u64::from(row.bytes),
+                );
+            }
+            traffic.add_receive(target.tile, bytes, copy.fragments, resets);
         }
         if let Some(storage) = storage.as_deref_mut() {
             storage.send(source.tile, outgoing_fragments, outgoing_long_fragments);
         }
         // A multicast source is sent once, rather than once per receiver.
-        traffic.add_outgoing(
-            if shared_tx_lane {
-                source.tile / 2
-            } else {
-                source.tile
-            },
-            bytes,
-            outgoing_fragments,
-        );
+        traffic.add_outgoing(source.tile, bytes, outgoing_fragments);
     }
 
     #[cfg(test)]
     {
-        let expected =
-            enumerated_geometry_traffic(program, phase, shared_tx_lane, expected_storage.as_mut())?;
+        let expected = enumerated_geometry_traffic(program, phase, expected_storage.as_mut())?;
         assert_eq!(traffic, expected);
         assert_eq!(storage.as_deref(), expected_storage.as_ref());
     }
@@ -365,7 +365,7 @@ pub(crate) fn program_footprint_analyzed(
     let mut table = ExchangeStorageEstimator::new(program.tile_count);
     for phase in &program.exchange_phases {
         let mut storage = ExchangeStoragePhase::new(program.tile_count);
-        let traffic = geometry_traffic(program, phase, false, Some(&mut storage), geometry)?;
+        let traffic = geometry_traffic(program, phase, Some(&mut storage), geometry)?;
         for transfer in &phase.transfers {
             if iterated.contains(&transfer.source.shard) {
                 storage
@@ -394,10 +394,10 @@ pub(crate) fn program_footprint_analyzed(
 fn enumerated_geometry_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
-    shared_tx_lane: bool,
     mut storage: Option<&mut ExchangeStoragePhase>,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
     let mut traffic = ExchangeEndpointTraffic::default();
+    let mut receive_end = vec![None; usize::from(program.tile_count)];
     for transfer in &phase.transfers {
         let source = &program.shards[transfer.source.shard.index() as usize];
         let order = transfer.span_order(&program.shards);
@@ -408,6 +408,7 @@ fn enumerated_geometry_traffic(
         for destination in &transfer.destinations {
             let target = &program.shards[destination.shard.index() as usize];
             let mut fragments = 0u64;
+            let mut resets = 0;
             let mut long_fragments = 0u64;
             let target_spans = crate::view_byte_traversal(target, destination, order)?;
             {
@@ -415,6 +416,11 @@ fn enumerated_geometry_traffic(
                     source_spans.spans(),
                     target_spans.spans(),
                     |_, offset, bytes| {
+                        let address =
+                            (u64::from(destination.shard.index()) << 32) + u64::from(offset);
+                        let end = &mut receive_end[usize::from(target.tile)];
+                        resets += u64::from(*end != Some(address));
+                        *end = Some(address + u64::from(bytes));
                         if let Some(storage) = storage.as_deref_mut() {
                             let max_bytes = u64::from(ipu_exchange::MAX_TRANSFER_WORDS) * 4;
                             let mut remaining = u64::from(bytes);
@@ -445,21 +451,13 @@ fn enumerated_geometry_traffic(
             }
             outgoing_fragments = outgoing_fragments.max(fragments);
             outgoing_long_fragments = outgoing_long_fragments.max(long_fragments);
-            traffic.add_incoming(target.tile, bytes, fragments);
+            traffic.add_receive(target.tile, bytes, fragments, resets);
         }
         if let Some(storage) = storage.as_deref_mut() {
             storage.send(source.tile, outgoing_fragments, outgoing_long_fragments);
         }
         // A multicast source is sent once, rather than once per receiver.
-        traffic.add_outgoing(
-            if shared_tx_lane {
-                source.tile / 2
-            } else {
-                source.tile
-            },
-            bytes,
-            outgoing_fragments,
-        );
+        traffic.add_outgoing(source.tile, bytes, outgoing_fragments);
     }
 
     Ok(traffic)
@@ -580,7 +578,7 @@ mod tests {
         };
         repeat.count = 7;
         let contiguous = program_cycles(&program, None).unwrap();
-        program.exchange_phases[0].transfers = (0..64)
+        program.exchange_phases[0].transfers = (0..2048)
             .map(|i| {
                 transfer(vec![ShardExtent {
                     axis: 0,

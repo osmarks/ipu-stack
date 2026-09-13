@@ -18,8 +18,7 @@ pub(crate) use mid::{
 };
 pub(crate) use program::{
     ProgramCycles, exchange_phase_estimate, program_cycles, program_cycles_analyzed,
-    program_footprint_analyzed,
-    scheduled_program_cycles,
+    program_footprint_analyzed, scheduled_program_cycles,
 };
 mod movement;
 mod tensor;
@@ -34,7 +33,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub use cycles::{
     CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel, RearrangementCost,
 };
-pub(crate) use cycles::{IPU21_LOGICAL_FRAGMENT_CYCLES, MemoizedCostModel, row_major_pack_cycles};
+pub(crate) use cycles::{
+    EXCHANGE_FRAGMENT_CONTROLS, MemoizedCostModel, exchange_work_cycles, row_major_pack_cycles,
+};
 pub(crate) use memory::*;
 pub use memory::{MemoryPeaks, MemoryUsage};
 pub(crate) use tensor::*;

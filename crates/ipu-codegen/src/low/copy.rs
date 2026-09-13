@@ -350,9 +350,11 @@ impl CopyPlan {
         } else {
             0
         };
-        let fragment_cycles = fragments
-            .saturating_mul(crate::estimate::IPU21_LOGICAL_FRAGMENT_CYCLES)
-            .saturating_add(clear_cycles);
+        let fragment_cycles = crate::estimate::exchange_work_cycles(
+            bytes,
+            fragments.saturating_mul(crate::estimate::EXCHANGE_FRAGMENT_CONTROLS),
+        )
+        .saturating_add(clear_cycles);
         let pack_cycles = crate::estimate::row_major_pack_cycles(
             destination,
             bytes.div_ceil(destination.format.precision.bytes().max(1)),

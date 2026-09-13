@@ -15,13 +15,7 @@ pub(crate) struct ConversionTraffic {
 pub(crate) struct ExchangeEndpointLoad {
     pub bytes: u64,
     pub fragments: u64,
-}
-
-impl ExchangeEndpointLoad {
-    fn add(&mut self, bytes: u64, fragments: u64) {
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.fragments = self.fragments.saturating_add(fragments);
-    }
+    pub controls: u64,
 }
 
 /// Resource-indexed work for one or more transfers which share an exchange
@@ -49,11 +43,38 @@ impl ExchangeEndpointTraffic {
     }
 
     pub(crate) fn add_outgoing(&mut self, tile: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(&mut self.outgoing_lanes, tile, bytes, fragments);
+        add_endpoint_load(
+            &mut self.outgoing_lanes,
+            tile,
+            bytes,
+            fragments,
+            fragments.saturating_mul(2),
+        );
     }
 
     pub(crate) fn add_incoming(&mut self, tile: u16, bytes: u64, fragments: u64) {
-        add_endpoint_load(&mut self.incoming_tiles, tile, bytes, fragments);
+        self.add_receive(tile, bytes, fragments, fragments);
+    }
+
+    pub(crate) fn add_receive(&mut self, tile: u16, bytes: u64, fragments: u64, resets: u64) {
+        add_endpoint_load(
+            &mut self.incoming_tiles,
+            tile,
+            bytes,
+            fragments,
+            fragments.saturating_mul(2).saturating_add(resets),
+        );
+    }
+
+    pub(crate) fn maximum_controls(&self) -> u64 {
+        // TX/RX payload lanes are independent, but share supervisor issue slots.
+        (0..self.outgoing_lanes.len().max(self.incoming_tiles.len()))
+            .map(|i| {
+                self.outgoing_lanes.get(i).map_or(0, |l| l.controls)
+                    + self.incoming_tiles.get(i).map_or(0, |l| l.controls)
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     pub(crate) fn maximum_outgoing_bytes(&self) -> u64 {
@@ -103,20 +124,24 @@ impl ExchangeEndpointTraffic {
     }
 }
 
-pub(super) fn add_endpoint_load(
+fn add_endpoint_load(
     loads: &mut Vec<ExchangeEndpointLoad>,
     endpoint: u16,
     bytes: u64,
     fragments: u64,
+    controls: u64,
 ) {
-    if bytes == 0 && fragments == 0 {
+    if bytes == 0 && fragments == 0 && controls == 0 {
         return;
     }
     loads.resize(
         loads.len().max(usize::from(endpoint).saturating_add(1)),
         ExchangeEndpointLoad::default(),
     );
-    loads[usize::from(endpoint)].add(bytes, fragments);
+    let load = &mut loads[usize::from(endpoint)];
+    load.bytes = load.bytes.saturating_add(bytes);
+    load.fragments = load.fragments.saturating_add(fragments);
+    load.controls = load.controls.saturating_add(controls);
 }
 
 pub(crate) fn conversion_traffic(
