@@ -103,3 +103,76 @@ scratch. It requires a native-panel epilogue, not a missing switch for the
 existing BiasGeLU kernel. A whole-sequence hardware comparison is still needed
 to establish the speedup; the profile does not justify promising removal of an
 entire exchange phase's runtime.
+
+## Hardware experiment: FP16 final-reduction epilogue
+
+Implementation is preserved on branch `experiment/reduction-bias-gelu-20260913`.
+It is not enabled or retained as production code on `main`: this version did
+not improve the complete model's runtime.
+
+The prototype attaches `SumEpilogue::BiasGelu` to the mid sum, moves the bias to
+its owners, and dispatches `ReductionBiasGelu` only on the last reduction stage.
+The kernel streams native 16-column panels and shares the existing MIX GeLU
+macros. Alternating signed postincrements reuse the bias across rows. A later
+FP16 redistribution remains explicit; this experiment does **not** remove that
+conversion or integrate the following FP8 cast. Ownership rotation is disabled
+for sums with an epilogue because their bias placement must move with them.
+
+The normal cost comparison prefers the existing path. For the hardware
+experiment, `IPU_TRIAL_SUM_EPILOGUE=1` bypasses that comparison on the experiment
+branch. It also forces the small MAP-head epilogue, so the whole-model numbers
+include that change and resulting placement/schedule changes.
+
+| 27-layer BS1, frozen GEMM/search recipe | Cycles | Time at 1.5 GHz |
+|---|---:|---:|
+| Existing separate path | 10,131,456 | 6.754304 ms |
+| Forced final-reduction bias/GeLU | 10,158,156 | 6.772104 ms |
+
+The fused version is **0.264% slower**. Both resident inferences pass; minimum
+cosine against FP32 remains **0.994243808**, unchanged from the baseline.
+These are the renderer's cropped profile span, not the initial-sync-inclusive
+range. The benchmark uses randomized weights/inputs from the saved recipe;
+this experiment does not add another real-weight accuracy evaluation.
+
+The largest fused MLP call is 17,898 cycles in the full-model profile. The
+existing reduction and balanced standalone bias/GeLU calls reach 7,218 and
+8,556 cycles respectively. Fusion saves bias storage/traffic and a launch, but
+inherits the reduction's uneven 16/32-column work distribution and still needs
+the downstream redistribution. Its complete critical path does not improve.
+The exchange phase maxima also change; summing isolated kernel/exchange maxima
+is not a substitute for the measured model comparison.
+
+The kernel fixture covers 288 combinations of 1–82 rows, 16–64 columns,
+2/3/6/15 partials, and separate/in-place output. It checks guard words and
+poisoned accumulators. Every case is bit-exact against separate hardware
+reduction and bias/GeLU calls; maximum error against the mathematical host
+reference is 0.002014. In that fixture, the 82x32, six-partial case improved
+from 21,072 to 18,540 to 17,892 cycles by reusing bias addresses and hoisting
+repeat-count setup. Its final instruction model is:
+
+```
+288 + (columns / 16) * (222 + ceil(rows * 4 / 6) * 6 * (20 + partials))
+```
+
+This matches the fixture measurements; the full-package call differs by six
+cycles. The fixture's separate native-row GeLU baseline is deliberately not
+used as the model-performance baseline: it has much worse row setup overhead
+than the model's existing redistributed GeLU.
+
+Validation also includes the 83 mid tests, focused epilogue matching and
+last-stage lowering tests, and `cargo check --workspace`.
+
+Artifacts:
+
+- `artifacts/reduction-epilogue-20260913/forced/build.sh`: reproducible forced
+  full-model build, starting from the previous saved recipe.
+- `artifacts/reduction-epilogue-20260913/forced/model.html` and adjacent `.data/`:
+  rendered incremental runtime profile; `model.capnp` and `query.json` retain
+  the underlying measurements.
+- `artifacts/reduction-epilogue-20260913/forced/memory/`: placement profiles.
+- `artifacts/reduction-epilogue-20260913/kernel-hoist/measurements.json`: final
+  isolated-kernel cases and timings.
+
+A more complete experiment would need to eliminate or reduce the remaining
+conversion/cast, most plausibly by producing an appropriate FP8 consumer
+format. Merely attaching FP16 bias/GeLU to this reduction is not a speedup.
