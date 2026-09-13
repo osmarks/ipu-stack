@@ -105,6 +105,93 @@ fn grouped_ready_queue_matches_eager_priority() {
 }
 
 #[test]
+fn loopback_packet_boundaries_preserve_repeat_sources() {
+    for source in [0, 745, 1238, 1471] {
+        for width in [ExchangeItemWidth::Word32, ExchangeItemWidth::Paired64] {
+            for count in 1..=64 {
+                let mut destinations = vec![
+                    source,
+                    Topology::c600().paired_logical(source).unwrap(),
+                    0,
+                    1,
+                    1470,
+                    1471,
+                ];
+                destinations.sort_unstable();
+                destinations.dedup();
+                if width == ExchangeItemWidth::Paired64
+                    && Topology::c600()
+                        .paired_multicast(source, &destinations, count)
+                        .is_err()
+                {
+                    // Primitive paired controls already reject some short
+                    // lengths; production width selection retains ordinary TX.
+                    continue;
+                }
+                let problem = ExchangeScheduleProblem {
+                    phase: 0,
+                    transfers: vec![ExchangeScheduleTransfer {
+                        source,
+                        source_addresses: vec![0x65000, 0x75000],
+                        destinations: destinations
+                            .iter()
+                            .map(|&tile| ExchangeScheduleDestination {
+                                tile,
+                                address: 0x98000,
+                            })
+                            .collect(),
+                        words: count * width.item_words(),
+                        width,
+                    }],
+                };
+                let packets = packet::split_self_receive_conflicts(
+                    &Topology::c600(),
+                    pending_from_problem(1472, &problem).unwrap(),
+                )
+                .unwrap();
+                let mut offset = 0;
+                if source == 745 && width == ExchangeItemWidth::Word32 && count == 28 {
+                    assert_eq!(
+                        packets.len(),
+                        2,
+                        "the pretrained-plan regression must split"
+                    );
+                    let mut cache =
+                        ExchangeScheduleCache::with_stream_words(std::num::NonZeroU32::new(1024));
+                    let (selected, run) = cache.schedule_problem(1472, &problem).unwrap();
+                    validate_exchange_schedule(1472, &selected, &run.phase).unwrap();
+                    let mut relocated = problem.clone();
+                    for address in &mut relocated.transfers[0].source_addresses {
+                        *address += 0x100;
+                    }
+                    let (selected, run) = cache.schedule_problem(1472, &relocated).unwrap();
+                    assert!(run.reused);
+                    validate_exchange_schedule(1472, &selected, &run.phase).unwrap();
+                }
+                for p in &packets {
+                    assert_eq!(p.source_addresses, vec![0x65000 + offset, 0x75000 + offset]);
+                    assert_eq!(p.source_offset, offset);
+                    assert!(
+                        p.destinations
+                            .iter()
+                            .all(|&(_, address)| address == 0x98000 + offset)
+                    );
+                    offset += p.words * 4;
+                }
+                assert_eq!(offset, problem.transfers[0].words * 4);
+                let run = schedule_exchange_problem_with_priority(
+                    1472,
+                    &problem,
+                    ExchangeSchedulingPriority::BalancedStreams(1024),
+                )
+                .unwrap();
+                validate_exchange_schedule(1472, &problem, &run.phase).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn multicast_loopback_schedules_both_roles_and_rejects_bank_aliases() {
     for (words, width) in [
         (1, ExchangeItemWidth::Word32),
@@ -992,12 +1079,21 @@ fn repeat_base_selects_tile_local_displacements_with_exceptions() {
         (id(3), 0x70000),
     ]);
     let expected = vec![Some((id(0), 8)), Some((id(2), 8)), None, None];
-    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
+        expected
+    );
     transfers.reverse();
-    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
+        expected
+    );
     // A stationary send gets an inverse relocation patch on this tile.
     transfers.push(make(0, 3, 0x70008, 0));
-    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
+        expected
+    );
     // One stationary send can contain more encoded address words than both
     // moving sends. Keep zero base when inverse patches would cost more.
     assert_eq!(
@@ -1007,7 +1103,10 @@ fn repeat_base_selects_tile_local_displacements_with_exceptions() {
     transfers.pop();
     // An irregular exception is patched, not treated as sharing the base.
     transfers[2].source_addresses[2] += 4;
-    assert_eq!(repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4), expected);
+    assert_eq!(
+        repeat_outgoing_bases(&transfers, &vec![1; transfers.len()], &addresses, 4),
+        expected
+    );
     // A low stationary address prevents relative encoding on tile 0 alone.
     transfers.push(make(0, 3, 0x50008, 0));
     assert_eq!(

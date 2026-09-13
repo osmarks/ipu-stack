@@ -282,6 +282,18 @@ pub struct PreparedTransfer<'a> {
     receivers: Vec<ReceiveRowTiming>,
 }
 
+impl PreparedTransfer<'_> {
+    /// SENDPIC continues an existing send; it cannot establish its first
+    /// source address. A self-receive control at this event therefore needs
+    /// different packet boundaries, not a later whole-transfer offset.
+    pub fn receiver_conflicts_with_send_start(&self, receiver: usize) -> bool {
+        self.receivers[receiver]
+            .events
+            .iter()
+            .any(|event| event.cycles == self.sender.payload_start.saturating_add(1))
+    }
+}
+
 impl MulticastPlan {
     pub fn prepare(&self) -> Result<PreparedTransfer<'_>, ExchangeError> {
         Ok(PreparedTransfer {

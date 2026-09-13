@@ -117,6 +117,7 @@ impl ExchangeScheduleCache {
         pending: Vec<PendingTransfer>,
         tile_count: u16,
     ) -> Result<ScheduledPending, ExchangeLoweringError> {
+        let pending = packet::split_self_receive_conflicts(topology, pending)?;
         let structure = structure_fingerprint(&pending, tile_count);
         if let Some(recipe) = self.phases.get(&phase)
             && recipe.structure == structure

@@ -4,6 +4,7 @@ mod diagnostic;
 mod hazards;
 use hazards::MemoryHistory;
 mod order;
+mod packet;
 use diagnostic::PhaseDiagnostics;
 pub use diagnostic::diagnose_exchange_tile;
 use order::{critical_neighborhood_order, point_to_point_matching_wave_order};
@@ -1438,6 +1439,12 @@ pub fn validate_exchange_schedule(
     problem: &ExchangeScheduleProblem,
     phase: &PhysicalExchangePhase,
 ) -> Result<(), ExchangeLoweringError> {
+    let packets = packet::split_self_receive_conflicts(
+        &Topology::c600(),
+        pending_from_problem(tile_count, problem)?,
+    )?;
+    let normalized = schedule_problem(problem.phase, &packets);
+    let problem = &normalized;
     let fail = |message| ExchangeLoweringError::Invariant(message);
     let size = usize::from(tile_count);
     if phase.id.index() != problem.phase {

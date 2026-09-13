@@ -36,7 +36,10 @@ pub fn schedule_exchange_problem_with_priority(
             .map(ipu_exchange::c600_logical_to_physical)
             .collect(),
     )?;
-    let pending = pending_from_problem(tile_count, problem)?;
+    let pending = packet::split_self_receive_conflicts(
+        &topology,
+        pending_from_problem(tile_count, problem)?,
+    )?;
     let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count)?;
     let scheduling = SchedulingProblem::new(&pending, tile_count);
     let schedule = if let ExchangeSchedulingPriority::Streams(words)
