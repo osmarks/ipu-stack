@@ -118,12 +118,37 @@ impl TileGraphBuilder {
                     }
                     continue;
                 }
-                let initial = self.push_packed_buffer(
-                    owner.tile,
-                    elements,
-                    Precision::F16,
-                    ShardDefinition::Staging,
-                )?;
+                let seed = contributors
+                    .iter()
+                    .position(|view| self.shards[view.shard.index() as usize].tile == owner.tile)
+                    .unwrap_or(0);
+                let source_view = |partial: &ShardView| ShardView {
+                    shard: partial.shard,
+                    extents: intersection.clone(),
+                };
+                let seed_source = source_view(&contributors[seed]);
+                let seed_shard = &self.shards[seed_source.shard.index() as usize];
+                // A single-stage reduction only reads its accumulator. A local
+                // physical slice therefore needs no packed seed buffer. Later
+                // stages may overwrite it, so retain staging for those plans.
+                let direct_seed = reduction_stages == 1
+                    && seed_shard.tile == owner.tile
+                    && view_byte_traversal(seed_shard, &seed_source, CopyOrder::Physical)?
+                        .contiguous_span()
+                        .is_some_and(|span| {
+                            span.offset.is_multiple_of(8)
+                                && u64::from(span.bytes) == u64::from(elements) * 2
+                        });
+                let initial = if direct_seed {
+                    seed_source.shard
+                } else {
+                    self.push_packed_buffer(
+                        owner.tile,
+                        elements,
+                        Precision::F16,
+                        ShardDefinition::Staging,
+                    )?
+                };
                 let remote_elements = elements
                     .checked_mul(
                         u32::try_from(remote_partials_per_stage)
@@ -165,16 +190,10 @@ impl TileGraphBuilder {
                         ShardDefinition::Staging,
                     )?
                 };
-                let seed = contributors
-                    .iter()
-                    .position(|view| self.shards[view.shard.index() as usize].tile == owner.tile)
-                    .unwrap_or(0);
-                let source_view = |partial: &ShardView| ShardView {
-                    shard: partial.shard,
-                    extents: intersection.clone(),
-                };
-                let seed_source = source_view(&contributors[seed]);
-                if self.shards[contributors[seed].shard.index() as usize].tile == owner.tile {
+                if direct_seed {
+                    // The kernel reads the source view directly below.
+                } else if self.shards[contributors[seed].shard.index() as usize].tile == owner.tile
+                {
                     append_span_copies(
                         &self.cache,
                         &self.shards,
@@ -186,7 +205,7 @@ impl TileGraphBuilder {
                     )?;
                 } else {
                     reduction_transfers[0]
-                        .entry(seed_source)
+                        .entry(seed_source.clone())
                         .or_default()
                         .push(self.full_view(initial));
                 }
@@ -237,7 +256,11 @@ impl TileGraphBuilder {
                             },
                             vec![
                                 KernelOperand {
-                                    views: vec![self.full_view(accumulator)],
+                                    views: vec![if direct_seed {
+                                        seed_source.clone()
+                                    } else {
+                                        self.full_view(accumulator)
+                                    }],
                                 },
                                 KernelOperand {
                                     views: vec![self.full_view(remote)],

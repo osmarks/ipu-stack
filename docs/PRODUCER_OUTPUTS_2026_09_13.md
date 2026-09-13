@@ -31,3 +31,23 @@ Artifacts: `artifacts/producer-fp8-20260913/`. `bias-check/` has direct diagnost
 profile, exact memory placement and resident-reference validation for both
 execution locations. The saved layout is the earlier compatible BS1 recipe,
 with zero extra layout-search steps.
+
+## Reduction seed inspection
+
+`prepare_sum_partials` used to copy every local seed into a packed accumulator.
+A single-stage reduction only reads it. It now reads an eight-byte-aligned,
+contiguous local physical slice directly, keeping its original lifetime. Remote
+seeds still arrive into staging; fragmented slices and multiple stages retain
+the old path because subsequent stages may write the accumulator.
+
+The randomized reduction tests pass. With the same source-output-fusion recipe,
+the full resident model falls from 11,016,888 to 10,996,980 cropped cycles
+(0.18%); cosine is unchanged at 0.993916310. This includes scheduling, copies,
+exchanges and barriers, not just an isolated reducer. Artifacts: `seed-full/`.
+
+Final-output bypass already supports a contiguous slice in the contributors'
+physical order. It does not implement a new order or precision: the reducer
+adds physical arrays, and FP8 AMP-left combines pairs of FP16 panels. A final
+quantization/permutation epilogue must explicitly preserve those coordinates;
+changing the output pointer or precision alone would be incorrect. Remote
+partial staging remains necessary for this kernel's contiguous input ABI.
