@@ -497,8 +497,10 @@ fn emit_steps(
                 }
                 if !exchange.preserve_base_registers {
                     if let Some(base) = exchange.outgoing_base {
-                        emit_address(code, 8, base, repeat_pointer_count)?;
-                        code.put_special(OUTGOING_BASE, 8)?;
+                        // Keep the moving base available to timed row sections;
+                        // subsequent receive/down-count setup reuses m8.
+                        emit_address(code, 6, base, repeat_pointer_count)?;
+                        code.put_special(OUTGOING_BASE, 6)?;
                     } else {
                         code.put_special(OUTGOING_BASE, 15)?;
                     }
