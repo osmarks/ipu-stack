@@ -117,6 +117,11 @@ pub fn encode_put_special_m(special: u8, register: u8) -> Result<u32, ExchangeEr
     Ok(PUT_SPECIAL_M_OPCODE | (u32::from(register) << 20) | u32::from(special))
 }
 
+/// Timed-stream cost of an INCOMING_BASE or OUTGOING_BASE write. Verified by
+/// matching sender-side writes against receiver-side delays on IPU21: one PUT
+/// takes 13 cycles; SETZI followed by two PUTs takes 27 cycles.
+pub const EXCHANGE_BASE_WRITE_CYCLES: u32 = 13;
+
 pub fn encode_ld32_m_immediate(
     destination: u8,
     base: u8,

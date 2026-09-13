@@ -13,6 +13,7 @@ pub use replay::{
     ExchangeSchedulingPriority, schedule_exchange_problem, schedule_exchange_problem_with_priority,
 };
 mod reuse;
+mod sections;
 mod traffic;
 pub use reuse::ExchangeScheduleCache;
 pub(crate) use traffic::MappingTraffic;
@@ -23,8 +24,7 @@ use crate::{
 use ipu_exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
     RETURN_M10_INSTRUCTION, ScheduledPayloadTiming, Topology, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address, patch_sender_instruction,
-    sender_address_instruction_groups,
+    patch_receiver_address, patch_sender_address,
 };
 use ipu_package::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
@@ -55,7 +55,7 @@ pub struct PhysicalExchangePhase {
     /// structured-repeat iteration.
     pub repeat_patches: Vec<Vec<ExchangeRowPatch>>,
     /// Per-tile Repeat argument and byte offset supplying OUTGOING_BASE.
-    /// Present only when every sender in the phase has a uniform relocation.
+    /// Used throughout a row or by its moving-source section; retained in m6.
     pub outgoing_bases: Vec<Option<(BlockValueId, u32)>>,
 }
 
@@ -439,13 +439,15 @@ pub(crate) fn lower_exchanges_cached(
         .map(|(phase, cache)| {
             let _entered = span.enter();
             let pending = prepare_phase(program, placement, phase, &repeat_inputs)?;
+            let section_candidate = sections::has_mixed_sources(&pending, program.tile_count)
+                .then(|| pending.clone());
             let ScheduledPending {
                 pending,
                 receive_counts,
                 incoming_bases,
                 optimized,
             } = cache.select(phase.id, topology, pending, program.tile_count)?;
-            let schedule_problem = schedule_problem(phase.id.index(), &pending);
+            let mut schedule_problem = schedule_problem(phase.id.index(), &pending);
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
                 for &(tile, address) in &transfer.destinations {
@@ -550,101 +552,17 @@ pub(crate) fn lower_exchanges_cached(
                 );
             }
             let mut physical = schedule.into_phase(phase.id, incoming_bases)?;
-            let address_groups = physical
-                .programs
-                .iter()
-                .map(|program| sender_address_instruction_groups(program))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut patch_words = vec![0; pending.len()];
-            for (groups, activity) in address_groups.iter().zip(&physical.activities) {
-                let sends = activity
-                    .iter()
-                    .filter(|a| a.kind == ExchangeActivityKind::Send);
-                if groups.len() != sends.clone().count() {
-                    return Err(ExchangeLoweringError::IncompatibleRepeatRows(
-                        "send instruction groups do not match scheduled messages",
-                    ));
-                }
-                for (group, send) in groups.iter().zip(sends) {
-                    patch_words[send.transfer as usize] = group.len();
+            sections::relocate_repeat_rows(&mut physical, &pending, placement, &repeat_inputs)?;
+            if let Some(pending) = section_candidate {
+                match sections::try_separate(&physical, pending, placement, &repeat_inputs, topology, cache) {
+                    Ok(Some((sectioned, problem))) => {
+                        physical = sectioned;
+                        schedule_problem = problem;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::debug!(phase = phase.id.index(), %error, "fixed/moving exchange sections are not encodable"),
                 }
             }
-            physical.outgoing_bases = repeat_outgoing_bases(
-                &pending,
-                &patch_words,
-                &placement.shard_addresses,
-                program.tile_count,
-            );
-            physical.repeat_patches = physical
-                .programs
-                .iter_mut()
-                .enumerate()
-                .zip(address_groups)
-                .map(|((tile, program), address_groups)| {
-                    let sends = physical.activities[tile]
-                        .iter()
-                        .filter(|activity| activity.kind == ExchangeActivityKind::Send)
-                        .map(|activity| &pending[activity.transfer as usize])
-                        .collect::<Vec<_>>();
-                    let mut patches = Vec::new();
-                    let bases = physical.outgoing_bases[tile]
-                        .map(|(shard, offset)| {
-                            repeat_inputs[&shard]
-                                .iter()
-                                .map(|address| {
-                                    address
-                                        .checked_add(offset)
-                                        .ok_or(ExchangeLoweringError::Overflow)
-                                })
-                                .collect::<Result<Vec<_>, ExchangeLoweringError>>()
-                        })
-                        .transpose()?;
-                    for (instructions, transfer) in address_groups.into_iter().zip(sends) {
-                        if bases.is_none()
-                            && transfer
-                                .source_addresses
-                                .iter()
-                                .all(|&a| a == transfer.source_address())
-                        {
-                            continue;
-                        }
-                        let count = transfer
-                            .source_addresses
-                            .len()
-                            .max(bases.as_ref().map_or(1, Vec::len));
-                        for (word_offset, byte_offset) in instructions {
-                            let values = (0..count)
-                                .map(|i| {
-                                    let base = bases
-                                        .as_ref()
-                                        .map_or(0, |b| b.get(i).copied().unwrap_or(b[0]));
-                                    let address = repeat_source_address(transfer, i)
-                                        .checked_sub(base)
-                                        .and_then(|a| a.checked_add(byte_offset))
-                                        .ok_or(ExchangeLoweringError::Overflow)?;
-                                    let mut instruction = program[word_offset];
-                                    patch_sender_instruction(&mut instruction, address)?;
-                                    Ok(instruction)
-                                })
-                                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
-                            if bases.is_none() && values[0] != program[word_offset] {
-                                return Err(ExchangeLoweringError::IncompatibleRepeatRows(
-                                    "relocation changes the first iteration",
-                                ));
-                            }
-                            program[word_offset] = values[0];
-                            if values.iter().any(|&v| v != values[0]) {
-                                patches.push(ExchangeRowPatch {
-                                    word_offset: u32::try_from(word_offset)
-                                        .map_err(|_| ExchangeLoweringError::Overflow)?,
-                                    values,
-                                });
-                            }
-                        }
-                    }
-                    Ok(patches)
-                })
-                .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
             if pending.len() > 1_000 {
                 let (tile, words) = physical
                     .programs

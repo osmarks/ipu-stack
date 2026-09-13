@@ -4,6 +4,7 @@ use crate::{
     ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
     lower_to_tiles, place,
 };
+use ipu_exchange::{patch_sender_instruction, sender_address_instruction_groups};
 
 #[test]
 fn grouped_ready_queue_matches_eager_priority() {

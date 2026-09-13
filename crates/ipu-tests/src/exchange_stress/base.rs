@@ -124,12 +124,23 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             let address = 0x6d000 + case * 3 * stride + section * stride;
             let mut plan = if paired {
                 topology.paired_multicast(0, &destinations, words / 2)?
+            } else if destinations.len() == 1 {
+                let point = topology.point_to_point(0, destinations[0], words)?;
+                MulticastPlan {
+                    sender: point.sender,
+                    receivers: vec![finalize_point_receiver(
+                        &point.receiver,
+                        topology.physical(0)?,
+                    )?],
+                }
             } else {
                 topology.multicast(0, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, if relative { 0 } else { source_address })?;
-            for row in &mut plan.receivers {
-                patch_receiver_address(row, address)?;
+            if destinations.len() != 1 {
+                for row in &mut plan.receivers {
+                    patch_receiver_address(row, address)?;
+                }
             }
             let prepared = plan.prepare()?;
             let helpers = if paired {
@@ -170,14 +181,34 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         let grouped_address = row_address;
         let mut grouped_rows = Vec::new();
         for tile in 0..tiles {
-            use ipu_exchange::{encode_delay_m, encode_put_special_m};
+            use ipu_exchange::{encode_delay_m, encode_put_special_m, encode_setzi_m};
             // The package prologue leaves the moving base in m6.
             let mut row = vec![encode_delay_m(1)?, encode_delay_m(1)?];
             for (section, phase) in sections.iter().enumerate() {
-                row.extend([
-                    encode_put_special_m(0xa7, if section == 1 || tile != 0 { 15 } else { 6 })?,
-                    encode_delay_m(1)?,
-                ]);
+                if tile == 0 || destinations.len() == 1 {
+                    row.extend([
+                        encode_setzi_m(
+                            8,
+                            if destinations.len() == 1 {
+                                0x6d000 + case * 3 * stride + section as u32 * stride
+                            } else {
+                                0
+                            },
+                        )?,
+                        encode_put_special_m(0xa4, 8)?,
+                        encode_put_special_m(0xa7, if section == 1 || tile != 0 { 15 } else { 6 })?,
+                        encode_delay_m(1)?,
+                    ]);
+                } else {
+                    // SETZI + two base writes must match exactly 27 timed
+                    // cycles, not the ordinary scalar issue-rate estimate.
+                    row.extend([
+                        encode_delay_m(1)?,
+                        encode_delay_m(1)?,
+                        encode_delay_m(25)?,
+                        encode_delay_m(1)?,
+                    ]);
+                }
                 let mut body = phase.programs[usize::from(tile)]
                     .clone()
                     .unwrap_or_else(inactive_exchange_program);

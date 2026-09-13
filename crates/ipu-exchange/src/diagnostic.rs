@@ -31,6 +31,14 @@ pub enum SendEncoding {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanOperation {
     Delay,
+    SetImmediate {
+        register: u8,
+        value: u32,
+    },
+    WriteBase {
+        incoming: bool,
+        register: u8,
+    },
     IncomingControl(IncomingControl),
     Send {
         encoding: SendEncoding,
@@ -173,6 +181,28 @@ fn decode_operation(
     }
     if word & DELAY_OPCODE_MASK == DELAY_OPCODE {
         return Ok((PlanOperation::Delay, (word & 0x7_ffff) + 1, 1));
+    }
+    if word & 0xff00_0000 == SETZI_M_OPCODE {
+        return Ok((
+            PlanOperation::SetImmediate {
+                register: ((word >> 20) & 15) as u8,
+                value: word & 0xf_ffff,
+            },
+            1,
+            1,
+        ));
+    }
+    if word & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa4
+        || word & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa7
+    {
+        return Ok((
+            PlanOperation::WriteBase {
+                incoming: word & 0xff == 0xa4,
+                register: ((word >> 20) & 15) as u8,
+            },
+            EXCHANGE_BASE_WRITE_CYCLES,
+            1,
+        ));
     }
     if word & OPCODE_MASK == DELAY_PIC_OPCODE {
         let advance = ((word >> 19) & 0x7f) + 1;
