@@ -297,6 +297,9 @@ fn analyze_storage<const PER_TILE: bool>(
             live[roots[value.index() as usize]] = true;
         }
         let (price, scratch, row_bytes) = operation_cost(operation, &program.values)?;
+        tracing::debug!(index, source = ?operation.source, count,
+            cycles = price.total, exchange = price.exchange,
+            "estimated mid operation");
         cycles.total = cycles
             .total
             .saturating_add(price.total.saturating_mul(count));

@@ -163,7 +163,11 @@ pub(crate) fn program_cycles_analyzed(
             .iter()
             .map(|phase| {
                 let traffic = geometry_traffic(program, phase, true, None, geometry)?;
-                Ok(phase_cycles(&traffic))
+                let cycles = phase_cycles(&traffic);
+                tracing::debug!(phase = phase.id.index(), source = ?phase.provenance.operation,
+                    bytes = traffic.maximum_payload_bytes(), fragments = traffic.maximum_fragments(),
+                    cycles, "estimated logical exchange");
+                Ok(cycles)
             })
             .collect::<ExpansionResult<Vec<_>>>()?
     };
