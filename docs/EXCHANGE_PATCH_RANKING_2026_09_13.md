@@ -50,8 +50,9 @@ would increase patch work and because its full-source-address base cannot
 represent those lower stationary addresses.
 
 The patches are not one per high-level transfer. The 5,353 patched words belong
-to 1,568 weight messages: paired SENDPICP restarts explicitly encode the source
-address again and must be updated too. On the worst physical tile, 1180, just two
+to 1,568 weight messages: SENDPICP combines two receive-control updates with an outgoing
+send and explicitly encodes the source address again. These fields must be
+updated too. This is distinct from paired-tile transfer mode. On the worst physical tile, 1180, just two
 weight messages account for 87 patched words (64 and 23). Its weight source is
 621,848–625,432; the 135 activation messages use much lower scratch addresses
 and account for another 179 address-bearing words.
