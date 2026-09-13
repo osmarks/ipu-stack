@@ -133,3 +133,7 @@ including the corrected case and a new payload/control, pointer-continuation,
 and independent-neighbor test. Existing randomized geometry checks compare
 compressed receive-control counts against enumerated byte spans. Both full-model
 hardware/reference checks passed. No numerical kernels changed.
+
+Follow-up: [MIX bias–GeLU optimization](BIAS_GELU_MIX_2026_09_13.md) makes the
+fused kernel profitable and validates it on hardware. The rejection discussed
+above describes the older kernel.
