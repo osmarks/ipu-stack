@@ -243,6 +243,16 @@ GEMM_DISPATCH_SYMBOL:
 	.size GEMM_DISPATCH_SYMBOL, .-GEMM_DISPATCH_SYMBOL
 #elif !defined(GEMM_WORKER_ONLY)
 	// ABI: m2 output, m3 left, m4 right, m5 FP8 scale, m10 return.
+	.macro LOAD_RETAINED_WORKER entry, rows
+	// Plain-output workers retain their row counts. Avoid rechecking them
+	// when this specialization guarantees that all six workers are occupied.
+	.if (\rows >= 6) && (GEMM_OUTPUT_GROUP == 0)
+	setzi $m0, \entry\()_nonempty
+	.else
+	setzi $m0, \entry
+	.endif
+	.endm
+
 	.macro GEMM_SUPERVISOR name, initial, rows, worker, retained_output_worker, retained_inner_worker
 	.section .text.\name,"ax",@progbits
 	.globl \name
@@ -253,9 +263,9 @@ GEMM_DISPATCH_SYMBOL:
 	add $m11, $m11, -48
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
-	setzi $m0, \retained_output_worker
+	LOAD_RETAINED_WORKER \retained_output_worker, \rows
 	st32 $m0, $m11, $m15, 2
-	setzi $m0, \retained_inner_worker
+	LOAD_RETAINED_WORKER \retained_inner_worker, \rows
 	st32 $m0, $m11, $m15, 3
 	setzi $m0, \worker
 	st32 $m0, $m11, $m15, 4
@@ -289,6 +299,9 @@ GEMM_DISPATCH_SYMBOL:
 	.section .text.\name,"ax",@progbits
 	.worker
 	.globl \name, \retained_output_name, \retained_inner_name
+#if !GEMM_OUTPUT_GROUP
+	.globl \retained_output_name\()_nonempty, \retained_inner_name\()_nonempty
+#endif
 	.p2align 3
 \name:
 #if GEMM_OUTPUT_GROUP
@@ -325,11 +338,13 @@ GEMM_DISPATCH_SYMBOL:
 	add $m2, $m1, $m6
 	add $m3, $m9, 32
 	add $m8, $m5, -1
+	// m4 is free after row partitioning. Retain the panel stride across launches.
+	ld32 $m4, $mvertex_base, $m15, 11
 	bri .Lgemm_f16_load_mode_\@
 \retained_output_name:
 	brz $m5, .Lgemm_f16_no_rows_\@
-	ld32 $m7, $mvertex_base, $m15, 11
-	add $m9, $m9, $m7
+\retained_output_name\()_nonempty:
+	add $m9, $m9, $m4
 	add $m2, $m1, $m6
 	add $m3, $m9, 32
 	add $m8, $m5, -1
@@ -417,16 +432,18 @@ GEMM_DISPATCH_SYMBOL:
 	bri .Lpacked_rows_\@
 #else
 	brz $m5, .Lgemm_f16_no_rows_\@
+\retained_inner_name\()_nonempty:
 	// Every inner-group invocation after the first accumulates into the
 	// retained output. Place that entry immediately before the accumulate
 	// body so dispatch does not pay an additional branch for every panel.
-	ld32 $m7, $mvertex_base, $m15, 11
-	add $m2, $m2, $m7
+	add $m2, $m2, $m4
 #endif
 .Lf16_accumulate_\@:
 	setzi $a6, CLEAR_AACC
-	uput $FP_CLR, $a6
-	ld128 $a0:3, $m9, $m15, 0
+	{
+		ld128 $a0:3, $m9, $m15, 0
+		uput $FP_CLR, $a6
+	}
 	{
 		add $m2, $m2, 0
 		GEMM_AMP $a6:7, $azeros, $a0:1, GEMM_TAMP_P0

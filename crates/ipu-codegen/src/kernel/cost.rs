@@ -513,7 +513,7 @@ mod tests {
             (48, 240, 64, false, 35022u64),
             (48, 240, 64, true, 33102),
             (96, 64, 64, true, 12108),
-            (128, 64, 64, true, 19944),
+            (128, 64, 64, true, 19872),
         ] {
             let predicted = f16_packed_gemm_cycles(rows, inner, columns, interleaved);
             assert!(predicted.abs_diff(measured) * 100 < measured);
@@ -527,11 +527,15 @@ mod tests {
     #[test]
     fn gemm_tracks_hardware_across_row_and_group_counts() {
         for (rows, inner, columns, measured) in [
-            (184, 288, 48, 48654u64),
-            (182, 288, 48, 48180),
-            (184, 288, 32, 32538),
-            (146, 576, 32, 53718),
-            (120, 80, 272, 55344),
+            // 2026-09-13 hardware: shared workers retain stride and bypass
+            // empty-row checks where the specialization proves nonempty.
+            // FP8 K extents are halved to count the same physical AMP groups.
+            (244, 64, 64, 18576u64),
+            (82, 96, 160, 29508),
+            (122, 80, 128, 26232),
+            (81, 80, 80, 12402),
+            (146, 48, 48, 7122),
+            (56, 64, 80, 8076),
         ] {
             let predicted = interleaved_f16_gemm_cycles(rows, inner, columns);
             assert!(predicted.abs_diff(measured) * 100 < measured * 2);
