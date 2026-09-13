@@ -1,5 +1,5 @@
 //! One validated incumbent; bounded proposals replace it only after packaging.
-mod checkpoint;
+pub(super) mod checkpoint;
 
 use super::*;
 use crate::mid::baseline::{self, Baseline, Recipe};

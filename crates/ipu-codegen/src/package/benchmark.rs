@@ -5,6 +5,8 @@ use std::sync::Arc;
 #[derive(serde::Serialize)]
 pub struct ExpansionBenchmark {
     pub planning_ms: f64,
+    pub mid_cost_ms: f64,
+    pub mid_cycles: u64,
     /// Whole-process Linux RSS, including caches and allocator-retained pages.
     pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
     pub baseline: ExpansionTiming,
@@ -50,6 +52,9 @@ pub struct ExpansionTiming {
     pub mid_operations: usize,
     pub mid_values: usize,
     pub expand_ms: f64,
+    /// Re-costing an expanded graph with its populated geometry cache.
+    pub recost_ms: f64,
+    pub low_cycles: u64,
     pub tile_lists_ms: f64,
     pub footprint_ms: f64,
     pub estimated_row_bytes: u64,
@@ -68,7 +73,7 @@ pub struct ExpansionTiming {
     pub panel_mappings: usize,
 }
 
-/// Build and expand the canonical baseline. Timings include
+/// Build and expand the canonical baseline or a saved search recipe. Timings include
 /// tile graph simplification and its normal analytical costing, but exclude
 /// footprint screening, tile mapping, placement, physical transfer preparation,
 /// scheduling, linking, and destruction of each completed low plan.
@@ -79,9 +84,20 @@ pub fn benchmark_mid_expansion(
 ) -> PackageBuildResult<ExpansionBenchmark> {
     let mut memory = BTreeMap::from([("start", process_memory())]);
     let start = Instant::now();
-    let mid = lower_baseline(graph, config, &Ipu21CostModel)?;
+    let mid = if config.load_search_state.is_some() {
+        let state = super::local::checkpoint::State::load(graph, config, None)?;
+        let mut fixed = config.clone();
+        fixed.inputs = state.inputs;
+        crate::mid::baseline::lower(graph, &fixed, &Ipu21CostModel, &state.recipe)?.program
+    } else {
+        lower_baseline(graph, config, &Ipu21CostModel)?
+    };
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("mid", process_memory());
+    let start = Instant::now();
+    let (mid_cost, _) = crate::estimate::analyze_mid(&mid, &BTreeMap::new())
+        .ok_or_else(|| invalid("cannot cost benchmark mid program"))?;
+    let mid_cost_ms = start.elapsed().as_secs_f64() * 1000.0;
     let cache = Arc::new(if cache_enabled {
         crate::low::expand::ExpansionCache::default()
     } else {
@@ -148,6 +164,9 @@ pub fn benchmark_mid_expansion(
     let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("expanded", process_memory());
     let start = Instant::now();
+    let low_cost = crate::estimate::program_cycles_analyzed(&expanded, None, &mut analysis)?;
+    let recost_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let start = Instant::now();
     let footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
     let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("footprint", process_memory());
@@ -167,6 +186,8 @@ pub fn benchmark_mid_expansion(
         mid_operations: mid.operations.len(),
         mid_values: mid.values.len(),
         expand_ms,
+        recost_ms,
+        low_cycles: low_cost.total,
         tile_lists_ms,
         footprint_ms,
         estimated_row_bytes: footprint.estimated_row_bytes(),
@@ -197,6 +218,8 @@ pub fn benchmark_mid_expansion(
     tracing::info!(expand_ms, tile_lists_ms, "benchmarked mid-to-low expansion");
     Ok(ExpansionBenchmark {
         planning_ms,
+        mid_cost_ms,
+        mid_cycles: mid_cost.total,
         process_memory: memory,
         baseline: timing,
         fragment_cache: cache.stats(),

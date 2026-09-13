@@ -122,7 +122,7 @@ struct Arguments {
     /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     export_exchange_schedule: Option<PathBuf>,
-    /// Time canonical baseline selection and low expansion and write JSON; no placement or hardware.
+    /// Time baseline or saved-recipe selection, costing and low expansion; no placement or hardware.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run", "export_exchange_schedule", "capture_exchange_schedule"])]
     benchmark_expansion: Option<PathBuf>,
     /// Disable low-fragment caching for an expansion benchmark comparison.

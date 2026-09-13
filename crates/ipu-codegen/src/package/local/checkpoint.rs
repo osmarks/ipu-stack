@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-pub(super) struct State {
+pub(in crate::package) struct State {
     version: u32,
     context: String,
     pub recipe: Recipe,
