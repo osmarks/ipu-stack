@@ -99,14 +99,38 @@ whole preparation/exchange/compute sequence.
 The default precision policy is unchanged. These results do not justify
 unconditionally enabling FP8 QK from its standalone kernel speed.
 
-## BS2 real-weight limitation
+## BS2 real-weight validation
 
-The calibrated BS2 control, with QK still FP16, does not fit. At a 96 KiB
-exchange budget it needs 103,396 bytes on the worst tile; with 112 KiB allowed,
-placement fails for a 2,048-byte standard allocation on tile 740. This is a
-failure to place the real-weight baseline, not a failed cosine check. No BS2
-real-weight accuracy result is claimed. Both logs are retained in
-`real-bs2-baseline/` (`budget96.log` and `build.log`).
+All six images also pass in three batch-two invocations with resident
+parameters, encoder FP8 QK/PV, both Q/K casts early, and FP16 MAP QK.
+The verifier takes the minimum cosine of the two individual embeddings.
+
+| Image pair | Minimum FP32-reference cosine |
+|---|---:|
+| authors + siglip | 0.996363787 |
+| caffeine + robosign | 0.994959132 |
+| fried_fish + cow_beach2 | 0.996347857 |
+
+Maximum absolute error across these checks is 0.392955. As with BS1, the
+pretrained test uses calibrated GEMM scales and FP16 input projection; it is
+not the randomized performance package.
+
+The fresh calibrated BS2 control, with QK still FP16, initially failed. At a
+96 KiB exchange budget it needed 103,396 bytes on the worst tile; with
+112 KiB allowed, placement failed for a 2,048-byte standard allocation on
+tile 740. Both failed logs remain in `real-bs2-baseline/` (`budget96.log` and
+`build.log`).
+
+`prepare_real_bs2.py` instead transfers the successful BS2 MLP-control geometry
+to the calibrated precision policy. It preserves batch-two layouts, sets each
+GEMM's operand precision and parameter-input precision from the established
+calibration, retains FP16 image projection, and enables early encoder Q/K
+casts. It constructs the matching checkpoint context; the compiler's exact
+context check and normal lowering, scheduling, placement, and validation are
+unchanged. This recipe fits with the 112 KiB exchange budget and passes the
+hardware checks above. No allocator change or numerical-threshold relaxation
+was needed. Package/state/log are in `real-bs2/`; input manifests, independent
+FP32 references and raw device outputs are in `fixture-bs2/`.
 
 ## Artifacts
 
