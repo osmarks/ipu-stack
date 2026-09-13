@@ -120,3 +120,46 @@ runtime profile are in `artifacts/exchange-base-sections-20260913/bs2/`.
 
 Final checks: 289 codegen tests passed (5 ignored), 52 exchange tests passed
 (2 ignored), and `cargo check --workspace` passed.
+
+## Forcing the rejected BS1 splits
+
+A diagnostic build disabled only the horizon-improvement gate, retaining the
+mixed-source, dependency, and patch-reduction checks. All six additional phases
+were legal and eliminated their Repeat patches. Both resident checks passed
+with cosine 0.994352454. Production source and the release test executable were
+restored; this experiment does not change selection policy.
+
+Measured exchange durations below run from the last tile's profile entry to the
+last exit in the first profiled transformer layer. They include setup/patching
+and synchronization, unlike the scheduled event horizon.
+
+| Phase | Current measured cycles | Forced split cycles | Change | Scheduled change |
+|---|---:|---:|---:|---:|
+| 10, before QKV bias add | 2,526 | 2,550 | +24 | +21 |
+| 18, attention output-projection GEMM preparation | 5,712 | 5,598 | -114 | +1 |
+| 20, before output-projection bias add | 1,098 | 1,266 | +168 | +160 |
+| 22, before MLP layernorm | 2,814 | 2,940 | +126 | +156 |
+| 25, before BiasGeLU | 2,970 | 3,210 | +240 | +240 |
+| 29, before downprojection bias add | 1,104 | 1,284 | +180 | +182 |
+
+Five splits lose time even after accounting for patch removal. The combined
+schedule overlaps small parameter traffic with activation redistribution; forcing
+sections gives up some of this overlap. Particularly in phase 25, removing the
+patches yields no visible reduction in the time beyond the scheduled horizon,
+consistent with patch work already being hidden by other tiles' arrival waits.
+The larger losses cannot be explained by the removable 16-cycle entry prefix.
+
+Conversely, phase 18 shows the current gate is too conservative: a one-cycle
+increase in its scheduled horizon accompanies a 114-cycle measured improvement.
+
+Forcing all six makes the full cropped run 10,544,568 cycles / 7.029712 ms,
+versus 10,528,050 / 7.018700 ms with current selection: **0.157% slower**.
+It removes all remaining 365 Repeat patch words and 14 sharing patch words
+per layer. Thus always separating these phases has a small total runtime cost
+in this model, although separation is not uniformly beneficial.
+
+Artifacts: `artifacts/exchange-separation-rejections-20260913/` contains the
+captured combined/fixed/moving schedule comparisons, diagnostic executable,
+original source copy, forced package and resident outputs, emitted patch audit,
+and `hardware-comparison.json`. The source change for the diagnostic build was
+`if false && ...` on the horizon comparison in `exchange/sections.rs`.
