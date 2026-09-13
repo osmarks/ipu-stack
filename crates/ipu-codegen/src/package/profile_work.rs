@@ -85,7 +85,9 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             affine_issue_slots,
             "layernorm: normalization and affine arithmetic",
         ),
-        TileKernelSpec::BiasGelu => (logical, physical, 3.25, "bias add and GeLU arithmetic"),
+        // Vector path: bias add, clamp, square/cube, MIX, two tanhs and
+        // three final arithmetic issues. GACC is data movement.
+        TileKernelSpec::BiasGelu => (logical, physical, 2.75, "bias add and MIX GeLU arithmetic"),
         TileKernelSpec::AddLayerNorm => (
             logical,
             physical,

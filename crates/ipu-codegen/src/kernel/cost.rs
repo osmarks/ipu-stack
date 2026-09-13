@@ -188,11 +188,38 @@ pub(crate) fn f16_reduction_cycles(elements: u64, partials: u64) -> u64 {
 /// at most six worker spans, independent of tensor size or tile count. The
 /// tail setup conservatively covers the final worker's six-cycle exit skew.
 pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
+    gelu_row_cycles(elements, false)
+}
+
+pub(crate) fn f16_bias_gelu_cycles(rows: u64, width: u64) -> u64 {
+    if rows == 0 || width == 0 {
+        return 0;
+    }
+    // Worker setup repeats per row; supervisor entry and accumulator/TAS setup
+    // occur once. MIX retains the coefficients, freeing ARF registers for x+b.
+    // Allocation bases normally have eight-byte alignment. The kernel checks
+    // offset views at runtime and falls back to the narrow loop when needed.
+    let row = if width.is_multiple_of(4) {
+        450u64.saturating_add(width.div_ceil(24).saturating_mul(90))
+    } else {
+        gelu_row_cycles(width, true).saturating_add(36)
+    };
+    row.saturating_sub(222)
+        .saturating_mul(rows)
+        .saturating_add(222)
+}
+
+fn gelu_row_cycles(elements: u64, bias: bool) -> u64 {
+    let (aligned_block, block, pair, setup): (u64, u64, u64, u64) = if bias {
+        (516, 534, 138, 426)
+    } else {
+        (462, 480, 120, 330)
+    };
     if elements == 0 {
         return 0;
     }
     if elements.is_multiple_of(16) {
-        return 330u64.saturating_add(elements.div_ceil(96).saturating_mul(462));
+        return setup.saturating_add(elements.div_ceil(96).saturating_mul(aligned_block));
     }
     (0..6)
         .map(|worker| {
@@ -203,9 +230,13 @@ pub(crate) fn f16_gelu_cycles(elements: u64) -> u64 {
             let blocks = if pairs < 8 { 0 } else { (pairs - 8) / 48 + 1 };
             let tail = pairs.saturating_sub(blocks.saturating_mul(48));
             blocks
-                .saturating_mul(480)
-                .saturating_add(tail.saturating_mul(120))
-                .saturating_add(if tail == 0 { 330 } else { 342 })
+                .saturating_mul(block)
+                .saturating_add(tail.saturating_mul(pair))
+                .saturating_add(if tail == 0 {
+                    setup
+                } else {
+                    setup + if bias { 36 } else { 12 }
+                })
         })
         .max()
         .unwrap_or(0)
@@ -397,6 +428,25 @@ mod tests {
         assert_eq!(f16_reduction_cycles(48, 1), 0);
         assert_eq!(f16_reduction_cycles(0, 4), 0);
         assert_eq!(f16_reduction_cycles(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn bias_gelu_tracks_mix_kernel_and_row_tails() {
+        for (rows, width, measured) in [
+            (1, 16, 540),
+            (1, 94, 1458),
+            (1, 98, 1170),
+            (1, 1408, 5760),
+            (1, 2152, 8550),
+            (1, 2208, 8730),
+            (3, 94, 3942),
+            (3, 2152, 25206),
+            (3, 2208, 25746),
+        ] {
+            assert!(f16_bias_gelu_cycles(rows, width).abs_diff(measured) <= 6 * rows);
+        }
+        assert_eq!(f16_bias_gelu_cycles(0, 2152), 0);
+        assert_eq!(f16_bias_gelu_cycles(1, 0), 0);
     }
 
     #[test]

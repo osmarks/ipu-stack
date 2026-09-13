@@ -184,14 +184,10 @@ pub(crate) fn kernel_cycles<'a>(
         }
         TileKernelSpec::Add => elements.saturating_mul(3),
         TileKernelSpec::BiasGelu => {
-            return rows
-                .saturating_mul(
-                    crate::kernel::cost::f16_gelu_cycles(elements.checked_div(rows).unwrap_or(0))
-                        .saturating_sub(330)
-                        + 40,
-                )
-                .saturating_add(elements.saturating_mul(2))
-                .saturating_add(330);
+            return crate::kernel::cost::f16_bias_gelu_cycles(
+                rows,
+                elements.checked_div(rows).unwrap_or(0),
+            );
         }
         TileKernelSpec::AddLayerNorm | TileKernelSpec::LayerNorm => {
             return crate::kernel::cost::f16_layernorm_cycles(
