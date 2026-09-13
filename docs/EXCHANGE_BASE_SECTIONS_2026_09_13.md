@@ -74,6 +74,37 @@ in this layout. The package-support sizing pass reserves 43,732 exchange-table
 bytes versus 43,684 in the control; phase maxima above are measured per tile,
 not total traffic across the accelerator.
 
+For the two MLP exchanges, measured time after the last tile enters the phase,
+minus its scheduled horizon, falls from 1,572 to 278 cycles and from 2,049 to
+294 cycles. These residuals include setup and synchronization as well as patching;
+they are not isolated patch-loop measurements.
+
+There is a compiler-time cost: the BS1 package-planning pass increased from
+68.8 to 86.5 seconds at 16 Rayon threads. Mixed phases now evaluate the combined
+schedule and two section schedules; their recipes are cached across placement,
+but replay still rebuilds and validates each physical schedule.
+
+## BS2 validation
+
+The saved BS2 FP8-PV recipe also fits and passes two resident reference calls,
+with unchanged minimum FP32-reference cosine 0.994151272.
+
+| Metric | Combined control | Timed sections |
+|---|---:|---:|
+| Cropped runtime | 17,462,346 cycles | 17,198,316 cycles |
+| Batch time at 1.5 GHz | 11.641564 ms | 11.465544 ms |
+| Repeat patches per layer | 13,854 words | 1,049 words |
+| Largest Repeat patch list | 100 words | 15 words |
+| Cross-phase sharing patches per layer | 2,916 words | 2,916 words |
+| Largest sharing patch list inside Repeat | 1 word | 1 word |
+
+The runtime reduction is **1.51%**. Sections are selected for phases 16, 32,
+and 34. Their maximum row-size changes are +92, -68, and +28 bytes respectively.
+Package planning increased from 264.0 to 366.8 seconds at 16 Rayon threads.
+The control is `artifacts/profile-allocation-20260913/bs2-pv/model.ipuexe`;
+new package, reference outputs, patch audit, exact memory profile, and incremental
+runtime profile are in `artifacts/exchange-base-sections-20260913/bs2/`.
+
 ## Artifacts and checks
 
 - New package, resident tensors, raw and incremental HTML profile:
@@ -86,3 +117,6 @@ not total traffic across the accelerator.
 - Unit tests check section dependency ordering, all decoded event horizons,
   transfer hazards, active/inactive tiles, row alignment, transfer indices, and
   relocated patch-word offsets. The full exchange crate tests also pass.
+
+Final checks: 289 codegen tests passed (5 ignored), 52 exchange tests passed
+(2 ignored), and `cargo check --workspace` passed.
