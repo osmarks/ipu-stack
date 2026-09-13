@@ -1,6 +1,9 @@
 # Switching exchange bases without an extra synchronization
 
-The production scheduler can now put fixed-address transfers and moving Repeat
+Superseded by [one schedule with timed outgoing-base changes](EXCHANGE_BASE_AWARE_2026_09_13.md).
+The measurements below describe the earlier split-schedule implementation.
+
+That scheduler could put fixed-address transfers and moving Repeat
 sources into two timed sections of one exchange row. Both sections execute under
 the original global synchronization. There is no intervening worker launch,
 profile sample, or global barrier.
