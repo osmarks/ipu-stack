@@ -6,6 +6,7 @@ pub(crate) mod cast;
 mod copy;
 mod elementwise;
 pub mod optimistic;
+mod output_fusion;
 mod packing;
 mod residual;
 mod rewrite;

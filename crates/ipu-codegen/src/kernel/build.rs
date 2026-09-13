@@ -107,13 +107,18 @@ impl KernelBuildPlan {
                 });
             }
         }
-        if exact_symbols.contains("gelu_f8") {
-            plan.compilations.push(KernelCompilation {
-                source: "gelu_f8.S",
-                name: "gelu_f8".into(),
-                flags: vec![],
-                retained_symbols: vec!["gelu_f8".into()],
-            });
+        for (symbol, extra) in [
+            ("gelu_f8", None),
+            ("bias_gelu_f8", Some("-DGELU_WITH_BIAS")),
+        ] {
+            if exact_symbols.contains(symbol) {
+                plan.compilations.push(KernelCompilation {
+                    source: "gelu_f8.S",
+                    name: symbol.into(),
+                    flags: extra.into_iter().map(str::to_owned).collect(),
+                    retained_symbols: vec![symbol.into()],
+                });
+            }
         }
         if exact_symbols.contains("reduce_sum_f16") {
             plan.compilations.push(KernelCompilation {

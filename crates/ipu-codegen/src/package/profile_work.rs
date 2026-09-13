@@ -87,7 +87,16 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         ),
         // Vector path: bias add, clamp, square/cube, MIX, two tanhs and
         // three final arithmetic issues. GACC is data movement.
-        TileKernelSpec::BiasGelu => (logical, physical, 2.75, "bias add and MIX GeLU arithmetic"),
+        TileKernelSpec::BiasGelu => (
+            logical,
+            physical,
+            if matches!(precision, Precision::F8F143 { .. }) {
+                3.25
+            } else {
+                2.75
+            },
+            "bias add, MIX GeLU and optional FP8 conversion",
+        ),
         TileKernelSpec::AddLayerNorm => (
             logical,
             physical,

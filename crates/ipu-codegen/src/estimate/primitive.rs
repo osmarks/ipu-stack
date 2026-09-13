@@ -90,8 +90,15 @@ pub(crate) fn kernel_cycles<'a>(
             return u64::MAX;
         };
         let width = u64::from(input.trailing_dimension(0).unwrap_or(0));
+        if *kernel == TileKernelSpec::BiasGelu {
+            return crate::kernel::cost::fp8_bias_gelu_cycles(
+                input.elements().checked_div(width).unwrap_or(0),
+                width,
+                output.format().layout.order == ElementOrder::Amp(crate::AmpOrder::Left),
+            );
+        }
         return crate::kernel::cost::fp8_elementwise_cycles(
-            matches!(kernel, TileKernelSpec::Gelu),
+            matches!(kernel, TileKernelSpec::Gelu | TileKernelSpec::BiasGelu),
             input.elements().checked_div(width).unwrap_or(0),
             width,
             output.format().layout.order == ElementOrder::Amp(crate::AmpOrder::Left),

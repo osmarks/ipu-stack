@@ -1,33 +1,48 @@
 #define GELU_MACROS_ONLY
 #include "gelu_f16.S"
 
-// output, input, rows, width (multiple of four), scale, packed output, input row stride, output columns.
+// Plain ABI: output, input, rows, width, scale, packed, input stride, output columns.
+// Bias ABI: output, input, bias, rows, width, scale, packed, output columns.
+#ifdef GELU_WITH_BIAS
+#define FP8_GELU_SYMBOL bias_gelu_f8
+#else
+#define FP8_GELU_SYMBOL gelu_f8
+#endif
 .text
 .allow_optimizations
-.section .text.gelu_f8,"ax",@progbits
-.globl gelu_f8
+.section .text.FP8_GELU_SYMBOL,"ax",@progbits
+.globl FP8_GELU_SYMBOL
 .p2align 2
-.type gelu_f8,@function
-gelu_f8:
+.type FP8_GELU_SYMBOL,@function
+FP8_GELU_SYMBOL:
 .supervisor
 add $m11, $m11, -64
 st32 $m2, $m11, $m15, 0
 st32 $m3, $m11, $m15, 1
+#ifdef GELU_WITH_BIAS
+st32 $m4, $m11, $m15, 14
+st32 $m5, $m11, $m15, 2
+st32 $m6, $m11, $m15, 6
+st32 $m6, $m11, $m15, 8
+st32 $m8, $m11, $m15, 7
+sub $m6, 0, $m7
+#else
 st32 $m4, $m11, $m15, 2
-STORE_GELU_BOUNDS
-sub $m6, 0, $m6
-and $m6, $m6, 255
-st32 $m6, $m11, $m15, 5
 st32 $m5, $m11, $m15, 6
 st32 $m7, $m11, $m15, 7
 st32 $m8, $m11, $m15, 8
+sub $m6, 0, $m6
+#endif
+and $m6, $m6, 255
+st32 $m6, $m11, $m15, 5
 st32 $m9, $m11, $m15, 9
+STORE_GELU_BOUNDS
 setzi $m0, .Lfp8_gelu_worker
 runall $m0, $m11, 0
 sync SYNC_COMPUTE_SET
 add $m11, $m11, 64
 br $m10
-.size gelu_f8, .-gelu_f8
+.size FP8_GELU_SYMBOL, .-FP8_GELU_SYMBOL
 
 .macro GELU_FP8_QUAD offset, output_offset
 ld32 $a0, $m3, $m15, \offset
@@ -47,6 +62,12 @@ put 9, $a0
 ld32 $a0, $mvertex_base, $m15, 5
 put 10, $a0
 LOAD_GELU_CONSTANTS
+#ifdef GELU_WITH_BIAS
+ldconst $a0, GELU_MIX_COEFFICIENTS_F16X2
+uput $TAS, $a0
+setzi $a0, 1 << CSR_W_FP_CLR__ZAACC__SHIFT
+uput $FP_CLR, $a0
+#endif
 setzi $m1, 0
 ld32 $m7, $mvertex_base, $m15, 2
 .Lfp8_gelu_row:
@@ -61,6 +82,10 @@ and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
 shl $m4, $m4, 5
 shl $m0, $m4, 1
 add $m3, $m3, $m0
+#ifdef GELU_WITH_BIAS
+ld32 $m9, $mvertex_base, $m15, 14
+add $m9, $m9, $m0
+#endif
 ld32 $m2, $mvertex_base, $m15, 0
 ld32 $m0, $mvertex_base, $m15, 7
 brz $m0, .Lfp8_gelu_linear
@@ -69,14 +94,14 @@ add $m2, $m2, $m0
 shl $m0, $m1, 5
 add $m2, $m2, $m0
 setzi $m0, 192
-mul $m9, $m7, $m0
+mul $m5, $m7, $m0
 bri .Lfp8_gelu_loop
 .Lfp8_gelu_linear:
 ld32 $m0, $mvertex_base, $m15, 9
 mul $m0, $m1, $m0
 add $m2, $m2, $m0
 add $m2, $m2, $m4
-setzi $m9, 192
+setzi $m5, 192
 .Lfp8_gelu_loop:
 add $m0, $m4, 32
 cmpult $m6, $m8, $m0
@@ -90,7 +115,10 @@ GELU_FP8_QUAD 10, 5
 GELU_FP8_QUAD 12, 6
 GELU_FP8_QUAD 14, 7
 add $m3, $m3, 384
-add $m2, $m2, $m9
+#ifdef GELU_WITH_BIAS
+add $m9, $m9, 384
+#endif
+add $m2, $m2, $m5
 add $m4, $m4, 192
 bri .Lfp8_gelu_loop
 .Lfp8_gelu_tail:
@@ -98,6 +126,9 @@ cmpult $m6, $m4, $m8
 brz $m6, .Lfp8_gelu_padding
 GELU_FP8_QUAD 0, 0
 add $m3, $m3, 8
+#ifdef GELU_WITH_BIAS
+add $m9, $m9, 8
+#endif
 add $m2, $m2, 4
 add $m4, $m4, 4
 bri .Lfp8_gelu_tail
@@ -113,7 +144,7 @@ and $m0, $m4, 31
 brnz $m0, .Lfp8_gelu_zero
 // The next panel assigned to this worker is six panels ahead.
 add $m4, $m4, 160
-add $m2, $m2, $m9
+add $m2, $m2, $m5
 add $m2, $m2, -32
 bri .Lfp8_gelu_zero
 .Lfp8_gelu_next_row:

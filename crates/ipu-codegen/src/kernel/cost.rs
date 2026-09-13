@@ -325,6 +325,17 @@ pub(crate) fn f16_layernorm_apply_cycles(rows: u64, width: u64, parts: u16) -> u
     )
 }
 
+/// MIX bias-GeLU plus FP8 conversion, with worker-distributed 32-value panels.
+pub(crate) fn fp8_bias_gelu_cycles(rows: u64, width: u64, packed: bool) -> u64 {
+    330u64.saturating_add(
+        rows.saturating_mul(
+            198u64
+                .saturating_add(width.div_ceil(192).saturating_mul(1104))
+                .saturating_add(if packed { 12 } else { 0 }),
+        ),
+    )
+}
+
 /// Pair conversion stays in ARF and emits complete FP8 words. Packed LN
 /// needs separate address calculations when a tile owns several rows.
 pub(crate) fn fp8_elementwise_cycles(gelu: bool, rows: u64, width: u64, packed: bool) -> u64 {

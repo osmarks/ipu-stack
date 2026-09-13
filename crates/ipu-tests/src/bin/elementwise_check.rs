@@ -17,6 +17,8 @@ struct Arguments {
     sdk: PathBuf,
     #[arg(long)]
     fp8: bool,
+    #[arg(long, requires = "fp8")]
+    bias_gelu: bool,
     #[arg(long)]
     residual: bool,
     #[arg(long, default_value = "device")]
@@ -135,6 +137,9 @@ fn main() -> Result<()> {
         }
     }
     if args.fp8 {
+        if args.bias_gelu {
+            source += "#define GELU_WITH_BIAS\n";
+        }
         source += &format!(
             "#include \"{}\"\n",
             args.source.canonicalize()?.join("gelu_f8.S").display()
@@ -180,7 +185,7 @@ fn main() -> Result<()> {
                     }
                     let tile = programs.len() as u16;
                     let elements = width * rows;
-                    let input_stride = if mode == 8 || mode == 9 {
+                    let input_stride = if (mode == 8 || mode == 9) && !args.bias_gelu {
                         width.next_multiple_of(32) + 64
                     } else {
                         width
@@ -220,6 +225,8 @@ fn main() -> Result<()> {
                         .map(|(i, &x)| {
                             if mode == 3 || mode >= 10 {
                                 rounded(x + right[i])
+                            } else if args.bias_gelu && (mode == 8 || mode == 9) {
+                                rounded(x + beta[i % width as usize])
                             } else {
                                 x
                             }
@@ -391,6 +398,11 @@ fn main() -> Result<()> {
                             "layer_norm_f8",
                             vec![addresses[0], addresses[2], addresses[3]],
                             vec![rows, width, (-4i32) as u32, mode % 2],
+                        ),
+                        8 | 9 if args.bias_gelu => (
+                            "bias_gelu_f8",
+                            vec![addresses[0], addresses[3]],
+                            vec![rows, width, (-4i32) as u32, mode % 2, output_columns],
                         ),
                         8 | 9 => (
                             "gelu_f8",

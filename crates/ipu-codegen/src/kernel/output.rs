@@ -19,6 +19,7 @@ impl TileKernelSpec {
         }
         let (operands, complete_rows) = match self {
             Self::Gelu => (1, false),
+            Self::BiasGelu => (2, false),
             Self::LayerNorm => (3, true),
             _ => return None,
         };

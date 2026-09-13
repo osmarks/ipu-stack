@@ -1,5 +1,5 @@
 //! Fuse compatible whole-device primitives before physical expansion.
-use super::rewrite::{apply_edits, producer_through_copies, same_storage, single_use_producers};
+use super::rewrite::{apply_edits, same_storage, single_use_producers};
 use super::*;
 
 impl MidProgram {
@@ -24,7 +24,7 @@ fn fuse_region(
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
 ) -> bool {
-    let mut changed = fuse_fp8_outputs(operations, values, required);
+    let mut changed = false;
     for operation in &mut *operations {
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
             changed |= fuse_region(&mut repeat.body.operations, values, &repeat.body.yields);
@@ -148,267 +148,7 @@ fn fuse_region(
         changed = true;
     }
     apply_edits(operations, &removed, BTreeMap::new());
-    changed
-}
-
-// A producer may write a cast's explicit result when its F16 intermediate
-// has no other readers. Keep the separate path whenever it costs less.
-fn fuse_fp8_outputs(
-    operations: &mut Vec<MidOperation>,
-    values: &mut Vec<MidValue>,
-    required: &[MidValueId],
-) -> bool {
-    let mut removed = BTreeSet::new();
-    let mut preparation = BTreeMap::<usize, Vec<MidOperation>>::new();
-    for index in 0..operations.len() {
-        let cast = operations[index].clone();
-        if super::rewrite::fp8_cast(&cast, values).is_none() {
-            continue;
-        }
-        let Some((intermediate, previous, identity_copies)) =
-            producer_through_copies(cast.inputs[0], &operations[..index], values, false)
-        else {
-            continue;
-        };
-        if std::iter::once(intermediate)
-            .chain(identity_copies.iter().map(|&i| operations[i].results[0]))
-            .any(|value| {
-                required.contains(&value)
-                    || operations
-                        .iter()
-                        .filter(|op| op.read_values().any(|v| *v == value))
-                        .count()
-                        != 1
-            })
-        {
-            continue;
-        }
-        if removed.contains(&previous) {
-            continue;
-        }
-        let producer = operations[previous].clone();
-        let MidOperationKind::Primitive(Primitive::Compute {
-            kernel,
-            operands,
-            product: None,
-            ..
-        }) = &producer.kind
-        else {
-            continue;
-        };
-        let Some(capability) = kernel.output_capability(
-            values[cast.results[0].index() as usize]
-                .tensor_type
-                .format
-                .precision,
-        ) else {
-            continue;
-        };
-        if producer.inputs.len() != capability.operands
-            || operands.iter().any(|window| !window.0.is_empty())
-        {
-            continue;
-        }
-        let redistributed = !same_storage(
-            &values[intermediate.index() as usize],
-            &values[cast.inputs[0].index() as usize],
-        );
-        // Elementwise arithmetic commutes with coordinate-preserving distribution. Move its
-        // input through the existing copies and run the fused producer on the
-        // consumer's owners. LN additionally requires complete rows and affine copies.
-        if redistributed
-            && (producer.inputs.is_empty()
-                || !same_storage(
-                    &values[producer.inputs[0].index() as usize],
-                    &values[intermediate.index() as usize],
-                ))
-        {
-            continue;
-        }
-        let input = &values[if redistributed {
-            cast.inputs[0]
-        } else {
-            intermediate
-        }
-        .index() as usize];
-        let output = &values[cast.results[0].index() as usize];
-        tracing::debug!(target: "ipu_codegen::mid::elementwise", producer = ?producer.source,
-            consumer = ?cast.source, ?kernel, input_layout = ?input.tensor_type.format.layout,
-            output_layout = ?output.tensor_type.format.layout, "considering direct FP8 output");
-        if input.tile_offset != output.tile_offset
-            || input.tensor_type.format.layout.order != capability.input_order
-            || !capability
-                .output_orders
-                .contains(&output.tensor_type.format.layout.order)
-        {
-            continue;
-        }
-        let expected = if output.tensor_type.format.layout.order == ElementOrder::RowMajor {
-            Some(input.tensor_type.format.layout.clone())
-        } else {
-            input
-                .tensor_type
-                .fp8_producer_layout(&output.tensor_type.format)
-        };
-        if expected.is_none_or(|layout| {
-            !same_storage(
-                &MidValue {
-                    tensor_type: TensorType {
-                        shape: input.tensor_type.shape.clone(),
-                        format: TensorFormat {
-                            precision: output.tensor_type.format.precision,
-                            layout,
-                        },
-                    },
-                    ..input.clone()
-                },
-                output,
-            )
-        }) || input
-            .tensor_type
-            .format
-            .layout
-            .resolve(&input.tensor_type.shape)
-            .ok()
-            .and_then(|resolved| {
-                resolved
-                    .axes()
-                    .and_then(|a| a.last())
-                    .map(|a| a.extents_are_multiple_of(capability.column_multiple))
-            })
-            != Some(true)
-        {
-            continue;
-        }
-        // Parameter copies may intervene, provided they cannot overwrite inputs.
-        let groups = producer
-            .inputs
-            .iter()
-            .map(|v| values[v.index() as usize].storage_group)
-            .chain(
-                identity_copies
-                    .iter()
-                    .map(|&i| values[operations[i].results[0].index() as usize].storage_group),
-            )
-            .collect::<BTreeSet<_>>();
-        if operations[previous + 1..index]
-            .iter()
-            .enumerate()
-            .any(|(i, op)| {
-                !identity_copies.contains(&(previous + 1 + i))
-                    && (matches!(op.kind, MidOperationKind::Repeat(_))
-                        || op
-                            .results
-                            .iter()
-                            .any(|v| groups.contains(&values[v.index() as usize].storage_group)))
-            })
-        {
-            continue;
-        }
-        let mut replacement = producer.clone();
-        replacement.results = cast.results.clone();
-        if redistributed {
-            replacement.inputs = cast.inputs.clone();
-        }
-        replacement.kind = MidOperationKind::Primitive(Primitive::Compute {
-            kernel: kernel.clone(),
-            operands: operands.clone(),
-            product: None,
-            output_aliases: Vec::new(),
-        });
-        let mut new_values = values.clone();
-        let mut copies = vec![];
-        if redistributed {
-            // Row reductions require complete rows; pointwise families may
-            // move across column shards. Place every row parameter on the
-            // selected owners using the same broadcast rules as normal lowering.
-            let rank = input.tensor_type.shape.0.len();
-            let width = *input.tensor_type.shape.0.last().unwrap();
-            if capability.complete_rows
-                && input
-                    .tensor_type
-                    .format
-                    .layout
-                    .tiling
-                    .axes
-                    .iter()
-                    .any(|axis| {
-                        axis.axis.resolve(rank).is_err()
-                            || (axis.axis.resolve(rank) == Ok(rank - 1)
-                                && (axis.partitions != 1
-                                    || !width.is_multiple_of(axis.padding_multiple)
-                                    || !width.is_multiple_of(axis.shard_padding_multiple)))
-                    })
-            {
-                continue;
-            }
-            let mut legal = true;
-            for &parameter in &producer.inputs[1..] {
-                let old = &values[parameter.index() as usize];
-                let Some(tiling) =
-                    implementation::pointwise_input_tiling(&old.tensor_type, &input.tensor_type)
-                else {
-                    legal = false;
-                    break;
-                };
-                let mut value = old.clone();
-                value.tensor_type.format.layout.tiling = tiling;
-                value.tile_offset = input.tile_offset;
-                if same_storage(old, &value) {
-                    replacement.inputs.push(parameter);
-                    continue;
-                }
-                value.id = MidValueId(new_values.len() as u32);
-                value.storage_group = value.id;
-                copies.push(MidOperation {
-                    source: producer.source,
-                    inputs: vec![parameter],
-                    results: vec![value.id],
-                    kind: MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(old.tensor_type.format.clone()),
-                        output: OperandRequirement::new(value.tensor_type.format.clone()),
-                        strategy: ConversionStrategy::DirectRetile,
-                    }),
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
-                });
-                replacement.inputs.push(value.id);
-                new_values.push(value);
-            }
-            if !legal {
-                continue;
-            }
-        }
-        let copy_cost = copies.iter().try_fold(0u64, |total, op| {
-            crate::estimate::operation_cost(op, &new_values)
-                .map(|(cost, _, _)| total.saturating_add(cost.total))
-        });
-        let prices = crate::estimate::operation_cost(&producer, values)
-            .zip(crate::estimate::operation_cost(&cast, values))
-            .zip(crate::estimate::operation_cost(&replacement, &new_values));
-        if prices.is_none_or(|(((a, _, _), (b, _, _)), (c, _, _))| {
-            copy_cost.is_none_or(|extra| {
-                c.total.saturating_add(extra) >= a.total.saturating_add(b.total)
-            })
-        }) {
-            continue;
-        }
-        *values = new_values;
-        if !copies.is_empty() {
-            preparation.insert(index, copies);
-        }
-        if redistributed {
-            let first = *identity_copies.last().expect("redistribution has a copy");
-            operations[first].inputs[0] = producer.inputs[0];
-        } else {
-            removed.extend(identity_copies);
-        }
-        operations[index] = replacement;
-        removed.insert(previous);
-    }
-    let changed = !removed.is_empty();
-    apply_edits(operations, &removed, preparation);
-    changed
+    changed | super::output_fusion::fuse(operations, values, required)
 }
 
 // Shared with the optimistic regional search: known fusion is not a missing kernel.
@@ -574,6 +314,23 @@ mod tests {
             })
         ));
         let graph = crate::expand_tiles(&fused_norm).unwrap();
+        for run in &graph.kernel_runs {
+            crate::validate_kernel_run(run).unwrap();
+        }
+        let mut bias = norm.clone();
+        bias.operations[0].inputs.truncate(2);
+        bias.operations[0].kind = MidOperationKind::Primitive(Primitive::Compute {
+            kernel: TileKernelSpec::BiasGelu,
+            operands: vec![OperandWindow::default(); 2],
+            product: None,
+            output_aliases: vec![],
+        });
+        let fused_bias = bias.with_elementwise_fusions().unwrap();
+        assert_eq!(fused_bias.operations.len(), 3); // activation/bias copies + producer
+        let last = fused_bias.operations.last().unwrap();
+        assert_eq!(last.inputs.len(), 2);
+        assert_ne!(last.inputs[1], bias.operations[0].inputs[1]);
+        let graph = crate::expand_tiles(&fused_bias).unwrap();
         for run in &graph.kernel_runs {
             crate::validate_kernel_run(run).unwrap();
         }

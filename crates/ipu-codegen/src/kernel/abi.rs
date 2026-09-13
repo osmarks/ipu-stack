@@ -375,6 +375,18 @@ pub fn tile_kernel_abi(
                 3,
                 &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
             ),
+            TileKernelSpec::BiasGelu if matches!(precision, Precision::F8F143 { .. }) => (
+                KernelSymbols::Exact("bias_gelu_f8"),
+                KernelAvailability::Implemented,
+                2,
+                &[
+                    ScalarValue::InputRows,
+                    ScalarValue::InputColumns,
+                    ScalarValue::OutputScale,
+                    ScalarValue::PackedOutput,
+                    ScalarValue::PhysicalColumns,
+                ],
+            ),
             TileKernelSpec::BiasGelu => (
                 KernelSymbols::Exact("bias_gelu_f16"),
                 KernelAvailability::Implemented,
@@ -760,7 +772,8 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     if matches!(
         kernel,
         TileKernelSpec::BiasGelu | TileKernelSpec::AddLayerNorm
-    ) {
+    ) && !fp8_producer
+    {
         let width = matrix_extent(run, true, true)?;
         if !width.is_multiple_of(2)
             || width == 0
@@ -788,6 +801,17 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         {
             return Err(KernelAbiError::RequirementMismatch);
         }
+    }
+    if fp8_producer
+        && matches!(kernel, TileKernelSpec::BiasGelu)
+        && run.inputs[1].views[0]
+            .extents
+            .iter()
+            .map(|e| e.physical_end - e.start)
+            .product::<u32>()
+            != input_matrix_extent(run, true, true)?
+    {
+        return Err(KernelAbiError::RequirementMismatch);
     }
     if matches!(kernel, TileKernelSpec::Gelu) && !fp8_producer {
         let KernelSymbols::Exact(symbol) = abi.symbols else {
