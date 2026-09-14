@@ -411,13 +411,6 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
             )
         })
         .collect::<Vec<_>>();
-    let outputs = shards_by_tile(
-        program,
-        program
-            .outputs
-            .iter()
-            .flat_map(|output| program.value_shards(*output).iter().copied()),
-    );
     let mut lifetimes = vec![Lifetime::default(); program.shards.len()];
     for input in &program.inputs {
         for shard in program.value_shards(input.value) {
@@ -440,8 +433,10 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
                 &exchanges,
             );
         }
-        for shard in &outputs[usize::from(tile.tile)] {
-            // The host reads outputs only after device work has finished.
+    }
+    // The host reads every output only after device work has finished.
+    for output in &program.outputs {
+        for shard in program.value_shards(*output) {
             lifetimes[shard.index() as usize].touch(u32::MAX);
         }
     }
