@@ -1,3 +1,24 @@
+pub use ipu_target::c600::logical_to_physical as c600_logical_to_physical;
+pub use ipu_target::ipu21::fabric::Topology;
+use ipu_target::ipu21::fabric::{direction, paired_time_to_mux, time_to_mux};
+pub use ipu_target::ipu21::instruction::encode_delay_immediate as encode_exchange_delay;
+use ipu_target::ipu21::instruction::{DELAY_OPCODE, encode_delay_immediate as delay};
+use ipu_target::ipu21::registers::{
+    INCOMING_BASE, INCOMING_DCOUNT as INCOMING_DCOUNT_REGISTER,
+    INCOMING_MUX as INCOMING_MUX_REGISTER, OUTGOING_BASE,
+};
+pub use ipu_target::ipu21::registers::{TILE_MUX_EXCHANGE, TILE_MUX_HOST};
+// Compatibility exports. Instruction definitions belong to the target.
+use ipu_target::ipu21::instruction::{
+    PUT_SPECIAL_M_OPCODE, SYNC_OPCODE, put_special_from_m8, setzi_m,
+};
+pub use ipu_target::ipu21::instruction::{
+    RETURN_M10_INSTRUCTION, SANS_INACTIVE_INSTRUCTION, SYNC_ALL_INSTRUCTION, SYNC_ANS_INSTRUCTION,
+    SYNC_HOST_INSTRUCTION, SYNC_RECEIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, br_m,
+    encode_add_m_immediate, encode_and_m_immediate, encode_br_m, encode_brz_m_immediate,
+    encode_call_m_immediate, encode_delay_m, encode_ld32_m_immediate, encode_put_special_m,
+    encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate, sans, sync,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,22 +35,17 @@ pub mod diagnostic;
 pub const PLAN_WORDS: usize = 9;
 pub const MAX_TRANSFER_WORDS: u32 = 4148;
 /// Largest scheduled delay encodable by one exchange delay instruction.
-pub const MAX_PLAN_OFFSET_CYCLES: u32 = 0x8_0000;
-pub const EXCHANGE_WINDOW_BASE: u32 = 0x50000;
-pub const EXCHANGE_WINDOW_BYTES: u32 = 0x8000;
+pub const MAX_PLAN_OFFSET_CYCLES: u32 = ipu_target::ipu21::instruction::MAX_PROCESSOR_DELAY_CYCLES;
 pub const HOST_SHORT_MAX_BYTES: u32 = 60;
 pub const HOST_LONG_MAX_BYTES: u32 = 1024;
 pub const TILE_TO_HOST_MAX_BYTES: u32 = 256;
 pub const HOST_PAGE_BYTES: u32 = 4096;
 pub const HOST_TO_TILE_WINDOW_BYTES: u32 = 0x4000;
-pub const TILE_MUX_HOST: u32 = 0x600;
-pub const TILE_MUX_EXCHANGE: u32 = 0x640;
 const XREQ_BITMAP0_BITS: u32 = 24;
 
 const OPCODE_MASK: u32 = 0xfc00_0000;
 const LONG_OPCODE_MASK: u32 = 0xf800_0000;
 const DELAY_OPCODE_MASK: u32 = 0xfff8_0000;
-const DELAY_OPCODE: u32 = 0x40a0_0000;
 const DELAY_PIC_OPCODE: u32 = 0x6000_0000;
 const DELAY_XPIC_OPCODE: u32 = 0x6400_0000;
 const PIC_RECEIVE_ADDRESS_MASK: u32 = 0x3ffff;
@@ -43,20 +59,6 @@ const SEND_PICP_OPCODE: u32 = 0xf000_0000;
 const SEND_CONTROL_OPCODE_MASK: u32 = 0xf810_0000;
 const SEND_PICP_OPCODE_MASK: u32 = 0xf000_0000;
 const SEND_COUNT_MASK: u32 = 0x07e0_0000;
-const SYNC_OPCODE: u32 = 0x4180_0000;
-const SANS_OPCODE: u32 = 0x40c0_0000;
-const BR_M_OPCODE: u32 = 0x4300_0000;
-const CALL_M_IMMEDIATE_OPCODE: u32 = 0x1800_0000;
-const SETZI_M_OPCODE: u32 = 0x1900_0000;
-const PUT_SPECIAL_M_OPCODE: u32 = 0x4300_8000;
-const LD32_M_IMMEDIATE_OPCODE: u32 = 0x0100_0000;
-const ST32_M_IMMEDIATE_OPCODE: u32 = 0x4f00_0000;
-const ADD_M_IMMEDIATE_OPCODE: u32 = 0x2200_0000;
-const AND_M_IMMEDIATE_OPCODE: u32 = 0x4200_0000;
-const SHL_M_IMMEDIATE_OPCODE: u32 = 0x4200_a000;
-const BRZ_M_IMMEDIATE_OPCODE: u32 = 0x1300_0000;
-const INCOMING_MUX_REGISTER: u8 = 0xa0;
-const INCOMING_DCOUNT_REGISTER: u8 = 0xa6;
 // The host hierarchy reserves eighteen exchange events for each tile-to-host
 // payload. Short payloads must be padded before the next packet header (or the
 // closing zero-byte read); longer payloads provide the interval themselves.
@@ -66,160 +68,10 @@ const HOST_TO_TILE_STREAM_END_BITS: u32 = 0x0c00_0000;
 // command and injecting that command into the device-side dispatch path.
 const HOST_COMMAND_ROUTE_CYCLES: u32 = 73;
 
-pub const SANS_INACTIVE_INSTRUCTION: u32 = sans(0);
-pub const SYNC_RECEIVE_INSTRUCTION: u32 = sync(0);
-pub const SYNC_ANS_INSTRUCTION: u32 = sync(1);
-pub const SYNC_SUPERVISOR_INSTRUCTION: u32 = sync(3);
-pub const SYNC_ALL_INSTRUCTION: u32 = sync(7);
-pub const SYNC_HOST_INSTRUCTION: u32 = sync(15);
-pub const RETURN_M10_INSTRUCTION: u32 = br_m(10);
-
-pub const fn sans(selector: u8) -> u32 {
-    SANS_OPCODE | selector as u32
-}
-
-pub const fn sync(selector: u8) -> u32 {
-    SYNC_OPCODE | selector as u32
-}
-
-pub const fn br_m(register: u8) -> u32 {
-    BR_M_OPCODE | ((register as u32) << 20)
-}
-
-pub fn encode_br_m(register: u8) -> Result<u32, ExchangeError> {
-    if register >= 16 {
-        return Err(ExchangeError::Schedule("branch register"));
-    }
-    Ok(br_m(register))
-}
-
-pub fn encode_call_m_immediate(
-    return_register: u8,
-    target_address: u32,
-) -> Result<u32, ExchangeError> {
-    if return_register >= 16 || target_address & 3 != 0 || target_address >= 1 << 21 {
-        return Err(ExchangeError::Schedule("call operand"));
-    }
-    Ok(CALL_M_IMMEDIATE_OPCODE | (u32::from(return_register) << 20) | (target_address >> 2))
-}
-
-pub fn encode_setzi_m(register: u8, immediate: u32) -> Result<u32, ExchangeError> {
-    if register >= 16 || immediate >= 1 << 20 {
-        return Err(ExchangeError::Schedule("setzi operand"));
-    }
-    Ok(setzi_m(register, immediate))
-}
-
-pub fn encode_put_special_m(special: u8, register: u8) -> Result<u32, ExchangeError> {
-    if register >= 16 {
-        return Err(ExchangeError::Schedule("put source register"));
-    }
-    Ok(PUT_SPECIAL_M_OPCODE | (u32::from(register) << 20) | u32::from(special))
-}
-
 /// Timed-stream cost of an INCOMING_BASE or OUTGOING_BASE write. Verified by
 /// matching sender-side writes against receiver-side delays on IPU21: one PUT
 /// takes 13 cycles; SETZI followed by two PUTs takes 27 cycles.
 pub const EXCHANGE_BASE_WRITE_CYCLES: u32 = 13;
-
-pub fn encode_ld32_m_immediate(
-    destination: u8,
-    base: u8,
-    delta: u8,
-    word_offset: u16,
-) -> Result<u32, ExchangeError> {
-    if destination >= 16 || base >= 16 || delta >= 16 || word_offset >= 1 << 12 {
-        return Err(ExchangeError::Schedule("ld32 operand"));
-    }
-    Ok(LD32_M_IMMEDIATE_OPCODE
-        | (u32::from(base) << 20)
-        | (u32::from(destination) << 16)
-        | (u32::from(delta) << 12)
-        | u32::from(word_offset))
-}
-
-pub fn encode_st32_m_immediate(
-    source: u8,
-    base: u8,
-    delta: u8,
-    word_offset: u16,
-) -> Result<u32, ExchangeError> {
-    if source >= 16 || base >= 16 || delta >= 16 || word_offset >= 1 << 12 {
-        return Err(ExchangeError::Schedule("st32 operand"));
-    }
-    Ok(ST32_M_IMMEDIATE_OPCODE
-        | (u32::from(base) << 20)
-        | (u32::from(source) << 16)
-        | (u32::from(delta) << 12)
-        | u32::from(word_offset))
-}
-
-pub fn encode_add_m_immediate(
-    destination: u8,
-    source: u8,
-    immediate: i32,
-) -> Result<u32, ExchangeError> {
-    let immediate =
-        i16::try_from(immediate).map_err(|_| ExchangeError::Schedule("add immediate operand"))?;
-    if destination >= 16 || source >= 16 {
-        return Err(ExchangeError::Schedule("add register operand"));
-    }
-    Ok(ADD_M_IMMEDIATE_OPCODE
-        | (u32::from(source) << 20)
-        | (u32::from(destination) << 16)
-        | u32::from(immediate as u16))
-}
-
-pub fn encode_and_m_immediate(
-    destination: u8,
-    source: u8,
-    immediate: u16,
-) -> Result<u32, ExchangeError> {
-    if destination >= 16 || source >= 16 || immediate >= 1 << 12 {
-        return Err(ExchangeError::Schedule("and operand"));
-    }
-    Ok(AND_M_IMMEDIATE_OPCODE
-        | (u32::from(source) << 20)
-        | (u32::from(destination) << 16)
-        | u32::from(immediate))
-}
-
-pub fn encode_shl_m_immediate(
-    destination: u8,
-    source: u8,
-    immediate: u16,
-) -> Result<u32, ExchangeError> {
-    if destination >= 16 || source >= 16 || immediate >= 1 << 12 {
-        return Err(ExchangeError::Schedule("shift-left operand"));
-    }
-    Ok(SHL_M_IMMEDIATE_OPCODE
-        | (u32::from(source) << 20)
-        | (u32::from(destination) << 16)
-        | u32::from(immediate))
-}
-
-pub fn encode_brz_m_immediate(register: u8, target_address: u32) -> Result<u32, ExchangeError> {
-    if register >= 16 || target_address & 3 != 0 || target_address >= 1 << 21 {
-        return Err(ExchangeError::Schedule("brz operand"));
-    }
-    Ok(BRZ_M_IMMEDIATE_OPCODE | (u32::from(register) << 20) | (target_address >> 2))
-}
-
-/// Encodes a processor delay of `cycles` cycles.
-pub fn encode_delay_m(cycles: u32) -> Result<u32, ExchangeError> {
-    if !(1..=MAX_PLAN_OFFSET_CYCLES).contains(&cycles) {
-        return Err(ExchangeError::Schedule("processor delay range"));
-    }
-    Ok(delay(cycles - 1))
-}
-
-const fn setzi_m(register: u8, immediate: u32) -> u32 {
-    SETZI_M_OPCODE | ((register as u32) << 20) | immediate
-}
-
-const fn put_special_from_m8(register: u8) -> u32 {
-    PUT_SPECIAL_M_OPCODE | (8 << 20) | register as u32
-}
 
 pub type PlanRow = [u32; PLAN_WORDS];
 
@@ -386,7 +238,7 @@ impl PhaseProgramBuilder {
     /// Receive payload can continue while the supervisor writes OUTGOING_BASE.
     /// Future RX controls may fill earlier gaps, but cannot occupy this write.
     pub fn switch_outgoing_base(&mut self, tile: u16, register: u8) -> Result<(), ExchangeError> {
-        let instruction = encode_put_special_m(0xa7, register)?;
+        let instruction = encode_put_special_m(OUTGOING_BASE, register)?;
         self.staged = None;
         let state = self
             .tile_states
@@ -769,7 +621,7 @@ impl PhaseProgramBuilder {
                     horizon: timing.horizon,
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, ExchangeError>>()?;
         let horizon = receiver_timings
             .iter()
             .map(|timing| timing.horizon)
@@ -811,7 +663,7 @@ impl PhaseProgramBuilder {
                 diagnostic::validate_tile_program(tile, schedule, &program)?;
                 Ok(Some(program))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, ExchangeError>>()?;
         Ok(PhasePrograms {
             programs,
             tile_event_cycles,
@@ -2113,8 +1965,8 @@ fn is_neutral_mux_teardown(instruction: u32) -> bool {
 fn instruction_advance(instruction: u32) -> u32 {
     if instruction & DELAY_OPCODE_MASK == DELAY_OPCODE {
         (instruction & 0x7_ffff) + 1
-    } else if instruction & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa7
-        || instruction & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa4
+    } else if instruction & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | u32::from(OUTGOING_BASE)
+        || instruction & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | u32::from(INCOMING_BASE)
     {
         EXCHANGE_BASE_WRITE_CYCLES
     } else {
@@ -2252,6 +2104,7 @@ pub fn assemble_host_xreq_program_for_targets(
 }
 
 pub fn assemble_host_command_read_program(
+    window_base: u32,
     packet_address: u32,
     destination_address: u32,
     host_offset: u32,
@@ -2259,7 +2112,7 @@ pub fn assemble_host_command_read_program(
     if packet_address & 7 != 0 {
         return Err(ExchangeError::HostPacket);
     }
-    let request = host_to_tile_packet(0, destination_address, host_offset, 4)?;
+    let request = host_to_tile_packet(window_base, 0, destination_address, host_offset, 4)?;
     let mut instructions = vec![
         setzi_m(8, TILE_MUX_HOST),
         put_special_from_m8(INCOMING_MUX_REGISTER),
@@ -2284,13 +2137,14 @@ pub fn assemble_host_command_read_program(
 }
 
 pub fn assemble_host_to_tile_target_program(
+    window_base: u32,
     physical_tile: u16,
     tile_address: u32,
     host_offset: u32,
     bytes: u32,
     packet_address: u32,
 ) -> Result<TileToHostProgram, ExchangeError> {
-    let chunks = plan_host_to_tile(physical_tile, tile_address, host_offset, bytes)?;
+    let chunks = plan_host_to_tile(window_base, physical_tile, tile_address, host_offset, bytes)?;
     if packet_address & 7 != 0 {
         return Err(ExchangeError::HostPacket);
     }
@@ -2340,11 +2194,6 @@ pub struct MulticastPlan {
     pub receivers: Vec<PlanRow>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Topology {
-    logical_to_physical: Vec<u16>,
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExchangeError {
     #[error("exchange incremental-encoding work budget exhausted")]
@@ -2369,20 +2218,42 @@ pub enum ExchangeError {
     HostPacket,
 }
 
+impl From<ipu_target::ipu21::instruction::InstructionError> for ExchangeError {
+    fn from(error: ipu_target::ipu21::instruction::InstructionError) -> Self {
+        Self::Schedule(error.0)
+    }
+}
+
+impl From<ipu_target::ipu21::fabric::TopologyError> for ExchangeError {
+    fn from(error: ipu_target::ipu21::fabric::TopologyError) -> Self {
+        match error {
+            ipu_target::ipu21::fabric::TopologyError::Tile(tile) => Self::Tile(tile),
+            ipu_target::ipu21::fabric::TopologyError::InvalidMapping => Self::ReceiverSet,
+        }
+    }
+}
+
+/// Resolve the packet's window-relative 32-byte address. The caller supplies
+/// the window configured for its runtime; packet encoding does not place it.
+fn host_exchange_address(window_base: u32, address: u32) -> Result<u32, ExchangeError> {
+    let offset = address
+        .checked_sub(window_base)
+        .ok_or(ExchangeError::HostPacket)?;
+    if window_base & 31 != 0 || offset & 31 != 0 || offset >= HOST_TO_TILE_WINDOW_BYTES {
+        return Err(ExchangeError::HostPacket);
+    }
+    Ok(offset >> 5)
+}
+
 pub fn host_to_tile_packet(
+    window_base: u32,
     physical_tile: u16,
     tile_address: u32,
     host_offset: u32,
     bytes: u32,
 ) -> Result<HostPacketHeader, ExchangeError> {
     validate_host_tile(physical_tile)?;
-    if tile_address < EXCHANGE_WINDOW_BASE || tile_address & 31 != 0 {
-        return Err(ExchangeError::HostPacket);
-    }
-    let exchange_address = (tile_address - EXCHANGE_WINDOW_BASE) >> 5;
-    if tile_address >= EXCHANGE_WINDOW_BASE + HOST_TO_TILE_WINDOW_BYTES {
-        return Err(ExchangeError::HostPacket);
-    }
+    let exchange_address = host_exchange_address(window_base, tile_address)?;
     let size = host_packet_size(host_offset, bytes)?;
     let opcode = match size {
         HostPacketSize::Short => 0xcc00_0200,
@@ -2412,17 +2283,12 @@ pub fn tile_to_host_packet(
 }
 
 pub fn zero_byte_read_packet(
+    window_base: u32,
     physical_tile: u16,
     dummy_tile_address: u32,
 ) -> Result<HostPacketHeader, ExchangeError> {
     validate_host_tile(physical_tile)?;
-    if dummy_tile_address < EXCHANGE_WINDOW_BASE || dummy_tile_address & 31 != 0 {
-        return Err(ExchangeError::HostPacket);
-    }
-    let exchange_address = (dummy_tile_address - EXCHANGE_WINDOW_BASE) >> 5;
-    if dummy_tile_address >= EXCHANGE_WINDOW_BASE + HOST_TO_TILE_WINDOW_BYTES {
-        return Err(ExchangeError::HostPacket);
-    }
+    let exchange_address = host_exchange_address(window_base, dummy_tile_address)?;
     Ok(HostPacketHeader {
         word0: 0xcc00_0200 | host_route_word0(physical_tile) | exchange_address,
         word1: host_route_word1(physical_tile),
@@ -2430,6 +2296,7 @@ pub fn zero_byte_read_packet(
 }
 
 pub fn plan_host_to_tile(
+    window_base: u32,
     physical_tile: u16,
     tile_address: u32,
     host_offset: u32,
@@ -2443,7 +2310,7 @@ pub fn plan_host_to_tile(
         host_offset,
         bytes,
         HOST_LONG_MAX_BYTES,
-        |tile, host, count| host_to_tile_packet(physical_tile, tile, host, count),
+        |tile, host, count| host_to_tile_packet(window_base, physical_tile, tile, host, count),
     )
 }
 
@@ -2466,6 +2333,7 @@ pub fn plan_tile_to_host(
 }
 
 pub fn assemble_tile_to_host_target_program(
+    window_base: u32,
     physical_tile: u16,
     tile_address: u32,
     host_offset: u32,
@@ -2484,7 +2352,7 @@ pub fn assemble_tile_to_host_target_program(
     let close_address = packet_address
         .checked_add(u32::try_from(packet_words.len() * 4).map_err(|_| ExchangeError::HostPacket)?)
         .ok_or(ExchangeError::HostPacket)?;
-    let close = zero_byte_read_packet(physical_tile, command_address)?;
+    let close = zero_byte_read_packet(window_base, physical_tile, command_address)?;
     packet_words.extend([close.word0, close.word1]);
     Ok(TileToHostProgram {
         instructions: tile_to_host_target_instructions(&chunks, packet_address, close_address)?,
@@ -2684,306 +2552,251 @@ fn host_route_word1(physical_tile: u16) -> u32 {
     u32::from(physical_tile & 1) << 31
 }
 
-impl Topology {
-    pub fn new(logical_to_physical: Vec<u16>) -> Result<Self, ExchangeError> {
-        let mut physical = HashSet::new();
-        if logical_to_physical.is_empty()
-            || logical_to_physical
-                .iter()
-                .any(|tile| !physical.insert(*tile))
-        {
-            return Err(ExchangeError::ReceiverSet);
-        }
-        Ok(Self {
-            logical_to_physical,
+/// Builds an SDK-compatible double-width multicast. Receivers must be
+/// complete physical tile pairs; both members consume the same 64-bit
+/// item stream.
+pub fn paired_multicast(
+    topology: &Topology,
+    sender_logical: u16,
+    receivers: &[u16],
+    count: u32,
+) -> Result<MulticastPlan, ExchangeError> {
+    validate_count(count)?;
+    if receivers.is_empty() || receivers.len() & 1 != 0 {
+        return Err(ExchangeError::ReceiverSet);
+    }
+    let receiver_set = receivers.iter().copied().collect::<HashSet<_>>();
+    if receiver_set.len() != receivers.len()
+        || receivers.iter().any(|&receiver| {
+            topology
+                .paired_logical(receiver)
+                .map_or(true, |paired| !receiver_set.contains(&paired))
         })
+    {
+        return Err(ExchangeError::ReceiverSet);
     }
 
-    pub fn c600() -> Self {
-        Self {
-            logical_to_physical: (0..1472).map(c600_logical_to_physical).collect(),
-        }
-    }
-
-    pub fn tile_count(&self) -> usize {
-        self.logical_to_physical.len()
-    }
-
-    pub fn physical(&self, logical: u16) -> Result<u16, ExchangeError> {
-        self.logical_to_physical
-            .get(usize::from(logical))
-            .copied()
-            .ok_or(ExchangeError::Tile(logical))
-    }
-
-    /// Logical tile that shares this tile's double-width exchange resources.
-    pub fn paired_logical(&self, logical: u16) -> Result<u16, ExchangeError> {
-        let paired_physical = self.physical(logical)? ^ 2;
-        self.logical_to_physical
-            .iter()
-            .position(|physical| *physical == paired_physical)
-            .map(|paired| u16::try_from(paired).expect("logical tile count fits u16"))
-            .ok_or(ExchangeError::Tile(logical))
-    }
-
-    /// Physical source selected by `INCOMING_MUXPAIR` for a 64-bit send.
-    pub fn paired_source_mux(&self, sender_logical: u16) -> Result<u16, ExchangeError> {
-        Ok(self.physical(sender_logical)? ^ 2)
-    }
-
-    /// Whether this member of a double-width receiving pair owns the paired
-    /// XPIC source-selection stream. This matches the SDK architecture
-    /// helper `TPair_RxIsEarly`.
-    pub fn paired_receiver_is_early(
-        &self,
-        receiver_logical: u16,
-        sender_logical: u16,
-    ) -> Result<bool, ExchangeError> {
-        let receiver = u32::from(self.physical(receiver_logical)?);
-        let sender = u32::from(self.physical(sender_logical)?);
-        let local = time_to_mux(sender, receiver);
-        let borrowed = time_to_mux(sender, receiver ^ 2);
-        Ok(local < borrowed)
-    }
-
-    /// Builds an SDK-compatible double-width multicast. Receivers must be
-    /// complete physical tile pairs; both members consume the same 64-bit
-    /// item stream.
-    pub fn paired_multicast(
-        &self,
-        sender_logical: u16,
-        receivers: &[u16],
-        count: u32,
-    ) -> Result<MulticastPlan, ExchangeError> {
-        validate_count(count)?;
-        if receivers.is_empty() || receivers.len() & 1 != 0 {
-            return Err(ExchangeError::ReceiverSet);
-        }
-        let receiver_set = receivers.iter().copied().collect::<HashSet<_>>();
-        if receiver_set.len() != receivers.len()
-            || receivers.iter().any(|&receiver| {
-                self.paired_logical(receiver)
-                    .map_or(true, |paired| !receiver_set.contains(&paired))
-            })
-        {
-            return Err(ExchangeError::ReceiverSet);
-        }
-
-        let mut plan = self.multicast(sender_logical, receivers, count, 0)?;
-        let sender_physical = u32::from(self.physical(sender_logical)?);
-        let send_control = if receivers.len() == 2 && !receivers.contains(&sender_logical) {
-            u8::try_from(direction(sender_physical, u32::from(self.physical(receivers[0])?)) | 4)
-                .expect("send control is three bits")
-        } else {
-            7
-        };
-        set_sender_control(&mut plan.sender, send_control)?;
-        let receiver_physical = receivers
-            .iter()
-            .map(|&receiver| self.physical(receiver).map(u32::from))
-            .collect::<Result<Vec<_>, _>>()?;
-        let minimum_double_mux = receiver_physical
-            .iter()
-            .map(|&receiver| paired_time_to_mux(sender_physical, receiver))
-            .min()
-            .expect("paired multicast has receivers");
-        plan.receivers = receivers
-            .iter()
-            .map(|&receiver| {
-                self.paired_receiver_row(sender_logical, receiver, count, minimum_double_mux)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(plan)
-    }
-
-    fn paired_receiver_row(
-        &self,
-        sender_logical: u16,
-        receiver_logical: u16,
-        count: u32,
-        minimum_double_mux: i32,
-    ) -> Result<PlanRow, ExchangeError> {
-        let sender = u32::from(self.physical(sender_logical)?);
-        let receiver = u32::from(self.physical(receiver_logical)?);
-        // Route times are already expressed in the exchange epoch's event
-        // clock when every receiver is on the positive side of the timing
-        // origin. Shift the whole multicast only when its earliest pair would
-        // otherwise configure the mux before event one.
-        let epoch_shift = (1 - minimum_double_mux).max(0);
-        let source_event = u32::try_from(paired_time_to_mux(sender, receiver) + epoch_shift)
-            .map_err(|_| ExchangeError::Schedule("paired source timing"))?;
-        // MXP is 59 plus twice the physical row. The SDK selects paired mode
-        // MXP-8 cycles after this pair's route-specific XPIC source event.
-        // Adjacent logical pairs can therefore have distinct format windows
-        // when the logical-to-physical mapping turns into another column.
-        let format_start = source_event + 51 + 2 * (receiver >> 6);
-        let mut events = Vec::with_capacity(5);
-        if self.paired_receiver_is_early(receiver_logical, sender_logical)? {
-            events.push(ReceiveEvent {
-                cycles: source_event,
-                instruction: delay_xpic(0, 1, sender ^ (receiver & 2)),
-                kind: ReceiveEventKind::PairedSource,
-            });
-            events.push(ReceiveEvent {
-                cycles: source_event + count,
-                instruction: delay_xpic(0, 1, TILE_MUX_EXCHANGE),
-                kind: ReceiveEventKind::PairedNeutral,
-            });
-        }
-        events.extend([
-            ReceiveEvent {
-                cycles: format_start,
-                instruction: delay_pic(0, 1, direction(sender, receiver)),
-                kind: ReceiveEventKind::Format,
-            },
-            ReceiveEvent {
-                cycles: format_start + 2,
-                instruction: delay_pic(0, 0, 0),
-                kind: ReceiveEventKind::PairedPointer,
-            },
-            ReceiveEvent {
-                cycles: format_start + count,
-                instruction: delay_pic(0, 1, 0),
-                kind: ReceiveEventKind::Format,
-            },
-        ]);
-        events.sort_by_key(|event| event.cycles);
-        // Directionless SENDPICP can apply ordinary PIC and XPIC controls on
-        // one event, but the paired receive path faults if format activation
-        // coincides with its source selection or teardown. Reject that row so
-        // placement-aware lowering can retain a Word32 transfer instead.
-        if events
-            .windows(2)
-            .any(|pair| pair[0].cycles == pair[1].cycles)
-        {
-            return Err(ExchangeError::Schedule(
-                "paired receive coincident controls",
-            ));
-        }
-        validate_receive_events(&events)?;
-
-        let horizon = events
-            .last()
-            .expect("paired receive always has format events")
-            .cycles
-            .checked_add(7)
-            .ok_or(ExchangeError::Schedule("paired receive horizon overflow"))?;
-        let mut words = vec![SYNC_SUPERVISOR_INSTRUCTION];
-        let mut cycles = 0;
-        append_receive_events(&mut words, &mut cycles, &events, horizon, false)?;
-        words.push(RETURN_M10_INSTRUCTION);
-        if words.len() > PLAN_WORDS {
-            return Err(ExchangeError::Schedule("paired receive row capacity"));
-        }
-        let mut row = [0; PLAN_WORDS];
-        row[..words.len()].copy_from_slice(&words);
-        Ok(row)
-    }
-
-    pub fn point_to_point(
-        &self,
-        sender_logical: u16,
-        receiver_logical: u16,
-        count: u32,
-    ) -> Result<Plan, ExchangeError> {
-        validate_count(count)?;
-        if sender_logical == receiver_logical {
-            return Err(ExchangeError::DuplicateTile);
-        }
-        let sender = u32::from(self.physical(sender_logical)?);
-        let receiver = u32::from(self.physical(receiver_logical)?);
-        let direction = direction(sender, receiver);
-        let mux_time = time_to_mux(sender, receiver);
-        let receiver_phase = 2 * (receiver >> 6);
-        let sender_delay = 111 - mux_time;
-        if !(-1..=0x7ffff).contains(&sender_delay) {
-            return Err(ExchangeError::Schedule("sender delay"));
-        }
-
-        let sender_row = primitive_sender_row(count, direction, sender_delay)?;
-        let mut receiver_row = [0; PLAN_WORDS];
-        receiver_row[0] = 1;
-        receiver_row[1] = SYNC_SUPERVISOR_INSTRUCTION;
-        receiver_row[2] = delay_xpic(112, 0, 0);
-        receiver_row[3..7].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0));
-        debug!(
-            sender_logical,
-            receiver_logical, count, "assembled point-to-point exchange"
-        );
-        Ok(Plan {
-            sender: sender_row,
-            receiver: receiver_row,
-        })
-    }
-
-    pub fn multicast(
-        &self,
-        sender_logical: u16,
-        receiver_logical: &[u16],
-        count: u32,
-        schedule_offset: u32,
-    ) -> Result<MulticastPlan, ExchangeError> {
-        validate_count(count)?;
-        let source_physical = u32::from(self.physical(sender_logical)?);
-        let mut used = HashSet::new();
-        // Source-only ordinary routing failed hardware probes with both one-
-        // and two-direction sends. Paired and remote multicast loopback work.
-        if receiver_logical.is_empty()
-            || receiver_logical == [sender_logical]
-            || receiver_logical
-                .iter()
-                .any(|receiver| !used.insert(*receiver) || self.physical(*receiver).is_err())
-        {
-            return Err(ExchangeError::ReceiverSet);
-        }
-        let mux_times: Vec<_> = receiver_logical
-            .iter()
-            .map(|receiver| {
-                self.physical(*receiver)
-                    .map(|physical| time_to_mux(source_physical, u32::from(physical)))
-            })
-            .collect::<Result<_, _>>()?;
-        let minimum_mux = *mux_times.iter().min().ok_or(ExchangeError::ReceiverSet)?;
-        let natural_start = (-minimum_mux).max(0) as u32;
-        let start_cycle = natural_start
-            .checked_add(schedule_offset)
-            .filter(|cycle| *cycle <= 4095)
-            .ok_or(ExchangeError::Schedule("multicast start cycle"))?;
-        let sender_delay = start_cycle as i32 - 1;
-
-        let send_direction = if receiver_logical.len() == 1 {
-            direction(
-                source_physical,
-                u32::from(self.physical(receiver_logical[0])?),
+    let mut plan = multicast(&topology, sender_logical, receivers, count, 0)?;
+    let sender_physical = u32::from(topology.physical(sender_logical)?);
+    let send_control = if receivers.len() == 2 && !receivers.contains(&sender_logical) {
+        u8::try_from(direction(sender_physical, u32::from(topology.physical(receivers[0])?)) | 4)
+            .expect("send control is three bits")
+    } else {
+        7
+    };
+    set_sender_control(&mut plan.sender, send_control)?;
+    let receiver_physical = receivers
+        .iter()
+        .map(|&receiver| topology.physical(receiver).map(u32::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let minimum_double_mux = receiver_physical
+        .iter()
+        .map(|&receiver| paired_time_to_mux(sender_physical, receiver))
+        .min()
+        .expect("paired multicast has receivers");
+    plan.receivers = receivers
+        .iter()
+        .map(|&receiver| {
+            paired_receiver_row(
+                topology,
+                sender_logical,
+                receiver,
+                count,
+                minimum_double_mux,
             )
-        } else {
-            3
-        };
-        let sender = primitive_sender_row(count, send_direction, sender_delay)?;
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(plan)
+}
 
-        let mut receivers = Vec::with_capacity(receiver_logical.len());
-        for (logical, mux_time) in receiver_logical.iter().zip(mux_times) {
-            let physical = u32::from(self.physical(*logical)?);
-            let receive_cycle = start_cycle as i32 + mux_time;
-            if !(0..=4095).contains(&receive_cycle) {
-                return Err(ExchangeError::Schedule("multicast receive cycle"));
-            }
-            let receiver_phase = 2 * (physical >> 6);
-            let mut row = [0; PLAN_WORDS];
-            row[0] = SYNC_SUPERVISOR_INSTRUCTION;
-            row[1] = delay_xpic(receive_cycle as u32, 0, source_physical);
-            row[2..6].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0x14000));
-            receivers.push(row);
-        }
-        debug!(
-            sender_logical,
-            receiver_logical = ?receiver_logical,
-            count,
-            schedule_offset,
-            "assembled multicast exchange"
-        );
-        Ok(MulticastPlan { sender, receivers })
+fn paired_receiver_row(
+    topology: &Topology,
+    sender_logical: u16,
+    receiver_logical: u16,
+    count: u32,
+    minimum_double_mux: i32,
+) -> Result<PlanRow, ExchangeError> {
+    let sender = u32::from(topology.physical(sender_logical)?);
+    let receiver = u32::from(topology.physical(receiver_logical)?);
+    // Route times are already expressed in the exchange epoch's event
+    // clock when every receiver is on the positive side of the timing
+    // origin. Shift the whole multicast only when its earliest pair would
+    // otherwise configure the mux before event one.
+    let epoch_shift = (1 - minimum_double_mux).max(0);
+    let source_event = u32::try_from(paired_time_to_mux(sender, receiver) + epoch_shift)
+        .map_err(|_| ExchangeError::Schedule("paired source timing"))?;
+    // MXP is 59 plus twice the physical row. The SDK selects paired mode
+    // MXP-8 cycles after this pair's route-specific XPIC source event.
+    // Adjacent logical pairs can therefore have distinct format windows
+    // when the logical-to-physical mapping turns into another column.
+    let format_start = source_event + 51 + 2 * (receiver >> 6);
+    let mut events = Vec::with_capacity(5);
+    if topology.paired_receiver_is_early(receiver_logical, sender_logical)? {
+        events.push(ReceiveEvent {
+            cycles: source_event,
+            instruction: delay_xpic(0, 1, sender ^ (receiver & 2)),
+            kind: ReceiveEventKind::PairedSource,
+        });
+        events.push(ReceiveEvent {
+            cycles: source_event + count,
+            instruction: delay_xpic(0, 1, TILE_MUX_EXCHANGE),
+            kind: ReceiveEventKind::PairedNeutral,
+        });
     }
+    events.extend([
+        ReceiveEvent {
+            cycles: format_start,
+            instruction: delay_pic(0, 1, direction(sender, receiver)),
+            kind: ReceiveEventKind::Format,
+        },
+        ReceiveEvent {
+            cycles: format_start + 2,
+            instruction: delay_pic(0, 0, 0),
+            kind: ReceiveEventKind::PairedPointer,
+        },
+        ReceiveEvent {
+            cycles: format_start + count,
+            instruction: delay_pic(0, 1, 0),
+            kind: ReceiveEventKind::Format,
+        },
+    ]);
+    events.sort_by_key(|event| event.cycles);
+    // Directionless SENDPICP can apply ordinary PIC and XPIC controls on
+    // one event, but the paired receive path faults if format activation
+    // coincides with its source selection or teardown. Reject that row so
+    // placement-aware lowering can retain a Word32 transfer instead.
+    if events
+        .windows(2)
+        .any(|pair| pair[0].cycles == pair[1].cycles)
+    {
+        return Err(ExchangeError::Schedule(
+            "paired receive coincident controls",
+        ));
+    }
+    validate_receive_events(&events)?;
+
+    let horizon = events
+        .last()
+        .expect("paired receive always has format events")
+        .cycles
+        .checked_add(7)
+        .ok_or(ExchangeError::Schedule("paired receive horizon overflow"))?;
+    let mut words = vec![SYNC_SUPERVISOR_INSTRUCTION];
+    let mut cycles = 0;
+    append_receive_events(&mut words, &mut cycles, &events, horizon, false)?;
+    words.push(RETURN_M10_INSTRUCTION);
+    if words.len() > PLAN_WORDS {
+        return Err(ExchangeError::Schedule("paired receive row capacity"));
+    }
+    let mut row = [0; PLAN_WORDS];
+    row[..words.len()].copy_from_slice(&words);
+    Ok(row)
+}
+
+pub fn point_to_point(
+    topology: &Topology,
+    sender_logical: u16,
+    receiver_logical: u16,
+    count: u32,
+) -> Result<Plan, ExchangeError> {
+    validate_count(count)?;
+    if sender_logical == receiver_logical {
+        return Err(ExchangeError::DuplicateTile);
+    }
+    let sender = u32::from(topology.physical(sender_logical)?);
+    let receiver = u32::from(topology.physical(receiver_logical)?);
+    let direction = direction(sender, receiver);
+    let mux_time = time_to_mux(sender, receiver);
+    let receiver_phase = 2 * (receiver >> 6);
+    let sender_delay = 111 - mux_time;
+    if !(-1..=0x7ffff).contains(&sender_delay) {
+        return Err(ExchangeError::Schedule("sender delay"));
+    }
+
+    let sender_row = primitive_sender_row(count, direction, sender_delay)?;
+    let mut receiver_row = [0; PLAN_WORDS];
+    receiver_row[0] = 1;
+    receiver_row[1] = SYNC_SUPERVISOR_INSTRUCTION;
+    receiver_row[2] = delay_xpic(112, 0, 0);
+    receiver_row[3..7].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0));
+    debug!(
+        sender_logical,
+        receiver_logical, count, "assembled point-to-point exchange"
+    );
+    Ok(Plan {
+        sender: sender_row,
+        receiver: receiver_row,
+    })
+}
+
+pub fn multicast(
+    topology: &Topology,
+    sender_logical: u16,
+    receiver_logical: &[u16],
+    count: u32,
+    schedule_offset: u32,
+) -> Result<MulticastPlan, ExchangeError> {
+    validate_count(count)?;
+    let source_physical = u32::from(topology.physical(sender_logical)?);
+    let mut used = HashSet::new();
+    // Source-only ordinary routing failed hardware probes with both one-
+    // and two-direction sends. Paired and remote multicast loopback work.
+    if receiver_logical.is_empty()
+        || receiver_logical == [sender_logical]
+        || receiver_logical
+            .iter()
+            .any(|receiver| !used.insert(*receiver) || topology.physical(*receiver).is_err())
+    {
+        return Err(ExchangeError::ReceiverSet);
+    }
+    let mux_times: Vec<_> = receiver_logical
+        .iter()
+        .map(|receiver| {
+            topology
+                .physical(*receiver)
+                .map(|physical| time_to_mux(source_physical, u32::from(physical)))
+        })
+        .collect::<Result<_, _>>()?;
+    let minimum_mux = *mux_times.iter().min().ok_or(ExchangeError::ReceiverSet)?;
+    let natural_start = (-minimum_mux).max(0) as u32;
+    let start_cycle = natural_start
+        .checked_add(schedule_offset)
+        .filter(|cycle| *cycle <= 4095)
+        .ok_or(ExchangeError::Schedule("multicast start cycle"))?;
+    let sender_delay = start_cycle as i32 - 1;
+
+    let send_direction = if receiver_logical.len() == 1 {
+        direction(
+            source_physical,
+            u32::from(topology.physical(receiver_logical[0])?),
+        )
+    } else {
+        3
+    };
+    let sender = primitive_sender_row(count, send_direction, sender_delay)?;
+
+    let mut receivers = Vec::with_capacity(receiver_logical.len());
+    for (logical, mux_time) in receiver_logical.iter().zip(mux_times) {
+        let physical = u32::from(topology.physical(*logical)?);
+        let receive_cycle = start_cycle as i32 + mux_time;
+        if !(0..=4095).contains(&receive_cycle) {
+            return Err(ExchangeError::Schedule("multicast receive cycle"));
+        }
+        let receiver_phase = 2 * (physical >> 6);
+        let mut row = [0; PLAN_WORDS];
+        row[0] = SYNC_SUPERVISOR_INSTRUCTION;
+        row[1] = delay_xpic(receive_cycle as u32, 0, source_physical);
+        row[2..6].copy_from_slice(&ordinary_receiver_tail(count, receiver_phase, 0x14000));
+        receivers.push(row);
+    }
+    debug!(
+        sender_logical,
+        receiver_logical = ?receiver_logical,
+        count,
+        schedule_offset,
+        "assembled multicast exchange"
+    );
+    Ok(MulticastPlan { sender, receivers })
 }
 
 fn primitive_sender_row(
@@ -3054,18 +2867,6 @@ pub fn set_sender_control(row: &mut PlanRow, send_control: u8) -> Result<(), Exc
     found
         .then_some(())
         .ok_or(ExchangeError::Schedule("sender payload"))
-}
-
-pub fn c600_logical_to_physical(logical: u16) -> u16 {
-    let pair = logical / 2;
-    let lane = logical & 1;
-    let block = pair / 23;
-    let mut row = pair % 23;
-    if block & 1 != 0 {
-        row = 22 - row;
-    }
-    let column = (block / 2) * 4 + (block & 1);
-    row * 64 + column + lane * 2
 }
 
 pub fn patch_sender_address(row: &mut PlanRow, byte_address: u32) -> Result<(), ExchangeError> {
@@ -3255,84 +3056,10 @@ fn validate_count(count: u32) -> Result<(), ExchangeError> {
     }
 }
 
-fn route_displacement(source: u32, destination: u32) -> i32 {
-    let source_raw = ((source >> 2) & 15) as i32;
-    let destination_raw = ((destination >> 2) & 15) as i32;
-    let source_column = if source_raw > 7 {
-        source_raw ^ 15
-    } else {
-        source_raw
-    };
-    let destination_column = if destination_raw > 7 {
-        destination_raw ^ 15
-    } else {
-        destination_raw
-    };
-    let source_mux = source_column + ((source_raw >> 3) ^ (source & 1) as i32);
-    let base = (destination_column - source_mux) * 6;
-    let destination_lane = destination & 3;
-    let destination_half = destination_raw >> 3;
-    if destination_lane > 1 {
-        base + if destination_half == (destination & 1) as i32 {
-            2
-        } else {
-            4
-        }
-    } else {
-        base + if destination_half == destination_lane as i32 {
-            1
-        } else {
-            5
-        }
-    }
-}
-
-fn direction(source: u32, destination: u32) -> u32 {
-    if route_displacement(source, destination) < 1 {
-        2
-    } else {
-        1
-    }
-}
-
-fn time_to_mux(source: u32, destination: u32) -> i32 {
-    let source_raw = ((source >> 2) & 15) as i32;
-    let destination_raw = ((destination >> 2) & 15) as i32;
-    let source_low = ((source >> 2) & 7) as i32;
-    let displacement = route_displacement(source, destination);
-    let source_edge = if source_raw > 7 {
-        (source_raw * 4) ^ 60
-    } else {
-        source_raw * 4
-    };
-    let destination_edge = if destination_raw > 7 {
-        (destination_raw * 4) ^ 60
-    } else {
-        destination_raw * 4
-    };
-    let local = ((source >> 2) & 8) as i32 | ((source >> 3) & 3) as i32;
-    let crossing = local - destination_raw + ((source_low >> 1) ^ 3);
-    let same_region = (source ^ destination) & 0x20 == 0;
-    let turn = if same_region {
-        source_low + 1
-    } else {
-        16 - source_low
-    };
-    let group_delta = (((source >> 6) & 31) as i32 - ((destination >> 6) & 31) as i32) * 2;
-    crossing + source_edge + turn - destination_edge + group_delta + displacement.abs() - 34
-}
-
 /// Route timing when a receiving tile borrows its physical partner's lane.
 /// It is monotonic in the opposite direction to the SDK's
 /// `ColossusBNET_TTDBL`, but differences between receiver pairs are in event
 /// cycles and drive the same paired-source schedule.
-fn paired_time_to_mux(source: u32, destination: u32) -> i32 {
-    time_to_mux(source, destination).max(time_to_mux(source, destination ^ 2))
-}
-
-pub const fn encode_exchange_delay(cycles: u32) -> u32 {
-    0x40a0_0000 | (cycles & 0x7ffff)
-}
 
 pub const fn encode_exchange_delay_pic(a: u32, b: u32, c: u32) -> u32 {
     0x6000_0000 | ((a << 19) & 0x03f8_0000) | ((b << 18) & 0x0004_0000) | (c & 0x3ffff)
@@ -3340,10 +3067,6 @@ pub const fn encode_exchange_delay_pic(a: u32, b: u32, c: u32) -> u32 {
 
 pub const fn encode_exchange_delay_xpic(a: u32, b: u32, c: u32) -> u32 {
     0x6400_0000 | ((a << 14) & 0x03ff_c000) | ((b << 13) & 0x0000_2000) | (c & 0x1fff)
-}
-
-const fn delay(cycles: u32) -> u32 {
-    encode_exchange_delay(cycles)
 }
 
 const fn delay_pic(a: u32, b: u32, c: u32) -> u32 {
@@ -3378,12 +3101,31 @@ fn send_off(count_minus_one: u32, direction: u32, base_word: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_packets_use_the_configured_window_without_address_wraparound() {
+        for base in [0x50000, 0x64000, 0xffffc000] {
+            assert_eq!(
+                host_to_tile_packet(base, 2, base + 0x120, 0x40, 64).unwrap(),
+                host_to_tile_packet(0x50000, 2, 0x50120, 0x40, 64).unwrap(),
+            );
+            assert_eq!(
+                zero_byte_read_packet(base, 2, base + 0x180).unwrap(),
+                zero_byte_read_packet(0x50000, 2, 0x50180).unwrap(),
+            );
+            let planned = plan_host_to_tile(base, 2, base + 0x120, 4, 100).unwrap();
+            assert_eq!(planned.iter().map(|c| c.bytes).sum::<u32>(), 100);
+            assert!(host_to_tile_packet(base, 2, base - 32, 0x40, 64).is_err());
+        }
+        assert!(zero_byte_read_packet(0x50001, 2, 0x50180).is_err());
+        assert!(zero_byte_read_packet(0xffffc000, 2, 0).is_err());
+    }
+
     use super::*;
 
     #[test]
     fn sender_cursor_matches_exhaustive_offset_search() {
         let mut rng = fastrand::Rng::with_seed(0x637572736f72);
-        let row = Topology::c600().multicast(0, &[2], 1, 0).unwrap().sender;
+        let row = multicast(&Topology::c600(), 0, &[2], 1, 0).unwrap().sender;
         for _ in 0..64 {
             let mut schedule = TileProgramSchedule::default();
             let mut end = 0;
@@ -3435,38 +3177,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn scalar_instruction_encoders_preserve_operands_and_reject_overflow() {
-        let setzi = encode_setzi_m(15, (1 << 20) - 1).unwrap();
-        assert_eq!((setzi >> 20) & 0xf, 15);
-        assert_eq!(setzi & ((1 << 20) - 1), (1 << 20) - 1);
-
-        let put = encode_put_special_m(0xa6, 8).unwrap();
-        assert_eq!((put >> 20) & 0xf, 8);
-        assert_eq!(put & 0xff, 0xa6);
-        assert_eq!((encode_br_m(10).unwrap() >> 20) & 0xf, 10);
-
-        let call = encode_call_m_immediate(10, 0x4c100).unwrap();
-        assert_eq!((call >> 20) & 0xf, 10);
-        assert_eq!((call & 0x7ffff) << 2, 0x4c100);
-
-        assert!(encode_setzi_m(16, 0).is_err());
-        assert!(encode_setzi_m(0, 1 << 20).is_err());
-        assert!(encode_put_special_m(0, 16).is_err());
-        assert!(encode_br_m(16).is_err());
-        assert!(encode_call_m_immediate(16, 0).is_err());
-        assert!(encode_call_m_immediate(0, 2).is_err());
-        assert!(encode_call_m_immediate(0, 1 << 21).is_err());
-
-        assert_eq!(encode_ld32_m_immediate(8, 11, 15, 1).unwrap(), 0x01b8_f001);
-        assert_eq!(encode_st32_m_immediate(2, 11, 15, 0).unwrap(), 0x4fb2_f000);
-        assert_eq!(encode_add_m_immediate(11, 11, -32).unwrap(), 0x22bb_ffe0);
-        assert_eq!(encode_and_m_immediate(0, 8, 1).unwrap(), 0x4280_0001);
-        assert_eq!(encode_shl_m_immediate(10, 7, 2).unwrap(), 0x427a_a002);
-        assert!(encode_shl_m_immediate(0, 0, 1 << 12).is_err());
-        assert_eq!(encode_brz_m_immediate(0, 0x4c100).unwrap(), 0x1301_3040);
     }
 
     #[test]
@@ -3536,7 +3246,7 @@ mod tests {
         let topology = Topology::c600();
         let cases = [(0, [2, 3], 2), (2, [0, 1], 0), (0, [46, 47], 47)];
         for (source, receivers, early) in cases {
-            let mut plan = topology.paired_multicast(source, &receivers, 64).unwrap();
+            let mut plan = paired_multicast(&topology, source, &receivers, 64).unwrap();
             patch_sender_address(&mut plan.sender, 0x50000).unwrap();
             for row in &mut plan.receivers {
                 patch_receiver_address(row, 0x60000).unwrap();
@@ -3663,9 +3373,7 @@ mod tests {
                     .copied()
                     .collect::<Vec<_>>();
                 let count = 512;
-                let plan = topology
-                    .paired_multicast(source, &receivers, count)
-                    .unwrap();
+                let plan = paired_multicast(&topology, source, &receivers, count).unwrap();
                 let minimum_route_time = receivers
                     .iter()
                     .map(|&receiver| {
@@ -3743,7 +3451,7 @@ mod tests {
                 continue;
             }
             assert!(matches!(
-                topology.paired_multicast(source, &receivers, count),
+                paired_multicast(&topology, source, &receivers, count),
                 Err(ExchangeError::Schedule(
                     "paired receive coincident controls"
                 ))
@@ -3754,17 +3462,6 @@ mod tests {
             }
         }
         assert_eq!(checked, 64);
-    }
-
-    #[test]
-    fn c600_mapping_is_a_permutation() {
-        let topology = Topology::c600();
-        let physical: HashSet<_> = (0..topology.tile_count() as u16)
-            .map(|logical| topology.physical(logical).unwrap())
-            .collect();
-        assert_eq!(physical.len(), 1472);
-        assert_eq!(topology.physical(46).unwrap(), 1409);
-        assert!(physical.iter().all(|tile| *tile < 1472));
     }
 
     #[test]
@@ -3817,7 +3514,7 @@ mod tests {
             ),
         ];
         for (sender, receiver, count, expected_sender, expected_receiver) in cases {
-            let plan = topology.point_to_point(sender, receiver, count).unwrap();
+            let plan = point_to_point(&topology, sender, receiver, count).unwrap();
             assert_eq!(&plan.sender[..expected_sender.len()], &expected_sender);
             assert_eq!(
                 &plan.receiver[..expected_receiver.len()],
@@ -3841,7 +3538,7 @@ mod tests {
         let topology = Topology::c600();
         for words in [1, 2, 51, 52, 53, 64, 65, 128, 512] {
             let receivers = [0, 274, 1286];
-            let mut plan = topology.multicast(0, &receivers, words, 0).unwrap();
+            let mut plan = multicast(&topology, 0, &receivers, words, 0).unwrap();
             for row in &mut plan.receivers {
                 patch_receiver_address(row, 0x98000).unwrap();
             }
@@ -3877,11 +3574,11 @@ mod tests {
             assert!(programs.programs[1286].is_some());
         }
         assert!(matches!(
-            topology.multicast(0, &[0, 0, 274], 64, 0),
+            multicast(&topology, 0, &[0, 0, 274], 64, 0),
             Err(ExchangeError::ReceiverSet)
         ));
         assert!(matches!(
-            topology.multicast(0, &[0], 64, 0),
+            multicast(&topology, 0, &[0], 64, 0),
             Err(ExchangeError::ReceiverSet)
         ));
     }
@@ -3889,7 +3586,7 @@ mod tests {
     #[test]
     fn multicast_primitive_encodings() {
         let topology = Topology::c600();
-        let plan = topology.multicast(0, &[274, 1286], 3, 0).unwrap();
+        let plan = multicast(&topology, 0, &[274, 1286], 3, 0).unwrap();
         assert_eq!(plan.sender[0], 0x41800003);
         assert_eq!(plan.sender[1], 0x40a00016);
         assert_eq!(plan.sender[2], 0x78400003);
@@ -3897,7 +3594,7 @@ mod tests {
         assert_eq!(plan.receivers[0][2], 0x64008640);
         assert_eq!(plan.receivers[0][3], 0x61814000);
 
-        let boundary = topology.multicast(736, &[100, 900], 52, 0).unwrap();
+        let boundary = multicast(&topology, 736, &[100, 900], 52, 0).unwrap();
         assert_eq!(boundary.receivers[0][2], 0x61d94000);
         assert_eq!(boundary.receivers[0][3], 0x64000640);
     }
@@ -3917,9 +3614,7 @@ mod tests {
                 u32::from(topology.physical(source).unwrap()),
                 u32::from(topology.physical(destination).unwrap()),
             );
-            let plan = topology
-                .multicast(source, &[destination], words, 0)
-                .unwrap();
+            let plan = multicast(&topology, source, &[destination], words, 0).unwrap();
             let payload_directions = plan
                 .sender
                 .iter()
@@ -3949,9 +3644,14 @@ mod tests {
                     receivers.push(receiver);
                 }
             }
-            let plan = topology
-                .multicast(source, &receivers, random.u32(1..=MAX_TRANSFER_WORDS), 0)
-                .unwrap();
+            let plan = multicast(
+                &topology,
+                source,
+                &receivers,
+                random.u32(1..=MAX_TRANSFER_WORDS),
+                0,
+            )
+            .unwrap();
             for receiver in plan.receivers {
                 assert!(receiver.iter().skip(2).any(|instruction| {
                     instruction & OPCODE_MASK == DELAY_XPIC_OPCODE
@@ -3966,7 +3666,7 @@ mod tests {
         let topology = Topology::c600();
         for receiver in [2, 46, 100, 736, 1286] {
             for count in [1, 51, 52, 53, 64, 65, 4148] {
-                let plan = topology.multicast(0, &[receiver], count, 0).unwrap();
+                let plan = multicast(&topology, 0, &[receiver], count, 0).unwrap();
                 let timing = receive_row_timing(&plan.receivers[0], 0).unwrap();
                 assert_eq!(
                     timing.pointer_cycles.unwrap() - timing.source_cycles.unwrap(),
@@ -3982,16 +3682,16 @@ mod tests {
         let topology = Topology::c600();
         for receiver in [2, 3, 46, 47] {
             let mut schedule = TileProgramSchedule::default();
-            let ordinary = topology
-                .multicast(0, &[receiver], 972, 0)
+            let ordinary = multicast(&topology, 0, &[receiver], 972, 0)
                 .unwrap()
                 .receivers[0];
             let previous = schedule
                 .append_receiver_at(&receive_row_timing(&ordinary, 0).unwrap(), 0, 972)
                 .unwrap();
             let pair = [receiver & !1, receiver | 1];
-            let row = topology.paired_multicast(4, &pair, 176).unwrap().receivers
-                [usize::from(receiver & 1)];
+            let row = paired_multicast(&topology, 4, &pair, 176)
+                .unwrap()
+                .receivers[usize::from(receiver & 1)];
             let offset = schedule
                 .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), 176, 0)
                 .unwrap();
@@ -4004,12 +3704,11 @@ mod tests {
     fn paired_source_setup_does_not_merge_with_an_ordinary_pointer() {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
-        let ordinary = topology.multicast(0, &[2], 53, 0).unwrap().receivers[0];
+        let ordinary = multicast(&topology, 0, &[2], 53, 0).unwrap().receivers[0];
         schedule
             .append_receiver_at(&receive_row_timing(&ordinary, 0).unwrap(), 0, 53)
             .unwrap();
-        let paired = topology
-            .paired_multicast(4, &[2, 3], 176)
+        let paired = paired_multicast(&topology, 4, &[2, 3], 176)
             .unwrap()
             .receivers[0];
         let offset = schedule
@@ -4031,15 +3730,13 @@ mod tests {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
         let receivers = (1206..1224).collect::<Vec<_>>();
-        let paired = topology
-            .paired_multicast(966, &receivers, 72)
+        let paired = paired_multicast(&topology, 966, &receivers, 72)
             .unwrap()
             .receivers[10];
         let previous = schedule
             .append_receiver_at(&receive_row_timing(&paired, 0).unwrap(), 0, 72)
             .unwrap();
-        let ordinary = topology
-            .multicast(612, &[244, 730, 1216], 4148, 0)
+        let ordinary = multicast(&topology, 612, &[244, 730, 1216], 4148, 0)
             .unwrap()
             .receivers[2];
         let offset = schedule
@@ -4058,8 +3755,7 @@ mod tests {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
         for (index, source) in [0, 4, 6, 8].into_iter().enumerate() {
-            let mut row = topology
-                .paired_multicast(source, &[2, 3], 176)
+            let mut row = paired_multicast(&topology, source, &[2, 3], 176)
                 .unwrap()
                 .receivers[0];
             patch_receiver_address(&mut row, 0x90000 + index as u32 * 0x1000).unwrap();
@@ -4090,8 +3786,7 @@ mod tests {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
         for (index, source) in [0, 4].into_iter().enumerate() {
-            let mut row = topology
-                .paired_multicast(source, &[2, 3], 176)
+            let mut row = paired_multicast(&topology, source, &[2, 3], 176)
                 .unwrap()
                 .receivers[0];
             patch_receiver_address(&mut row, 0x90000 + index as u32 * 0x1000).unwrap();
@@ -4140,8 +3835,7 @@ mod tests {
                     address += random.u32(1..=16) * 4;
                     pointer_writes += 1;
                 }
-                let mut row = topology
-                    .multicast(source, &[receiver], words, 0)
+                let mut row = multicast(&topology, source, &[receiver], words, 0)
                     .unwrap()
                     .receivers[0];
                 patch_receiver_address(&mut row, address).unwrap();
@@ -4201,13 +3895,11 @@ mod tests {
                 }
             };
             let words = random.u32(2..=256);
-            let mut incoming = topology
-                .multicast(incoming_source, &[tile], words, 0)
+            let mut incoming = multicast(&topology, incoming_source, &[tile], words, 0)
                 .unwrap()
                 .receivers[0];
             patch_receiver_address(&mut incoming, 0x50000 + random.u32(0..0x1000) * 4).unwrap();
-            let outgoing = topology
-                .multicast(tile, &[outgoing_destination], words, 0)
+            let outgoing = multicast(&topology, tile, &[outgoing_destination], words, 0)
                 .unwrap()
                 .sender;
 
@@ -4341,8 +4033,8 @@ mod tests {
     #[test]
     fn event_horizon_tracks_transfer_size_and_route() {
         let topology = Topology::c600();
-        let short = topology.multicast(0, &[736, 1286], 1, 0).unwrap();
-        let long = topology.multicast(0, &[736, 1286], 1024, 0).unwrap();
+        let short = multicast(&topology, 0, &[736, 1286], 1, 0).unwrap();
+        let long = multicast(&topology, 0, &[736, 1286], 1024, 0).unwrap();
         let horizon = |plan: &MulticastPlan| {
             std::iter::once(&plan.sender)
                 .chain(plan.receivers.iter())
@@ -4362,15 +4054,13 @@ mod tests {
     #[test]
     fn encoder_places_receive_then_send_on_one_event_timeline() {
         let topology = Topology::c600();
-        let first = topology.multicast(0, &[736], 64, 0).unwrap();
+        let first = multicast(&topology, 0, &[736], 64, 0).unwrap();
         let first_horizon = std::iter::once(&first.sender)
             .chain(first.receivers.iter())
             .map(|row| plan_event_cycles(row).unwrap())
             .max()
             .unwrap();
-        let second = topology
-            .multicast(736, &[1286], 64, first_horizon + 1)
-            .unwrap();
+        let second = multicast(&topology, 736, &[1286], 64, first_horizon + 1).unwrap();
         let horizon = std::iter::once(&second.sender)
             .chain(second.receivers.iter())
             .map(|row| plan_event_cycles(row).unwrap())
@@ -4410,14 +4100,14 @@ mod tests {
     fn validates_limits_and_patches_addresses() {
         let topology = Topology::c600();
         assert_eq!(
-            topology.point_to_point(0, 1, 0),
+            point_to_point(&topology, 0, 1, 0),
             Err(ExchangeError::Count(0))
         );
         assert_eq!(
-            topology.multicast(0, &[1, 1], 1, 0),
+            multicast(&topology, 0, &[1, 1], 1, 0),
             Err(ExchangeError::ReceiverSet)
         );
-        let mut plan = topology.multicast(0, &[274], 65, 0).unwrap();
+        let mut plan = multicast(&topology, 0, &[274], 65, 0).unwrap();
         patch_sender_address(&mut plan.sender, 0x52040).unwrap();
         patch_receiver_address(&mut plan.receivers[0], 0x53080).unwrap();
         assert_eq!(
@@ -4453,14 +4143,14 @@ mod tests {
             }
         );
         assert_eq!(
-            host_to_tile_packet(0, 0x50120, 0x40, 64).unwrap(),
+            host_to_tile_packet(0x50000, 0, 0x50120, 0x40, 64).unwrap(),
             HostPacketHeader {
                 word0: 0xec00_0209,
                 word1: 0x0000_0011,
             }
         );
         assert_eq!(
-            zero_byte_read_packet(2, 0x50180).unwrap(),
+            zero_byte_read_packet(0x50000, 2, 0x50180).unwrap(),
             HostPacketHeader {
                 word0: 0xcc01_020c,
                 word1: 0,
@@ -4482,8 +4172,8 @@ mod tests {
         assert!(tile_to_host_packet(0, 2, 4).is_err());
         assert!(tile_to_host_packet(0, 0, 0).is_err());
         assert!(tile_to_host_packet(0, 0, 1028).is_err());
-        assert!(host_to_tile_packet(0, 0x50124, 0x40, 64).is_err());
-        assert!(host_to_tile_packet(0, 0x54000, 0x40, 64).is_err());
+        assert!(host_to_tile_packet(0x50000, 0, 0x50124, 0x40, 64).is_err());
+        assert!(host_to_tile_packet(0x50000, 0, 0x54000, 0x40, 64).is_err());
         assert!(tile_to_host_packet(0x1000, 0, 4).is_err());
     }
 
@@ -4509,19 +4199,19 @@ mod tests {
                 == (chunk.host_offset + chunk.bytes - 1) / HOST_PAGE_BYTES
         }));
 
-        let h2d = plan_host_to_tile(1409, 0x50000, 4, 100).unwrap();
+        let h2d = plan_host_to_tile(0x50000, 1409, 0x50000, 4, 100).unwrap();
         assert_eq!(
             h2d.iter().map(|chunk| chunk.bytes).collect::<Vec<_>>(),
             [32, 32, 36]
         );
         assert_eq!(h2d.last().unwrap().tile_address + 36, 0x50064);
-        assert!(plan_host_to_tile(0, 0x50004, 0, 4).is_err());
+        assert!(plan_host_to_tile(0x50000, 0, 0x50004, 0, 4).is_err());
     }
 
     #[test]
     fn plan_offsets_extend_beyond_route_timing_fields() {
         let topology = Topology::c600();
-        let mut plan = topology.multicast(0, &[1, 2], 4096, 0).unwrap();
+        let mut plan = multicast(&topology, 0, &[1, 2], 4096, 0).unwrap();
         let sender_cycles = plan_event_cycles(&plan.sender).unwrap();
         let receiver_cycles = plan_event_cycles(&plan.receivers[0]).unwrap();
         let offset = MAX_PLAN_OFFSET_CYCLES + 70;
@@ -4542,7 +4232,8 @@ mod tests {
     #[test]
     fn tile_to_host_target_preserves_packet_and_payload_addresses() {
         let plan =
-            assemble_tile_to_host_target_program(2, 0x50120, 0x40, 64, 0x50160, 0x501a0).unwrap();
+            assemble_tile_to_host_target_program(0x50000, 2, 0x50120, 0x40, 64, 0x50160, 0x501a0)
+                .unwrap();
         assert_eq!(
             &plan.packet_words[..2],
             &host_packet_words(tile_to_host_packet(2, 0x40, 64).unwrap())
@@ -4585,6 +4276,7 @@ mod tests {
             let bytes = random.u32(1..=1024) * 4;
             let chunks = plan_tile_to_host(2, 0x52000, host_offset, bytes).unwrap();
             let target = assemble_tile_to_host_target_program(
+                0x50000,
                 2,
                 0x52000,
                 host_offset,
@@ -4618,7 +4310,8 @@ mod tests {
     #[test]
     fn tile_to_host_target_has_no_controller_xreq_or_sync_wrapper() {
         let target =
-            assemble_tile_to_host_target_program(2, 0x50120, 0x40, 64, 0x50160, 0x501a0).unwrap();
+            assemble_tile_to_host_target_program(0x50000, 2, 0x50120, 0x40, 64, 0x50160, 0x501a0)
+                .unwrap();
 
         assert_eq!(target.packet_words.len(), 4);
         assert_eq!(
@@ -4644,7 +4337,8 @@ mod tests {
         );
 
         let target =
-            assemble_tile_to_host_target_program(2, 0x52000, 0x40, 2048, 0x50160, 0x501a0).unwrap();
+            assemble_tile_to_host_target_program(0x50000, 2, 0x52000, 0x40, 2048, 0x50160, 0x501a0)
+                .unwrap();
 
         assert_eq!(target.packet_words.len(), chunks.len() * 2 + 2);
         assert_eq!(target.instructions[0], setzi_m(8, 1));
@@ -4669,10 +4363,11 @@ mod tests {
 
     #[test]
     fn host_to_tile_target_preserves_packet_and_request_addresses() {
-        let plan = assemble_host_to_tile_target_program(2, 0x50120, 0x40, 64, 0x50160).unwrap();
+        let plan =
+            assemble_host_to_tile_target_program(0x50000, 2, 0x50120, 0x40, 64, 0x50160).unwrap();
         assert_eq!(
             &plan.packet_words[..],
-            &host_packet_words(host_to_tile_packet(2, 0x50120, 0x40, 64).unwrap())
+            &host_packet_words(host_to_tile_packet(0x50000, 2, 0x50120, 0x40, 64).unwrap())
         );
         let sends = plan
             .instructions
@@ -4692,8 +4387,9 @@ mod tests {
 
     #[test]
     fn groups_multi_packet_host_to_tile_as_one_stream_copy() {
-        let chunks = plan_host_to_tile(63, 0x50000, 0x40, 4096).unwrap();
-        let plan = assemble_host_to_tile_target_program(63, 0x50000, 0x40, 4096, 0x54000).unwrap();
+        let chunks = plan_host_to_tile(0x50000, 63, 0x50000, 0x40, 4096).unwrap();
+        let plan = assemble_host_to_tile_target_program(0x50000, 63, 0x50000, 0x40, 4096, 0x54000)
+            .unwrap();
         assert_eq!(plan.packet_words.len(), chunks.len() * 2);
         assert!(
             plan.packet_words[..plan.packet_words.len() - 2]
@@ -4715,7 +4411,7 @@ mod tests {
 
     #[test]
     fn host_command_read_encoder_preserves_recovered_packet_and_addresses() {
-        let plan = assemble_host_command_read_program(0x50160, 0x50180, 0x1000).unwrap();
+        let plan = assemble_host_command_read_program(0x50000, 0x50160, 0x50180, 0x1000).unwrap();
         assert_eq!(plan.packet_words, [1, 0, 0xcc00_020c, 0x4001]);
         assert_eq!(send_address(plan.instructions[5]), 0x50160);
         assert_eq!(send_address(plan.instructions[6]), 0x50168);
@@ -4797,7 +4493,8 @@ mod tests {
         assert_eq!(&wrapped_xreq[..3], &[0x1980_0604, 0x4380_80a0, 0x4180_000f]);
 
         let d2h =
-            assemble_tile_to_host_target_program(260, 0x50120, 0x40, 64, 0x50160, 0x50180).unwrap();
+            assemble_tile_to_host_target_program(0x50000, 260, 0x50120, 0x40, 64, 0x50160, 0x50180)
+                .unwrap();
         assert_eq!(
             d2h.instructions,
             [
@@ -4813,7 +4510,8 @@ mod tests {
         );
         assert_eq!(d2h.packet_words, [0xa082_0000, 0x0000_0011, 0xcc82_020c, 0]);
 
-        let h2d = assemble_host_to_tile_target_program(260, 0x50120, 0x40, 64, 0x50170).unwrap();
+        let h2d =
+            assemble_host_to_tile_target_program(0x50000, 260, 0x50120, 0x40, 64, 0x50170).unwrap();
         assert_eq!(
             h2d.instructions,
             [
@@ -4833,7 +4531,8 @@ mod tests {
             &[0x4180_0007, 0x1980_0640, 0x4380_80a0, 0x43a0_0000]
         );
 
-        let local = assemble_host_to_tile_target_program(0, 0x50120, 0x40, 64, 0x50168).unwrap();
+        let local =
+            assemble_host_to_tile_target_program(0x50000, 0, 0x50120, 0x40, 64, 0x50168).unwrap();
         let wrapped_local = wrap_combined_host_operation(0, &local.instructions, 0x50160).unwrap();
         assert_eq!(
             &wrapped_local[..3],
@@ -4853,7 +4552,7 @@ mod tests {
     #[test]
     fn finalizes_point_receiver_for_direct_execution() {
         let topology = Topology::c600();
-        let plan = topology.point_to_point(274, 1286, 64).unwrap();
+        let plan = point_to_point(&topology, 274, 1286, 64).unwrap();
         let row = finalize_point_receiver(&plan.receiver, topology.physical(274).unwrap()).unwrap();
         assert_eq!(row[0], SYNC_SUPERVISOR_INSTRUCTION);
         assert_eq!(row[1] & 0x1fff, 9);

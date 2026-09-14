@@ -6,6 +6,7 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+ipu-target = { path = "../ipu-target" }
 capnp.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

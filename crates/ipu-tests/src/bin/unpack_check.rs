@@ -83,7 +83,7 @@ fn main() -> Result<()> {
             wanted.extend([guard; 2]);
             let bytes: Vec<_> = wanted.iter().flat_map(|x| x.to_le_bytes()).collect();
             slices.push(RegionSlice {
-                tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                tile: u32::from(ipu_target::c600::logical_to_physical(tile)),
                 tile_address: output_address - 4,
                 file_offset: expected.len() as u64,
                 size: bytes.len() as u64,

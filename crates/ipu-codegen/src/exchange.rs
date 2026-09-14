@@ -1,5 +1,10 @@
 //! Physical exchange programs generated from logical shard transfers.
 
+use ipu_target::ipu21::fabric::Topology;
+use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
+use ipu_target::ipu21::memory::{
+    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
+};
 mod diagnostic;
 mod hazards;
 use hazards::MemoryHistory;
@@ -24,12 +29,9 @@ use crate::{
 };
 use ipu_exchange::{
     MAX_TRANSFER_WORDS, MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming,
-    RETURN_M10_INSTRUCTION, ScheduledPayloadTiming, Topology, finalize_point_receiver,
-    patch_receiver_address, patch_sender_address,
+    ScheduledPayloadTiming, finalize_point_receiver, patch_receiver_address, patch_sender_address,
 };
-use ipu_package::{
-    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
-};
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -189,6 +191,10 @@ pub struct ExchangeScheduleRun {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ExchangeLoweringError {
+    #[error(transparent)]
+    Topology(#[from] ipu_target::ipu21::fabric::TopologyError),
+    #[error(transparent)]
+    Instruction(#[from] ipu_target::ipu21::instruction::InstructionError),
     #[error(transparent)]
     Exchange(#[from] ipu_exchange::ExchangeError),
     #[error(transparent)]
@@ -922,9 +928,13 @@ fn paired_transfer_alternatives(
             .iter()
             .map(|&(tile, _)| tile)
             .collect::<Vec<_>>();
-        if topology
-            .paired_multicast(transfer.source, &paired_tiles, transfer.words / 2)
-            .is_err()
+        if ipu_exchange::paired_multicast(
+            &topology,
+            transfer.source,
+            &paired_tiles,
+            transfer.words / 2,
+        )
+        .is_err()
         {
             alternatives.push(None);
             continue;
@@ -2613,9 +2623,9 @@ fn append_transfer(
                 && incoming_bases[usize::from(tile)] == address
         });
     let mut plan = if width == ExchangeItemWidth::Paired64 {
-        topology.paired_multicast(source, &tiles, item_count)?
+        ipu_exchange::paired_multicast(&topology, source, &tiles, item_count)?
     } else if point_receiver {
-        let point = topology.point_to_point(source, tiles[0], words)?;
+        let point = ipu_exchange::point_to_point(&topology, source, tiles[0], words)?;
         MulticastPlan {
             sender: point.sender,
             receivers: vec![finalize_point_receiver(
@@ -2624,7 +2634,7 @@ fn append_transfer(
             )?],
         }
     } else {
-        topology.multicast(source, &tiles, item_count, 0)?
+        ipu_exchange::multicast(&topology, source, &tiles, item_count, 0)?
     };
     patch_sender_address(&mut plan.sender, source_address)?;
     if !point_receiver {

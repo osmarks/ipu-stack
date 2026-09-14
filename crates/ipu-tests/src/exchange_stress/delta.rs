@@ -1,13 +1,15 @@
 use super::*;
+use ipu_target::ipu21::instruction::{
+    encode_put_special_m, encode_setzi_m, encode_st32_m_immediate,
+};
 
 /// Test whether the DELTA CSRs are strides or mutable address cursors. Record
 /// them immediately around the exchange, before host readback changes state.
 pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<StressPackage> {
-    use ipu_exchange::{encode_put_special_m, encode_setzi_m, encode_st32_m_immediate};
     let topology = Topology::c600();
     let tiles = u16::try_from(topology.tile_count())?;
     let words = 16;
-    let mut plan = topology.multicast(0, &[1, 2], words, 0)?;
+    let mut plan = ipu_exchange::multicast(&topology, 0, &[1, 2], words, 0)?;
     patch_sender_address(&mut plan.sender, SOURCE_BASE)?;
     for row in &mut plan.receivers {
         patch_receiver_address(row, DATA_BASE)?;
@@ -38,16 +40,22 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             prefix.push(encode_st32_m_immediate(0, 1, 15, index as u16)?);
         }
         // All tiles execute the same preamble after the global barrier.
-        prefix.insert(0, ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
-        prefix.push(encode_exchange_delay(0));
+        prefix.insert(
+            0,
+            ipu_target::ipu21::instruction::SYNC_SUPERVISOR_INSTRUCTION,
+        );
+        prefix.push(encode_delay_immediate(0));
         prefix.append(&mut row);
         row = prefix;
-        assert_eq!(row.pop(), Some(ipu_exchange::RETURN_M10_INSTRUCTION));
+        assert_eq!(
+            row.pop(),
+            Some(ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION)
+        );
         for (index, csr) in [0xa2, 0xa8].into_iter().enumerate() {
             row.push(0x4100_0000 | csr);
             row.push(encode_st32_m_immediate(0, 1, 15, index as u16 + 2)?);
         }
-        row.push(ipu_exchange::RETURN_M10_INSTRUCTION);
+        row.push(ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION);
         rows.push((tile, row.clone()));
         programs.push(TileProgram {
             tile,

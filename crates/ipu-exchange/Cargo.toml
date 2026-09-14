@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ipu-target = { path = "../ipu-target" }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

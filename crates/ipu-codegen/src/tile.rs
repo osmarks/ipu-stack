@@ -1,6 +1,10 @@
 //! Final lowering from logical per-tile work to address-resolved programs.
 
 #[cfg(test)]
+use ipu_target::ipu21::fabric::Topology;
+#[cfg(test)]
+use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
+#[cfg(test)]
 #[path = "tile/tests/iterated_aliases.rs"]
 mod iterated_aliases;
 
@@ -96,7 +100,7 @@ impl<'a> TileProgramLowering<'a> {
                 program.tile_count,
             )?)
             .ok_or(TileLoweringError::Overflow)?;
-        let executable_memory_end = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
+        let executable_memory_end = ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT;
         if cursor > executable_memory_end {
             return Err(TileLoweringError::ExchangeCodeMemory {
                 start: exchange_code_base,
@@ -657,7 +661,6 @@ mod tests {
         ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_exchanges,
         lower_to_tiles, place,
     };
-    use ipu_exchange::{RETURN_M10_INSTRUCTION, Topology};
 
     #[test]
     fn shared_rows_restore_zero_addresses_in_either_order() {

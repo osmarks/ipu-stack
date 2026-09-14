@@ -182,9 +182,9 @@ fn analyze_storage<const PER_TILE: bool>(
         let count = copies.get(&value.id).copied().unwrap_or(1);
         let alignment = if element[id] {
             u64::from(if class == MemoryClass::Ipu21Interleaved {
-                ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+                ipu_target::ipu21::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
             } else {
-                ipu_package::TILE_MEMORY_ELEMENT_SIZE
+                ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE
             })
         } else {
             1

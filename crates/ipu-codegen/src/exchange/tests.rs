@@ -120,9 +120,13 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                 destinations.sort_unstable();
                 destinations.dedup();
                 if width == ExchangeItemWidth::Paired64
-                    && Topology::c600()
-                        .paired_multicast(source, &destinations, count)
-                        .is_err()
+                    && ipu_exchange::paired_multicast(
+                        &Topology::c600(),
+                        source,
+                        &destinations,
+                        count,
+                    )
+                    .is_err()
                 {
                     // Primitive paired controls already reject some short
                     // lengths; production width selection retains ordinary TX.
@@ -471,7 +475,7 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
         }
         let topology = Topology::new(
             (0..tile_count)
-                .map(ipu_exchange::c600_logical_to_physical)
+                .map(ipu_target::c600::logical_to_physical)
                 .collect(),
         )
         .unwrap();
@@ -547,12 +551,8 @@ fn width_selection_pairs_receivers_with_independent_addresses() {
 
 #[test]
 fn borrowed_transmit_lane_allows_receive_but_excludes_local_send() {
-    let topology = Topology::new(
-        (0..64)
-            .map(ipu_exchange::c600_logical_to_physical)
-            .collect(),
-    )
-    .unwrap();
+    let topology =
+        Topology::new((0..64).map(ipu_target::c600::logical_to_physical).collect()).unwrap();
     for source in [0, 1] {
         let partner = source ^ 1;
         let transfer = |source, destinations: &[u16], words, width| ExchangeScheduleTransfer {
@@ -653,9 +653,9 @@ fn randomized_eligible_physical_pairs_use_double_width_transfers() {
             .iter()
             .map(|&(tile, _)| tile)
             .collect::<Vec<_>>();
-        let paired_is_encodable = topology
-            .paired_multicast(source, &paired_tiles, (words & !1) / 2)
-            .is_ok();
+        let paired_is_encodable =
+            ipu_exchange::paired_multicast(&topology, source, &paired_tiles, (words & !1) / 2)
+                .is_ok();
         let alternatives =
             paired_transfer_alternatives(std::slice::from_ref(&original), &topology, tile_count)
                 .unwrap();
@@ -921,7 +921,9 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
                 assert_eq!(*active, *local_cycles != 0);
                 assert_eq!(plan_event_cycles(program).unwrap(), *local_cycles);
                 assert!(*local_cycles <= phase.event_cycles);
-                assert!(!program.contains(&ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION));
+                assert!(
+                    !program.contains(&ipu_target::ipu21::instruction::SYNC_SUPERVISOR_INSTRUCTION)
+                );
             }
         }
     }
@@ -997,7 +999,7 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
 #[test]
 fn repeat_sources_follow_execution_order_when_sends_fill_earlier_gaps() {
     let topology =
-        Topology::new((0..3).map(ipu_exchange::c600_logical_to_physical).collect()).unwrap();
+        Topology::new((0..3).map(ipu_target::c600::logical_to_physical).collect()).unwrap();
     let pending = (0..2)
         .map(|i| {
             let address = 0x10000 + i * 0x4000;

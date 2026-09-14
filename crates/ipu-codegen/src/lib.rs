@@ -1,9 +1,14 @@
-pub mod f143;
-use ipu_exchange::{
+use ipu_target::ipu21::instruction::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
     encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
     encode_setzi_m, encode_shl_m_immediate, encode_st32_m_immediate,
 };
+use ipu_target::ipu21::registers::{
+    INCOMING_BASE, INCOMING_DCOUNT, INCOMING_FORMAT, INCOMING_MUX, INCOMING_MUXPAIR, OUTGOING_BASE,
+};
+pub mod f143;
+pub mod runtime_layout;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -70,16 +75,10 @@ pub use tensor::{
 };
 pub(crate) use tile::*;
 
-const INCOMING_BASE: u8 = 0xa4;
-const INCOMING_DCOUNT: u8 = 0xa6;
-const INCOMING_MUX: u8 = 0xa0;
-const INCOMING_FORMAT: u8 = 0xa3;
-const INCOMING_MUXPAIR: u8 = 0xa1;
 // Recovered primitive PIC/XPIC plans arm A6 with one; their payload length is
 // encoded in the timed instructions rather than this external-stream counter.
 // Consolidated phases currently preserve that primitive-plan setting.
 const INTERNAL_EXCHANGE_DCOUNT: u32 = 1;
-const OUTGOING_BASE: u8 = 0xa7;
 const LAST_VALUE_REGISTER: u8 = 9;
 
 pub const WORKER_BARRIER_SYMBOL: &str = "ipu_stack_static_worker_barrier";
@@ -108,6 +107,8 @@ const PATCHED_BREAKPOINT_TRAP_BASE: u32 = 0x4180_1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CodegenError {
+    #[error(transparent)]
+    Instruction(#[from] ipu_target::ipu21::instruction::InstructionError),
     #[error("exchange encoding failed: {0}")]
     Exchange(#[from] ipu_exchange::ExchangeError),
     #[error("invalid tile program: {0}")]
@@ -555,7 +556,7 @@ fn emit_steps(
                 } else {
                     if !exchange.active {
                         code.instruction(SANS_INACTIVE_INSTRUCTION);
-                        code.instruction(ipu_exchange::SYNC_ANS_INSTRUCTION);
+                        code.instruction(ipu_target::ipu21::instruction::SYNC_ANS_INSTRUCTION);
                     }
                 }
                 code.call(exchange.program.address, 10)?;
@@ -740,7 +741,8 @@ fn validate_exchange_program(exchange: &ExchangeStep) -> Result<()> {
         .first()
         .is_some_and(|word| *word == SYNC_SUPERVISOR_INSTRUCTION);
     if exchange.program.address & 0b11 != 0
-        || exchange.program.words.last() != Some(&ipu_exchange::RETURN_M10_INSTRUCTION)
+        || exchange.program.words.last()
+            != Some(&ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION)
         || embedded_sync != exchange.sync_in_program
         || exchange
             .program
@@ -1315,7 +1317,7 @@ mod tests {
                         sync_in_program: false,
                         program: PlacedExchangeRow {
                             address: 0x60000,
-                            words: vec![0, ipu_exchange::RETURN_M10_INSTRUCTION],
+                            words: vec![0, ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION],
                         },
                         setup_patch: None,
                         repeat_patches: vec![ExchangePatch {

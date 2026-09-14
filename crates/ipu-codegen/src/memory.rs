@@ -1,11 +1,7 @@
 use std::ops::Range;
 
-/// Runtime completion word followed by the supervisor and worker stack state.
-pub const RUNTIME_STATE_BASE: u32 =
-    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES;
-pub const WORKER_STACK_HEADROOM: u32 = 0xe0;
-pub const WORKER_SYNC_STRIDE: u32 = 0x100;
-pub const WORKER_CONTEXTS: u32 = 6;
+pub use crate::runtime_layout::{RUNTIME_STATE_BASE, WORKER_STACK_HEADROOM, WORKER_SYNC_STRIDE};
+pub use ipu_target::ipu21::WORKER_CONTEXTS;
 pub const RUNTIME_STATE_BYTES: u32 = WORKER_STACK_HEADROOM + WORKER_CONTEXTS * WORKER_SYNC_STRIDE;
 pub const PROFILE_START_CYCLE: u32 = RUNTIME_STATE_BASE + 4;
 pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
@@ -13,11 +9,11 @@ pub const PROFILE_END_CYCLE: u32 = RUNTIME_STATE_BASE + 8;
 /// First byte after the permanently reserved runtime state.
 pub const IPU21_DATA_BASE: u32 = RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES;
 /// Loader-populatable region 1 storage available to interleaved data.
-pub const IPU21_INTERLEAVED_REGION_BYTES: u32 =
-    ipu_package::IPU21_APPLICATION_MEMORY_LIMIT - ipu_package::IPU21_INTERLEAVED_MEMORY_BASE;
+pub const IPU21_INTERLEAVED_REGION_BYTES: u32 = ipu_package::loader_abi::APPLICATION_LOAD_LIMIT
+    - ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE;
 /// Standard-addressable storage which is not borrowed from region 1.
 pub const IPU21_STANDARD_FIXED_BYTES: u32 =
-    ipu_package::IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;
+    ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;
 /// Total tile SRAM available to planned values after permanent runtime state.
 pub const IPU21_PLANNED_DATA_BYTES: u32 =
     IPU21_STANDARD_FIXED_BYTES + IPU21_INTERLEAVED_REGION_BYTES;
@@ -26,7 +22,8 @@ pub const IPU21_PLANNED_DATA_BYTES: u32 =
 /// so three standard memory elements preserve one contiguous allocation once
 /// host-command and generated-program data are placed around the interleaved
 /// region.
-pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 =
+    3 * ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MemoryAllocation {
@@ -75,8 +72,9 @@ impl TileMemoryMap {
 
     pub(crate) fn new() -> Self {
         let free = std::iter::once(
-            ipu_package::TILE_MEMORY_BASE
-                ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+            ipu_target::ipu21::memory::TILE_MEMORY_BASE
+                ..ipu_target::ipu21::memory::TILE_MEMORY_BASE
+                    + ipu_target::ipu21::memory::TILE_MEMORY_SIZE,
         )
         .collect();
         Self {
@@ -246,8 +244,9 @@ mod tests {
                     name: "random",
                     bytes,
                     alignment,
-                    bounds: ipu_package::TILE_MEMORY_BASE
-                        ..ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE,
+                    bounds: ipu_target::ipu21::memory::TILE_MEMORY_BASE
+                        ..ipu_target::ipu21::memory::TILE_MEMORY_BASE
+                            + ipu_target::ipu21::memory::TILE_MEMORY_SIZE,
                     end_alignment: 1 << random.u32(0..=14),
                     guard_after: random.u32(0..=64),
                 });
@@ -266,10 +265,14 @@ mod tests {
             assert!(map.free.windows(2).all(|pair| pair[0].end < pair[1].start));
             ranges.extend(map.free.clone());
             ranges.sort_by_key(|range| range.start);
-            assert_eq!(ranges.first().unwrap().start, ipu_package::TILE_MEMORY_BASE);
+            assert_eq!(
+                ranges.first().unwrap().start,
+                ipu_target::ipu21::memory::TILE_MEMORY_BASE
+            );
             assert_eq!(
                 ranges.last().unwrap().end,
-                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE
+                ipu_target::ipu21::memory::TILE_MEMORY_BASE
+                    + ipu_target::ipu21::memory::TILE_MEMORY_SIZE
             );
             assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
         }

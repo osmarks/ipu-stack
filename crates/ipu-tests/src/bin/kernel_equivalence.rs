@@ -239,7 +239,7 @@ exitz $mzero
             data: bytes,
         });
     }
-    let topology = ipu_exchange::Topology::c600();
+    let topology = ipu_target::ipu21::fabric::Topology::c600();
     let mut outputs = vec![Binding {
         name: "timestamps".into(),
         dtype: "u32".into(),

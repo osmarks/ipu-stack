@@ -1,4 +1,5 @@
-use ipu_package::{Application, HostCall, HostExchange, TILE_MEMORY_BASE};
+use ipu_package::{Application, HostCall, HostExchange};
+use ipu_target::ipu21::memory::TILE_MEMORY_BASE;
 use object::{Object, ObjectSegment};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -10,33 +11,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
 pub const CONFIG_BAR_SIZE: usize = 0x80000;
-pub const TILE_MEMORY_SIZE: usize = 624 * 1024;
-// The secondary loader installs framed application payload at the SDK image's
-// launch slot. Applications reserve that word and enter at the following word.
-pub const APPLICATION_LOAD_BASE: u32 = TILE_MEMORY_BASE + 0x10;
-pub const HSP_MARK_MASK: u32 = 0xffff;
-// The secondary loader consumes 23 tile batches before handing HSP ownership
-// to the resident host-exchange program.
-pub const HOST_EXCHANGE_HANDOFF_MARK: u32 = 23;
-pub const TILES_PER_BATCH: usize = 64;
-pub const FRAME_SIZE: usize = 1024;
-pub const FRAME_HEADER_SIZE: usize = 16;
-pub const FRAME_TRAILER_SIZE: usize = 16;
-pub const FRAME_PAYLOAD_SIZE: usize = FRAME_SIZE - FRAME_HEADER_SIZE - FRAME_TRAILER_SIZE;
-pub const DESCRIPTOR_AREA_SIZE: usize = 4096;
-pub const TRANSPORT_SIZE: usize = 0x2842000;
-// The Graphcore secondary loader does not acknowledge a one-frame application.
-// Pad transport payloads to the smallest established working envelope.
-pub const SECONDARY_LOADER_MIN_PAYLOAD_SIZE: usize = 0x4134;
-/// Maximum frame count accepted by the IPU21 SDK secondary bootloader.
-pub const SECONDARY_LOADER_MAX_FRAMES: usize = 0x283;
-/// Exclusive upper address that can be represented by that bootloader when
-/// loading an application from [`APPLICATION_LOAD_BASE`].
-pub const APPLICATION_LOAD_LIMIT: u32 = ipu_package::IPU21_APPLICATION_MEMORY_LIMIT;
-const _: () = assert!(
-    APPLICATION_LOAD_LIMIT
-        == APPLICATION_LOAD_BASE + (SECONDARY_LOADER_MAX_FRAMES * FRAME_PAYLOAD_SIZE) as u32
-);
+pub use ipu_package::loader_abi::*;
+pub use ipu_target::ipu21::memory::TILE_MEMORY_SIZE;
 const TILE_DEBUG_BASE: u32 = 0x30000;
 const TILE_DEBUG_TILE_STRIDE: u32 = 0x40;
 const TILE_DEBUG_EXCEPTION_STATE: u32 = 5;
@@ -589,7 +565,7 @@ impl Device {
             .ok_or_else(|| DriverError::Invalid("tile diagnostic range overflow".into()))?;
         if address & 3 != 0
             || address < TILE_MEMORY_BASE
-            || end > TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32
+            || end > TILE_MEMORY_BASE + TILE_MEMORY_SIZE
         {
             return Err(DriverError::Invalid(format!(
                 "invalid tile memory range 0x{address:x}..0x{end:x}"
@@ -614,8 +590,7 @@ impl Device {
         }
         if addresses.iter().any(|&address| {
             address & 3 != 0
-                || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
-                    .contains(&address)
+                || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE - 4).contains(&address)
         }) {
             return Err(DriverError::Invalid(
                 "invalid tile memory address in diagnostic read".into(),
@@ -637,8 +612,7 @@ impl Device {
         inactive_is_quiescent: bool,
     ) -> Result<u32, DriverError> {
         if address & 3 != 0
-            || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
-                .contains(&address)
+            || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE - 4).contains(&address)
         {
             return Err(DriverError::Invalid(format!(
                 "invalid tile memory address 0x{address:x}"
@@ -712,8 +686,7 @@ impl Device {
         inactive_is_quiescent: bool,
     ) -> Result<(), DriverError> {
         if address & 0b11 != 0
-            || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE as u32 - 4)
-                .contains(&address)
+            || !(TILE_MEMORY_BASE..=TILE_MEMORY_BASE + TILE_MEMORY_SIZE - 4).contains(&address)
         {
             return Err(DriverError::Invalid(
                 "tile memory write address is invalid".into(),
@@ -1003,7 +976,7 @@ impl Device {
         self.wait_autoloader(Duration::from_secs(2))?;
         self.write_config(
             pci::AUTOLD_TARGET,
-            zone | ((TILE_MEMORY_SIZE as u32 / 1024) << pci::AUTOLD_ADDRESS_SHIFT) | kib,
+            zone | ((TILE_MEMORY_SIZE / 1024) << pci::AUTOLD_ADDRESS_SHIFT) | kib,
         )?;
         self.write_config(
             pci::AUTOLD_CSR,

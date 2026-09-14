@@ -195,7 +195,7 @@ fn main() -> Result<()> {
                     wanted.extend(result);
                     wanted.resize((count as usize).next_multiple_of(8) + 16, 0xa5);
                     slices.push(RegionSlice {
-                        tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                        tile: u32::from(ipu_target::c600::logical_to_physical(tile)),
                         tile_address: output_address - 8,
                         file_offset: expected.len() as u64,
                         size: wanted.len() as u64,
@@ -318,7 +318,7 @@ fn main() -> Result<()> {
                             data: vec![0; 8],
                         });
                         slices.push(RegionSlice {
-                            tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                            tile: u32::from(ipu_target::c600::logical_to_physical(tile)),
                             tile_address: output_address - 8,
                             file_offset: expected.len() as u64,
                             size: wanted.len() as u64,

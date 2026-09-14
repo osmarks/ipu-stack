@@ -1,5 +1,8 @@
 //! Package support sizing, address binding and final image emission.
 //! Tensor search, placement and exchange scheduling belong to the compiler driver.
+use ipu_target::ipu21::fabric::Topology;
+use ipu_target::ipu21::instruction::{encode_br_m, encode_setzi_m};
+use ipu_target::ipu21::memory::TILE_MEMORY_BASE;
 mod bindings;
 use bindings::{PackageBindings, auxiliary_ranges};
 mod profile;
@@ -24,14 +27,14 @@ use crate::{
     WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, shard_storage_bytes,
 };
 use crate::{PipelineConfig, Precision, TileGraph};
-use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
-use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
+use ipu_exchange::ExchangeError;
+use ipu_package::loader_abi::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_package::{
     Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
     PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
     ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
-    SEGMENT_WRITE, Segment, TILE_MEMORY_BASE, TileImage, TileProfilePlan,
+    SEGMENT_WRITE, Segment, TileImage, TileProfilePlan,
 };
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -42,12 +45,18 @@ use std::time::Instant;
 const ENTRY_BYTES: u32 = 8;
 const SUPPORT_START: u32 = APPLICATION_LOAD_BASE + ENTRY_BYTES;
 const COMPLETION_ADDRESS: u32 = RUNTIME_STATE_BASE;
-const RUNTIME_EXECUTABLE_START: u32 =
-    (RUNTIME_STATE_BASE + RUNTIME_STATE_BYTES + ipu_package::TILE_MEMORY_ELEMENT_SIZE - 1)
-        & !(ipu_package::TILE_MEMORY_ELEMENT_SIZE - 1);
+const RUNTIME_EXECUTABLE_START: u32 = (RUNTIME_STATE_BASE
+    + RUNTIME_STATE_BYTES
+    + ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE
+    - 1)
+    & !(ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE - 1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageBuildError {
+    #[error(transparent)]
+    Topology(#[from] ipu_target::ipu21::fabric::TopologyError),
+    #[error(transparent)]
+    Instruction(#[from] ipu_target::ipu21::instruction::InstructionError),
     #[error("exchange transfer count exceeds per-tile limit: {transfers} fragments, limit {limit}")]
     ExchangeTransferLimitExceeded { transfers: u64, limit: u64 },
     #[error("exchange tables exceed per-tile budget: {bytes} bytes, limit {budget} bytes")]
@@ -282,7 +291,8 @@ pub(crate) fn emit_package(
         // Placement can change row sharing and instruction alignment. The
         // entire SRAM element is already excluded from tensor storage, so
         // let final rows use its padding while retaining fetch look-ahead.
-        let capacity_end = storage.reserved.end - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD;
+        let capacity_end =
+            storage.reserved.end - ipu_target::ipu21::memory::IPU21_SUPERVISOR_FETCH_LOOKAHEAD;
         tracing::debug!(
             planned_bytes = storage.range.len(),
             final_bytes = finalizer.exchange_code_end() - storage.range.start,
@@ -597,7 +607,7 @@ pub(crate) fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
 pub(crate) fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
     Ok(Topology::new(
         (0..tile_count)
-            .map(ipu_exchange::c600_logical_to_physical)
+            .map(ipu_target::c600::logical_to_physical)
             .collect(),
     )?)
 }
@@ -696,10 +706,10 @@ fn link_runtime(
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
             regions: vec![
-                (SUPPORT_START, ipu_exchange::EXCHANGE_WINDOW_BASE),
+                (SUPPORT_START, crate::runtime_layout::EXCHANGE_WINDOW_BASE),
                 (
                     RUNTIME_EXECUTABLE_START,
-                    ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                    ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
                 ),
             ],
             entry_symbol: RUNTIME_ENTRY_SYMBOL.into(),
@@ -795,7 +805,7 @@ fn allocate_package_code(
         name,
         bytes,
         alignment: 8,
-        bounds: RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        bounds: RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
         end_alignment,
         guard_after,
     })
@@ -813,8 +823,9 @@ fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
 fn reserve_fixed_runtime_memory(memory: &mut TileMemoryMap) -> PackageBuildResult<()> {
     memory.reserve(
         "host exchange aperture",
-        ipu_exchange::EXCHANGE_WINDOW_BASE
-            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+        crate::runtime_layout::EXCHANGE_WINDOW_BASE
+            ..crate::runtime_layout::EXCHANGE_WINDOW_BASE
+                + crate::runtime_layout::EXCHANGE_WINDOW_BYTES,
     )?;
     memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
     Ok(())
@@ -837,7 +848,7 @@ fn protect_executable_elements(
 ) -> PackageBuildResult<()> {
     // Instruction fetch conflicts with data access in the same element, but
     // distinct executable objects can share it safely.
-    let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+    let element = ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE;
     for range in ranges {
         let start = (range.start / element * element).max(RUNTIME_EXECUTABLE_START);
         let end = range.end.div_ceil(element) * element;
@@ -907,7 +918,7 @@ mod tests {
     #[test]
     fn linked_sections_protect_their_complete_memory_elements() {
         let base = RUNTIME_EXECUTABLE_START;
-        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
+        let element = ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE;
         let linked = LinkedImage {
             base,
             entry: base,
@@ -954,8 +965,8 @@ mod tests {
     #[test]
     fn package_code_reuses_holes_before_the_last_linked_section() {
         let base = RUNTIME_EXECUTABLE_START;
-        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-        let limit = ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT;
+        let element = ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE;
+        let limit = ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT;
         let linked = LinkedImage {
             base,
             entry: base,
@@ -984,7 +995,7 @@ mod tests {
             "host programs",
             4096,
             8,
-            ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+            ipu_target::ipu21::memory::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
         )
         .unwrap();
         let tile = allocate_package_code(&mut memory, "generated tile programs", 17556, element, 0)
@@ -1005,7 +1016,7 @@ mod tests {
                 name: "host descriptors",
                 bytes: 6280,
                 alignment: 4,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
                 end_alignment: 4,
                 guard_after: 0,
             })

@@ -1,5 +1,6 @@
 use super::*;
 use ipu_codegen::{RepeatPointer, RepeatStep};
+use ipu_target::ipu21::instruction::{encode_delay_m, encode_put_special_m, encode_setzi_m};
 
 /// Exercise exact payloads on every Repeat iteration, then an absolute row to
 /// check that a subsequent exchange resets OUTGOING_BASE.
@@ -61,9 +62,9 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         for relative in [true, false] {
             let items = if paired { words / 2 } else { words };
             let mut plan = if paired {
-                topology.paired_multicast(0, &destinations, items)?
+                ipu_exchange::paired_multicast(&topology, 0, &destinations, items)?
             } else if destinations.len() == 1 {
-                let point = topology.point_to_point(0, destinations[0], words)?;
+                let point = ipu_exchange::point_to_point(&topology, 0, destinations[0], words)?;
                 MulticastPlan {
                     sender: point.sender,
                     receivers: vec![finalize_point_receiver(
@@ -72,7 +73,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     )?],
                 }
             } else {
-                topology.multicast(0, &destinations, words, 0)?
+                ipu_exchange::multicast(&topology, 0, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, if relative { 0 } else { source_address })?;
             for row in &mut plan.receivers {
@@ -123,9 +124,9 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             let relative = section != 1;
             let address = 0x6d000 + case * 3 * stride + section * stride;
             let mut plan = if paired {
-                topology.paired_multicast(0, &destinations, words / 2)?
+                ipu_exchange::paired_multicast(&topology, 0, &destinations, words / 2)?
             } else if destinations.len() == 1 {
-                let point = topology.point_to_point(0, destinations[0], words)?;
+                let point = ipu_exchange::point_to_point(&topology, 0, destinations[0], words)?;
                 MulticastPlan {
                     sender: point.sender,
                     receivers: vec![finalize_point_receiver(
@@ -134,7 +135,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     )?],
                 }
             } else {
-                topology.multicast(0, &destinations, words, 0)?
+                ipu_exchange::multicast(&topology, 0, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, if relative { 0 } else { source_address })?;
             if destinations.len() != 1 {
@@ -181,7 +182,6 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         let grouped_address = row_address;
         let mut grouped_rows = Vec::new();
         for tile in 0..tiles {
-            use ipu_exchange::{encode_delay_m, encode_put_special_m, encode_setzi_m};
             // The package prologue leaves the moving base in m6.
             let mut row = vec![encode_delay_m(1)?, encode_delay_m(1)?];
             for (section, phase) in sections.iter().enumerate() {
@@ -212,7 +212,10 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                 let mut body = phase.programs[usize::from(tile)]
                     .clone()
                     .unwrap_or_else(inactive_exchange_program);
-                assert_eq!(body.pop(), Some(ipu_exchange::RETURN_M10_INSTRUCTION));
+                assert_eq!(
+                    body.pop(),
+                    Some(ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION)
+                );
                 row.extend(body);
                 // Equal timed sections on all tiles; retain eight-byte alignment.
                 let padding = phase.event_cycles + 16 - phase.tile_event_cycles[usize::from(tile)];
@@ -223,7 +226,7 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     row.push(encode_delay_m(padding)?);
                 }
             }
-            row.push(ipu_exchange::RETURN_M10_INSTRUCTION);
+            row.push(ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION);
             row_address = row_address.max(grouped_address + row.len() as u32 * 4);
             grouped_rows.push((tile, row.clone()));
             let mut body = vec![TileStep::Exchange(ExchangeStep {

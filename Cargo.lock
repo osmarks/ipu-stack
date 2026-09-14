@@ -336,6 +336,7 @@ dependencies = [
  "ipu-package",
  "ipu-profile",
  "ipu-runtime",
+ "ipu-target",
  "serde",
  "serde_json",
  "tracing",
@@ -348,10 +349,10 @@ dependencies = [
  "fastrand",
  "foldhash",
  "hashbrown",
- "ipu-driver",
  "ipu-elf",
  "ipu-exchange",
  "ipu-package",
+ "ipu-target",
  "min-max-heap",
  "radsort",
  "rayon",
@@ -367,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "fastrand",
  "ipu-package",
+ "ipu-target",
  "libc",
  "object",
  "thiserror",
@@ -391,6 +393,7 @@ name = "ipu-exchange"
 version = "0.1.0"
 dependencies = [
  "fastrand",
+ "ipu-target",
  "serde",
  "thiserror",
  "tracing",
@@ -403,6 +406,7 @@ dependencies = [
  "capnp",
  "capnpc",
  "fastrand",
+ "ipu-target",
  "thiserror",
  "tracing",
 ]
@@ -426,6 +430,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipu-target"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "ipu-tests"
 version = "0.1.0"
 dependencies = [
@@ -440,6 +451,7 @@ dependencies = [
  "ipu-exchange",
  "ipu-package",
  "ipu-runtime",
+ "ipu-target",
  "rand_distr",
  "rand_xoshiro",
  "rayon",

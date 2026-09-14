@@ -96,7 +96,7 @@ fn main() -> Result<()> {
             });
         }
         slices.push(RegionSlice {
-            tile: u32::from(ipu_exchange::c600_logical_to_physical(tile as u16)),
+            tile: u32::from(ipu_target::c600::logical_to_physical(tile as u16)),
             tile_address: output_address,
             file_offset: expected.len() as u64,
             size: bytes as u64,

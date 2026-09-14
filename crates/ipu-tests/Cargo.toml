@@ -26,6 +26,7 @@ ipu-elf = { path = "../ipu-elf" }
 ipu-exchange = { path = "../ipu-exchange" }
 ipu-package = { path = "../ipu-package" }
 ipu-runtime = { path = "../ipu-runtime" }
+ipu-target = { path = "../ipu-target" }
 fastrand.workspace = true
 rayon.workspace = true
 half.workspace = true

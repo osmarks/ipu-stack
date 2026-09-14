@@ -89,7 +89,7 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
         let phases = crate::exchange::lower_exchanges(
             &low,
             &placement,
-            &ipu_exchange::Topology::c600(),
+            &ipu_target::ipu21::fabric::Topology::c600(),
             false,
         )
         .unwrap()
@@ -179,11 +179,11 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
         // The same sequence contract must work in either physical region.
         for base in [
             crate::memory::IPU21_DATA_BASE,
-            ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+            ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE,
         ] {
             let placement = crate::place::place_with_ranges(
                 &low,
-                &[(base, ipu_package::IPU21_APPLICATION_MEMORY_LIMIT)],
+                &[(base, ipu_package::loader_abi::APPLICATION_LOAD_LIMIT)],
             )
             .unwrap();
             let sequence = &low.repeat_runs[0].binding.iterated[0];
@@ -199,7 +199,7 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
             let phases = crate::exchange::lower_exchanges(
                 &low,
                 &placement,
-                &ipu_exchange::Topology::c600(),
+                &ipu_target::ipu21::fabric::Topology::c600(),
                 false,
             )
             .unwrap()
@@ -349,6 +349,6 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
     assert_eq!(code.words.len(), 2);
     assert_eq!(
         code.words[1],
-        ipu_exchange::encode_add_m_immediate(3, 3, -32768).unwrap()
+        ipu_target::ipu21::instruction::encode_add_m_immediate(3, 3, -32768).unwrap()
     );
 }

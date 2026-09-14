@@ -8,9 +8,9 @@ license.workspace = true
 foldhash.workspace = true
 hashbrown.workspace = true
 ipu-exchange = { path = "../ipu-exchange" }
-ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }
 ipu-package = { path = "../ipu-package" }
+ipu-target = { path = "../ipu-target" }
 rayon.workspace = true
 radsort.workspace = true
 serde.workspace = true

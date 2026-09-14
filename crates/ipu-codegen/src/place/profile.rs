@@ -2,7 +2,8 @@
 use super::*;
 use crate::memory::TileMemoryMap;
 use crate::package::{PackageBuildError, PackageBuildResult};
-use ipu_package::{Application, TILE_MEMORY_BASE, TILE_MEMORY_SIZE};
+use ipu_package::Application;
+use ipu_target::ipu21::memory::{TILE_MEMORY_BASE, TILE_MEMORY_SIZE};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -73,13 +74,18 @@ fn collect(
         })
         .collect::<BTreeMap<_, _>>();
     let mut labels = Labels::default();
-    let mut tiles = (0..application.tiles.len())
-        .map(|logical| Tile {
-            logical: logical as u16,
-            physical: ipu_exchange::c600_logical_to_physical(logical as u16),
-            allocations: Vec::new(),
+    let mut tiles = application
+        .tiles
+        .iter()
+        .enumerate()
+        .map(|(logical, image)| {
+            Ok(Tile {
+                logical: logical as u16,
+                physical: u16::try_from(image.physical_tile)?,
+                allocations: Vec::new(),
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<PackageBuildResult<Vec<_>>>()?;
     for tile in &mut tiles {
         let members = &analysis.tiles[usize::from(tile.logical)].members;
         let requests = allocation_requests(program, &analysis, tile.logical)?;
@@ -241,9 +247,9 @@ fn collect(
         }
         // Display the loader-inaccessible SRAM tail explicitly.
         tile.allocations.push(Allocation {
-            start: IPU21_APPLICATION_MEMORY_LIMIT,
+            start: APPLICATION_LOAD_LIMIT,
             end: TILE_MEMORY_BASE + TILE_MEMORY_SIZE,
-            payload_end: IPU21_APPLICATION_MEMORY_LIMIT,
+            payload_end: APPLICATION_LOAD_LIMIT,
             label: labels.intern("Outside application load range".into()),
             kind: "padding".into(),
             first: 0,
@@ -339,6 +345,7 @@ fn write_html(profile: &Profile, output: &Path) -> PackageBuildResult<()> {
     let index = serde_json::json!({
         "start": profile.start, "end": profile.end, "labels": profile.labels,
         "tiles": tiles, "chunk_size": TILES_PER_CHUNK,
+        "region_boundaries": [IPU21_INTERLEAVED_MEMORY_BASE],
         "directory": directory.file_name().unwrap().to_string_lossy(),
     });
     std::fs::write(
@@ -441,7 +448,7 @@ mod tests {
         let application = Application {
             tiles: (0..8)
                 .map(|tile| ipu_package::TileImage {
-                    physical_tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                    physical_tile: u32::from(ipu_target::c600::logical_to_physical(7 - tile)),
                     entry_point: 0,
                     command_address: 0,
                     diagnostic_address: 0,
@@ -458,6 +465,13 @@ mod tests {
             )
             .unwrap();
         let report = collect(&low, &placement, &support, &application).unwrap();
+        assert!(
+            report
+                .tiles
+                .iter()
+                .zip(&application.tiles)
+                .all(|(tile, image)| { u32::from(tile.physical) == image.physical_tile })
+        );
         for input in low
             .inputs
             .iter()

@@ -235,8 +235,8 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
                         crate::memory::IPU21_DATA_BASE + 4,
                     ),
                     (
-                        ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
-                        ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                        ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE,
+                        ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
                     ),
                 ],
             )

@@ -81,7 +81,14 @@ comparisons observe the same assignment. Existing rotation behavior remains.
 Ownership-copy insertion belongs to mid and covers allocation aliases as well
 as callable operands. This representation work does not yet move the global
 mapping proposal into Recipe. Scoped ownership decisions and the remaining
-family storage, relocation, target and cache boundaries below still require work.
+family storage, relocation and cache boundaries below still require work.
+Architectural SRAM, supervisor encodings, register IDs and physical routing now
+belong to the dependency-leaf `ipu-target` crate. Exchange construction consumes
+the target topology through explicit functions. Package validation and the driver
+share the secondary-loader ABI; codegen no longer depends on the driver. Runtime
+placement defaults live in codegen, and host packet encoding takes the configured
+window base. Rust and device assembly share register, opcode and runtime-layout
+definition inputs instead of separately maintained copies.
 The diagnoses below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

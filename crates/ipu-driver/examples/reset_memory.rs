@@ -2,7 +2,7 @@
 //! Run with: c600-init.ipucfg an-idle.ipuexe tile_bootloader_cc_ipu21.elf
 //! The package is loaded only to establish a runnable diagnostic environment.
 use ipu_driver::{Device, TILE_MEMORY_SIZE};
-use ipu_package::TILE_MEMORY_BASE;
+use ipu_target::ipu21::memory::TILE_MEMORY_BASE;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ipu_driver::block_device_interrupt_signals()?;

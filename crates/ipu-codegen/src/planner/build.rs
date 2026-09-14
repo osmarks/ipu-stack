@@ -207,7 +207,8 @@ fn canonical(shape: &TensorShape, precision: Precision, tiles: u16, capacity: bo
         rows.min(u32::from(tiles)) as u16
     } else {
         let row_bytes = shape.elements() / u64::from(rows) * precision.bytes();
-        let capacity = (u64::from(ipu_package::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
+        let capacity =
+            (u64::from(ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE) / row_bytes).max(1);
         let block = (1u32 << capacity.min(u64::from(u32::MAX)).ilog2())
             .min(rows)
             .max(rows.div_ceil(u32::from(tiles)));

@@ -348,7 +348,7 @@ fn main() -> Result<()> {
                         data: initial,
                     });
                     slices.push(RegionSlice {
-                        tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                        tile: u32::from(ipu_target::c600::logical_to_physical(tile)),
                         tile_address: output - 8,
                         file_offset: cases
                             .iter()

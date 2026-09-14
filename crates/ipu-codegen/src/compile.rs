@@ -22,7 +22,7 @@ use crate::package::{
 use crate::planner::{Candidate, Recipe, build};
 use crate::planner::{checkpoint, proposals};
 use ipu_elf::Toolchain;
-use ipu_exchange::Topology;
+use ipu_target::ipu21::fabric::Topology;
 use rayon::prelude::*;
 use std::{path::PathBuf, sync::Arc};
 

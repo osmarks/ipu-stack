@@ -166,7 +166,7 @@ fn main() -> Result<()> {
                 address: 0x7c000,
                 data: vec![0; 0x4000],
             });
-            let physical = u32::from(ipu_exchange::c600_logical_to_physical(tile));
+            let physical = u32::from(ipu_target::c600::logical_to_physical(tile));
             for (address, size) in [(0x7f000, 16), (old - 8, size + 16), (new - 8, size + 16)] {
                 for start in (0..size).step_by(256) {
                     let chunk = (size - start).min(256);

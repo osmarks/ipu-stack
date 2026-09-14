@@ -1,3 +1,4 @@
+use crate::runtime_layout::{HOST_CLOSE_ADDRESS, HOST_PACKET_ADDRESS, HOST_STAGING_ADDRESS};
 use crate::{HostPhase, HostProgram};
 use ipu_package::{
     Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice, SEGMENT_EXECUTE,
@@ -8,9 +9,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use super::package::{PackageBuildResult, invalid};
 
 const HOST_DATA_START: u32 = ipu_exchange::HOST_PAGE_BYTES;
-const HOST_PACKET_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE;
-const HOST_CLOSE_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x160;
-const HOST_STAGING_ADDRESS: u32 = ipu_exchange::EXCHANGE_WINDOW_BASE + 0x180;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -84,6 +82,7 @@ pub(crate) fn plan(
         transfer.copy_destination = Some(transfer.tile_address);
         transfer.tile_address = HOST_STAGING_ADDRESS;
         ipu_exchange::plan_host_to_tile(
+            crate::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -163,7 +162,7 @@ pub(crate) fn plan(
         programs,
         segments: all_segments,
         protocol: HostExchange {
-            startup_mark: ipu_driver::HOST_EXCHANGE_HANDOFF_MARK,
+            startup_mark: ipu_package::loader_abi::HOST_EXCHANGE_HANDOFF_MARK,
             command_page: 0,
             command_offset: 0,
             pages: vec![
@@ -426,6 +425,7 @@ fn phase_instructions(
 fn target_program(transfer: Transfer) -> PackageBuildResult<ipu_exchange::TileToHostProgram> {
     Ok(match transfer.direction {
         Direction::ToTile => ipu_exchange::assemble_host_to_tile_target_program(
+            crate::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -433,6 +433,7 @@ fn target_program(transfer: Transfer) -> PackageBuildResult<ipu_exchange::TileTo
             HOST_PACKET_ADDRESS + 8,
         )?,
         Direction::ToHost => ipu_exchange::assemble_tile_to_host_target_program(
+            crate::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -448,7 +449,7 @@ fn descriptor_words(
     packet_source: u32,
     packet_words: u32,
     target_only: bool,
-) -> PackageBuildResult<[u32; 3]> {
+) -> PackageBuildResult<[u32; crate::runtime_layout::HOST_RUN_DESCRIPTOR_WORDS]> {
     let (destination, copy_words) = target
         .and_then(|transfer| Some((transfer.copy_destination?, transfer.bytes / 4)))
         .unwrap_or_default();
@@ -486,9 +487,9 @@ fn xreq_targets(physical_tile: u16, phase: &[Transfer]) -> PackageBuildResult<Ve
 
 fn inactive_instructions() -> [u32; 3] {
     [
-        ipu_exchange::sans(1),
-        ipu_exchange::SYNC_ANS_INSTRUCTION,
-        ipu_exchange::RETURN_M10_INSTRUCTION,
+        ipu_target::ipu21::instruction::sans(1),
+        ipu_target::ipu21::instruction::SYNC_ANS_INSTRUCTION,
+        ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION,
     ]
 }
 

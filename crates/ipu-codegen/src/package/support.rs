@@ -16,7 +16,7 @@ use crate::memory::{
 };
 use crate::{CodegenOptions, PipelineConfig, TileProgramLowering, emit};
 use ipu_elf::LinkedImage;
-use ipu_exchange::Topology;
+use ipu_target::ipu21::fabric::Topology;
 use rayon::prelude::*;
 
 /// Reservations measured with the same host/tile emitters used for final output.
@@ -44,7 +44,7 @@ impl PackageSupport {
     pub(crate) fn exchange_row_capacity(&self) -> u32 {
         self.exchange_rows.as_ref().map_or(0, |storage| {
             storage.reserved.end
-                - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
+                - ipu_target::ipu21::memory::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
                 - storage.range.start
         })
     }
@@ -127,7 +127,10 @@ pub(crate) fn size_support(
     // Addresses do not affect instruction sizing. Final emission and host
     // bindings use the auxiliary allocations chosen alongside tensors.
     let provisional_profile_addresses = config.profiling.then(|| {
-        vec![ipu_package::IPU21_INTERLEAVED_MEMORY_BASE; usize::from(execution_tile_count)]
+        vec![
+            ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE;
+            usize::from(execution_tile_count)
+        ]
     });
     let execution_topology = Topology::c600();
     let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
@@ -148,7 +151,7 @@ pub(crate) fn size_support(
     )?;
     let sizing_host_base = memory.next_free(
         RUNTIME_EXECUTABLE_START,
-        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
         4,
         "host programs",
     )?;
@@ -157,7 +160,7 @@ pub(crate) fn size_support(
     let provisional_auxiliary_ranges = vec![
         vec![(
             crate::IPU21_DATA_BASE,
-            ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+            ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
         )];
         usize::from(execution_tile_count)
     ];
@@ -180,7 +183,7 @@ pub(crate) fn size_support(
                 "host programs",
                 host_code_bytes,
                 8,
-                ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+                ipu_target::ipu21::memory::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
             )
         })
         .transpose()?;
@@ -207,7 +210,7 @@ pub(crate) fn size_support(
     )?;
     let sizing_code_address = memory.next_free(
         RUNTIME_EXECUTABLE_START,
-        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
         4,
         "generated tile programs",
     )?;
@@ -251,7 +254,7 @@ pub(crate) fn size_support(
     })?;
     tracing::info!(linked_end, host_code_base, host_code_bytes, generated_code_bytes,
         exchange_table_bytes,
-        executable_ranges = ?memory.free_ranges(RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
+        executable_ranges = ?memory.free_ranges(RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT),
         "placing generated tile programs");
     let tile_code = (generated_code_bytes != 0)
         .then(|| {
@@ -291,10 +294,11 @@ pub(crate) fn size_support(
                 // any transfer source or destination. Reserve whole elements
                 // at both ends so storage placement cannot use a prefix of the
                 // row table's first element.
-                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
+                alignment: ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE,
+                bounds: crate::IPU21_DATA_BASE
+                    ..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                end_alignment: ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE,
+                guard_after: ipu_target::ipu21::memory::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
             })
         })
         .transpose()?;
@@ -311,14 +315,14 @@ pub(crate) fn size_support(
                 name: "host descriptors",
                 bytes: host_data_bytes,
                 alignment: 4,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                bounds: crate::IPU21_DATA_BASE..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
                 end_alignment: 4,
                 guard_after: 0,
             })
         })
         .transpose()?;
     let mut available_ranges =
-        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT);
+        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT);
     available_ranges.insert(0, crate::place::HOST_SCRATCH_RANGE);
     tracing::info!(
         linked_end,

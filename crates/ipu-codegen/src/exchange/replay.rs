@@ -26,7 +26,7 @@ pub fn select_exchange_schedule(
     validate_snapshot_tile_count(tile_count)?;
     let topology = Topology::new(
         (0..tile_count)
-            .map(ipu_exchange::c600_logical_to_physical)
+            .map(ipu_target::c600::logical_to_physical)
             .collect(),
     )?;
     let pending = pending_from_problem(tile_count, problem)?;
@@ -70,7 +70,7 @@ pub fn schedule_exchange_problem_with_priority(
     validate_snapshot_tile_count(tile_count)?;
     let topology = Topology::new(
         (0..tile_count)
-            .map(ipu_exchange::c600_logical_to_physical)
+            .map(ipu_target::c600::logical_to_physical)
             .collect(),
     )?;
     let pending = packet::split_self_receive_conflicts(

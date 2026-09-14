@@ -182,7 +182,7 @@ mod tests {
         let mut builder = PhaseProgramBuilder::new(4);
         for round in 0..32 {
             let (source, receivers) = if round % 2 == 0 { (0, [2]) } else { (1, [0]) };
-            let mut plan = topology.multicast(source, &receivers, 64, 0).unwrap();
+            let mut plan = multicast(&topology, source, &receivers, 64, 0).unwrap();
             patch_sender_address(&mut plan.sender, 0x10000 + round * 256).unwrap();
             patch_receiver_address(&mut plan.receivers[0], 0x50000 + round * 256).unwrap();
             let prepared = plan.prepare().unwrap();
@@ -212,7 +212,7 @@ mod tests {
             }
         }
         let mut builder = PhaseProgramBuilder::new(4);
-        let plan = topology.multicast(1, &[0], 256, 0).unwrap();
+        let plan = multicast(&topology, 1, &[0], 256, 0).unwrap();
         let plan = plan.prepare().unwrap();
         let offset = builder
             .earliest_transfer_offset(1, &[], &[0], &plan, 256, 0)
@@ -230,7 +230,7 @@ mod tests {
     #[test]
     fn validated_transfer_commits_its_encoded_trial_and_rejects_stale_trials() {
         let topology = Topology::c600();
-        let plan = topology.multicast(0, &[2], 64, 0).unwrap();
+        let plan = multicast(&topology, 0, &[2], 64, 0).unwrap();
         let mut builder = PhaseProgramBuilder::new(4);
         let offset = builder
             .earliest_transfer_offset(0, &[], &[2], &plan.prepare().unwrap(), 64, 0)
@@ -267,7 +267,7 @@ mod tests {
         builder
             .earliest_transfer_offset(0, &[], &[2], &plan.prepare().unwrap(), 64, 0)
             .unwrap();
-        let other = topology.multicast(1, &[3], 32, 0).unwrap();
+        let other = multicast(&topology, 1, &[3], 32, 0).unwrap();
         let offset = builder
             .earliest_transfer_offset_deferred(1, &[], &[3], &other.prepare().unwrap(), 32, 0)
             .unwrap();
@@ -284,8 +284,7 @@ mod tests {
 
     #[test]
     fn rejected_receive_preserves_stream_and_encoding() {
-        let row = Topology::c600()
-            .multicast(0, &[2], 64, 0)
+        let row = multicast(&Topology::c600(), 0, &[2], 64, 0)
             .unwrap()
             .receivers[0];
         let mut schedule = TileProgramSchedule::default();
@@ -316,7 +315,7 @@ mod tests {
 
     #[test]
     fn sender_insertion_checks_both_neighbors_without_changing_failed_history() {
-        let row = Topology::c600().multicast(0, &[2], 64, 0).unwrap().sender;
+        let row = multicast(&Topology::c600(), 0, &[2], 64, 0).unwrap().sender;
         let mut schedule = TileProgramSchedule::default();
         for offset in [3000, 1000, 2000] {
             schedule
@@ -345,7 +344,7 @@ mod tests {
     fn validation_budget_limits_effort_without_invalidating_the_schedule() {
         let topology = Topology::c600();
         let receivers = [2];
-        let plan = topology.multicast(0, &receivers, 64, 0).unwrap();
+        let plan = multicast(&topology, 0, &receivers, 64, 0).unwrap();
         let mut builder = PhaseProgramBuilder::new(4).with_validation_budget(2);
         let offset = builder
             .earliest_transfer_offset(0, &[], &receivers, &plan.prepare().unwrap(), 64, 0)
@@ -377,9 +376,9 @@ mod tests {
             let mut prefix = None;
             for index in 0..count {
                 let plan = if index % 8 < 4 {
-                    topology.paired_multicast(0, &[2, 3], 64).unwrap()
+                    paired_multicast(&topology, 0, &[2, 3], 64).unwrap()
                 } else {
-                    topology.multicast(0, &[2], 64, 0).unwrap()
+                    multicast(&topology, 0, &[2], 64, 0).unwrap()
                 };
                 let mut row = plan.receivers[0];
                 patch_receiver_address(&mut row, 0x50000 + index % 128 * 512).unwrap();
@@ -416,7 +415,7 @@ mod tests {
                 if index == count {
                     prefix = Some(schedule.encoded().unwrap().clone());
                 }
-                let mut row = topology.multicast(0, &[2], 64, 0).unwrap().receivers[0];
+                let mut row = multicast(&topology, 0, &[2], 64, 0).unwrap().receivers[0];
                 patch_receiver_address(&mut row, 0x50000 + index % 256 * 256).unwrap();
                 let offset = schedule
                     .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), 64, 0)
@@ -469,7 +468,7 @@ mod tests {
         let topology = Topology::c600();
         let mut schedule = TileProgramSchedule::default();
         for index in 0..128 {
-            let mut row = topology.multicast(0, &[2], 64, 0).unwrap().receivers[0];
+            let mut row = multicast(&topology, 0, &[2], 64, 0).unwrap().receivers[0];
             patch_receiver_address(&mut row, 0x50000 + index * 256).unwrap();
             let offset = schedule
                 .earliest_receiver_offset(&receive_row_timing(&row, 0).unwrap(), 64, 0)
@@ -495,9 +494,7 @@ mod tests {
                     let source = random.u16(0..4) * 2;
                     let destination = (source + 2) % 8;
                     let receivers = vec![destination, destination + 1];
-                    let plan = topology
-                        .paired_multicast(source, &receivers, words)
-                        .unwrap();
+                    let plan = paired_multicast(&topology, source, &receivers, words).unwrap();
                     (source, receivers, vec![source ^ 1], plan)
                 } else {
                     let source = random.u16(0..8);
@@ -507,7 +504,7 @@ mod tests {
                     if receivers.is_empty() || receivers == [source] {
                         continue;
                     }
-                    let plan = topology.multicast(source, &receivers, words, 0).unwrap();
+                    let plan = multicast(&topology, source, &receivers, words, 0).unwrap();
                     (source, receivers, vec![], plan)
                 };
                 let offset = builder

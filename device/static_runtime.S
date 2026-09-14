@@ -1,17 +1,16 @@
 #include "arch/gc_tile_defines.h"
+#define IPU_CONSTANT(name, type, value) .set name, value
+#include "../crates/ipu-target/include/ipu21_registers.def"
+#include "../crates/ipu-target/include/ipu21_instruction.def"
+#include "runtime_layout.def"
+#undef IPU_CONSTANT
 
 	.text
 	.allow_optimizations
 
-	.set TILE_MUX_HOST, 0x600
-	.set TILE_MUX_EXCHANGE, 0x640
-	.set WORKER_BASE_STRIDE, 0x100
-	.set HOST_RUN_DESCRIPTOR_BYTES, 3 * 4
-	.set HOST_PACKET_ADDRESS, 0x50000
 	.set SYNC_ALL, 7
 	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
 	.set SYNC_SUPERVISOR, 3
-	.set OPCODE_SYNC, 0x41800000
 	.set PRNG_WARMUP_REPEAT_COUNT, 15
 
 	.extern ipu_stack_static_worker_sync_context
@@ -28,12 +27,12 @@
 	.type ipu_stack_static_start,@function
 ipu_stack_static_start:
 	.supervisor
-	.long OPCODE_SYNC | SYNC_SUPERVISOR
+	.long SYNC_OPCODE | SYNC_SUPERVISOR
 	// The bootloader may reach application entry before every worker retires.
-	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	.long SYNC_OPCODE | SYNC_COMPUTE_SET
 	setzi $m0, TILE_MUX_EXCHANGE
-	put 0xa0, $m0
-	put 0xa7, $m15
+	put INCOMING_MUX, $m0
+	put OUTGOING_BASE, $m15
 	// Numerical kernels require finite results. Treat overflow as a fault;
 	// worker FP_CTL inherits FP_ICTL on activation.
 	get $m0, $FP_ICTL
@@ -42,25 +41,25 @@ ipu_stack_static_start:
 	put $FP_ICTL, $m0
 	setzi $m11, ipu_stack_static_worker_stack_base
 	put 0x21, $m11
-	add $m11, $m11, WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_SYNC_STRIDE
 	put 0x22, $m11
-	add $m11, $m11, WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_SYNC_STRIDE
 	put 0x23, $m11
-	add $m11, $m11, WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_SYNC_STRIDE
 	put 0x24, $m11
-	add $m11, $m11, WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_SYNC_STRIDE
 	put 0x25, $m11
-	add $m11, $m11, WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_SYNC_STRIDE
 	put 0x26, $m11
-	add $m11, $m11, WORKER_BASE_STRIDE
+	add $m11, $m11, WORKER_SYNC_STRIDE
 	setzi $m0, ipu_stack_static_worker_init
 	runall $m0, $m15, 0
-	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	.long SYNC_OPCODE | SYNC_COMPUTE_SET
 	setzi $m0, TILE_MUX_HOST
-	put 0xa0, $m0
-	.long OPCODE_SYNC | SYNC_ALL
+	put INCOMING_MUX, $m0
+	.long SYNC_OPCODE | SYNC_ALL
 	setzi $m0, TILE_MUX_EXCHANGE
-	put 0xa0, $m0
+	put INCOMING_MUX, $m0
 	setzi $m0, ipu_stack_static_program
 	br $m0
 	.size ipu_stack_static_start, .-ipu_stack_static_start
@@ -98,7 +97,7 @@ ipu_stack_static_worker_barrier:
 	.supervisor
 	setzi $m0, ipu_stack_static_worker_barrier_worker
 	runall $m0, $m15, 0
-	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	.long SYNC_OPCODE | SYNC_COMPUTE_SET
 	br $m7
 	.size ipu_stack_static_worker_barrier, .-ipu_stack_static_worker_barrier
 
@@ -542,7 +541,7 @@ ipu_stack_static_sample_cycle:
 	st32 $m2, $m5, $m15, 0
 	setzi $m0, ipu_stack_static_sample_cycle_worker
 	runall $m0, $m5, 0
-	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	.long SYNC_OPCODE | SYNC_COMPUTE_SET
 	br $m10
 	.size ipu_stack_static_sample_cycle, .-ipu_stack_static_sample_cycle
 
@@ -595,7 +594,7 @@ static_worker_delay:
 	st32 $m4, $m11, $m15, 0
 	setzi $m0, .Lworker_delay
 	runall $m0, $m11, 0
-	.long OPCODE_SYNC | SYNC_COMPUTE_SET
+	.long SYNC_OPCODE | SYNC_COMPUTE_SET
 	add $m11, $m11, 8
 	br $m10
 	.size static_worker_delay, .-static_worker_delay

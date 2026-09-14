@@ -57,7 +57,7 @@ pub fn cycle_binding(cases: u16, address: u32) -> Binding {
         shape: vec![u32::from(cases), 2],
         slices: (0..cases)
             .map(|tile| RegionSlice {
-                tile: u32::from(ipu_exchange::c600_logical_to_physical(tile)),
+                tile: u32::from(ipu_target::c600::logical_to_physical(tile)),
                 tile_address: address,
                 file_offset: u64::from(tile) * 8,
                 size: 8,

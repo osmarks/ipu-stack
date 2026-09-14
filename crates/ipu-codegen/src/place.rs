@@ -1,5 +1,8 @@
 //! Deterministic placement of logical shards in IPU21 tile SRAM.
 
+use ipu_target::ipu21::memory::{
+    IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
+};
 mod dump;
 mod exchange;
 pub(crate) mod profile;
@@ -11,10 +14,7 @@ use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::{BlockValueId, ShardDefinition};
 use crate::{StorageError, shard_storage_bytes};
-use ipu_package::{
-    IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
-    TILE_MEMORY_ELEMENT_SIZE,
-};
+use ipu_package::loader_abi::APPLICATION_LOAD_LIMIT;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -105,8 +105,8 @@ impl Lifetime {
 /// The host protocol owns this range before and after device execution.
 /// It is never available to persistent support, inputs or outputs.
 pub(crate) const HOST_SCRATCH_RANGE: (u32, u32) = (
-    ipu_exchange::EXCHANGE_WINDOW_BASE,
-    ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+    crate::runtime_layout::EXCHANGE_WINDOW_BASE,
+    crate::runtime_layout::EXCHANGE_WINDOW_BASE + crate::runtime_layout::EXCHANGE_WINDOW_BYTES,
 );
 
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
@@ -114,7 +114,7 @@ pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {
         program,
         &[
             HOST_SCRATCH_RANGE,
-            (IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT),
+            (IPU21_DATA_BASE, APPLICATION_LOAD_LIMIT),
         ],
     )
 }
@@ -153,7 +153,7 @@ pub(crate) fn place_with_auxiliary(
     }
     if available_ranges.iter().any(|&(start, end)| {
         (start < IPU21_DATA_BASE && (start, end) != HOST_SCRATCH_RANGE)
-            || end > IPU21_APPLICATION_MEMORY_LIMIT
+            || end > APPLICATION_LOAD_LIMIT
             || start >= end
     }) || available_ranges
         .windows(2)
@@ -1565,7 +1565,7 @@ mod tests {
 
     #[test]
     fn partial_elements_accept_payload_without_truncating_it() {
-        let limit = IPU21_APPLICATION_MEMORY_LIMIT;
+        let limit = APPLICATION_LOAD_LIMIT;
         let base = limit / IPU21_INTERLEAVED_ELEMENT_SIZE * IPU21_INTERLEAVED_ELEMENT_SIZE;
         let mut arena = Arena::new(&[(base, limit)], 0);
         let mut payload = request(MemoryClass::Ipu21Interleaved, limit - base, 8, 0, 1);
@@ -1600,7 +1600,7 @@ mod tests {
         let ranges = [
             (boundary - 65536, boundary - 32768),
             (boundary - 16384, boundary),
-            (boundary, IPU21_APPLICATION_MEMORY_LIMIT),
+            (boundary, APPLICATION_LOAD_LIMIT),
         ];
         for trial in 0..128 {
             let mut arena = Arena::new(&ranges, 256);
@@ -1734,19 +1734,13 @@ mod tests {
                 &low,
                 &[
                     (IPU21_DATA_BASE, IPU21_DATA_BASE + 4),
-                    (
-                        IPU21_INTERLEAVED_MEMORY_BASE,
-                        IPU21_APPLICATION_MEMORY_LIMIT,
-                    ),
+                    (IPU21_INTERLEAVED_MEMORY_BASE, APPLICATION_LOAD_LIMIT),
                 ],
             )
             .unwrap(),
             place_with_ranges(
                 &low,
-                &[(
-                    IPU21_INTERLEAVED_MEMORY_BASE,
-                    IPU21_APPLICATION_MEMORY_LIMIT,
-                )],
+                &[(IPU21_INTERLEAVED_MEMORY_BASE, APPLICATION_LOAD_LIMIT)],
             )
             .unwrap(),
         ] {
@@ -1812,7 +1806,7 @@ mod tests {
         let placed = place_tile(
             &low,
             0,
-            &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
+            &[(IPU21_DATA_BASE, APPLICATION_LOAD_LIMIT)],
             0,
             &analysis,
             &[],
@@ -1903,7 +1897,7 @@ mod tests {
             );
             let placement = place_with_offset(
                 &low,
-                &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
+                &[(IPU21_DATA_BASE, APPLICATION_LOAD_LIMIT)],
                 random.u32(0..8) * 4096,
             )
             .unwrap();
@@ -1919,7 +1913,7 @@ mod tests {
                 match shard.tensor_type.format.layout.memory_class {
                     MemoryClass::Ipu21Interleaved => {
                         assert!(
-                            (IPU21_INTERLEAVED_MEMORY_BASE..IPU21_APPLICATION_MEMORY_LIMIT)
+                            (IPU21_INTERLEAVED_MEMORY_BASE..APPLICATION_LOAD_LIMIT)
                                 .contains(&address)
                         )
                     }

@@ -32,9 +32,11 @@ pub(super) fn split_self_receive_conflicts(
             .collect::<Vec<_>>();
         let count = transfer.item_count()?;
         let plan = match transfer.width {
-            ExchangeItemWidth::Word32 => topology.multicast(transfer.source, &tiles, count, 0)?,
+            ExchangeItemWidth::Word32 => {
+                ipu_exchange::multicast(&topology, transfer.source, &tiles, count, 0)?
+            }
             ExchangeItemWidth::Paired64 => {
-                topology.paired_multicast(transfer.source, &tiles, count)?
+                ipu_exchange::paired_multicast(&topology, transfer.source, &tiles, count)?
             }
         };
         if !plan.prepare()?.receiver_conflicts_with_send_start(receiver) {

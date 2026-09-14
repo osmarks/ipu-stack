@@ -130,7 +130,7 @@ pub(super) fn propose_exchange_placement(
         return Ok(None);
     }
     let mut best: Option<(u128, u32, crate::Placement)> = None;
-    for offset in (4096..ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE).step_by(4096) {
+    for offset in (4096..ipu_target::ipu21::memory::IPU21_INTERLEAVED_ELEMENT_SIZE).step_by(4096) {
         let candidate = match crate::place::place_with_auxiliary(
             program,
             available_ranges,

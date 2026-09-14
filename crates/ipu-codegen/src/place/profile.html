@@ -8,7 +8,7 @@
 <main>
 <div class="controls">
 <label>Tile <input id="tile" type="number" value="0" min="0"></label><button id="jump">Go</button>
-<label>Address <input id="address" value="0x4c000" aria-label="Memory address"></label><button id="goAddress">Go</button>
+<label>Address <input id="address" aria-label="Memory address"></label><button id="goAddress">Go</button>
 <button id="zoomIn" aria-label="Zoom in">+</button><button id="zoomOut" aria-label="Zoom out">−</button><button id="fit">Fit</button><span id="scale"></span>
 <label>Row height <select id="rowHeight"><option value="12">12 px</option><option value="16" selected>16 px</option><option value="24">24 px</option></select></label>
 <label><input id="reuse" type="checkbox" checked>Reused allocations</label>
@@ -34,6 +34,7 @@ const p=JSON.parse(document.getElementById('data').textContent);
 const $=id=>document.getElementById(id), view=$('viewport'), canvas=$('map'), ruler=$('ruler');
 const colors={support:'#6675b5',parameter:'#17854c',activation:'#cf3f4a',scratch:'#c58b24',padding:'#fff'};
 const hex=n=>'0x'+n.toString(16).padStart(5,'0'), bytes=n=>n.toLocaleString('en-US')+' B';
+$('address').value=hex(p.start);
 const label=88, gap=5, tiles=p.tiles, span=p.end-p.start;
 let band=16;
 let bpp=1024, fitMode=true, pinned=null, hover=null, pending=false, height=0;
@@ -111,7 +112,7 @@ function draw(){
   if(row.lane===0||band>=10)ctx.fillText(row.lane===0?'L'+row.tile.logical+' P'+row.tile.physical:'  ↳ reuse '+row.lane,4,y+9);
  }
  ctx.globalAlpha=1;
- for(const address of [0x80000,p.end]){const at=x(address);if(at>=label&&at<w){ctx.strokeStyle='#000';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(at,0);ctx.lineTo(at,h);ctx.stroke();ctx.setLineDash([]);}}
+ for(const address of [...p.region_boundaries,p.end]){const at=x(address);if(at>=label&&at<w){ctx.strokeStyle='#000';ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(at,0);ctx.lineTo(at,h);ctx.stroke();ctx.setLineDash([]);}}
  if(drag&&drag.moved){const l=x(Math.min(drag.start,drag.end)),r=x(Math.max(drag.start,drag.end));ctx.fillStyle='rgba(0,87,255,.18)';ctx.fillRect(l,0,r-l,h);axis.fillStyle='rgba(0,87,255,.18)';axis.fillRect(l,0,r-l,28);}
  $('scale').textContent=bpp.toFixed(bpp<1?2:0)+' B / px';
 }

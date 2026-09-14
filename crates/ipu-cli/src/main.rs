@@ -264,8 +264,11 @@ fn main() -> Result<()> {
             let image = link(
                 &objects,
                 &LinkOptions {
-                    image_base: ipu_package::TILE_MEMORY_BASE,
-                    regions: vec![(base, ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT)],
+                    image_base: ipu_target::ipu21::memory::TILE_MEMORY_BASE,
+                    regions: vec![(
+                        base,
+                        ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
+                    )],
                     entry_symbol: entry,
                     retained_symbols: Vec::new(),
                     externals: symbol.into_iter().collect(),

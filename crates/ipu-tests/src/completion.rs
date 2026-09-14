@@ -110,7 +110,7 @@ pub fn report_kernel_faults(
             .collect::<Vec<_>>()
     );
     for (logical, case) in cases.into_iter().enumerate() {
-        let tile = ipu_exchange::c600_logical_to_physical(logical as u16);
+        let tile = ipu_target::c600::logical_to_physical(logical as u16);
         for context in 0..=6 {
             if device.tile_context_state(tile, context).ok() != Some(3) {
                 continue;

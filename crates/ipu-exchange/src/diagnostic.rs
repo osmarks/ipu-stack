@@ -6,6 +6,7 @@
 //! the second is inline PIC/XPIC payload, not an independently executed word.
 
 use super::*;
+use ipu_target::ipu21::instruction::SETZI_M_OPCODE;
 use std::fmt::{self, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,12 +199,12 @@ fn decode_operation(
             1,
         ));
     }
-    if word & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa4
-        || word & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | 0xa7
+    if word & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | u32::from(INCOMING_BASE)
+        || word & 0xff0f_ffff == PUT_SPECIAL_M_OPCODE | u32::from(OUTGOING_BASE)
     {
         return Ok((
             PlanOperation::WriteBase {
-                incoming: word & 0xff == 0xa4,
+                incoming: word & 0xff == u32::from(INCOMING_BASE),
                 register: ((word >> 20) & 15) as u8,
             },
             EXCHANGE_BASE_WRITE_CYCLES,

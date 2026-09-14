@@ -7,12 +7,13 @@ use ipu_codegen::{
 use ipu_driver::{Device, TileException};
 use ipu_elf::Toolchain;
 use ipu_exchange::{
-    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, Topology, encode_exchange_delay,
-    finalize_point_receiver, patch_receiver_address, patch_sender_address,
-    scheduled_receiver_timing,
+    MulticastPlan, PhaseProgramBuilder, PhaseTransferTiming, finalize_point_receiver,
+    patch_receiver_address, patch_sender_address, scheduled_receiver_timing,
 };
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
+use ipu_target::ipu21::fabric::Topology;
+use ipu_target::ipu21::instruction::encode_delay_immediate;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -159,9 +160,9 @@ pub(crate) fn build_wide(
     let mut validated = BTreeSet::new();
     let mut row_address = WIDE_ROW_BASE;
     let setup_row = vec![
-        ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
-        encode_exchange_delay(0),
-        ipu_exchange::RETURN_M10_INSTRUCTION,
+        ipu_target::ipu21::instruction::SYNC_SUPERVISOR_INSTRUCTION,
+        encode_delay_immediate(0),
+        ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION,
     ];
     let setup_end = row_address + u32::try_from(setup_row.len())? * 4;
     diagnostic_rows.push(StressRow {
@@ -216,16 +217,17 @@ pub(crate) fn build_wide(
     {
         let destinations = (first_destination..destination_end).collect::<Vec<_>>();
         let bank_case = case & 3;
-        let source_element_size = if source_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
-            ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
-        } else {
-            ipu_package::TILE_MEMORY_ELEMENT_SIZE
-        };
-        let destination_element_size =
-            if destination_base >= ipu_package::IPU21_INTERLEAVED_MEMORY_BASE {
-                ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE
+        let source_element_size =
+            if source_base >= ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE {
+                ipu_target::ipu21::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
             } else {
-                ipu_package::TILE_MEMORY_ELEMENT_SIZE
+                ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE
+            };
+        let destination_element_size =
+            if destination_base >= ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE {
+                ipu_target::ipu21::memory::IPU21_INTERLEAVED_ELEMENT_SIZE
+            } else {
+                ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE
             };
         let source_bank_offset = (u32::try_from(bank_case)? >> 1) * source_element_size;
         let destination_bank_offset = (u32::try_from(bank_case)? & 1) * destination_element_size;
@@ -240,7 +242,7 @@ pub(crate) fn build_wide(
         let source_address = source_base + region_offset + source_bank_offset;
         let destination_address = destination_base + region_offset + destination_bank_offset;
 
-        let mut plan = topology.paired_multicast(source, &destinations, items)?;
+        let mut plan = ipu_exchange::paired_multicast(&topology, source, &destinations, items)?;
         patch_sender_address(&mut plan.sender, source_address)?;
         for row in &mut plan.receivers {
             patch_receiver_address(row, destination_address)?;
@@ -267,7 +269,10 @@ pub(crate) fn build_wide(
         let phase = builder.finish()?;
         let mut rows = phase.programs;
         for row in rows.iter_mut().flatten() {
-            row.insert(0, ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION);
+            row.insert(
+                0,
+                ipu_target::ipu21::instruction::SYNC_SUPERVISOR_INSTRUCTION,
+            );
         }
         for (index, &destination) in destinations.iter().enumerate() {
             if receiver_mask & (1 << (index & 1)) == 0 {
@@ -278,9 +283,9 @@ pub(crate) fn build_wide(
             for row in &mut rows {
                 if row.is_none() {
                     *row = Some(vec![
-                        ipu_exchange::SYNC_SUPERVISOR_INSTRUCTION,
-                        encode_exchange_delay(0),
-                        ipu_exchange::RETURN_M10_INSTRUCTION,
+                        ipu_target::ipu21::instruction::SYNC_SUPERVISOR_INSTRUCTION,
+                        encode_delay_immediate(0),
+                        ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION,
                     ]);
                 }
             }
@@ -639,7 +644,8 @@ pub(crate) fn build(
                 .map(|&tile| allocate(&mut expected_cursors, tile, bytes, DATA_LIMIT, &mut rng))
                 .collect::<Result<Vec<_>>>()?;
             let mut plan = if destinations.len() == 1 {
-                let point = topology.point_to_point(source, destinations[0], words)?;
+                let point =
+                    ipu_exchange::point_to_point(&topology, source, destinations[0], words)?;
                 MulticastPlan {
                     sender: point.sender,
                     receivers: vec![finalize_point_receiver(
@@ -648,7 +654,7 @@ pub(crate) fn build(
                     )?],
                 }
             } else {
-                topology.multicast(source, &destinations, words, 0)?
+                ipu_exchange::multicast(&topology, source, &destinations, words, 0)?
             };
             patch_sender_address(&mut plan.sender, source_address)?;
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
@@ -1691,7 +1697,7 @@ fn point_plan(
     destination: u16,
     words: u32,
 ) -> Result<MulticastPlan> {
-    let point = topology.point_to_point(source, destination, words)?;
+    let point = ipu_exchange::point_to_point(&topology, source, destination, words)?;
     Ok(MulticastPlan {
         sender: point.sender,
         receivers: vec![finalize_point_receiver(
@@ -1707,7 +1713,7 @@ fn paired_control_words(
     receiver: u16,
     maximum: u32,
 ) -> Result<Option<u32>> {
-    let plan = topology.point_to_point(source, receiver, 1)?;
+    let plan = ipu_exchange::point_to_point(&topology, source, receiver, 1)?;
     let receiver = finalize_point_receiver(&plan.receiver, topology.physical(source)?)?;
     let timing = scheduled_receiver_timing(&receiver, 0)?;
     Ok(timing

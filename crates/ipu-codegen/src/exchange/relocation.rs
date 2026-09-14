@@ -1,8 +1,7 @@
 //! Relocate moving send groups against the Repeat base retained in m6.
 use super::*;
-use ipu_exchange::{
-    encode_put_special_m, patch_sender_instruction, sender_address_instruction_groups,
-};
+use ipu_exchange::{patch_sender_instruction, sender_address_instruction_groups};
+use ipu_target::ipu21::instruction::encode_put_special_m;
 
 pub(super) fn relocate_repeat_rows(
     physical: &mut PhysicalExchangePhase,
@@ -47,7 +46,7 @@ pub(super) fn relocate_repeat_rows(
                 .map(|activity| &pending[activity.transfer as usize]);
             if physical.outgoing_bases[tile].is_none() {
                 // No common representable base: retain ordinary word patching.
-                let moving = encode_put_special_m(0xa7, 6)?;
+                let moving = encode_put_special_m(ipu_target::ipu21::registers::OUTGOING_BASE, 6)?;
                 if program.contains(&moving) {
                     for instruction in
                         ipu_exchange::diagnostic::diagnose_plan_program(program, None)?.instructions
@@ -59,8 +58,10 @@ pub(super) fn relocate_repeat_rows(
                                 register: 6
                             }
                         ) {
-                            program[instruction.word_offset as usize] =
-                                encode_put_special_m(0xa7, 15)?;
+                            program[instruction.word_offset as usize] = encode_put_special_m(
+                                ipu_target::ipu21::registers::OUTGOING_BASE,
+                                15,
+                            )?;
                         }
                     }
                 }

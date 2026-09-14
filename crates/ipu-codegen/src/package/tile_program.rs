@@ -127,8 +127,8 @@ pub fn build_tile_program_package(
                 name: "host aperture initial contents",
                 bytes,
                 alignment: 4,
-                bounds: ipu_package::IPU21_INTERLEAVED_MEMORY_BASE
-                    ..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
+                bounds: ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE
+                    ..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
                 end_alignment: 4,
                 guard_after: 0,
             })?
@@ -163,8 +163,8 @@ pub fn build_tile_program_package(
         // These externally fixed ranges precede code placement. Exclude their
         // entire executable elements: instruction fetch conflicts with data
         // access even when the byte ranges do not overlap.
-        let element = ipu_package::TILE_MEMORY_ELEMENT_SIZE;
-        let executable_end = end.min(ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT);
+        let element = ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE;
+        let executable_end = end.min(ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT);
         if start < executable_end {
             for (free_start, free_end) in memory
                 .free_ranges(start / element * element..executable_end.div_ceil(element) * element)
@@ -198,10 +198,10 @@ pub fn build_tile_program_package(
     };
     let mut run_outputs = outputs.to_vec();
     run_outputs.push(finish);
-    let host_bounds = crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT;
+    let host_bounds = crate::IPU21_DATA_BASE..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT;
     let sizing_host_base = memory.next_free(
         RUNTIME_EXECUTABLE_START,
-        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
         8,
         "host programs",
     )?;
@@ -245,7 +245,7 @@ pub fn build_tile_program_package(
 
     let sizing_address = memory.next_free(
         RUNTIME_EXECUTABLE_START,
-        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
+        RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
         8,
         "generated tile programs",
     )?;
@@ -266,7 +266,7 @@ pub fn build_tile_program_package(
         &mut memory,
         "generated tile programs",
         maximum_bytes,
-        ipu_package::TILE_MEMORY_ELEMENT_SIZE,
+        ipu_target::ipu21::memory::TILE_MEMORY_ELEMENT_SIZE,
         0,
     )?
     .range
@@ -381,8 +381,8 @@ fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep])
 fn split_aperture_data(
     data: &[crate::TileProgramData],
 ) -> PackageBuildResult<(Vec<crate::TileProgramData>, Vec<crate::TileProgramData>)> {
-    let start = ipu_exchange::EXCHANGE_WINDOW_BASE;
-    let end = start + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+    let start = crate::runtime_layout::EXCHANGE_WINDOW_BASE;
+    let end = start + crate::runtime_layout::EXCHANGE_WINDOW_BYTES;
     let mut loader = Vec::new();
     let mut aperture = BTreeMap::<u16, Vec<crate::TileProgramData>>::new();
     for segment in data {
@@ -443,8 +443,8 @@ mod tests {
     use super::*;
     #[test]
     fn aperture_initial_values_are_word_aligned_and_kept_out_of_loader_data() {
-        let start = ipu_exchange::EXCHANGE_WINDOW_BASE;
-        let end = start + ipu_exchange::EXCHANGE_WINDOW_BYTES;
+        let start = crate::runtime_layout::EXCHANGE_WINDOW_BASE;
+        let end = start + crate::runtime_layout::EXCHANGE_WINDOW_BYTES;
         let input = vec![
             crate::TileProgramData {
                 tile: 0,
