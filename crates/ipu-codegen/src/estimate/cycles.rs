@@ -381,6 +381,7 @@ impl CostModel for Ipu21CostModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::estimate::ExchangeEndpointLoad;
     use crate::{MidOperator, OperatorDispatch};
     use crate::{
         OperandRequirement, OutputAliasing, StorageRequirements, TensorFormat, TileKernelSpec,
@@ -480,8 +481,13 @@ mod tests {
             for tile in 0..random.u16(1..=64) {
                 traffic.add_incoming(tile, random.u64(1..=1 << 20), random.u64(1..=256));
             }
-            let outgoing = traffic.maximum_outgoing_bytes();
-            let incoming = traffic.maximum_incoming_bytes();
+            let maxima = |loads: &[ExchangeEndpointLoad]| {
+                loads.iter().fold((0u64, 0u64), |(bytes, fragments), load| {
+                    (bytes.max(load.bytes), fragments.max(load.fragments))
+                })
+            };
+            let (outgoing, outgoing_fragments) = maxima(&traffic.outgoing_lanes);
+            let (incoming, incoming_fragments) = maxima(&traffic.incoming_tiles);
             let phases = random.u64(1..=32);
             let fixed = phases.saturating_mul(IPU21_TARGET_COSTS.exchange_phase_cycles);
             let cycles = exchange_endpoint_cycles(&traffic, phases);
@@ -495,8 +501,8 @@ mod tests {
             let reversed_traffic = ExchangeEndpointTraffic::from_maxima(
                 incoming,
                 outgoing,
-                traffic.maximum_incoming_fragments(),
-                traffic.maximum_outgoing_fragments(),
+                incoming_fragments,
+                outgoing_fragments,
             );
             let reversed = exchange_endpoint_cycles(&reversed_traffic, phases);
             assert_eq!(cycles, reversed, "case {case}");

@@ -77,46 +77,22 @@ impl ExchangeEndpointTraffic {
             .unwrap_or(0)
     }
 
-    pub(crate) fn maximum_outgoing_bytes(&self) -> u64 {
-        self.outgoing_lanes
-            .iter()
-            .map(|load| load.bytes)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn maximum_incoming_bytes(&self) -> u64 {
-        self.incoming_tiles
-            .iter()
-            .map(|load| load.bytes)
-            .max()
-            .unwrap_or(0)
-    }
-
     pub(crate) fn maximum_payload_bytes(&self) -> u64 {
-        self.maximum_outgoing_bytes()
-            .max(self.maximum_incoming_bytes())
-    }
-
-    pub(crate) fn maximum_outgoing_fragments(&self) -> u64 {
         self.outgoing_lanes
             .iter()
-            .map(|load| load.fragments)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn maximum_incoming_fragments(&self) -> u64 {
-        self.incoming_tiles
-            .iter()
-            .map(|load| load.fragments)
+            .chain(&self.incoming_tiles)
+            .map(|load| load.bytes)
             .max()
             .unwrap_or(0)
     }
 
     pub(crate) fn maximum_fragments(&self) -> u64 {
-        self.maximum_outgoing_fragments()
-            .max(self.maximum_incoming_fragments())
+        self.outgoing_lanes
+            .iter()
+            .chain(&self.incoming_tiles)
+            .map(|load| load.fragments)
+            .max()
+            .unwrap_or(0)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
