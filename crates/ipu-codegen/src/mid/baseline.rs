@@ -79,9 +79,10 @@ pub(crate) fn lower(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     recipe: &Recipe,
 ) -> LoweringResult<Baseline> {
-    let mut selected = select(graph, config, costs, recipe)?;
+    let mut selected = select(graph, config, costs, fragments, recipe)?;
     let mut program = selected.program;
     selected.cast_sites = program.reorder_casts(
         &selected.recipe.cast_before_copies,
@@ -132,6 +133,7 @@ pub(crate) fn select(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     recipe: &Recipe,
 ) -> LoweringResult<Baseline> {
     if config.tile_count == 0 {
@@ -155,6 +157,7 @@ pub(crate) fn select(
         graph,
         config,
         costs,
+        fragments,
         recipe: recipe.clone(),
         state: LoweringState::default(),
         values: BTreeMap::new(),
@@ -279,6 +282,7 @@ struct Builder<'a, C> {
     graph: &'a ComputeGraph,
     config: &'a PipelineConfig,
     costs: &'a C,
+    fragments: &'a FragmentCache,
     recipe: Recipe,
     state: LoweringState,
     values: BTreeMap<ValueId, MidValueId>,
@@ -340,7 +344,14 @@ impl<C: CostModel> Builder<'_, C> {
             let mut plans = if let Some(plan) = self.recipe.plans.get(&operation.id) {
                 vec![plan.clone()]
             } else {
-                search.generate(&types, &parameters, &automatic, shape, self.costs)?
+                search.generate(
+                    &types,
+                    &parameters,
+                    &automatic,
+                    shape,
+                    self.costs,
+                    self.fragments,
+                )?
             };
             // Prefer the AMP attention family over the scalar reference kernel
             // when this shape has a supported whole-device implementation.
@@ -390,8 +401,7 @@ impl<C: CostModel> Builder<'_, C> {
                             early_cast || self.recipe.early_casts.contains(&operation.id);
                         if !self.config.capacity_baseline {
                             let (inputs, output) = plan.tensor_types(&types, shape);
-                            let implementation =
-                                self.costs.implementation(plan, &inputs, &output)?;
+                            let implementation = self.fragments.get(plan, &inputs, &output)?;
                             let mut state = LoweringState::default();
                             let mut conversions = Vec::new();
                             for ((source, requirement), &automatic) in
@@ -459,6 +469,7 @@ impl<C: CostModel> Builder<'_, C> {
                             shape.clone(),
                             plan,
                             self.costs,
+                            self.fragments,
                             &mut values,
                             &mut state,
                             &mut sequence,
@@ -552,6 +563,7 @@ impl<C: CostModel> Builder<'_, C> {
                 shape.clone(),
                 &selected,
                 self.costs,
+                self.fragments,
                 &mut self.values,
                 &mut self.state,
                 &mut operations,
@@ -797,7 +809,14 @@ mod tests {
         let config = PipelineConfig::new(8)
             .with_automatic_input(x, Precision::F16)
             .with_automatic_input(weight, Precision::F16);
-        let baseline = lower(&graph, &config, &Ipu21CostModel, &Recipe::default()).unwrap();
+        let baseline = lower(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
+            &Recipe::default(),
+        )
+        .unwrap();
         let op = baseline
             .program
             .operations
@@ -860,7 +879,14 @@ mod tests {
                 .unwrap()[0];
             graph.set_outputs([output]).unwrap();
             let costs = MemoizedCostModel::new(&Ipu21CostModel);
-            let baseline = lower(&graph, &config, &costs, &Recipe::default()).unwrap();
+            let baseline = lower(
+                &graph,
+                &config,
+                &costs,
+                &crate::mid::implementation::FragmentCache::default(),
+                &Recipe::default(),
+            )
+            .unwrap();
             let repeat = baseline
                 .program
                 .operations

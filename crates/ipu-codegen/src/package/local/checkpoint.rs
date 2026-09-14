@@ -129,8 +129,14 @@ mod tests {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(4).with_automatic_input(input, crate::Precision::F16);
         let mut state = State::load(&graph, &config, None).unwrap();
-        let selected =
-            baseline::lower(&graph, &config, &Ipu21CostModel, &Recipe::default()).unwrap();
+        let selected = baseline::lower(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
+            &Recipe::default(),
+        )
+        .unwrap();
         state.recipe = selected.recipe;
         state.attempts = 17;
         let start = state.context.find("OperatorPlan {").unwrap();

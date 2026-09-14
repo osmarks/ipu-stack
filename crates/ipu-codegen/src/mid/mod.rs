@@ -14,6 +14,7 @@ mod rewrite;
 mod validate;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
+use implementation::FragmentCache;
 mod primitive;
 pub use primitive::*;
 mod candidates;
@@ -37,7 +38,14 @@ pub(crate) fn lower_baseline(
     config: &PipelineConfig,
     costs: &impl CostModel,
 ) -> LoweringResult<MidProgram> {
-    Ok(baseline::lower(graph, config, costs, &baseline::Recipe::default())?.program)
+    Ok(baseline::lower(
+        graph,
+        config,
+        costs,
+        &FragmentCache::default(),
+        &baseline::Recipe::default(),
+    )?
+    .program)
 }
 #[cfg(test)]
 pub(crate) fn expand_tiles(

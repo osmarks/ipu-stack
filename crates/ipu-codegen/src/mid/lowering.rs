@@ -46,7 +46,8 @@ pub fn lower(
     recipe
         .early_casts
         .extend(graph.operations().iter().map(|op| op.id));
-    let mut program = baseline::select(graph, &config, costs, &recipe)?.program;
+    let mut program =
+        baseline::select(graph, &config, costs, &FragmentCache::default(), &recipe)?.program;
     program.compose_copies();
     program
         .refresh_estimates()
@@ -138,6 +139,7 @@ pub(super) fn emit_selected(
     output_shape: TensorShape,
     plan: &OperatorPlan,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     values: &mut BTreeMap<ValueId, MidValueId>,
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
@@ -167,8 +169,8 @@ pub(super) fn emit_selected(
         .iter()
         .map(|&id| state.get(id).tensor_type.clone())
         .collect::<Vec<_>>();
-    let fragment = costs
-        .implementation(plan, &input_types, &output)
+    let fragment = fragments
+        .get(plan, &input_types, &output)
         .ok_or(LoweringError::InvalidImplementation)?;
     let result = state.value(operation.results[0], output);
     if matches!(

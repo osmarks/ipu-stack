@@ -205,6 +205,7 @@ pub fn plan_region(
         .collect::<BTreeSet<_>>();
     let demands = OutputDemands::new(ops, graph.value_shapes(), config);
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
+    let fragments = super::super::implementation::FragmentCache::default();
     let mut conversion_cache = ConversionCache::new();
     let mut beam = vec![initial];
     let mut report = SearchReport::default();
@@ -244,6 +245,7 @@ pub fn plan_region(
                 shape,
                 config,
                 &costs,
+                &fragments,
                 true,
                 None,
                 &[],
@@ -261,7 +263,7 @@ pub fn plan_region(
                 {
                     continue;
                 }
-                let Some(implementation) = costs.implementation(&plan, &required, &output) else {
+                let Some(implementation) = fragments.get(&plan, &required, &output) else {
                     report.rejected_implementations += 1;
                     continue;
                 };

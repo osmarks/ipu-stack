@@ -88,7 +88,14 @@ pub fn benchmark_mid_expansion(
         let state = super::local::checkpoint::State::load(graph, config, None)?;
         let mut fixed = config.clone();
         fixed.inputs = state.inputs;
-        crate::mid::baseline::lower(graph, &fixed, &Ipu21CostModel, &state.recipe)?.program
+        crate::mid::baseline::lower(
+            graph,
+            &fixed,
+            &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
+            &state.recipe,
+        )?
+        .program
     } else {
         lower_baseline(graph, config, &Ipu21CostModel)?
     };

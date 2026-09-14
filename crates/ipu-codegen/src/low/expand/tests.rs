@@ -1663,6 +1663,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
             &graph,
             &config,
             &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
             &crate::mid::baseline::Recipe::default(),
         )
         .unwrap();

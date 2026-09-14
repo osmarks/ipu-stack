@@ -11,14 +11,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 pub trait CostModel: Sync {
-    fn implementation(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> Option<Arc<crate::MidProgram>> {
-        crate::mid::implementation::implement(plan, inputs, output)
-    }
     fn operator_cycle_override(
         &self,
         _plan: &OperatorPlan,
@@ -26,19 +18,6 @@ pub trait CostModel: Sync {
         _output: &TensorType,
     ) -> Option<u64> {
         None
-    }
-    #[cfg(test)]
-    fn operator_cycles(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> u64 {
-        self.operator_cycle_override(plan, inputs, output)
-            .unwrap_or_else(|| {
-                self.implementation(plan, inputs, output)
-                    .map_or(u64::MAX, |estimate| estimate.estimated_cycles)
-            })
     }
     fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
     fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
@@ -90,8 +69,6 @@ impl ExchangeFootprint {
 pub(crate) struct MemoizedCostModel<'a, C> {
     inner: &'a C,
     rearrangements: Mutex<RearrangementCache>,
-    implementations:
-        Mutex<HashMap<(OperatorPlan, Vec<TensorType>, TensorType), Arc<crate::MidProgram>>>,
 }
 
 type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
@@ -102,32 +79,11 @@ impl<'a, C> MemoizedCostModel<'a, C> {
         Self {
             inner,
             rearrangements: Mutex::new(HashMap::default()),
-            implementations: Mutex::new(HashMap::default()),
         }
     }
 }
 
 impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
-    fn implementation(
-        &self,
-        plan: &OperatorPlan,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> Option<Arc<crate::MidProgram>> {
-        let plan = plan.clone();
-        let key = (plan, inputs.to_vec(), output.clone());
-        if let Some(retained) = self.implementations.lock().unwrap().get(&key).cloned() {
-            return Some(retained);
-        }
-        // These are compact whole-device fragments. Retain them for this search
-        // so shortlist and branch costing do not reconstruct rejected candidates.
-        let built = self.inner.implementation(&key.0, &key.1, &key.2)?;
-        self.implementations
-            .lock()
-            .unwrap()
-            .insert(key, built.clone());
-        Some(built)
-    }
     fn operator_cycle_override(
         &self,
         plan: &OperatorPlan,
@@ -540,7 +496,7 @@ mod tests {
             let unsharded =
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(1));
             for operator in [MidOperator::Gelu, MidOperator::Add] {
-                let sharded_cycles = Ipu21CostModel.operator_cycles(
+                let sharded_cycles = crate::mid::implementation::implement(
                     &OperatorPlan {
                         operator,
                         dispatch: pointwise_dispatch(),
@@ -548,8 +504,9 @@ mod tests {
                     },
                     std::slice::from_ref(&sharded),
                     &sharded,
-                );
-                let unsharded_cycles = Ipu21CostModel.operator_cycles(
+                )
+                .map_or(u64::MAX, |program| program.estimated_cycles);
+                let unsharded_cycles = crate::mid::implementation::implement(
                     &OperatorPlan {
                         operator,
                         dispatch: pointwise_dispatch(),
@@ -557,7 +514,8 @@ mod tests {
                     },
                     std::slice::from_ref(&unsharded),
                     &unsharded,
-                );
+                )
+                .map_or(u64::MAX, |program| program.estimated_cycles);
                 assert!(sharded_cycles <= unsharded_cycles, "case {case}");
             }
         }

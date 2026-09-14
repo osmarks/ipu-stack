@@ -18,8 +18,10 @@ reconstruction are removed. Selection now directly binds executable family
 fragments: `Operator`, nested implementations, deferred offers/claims and the
 resolution pass are removed. Parameter-home changes insert their own required
 copies, and a binding validator checks constructed/rewritten mid programs.
-`Convert`, the primitive wrapper, cost-owned fragment caching and the other
-boundaries below remain to be refactored. The diagnoses below describe the
+The family-fragment cache is also separate from costing: selection and insertion
+share it explicitly, and `CostModel::implementation` is removed. `Convert`, the
+primitive wrapper, planner module ownership and the other boundaries below
+remain to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.
 

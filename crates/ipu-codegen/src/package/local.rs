@@ -13,6 +13,7 @@ pub(super) fn optimize<T: Send>(
     finalize: impl Fn(&mut ScheduledPlan) -> PackageBuildResult<(u64, T)> + Sync,
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
+    let fragments = crate::mid::implementation::FragmentCache::default();
     let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
     let mut schedules = crate::ExchangeScheduleCache::default();
     let mut state = checkpoint::State::load(graph, config, tile_mapping)?;
@@ -21,7 +22,7 @@ pub(super) fn optimize<T: Send>(
     if resuming {
         fixed.inputs = state.inputs.clone();
     }
-    let mut incumbent = baseline::lower(graph, &fixed, &costs, &state.recipe)?;
+    let mut incumbent = baseline::lower(graph, &fixed, &costs, &fragments, &state.recipe)?;
     if resuming {
         incumbent.alternatives = state.alternatives.clone();
     }
@@ -98,7 +99,7 @@ pub(super) fn optimize<T: Send>(
             .map(|(proposal, recipe)| {
                 let span = tracing::debug_span!("local_screen", round = state.attempts, proposal);
                 let _entered = span.enter();
-                let candidate = baseline::lower(graph, &fixed, &costs, &recipe);
+                let candidate = baseline::lower(graph, &fixed, &costs, &fragments, &recipe);
                 let candidate = match candidate {
                     Ok(candidate) => {
                         let visited = state.visited.contains(&candidate.recipe);
@@ -440,11 +441,19 @@ mod tests {
     fn memoization_does_not_change_baseline_selection() {
         let (graph, mut config) = mlp();
         let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
+        let fragments = crate::mid::implementation::FragmentCache::default();
         for capacity in [false, true] {
             config.capacity_baseline = capacity;
             let recipe = Recipe::default();
-            let direct = baseline::lower(&graph, &config, &Ipu21CostModel, &recipe).unwrap();
-            let memoized = baseline::lower(&graph, &config, &costs, &recipe).unwrap();
+            let direct = baseline::lower(
+                &graph,
+                &config,
+                &Ipu21CostModel,
+                &crate::mid::implementation::FragmentCache::default(),
+                &recipe,
+            )
+            .unwrap();
+            let memoized = baseline::lower(&graph, &config, &costs, &fragments, &recipe).unwrap();
             assert_eq!(direct.program, memoized.program);
             assert!(direct.recipe == memoized.recipe);
         }

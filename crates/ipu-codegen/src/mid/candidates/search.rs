@@ -59,6 +59,7 @@ impl<'a> CandidateSearch<'a> {
         automatic_inputs: &[bool],
         output_shape: &TensorShape,
         costs: &impl CostModel,
+        fragments: &FragmentCache,
     ) -> LoweringResult<Vec<OperatorPlan>> {
         let operation = self.operation;
         let config = self.config;
@@ -105,6 +106,7 @@ impl<'a> CandidateSearch<'a> {
                 output_shape,
                 config,
                 costs,
+                fragments,
                 self.distributed_result_is_useful,
                 grouped_output,
                 &direct_consumer_layouts,
@@ -157,6 +159,7 @@ impl<'a> CandidateSearch<'a> {
                 input_types,
                 output_shape,
                 costs,
+                fragments,
                 config.operator_candidate_limit.max(1),
                 self.demands.get(operation.results[0]),
                 config.capacity_baseline,

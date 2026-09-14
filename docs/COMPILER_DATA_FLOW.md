@@ -322,7 +322,7 @@ reduction lowering.
 
 | Cache or retained analysis | Contents and key | Lifetime / owner |
 | --- | --- | --- |
-| `MemoizedCostModel.implementations` | `(OperatorPlan, input types, output type)` to executable mid fragment | One `package/local::optimize` call; shared across candidate work |
+| `implementation::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | Owned by the search invocation, passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
 | `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
 | `ExpansionCache.plans` | Destination type/extents and ordered source mappings to `CopyPlan`, including staging decisions | Same search in production; bounded at 32,768 entries |
 | `ExpansionCache.copies` | Normalized view geometry, copy order, same-buffer flag to relative local-copy descriptors | Same search; separately bounded at 32,768 entries |
@@ -335,9 +335,10 @@ reduction lowering.
 
 [ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses custom
 hash buckets with full equality checks; both its fingerprints and bucket maps
-use the standard hasher. The implementation-fragment map and
-[GeometryAnalysis](../crates/ipu-codegen/src/estimate/geometry.rs) also use
-standard hash maps. These are not all caches of the same computation.
+use the standard hasher. [GeometryAnalysis](../crates/ipu-codegen/src/estimate/geometry.rs)
+also uses standard hash maps. These are not all caches of the same computation.
+Family fragments are built by the constructor and consumed by costing;
+`CostModel` no longer constructs or caches executable programs.
 
 `borrowed_views` is different: it records storage substitutions made during
 expansion. It is mutable lowering state, not a memoization cache, and cannot be

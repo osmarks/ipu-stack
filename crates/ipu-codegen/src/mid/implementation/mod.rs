@@ -2,6 +2,8 @@
 //! No shard enumeration, tile calls, byte spans, or physical allocation occurs here.
 
 mod attention;
+mod cache;
+pub(crate) use cache::FragmentCache;
 mod gemm;
 mod layernorm;
 

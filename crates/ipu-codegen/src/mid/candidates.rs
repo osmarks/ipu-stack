@@ -127,6 +127,7 @@ pub(super) fn plans(
     output: &TensorShape,
     config: &PipelineConfig,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     distributed_result_is_useful: bool,
     grouped_output: Option<GroupedOutputLayout>,
     direct_consumer_layouts: &[Layout],
@@ -466,6 +467,7 @@ pub(super) fn plans(
                 output,
                 config,
                 costs,
+                fragments,
                 distributed_result_is_useful,
                 gemm_constraint,
                 grouped_output,
@@ -910,6 +912,7 @@ pub(super) fn parallel_reduction_candidates(
     output: &TensorShape,
     config: &PipelineConfig,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
     grouped_output: Option<GroupedOutputLayout>,
@@ -925,6 +928,7 @@ pub(super) fn parallel_reduction_candidates(
                 output,
                 config,
                 costs,
+                fragments,
                 orientation,
                 distributed_result_is_useful,
                 constraint,
@@ -942,6 +946,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     output: &TensorShape,
     config: &PipelineConfig,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     orientation: GemmOrientation,
     distributed_result_is_useful: bool,
     constraint: Option<&GemmPlanConstraint>,
@@ -1429,6 +1434,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
             inputs,
             output,
             costs,
+            fragments,
             config.operator_candidate_limit.max(1),
             output_demands,
             config.capacity_baseline,
@@ -1542,9 +1548,19 @@ pub(super) fn retain_operator_candidates(
     inputs: &[TensorType],
     output: &TensorShape,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     width: usize,
 ) -> Vec<OperatorPlan> {
-    retain_operator_candidates_for_demands(candidates, inputs, output, costs, width, &[], false)
+    retain_operator_candidates_for_demands(
+        candidates,
+        inputs,
+        output,
+        costs,
+        fragments,
+        width,
+        &[],
+        false,
+    )
 }
 
 pub(super) fn retain_operator_candidates_for_demands(
@@ -1552,6 +1568,7 @@ pub(super) fn retain_operator_candidates_for_demands(
     inputs: &[TensorType],
     output: &TensorShape,
     costs: &impl CostModel,
+    fragments: &FragmentCache,
     width: usize,
     demands: &[OutputDemand],
     capacity: bool,
@@ -1566,7 +1583,7 @@ pub(super) fn retain_operator_candidates_for_demands(
             // Price the compact whole-device implementation, including staging
             // and reduction work. Boundary bytes are not an execution cost and
             // systematically discard useful larger-K, lower-fan-in GEMM grids.
-            let implementation = costs.implementation(&candidate, &planned_inputs, &planned_output);
+            let implementation = fragments.get(&candidate, &planned_inputs, &planned_output);
             let peak = implementation
                 .as_ref()
                 .map(|p| p.peak_memory)

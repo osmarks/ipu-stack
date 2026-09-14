@@ -216,7 +216,14 @@ fn fp8_mlp_can_quantize_before_replication() {
     recipe
         .early_casts
         .extend(graph.operations().iter().map(|op| op.id));
-    let lowered = baseline::lower(&graph, &config, &crate::Ipu21CostModel, &recipe).unwrap();
+    let lowered = baseline::lower(
+        &graph,
+        &config,
+        &crate::Ipu21CostModel,
+        &crate::mid::implementation::FragmentCache::default(),
+        &recipe,
+    )
+    .unwrap();
     assert!(lowered.recipe.early_casts.is_empty());
     assert!(!lowered.recipe.cast_before_copies.is_empty());
     let mid = lowered.program;
@@ -435,6 +442,7 @@ fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
             &TensorShape(vec![m, n]),
             &config,
             &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
             true,
             None,
             None,
@@ -539,8 +547,10 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
             requirements,
         };
         let standard_cost =
-            Ipu21CostModel.operator_cycles(&plan, &[left.clone(), standard], &output);
-        let direct_cost = Ipu21CostModel.operator_cycles(&plan, &[left, direct], &output);
+            crate::mid::implementation::implement(&plan, &[left.clone(), standard], &output)
+                .map_or(u64::MAX, |program| program.estimated_cycles);
+        let direct_cost = crate::mid::implementation::implement(&plan, &[left, direct], &output)
+            .map_or(u64::MAX, |program| program.estimated_cycles);
         assert!(direct_cost < standard_cost);
     }
 }
@@ -1357,14 +1367,20 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
     let output = TensorShape::new([128, 64]);
     let rows = |plan: &OperatorPlan| {
         let (inputs, output) = plan.tensor_types(&inputs, &output);
-        Ipu21CostModel
-            .implementation(plan, &inputs, &output)
+        crate::mid::implementation::implement(plan, &inputs, &output)
             .unwrap()
             .peak_memory
             .exchange_rows
     };
     let minimum_rows = candidates.iter().map(rows).min().unwrap();
-    let selected = retain_operator_candidates(candidates, &inputs, &output, &Ipu21CostModel, 2);
+    let selected = retain_operator_candidates(
+        candidates,
+        &inputs,
+        &output,
+        &Ipu21CostModel,
+        &crate::mid::implementation::FragmentCache::default(),
+        2,
+    );
     assert!((2..=4).contains(&selected.len()));
     assert_eq!(selected.iter().map(rows).min(), Some(minimum_rows));
 }
@@ -1454,6 +1470,7 @@ fn blocked_attention_reserves_online_state_between_accumulator_rows() {
         &graph,
         &config,
         &Ipu21CostModel,
+        &crate::mid::implementation::FragmentCache::default(),
         &baseline::Recipe::default(),
     )
     .unwrap()
@@ -1572,6 +1589,7 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
             &graph,
             &config,
             &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
             &baseline::Recipe::default(),
         )
         .unwrap();
@@ -1592,7 +1610,14 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
     };
     assert!(boundary_bytes(&plans[0]) > boundary_bytes(&plans[1]));
     let expected = plans[0].clone();
-    let selected = retain_operator_candidates(plans, &inputs, &output, &Ipu21CostModel, 1);
+    let selected = retain_operator_candidates(
+        plans,
+        &inputs,
+        &output,
+        &Ipu21CostModel,
+        &crate::mid::implementation::FragmentCache::default(),
+        1,
+    );
     assert_eq!(selected, vec![expected]);
 }
 
@@ -1615,6 +1640,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
         }
     }
     let costs = MemoizedCostModel::new(&Ipu21CostModel);
+    let fragments = FragmentCache::default();
     for (operation, inner, columns, grid) in
         [(0, 1152, 4304, (4, 92, 4)), (2, 4304, 1152, (4, 24, 15))]
     {
@@ -1634,6 +1660,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
             &shape,
             &config,
             &costs,
+            &fragments,
             true,
             None,
             &[],
@@ -1644,6 +1671,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
             &inputs,
             &shape,
             &costs,
+            &crate::mid::implementation::FragmentCache::default(),
             config.operator_candidate_limit,
         );
         for memory in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
@@ -1672,8 +1700,8 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
         assert!(retained.len() <= 2 * config.operator_candidate_limit);
         assert!(retained.iter().all(|plan| {
             let (inputs, output) = plan.tensor_types(&inputs, &shape);
-            costs
-                .implementation(plan, &inputs, &output)
+            fragments
+                .get(plan, &inputs, &output)
                 .unwrap()
                 .peak_memory
                 .standard_contiguous_overflow()
@@ -1705,6 +1733,7 @@ fn parallel_gemm_family_does_not_depend_on_concrete_templates() {
             &TensorShape::new([16, 128]),
             config,
             &Ipu21CostModel,
+            &FragmentCache::default(),
             true,
             None,
             &[],
@@ -1776,6 +1805,7 @@ fn value_projection_retains_head_grouped_swapped_output_from_packed_activations(
             &[false, true],
             graph.value_shape(projection).unwrap(),
             &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
         )
         .unwrap();
     let requested = OutputDemand {
@@ -1991,6 +2021,7 @@ fn attention_can_share_key_panels_when_streams_exceed_panel_owner_budget() {
         &TensorShape(vec![128, 729, 72]),
         &PipelineConfig::new(1472),
         &Ipu21CostModel,
+        &FragmentCache::default(),
         false,
         None,
         &[],
@@ -2431,6 +2462,7 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             &graph,
             &config,
             &Ipu21CostModel,
+            &crate::mid::implementation::FragmentCache::default(),
             &baseline::Recipe::default(),
         )
         .unwrap();
@@ -2451,13 +2483,27 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             recipe.cast_before_copies.insert(*site);
             let serialized = serde_json::to_vec(&recipe).unwrap();
             let recipe: baseline::Recipe = serde_json::from_slice(&serialized).unwrap();
-            let early = baseline::lower(&graph, &config, &Ipu21CostModel, &recipe).unwrap();
+            let early = baseline::lower(
+                &graph,
+                &config,
+                &Ipu21CostModel,
+                &crate::mid::implementation::FragmentCache::default(),
+                &recipe,
+            )
+            .unwrap();
             assert_ne!(early.program.operations, late.program.operations);
             assert_eq!(early.recipe.cast_before_copies, recipe.cast_before_copies);
             let tiles = crate::expand_tiles(&early.program).unwrap();
             let low = crate::lower_to_tiles(&tiles, false);
             crate::KernelBuildPlan::from_program(&low).unwrap();
-            let replay = baseline::lower(&graph, &config, &Ipu21CostModel, &early.recipe).unwrap();
+            let replay = baseline::lower(
+                &graph,
+                &config,
+                &Ipu21CostModel,
+                &crate::mid::implementation::FragmentCache::default(),
+                &early.recipe,
+            )
+            .unwrap();
             assert_eq!(replay.program, early.program);
         }
     }
