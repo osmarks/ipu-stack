@@ -127,14 +127,9 @@ pub fn enumerate_conversions(
         }
         retained.push(path);
     }
-    // Keep an assumption-free route even if the optimistic frontier is full.
-    let baseline = retained.iter().find(|p| p.assumptions.is_empty()).cloned();
-    retained.truncate(options.conversion_frontier);
-    if let Some(baseline) = baseline
-        && !retained.iter().any(|p| p.assumptions.is_empty())
-    {
-        retained.push(baseline);
-    }
+    truncate_with_baseline(&mut retained, options.conversion_frontier, |p| {
+        p.assumptions.is_empty()
+    });
     Ok(retained)
 }
 
@@ -148,13 +143,10 @@ fn equivalent(a: &TensorType, b: &TensorType) -> bool {
     {
         return false;
     }
-    let Some(axes) = a
-        .format
-        .layout
-        .resolve(&a.shape)
-        .ok()
-        .and_then(|r| r.axes().map(<[_]>::to_vec))
-    else {
+    let Ok(resolved) = a.format.layout.resolve(&a.shape) else {
+        return false;
+    };
+    let Some(axes) = resolved.axes() else {
         return false;
     };
     let width = if matches!(a.format.precision, Precision::F8F143 { .. }) {

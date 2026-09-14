@@ -159,6 +159,19 @@ pub enum SearchError {
     },
 }
 
+/// Keep one ordinary route even when speculative alternatives fill the limit.
+fn truncate_with_baseline<T>(items: &mut Vec<T>, limit: usize, is_baseline: impl Fn(&T) -> bool) {
+    let baseline = items
+        .iter()
+        .position(is_baseline)
+        .filter(|&index| index >= limit)
+        .map(|index| items.remove(index));
+    items.truncate(limit);
+    if let Some(baseline) = baseline {
+        items.push(baseline);
+    }
+}
+
 fn invalid(message: impl Into<String>) -> SearchError {
     SearchError::InvalidRequest(message.into())
 }

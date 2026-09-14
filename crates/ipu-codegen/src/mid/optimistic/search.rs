@@ -286,18 +286,9 @@ pub fn plan_region(
                     if converted.len() > options.beam_width {
                         report.truncated = true;
                     }
-                    let reference = converted
-                        .iter()
-                        .find(|(s, _)| s.graph.assumptions.is_empty())
-                        .cloned();
-                    converted.truncate(options.beam_width);
-                    if let Some(reference) = reference
-                        && !converted
-                            .iter()
-                            .any(|(s, _)| s.graph.assumptions.is_empty())
-                    {
-                        converted.push(reference);
-                    }
+                    truncate_with_baseline(&mut converted, options.beam_width, |(s, _)| {
+                        s.graph.assumptions.is_empty()
+                    });
                     branches = converted;
                 }
                 for (mut child, ids) in branches {
