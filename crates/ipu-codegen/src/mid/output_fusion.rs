@@ -39,8 +39,8 @@ fn fuse_fp8_outputs_at(
     let mut removed = BTreeSet::new();
     let mut preparation = BTreeMap::<usize, Vec<MidOperation>>::new();
     for index in 0..operations.len() {
-        let cast = operations[index].clone();
-        if super::rewrite::fp8_cast(&cast, values).is_none() {
+        let cast = &operations[index];
+        if super::rewrite::fp8_cast(cast, values).is_none() {
             continue;
         }
         let Some((intermediate, previous, identity_copies)) =
@@ -57,7 +57,7 @@ fn fuse_fp8_outputs_at(
         if removed.contains(&previous) {
             continue;
         }
-        let producer = operations[previous].clone();
+        let producer = &operations[previous];
         let MidOperationKind::Primitive(Primitive::Compute {
             kernel,
             operands,
@@ -187,7 +187,8 @@ fn fuse_fp8_outputs_at(
                     output: OperandRequirement::new(output.tensor_type.format.clone()),
                     strategy: ConversionStrategy::DirectRetile,
                 }),
-                ..cast.clone()
+                results: cast.results.clone(),
+                ..*cast
             };
             values.push(value);
             if !super::rewrite::fusion_pays(
@@ -285,7 +286,7 @@ fn fuse_fp8_outputs_at(
         if !super::rewrite::fusion_pays(
             "consumer FP8 output",
             producer.source,
-            [&producer, &cast],
+            [producer, cast],
             std::iter::once(&replacement).chain(&copies),
             &new_values,
         ) {

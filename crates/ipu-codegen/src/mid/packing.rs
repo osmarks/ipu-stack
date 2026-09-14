@@ -109,7 +109,7 @@ fn distribute_region(
                         id,
                         tensor_type,
                         storage_group: id,
-                        ..target.clone()
+                        ..target
                     });
                 }
                 let pack = MidOperation {

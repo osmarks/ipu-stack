@@ -101,7 +101,7 @@ pub(super) fn fuse(
                 id,
                 tensor_type: stats_type,
                 storage_group: id,
-                ..value.clone()
+                ..*value
             });
             id
         } else {
@@ -170,7 +170,7 @@ pub(super) fn fuse(
                 id,
                 storage_group: id,
                 tensor_type,
-                ..target.clone()
+                ..*target
             });
             *apply.inputs.last_mut().unwrap() = id;
             Some(copy)

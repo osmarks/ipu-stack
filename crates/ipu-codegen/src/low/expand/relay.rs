@@ -276,7 +276,7 @@ fn candidate(
     transfers.extend(forward);
     Ok(Some(ExchangePhase {
         transfers,
-        ..phase.clone()
+        ..*phase
     }))
 }
 
