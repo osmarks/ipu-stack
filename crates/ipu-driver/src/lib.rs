@@ -1718,17 +1718,28 @@ fn host_batch_ranges(ends: &[u32]) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+fn host_slice_range(
+    pages: &HashMap<u32, HostPageRange>,
+    slice: &ipu_package::HostSlice,
+) -> Result<std::ops::Range<usize>, DriverError> {
+    let page = pages
+        .get(&slice.page)
+        .ok_or_else(|| DriverError::Invalid(format!("missing host page {}", slice.page)))?;
+    let end = slice
+        .page_offset
+        .checked_add(slice.size)
+        .filter(|&end| end <= page.size as u64)
+        .ok_or_else(|| DriverError::Invalid(format!("host slice exceeds page {}", slice.page)))?;
+    Ok(page.offset + slice.page_offset as usize..page.offset + end as usize)
+}
+
 fn poison_output(
     storage: &mut HostBuffer,
     pages: &HashMap<u32, HostPageRange>,
     call: &HostCall,
 ) -> Result<(), DriverError> {
     for slice in &call.outputs {
-        let page = pages
-            .get(&slice.page)
-            .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
-        let start = page.offset + slice.page_offset as usize;
-        storage.bytes_mut()[start..start + slice.size as usize].fill(0xa5);
+        storage.bytes_mut()[host_slice_range(pages, slice)?].fill(0xa5);
     }
     Ok(())
 }
@@ -1771,13 +1782,9 @@ fn copy_input_slice(
     slice: &ipu_package::HostSlice,
     input: &[u8],
 ) -> Result<(), DriverError> {
-    let page = pages
-        .get(&slice.page)
-        .ok_or_else(|| DriverError::Invalid("missing input page".into()))?;
-    let destination = page.offset + slice.page_offset as usize;
+    let destination = host_slice_range(pages, slice)?;
     let source = slice.file_offset as usize;
-    storage.bytes_mut()[destination..destination + slice.size as usize]
-        .copy_from_slice(&input[source..source + slice.size as usize]);
+    storage.bytes_mut()[destination].copy_from_slice(&input[source..source + slice.size as usize]);
     Ok(())
 }
 
@@ -1790,13 +1797,10 @@ fn capture_output(
     // The entire batch has completed DMA before its staging pages are read.
     fence(Ordering::SeqCst);
     for slice in slices {
-        let page = pages
-            .get(&slice.page)
-            .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
-        let source = page.offset + slice.page_offset as usize;
+        let source = host_slice_range(pages, slice)?;
         let destination = slice.file_offset as usize;
         output.0[destination..destination + slice.size as usize]
-            .copy_from_slice(&storage.bytes()[source..source + slice.size as usize]);
+            .copy_from_slice(&storage.bytes()[source]);
         output.1 += 1;
     }
     Ok(())
@@ -1919,6 +1923,31 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xff)
         );
+    }
+
+    #[test]
+    fn host_slices_cannot_cross_into_adjacent_staging_pages() {
+        let pages = HashMap::from([(
+            1,
+            HostPageRange {
+                offset: 32,
+                size: 16,
+            },
+        )]);
+        assert_eq!(
+            host_slice_range(&pages, &host_slice(1, 4, 12)).unwrap(),
+            36..48
+        );
+        for slice in [
+            host_slice(1, 4, 13),
+            host_slice(1, u64::MAX, 2),
+            host_slice(2, 0, 1),
+        ] {
+            assert!(matches!(
+                host_slice_range(&pages, &slice),
+                Err(DriverError::Invalid(_))
+            ));
+        }
     }
 
     #[test]
