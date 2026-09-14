@@ -116,8 +116,14 @@ impl KernelBuildPlan {
             format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
             format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
         ];
-        if assembly.is_some() {
+        if let Some(source) = assembly {
             flags.push(format!("-DREARRANGE_CALL_SYMBOL={call}"));
+            self.compilations.push(KernelCompilation {
+                source,
+                name: format!("rearrange_f16_codelet_{suffix}"),
+                flags,
+                retained_symbols: vec![call],
+            });
         } else {
             flags.extend([
                 "-O2".into(),
@@ -127,15 +133,6 @@ impl KernelBuildPlan {
                 format!("-DREARRANGE_COLUMN_BLOCK={column_block}"),
                 format!("-DREARRANGE_VERTEX_NAME={vertex}"),
             ]);
-        }
-        if let Some(source) = assembly {
-            self.compilations.push(KernelCompilation {
-                source,
-                name: format!("rearrange_f16_codelet_{suffix}"),
-                flags,
-                retained_symbols: vec![call],
-            });
-        } else {
             self.add_vertex(
                 "rearrange_f16.cpp",
                 &call,
