@@ -5,11 +5,11 @@ use std::{collections::HashMap, fs, path::Path};
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Payload {
+struct Payload<'a> {
     clock_hz: u64,
     tile_count: usize,
     sample_count: usize,
-    strings: Vec<String>,
+    strings: Vec<&'a str>,
     metadata: Vec<u32>,
     metadata_sets: Vec<[u32; 2]>,
     activity_sets: Vec<Vec<[u32; 5]>>,
@@ -26,7 +26,7 @@ struct Tile {
     samples: Vec<[u32; 4]>,
 }
 
-fn payload(report: &ProfileReport) -> Payload {
+fn payload(report: &ProfileReport) -> Payload<'_> {
     fn intern<T: Clone + Eq + std::hash::Hash>(
         values: &mut Vec<T>,
         indices: &mut HashMap<T, u32>,
@@ -37,17 +37,6 @@ fn payload(report: &ProfileReport) -> Payload {
             values.push(value.clone());
             index
         })
-    }
-
-    fn intern_string(
-        values: &mut Vec<String>,
-        indices: &mut HashMap<String, u32>,
-        value: &str,
-    ) -> u32 {
-        indices
-            .get(value)
-            .copied()
-            .unwrap_or_else(|| intern(values, indices, value.to_owned()))
     }
 
     let mut strings = Vec::new();
@@ -73,8 +62,8 @@ fn payload(report: &ProfileReport) -> Payload {
                         .iter()
                         .map(|entry| {
                             [
-                                intern_string(&mut strings, &mut string_indices, &entry.name),
-                                intern_string(&mut strings, &mut string_indices, &entry.value),
+                                intern(&mut strings, &mut string_indices, entry.name.as_str()),
+                                intern(&mut strings, &mut string_indices, entry.value.as_str()),
                             ]
                         })
                         .collect::<Vec<_>>();
@@ -82,8 +71,16 @@ fn payload(report: &ProfileReport) -> Payload {
                     let step = [
                         sample.step.phase,
                         sample.step.epoch,
-                        intern_string(&mut strings, &mut string_indices, &sample.step.operation),
-                        intern_string(&mut strings, &mut string_indices, &sample.step.kernel),
+                        intern(
+                            &mut strings,
+                            &mut string_indices,
+                            sample.step.operation.as_str(),
+                        ),
+                        intern(
+                            &mut strings,
+                            &mut string_indices,
+                            sample.step.kernel.as_str(),
+                        ),
                         metadata,
                         match sample.step.kind {
                             ProfileStepKind::Exchange => 0,
