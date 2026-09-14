@@ -50,14 +50,7 @@ fn fuse_fp8_outputs_at(
         };
         if std::iter::once(intermediate)
             .chain(identity_copies.iter().map(|&i| operations[i].results[0]))
-            .any(|value| {
-                required.contains(&value)
-                    || operations
-                        .iter()
-                        .filter(|op| op.read_values().any(|v| *v == value))
-                        .count()
-                        != 1
-            })
+            .any(|value| !super::rewrite::is_single_use(operations, required, value))
         {
             continue;
         }
@@ -103,7 +96,8 @@ fn fuse_fp8_outputs_at(
         {
             continue;
         }
-        let input = &values[if redistributed {
+        let at_source = at_source && redistributed;
+        let input = &values[if redistributed && !at_source {
             cast.inputs[0]
         } else {
             intermediate
@@ -113,38 +107,18 @@ fn fuse_fp8_outputs_at(
         tracing::debug!(target: "ipu_codegen::mid::elementwise", producer = ?producer.source,
             consumer = ?cast.source, ?kernel, input_layout = ?input.tensor_type.format.layout,
             output_layout = ?output.tensor_type.format.layout, "considering direct FP8 output");
-        if !(at_source && redistributed)
-            && (input.tile_offset != output.tile_offset
-                || input.tensor_type.format.layout.order != capability.input_order
-                || !capability
-                    .output_orders
-                    .contains(&output.tensor_type.format.layout.order))
-        {
-            continue;
-        }
-        let expected = if output.tensor_type.format.layout.order == ElementOrder::RowMajor {
-            Some(input.tensor_type.format.layout.clone())
-        } else {
-            input
-                .tensor_type
-                .fp8_producer_layout(&output.tensor_type.format)
-        };
-        if !(at_source && redistributed)
-            && (expected.is_none_or(|layout| {
-                !same_storage(
-                    &MidValue {
-                        tensor_type: TensorType {
-                            shape: input.tensor_type.shape.clone(),
-                            format: TensorFormat {
-                                precision: output.tensor_type.format.precision,
-                                layout,
-                            },
-                        },
-                        ..input.clone()
-                    },
-                    output,
-                )
-            }) || input
+        let layout =
+            if !at_source && output.tensor_type.format.layout.order == ElementOrder::RowMajor {
+                Some(input.tensor_type.format.layout.clone())
+            } else {
+                input
+                    .tensor_type
+                    .fp8_producer_layout(&output.tensor_type.format)
+            };
+        let Some(layout) = layout else { continue };
+        if input.tensor_type.format.layout.order != capability.input_order
+            || !capability.output_orders.contains(&layout.order)
+            || input
                 .tensor_type
                 .format
                 .layout
@@ -156,8 +130,18 @@ fn fuse_fp8_outputs_at(
                         .and_then(|a| a.last())
                         .map(|a| a.extents_are_multiple_of(capability.column_multiple))
                 })
-                != Some(true))
+                != Some(true)
         {
+            continue;
+        }
+        let mut value = input.clone();
+        value.tensor_type.format = TensorFormat {
+            precision: output.tensor_type.format.precision,
+            layout,
+        };
+        // Consumer-owned fusion must match its existing allocation; producer-owned
+        // fusion creates a new value and retains the distribution afterwards.
+        if !at_source && !same_storage(&value, output) {
             continue;
         }
         // Parameter copies may intervene, provided they cannot overwrite inputs.
@@ -185,40 +169,9 @@ fn fuse_fp8_outputs_at(
         {
             continue;
         }
-        if at_source && redistributed {
-            let source = &values[intermediate.index() as usize];
-            if source.tensor_type.format.layout.order != capability.input_order {
-                continue;
-            }
-            let Some(layout) = source
-                .tensor_type
-                .fp8_producer_layout(&output.tensor_type.format)
-            else {
-                continue;
-            };
-            if !capability.output_orders.contains(&layout.order)
-                || !source
-                    .tensor_type
-                    .format
-                    .layout
-                    .resolve(&source.tensor_type.shape)
-                    .ok()
-                    .and_then(|r| {
-                        r.axes()
-                            .and_then(|a| a.last())
-                            .map(|a| a.extents_are_multiple_of(capability.column_multiple))
-                    })
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-            let mut value = source.clone();
+        if at_source {
             value.id = MidValueId(values.len() as u32);
             value.storage_group = value.id;
-            value.tensor_type.format = TensorFormat {
-                precision: output.tensor_type.format.precision,
-                layout,
-            };
             let mut fused = producer.clone();
             fused.results = vec![value.id];
             fused.kind = MidOperationKind::Primitive(Primitive::Compute {

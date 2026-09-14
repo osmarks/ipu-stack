@@ -31,6 +31,22 @@ pub(super) fn single_use_producers(
     producers
 }
 
+/// Query the current graph when a rewrite is changing readers as it proceeds.
+/// Like `single_use_producers`, count consuming operations, not operand slots.
+pub(super) fn is_single_use(
+    operations: &[MidOperation],
+    required: &[MidValueId],
+    value: MidValueId,
+) -> bool {
+    !required.contains(&value)
+        && operations
+            .iter()
+            .filter(|op| op.read_values().any(|v| *v == value))
+            .take(2)
+            .count()
+            == 1
+}
+
 /// Recognize an unfused, whole-value FP16-to-FP8 local conversion.
 pub(super) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidValueId, MidValueId)> {
     let local = match &op.kind {

@@ -191,13 +191,7 @@ pub(super) fn fuse(
         }
         for copy in identity_copies.into_iter().filter(|_| !redistributed) {
             let result = operations[copy].results[0];
-            if !required.contains(&result)
-                && operations
-                    .iter()
-                    .filter(|op| op.read_values().any(|v| *v == result))
-                    .count()
-                    == 1
-            {
+            if super::rewrite::is_single_use(operations, required, result) {
                 removed.insert(copy);
             }
         }

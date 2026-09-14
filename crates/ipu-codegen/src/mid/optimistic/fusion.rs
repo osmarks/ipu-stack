@@ -200,5 +200,5 @@ fn known_fusion_cost(
         estimated_cycles: 0,
         estimated_exchange_cycles: 0,
     };
-    crate::estimate::operation_cost(&op, &values).map(|(cost, _, _)| cost.total)
+    super::super::rewrite::operation_cycles([&op], &values)
 }
