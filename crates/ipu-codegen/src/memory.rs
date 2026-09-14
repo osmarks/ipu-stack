@@ -89,7 +89,7 @@ impl TileMemoryMap {
         &mut self,
         name: &'static str,
         range: Range<u32>,
-    ) -> Result<MemoryAllocation, MemoryLayoutError> {
+    ) -> Result<&mut MemoryAllocation, MemoryLayoutError> {
         if range.start >= range.end {
             return Err(MemoryLayoutError::Invalid(name));
         }
@@ -110,13 +110,12 @@ impl TileMemoryMap {
             index..=index,
             remaining.into_iter().filter(|range| !range.is_empty()),
         );
-        let allocation = MemoryAllocation {
+        self.allocations.push(MemoryAllocation {
             name,
             range: range.clone(),
             reserved: range,
-        };
-        self.allocations.push(allocation.clone());
-        Ok(allocation)
+        });
+        Ok(self.allocations.last_mut().unwrap())
     }
 
     pub(crate) fn allocate(
@@ -144,18 +143,9 @@ impl TileMemoryMap {
             };
             let reserved_end = align_up(guarded_end, request.end_alignment, request.name)?;
             if reserved_end <= free.end.min(request.bounds.end) {
-                let payload = start..payload_end;
-                let reserved = self.reserve(request.name, start..reserved_end)?;
-                let allocation = MemoryAllocation {
-                    name: request.name,
-                    range: payload,
-                    reserved: reserved.reserved,
-                };
-                *self
-                    .allocations
-                    .last_mut()
-                    .expect("reserve records allocation") = allocation.clone();
-                return Ok(allocation);
+                let allocation = self.reserve(request.name, start..reserved_end)?;
+                allocation.range.end = payload_end;
+                return Ok(allocation.clone());
             }
         }
         Err(MemoryLayoutError::OutOfMemory {
