@@ -864,16 +864,18 @@ impl Device {
         let old_run_break = self.read_tile_debug(physical_tile, TDI_RUN_BREAK)?;
         let already_stopped =
             matches!(initial_state, 2 | 3) || (inactive_is_quiescent && initial_state == 0);
-        if !already_stopped {
-            self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break | context_bit)?;
-            let deadline = Instant::now() + Duration::from_millis(100);
-            while !matches!(self.tile_context_state(physical_tile, context)?, 2 | 3) {
-                if Instant::now() >= deadline {
-                    return Err(DriverError::Timeout("stopping tile context".into()));
+        let result = (|| {
+            if !already_stopped {
+                self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break | context_bit)?;
+                let deadline = Instant::now() + Duration::from_millis(100);
+                while !matches!(self.tile_context_state(physical_tile, context)?, 2 | 3) {
+                    if Instant::now() >= deadline {
+                        return Err(DriverError::Timeout("stopping tile context".into()));
+                    }
                 }
             }
-        }
-        let result = operation();
+            operation()
+        })();
         if !already_stopped {
             self.write_tile_debug(physical_tile, TDI_RUN_BREAK, old_run_break)?;
             if old_run_break & context_bit == 0 {
@@ -1871,6 +1873,55 @@ mod tests {
             file_offset: 0,
             size,
         }
+    }
+
+    // Exercise BAR-only diagnostics without issuing ioctls or owning an mmap.
+    fn with_test_bar(test: impl FnOnce(&Device)) {
+        let mut bar = vec![0u32; CONFIG_BAR_SIZE / 4];
+        let device = std::mem::ManuallyDrop::new(Device {
+            fd: -1,
+            config: bar.as_mut_ptr().cast(),
+        });
+        test(&device);
+    }
+
+    #[test]
+    fn failed_context_stop_restores_run_break() {
+        with_test_bar(|device| {
+            device.write_tile_debug(0, TDI_RUN_BREAK, 0x40).unwrap();
+            let result = device.with_tile_context(0, 1, false, || -> Result<(), DriverError> {
+                panic!("inactive context must time out before invoking the operation");
+            });
+            assert!(matches!(result, Err(DriverError::Timeout(_))));
+            assert_eq!(device.read_tile_debug(0, TDI_RUN_BREAK).unwrap(), 0x40);
+            for context in [7, 16, 32, u32::MAX] {
+                assert!(matches!(
+                    device.read_tile_program_counter(0, context),
+                    Err(DriverError::Invalid(_))
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn failed_diagnostic_operation_restores_scratch() {
+        with_test_bar(|device| {
+            device.write_tile_debug(0, TDI_DATA, 0x12345678).unwrap();
+            let result = device.with_tile_scratch::<2, ()>(0, 1, true, || {
+                device.write_tile_debug(0, TDI_DATA, 0)?;
+                Err(DriverError::Invalid("injected diagnostic failure".into()))
+            });
+            assert!(
+                matches!(result, Err(DriverError::Invalid(s)) if s == "injected diagnostic failure")
+            );
+            // The fake BAR returns the same saved value for m0 and m1. The
+            // hardware fixture separately checks distinct registers and order.
+            assert_eq!(device.read_tile_debug(0, TDI_DATA).unwrap(), 0x12345678);
+            assert_eq!(
+                device.read_tile_debug(0, TDI_INSTRUCTION).unwrap(),
+                tdi_instruction::GET_M0_DEBUG_DATA
+            );
+        });
     }
 
     #[test]
