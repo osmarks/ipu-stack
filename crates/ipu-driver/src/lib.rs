@@ -547,9 +547,6 @@ impl Device {
         physical_tile: u16,
         context: u32,
     ) -> Result<(), DriverError> {
-        if context >= 7 {
-            return Err(DriverError::Invalid("tile context out of range".into()));
-        }
         self.write_tile_debug(physical_tile, TDI_EXCEPTION_CLEAR, 1 << context)
     }
 
@@ -623,18 +620,11 @@ impl Device {
                 "invalid tile memory address in diagnostic read".into(),
             ));
         }
-        self.with_tile_context(physical_tile, context, true, || {
-            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
-            let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
-            let read = addresses
+        self.with_tile_scratch::<2, _>(physical_tile, context, true, || {
+            addresses
                 .iter()
                 .map(|&address| self.read_tile_word_without_save(physical_tile, context, address))
-                .collect();
-            let restore = self.restore_tile_m01(physical_tile, context, original_m0, original_m1);
-            match (read, restore) {
-                (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                (Ok(values), Ok(())) => Ok(values),
-            }
+                .collect()
         })
     }
 
@@ -653,25 +643,9 @@ impl Device {
                 "invalid tile memory address 0x{address:x}"
             )));
         }
-        self.with_tile_context(physical_tile, context, inactive_is_quiescent, || {
-            self.read_tile_word_in_context(physical_tile, context, address)
+        self.with_tile_scratch::<2, _>(physical_tile, context, inactive_is_quiescent, || {
+            self.read_tile_word_without_save(physical_tile, context, address)
         })
-    }
-
-    fn read_tile_word_in_context(
-        &self,
-        physical_tile: u16,
-        context: u32,
-        address: u32,
-    ) -> Result<u32, DriverError> {
-        let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
-        let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
-        let read = self.read_tile_word_without_save(physical_tile, context, address);
-        let restore = self.restore_tile_m01(physical_tile, context, original_m0, original_m1);
-        match (read, restore) {
-            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-            (Ok(value), Ok(())) => Ok(value),
-        }
     }
 
     fn read_tile_word_without_save(
@@ -696,23 +670,7 @@ impl Device {
         physical_tile: u16,
         context: u32,
     ) -> Result<u32, DriverError> {
-        self.with_stopped_tile_context(physical_tile, context, || {
-            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
-            self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_PC)?;
-            self.execute_tile_instruction(
-                physical_tile,
-                context,
-                tdi_instruction::PUT_DEBUG_DATA_M0,
-            )?;
-            let pc = self.read_tile_debug(physical_tile, TDI_DATA);
-            self.write_tile_debug(physical_tile, TDI_DATA, original_m0)?;
-            self.execute_tile_instruction(
-                physical_tile,
-                context,
-                tdi_instruction::GET_M0_DEBUG_DATA,
-            )?;
-            pc
-        })
+        self.read_tile_special_in_context(physical_tile, context, tdi_instruction::GET_M0_PC, false)
     }
 
     /// Writes one SRAM word through an excepted or inactive context while
@@ -760,9 +718,7 @@ impl Device {
                 "tile memory write address is invalid".into(),
             ));
         }
-        self.with_tile_context(physical_tile, context, inactive_is_quiescent, || {
-            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
-            let original_m1 = self.read_tile_m_register_in_context(physical_tile, context, 1)?;
+        self.with_tile_scratch::<2, _>(physical_tile, context, inactive_is_quiescent, || {
             self.write_tile_debug(physical_tile, TDI_DATA, address)?;
             self.execute_tile_instruction(
                 physical_tile,
@@ -775,8 +731,7 @@ impl Device {
                 context,
                 tdi_instruction::GET_M0_DEBUG_DATA,
             )?;
-            self.execute_tile_instruction(physical_tile, context, tdi_instruction::STORE_M0_AT_M1)?;
-            self.restore_tile_m01(physical_tile, context, original_m0, original_m1)
+            self.execute_tile_instruction(physical_tile, context, tdi_instruction::STORE_M0_AT_M1)
         })
     }
 
@@ -798,26 +753,12 @@ impl Device {
         physical_tile: u16,
         context: u32,
     ) -> Result<u32, DriverError> {
-        if context >= 7 {
-            return Err(DriverError::Invalid("tile context out of range".into()));
-        }
-        self.with_stopped_tile_context(physical_tile, context, || {
-            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
-            self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_WSR)?;
-            self.execute_tile_instruction(
-                physical_tile,
-                context,
-                tdi_instruction::PUT_DEBUG_DATA_M0,
-            )?;
-            let status = self.read_tile_debug(physical_tile, TDI_DATA);
-            self.write_tile_debug(physical_tile, TDI_DATA, original_m0)?;
-            self.execute_tile_instruction(
-                physical_tile,
-                context,
-                tdi_instruction::GET_M0_DEBUG_DATA,
-            )?;
-            status
-        })
+        self.read_tile_special_in_context(
+            physical_tile,
+            context,
+            tdi_instruction::GET_M0_WSR,
+            false,
+        )
     }
 
     pub fn read_tile_m_register(
@@ -826,7 +767,7 @@ impl Device {
         context: u32,
         register: u32,
     ) -> Result<u32, DriverError> {
-        self.with_stopped_tile_context(physical_tile, context, || {
+        self.with_tile_context(physical_tile, context, false, || {
             self.read_tile_m_register_in_context(physical_tile, context, register)
         })
     }
@@ -840,26 +781,29 @@ impl Device {
         context: u32,
         special: u8,
     ) -> Result<u32, DriverError> {
-        self.with_tile_context(physical_tile, context, true, || {
-            let original_m0 = self.read_tile_m_register_in_context(physical_tile, context, 0)?;
-            self.execute_tile_instruction(
-                physical_tile,
-                context,
-                0x4100_0000 | u32::from(special),
-            )?;
+        self.read_tile_special_in_context(
+            physical_tile,
+            context,
+            0x4100_0000 | u32::from(special),
+            true,
+        )
+    }
+
+    fn read_tile_special_in_context(
+        &self,
+        physical_tile: u16,
+        context: u32,
+        instruction: u32,
+        inactive_is_quiescent: bool,
+    ) -> Result<u32, DriverError> {
+        self.with_tile_scratch::<1, _>(physical_tile, context, inactive_is_quiescent, || {
+            self.execute_tile_instruction(physical_tile, context, instruction)?;
             self.execute_tile_instruction(
                 physical_tile,
                 context,
                 tdi_instruction::PUT_DEBUG_DATA_M0,
             )?;
-            let value = self.read_tile_debug(physical_tile, TDI_DATA);
-            self.write_tile_debug(physical_tile, TDI_DATA, original_m0)?;
-            self.execute_tile_instruction(
-                physical_tile,
-                context,
-                tdi_instruction::GET_M0_DEBUG_DATA,
-            )?;
-            value
+            self.read_tile_debug(physical_tile, TDI_DATA)
         })
     }
 
@@ -875,26 +819,37 @@ impl Device {
         self.read_tile_debug(physical_tile, TDI_DATA)
     }
 
-    fn restore_tile_m01(
+    /// Preserve the first N M registers around injected diagnostic instructions,
+    /// including failures. Restore in reverse order, as for the SRAM m0/m1 path.
+    fn with_tile_scratch<const N: usize, T>(
         &self,
         physical_tile: u16,
         context: u32,
-        m0: u32,
-        m1: u32,
-    ) -> Result<(), DriverError> {
-        self.write_tile_debug(physical_tile, TDI_DATA, m1)?;
-        self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M1_DEBUG_DATA)?;
-        self.write_tile_debug(physical_tile, TDI_DATA, m0)?;
-        self.execute_tile_instruction(physical_tile, context, tdi_instruction::GET_M0_DEBUG_DATA)
-    }
-
-    fn with_stopped_tile_context<T>(
-        &self,
-        physical_tile: u16,
-        context: u32,
+        inactive_is_quiescent: bool,
         operation: impl FnOnce() -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
-        self.with_tile_context(physical_tile, context, false, operation)
+        const { assert!(N <= 16) };
+        self.with_tile_context(physical_tile, context, inactive_is_quiescent, || {
+            let mut saved = [0; N];
+            for (register, value) in saved.iter_mut().enumerate() {
+                *value =
+                    self.read_tile_m_register_in_context(physical_tile, context, register as u32)?;
+            }
+            let result = operation();
+            let restore = saved
+                .iter()
+                .enumerate()
+                .rev()
+                .try_for_each(|(register, &value)| {
+                    self.write_tile_debug(physical_tile, TDI_DATA, value)?;
+                    self.execute_tile_instruction(
+                        physical_tile,
+                        context,
+                        tdi_instruction::GET_M0_DEBUG_DATA | ((register as u32) << 16),
+                    )
+                });
+            result.and_then(|value| restore.map(|()| value))
+        })
     }
 
     fn with_tile_context<T>(
@@ -904,9 +859,9 @@ impl Device {
         inactive_is_quiescent: bool,
         operation: impl FnOnce() -> Result<T, DriverError>,
     ) -> Result<T, DriverError> {
+        let initial_state = self.tile_context_state(physical_tile, context)?;
         let context_bit = 1 << context;
         let old_run_break = self.read_tile_debug(physical_tile, TDI_RUN_BREAK)?;
-        let initial_state = self.tile_context_state(physical_tile, context)?;
         let already_stopped =
             matches!(initial_state, 2 | 3) || (inactive_is_quiescent && initial_state == 0);
         if !already_stopped {
@@ -929,6 +884,9 @@ impl Device {
     }
 
     pub fn tile_context_state(&self, physical_tile: u16, context: u32) -> Result<u32, DriverError> {
+        if context >= 7 {
+            return Err(DriverError::Invalid("tile context out of range".into()));
+        }
         Ok((self.read_tile_debug(physical_tile, TDI_CONTEXT_STATUS)? >> (context * 2)) & 3)
     }
 
