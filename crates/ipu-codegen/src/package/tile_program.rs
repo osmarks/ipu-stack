@@ -82,12 +82,7 @@ pub fn build_tile_program_package(
         &mut memory,
         layout.segments.iter().map(|segment| segment.range.clone()),
     )?;
-    memory.reserve(
-        "host exchange aperture",
-        ipu_exchange::EXCHANGE_WINDOW_BASE
-            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-    )?;
-    memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
+    reserve_fixed_runtime_memory(&mut memory)?;
     let mut tile_data = vec![Vec::<(u32, u32)>::new(); usize::from(execution_tiles)];
     for segment in &data {
         let bytes = u32::try_from(segment.data.len())?;

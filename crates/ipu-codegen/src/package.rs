@@ -385,12 +385,7 @@ fn build_package_from_objects(
     let linked_end = linked_end(&layout)?;
     let mut memory = TileMemoryMap::new();
     reserve_linked_image(&mut memory, &layout, "linked runtime and kernels")?;
-    memory.reserve(
-        "host exchange aperture",
-        ipu_exchange::EXCHANGE_WINDOW_BASE
-            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
-    )?;
-    memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
+    reserve_fixed_runtime_memory(&mut memory)?;
 
     let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
     let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
@@ -1312,6 +1307,16 @@ fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
         .map(|segment| segment.range.end)
         .max()
         .ok_or_else(|| invalid("linked runtime has no valid segments"))
+}
+
+fn reserve_fixed_runtime_memory(memory: &mut TileMemoryMap) -> PackageBuildResult<()> {
+    memory.reserve(
+        "host exchange aperture",
+        ipu_exchange::EXCHANGE_WINDOW_BASE
+            ..ipu_exchange::EXCHANGE_WINDOW_BASE + ipu_exchange::EXCHANGE_WINDOW_BYTES,
+    )?;
+    memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
+    Ok(())
 }
 
 fn reserve_linked_image(
