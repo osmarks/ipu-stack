@@ -347,15 +347,13 @@ pub(super) fn validate_tile_program(
                 incoming: false, ..
             } => Some((i.end_cycle, words[i.word_offset as usize])),
             _ => None,
-        })
-        .collect::<Vec<_>>();
+        });
     let expected_bases = schedule
         .receive_events
         .iter()
         .filter(|e| e.kind == ReceiveEventKind::OutgoingBase)
-        .map(|e| (e.cycles, e.instruction))
-        .collect::<Vec<_>>();
-    if actual_bases != expected_bases {
+        .map(|e| (e.cycles, e.instruction));
+    if !actual_bases.eq(expected_bases) {
         return Err(ExchangeError::Schedule("encoded outgoing base mismatch"));
     }
     let mut actual_controls = Vec::new();
