@@ -194,10 +194,10 @@ fn collect(
         for allocation in support.allocations() {
             let host_aperture = !program.requires_finite_scratch
                 && (allocation.reserved.start, allocation.reserved.end) == HOST_SCRATCH_RANGE;
-            for (first, last) in if host_aperture {
-                vec![(0, 0), (u32::MAX, u32::MAX)]
+            for &(first, last) in if host_aperture {
+                &[(0, 0), (u32::MAX, u32::MAX)][..]
             } else {
-                vec![(0, u32::MAX)]
+                &[(0, u32::MAX)][..]
             } {
                 tile.allocations.push(Allocation {
                     start: allocation.reserved.start,
@@ -309,18 +309,15 @@ pub fn render_memory_profile(input: impl std::io::Read, output: &Path) -> Packag
 fn allocation_lanes(tile: &Tile) -> Vec<Vec<&Allocation>> {
     let mut lanes: Vec<Vec<&Allocation>> = vec![Vec::new()];
     for allocation in &tile.allocations {
-        let mut placed = false;
-        for lane in &mut lanes {
+        let slot = lanes.iter_mut().find_map(|lane| {
             let i = lane.partition_point(|a| a.start < allocation.start);
-            if (i == 0 || lane[i - 1].end <= allocation.start)
-                && (i == lane.len() || allocation.end <= lane[i].start)
-            {
-                lane.insert(i, allocation);
-                placed = true;
-                break;
-            }
-        }
-        if !placed {
+            ((i == 0 || lane[i - 1].end <= allocation.start)
+                && (i == lane.len() || allocation.end <= lane[i].start))
+                .then_some((lane, i))
+        });
+        if let Some((lane, i)) = slot {
+            lane.insert(i, allocation);
+        } else {
             lanes.push(vec![allocation]);
         }
     }
