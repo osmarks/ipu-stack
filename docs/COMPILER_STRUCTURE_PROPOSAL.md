@@ -8,6 +8,12 @@ and call direction; they are not existing APIs. The follow-up review separates
 explicit choices from search coverage and traces additional low/backend ownership
 problems, including a reproduced disagreement about which work executes.
 
+Implementation has started: padding removal now transforms the authoritative low
+graph before pure tile projection, and Repeat projections use the common storage
+binding record. The corresponding regression covers both straight-line and
+repeated execution. The diagnoses below describe the reviewed starting point;
+[current data flow](COMPILER_DATA_FLOW.md) tracks implemented changes.
+
 ## Diagnosis
 
 The principal problem is that the compiler repeatedly crosses the same conceptual

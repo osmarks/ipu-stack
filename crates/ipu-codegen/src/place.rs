@@ -482,7 +482,7 @@ fn touch_work(
             }
         }
         TileWorkRef::Repeat(repeat) => {
-            for shard in repeat.bound_shards() {
+            for shard in repeat.binding.bound_shards() {
                 touch(shard);
             }
             *event = event.saturating_add(1);
@@ -490,7 +490,7 @@ fn touch_work(
                 touch_work(program, nested, tile, event, lifetimes, exchanges);
             }
             let end = *event;
-            for shard in repeat.bound_shards() {
+            for shard in repeat.binding.bound_shards() {
                 lifetimes[shard.index() as usize].touch(end);
             }
             *event = event.saturating_add(1);
@@ -511,15 +511,15 @@ fn collect_repeat_constraints(
         let TileWorkRef::Repeat(repeat) = work else {
             continue;
         };
-        for carried in &repeat.carried {
+        for carried in &repeat.binding.carried {
             checked_union(program, sets, carried.initial, carried.argument)?;
             checked_union(program, sets, carried.initial, carried.yielded)?;
             checked_union(program, sets, carried.initial, carried.result)?;
         }
-        for invariant in &repeat.invariants {
+        for invariant in &repeat.binding.invariants {
             checked_union(program, sets, invariant.input, invariant.argument)?;
         }
-        for input in &repeat.iterated {
+        for input in &repeat.binding.iterated {
             let first = *input.inputs.first().ok_or(PlacementError::IteratedStride)?;
             checked_union(program, sets, first, input.argument)?;
             iterated.push(IteratedGroup {
@@ -1737,9 +1737,9 @@ mod tests {
                     let crate::TileWorkRef::Repeat(repeat) = work else {
                         continue;
                     };
-                    for input in &repeat.iterated {
+                    for input in &repeat.binding.iterated {
                         assert!(input.stride_bytes < TILE_MEMORY_ELEMENT_SIZE);
-                        let output = placement.shard_addresses[&repeat.carried[0].initial];
+                        let output = placement.shard_addresses[&repeat.binding.carried[0].initial];
                         let element = |address| {
                             if address >= IPU21_INTERLEAVED_MEMORY_BASE {
                                 IPU21_INTERLEAVED_ELEMENT_SIZE

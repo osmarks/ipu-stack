@@ -113,6 +113,7 @@ pub(crate) fn expand_tiles_analyzed(
     }
     let mut program = TileGraph {
         tile_count: graph.tile_count,
+        requires_finite_scratch: false,
         shards: state.shards,
         exchange_phases: state.phases,
         inputs: graph.inputs.clone(),
@@ -145,12 +146,15 @@ pub(crate) fn expand_tiles_analyzed(
     let simplify_time = start.elapsed();
     let start = Instant::now();
     relay::select(&mut program, analysis)?;
+    let relay_time = start.elapsed();
+    crate::low::initialization::omit_unread_fp8_input_padding(&mut program);
+    crate::low::initialization::reuse_finite_padding(&mut program);
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),
         build_ms = build_time.as_secs_f64() * 1000.0,
         simplify_ms = simplify_time.as_secs_f64() * 1000.0,
-        relay_ms = start.elapsed().as_secs_f64() * 1000.0,
+        relay_ms = relay_time.as_secs_f64() * 1000.0,
         "built logical tile schedule"
     );
     Ok(Arc::new(program))

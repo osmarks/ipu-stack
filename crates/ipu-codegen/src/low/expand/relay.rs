@@ -356,6 +356,7 @@ mod tests {
         };
         TileGraph {
             tile_count: 64,
+            requires_finite_scratch: false,
             shards,
             exchange_phases: vec![phase],
             body: BlockRegion {

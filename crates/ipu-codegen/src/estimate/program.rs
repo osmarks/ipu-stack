@@ -481,6 +481,7 @@ mod tests {
         };
         let mut program = TileGraph {
             tile_count: 2,
+            requires_finite_scratch: false,
             shards: vec![],
             kernel_runs: vec![],
             local_copies: vec![],

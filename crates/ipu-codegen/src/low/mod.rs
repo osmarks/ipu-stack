@@ -25,34 +25,8 @@ pub struct RepeatRunId(u32);
 pub struct RepeatRun {
     pub provenance: WorkProvenance,
     pub count: u32,
-    pub carried: Vec<RepeatCarried>,
-    pub invariants: Vec<RepeatInvariant>,
-    pub iterated: Vec<RepeatIterated>,
+    pub binding: BlockRepeatBinding,
     pub body: Box<TileWorkList>,
-}
-
-impl RepeatRun {
-    /// Storage exposed by bindings on either side of the body boundary.
-    pub(crate) fn bound_shards(&self) -> impl Iterator<Item = BlockValueId> + '_ {
-        self.carried
-            .iter()
-            .flat_map(|binding| {
-                [
-                    binding.initial,
-                    binding.argument,
-                    binding.yielded,
-                    binding.result,
-                ]
-            })
-            .chain(
-                self.invariants
-                    .iter()
-                    .flat_map(|binding| [binding.input, binding.argument]),
-            )
-            .chain(self.iterated.iter().flat_map(|binding| {
-                std::iter::once(binding.argument).chain(binding.inputs.iter().copied())
-            }))
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,9 +57,6 @@ pub struct TileWorkList {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LowProgram {
     pub program: Arc<TileGraph>,
-    /// Padding clears were elided using the finite-F16 arena invariant.
-    /// Such storage cannot borrow memory containing host protocol words.
-    pub requires_finite_scratch: bool,
     pub tiles: Vec<TileWorkList>,
     pub repeat_runs: Vec<RepeatRun>,
 }
@@ -116,8 +87,8 @@ impl LowProgram {
     }
 }
 
-/// Project tile work and remove redundant finite-only initialization.
-/// Numerical inputs/results must be finite; loading must first initialize SRAM.
+/// Derive per-tile indexes from the executable graph without changing its work.
+/// Run low transformations before projection so costing and emission agree.
 pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) -> LowProgram {
     fn project(
         region: &BlockRegion,
@@ -161,9 +132,7 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
                         repeats.push(RepeatRun {
                             provenance: repeat.provenance,
                             count: repeat.count,
-                            carried: binding.carried.clone(),
-                            invariants: binding.invariants.clone(),
-                            iterated: binding.iterated.clone(),
+                            binding: binding.clone(),
                             body: Box::new(body[usize::from(binding.tile)].clone()),
                         });
                         tiles[usize::from(binding.tile)]
@@ -182,13 +151,9 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
         &mut repeat_runs,
         diagnostic_checkpoints,
     );
-    let mut low = LowProgram {
+    LowProgram {
         program: Arc::clone(program),
-        requires_finite_scratch: false,
         tiles,
         repeat_runs,
-    };
-    initialization::omit_unread_fp8_input_padding(&mut low);
-    initialization::reuse_finite_padding(&mut low);
-    low
+    }
 }

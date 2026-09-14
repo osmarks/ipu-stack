@@ -12,34 +12,52 @@ use std::collections::BTreeSet;
 // These readers have no kernel-specific proof that padding can be ignored.
 // Repeat bindings can expose bytes to readers under another shard ID; scratch
 // local to the body has no such additional readers.
-fn non_kernel_read_storage(program: &LowProgram) -> BTreeSet<BlockValueId> {
-    program
-        .exchange_phases
+fn non_kernel_read_storage(program: &TileGraph) -> BTreeSet<BlockValueId> {
+    let mut readers = program
+        .outputs
         .iter()
-        .flat_map(|phase| phase.transfers.iter().map(|transfer| transfer.source.shard))
-        .chain(program.local_copies.iter().map(|copy| copy.source))
-        .chain(
-            program
-                .outputs
-                .iter()
-                .flat_map(|&output| program.value_shards(output).iter().copied()),
-        )
-        .chain(program.repeat_runs.iter().flat_map(RepeatRun::bound_shards))
+        .flat_map(|&output| program.value_shards(output).iter().copied())
+        .collect::<BTreeSet<_>>();
+    for operation in program.body.walk() {
+        match operation {
+            BlockOperation::Exchange(id) => readers.extend(
+                program.exchange_phases[id.index() as usize]
+                    .transfers
+                    .iter()
+                    .map(|transfer| transfer.source.shard),
+            ),
+            BlockOperation::Copy { copy, .. } => {
+                readers.insert(program.local_copies[copy.0 as usize].source);
+            }
+            BlockOperation::Repeat(repeat) => {
+                readers.extend(
+                    repeat
+                        .bindings
+                        .iter()
+                        .flat_map(BlockRepeatBinding::bound_shards),
+                );
+            }
+            _ => {}
+        }
+    }
+    readers
+        .into_iter()
         .map(|id| storage_root(&program.shards, id))
         .collect()
 }
 
 /// Row-major FP8 packing reads only logical columns/rows and writes its own
 /// output padding. Drop input padding clears when that is the sole reader.
-pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
-    let graph = &program.program;
-    let root = |id| storage_root(&graph.shards, id);
+pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
+    let shards = &program.shards;
+    let kernels = &program.kernel_runs;
+    let root = |id| storage_root(shards, id);
     let mut candidates = BTreeSet::new();
     let mut forbidden = non_kernel_read_storage(program);
-    for run in &graph.kernel_runs {
+    for run in program.kernel_calls() {
         for input in &run.inputs {
             for view in &input.views {
-                let block = &graph.shards[view.shard.index() as usize];
+                let block = &shards[view.shard.index() as usize];
                 let columns = view.extents.last();
                 let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
                     from: Precision::F16, to: Precision::F8F143 { .. }
@@ -71,9 +89,9 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
     }
     candidates.retain(|id| !forbidden.contains(id));
     let mut removed = 0;
-    let mut keep = |work: &TileWork| {
-        if let TileWork::Kernel(id) = work {
-            let run = &graph.kernel_runs[id.0 as usize];
+    let mut keep = |operation: &BlockOperation| {
+        if let BlockOperation::Compute { run: id, .. } = operation {
+            let run = &kernels[id.0 as usize];
             if matches!(
                 run.kernel,
                 TileKernelSpec::FillZero {
@@ -88,23 +106,18 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
         }
         true
     };
-    for tile in &mut program.tiles {
-        tile.work.retain(&mut keep);
-    }
-    for repeat in &mut program.repeat_runs {
-        repeat.body.work.retain(&mut keep);
-    }
+    program.body.retain(&mut keep);
     tracing::info!(removed, "eliminated unread FP8 cast input padding clears");
 }
 
-pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
+pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
     if program
         .shards
         .iter()
         .any(|shard| shard.tensor_type.format.precision != Precision::F16)
         // Attention row-state storage contains FP32 words inside its packed
         // F16 allocation. Its bits do not preserve the arena-wide invariant.
-        || program.kernel_runs.iter().any(|run| matches!(run.kernel,
+        || program.kernel_calls().any(|run| matches!(run.kernel,
             TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. }
         ))
     {
@@ -119,31 +132,38 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         .map(root)
         .collect::<BTreeSet<_>>();
     let mut incoming = std::collections::BTreeMap::<BlockValueId, BTreeSet<BlockValueId>>::new();
-    for copy in &program.local_copies {
-        incoming
-            .entry(root(copy.destination))
-            .or_default()
-            .insert(root(copy.source));
-    }
-    for phase in &program.exchange_phases {
-        for transfer in &phase.transfers {
-            for destination in &transfer.destinations {
+    for operation in program.body.walk() {
+        match operation {
+            BlockOperation::Copy { copy, .. } => {
+                let copy = &program.local_copies[copy.0 as usize];
                 incoming
-                    .entry(root(destination.shard))
+                    .entry(root(copy.destination))
                     .or_default()
-                    .insert(root(transfer.source.shard));
+                    .insert(root(copy.source));
             }
-        }
-    }
-    for run in &program.kernel_runs {
-        if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
-            // Arithmetic results are not known-zero-padded parameters.
-            for output in run.outputs() {
-                incoming
-                    .entry(root(output.shard))
-                    .or_default()
-                    .insert(root(output.shard));
+            BlockOperation::Exchange(id) => {
+                for transfer in &program.exchange_phases[id.index() as usize].transfers {
+                    for destination in &transfer.destinations {
+                        incoming
+                            .entry(root(destination.shard))
+                            .or_default()
+                            .insert(root(transfer.source.shard));
+                    }
+                }
             }
+            BlockOperation::Compute { run, .. } => {
+                let run = &program.kernel_runs[run.0 as usize];
+                if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
+                    // Arithmetic results are not known-zero-padded parameters.
+                    for output in run.outputs() {
+                        incoming
+                            .entry(root(output.shard))
+                            .or_default()
+                            .insert(root(output.shard));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Writes through aliases also invalidate an input's original parameter
@@ -165,7 +185,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
     }
     let mut candidates = BTreeSet::new();
     let mut forbidden = non_kernel_read_storage(program);
-    for run in &program.kernel_runs {
+    for run in program.kernel_calls() {
         // Parameter packing supplies exact zero coefficients beyond logical K.
         // Only the activation operand can therefore tolerate arbitrary finite K
         // padding. Missing logical values and explicit reduction zeros cannot.
@@ -190,24 +210,24 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         }
     }
     candidates.retain(|shard| !forbidden.contains(shard));
-    let graph = &program.program;
-    let kernels = &graph.kernel_runs;
+    let shards = &program.shards;
+    let kernels = &program.kernel_runs;
     let mut valid_row_ranges = std::collections::BTreeMap::new();
     let mut removed = 0;
-    let mut remove = |work: &TileWork| {
-        if let TileWork::Kernel(id) = work {
+    let mut keep = |operation: &BlockOperation| {
+        if let BlockOperation::Compute { run: id, .. } = operation {
             let run = &kernels[id.0 as usize];
             if let TileKernelSpec::FillZero {
                 offset,
                 bytes,
                 padding_only: true,
             } = run.kernel
-                && candidates.contains(&storage_root(&graph.shards, run.output.shard))
+                && candidates.contains(&storage_root(shards, run.output.shard))
             {
                 // Keep discarded row padding zero: arbitrary nonzero rows
                 // could overflow even though their outputs are unobserved.
                 let ranges = valid_row_ranges.entry(run.output.shard).or_insert_with(|| {
-                    let shard = &graph.shards[run.output.shard.index() as usize];
+                    let shard = &shards[run.output.shard.index() as usize];
                     let mut rows = shard.extents.clone();
                     let rank = rows.len();
                     let inner = match shard.tensor_type.format.layout.order {
@@ -239,12 +259,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         }
         true
     };
-    for tile in &mut program.tiles {
-        tile.work.retain(&mut remove);
-    }
-    for repeat in &mut program.repeat_runs {
-        repeat.body.work.retain(&mut remove);
-    }
+    program.body.retain(&mut keep);
     program.requires_finite_scratch |= removed != 0;
     tracing::info!(
         removed,
@@ -257,7 +272,7 @@ mod tests {
     use super::*;
     use crate::{AccumulationPrecision, KernelAccess, KernelRequirements, TensorType};
 
-    fn fixture() -> LowProgram {
+    fn fixture() -> TileGraph {
         let tensor_type = TensorType::new(
             [2, 64],
             Precision::F16,
@@ -299,8 +314,9 @@ mod tests {
                 },
             )
         };
-        let graph = TileGraph {
+        TileGraph {
             tile_count: 1,
+            requires_finite_scratch: false,
             shards: (0..3)
                 .map(|id| BlockValue {
                     id: BlockValueId(id),
@@ -316,7 +332,18 @@ mod tests {
                 kind: crate::GraphInputKind::Parameter,
                 value: MidValueId::from_index(0),
             }],
-            body: BlockRegion::default(),
+            body: BlockRegion {
+                operations: vec![
+                    BlockOperation::Compute {
+                        tile: 0,
+                        run: KernelRunId(0),
+                    },
+                    BlockOperation::Compute {
+                        tile: 0,
+                        run: KernelRunId(1),
+                    },
+                ],
+            },
             kernel_runs: vec![
                 run(
                     TileKernelSpec::FillZero {
@@ -352,25 +379,86 @@ mod tests {
             outputs: Vec::new(),
             logical_values: Vec::new(),
             checkpoints: Vec::new(),
-        };
-        LowProgram {
-            program: Arc::new(graph),
-            requires_finite_scratch: false,
-            tiles: vec![TileWorkList {
-                tile: 0,
-                work: vec![
-                    TileWork::Kernel(KernelRunId(0)),
-                    TileWork::Kernel(KernelRunId(1)),
-                ],
-            }],
-            repeat_runs: Vec::new(),
         }
+    }
+
+    fn has_clear(program: &TileGraph) -> bool {
+        program
+            .kernel_calls()
+            .any(|run| matches!(run.kernel, TileKernelSpec::FillZero { .. }))
+    }
+
+    #[test]
+    fn padding_removal_changes_the_graph_cost_and_projected_repeat_work_together() {
+        for count in [1, 3] {
+            let mut program = fixture();
+            if count > 1 {
+                let body = std::mem::take(&mut program.body);
+                program
+                    .body
+                    .operations
+                    .push(BlockOperation::Repeat(Box::new(BlockRepeat {
+                        provenance: program.kernel_runs[1].provenance,
+                        count,
+                        bindings: vec![BlockRepeatBinding {
+                            tile: 0,
+                            carried: vec![],
+                            invariants: vec![],
+                            iterated: vec![],
+                        }],
+                        body,
+                    })));
+            }
+            let before = crate::estimate::scheduled_program_cycles(&program, &[]).unwrap();
+            reuse_finite_padding(&mut program);
+            let after = crate::estimate::scheduled_program_cycles(&program, &[]).unwrap();
+            assert!(after.total < before.total);
+            assert!(!has_clear(&program));
+            assert!(program.requires_finite_scratch);
+            // The removed entry may remain interned, but must not become live
+            // again when a consumer derives per-tile execution indexes.
+            assert_eq!(program.kernel_runs.len(), 2);
+            let program = Arc::new(program);
+            let low = lower_to_tiles(&program, false);
+            assert!(Arc::ptr_eq(&program, &low.program));
+            let work = if count == 1 {
+                &low.tiles[0]
+            } else {
+                &low.repeat_runs[0].body
+            };
+            let [TileWork::Kernel(id)] = work.work.as_slice() else {
+                panic!("projection did not retain exactly the live computation");
+            };
+            let mut executed = (*program).clone();
+            executed.body.operations = vec![BlockOperation::Compute { tile: 0, run: *id }];
+            let cost = crate::estimate::scheduled_program_cycles(&executed, &[]).unwrap();
+            assert_eq!(after.total, cost.total * u64::from(count));
+            let mut again = (*program).clone();
+            reuse_finite_padding(&mut again);
+            assert_eq!(again, *program, "removal must be idempotent");
+        }
+    }
+
+    fn append_copy(program: &mut TileGraph, source: u32, destination: u32, bytes: u32) {
+        let copy = LocalCopyId(program.local_copies.len() as u32);
+        program.local_copies.push(LocalCopy {
+            source: BlockValueId(source),
+            source_offset: 0,
+            destination: BlockValueId(destination),
+            destination_offset: 0,
+            bytes,
+            pattern: CopyPattern::Contiguous,
+        });
+        program
+            .body
+            .operations
+            .insert(0, BlockOperation::Copy { tile: 0, copy });
     }
 
     #[test]
     fn cast_padding_elision_requires_exclusive_column_only_reader() {
         let mut baseline = fixture();
-        let graph = Arc::make_mut(&mut baseline.program);
+        let graph = &mut baseline;
         graph.shards[0].extents[1].logical_end = 48;
         let run = &mut graph.kernel_runs[1];
         run.inputs.truncate(1);
@@ -384,21 +472,14 @@ mod tests {
         metadata.requirements.output.format.precision = Precision::F8F143 { scale_exponent: -4 };
         for case in 0..11 {
             let mut program = baseline.clone();
-            let graph = Arc::make_mut(&mut program.program);
+            let graph = &mut program;
             match case {
                 1 => {
                     graph.shards[0].extents[0].logical_end = 1;
                     graph.kernel_runs[1].inputs[0].views[0].extents[0].logical_end = 1;
                 }
                 2 => graph.outputs.push(MidValueId::from_index(1)),
-                3 => graph.local_copies.push(LocalCopy {
-                    source: BlockValueId(0),
-                    source_offset: 0,
-                    destination: BlockValueId(1),
-                    destination_offset: 0,
-                    bytes: 128,
-                    pattern: CopyPattern::Contiguous,
-                }),
+                3 => append_copy(graph, 0, 1, 128),
                 5 | 6 => {
                     Arc::make_mut(&mut graph.kernel_runs[1].metadata).kernel = TileKernelSpec::Gelu;
                     if case == 6 {
@@ -418,49 +499,49 @@ mod tests {
                     let mut argument = graph.shards[1].clone();
                     argument.id = BlockValueId(3);
                     graph.shards.push(argument);
-                    program.repeat_runs.push(RepeatRun {
-                        provenance: graph.kernel_runs[1].provenance.clone(),
-                        count: 3,
-                        carried: Vec::new(),
-                        invariants: if case == 10 {
-                            vec![RepeatInvariant {
-                                input: BlockValueId(1),
-                                argument: BlockValueId(0),
-                            }]
-                        } else {
-                            Vec::new()
-                        },
-                        iterated: vec![RepeatIterated {
-                            inputs: vec![BlockValueId(if case == 9 { 0 } else { 1 }); 3],
-                            argument: BlockValueId(if case == 8 { 0 } else { 3 }),
-                            stride_bytes: 128,
-                            alignment: 8,
-                        }],
-                        body: Box::new(program.tiles[0].clone()),
-                    });
+                    let body = graph.body.clone();
+                    graph
+                        .body
+                        .operations
+                        .push(BlockOperation::Repeat(Box::new(BlockRepeat {
+                            provenance: graph.kernel_runs[1].provenance,
+                            count: 3,
+                            bindings: vec![BlockRepeatBinding {
+                                tile: 0,
+                                carried: Vec::new(),
+                                invariants: if case == 10 {
+                                    vec![RepeatInvariant {
+                                        input: BlockValueId(1),
+                                        argument: BlockValueId(0),
+                                    }]
+                                } else {
+                                    Vec::new()
+                                },
+                                iterated: vec![RepeatIterated {
+                                    inputs: vec![BlockValueId(if case == 9 { 0 } else { 1 }); 3],
+                                    argument: BlockValueId(if case == 8 { 0 } else { 3 }),
+                                    stride_bytes: 128,
+                                    alignment: 8,
+                                }],
+                            }],
+                            body,
+                        })));
                 }
                 _ => {}
             }
             omit_unread_fp8_input_padding(&mut program);
             assert_eq!(
-                program.tiles[0].work.len(),
-                if case <= 1 || case == 5 || case == 7 {
-                    1
-                } else {
-                    2
-                },
+                has_clear(&program),
+                !(case <= 1 || case == 5 || case == 7),
                 "case {case}"
             );
-            if let Some(repeat) = program.repeat_runs.first() {
-                assert_eq!(repeat.body.work.len(), program.tiles[0].work.len());
-            }
         }
     }
 
     #[test]
     fn embedded_fp32_attention_state_prevents_f16_arena_reuse() {
         let mut program = fixture();
-        let graph = Arc::make_mut(&mut program.program);
+        let graph = &mut program;
         let mut state_writer = graph.kernel_runs[1].clone();
         state_writer.inputs.clear();
         Arc::make_mut(&mut state_writer.metadata).kernel = TileKernelSpec::AttentionSoftmax {
@@ -468,20 +549,25 @@ mod tests {
             key_columns: 729,
             padded_key_columns: 768,
         };
+        let run = KernelRunId(graph.kernel_runs.len() as u32);
         graph.kernel_runs.push(state_writer);
+        graph
+            .body
+            .operations
+            .push(BlockOperation::Compute { tile: 0, run });
         reuse_finite_padding(&mut program);
-        assert_eq!(program.tiles[0].work.len(), 2);
+        assert!(has_clear(&program));
     }
 
     #[test]
     fn finite_padding_requires_zero_weights_and_no_other_consumers() {
         let mut program = fixture();
         reuse_finite_padding(&mut program);
-        assert_eq!(program.tiles[0].work.len(), 1);
+        assert!(!has_clear(&program));
         assert!(program.requires_finite_scratch);
         for case in 0..5 {
             let mut program = fixture();
-            let graph = Arc::make_mut(&mut program.program);
+            let graph = &mut program;
             match case {
                 0 => graph.inputs.clear(),
                 1 => graph.shards[2].tensor_type.format.precision = Precision::F32,
@@ -505,48 +591,28 @@ mod tests {
                 _ => graph.outputs.push(MidValueId::from_index(1)),
             }
             reuse_finite_padding(&mut program);
-            assert_eq!(program.tiles[0].work.len(), 2, "case {case}");
+            assert!(has_clear(&program), "case {case}");
         }
     }
 
     #[test]
     fn parameter_copy_proof_rejects_mixed_sources() {
         let mut program = fixture();
-        let graph = Arc::make_mut(&mut program.program);
+        let graph = &mut program;
         let mut staged = graph.shards[1].clone();
         staged.id = BlockValueId(3);
         graph.shards.push(staged);
-        graph.local_copies.push(LocalCopy {
-            source: BlockValueId(1),
-            source_offset: 0,
-            destination: BlockValueId(3),
-            destination_offset: 0,
-            bytes: 256,
-            pattern: CopyPattern::Contiguous,
-        });
+        append_copy(graph, 1, 3, 256);
         graph.kernel_runs[1].inputs[1].views[0].shard = BlockValueId(3);
         let mut mixed = program.clone();
-        Arc::make_mut(&mut mixed.program)
-            .local_copies
-            .push(LocalCopy {
-                source: BlockValueId(2),
-                source_offset: 0,
-                destination: BlockValueId(3),
-                destination_offset: 0,
-                bytes: 8,
-                pattern: CopyPattern::Contiguous,
-            });
+        append_copy(&mut mixed, 2, 3, 8);
         let mut overwritten = mixed.clone();
-        Arc::make_mut(&mut overwritten.program)
-            .local_copies
-            .last_mut()
-            .unwrap()
-            .destination = BlockValueId(1);
+        overwritten.local_copies.last_mut().unwrap().destination = BlockValueId(1);
         reuse_finite_padding(&mut program);
         reuse_finite_padding(&mut mixed);
         reuse_finite_padding(&mut overwritten);
-        assert_eq!(program.tiles[0].work.len(), 1);
-        assert_eq!(mixed.tiles[0].work.len(), 2);
-        assert_eq!(overwritten.tiles[0].work.len(), 2);
+        assert!(!has_clear(&program));
+        assert!(has_clear(&mixed));
+        assert!(has_clear(&overwritten));
     }
 }

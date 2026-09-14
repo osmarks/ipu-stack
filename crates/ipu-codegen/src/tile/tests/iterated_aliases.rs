@@ -154,7 +154,7 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
 #[test]
 fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
     let (low, mut placement) = iterated_sum(1);
-    let argument = low.repeat_runs[0].iterated[0].argument;
+    let argument = low.repeat_runs[0].binding.iterated[0].argument;
     let mut shards = low.shards.clone();
     let overrides = BTreeMap::from([(
         argument,

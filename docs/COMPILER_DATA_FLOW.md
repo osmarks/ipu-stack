@@ -1,6 +1,7 @@
 # Compiler data flow
 
-Source review: 2026-09-14, `1501698`. This describes the current implementation.
+Source review: 2026-09-14, with the subsequent low-work refactor incorporated.
+This describes the current implementation.
 [Structural proposal](COMPILER_STRUCTURE_PROPOSAL.md) describes the proposed changes.
 Older experiment reports explain history, not the current pipeline.
 
@@ -28,11 +29,10 @@ The two mid rows are **states of the same Rust type**, not separate checked
 interfaces. `resolve` removes `Operator` but can leave `Convert`. Low rejects
 an unresolved `Operator` at runtime. This is a significant source of ambiguity.
 
-`TileGraph` and `LowProgram` share arenas, but their live operation lists can
-diverge. `lower_to_tiles` projects the graph and then performs initialization
-elimination on per-tile work only. The original graph still contains removed
-calls. This matters because different downstream consumers use different lists;
-see the low-work trace below.
+`TileGraph` owns the live operation list and finite-scratch requirement.
+`LowProgram` shares its arenas and derives per-tile indexes without changing
+execution. Padding removal runs on the graph before this projection; costing,
+inventory and emission observe the same live work.
 
 ## Production control flow
 
@@ -45,7 +45,7 @@ flowchart TD
   I --> W[Cast ordering, copy composition, fusions, ownership and storage rewrites]
   W --> M[Resolved MidProgram: Primitive / Convert / Repeat]
   M --> E[low::expand: shard enumeration and physical realization]
-  E --> O[Low simplification and relay selection]
+  E --> O[Low simplification, relay selection and padding removal]
   O --> T[TileGraph]
   T --> F[Detailed exchange-footprint screen]
   F --> L[Tile mapping and lower_to_tiles]
@@ -82,9 +82,7 @@ provisional/final cycle is real. Cached ordering and widths are replayed and
 validated; cached physical addresses are not assumed valid.
 
 The reported final cycles still combine modelled kernel work with scheduled
-exchange horizons. They are not hardware measurements. In addition to modelling
-error, the low-work trace identifies an actual mismatch between their input and
-emitted work.
+exchange horizons. They are not hardware measurements.
 
 ## Trace 1: GEMM and its reduction
 
@@ -251,23 +249,24 @@ alongside movement and kernel binding.
 
 ## Trace 4: live low work and storage contracts
 
-[lower_to_tiles](../crates/ipu-codegen/src/low/mod.rs) first projects `BlockRegion`
-operations into tile work and Repeat instances.
-[initialization.rs](../crates/ipu-codegen/src/low/initialization.rs) then removes
-padding clears from the projected lists. The shared `TileGraph.body` is unchanged.
+[initialization.rs](../crates/ipu-codegen/src/low/initialization.rs) removes proven
+redundant padding clears from `TileGraph.body`, including Repeat bodies, at the
+end of expansion. Its analyses walk live operations, not unused arena entries.
+The graph records whether the remaining work requires finite initial scratch.
+[lower_to_tiles](../crates/ipu-codegen/src/low/mod.rs) subsequently derives tile
+work and Repeat instances without removing calls. Repeat's storage binding record
+is shared by both representations.
 
 | Consumer | Execution description used |
 | --- | --- |
-| Final `scheduled_program_cycles` in [estimate/program.rs](../crates/ipu-codegen/src/estimate/program.rs), called by package construction | Original `BlockRegion` operations |
-| [KernelBuildPlan](../crates/ipu-codegen/src/kernel/build.rs), runtime-symbol retention and tile emission | Filtered per-tile work, including Repeat bodies |
-| Placement lifetimes and kernel access collection | Filtered `TileWorkRef` traversal |
+| Final `scheduled_program_cycles` in [estimate/program.rs](../crates/ipu-codegen/src/estimate/program.rs), called by package construction | Transformed `BlockRegion` operations |
+| [KernelBuildPlan](../crates/ipu-codegen/src/kernel/build.rs), runtime-symbol retention and tile emission | Per-tile indexes of those operations, including Repeat bodies |
+| Placement lifetimes and kernel access collection | The same indexed operations through `TileWorkRef` |
 
-A temporary test populated the graph body corresponding to the existing
-initialization fixture and ran `lower_to_tiles`: two graph calls became one tile
-call. Scheduled costing reported 1,402 cycles; removing the same dead call from
-the graph before costing gave 1,390. The test was removed after this diagnostic.
-It establishes disagreement about live work, not a large performance regression
-or an inaccurate kernel inventory.
+Before this refactor, padding removal edited only projected work. A diagnostic
+showed 1,402 reported cycles versus 1,390 for work actually retained. The permanent
+regression test now checks agreement between graph cost and projected execution,
+with and without Repeat, and checks that padding removal is idempotent.
 
 Several physical access contracts also have multiple owners:
 

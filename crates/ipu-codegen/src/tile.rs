@@ -327,8 +327,8 @@ fn lower_repeat(
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
 ) -> Result<RepeatStep, TileLoweringError> {
     let mut overrides = BTreeMap::new();
-    let mut pointers = Vec::with_capacity(repeat.iterated.len());
-    for (index, iterated) in repeat.iterated.iter().enumerate() {
+    let mut pointers = Vec::with_capacity(repeat.binding.iterated.len());
+    for (index, iterated) in repeat.binding.iterated.iter().enumerate() {
         let initial_address = iterated
             .inputs
             .first()
@@ -725,6 +725,7 @@ mod tests {
         let id = crate::BlockValueId::from_index;
         let graph = crate::TileGraph {
             tile_count: 1,
+            requires_finite_scratch: false,
             shards: (0..2)
                 .map(|index| crate::BlockValue {
                     id: id(index),
@@ -756,7 +757,6 @@ mod tests {
             checkpoints: vec![],
         };
         let program = LowProgram {
-            requires_finite_scratch: false,
             program: std::sync::Arc::new(graph),
             repeat_runs: vec![],
             tiles: vec![TileWorkList {

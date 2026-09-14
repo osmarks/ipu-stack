@@ -1880,14 +1880,14 @@ fn randomized_repeats_remain_structured_per_tile() {
                 .collect::<Vec<_>>();
             assert_eq!(repeats.len(), 1, "case {case}");
             assert_eq!(repeats[0].count, count);
-            assert_eq!(repeats[0].iterated[0].inputs.len(), count as usize);
-            assert!(repeats[0].iterated[0].stride_bytes > 0);
+            assert_eq!(repeats[0].binding.iterated[0].inputs.len(), count as usize);
+            assert!(repeats[0].binding.iterated[0].stride_bytes > 0);
             assert!(
-                repeats[0].iterated[0]
+                repeats[0].binding.iterated[0]
                     .stride_bytes
-                    .is_multiple_of(repeats[0].iterated[0].alignment)
+                    .is_multiple_of(repeats[0].binding.iterated[0].alignment)
             );
-            let carried = &repeats[0].carried[0];
+            let carried = &repeats[0].binding.carried[0];
             assert_eq!(
                 low.shards[carried.argument.index() as usize].definition,
                 ShardDefinition::Alias(carried.initial)
@@ -1953,22 +1953,22 @@ fn repeat_binds_every_linear_fragment_including_rotated_owners() {
         let low = lower_to_tiles(&mid, false).unwrap();
         let placement = crate::place(&low).unwrap();
         for repeat in &low.repeat_runs {
-            assert_eq!(repeat.carried.len(), 4);
-            assert_eq!(repeat.invariants.len(), 4);
-            assert_eq!(repeat.iterated.len(), 4);
-            for binding in &repeat.carried {
+            assert_eq!(repeat.binding.carried.len(), 4);
+            assert_eq!(repeat.binding.invariants.len(), 4);
+            assert_eq!(repeat.binding.iterated.len(), 4);
+            for binding in &repeat.binding.carried {
                 let initial = placement.shard_addresses[&binding.initial];
                 for shard in [binding.argument, binding.yielded, binding.result] {
                     assert_eq!(placement.shard_addresses[&shard], initial);
                 }
             }
-            for binding in &repeat.invariants {
+            for binding in &repeat.binding.invariants {
                 assert_eq!(
                     placement.shard_addresses[&binding.input],
                     placement.shard_addresses[&binding.argument]
                 );
             }
-            for binding in &repeat.iterated {
+            for binding in &repeat.binding.iterated {
                 assert_eq!(
                     placement.shard_addresses[&binding.inputs[0]],
                     placement.shard_addresses[&binding.argument]
@@ -2020,8 +2020,8 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
                 })
                 .unwrap();
             assert_eq!(
-                low.shards[repeat.carried[0].yielded.index() as usize].definition,
-                ShardDefinition::WritableAlias(repeat.carried[0].argument),
+                low.shards[repeat.binding.carried[0].yielded.index() as usize].definition,
+                ShardDefinition::WritableAlias(repeat.binding.carried[0].argument),
                 "case {case}"
             );
         }
@@ -2099,7 +2099,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
     let low = lower_to_tiles(&mid, false).unwrap();
     let placement = crate::place(&low).unwrap();
     let repeat = &low.repeat_runs[0];
-    let target = placement.shard_addresses[&repeat.carried[0].result];
+    let target = placement.shard_addresses[&repeat.binding.carried[0].result];
     assert!(
         low.work(&repeat.body).any(|work| match work {
             TileWorkRef::Kernel(run) => placement.shard_addresses[&run.output.shard] == target,
@@ -2149,7 +2149,7 @@ fn repeat_preserves_shared_initial_values() {
         let placement = crate::place(&low).unwrap();
         let initial = placement.shard_addresses[&low.value_shards(low.inputs[0].value)[0]];
         let repeat = &low.repeat_runs[0];
-        for binding in &repeat.carried {
+        for binding in &repeat.binding.carried {
             let result = placement.shard_addresses[&binding.result];
             if case == 4 {
                 assert_eq!(initial, result, "an unshared host input can be donated");
@@ -2162,8 +2162,8 @@ fn repeat_preserves_shared_initial_values() {
         }
         if case == 2 {
             assert_ne!(
-                placement.shard_addresses[&repeat.carried[0].result],
-                placement.shard_addresses[&repeat.carried[1].result],
+                placement.shard_addresses[&repeat.binding.carried[0].result],
+                placement.shard_addresses[&repeat.binding.carried[1].result],
                 "two carried states must evolve independently"
             );
         }

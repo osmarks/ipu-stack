@@ -234,7 +234,7 @@ fn repeat_source_bases(
 ) -> Result<BTreeMap<BlockValueId, Vec<u32>>, ExchangeLoweringError> {
     let mut repeat_inputs = BTreeMap::<BlockValueId, Vec<BlockValueId>>::new();
     for repeat in &program.repeat_runs {
-        for iterated in &repeat.iterated {
+        for iterated in &repeat.binding.iterated {
             match repeat_inputs.entry(iterated.argument) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     entry.insert(iterated.inputs.clone());

@@ -220,6 +220,38 @@ pub struct BlockRegion {
     pub operations: Vec<BlockOperation>,
 }
 
+impl BlockRegion {
+    /// Live operations in structural order, entering each Repeat body once.
+    /// Arena entries alone do not imply execution; removed calls may remain interned.
+    pub(crate) fn walk(&self) -> impl Iterator<Item = &BlockOperation> {
+        let mut regions = vec![self.operations.iter()];
+        std::iter::from_fn(move || {
+            loop {
+                let Some(operation) = regions.last_mut()?.next() else {
+                    regions.pop();
+                    continue;
+                };
+                if let BlockOperation::Repeat(repeat) = operation {
+                    regions.push(repeat.body.operations.iter());
+                }
+                return Some(operation);
+            }
+        })
+    }
+
+    pub(crate) fn retain(&mut self, keep: &mut impl FnMut(&BlockOperation) -> bool) {
+        self.operations.retain_mut(|operation| {
+            if !keep(operation) {
+                return false;
+            }
+            if let BlockOperation::Repeat(repeat) = operation {
+                repeat.body.retain(keep);
+            }
+            true
+        });
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockOperation {
     Exchange(ExchangePhaseId),
@@ -245,9 +277,36 @@ pub struct BlockRepeatBinding {
     pub iterated: Vec<RepeatIterated>,
 }
 
+impl BlockRepeatBinding {
+    /// Storage exposed by bindings on either side of the body boundary.
+    pub(crate) fn bound_shards(&self) -> impl Iterator<Item = BlockValueId> + '_ {
+        self.carried
+            .iter()
+            .flat_map(|binding| {
+                [
+                    binding.initial,
+                    binding.argument,
+                    binding.yielded,
+                    binding.result,
+                ]
+            })
+            .chain(
+                self.invariants
+                    .iter()
+                    .flat_map(|binding| [binding.input, binding.argument]),
+            )
+            .chain(self.iterated.iter().flat_map(|binding| {
+                std::iter::once(binding.argument).chain(binding.inputs.iter().copied())
+            }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileGraph {
     pub tile_count: u16,
+    /// Padding clears were elided using the finite-F16 arena invariant.
+    /// Such storage cannot borrow memory containing host protocol words.
+    pub requires_finite_scratch: bool,
     pub shards: Vec<BlockValue>,
     pub exchange_phases: Vec<ExchangePhase>,
     pub inputs: Vec<MidInput>,
@@ -264,6 +323,13 @@ pub struct TileGraph {
 impl TileGraph {
     pub fn value_shards(&self, value: MidValueId) -> &[BlockValueId] {
         &self.value_shards[value.index() as usize]
+    }
+
+    pub(crate) fn kernel_calls(&self) -> impl Iterator<Item = &KernelRun> {
+        self.body.walk().filter_map(|operation| match operation {
+            BlockOperation::Compute { run, .. } => Some(&self.kernel_runs[run.0 as usize]),
+            _ => None,
+        })
     }
 }
 
