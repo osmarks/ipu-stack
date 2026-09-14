@@ -1,113 +1,261 @@
 # Compiler data flow
 
-Updated 2026-09-06 for the whole-device mid boundary and staged physical selection.
-These curated diagrams supersede the older generated `ipu-stack-package-callgraph*` artifacts.
+Source review: 2026-09-14, `1501698`. This describes the current implementation.
+[Structural proposal](COMPILER_STRUCTURE_PROPOSAL.md) describes the proposed changes.
+Older experiment reports explain history, not the current pipeline.
 
-## Selection and execution
+## Start here
+
+The public entry point is `build_package` in
+[package.rs](../crates/ipu-codegen/src/package.rs). It compiles the runtime, then
+calls `package/local::optimize` with a callback that builds a complete package.
+Even with zero optimization steps, it constructs and validates a baseline.
+
+The compiler has three principal program representations, but the boundaries
+are less clean than their names suggest:
+
+| Representation | What it contains | What remains undecided |
+| --- | --- | --- |
+| `ComputeGraph` | Shaped semantic operations, parameters, outputs and structured Repeat | Precision, distribution, kernels, movement, storage |
+| `MidProgram` during selection | Chosen operator plans, optional cached mid implementations, conversions, deferred inputs, values with formats/ownership | Inlining, deferred movement, rewrites |
+| `MidProgram` after resolution and rewrites | Whole-device `Compute`, mapped `Copy`, `Sum`, **remaining `Convert`**, and Repeat | Tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
+| `TileGraph` | Shards, relative views, local copies, multicast source/recipient groups, kernel runs, structured control | Physical addresses, exact exchange instructions, linked symbols |
+| `LowProgram` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
+| `ScheduledPlan` | Low program, provisional placement, encoded exchange phases, reusable scheduling choices | Support-memory reservations and their final placement effects |
+| `Application` | Tile images, host bindings/protocol, debug/profile metadata | Loading and execution |
+
+The two mid rows are **states of the same Rust type**, not separate checked
+interfaces. `resolve` removes `Operator` but can leave `Convert`. Low rejects
+an unresolved `Operator` at runtime. This is a significant source of ambiguity.
+
+`TileGraph` and `LowProgram` are different views of the same arenas, not two
+independently owned copies of all calls and transfers. `lower_to_tiles` also
+performs finite-value initialization elimination; it is not only projection.
+
+## Production control flow
 
 ```mermaid
 flowchart TD
-  G[ComputeGraph: semantic operations and regions] --> C[Catalogue and geometry screening]
-  C --> B[mid implementation: distributed tensor primitives]
-  B --> CACHE[Compact implementation cache]
-  CACHE --> SHORT[Execution-cost shortlist with geometry diversity]
-  SHORT --> REGION[Compose compact candidate region]
-  REGION --> COST[Geometry prices and coarse live storage]
-  COST --> BEAM[Beam ranking]
-  BEAM --> FINAL[Selected MidProgram: resolve recipes and deferred movement]
-  FINAL --> EXPAND[low expand: enumerate tile calls and transfers]
-  EXPAND --> TG[TileGraph: storage, views, calls, copies and exchanges]
-  TG --> LOW[LowProgram: per-tile work lists]
-  LOW --> PLACE[Provisional physical allocation]
-  PLACE --> MODEL[Model mappings and shortlist complete layouts]
-  MODEL --> EX[Exact scheduling and finalist selection]
-  EX --> SUPPORT[Link and reserve package support storage]
-  SUPPORT --> FINALPLACE[Final allocation and bounded SRAM refinement]
-  FINALPLACE --> REPLAY[Replay or rebuild schedules with final addresses]
-  REPLAY --> IMAGE[Tile images and final timeline cost]
+  G[ComputeGraph and PipelineConfig] --> P[baseline::select: choose operators and boundaries]
+  R[Recipe: selections and rewrite choices] --> P
+  P --> U[Mixed MidProgram: Operator / Convert / Primitive / Repeat]
+  U --> I[implementation::resolve_rewriting: inline and bind]
+  I --> W[Cast ordering, copy composition, fusions, ownership and storage rewrites]
+  W --> M[Resolved MidProgram: Primitive / Convert / Repeat]
+  M --> E[low::expand: shard enumeration and physical realization]
+  E --> O[Low simplification and relay selection]
+  O --> T[TileGraph]
+  T --> F[Detailed exchange-footprint screen]
+  F --> L[Tile mapping and lower_to_tiles]
+  L --> V[Provisional placement and exact exchange scheduling]
+  V --> B[Compile/link kernels, reserve support, finalize placement and exchanges]
+  B --> A[Application and modelled final cycles]
+  A -. accepted incumbent guides next recipe .-> R
 ```
 
-Mid selection chooses distributed work. Low expansion realizes that work; it does
-not rebuild a GEMM or attention algorithm. Cached fragments contain distributed
-tensor values, not tile buffers. Final resolution inserts ordinary mid copies
-where selected ownership differs, and maps claimed views directly into consumer
-windows. Low projection only builds per-tile references to the expanded arenas.
+[baseline::lower](../crates/ipu-codegen/src/mid/baseline.rs) controls the mid
+rewrite order. [local::optimize](../crates/ipu-codegen/src/package/local.rs)
+keeps a fully validated incumbent. It generates recipes, rebuilds their mid
+programs, screens using compact estimated cycles, and evaluates promising
+candidates concurrently. It accepts the first improvement in shortlist order,
+not the best of an exhaustively evaluated beam. Logical input homes are fixed
+from the initial incumbent. A recipe is a search decision record; it is not
+another executable representation.
 
-## Shared prices, different precision
+[validation::expand_and_screen](../crates/ipu-codegen/src/package/validation.rs)
+expands each retained candidate and checks transfer geometry before scheduling.
+The package callback then accounts for linked code, host support, exchange rows,
+profiling and tensor placement. Final addresses can change scheduling, so the
+provisional/final cycle is real. Cached ordering and widths are replayed and
+validated; cached physical addresses are not assumed valid.
+
+The reported final cycles still combine modelled kernel work with scheduled
+exchange horizons. They are not hardware measurements.
+
+## Trace 1: GEMM and its reduction
+
+For `A[M,K] * W[K,N]`, a parallel plan partitions M, N and K. The K partitions
+produce independent partial answers:
 
 ```mermaid
 flowchart LR
-  MID[Mid primitives and tensor layouts] --> GEO[Maximum local geometry]
-  GEO --> PRICE[Shared primitive kernel prices]
-  GEO --> COARSE[Approximate traffic and storage liveness]
-  PRICE --> SCORE[Beam score]
-  COARSE --> SCORE
-  TILE[Expanded calls and movement] --> PRICE
-  TILE --> TIME[Actual per-tile timelines]
-  PRICE --> TIME
-  TILE --> ALLOC[Access requirements and allocation lifetimes]
-  TILE --> SCHED[Exchange scheduler]
-  SCHED --> TIME
+  A[Logical A] --> CA[Copy/cast to selected activation layout]
+  W[Logical W] --> CW[Copy/cast to selected weight layout]
+  CA --> G[Compute: distributed GEMM]
+  CW --> G
+  G --> P[Partials tensor P over p, M, N]
+  P --> S[Sum over p with selected staging policy]
+  S --> Y[Output with selected ownership and order]
 ```
 
-Beam costing never constructs tile graphs or runs physical allocation analysis.
-Its exchange approximation assumes a representative fragment size rather than
-walking byte spans or predicting the ready queue. Shared kernel prices avoid
-maintaining separate GEMM/attention cost algorithms. Actual timelines and
-scheduled phase prices remain available after expansion. Coarse memory feasibility
-does not guarantee placement, particularly with disjoint ownership groups and
-fragmented exchange tables.
+1. [Candidate generation](../crates/ipu-codegen/src/mid/candidates.rs) and
+   [operator plans](../crates/ipu-codegen/src/mid/operator.rs) choose the grid,
+   precision, orientation, kernel blocking, result layout and reduction staging.
+   [ensure_format](../crates/ipu-codegen/src/mid/lowering.rs) prepares outer
+   operand formats, possibly recording deferred movement.
+2. [implementation/gemm.rs](../crates/ipu-codegen/src/mid/implementation/gemm.rs)
+   builds a compact mid fragment. Parallel GEMM emits ordinary copies, a
+   `Compute` with `ProductAxes`, a leading partials dimension, and `Sum`.
+   Output-stationary GEMM instead exposes successive K-panel values and
+   accumulating result versions. This is the owner of the distributed algorithm.
+3. [implementation::resolve_region](../crates/ipu-codegen/src/mid/implementation/mod.rs)
+   splices that fragment into the selected program, remaps value IDs, assigns
+   ownership offsets, and inserts copies when compute operands need a different
+   owner rotation. It can rebuild a fragment when deferred inputs change its
+   actual input types.
+4. [low/expand/primitive.rs](../crates/ipu-codegen/src/low/expand/primitive.rs)
+   finds resident operand shards. `product_calls` enumerates local K/column
+   blocks, chooses initialize/accumulate for those calls, clips logical work
+   accounting, and selects the weight-load variant from the actual memory class.
+   [expand/gemm.rs](../crates/ipu-codegen/src/low/expand/gemm.rs) further splits
+   batch matrices for local execution. These loops do not search a new GEMM grid.
+5. `prepare_sum` removes the independent-partials axis from alias views and
+   groups matching coordinates. [expand/reduce.rs](../crates/ipu-codegen/src/low/expand/reduce.rs)
+   intersects these groups with output ownership, chooses a seed, allocates
+   bounded contributor buffers, and emits transfer/reduction stages. It bypasses
+   seed or output copies when a compatible physical slice is usable directly.
 
-Sources: [mid decomposition](../crates/ipu-codegen/src/mid/implementation/mod.rs),
-[mid primitives](../crates/ipu-codegen/src/mid/primitive.rs),
-[compact costing](../crates/ipu-codegen/src/estimate/mid.rs),
-[shared kernel prices](../crates/ipu-codegen/src/estimate/primitive.rs),
-[tile expansion](../crates/ipu-codegen/src/low/expand/primitive.rs),
-[final timelines](../crates/ipu-codegen/src/estimate/program.rs).
+`Sum` is therefore a **distributed collective**, not the local `ReduceSum`
+kernel under another name. Its staging policy affects communication and scratch;
+its output layout permits different final owners. Erasing it into an ordinary
+pointwise kernel call would lose useful information.
 
-## Explicit decomposition
+However, its current implementation is narrower than the name: singleton partial
+axis outside the final matrix axes, FP16 contributors/results, matching element
+orders, and reduction pieces divisible by eight elements. These checks are split
+between `prepare_sum` and `prepare_sum_partials`. They should be presented as
+implementation capabilities, not silently treated as the semantics of summation.
+
+## Trace 2: broadcast Add
+
+Take `X[8,4,32] + B[1,4,32]`, with the output sharded over four column owners.
+The semantic relation is `Y[b,r,c] = X[b,r,c] + B[0,r,c]`.
+
+| Step | Current owner | Purpose |
+| --- | --- | --- |
+| Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph.rs), `infer_shape`/`broadcast` | Define valid logical computation |
+| Select output layout and compatible kernel | [mid/candidates.rs](../crates/ipu-codegen/src/mid/candidates.rs) | Choose distributed implementation |
+| Project output ownership onto non-broadcast input axes | [implementation/mod.rs](../crates/ipu-codegen/src/mid/implementation/mod.rs), `pointwise_input_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
+| Select resident shard and crop a broadcast view | [expand/primitive.rs](../crates/ipu-codegen/src/low/expand/primitive.rs), [pointwise.rs](../crates/ipu-codegen/src/low/expand/pointwise.rs) | Supply the local kernel with the needed coordinates |
+| Validate supported broadcast shape and encode strides/counts | [kernel/abi.rs](../crates/ipu-codegen/src/kernel/abi.rs) | Match the actual kernel's address arithmetic |
+
+These steps do different jobs; their existence is not automatically duplication.
+The missing connection is a shared operand-indexing contract. Mid records mostly
+empty `OperandWindow`s; low recognizes Add/BiasGeLU/AddLayerNorm by kernel name
+and infers the relationship again. A new fused kernel can need another exception
+in that dispatch. Broadcasting is also inferred for GEMM batch dimensions in a
+separate helper.
+
+Physical padding adds a second concern: equal-layout pointwise calls consume the
+complete physical panel, whereas broadcasting a singleton axis must use the
+logical shape even if storage is borrowed from a larger allocation.
+`pointwise.rs` handles both. A logical broadcast map must not erase this distinction.
+
+## Trace 3: mapped copy, unpacking and exchange
+
+A view such as `[B,S,H*D] -> [B*H,S,D]` changes coordinate interpretation. It does
+not by itself specify which bytes move or whether storage can be reused.
 
 ```mermaid
-flowchart LR
-  L[Left materialization] --> GEMM[Distributed partial GEMM]
-  R[Right materialization] --> GEMM
-  GEMM --> P[Tensor with independent-partials axis]
-  P --> SUM[Sum: complete or streamed contributors]
-  SUM --> O[Output tensor]
+flowchart TD
+  V[View/slice or implementation-created copy] --> C[Primitive::Copy with CoordinateMapping]
+  F[Boundary format requirement] --> CV[Convert with ConversionStrategy]
+  C --> MP[materialize: map output regions back to source owners]
+  CV --> CP[conversion: resident kernel or identity intersections]
+  MP --> U[Optional AMP unpack or physical panel mapping]
+  U --> B[prepare_mapped_views]
+  CP --> B
+  B --> P[CopyPlan: coverage, direct exchange vs staging/packing]
+  P --> Q[MaterializationBatch: before / exchange / after / kernels]
+  Q --> X[Local copies, logical multicast groups and kernel runs]
 ```
 
-Output-stationary GEMM instead exposes staged K panels and accumulating output
-versions. Attention exposes Q/K/V copies, products, softmax and merge. Key/value packing
-on a small owner grid and broadcast to the compute grid are separate mid copies. Selected
-view slices are mapped copies whose output is an ordinary mid value. Tile
-expansion shares physical copy realization across all these uses, including
-padding, direct resident views and destination packing.
+[materialize.rs](../crates/ipu-codegen/src/low/expand/materialize.rs) bridges
+**logical coordinate mapping to shard-to-shard movement**. It maps output windows
+back to sources, asks [CopyRegions](../crates/ipu-codegen/src/low/expand/ownership.rs)
+for intersecting owners, recognizes reusable local storage, and tries physical
+micro-panel movement. If the packed source cannot be handled that way, it can
+insert an AMP-to-row-major unpack before mapping again.
 
-```mermaid
-flowchart LR
-  K[Logical keys and values] --> PACK[Copy to distributed packed tensors]
-  PACK --> WINDOW[Copy each key-block window to the compute grid]
-  Q[Materialized queries] --> QK[QK product]
-  WINDOW --> QK
-  QK --> SOFTMAX[Softmax and row state]
-  SOFTMAX --> PV[Probability/value product]
-  WINDOW --> PV
-  PV --> MERGE[Merge output version]
-```
+[conversion.rs](../crates/ipu-codegen/src/low/expand/conversion.rs) contains both
+a second entry path for `Convert` and the shared assembly used by mapped copies.
+It constructs local kernels, stages unaligned transfers, groups multicast
+recipients, and conditionally turns compatible local copies into receivers of an
+existing multicast.
 
-Packing happens once before the key-block sequence. Flash key/value broadcasts
-for a block are adjacent independent copies; generic low transfer consolidation
-can combine them. Materialized attention delays the resident value copy until
-after softmax, keeping the large resident key/value matrices in disjoint
-lifetimes. This ordering is explicit in mid; low has no attention strategy builder.
+[CopyPlan::for_destination](../crates/ipu-codegen/src/low/copy.rs) computes
+uncovered padding and chooses direct word transfers versus staging/packing using
+estimated costs. This is **policy as well as geometry**. Meanwhile that same file
+also implements relative copy descriptors and span coalescing.
+[storage](../crates/ipu-codegen/src/storage.rs) owns layout-to-byte traversal.
+The files are not organized along these responsibility boundaries.
 
-**General copy/view chain composition (#4) remains deferred at the user's
-request.** Discuss its overlap with planning before implementing it. Resolving
-already selected deferred views is part of the current boundary rewrite; it is
-not an arbitrary producer/consumer layout optimization pass.
+The two entry paths do converge; they are not wholly duplicated engines. But
+requiring them both means rewrites and costs must recognize both `Copy` and
+`Convert`, and the selected conversion strategy does not fully describe the
+physical route later chosen by `CopyPlan`.
 
-Candidate attention dispatches retain geometry and the materialization choice once.
-The mid implementation derives QK/PV kernel specifications from that geometry.
-Pointwise operand selection follows tensor shapes and ownership; it has no separate
-mapping-policy field. Region cost analysis returns cycles and memory directly,
-while only reusable operator implementations retain `Arc<MidProgram>` values.
+## What each later representation is for
+
+- `KernelRun` retains relative views, kernel specification and access requirements.
+  It is not yet a fully checked executable call: ABI validation, specialization,
+  scalar construction and some view-contiguity checks occur later in `kernel`.
+- `LogicalExchange` stores one source with multiple recipient views. Physical
+  addresses, message lengths, pairing and hazard ordering are resolved in
+  [codegen/exchange.rs](../crates/ipu-codegen/src/exchange.rs). The encoding and
+  timed-program builder live in [ipu-exchange](../crates/ipu-exchange/src/lib.rs).
+- [place.rs](../crates/ipu-codegen/src/place.rs) derives lifetimes, aliases,
+  access tails, element-separation constraints and addresses. Parameters remain
+  resident across host invocations. `storage_group` in mid concerns ownership
+  mapping; it does not itself mean two values alias the same allocation.
+- Repeat remains structured throughout. Mid retains body and value sequences;
+  low builds carried/invariant/iterated bindings; placement establishes sequence
+  strides; tile emission uses advancing pointers, base relocation and patches.
+  It is not implemented by compiling 27 unrelated bodies.
+- [kernel::materialize_kernel_run](../crates/ipu-codegen/src/kernel/mod.rs)
+  binds relative views to placed or Repeat-relative addresses.
+  [tile.rs](../crates/ipu-codegen/src/tile.rs) builds `TileProgram`s;
+  [codegen/lib.rs](../crates/ipu-codegen/src/lib.rs) emits supervisor instructions.
+  The package builder assembles executable images and host-visible metadata.
+
+## Costs and caches
+
+Compact costing reads layouts and mid primitives; detailed costing reads tile
+geometry/timelines; scheduled costing substitutes real exchange horizons. Sharing
+kernel formulae does not make the first two equivalent. In particular, mid's
+`Sum` scratch/traffic formula approximates choices subsequently made by physical
+reduction lowering.
+
+| Cache or retained analysis | Contents and key | Lifetime / owner |
+| --- | --- | --- |
+| `MemoizedCostModel.implementations` | `(OperatorPlan, input types, output type)` to compact mid fragment; ignores deferred-output marker | One `package/local::optimize` call; shared across candidate work |
+| `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
+| `ExpansionCache.plans` | Destination type/extents and ordered source mappings to `CopyPlan`, including staging decisions | Same search in production; bounded at 32,768 entries |
+| `ExpansionCache.copies` | Normalized view geometry, copy order, same-buffer flag to relative local-copy descriptors | Same search; separately bounded at 32,768 entries |
+| `GeometryAnalysis` | Interned view traversals and source/recipient pair facts: bytes, fragments, receive spans | One candidate's expansion and footprint screen; also used to price tentative relays |
+| `CopyRegions.targets` | Requested logical region to clipped source regions/replica owners | One source set during a copy or conversion; avoids repeating intersection work for replicas |
+| `TileGraphBuilder.kernel_metadata` | Shared provenance/kernel/format access contracts, found by linear lookup | One expansion; operand views remain per call |
+| Timeline `KernelCosts` | Interned call metadata plus physical widths to cycles | One timeline evaluation |
+| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order and normalized encoded rows | Incumbent plus speculative candidate snapshots; physical replay is validated |
+| ELF artifact cache | Source/includes, effective flags, target and tool identity to immutable compiled objects | On disk across builds |
+
+[ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses custom
+hash buckets with full equality checks; both its fingerprints and bucket maps
+use the standard hasher. The implementation-fragment map and
+[GeometryAnalysis](../crates/ipu-codegen/src/estimate/geometry.rs) also use
+standard hash maps. These are not all caches of the same computation.
+
+`borrowed_views` is different: it records storage substitutions made during
+expansion. It is mutable lowering state, not a memoization cache, and cannot be
+shared between candidates.
+
+The overlapping work is constructing, normalizing and matching byte geometry in
+copy realization and geometry costing. The cached `CopyPlan` additionally
+contains cost-dependent decisions, so it cannot simply become a global geometry
+cache. Its current coefficients are fixed; a configurable target/policy would
+need appropriate scoping or keying.
+
+[Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) found a useful
+MLP B2 improvement, marginal attention changes, and rejected broader fragment
+caches. Those measurements have not been rerun for this review. Deleting caches
+because their names overlap would discard evidence, not simplify the data flow.
