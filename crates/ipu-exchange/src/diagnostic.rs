@@ -6,6 +6,7 @@
 //! the second is inline PIC/XPIC payload, not an independently executed word.
 
 use super::*;
+use std::fmt::{self, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IncomingControlStream {
@@ -72,18 +73,25 @@ pub struct PlanProgramDiagnostic {
     pub row_words: u32,
 }
 
+impl fmt::Display for DecodedPlanInstruction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.address {
+            Some(address) => write!(f, "0x{address:05x}"),
+            None => write!(f, "word+{}", self.word_offset),
+        }?;
+        write!(
+            f,
+            " cycles={}..{} {:?}",
+            self.start_cycle, self.end_cycle, self.operation
+        )
+    }
+}
+
 impl PlanProgramDiagnostic {
     pub fn render(&self) -> String {
         let mut output = String::new();
         for instruction in &self.instructions {
-            let location = instruction.address.map_or_else(
-                || format!("word+{}", instruction.word_offset),
-                |address| format!("0x{address:05x}"),
-            );
-            output.push_str(&format!(
-                "{location} cycles={}..{} {:?}\n",
-                instruction.start_cycle, instruction.end_cycle, instruction.operation
-            ));
+            writeln!(output, "{instruction}").unwrap();
         }
         output
     }
@@ -105,7 +113,9 @@ impl PlanProgramDiagnostic {
                     } else {
                         4
                     };
-                    (start..start + width).contains(&address)
+                    address
+                        .checked_sub(start)
+                        .is_some_and(|offset| offset < width)
                 })
             })
             .unwrap_or_else(|| {
@@ -116,18 +126,14 @@ impl PlanProgramDiagnostic {
                     .min(self.instructions.len().saturating_sub(1))
             });
         let start = focus.saturating_sub(radius);
-        let end = (focus + radius + 1).min(self.instructions.len());
+        let end = focus
+            .saturating_add(radius)
+            .saturating_add(1)
+            .min(self.instructions.len());
         let mut output = String::new();
         for (index, instruction) in self.instructions[start..end].iter().enumerate() {
-            let location = instruction.address.map_or_else(
-                || format!("word+{}", instruction.word_offset),
-                |instruction_address| format!("0x{instruction_address:05x}"),
-            );
             let marker = if start + index == focus { ">" } else { " " };
-            output.push_str(&format!(
-                "{marker} {location} cycles={}..{} {:?}\n",
-                instruction.start_cycle, instruction.end_cycle, instruction.operation
-            ));
+            writeln!(output, "{marker} {instruction}").unwrap();
         }
         output
     }
@@ -472,6 +478,31 @@ fn control_key(control: IncomingControl) -> (u8, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_windows_handle_unbounded_radius_and_unplaced_rows() {
+        let words = [delay(2), RETURN_M10_INSTRUCTION];
+        let unplaced = diagnose_plan_program(&words, None).unwrap();
+        assert_eq!(
+            unplaced.render(),
+            "word+0 cycles=0..3 Delay\nword+1 cycles=3..3 Return\n"
+        );
+        let placed = diagnose_plan_program(&words, Some(0x60000)).unwrap();
+        assert_eq!(
+            placed.render_around_address(0x60004, usize::MAX),
+            "  0x60000 cycles=0..3 Delay\n> 0x60004 cycles=3..3 Return\n"
+        );
+        assert_eq!(
+            placed.render_around_address(0x60004, 0),
+            "> 0x60004 cycles=3..3 Return\n"
+        );
+        assert_eq!(
+            diagnose_plan_program(&[], None)
+                .unwrap()
+                .render_around_address(0, usize::MAX),
+            ""
+        );
+    }
 
     #[test]
     fn sdk_receiver_row_decodes_two_word_controls_as_single_instructions() {
