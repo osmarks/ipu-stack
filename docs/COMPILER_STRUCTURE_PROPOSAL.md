@@ -36,6 +36,8 @@ policy. The cache retains geometry instead of selected staging, uses foldhash an
 a hash table instead of custom buckets, and excludes ownership from geometry keys.
 Low kernel calls now bind all results together in one indexed list, with matching
 access requirements; element-separation constraints can name every result.
+Input bindings are direct views too; the single-view `KernelOperand` list wrapper
+and its nested consumer paths are removed.
 Mid operands now declare elementwise/result indexing or local windows. Graph
 validation, ownership projection, low binding and product batch selection share
 the logical broadcast relation; generic low kernel-name broadcasting is removed.

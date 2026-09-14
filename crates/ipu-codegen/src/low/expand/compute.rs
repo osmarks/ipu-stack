@@ -112,10 +112,7 @@ impl TileGraphBuilder {
                     let run = self.kernel_run(
                         operation_provenance(operation),
                         kernel.clone(),
-                        inputs
-                            .into_iter()
-                            .map(|view| KernelOperand { views: vec![view] })
-                            .collect(),
+                        inputs,
                         results,
                     )?;
                     if donate_cast {

@@ -502,11 +502,8 @@ fn touch_work(
     let mut touch = |shard: BlockValueId| lifetimes[shard.index() as usize].touch(current);
     match work {
         TileWorkRef::Kernel(run) => {
-            for view in run.inputs.iter().flat_map(|operand| &operand.views) {
+            for view in run.inputs.iter().chain(&run.outputs) {
                 touch(view.shard);
-            }
-            for output in run.outputs.iter() {
-                touch(output.shard);
             }
         }
         TileWorkRef::LocalCopy(copy) => {
@@ -579,37 +576,28 @@ fn collect_requirements(
     for work in program.work(tile) {
         match work {
             TileWorkRef::Kernel(run) => {
-                let inputs = &run.requirements.inputs;
                 for operands in &run.requirements.distinct_elements {
-                    let groups = operands
+                    let shards = operands
                         .iter()
                         .map(|&operand| {
-                            run.operand_views(operand)
+                            run.operand_view(operand)
                                 .expect("kernel constraints refer to bound operands")
-                                .iter()
-                                .map(|view| view.shard.index() as usize)
-                                .collect()
+                                .shard
+                                .index() as usize
                         })
-                        .collect::<Vec<Vec<usize>>>();
-                    for (index, group) in groups.iter().enumerate() {
-                        for other in &groups[..index] {
-                            for &left in group {
-                                for &right in other {
-                                    pairs.push((left, right));
-                                }
-                            }
+                        .collect::<Vec<_>>();
+                    for (index, &left) in shards.iter().enumerate() {
+                        for &right in &shards[..index] {
+                            pairs.push((left, right));
                         }
                     }
                 }
-                for (operand, requirement) in run.inputs.iter().zip(inputs) {
-                    for view in &operand.views {
-                        apply_requirement(
-                            &mut requirements[view.shard.index() as usize],
-                            requirement,
-                        );
-                    }
-                }
-                for (view, requirement) in run.outputs.iter().zip(&run.requirements.outputs) {
+                for (view, requirement) in run
+                    .inputs
+                    .iter()
+                    .zip(&run.requirements.inputs)
+                    .chain(run.outputs.iter().zip(&run.requirements.outputs))
+                {
                     apply_requirement(&mut requirements[view.shard.index() as usize], requirement);
                 }
             }
@@ -1953,12 +1941,9 @@ mod tests {
                                         crate::MemoryOperand::Output(index) => {
                                             vec![run.outputs[usize::from(*index)].shard]
                                         }
-                                        crate::MemoryOperand::Input(index) => run.inputs
-                                            [usize::from(*index)]
-                                        .views
-                                        .iter()
-                                        .map(|view| view.shard)
-                                        .collect(),
+                                        crate::MemoryOperand::Input(index) => {
+                                            vec![run.inputs[usize::from(*index)].shard]
+                                        }
                                     };
                                     for shard in shards {
                                         let definition = &low.shards[shard.index() as usize];

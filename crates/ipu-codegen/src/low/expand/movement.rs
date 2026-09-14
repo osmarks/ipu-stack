@@ -193,9 +193,7 @@ impl TileGraphBuilder {
             let run = self.kernel_run(
                 provenance,
                 TileKernelSpec::Rearrange { from, to },
-                vec![KernelOperand {
-                    views: vec![self.full_view(source_shard)],
-                }],
+                vec![self.full_view(source_shard)],
                 vec![self.full_view(staging)],
             )?;
             self.append_kernel(tiles, tile, run)?;
@@ -239,9 +237,7 @@ impl TileGraphBuilder {
                     from: source.tensor_type.format.layout.clone(),
                     to: destination.tensor_type.format.layout.clone(),
                 },
-                vec![KernelOperand {
-                    views: vec![self.full_view(input)],
-                }],
+                vec![self.full_view(input)],
                 vec![self.full_view(output)],
             )?;
             self.append_kernel(tiles, tile, run)?;
@@ -706,9 +702,7 @@ impl TileGraphBuilder {
                         self.kernel_run(
                             provenance,
                             kernel.clone(),
-                            vec![KernelOperand {
-                                views: vec![staging],
-                            }],
+                            vec![staging],
                             vec![self.full_view(destination_shard)],
                         )?,
                     ));

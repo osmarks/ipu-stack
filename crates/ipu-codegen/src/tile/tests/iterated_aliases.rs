@@ -312,9 +312,7 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
     let run = KernelRun::new(
         low.repeat_runs[0].provenance,
         kernel.clone(),
-        vec![KernelOperand {
-            views: vec![view(source)],
-        }],
+        vec![view(source)],
         vec![view(output)],
         KernelRequirements::new(
             &kernel,

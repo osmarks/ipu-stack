@@ -157,15 +157,7 @@ impl TileGraphBuilder {
                         crate::GemmWeightLoad::Standard
                     },
                 };
-                let run = self.kernel_run(
-                    provenance,
-                    kernel,
-                    vec![
-                        KernelOperand { views: vec![l] },
-                        KernelOperand { views: vec![r] },
-                    ],
-                    vec![destination],
-                )?;
+                let run = self.kernel_run(provenance, kernel, vec![l, r], vec![destination])?;
                 let flattens_outer_rows = matches!(
                     run.requirements.outputs[0].format.layout.order,
                     ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
@@ -192,16 +184,11 @@ impl TileGraphBuilder {
                         .filter(|(axis, _)| *axis != output_column)
                         .map(|(_, &e)| size(e, None))
                         .product();
-                    let cols =
-                        size(run.outputs[0].extents[output_column], axes.valid_columns).min(size(
-                            run.inputs[1].views[0].extents[right_column],
-                            axes.valid_columns,
-                        ));
-                    let inner = size(run.inputs[0].views[0].extents[left_inner], axes.valid_inner)
-                        .min(size(
-                            run.inputs[1].views[0].extents[right_inner],
-                            axes.valid_inner,
-                        ));
+                    let cols = size(run.outputs[0].extents[output_column], axes.valid_columns).min(
+                        size(run.inputs[1].extents[right_column], axes.valid_columns),
+                    );
+                    let inner = size(run.inputs[0].extents[left_inner], axes.valid_inner)
+                        .min(size(run.inputs[1].extents[right_inner], axes.valid_inner));
                     let physical: u64 = run.outputs[0]
                         .extents
                         .iter()
@@ -257,11 +244,9 @@ fn split_gemm_matrices(
         output_shape,
         coordinates,
     )?;
-    for operand in &mut matrix.inputs {
-        for view in &mut operand.views {
-            let shape = &shards[view.shard.index() as usize].tensor_type.shape.0;
-            narrow_gemm_matrix_view(view, shape, output_shape, coordinates)?;
-        }
+    for view in &mut matrix.inputs {
+        let shape = &shards[view.shard.index() as usize].tensor_type.shape.0;
+        narrow_gemm_matrix_view(view, shape, output_shape, coordinates)?;
     }
     runs.push(matrix);
     Ok(())

@@ -1,33 +1,25 @@
 //! Append tile movement and compute operations with bound contracts.
 
 use super::*;
-use crate::tensor::TensorFormat;
 
 impl TileGraphBuilder {
     pub(super) fn kernel_run(
         &mut self,
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
-        mut inputs: Vec<KernelOperand>,
+        mut inputs: Vec<ShardView>,
         outputs: Vec<ShardView>,
     ) -> ExpansionResult<KernelRun> {
-        for view in inputs.iter_mut().flat_map(|operand| &mut operand.views) {
+        for view in &mut inputs {
             self.resolve_read_view(view)?;
         }
         // Intern the contract before allocating its formats/requirements. Operand
         // views vary by tile; the kernel and storage contracts usually do not.
-        let format = |operand: &KernelOperand| -> ExpansionResult<&TensorFormat> {
-            let view = operand
-                .views
-                .first()
-                .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            Ok(&self.shards[view.shard.index() as usize].tensor_type.format)
-        };
+        let format =
+            |view: &ShardView| &self.shards[view.shard.index() as usize].tensor_type.format;
         if outputs.is_empty() {
             return Err(ExpansionError::ResultArity);
         }
-        let output_format =
-            |view: &ShardView| &self.shards[view.shard.index() as usize].tensor_type.format;
         for metadata in &self.kernel_metadata {
             if metadata.provenance == provenance
                 && metadata.kernel == kernel
@@ -35,14 +27,12 @@ impl TileGraphBuilder {
                 && outputs
                     .iter()
                     .zip(&metadata.requirements.outputs)
-                    .all(|(view, requirement)| *output_format(view) == requirement.format)
+                    .all(|(view, requirement)| *format(view) == requirement.format)
                 && metadata.requirements.inputs.len() == inputs.len()
                 && inputs
                     .iter()
                     .zip(&metadata.requirements.inputs)
-                    .all(|(operand, requirement)| {
-                        format(operand).is_ok_and(|f| *f == requirement.format)
-                    })
+                    .all(|(operand, requirement)| *format(operand) == requirement.format)
             {
                 return Ok(KernelRun {
                     product_flops: None,
@@ -52,14 +42,10 @@ impl TileGraphBuilder {
                 });
             }
         }
-        let formats = inputs
-            .iter()
-            .map(|operand| format(operand).cloned())
-            .collect::<ExpansionResult<Vec<_>>>()?;
         let requirements = KernelRequirements::new(
             &kernel,
-            formats,
-            outputs.iter().map(|view| output_format(view).clone()),
+            inputs.iter().map(|view| format(view).clone()),
+            outputs.iter().map(|view| format(view).clone()),
         );
         let run = KernelRun::new(provenance, kernel, inputs, outputs, requirements);
         self.kernel_metadata.push(Arc::clone(&run.metadata));

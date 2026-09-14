@@ -1,4 +1,3 @@
-use crate::low::*;
 use crate::mid::Compute;
 use crate::mid::ConcreteOperatorCandidate;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
@@ -323,16 +322,14 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
         .kernel_run(
             provenance,
             TileKernelSpec::Gelu,
-            vec![KernelOperand {
-                views: vec![logical.clone()],
-            }],
+            vec![logical.clone()],
             vec![builder.full_view(source)],
         )
         .unwrap();
-    assert_eq!(run.inputs[0].views[0], builder.full_view(source));
-    let mut already_resolved = run.inputs[0].views[0].clone();
+    assert_eq!(run.inputs[0], builder.full_view(source));
+    let mut already_resolved = run.inputs[0].clone();
     builder.resolve_read_view(&mut already_resolved).unwrap();
-    assert_eq!(already_resolved, run.inputs[0].views[0]);
+    assert_eq!(already_resolved, run.inputs[0]);
     let mut outside = logical;
     outside.extents[2].physical_end += 1;
     assert!(builder.resolve_read_view(&mut outside).is_err());
@@ -627,10 +624,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .iter()
             .filter(|run| {
                 matches!(run.kernel, TileKernelSpec::Gemm { .. })
-                    && run.inputs[1]
-                        .views
-                        .iter()
-                        .any(|view| parameter_shards.contains(&view.shard))
+                    && parameter_shards.contains(&run.inputs[1].shard)
             })
             .count();
         assert!(direct_parameter_runs > 0, "case {case}");
@@ -836,7 +830,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
         }
         for run in &low.kernel_runs {
             if matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
-                let input = &run.inputs[0].views[0];
+                let input = &run.inputs[0];
                 assert_ne!(
                     low.shards[input.shard.index() as usize].definition,
                     ShardDefinition::Unmaterialized,
@@ -901,7 +895,7 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
                     continue;
                 };
                 assert_eq!(
-                    low.shards[run.inputs[0].views[0].shard.index() as usize].tile,
+                    low.shards[run.inputs[0].shard.index() as usize].tile,
                     tile.tile
                 );
                 assert_eq!(
@@ -1404,12 +1398,9 @@ fn randomized_schedules_make_kernel_operands_resident() {
                         tile.tile
                     );
                     assert!(
-                        run.inputs
-                            .iter()
-                            .flat_map(|operand| &operand.views)
-                            .all(|view| {
-                                low.shards[view.shard.index() as usize].tile == tile.tile
-                            })
+                        run.inputs.iter().all(|view| {
+                            low.shards[view.shard.index() as usize].tile == tile.tile
+                        })
                     );
                 }
             }
@@ -1467,16 +1458,16 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(add.inputs[0].views[0].extents[0].logical_end, 1);
+            assert_eq!(add.inputs[0].extents[0].logical_end, 1);
             assert!(
                 !matches!(
-                    low.shards[add.inputs[0].views[0].shard.index() as usize].definition,
+                    low.shards[add.inputs[0].shard.index() as usize].definition,
                     ShardDefinition::Unmaterialized
                 ),
                 "broadcast must resolve locally reused input views"
             );
             assert_eq!(
-                low.shards[add.inputs[0].views[0].shard.index() as usize].tile,
+                low.shards[add.inputs[0].shard.index() as usize].tile,
                 tile.tile
             );
         }
@@ -1566,9 +1557,8 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                     "case {case}"
                 );
                 assert_eq!(run.inputs.len(), 2);
-                assert!(run.inputs.iter().all(|operand| operand.views.len() == 1));
                 assert!(
-                    run.inputs[0].views[0]
+                    run.inputs[0]
                         .extents
                         .iter()
                         .any(|extent| { extent.physical_end - extent.start == kernel_inner })
@@ -2469,7 +2459,7 @@ fn local_casts_pair_corresponding_linear_fragments() {
         .collect::<Vec<_>>();
     assert_eq!(casts.len(), 8);
     for run in casts {
-        assert_eq!(run.inputs[0].views[0].extents, run.outputs[0].extents);
+        assert_eq!(run.inputs[0].extents, run.outputs[0].extents);
     }
 }
 

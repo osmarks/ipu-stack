@@ -7,30 +7,22 @@ use crate::{BlockOperation, BlockRegion, ExpansionResult, KernelRun, TileGraph};
 type KernelCosts<'a> =
     std::collections::HashMap<*const crate::low::KernelRunMetadata, Vec<(&'a KernelRun, u64)>>;
 fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> u64 {
-    fn shapes(run: &KernelRun) -> impl Iterator<Item = Option<&[crate::ShardExtent]>> {
+    fn shapes(run: &KernelRun) -> impl Iterator<Item = &[crate::ShardExtent]> {
         run.inputs
             .iter()
-            .map(|i| i.views.first().map(|v| v.extents.as_slice()))
-            .chain(
-                run.outputs
-                    .iter()
-                    .map(|output| Some(output.extents.as_slice())),
-            )
+            .chain(&run.outputs)
+            .map(|view| view.extents.as_slice())
     }
     let variants = costs
         .entry(std::sync::Arc::as_ptr(&run.metadata))
         .or_default();
     let found = variants.iter().find(|(other, _)| {
         run.inputs.len() == other.inputs.len()
-            && shapes(run).zip(shapes(other)).all(|(a, b)| match (a, b) {
-                (Some(a), Some(b)) => {
-                    a.len() == b.len()
-                        && a.iter()
-                            .zip(b)
-                            .all(|(a, b)| a.physical_end - a.start == b.physical_end - b.start)
-                }
-                (None, None) => true,
-                _ => false,
+            && shapes(run).zip(shapes(other)).all(|(a, b)| {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(a, b)| a.physical_end - a.start == b.physical_end - b.start)
             })
     });
     if let Some((_, cycles)) = found {
@@ -330,7 +322,7 @@ fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
         |index| {
             let operand = run.inputs.get(index)?;
             let access = run.requirements.inputs.get(index)?;
-            Some(geometry(operand.views.first()?, &access.format))
+            Some(geometry(operand, &access.format))
         },
         geometry(&run.outputs[0], &run.requirements.outputs[0].format),
     )

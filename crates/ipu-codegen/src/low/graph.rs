@@ -136,12 +136,6 @@ pub struct WorkProvenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KernelOperand {
-    /// Views resident on the execution tile which form this ABI operand.
-    pub views: Vec<ShardView>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRunMetadata {
     pub provenance: WorkProvenance,
     pub kernel: TileKernelSpec,
@@ -153,29 +147,23 @@ pub struct KernelRun {
     /// Useful and physical product FLOPs, before axes are erased by the ABI.
     pub product_flops: Option<[u64; 2]>,
     pub(crate) metadata: Arc<KernelRunMetadata>,
-    pub inputs: Vec<KernelOperand>,
+    pub inputs: Vec<ShardView>,
     /// All result bindings in the family's declared order.
     pub outputs: Vec<ShardView>,
 }
 
 impl KernelRun {
-    pub(crate) fn operand_views(&self, operand: MemoryOperand) -> Option<&[ShardView]> {
+    pub(crate) fn operand_view(&self, operand: MemoryOperand) -> Option<&ShardView> {
         match operand {
-            MemoryOperand::Input(index) => self
-                .inputs
-                .get(usize::from(index))
-                .map(|operand| operand.views.as_slice()),
-            MemoryOperand::Output(index) => self
-                .outputs
-                .get(usize::from(index))
-                .map(std::slice::from_ref),
+            MemoryOperand::Input(index) => self.inputs.get(usize::from(index)),
+            MemoryOperand::Output(index) => self.outputs.get(usize::from(index)),
         }
     }
 
     pub fn new(
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
-        inputs: Vec<KernelOperand>,
+        inputs: Vec<ShardView>,
         outputs: Vec<ShardView>,
         requirements: KernelRequirements,
     ) -> Self {

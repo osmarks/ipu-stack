@@ -301,16 +301,12 @@ impl TileGraphBuilder {
                                     .map_err(|_| ExpansionError::IdOverflow)?,
                             },
                             vec![
-                                KernelOperand {
-                                    views: vec![if direct_seed {
-                                        seed_source.clone()
-                                    } else {
-                                        self.full_view(accumulator)
-                                    }],
+                                if direct_seed {
+                                    seed_source.clone()
+                                } else {
+                                    self.full_view(accumulator)
                                 },
-                                KernelOperand {
-                                    views: vec![self.full_view(remote)],
-                                },
+                                self.full_view(remote),
                             ],
                             vec![if direct_output && stage + 1 == reduction_stages {
                                 destination.clone()
@@ -536,8 +532,8 @@ mod tests {
                         let TileKernelSpec::ReductionSum { partials } = run.kernel else {
                             panic!("unexpected compute block");
                         };
-                        let initial = &memory[run.inputs[0].views[0].shard.index() as usize];
-                        let remote = &memory[run.inputs[1].views[0].shard.index() as usize];
+                        let initial = &memory[run.inputs[0].shard.index() as usize];
+                        let remote = &memory[run.inputs[1].shard.index() as usize];
                         let result = (0..initial.len())
                             .map(|element| {
                                 initial[element]

@@ -285,7 +285,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         .find(|run| run.kernel == TileKernelSpec::Add)
         .unwrap();
     crate::validate_kernel_run(run).unwrap();
-    let scalar = &run.inputs[1].views[0];
+    let scalar = &run.inputs[1];
     assert_eq!(scalar.shard, graph.value_shards(graph.inputs[0].value)[0]);
     assert!(
         scalar
@@ -372,11 +372,11 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
             );
             assert_eq!(run.outputs[0].extents[0], residual.extents[0]);
             for operand in &run.inputs {
-                assert_eq!(operand.views[0].extents, residual.extents);
+                assert_eq!(operand.extents, residual.extents);
             }
             assert_eq!(
                 placement.shard_addresses[&residual.shard],
-                placement.shard_addresses[&run.inputs[0].views[0].shard]
+                placement.shard_addresses[&run.inputs[0].shard]
             );
         }
         assert_eq!(covered, (0..rows).collect());

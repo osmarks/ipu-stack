@@ -1266,7 +1266,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
             for (operand, requirement) in run.inputs.iter().zip(&run.requirements.inputs) {
                 assert_eq!(
                     requirement.format,
-                    tiled.shards[operand.views[0].shard.index() as usize]
+                    tiled.shards[operand.shard.index() as usize]
                         .tensor_type
                         .format
                 );
@@ -1427,8 +1427,8 @@ fn uneven_mlp_products_preserve_global_coordinates() {
             continue;
         }
         let output = &run.outputs[0].extents;
-        let left = &run.inputs[0].views[0].extents;
-        let right = &run.inputs[1].views[0].extents;
+        let left = &run.inputs[0].extents;
+        let right = &run.inputs[1].extents;
         let bounds = |e: &ShardExtent| (e.start, e.logical_end, e.physical_end);
         assert_eq!(
             bounds(&left[left.len() - 2]),
@@ -2358,7 +2358,6 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
             assert!(
                 run.inputs
                     .iter()
-                    .flat_map(|input| &input.views)
                     .all(|view| written.contains(&crate::storage_root(&low.shards, view.shard)))
             );
         }

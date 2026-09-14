@@ -372,12 +372,7 @@ fn profile_step(
             for (operand, input) in run.inputs.iter().enumerate() {
                 description.metadata.push(ProfileMetadata {
                     name: format!("input{operand}Elements"),
-                    value: input
-                        .views
-                        .iter()
-                        .map(view_logical_elements)
-                        .sum::<u64>()
-                        .to_string(),
+                    value: view_logical_elements(input).to_string(),
                 });
             }
             Ok(description)

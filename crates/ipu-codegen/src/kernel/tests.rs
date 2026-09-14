@@ -31,8 +31,8 @@ fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
         if matches!(run.kernel, TileKernelSpec::Add) {
             materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new()).unwrap();
             assert_eq!(
-                run.inputs[1].views[0].extents.last().unwrap().physical_end
-                    - run.inputs[1].views[0].extents.last().unwrap().start,
+                run.inputs[1].extents.last().unwrap().physical_end
+                    - run.inputs[1].extents.last().unwrap().start,
                 8
             );
         }
@@ -40,7 +40,7 @@ fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
 }
 
 #[test]
-fn packed_add_keeps_padding_in_dense_operand_views() {
+fn packed_add_keeps_padding_in_dense_operand_view() {
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [2, 3, 32]).unwrap();
     let y = graph.host_input("y", [2, 3, 32]).unwrap();
@@ -514,11 +514,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 reason: WorkReason::OperatorKernel,
             },
             kernel,
-            (0..inputs)
-                .map(|_| crate::KernelOperand {
-                    views: vec![output.clone()],
-                })
-                .collect(),
+            (0..inputs).map(|_| output.clone()).collect(),
             vec![output],
             KernelRequirements {
                 inputs: vec![
@@ -770,9 +766,7 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
                 from: Precision::F32,
                 to: Precision::F16,
             },
-            vec![crate::KernelOperand {
-                views: vec![view(0)],
-            }],
+            vec![view(0)],
             vec![view(1)],
             KernelRequirements {
                 inputs: vec![KernelAccess::new(format(Precision::F32), 8)],
@@ -914,20 +908,13 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
             reason: WorkReason::OperatorKernel,
         },
         kernel.clone(),
-        vec![
-            crate::KernelOperand {
-                views: vec![view(0, [1, 2])],
-            },
-            crate::KernelOperand {
-                views: vec![view(1, [1, 2])],
-            },
-        ],
+        vec![view(0, [1, 2]), view(1, [1, 2])],
         vec![view(2, [1, 2])],
         KernelRequirements::new(&kernel, [format.clone(), format.clone()], vec![format]),
     );
     validate_kernel_run(&run).unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.
-    run.inputs[1].views[0] = view(1, [2, (1 << 31) + 1]);
+    run.inputs[1] = view(1, [2, (1 << 31) + 1]);
     assert_eq!(
         validate_kernel_run(&run),
         Err(KernelAbiError::ElementCountOverflow)

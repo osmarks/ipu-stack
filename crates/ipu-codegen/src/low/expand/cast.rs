@@ -8,7 +8,7 @@ impl TileGraphBuilder {
         tile: u16,
         run: KernelRun,
     ) -> ExpansionResult<()> {
-        let dimensions = run.inputs[0].views[0]
+        let dimensions = run.inputs[0]
             .extents
             .iter()
             .map(|e| e.physical_end - e.start)
@@ -20,7 +20,7 @@ impl TileGraphBuilder {
         .ok_or(ExpansionError::InvalidOperatorPlan)?;
         for (start, end) in chunks.ranges {
             let mut part = run.clone();
-            for view in [&mut part.inputs[0].views[0], &mut part.outputs[0]] {
+            for view in [&mut part.inputs[0], &mut part.outputs[0]] {
                 let extent = &mut view.extents[chunks.axis];
                 let base = extent.start;
                 extent.start = base + start;

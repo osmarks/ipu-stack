@@ -25,7 +25,6 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
     let statistics_width = run
         .inputs
         .first()
-        .and_then(|input| input.views.first())
         .and_then(|view| view.extents.last())
         .map_or(0, |extent| extent.physical_end - extent.start);
     let wide_statistics = statistics_width >= 96 && statistics_width.is_multiple_of(8);
@@ -60,7 +59,7 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
             "GeLU arithmetic and optional FP8 conversion",
         ),
         TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
-            let elements: u64 = run.inputs[0].views[0]
+            let elements: u64 = run.inputs[0]
                 .extents
                 .iter()
                 .map(|e| u64::from(e.logical_end - e.start))

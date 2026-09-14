@@ -299,6 +299,10 @@ in an element-separation constraint. Placement, lifetimes and ABI validation use
 these same bindings. The worker ABI's register order still puts result zero
 before inputs and subsequent results; that calling convention does not divide
 the storage model into primary and additional outputs.
+Inputs likewise bind directly to `ShardView`s. The former `KernelOperand` wrapper
+allocated a list per input, although every implemented ABI required exactly one
+view. Removing it leaves physical strides and packed views intact, and removes
+the nested loops and impossible multiple-view operand state from consumers.
 
 The shifted FP16-to-FP8 cast similarly separates access geometry from the
 optimization that requests it. [kernel/cast.rs](../crates/ipu-codegen/src/kernel/cast.rs)

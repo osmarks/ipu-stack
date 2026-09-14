@@ -147,7 +147,7 @@ pub fn materialize_kernel_run(
     let input_addresses = run
         .inputs
         .iter()
-        .map(|operand| resolve(&operand.views[0], false))
+        .map(|operand| resolve(operand, false))
         .chain(run.outputs.iter().skip(1).map(|view| resolve(view, false)))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {

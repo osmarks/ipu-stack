@@ -78,8 +78,6 @@ pub enum KernelAbiError {
     Fp8Scale(i32),
     #[error("kernel run has {actual} pointer operands, ABI requires {expected}")]
     PointerArity { expected: usize, actual: usize },
-    #[error("kernel operand {0} is fragmented into multiple views")]
-    FragmentedOperand(usize),
     #[error("kernel {0:?} has no device implementation")]
     Unavailable(TileKernelSpec),
     #[error("GEMM output view does not have a matrix row axis")]
@@ -118,20 +116,15 @@ pub(crate) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, K
     let [query, key, value] = run.inputs.as_slice() else {
         return Err(KernelAbiError::RequirementMismatch);
     };
-    let extents = |operand: &crate::KernelOperand| {
-        let [view] = operand.views.as_slice() else {
-            return None;
-        };
-        Some(
-            view.extents
-                .iter()
-                .map(|extent| extent.physical_end - extent.start)
-                .collect::<Vec<_>>(),
-        )
+    let extents = |view: &ShardView| {
+        view.extents
+            .iter()
+            .map(|extent| extent.physical_end - extent.start)
+            .collect::<Vec<_>>()
     };
-    let query = extents(query).ok_or(KernelAbiError::RequirementMismatch)?;
-    let key = extents(key).ok_or(KernelAbiError::RequirementMismatch)?;
-    let value = extents(value).ok_or(KernelAbiError::RequirementMismatch)?;
+    let query = extents(query);
+    let key = extents(key);
+    let value = extents(value);
     if query.len() < 2 || query.len() != key.len() || query.len() != value.len() {
         return Err(KernelAbiError::RequirementMismatch);
     }
@@ -208,7 +201,6 @@ pub(crate) fn input_matrix_extent(
     let view = run
         .inputs
         .first()
-        .and_then(|operand| operand.views.first())
         .ok_or(KernelAbiError::RequirementMismatch)?;
     matrix_extent(view, logical, columns)
 }
@@ -217,7 +209,6 @@ pub(crate) fn matrix_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
     let view = run
         .inputs
         .first()
-        .and_then(|operand| operand.views.first())
         .ok_or(KernelAbiError::RequirementMismatch)?;
     view.extents[..view.extents.len().saturating_sub(2)]
         .iter()

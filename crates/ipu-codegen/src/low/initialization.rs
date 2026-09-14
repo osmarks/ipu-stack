@@ -57,32 +57,30 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
     let mut candidates = BTreeSet::new();
     let mut forbidden = non_kernel_read_storage(program);
     for run in program.kernel_calls() {
-        for input in &run.inputs {
-            for view in &input.views {
-                let block = &shards[view.shard.index() as usize];
-                let columns = view.extents.last();
-                let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
-                    from: Precision::F16, to: Precision::F8F143 { .. }
-                } | TileKernelSpec::Gelu)
-                    && matches!(run.requirements.outputs[0].format.precision, Precision::F8F143 { .. })
-                    && block.tensor_type.format.precision == Precision::F16
-                    && block.tensor_type.format.layout.order == ElementOrder::RowMajor
-                    && matches!(run.requirements.outputs[0].format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
-                    && (run.kernel == TileKernelSpec::Gelu || run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left))
-                    && view.extents == block.extents
-                    && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
-                    // Matrix-row padding is skipped by the packed row bounds;
-                    // padding in outer dimensions still requires initialization.
-                    && view.extents.iter().rev().skip(2).all(|axis| axis.logical_end == axis.physical_end)
-                    && (view.extents.len() < 2 || {
-                        let rows = view.extents[view.extents.len()-2];
-                        rows.logical_end == rows.physical_end || (matches!(run.kernel, TileKernelSpec::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
-                    });
-                if ignores_padding {
-                    candidates.insert(root(view.shard));
-                } else {
-                    forbidden.insert(root(view.shard));
-                }
+        for view in &run.inputs {
+            let block = &shards[view.shard.index() as usize];
+            let columns = view.extents.last();
+            let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
+                from: Precision::F16, to: Precision::F8F143 { .. }
+            } | TileKernelSpec::Gelu)
+                && matches!(run.requirements.outputs[0].format.precision, Precision::F8F143 { .. })
+                && block.tensor_type.format.precision == Precision::F16
+                && block.tensor_type.format.layout.order == ElementOrder::RowMajor
+                && matches!(run.requirements.outputs[0].format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
+                && (run.kernel == TileKernelSpec::Gelu || run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left))
+                && view.extents == block.extents
+                && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
+                // Matrix-row padding is skipped by the packed row bounds;
+                // padding in outer dimensions still requires initialization.
+                && view.extents.iter().rev().skip(2).all(|axis| axis.logical_end == axis.physical_end)
+                && (view.extents.len() < 2 || {
+                    let rows = view.extents[view.extents.len()-2];
+                    rows.logical_end == rows.physical_end || (matches!(run.kernel, TileKernelSpec::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
+                });
+            if ignores_padding {
+                candidates.insert(root(view.shard));
+            } else {
+                forbidden.insert(root(view.shard));
             }
         }
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
@@ -193,18 +191,12 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
         // padding. Missing logical values and explicit reduction zeros cannot.
         let finite_left = matches!(run.kernel, TileKernelSpec::Gemm { .. })
             && run.inputs.len() == 2
-            && !run.inputs[1].views.is_empty()
-            && run.inputs[1]
-                .views
-                .iter()
-                .all(|view| parameter_storage.contains(&root(view.shard)));
-        for (index, input) in run.inputs.iter().enumerate() {
-            for view in &input.views {
-                if finite_left && index == 0 {
-                    candidates.insert(root(view.shard));
-                } else {
-                    forbidden.insert(root(view.shard));
-                }
+            && parameter_storage.contains(&root(run.inputs[1].shard));
+        for (index, view) in run.inputs.iter().enumerate() {
+            if finite_left && index == 0 {
+                candidates.insert(root(view.shard));
+            } else {
+                forbidden.insert(root(view.shard));
             }
         }
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
@@ -369,14 +361,7 @@ mod tests {
                         inner_block: 64,
                         output_columns: 16,
                     },
-                    vec![
-                        KernelOperand {
-                            views: vec![view(0)],
-                        },
-                        KernelOperand {
-                            views: vec![view(1)],
-                        },
-                    ],
+                    vec![view(0), view(1)],
                     2,
                 ),
             ],
@@ -468,7 +453,7 @@ mod tests {
         graph.shards[0].extents[1].logical_end = 48;
         let run = &mut graph.kernel_runs[1];
         run.inputs.truncate(1);
-        run.inputs[0].views[0].extents[1].logical_end = 48;
+        run.inputs[0].extents[1].logical_end = 48;
         let metadata = Arc::make_mut(&mut run.metadata);
         metadata.kernel = TileKernelSpec::Cast {
             from: Precision::F16,
@@ -483,7 +468,7 @@ mod tests {
             match case {
                 1 => {
                     graph.shards[0].extents[0].logical_end = 1;
-                    graph.kernel_runs[1].inputs[0].views[0].extents[0].logical_end = 1;
+                    graph.kernel_runs[1].inputs[0].extents[0].logical_end = 1;
                 }
                 2 => graph.outputs.push(MidValueId::from_index(1)),
                 3 => append_copy(graph, 0, 1, 128),
@@ -491,7 +476,7 @@ mod tests {
                     Arc::make_mut(&mut graph.kernel_runs[1].metadata).kernel = TileKernelSpec::Gelu;
                     if case == 6 {
                         graph.shards[0].extents[0].logical_end = 1;
-                        graph.kernel_runs[1].inputs[0].views[0].extents[0].logical_end = 1;
+                        graph.kernel_runs[1].inputs[0].extents[0].logical_end = 1;
                     }
                 }
                 4 => {
@@ -608,7 +593,7 @@ mod tests {
         staged.id = BlockValueId(3);
         graph.shards.push(staged);
         append_copy(graph, 1, 3, 256);
-        graph.kernel_runs[1].inputs[1].views[0].shard = BlockValueId(3);
+        graph.kernel_runs[1].inputs[1].shard = BlockValueId(3);
         let mut mixed = program.clone();
         append_copy(&mut mixed, 2, 3, 8);
         let mut overwritten = mixed.clone();
