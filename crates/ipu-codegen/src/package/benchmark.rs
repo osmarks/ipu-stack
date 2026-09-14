@@ -52,7 +52,7 @@ pub struct ExpansionTiming {
     pub mid_operations: usize,
     pub mid_values: usize,
     pub expand_ms: f64,
-    /// Re-costing an expanded graph with its populated geometry cache.
+    /// Costing an expanded graph, reusing geometry cached during relay selection.
     pub recost_ms: f64,
     pub low_cycles: u64,
     pub tile_lists_ms: f64,

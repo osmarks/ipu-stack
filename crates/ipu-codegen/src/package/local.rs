@@ -481,7 +481,12 @@ mod tests {
                 let (graph, mut config) = mlp();
                 let path =
                     std::env::temp_dir().join(format!("ipu-search-{}.json", fastrand::u64(..)));
-                let cost = |plan: &mut ScheduledPlan| Ok((plan.program.estimated_cycles, ()));
+                let cost = |plan: &mut ScheduledPlan| {
+                    Ok((
+                        crate::estimate::program_cycles(&plan.program, None)?.total,
+                        (),
+                    ))
+                };
                 config.optimization_steps = 4;
                 let uninterrupted = optimize(&graph, &config, None, cost).unwrap().0;
                 config.optimization_steps = 2;
@@ -651,7 +656,7 @@ mod tests {
                 .unwrap()
                 .install(|| {
                     optimize(&graph, &config, None, |plan| {
-                        let cycles = plan.program.estimated_cycles;
+                        let cycles = crate::estimate::program_cycles(&plan.program, None)?.total;
                         // Deliberately perturb completion order. Selection must
                         // depend on shortlist order, not callback arrival.
                         std::thread::sleep(std::time::Duration::from_millis(cycles % 7));

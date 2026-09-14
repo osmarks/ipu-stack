@@ -783,8 +783,6 @@ mod tests {
             outputs: vec![],
             logical_values: vec![],
             checkpoints: vec![],
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let program = LowProgram {
             requires_finite_scratch: false,

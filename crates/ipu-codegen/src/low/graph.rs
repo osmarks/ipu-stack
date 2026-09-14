@@ -259,8 +259,6 @@ pub struct TileGraph {
     pub outputs: Vec<MidValueId>,
     pub logical_values: Vec<MidValue>,
     pub checkpoints: Vec<(OperationId, Vec<MidValueId>)>,
-    pub estimated_cycles: u64,
-    pub estimated_exchange_cycles: u64,
 }
 
 impl TileGraph {

@@ -138,8 +138,6 @@ pub(crate) fn expand_tiles_analyzed(
                     .map(|source| (source, operation.results.clone()))
             })
             .collect(),
-        estimated_cycles: graph.estimated_cycles,
-        estimated_exchange_cycles: graph.estimated_exchange_cycles,
     };
     let build_time = start.elapsed();
     let start = Instant::now();
@@ -147,17 +145,14 @@ pub(crate) fn expand_tiles_analyzed(
     let simplify_time = start.elapsed();
     let start = Instant::now();
     relay::select(&mut program, analysis)?;
-    let cycles = crate::estimate::program_cycles_analyzed(&program, None, analysis)?;
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),
         build_ms = build_time.as_secs_f64() * 1000.0,
         simplify_ms = simplify_time.as_secs_f64() * 1000.0,
-        cost_ms = start.elapsed().as_secs_f64() * 1000.0,
-        "built and costed logical tile schedule"
+        relay_ms = start.elapsed().as_secs_f64() * 1000.0,
+        "built logical tile schedule"
     );
-    program.estimated_cycles = cycles.total;
-    program.estimated_exchange_cycles = cycles.exchange;
     Ok(Arc::new(program))
 }
 

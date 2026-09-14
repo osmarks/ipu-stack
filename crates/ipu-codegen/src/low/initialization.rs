@@ -375,8 +375,6 @@ mod tests {
             outputs: Vec::new(),
             logical_values: Vec::new(),
             checkpoints: Vec::new(),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         LowProgram {
             program: Arc::new(graph),

@@ -367,8 +367,6 @@ mod tests {
             value_shards: vec![],
             logical_values: vec![],
             checkpoints: vec![],
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }
     }
 
