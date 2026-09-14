@@ -1,12 +1,13 @@
 use super::*;
-use crate::{AMP_INNER_BLOCK, GemmDistribution, OperatorDispatch, TensorAxis};
+use crate::planner::operator::{GemmDistribution, OperatorDispatch};
+use crate::{AMP_INNER_BLOCK, TensorAxis};
 use std::collections::BTreeSet;
 
 fn output_stationary_dispatch() -> OperatorDispatch {
     OperatorDispatch::BlockedGemm {
         inner_block: AMP_INNER_BLOCK,
         output_column_block: crate::tensor::AMP_OUTPUT_COLUMN_BLOCK,
-        orientation: crate::GemmOrientation::Normal,
+        orientation: crate::planner::operator::GemmOrientation::Normal,
         distribution: GemmDistribution::OutputStationary,
     }
 }
@@ -239,7 +240,8 @@ fn randomized_resolved_capacity_matches_physical_storage() {
 
 #[test]
 fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
-    use crate::{GemmOrientation, GridOrder};
+    use crate::GridOrder;
+    use crate::planner::operator::GemmOrientation;
     for orientation in [GemmOrientation::Normal, GemmOrientation::Swapped] {
         let (shape, layout) = match orientation {
             GemmOrientation::Normal => (

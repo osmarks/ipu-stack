@@ -1,7 +1,34 @@
 //! Distributed arithmetic and its operand windows. Tile calls are enumerated in low.
 
-use super::{Precision, ReductionStaging, TensorAxis};
 use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
+use crate::tensor::{Precision, TensorAxis};
+use serde::{Deserialize, Serialize};
+
+/// Lifetime policy for partials reduced across a GEMM's K partitions.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+pub enum ReductionStaging {
+    /// Receive every remote partial into one packed buffer, then reduce once.
+    #[default]
+    Complete,
+    /// Receive and accumulate one remote partial at a time. This minimizes
+    /// temporary SRAM at the expense of additional exchange epochs and kernel
+    /// launches.
+    Streamed,
+    /// Receive at most this many remote partials per exchange epoch.
+    Batched(std::num::NonZeroU16),
+}
+
+impl ReductionStaging {
+    pub(crate) fn remote_partials_per_stage(self, remote: u64) -> u64 {
+        match self {
+            Self::Complete => remote.max(1),
+            Self::Streamed => 1,
+            Self::Batched(limit) => u64::from(limit.get()).min(remote.max(1)),
+        }
+    }
+}
 
 /// A rectangular operand window in global tensor coordinates. Omitted axes
 /// retain their full extent. Windows do not allocate temporary tensors.

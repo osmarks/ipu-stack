@@ -1,8 +1,10 @@
 //! Compiler timings which stop before placement and exchange scheduling.
 use crate::Compute;
+use crate::compile::PipelineConfig;
+use crate::estimate::Ipu21CostModel;
 use crate::graph::ComputeGraph;
-use crate::mid::{Ipu21CostModel, PipelineConfig, lower_baseline};
 use crate::package::{PackageBuildResult, invalid};
+use crate::planner::build_baseline;
 use std::sync::Arc;
 use std::{collections::BTreeMap, fs, time::Instant};
 
@@ -92,16 +94,16 @@ pub fn benchmark_mid_expansion(
         let state = crate::planner::checkpoint::State::load(graph, config, None)?;
         let mut fixed = config.clone();
         fixed.inputs = state.inputs;
-        crate::mid::baseline::lower(
+        crate::planner::build_candidate(
             graph,
             &fixed,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
+            &crate::planner::cache::FragmentCache::default(),
             &state.recipe,
         )?
         .program
     } else {
-        lower_baseline(graph, config, &Ipu21CostModel)?
+        build_baseline(graph, config, &Ipu21CostModel)?
     };
     let planning_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("mid", process_memory());

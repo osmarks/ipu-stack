@@ -651,9 +651,11 @@ fn layout_exchange_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::estimate::Ipu21CostModel;
+    use crate::planner::test_support::lower;
     use crate::{
-        ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
-        lower_exchanges, lower_to_tiles, place,
+        ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_exchanges,
+        lower_to_tiles, place,
     };
     use ipu_exchange::{RETURN_M10_INSTRUCTION, Topology};
 

@@ -1,8 +1,17 @@
 //! Pack smaller panels on additional owners, then transfer packed storage.
-use super::*;
+
+use crate::kernel::TileKernelSpec;
+use crate::mid::{
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
+    OperandIndexing,
+};
+use crate::tensor::{
+    AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
+    TensorTiling, TensorType,
+};
 
 impl MidProgram {
-    pub(super) fn with_distributed_packing(&self, rows: u16) -> Option<Self> {
+    pub(crate) fn with_distributed_packing(&self, rows: u16) -> Option<Self> {
         let mut result = self.clone();
         if !distribute_region(
             &mut result.operations,
@@ -154,6 +163,11 @@ fn distribute_region(
 
 #[cfg(test)]
 mod tests {
+    use crate::graph::{GraphInputKind, ValueId};
+    use crate::mid::MidInput;
+
+    use crate::tensor::{AxisFactorView, MemoryClass};
+
     use super::*;
     #[test]
     fn distributed_panels_retile_without_unpacking_the_packed_intermediate() {

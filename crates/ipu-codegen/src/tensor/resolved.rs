@@ -3,8 +3,8 @@
 //! Axis partitions are resolved once, independently of element encoding and
 //! physical addresses. Replicas select the same bounds without duplicating them.
 
-use super::TensorShape;
 use super::{AxisTiling, Layout, LayoutError, Padding, ShardExtent, TensorTiling};
+use super::{TensorAxis, TensorShape, TensorType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedAxis {
@@ -476,4 +476,71 @@ fn has_regular_tile_mapping(tiling: &TensorTiling, strides: &[u32]) -> bool {
         expected_stride = next;
     }
     true
+}
+
+/// Project the output's ownership onto non-broadcast operand dimensions.
+/// Replicating a whole multi-row parameter and then selecting its columns
+/// leaves strided views; partition it before dispatch instead.
+pub(crate) fn broadcast_operand_tiling(
+    input: &TensorType,
+    output: &TensorType,
+) -> Option<TensorTiling> {
+    let indexing = crate::tensor::Broadcast::new(&input.shape.0, &output.shape.0)?;
+    if input.shape == output.shape {
+        return Some(output.format.layout.tiling.clone());
+    }
+    project_tiling(output, |axis| indexing.input_axis(axis))
+}
+
+pub(crate) fn axis_tiling(tensor: &TensorType, axis: usize) -> Option<&AxisTiling> {
+    tensor
+        .format
+        .layout
+        .tiling
+        .axes
+        .iter()
+        .find(|dim| dim.axis.resolve(tensor.shape.0.len()) == Ok(axis))
+}
+
+/// Keep physical tile strides while omitted distributed axes become replicas.
+pub(crate) fn project_tiling(
+    output: &TensorType,
+    map_axis: impl Fn(usize) -> Option<usize>,
+) -> Option<TensorTiling> {
+    let tiling = &output.format.layout.tiling;
+    let mut replicas = tiling.replicas;
+    let mut axes = Vec::new();
+    for (dim, stride) in tiling.axes.iter().zip(tiling.axis_strides().ok()?) {
+        if let Some(mapped) = map_axis(dim.axis.resolve(output.shape.0.len()).ok()?) {
+            let mut dim = *dim;
+            dim.axis = TensorAxis::FromStart(u16::try_from(mapped).ok()?);
+            dim.tile_stride = Some(u16::try_from(stride).ok()?);
+            axes.push(dim);
+        } else {
+            replicas = replicas.checked_mul(dim.partitions)?;
+        }
+    }
+    Some(TensorTiling {
+        tile_count: tiling.tile_count,
+        replicas,
+        axes,
+    })
+}
+
+pub(crate) fn same_distribution(a: &TensorType, b: &TensorType) -> bool {
+    a.shape == b.shape
+        && a.format.layout.tiling.tile_count == b.format.layout.tiling.tile_count
+        && a.format
+            .layout
+            .resolve(&a.shape)
+            .ok()
+            .zip(b.format.layout.resolve(&b.shape).ok())
+            .is_some_and(|(left, right)| {
+                left.padded_shape == right.padded_shape
+                    && (a.format.layout.tiling == b.format.layout.tiling
+                        || left.axes().zip(right.axes()).is_some_and(|(a, b)| {
+                            a.len() == b.len()
+                                && a.iter().zip(b).all(|(a, b)| a.same_partitioning(b))
+                        }))
+            })
 }

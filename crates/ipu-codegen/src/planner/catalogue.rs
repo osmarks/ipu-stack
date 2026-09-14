@@ -1,6 +1,18 @@
 //! Concrete implementations and explicitly enabled shape-dependent families.
 
-use super::*;
+use crate::graph::{AttentionOptions, GemmOptions};
+use crate::kernel::AccumulationPrecision;
+use crate::tensor::MemoryClass;
+use crate::tensor::Precision;
+
+use crate::planner::operator::{
+    GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
+    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing,
+    StorageRequirements, default_dispatch,
+};
+use crate::tensor::{
+    AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, GridOrder, Layout, TensorFormat, TensorShape,
+};
 
 /// An explicitly enabled concrete implementation or shape-dependent family.
 // Most entries are concrete; keep their storage inline as in the original catalogue.
@@ -62,7 +74,7 @@ impl OperatorCandidate {
         }
     }
 
-    pub fn operator(&self) -> MidOperator {
+    pub fn operator(&self) -> OperatorFamily {
         match self {
             Self::Concrete(candidate) => candidate.plan.operator,
             Self::ParallelGemm {
@@ -70,7 +82,7 @@ impl OperatorCandidate {
                 multiply,
                 accumulate,
                 ..
-            } => MidOperator::Gemm {
+            } => OperatorFamily::Gemm {
                 options: *options,
                 multiply: *multiply,
                 accumulate: *accumulate,
@@ -88,7 +100,7 @@ impl OperatorCandidate {
 
 impl ConcreteOperatorCandidate {
     pub fn new(
-        operator: MidOperator,
+        operator: OperatorFamily,
         inputs: impl IntoIterator<Item = OperandRequirement>,
         output: OperandRequirement,
     ) -> Self {
@@ -122,7 +134,7 @@ impl ConcreteOperatorCandidate {
     }
 }
 
-pub(super) fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
+pub(crate) fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
     // Each group is unique, and candidates from different groups retain
     // different tile counts in their layouts or family parameters.
     candidate_active_tile_counts(tile_count)
@@ -175,7 +187,7 @@ pub(super) fn shape_aware_active_tile_counts<'a>(
     counts
 }
 
-pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate> {
+pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<OperatorCandidate> {
     let amp_left_result_f16 = TensorFormat {
         precision: Precision::F16,
         layout: Layout::amp_left_result(tile_count),
@@ -287,7 +299,7 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
     for input in [0, 1] {
         candidates.push(
             pointwise_operator_candidate(
-                MidOperator::Add,
+                OperatorFamily::Add,
                 [rows_f16.clone(), rows_f16.clone()],
                 rows_f16.clone(),
             )
@@ -296,14 +308,14 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
         );
     }
     let mut grid_add = pointwise_operator_candidate(
-        MidOperator::Add,
+        OperatorFamily::Add,
         [rows_f16.clone(), rows_f16.clone()],
         rows_f16.clone(),
     );
     grid_add.format_policy = OperatorFormatPolicy::RowMajorGrid;
     candidates.push(grid_add.with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])));
     let mut norm = pointwise_operator_candidate(
-        MidOperator::LayerNorm,
+        OperatorFamily::LayerNorm,
         [rows_f16.clone(), rows_f16.clone(), rows_f16.clone()],
         rows_f16.clone(),
     );
@@ -311,20 +323,20 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
     candidates.push(norm);
     candidates.extend([
         pointwise_operator_candidate(
-            MidOperator::LayerNorm,
+            OperatorFamily::LayerNorm,
             [rows_f16.clone(), rows_f16.clone(), rows_f16.clone()],
             rows_f16.clone(),
         ),
-        format_preserving_unary_candidate(MidOperator::Gelu, amp_left_result_f16),
-        format_preserving_unary_candidate(MidOperator::Gelu, rows_f16.clone()),
+        format_preserving_unary_candidate(OperatorFamily::Gelu, amp_left_result_f16),
+        format_preserving_unary_candidate(OperatorFamily::Gelu, rows_f16.clone()),
         pointwise_operator_candidate(
-            MidOperator::Add,
+            OperatorFamily::Add,
             [rows_f16.clone(), rows_f16.clone()],
             rows_f16,
         )
         .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0, 1])),
         pointwise_operator_candidate(
-            MidOperator::FlashAttention {
+            OperatorFamily::FlashAttention {
                 options: AttentionOptions::default(),
                 accumulate: AccumulationPrecision::F32,
             },
@@ -348,7 +360,7 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
 }
 
 pub(super) fn pointwise_operator_candidate(
-    operator: MidOperator,
+    operator: OperatorFamily,
     inputs: impl IntoIterator<Item = TensorFormat>,
     output: TensorFormat,
 ) -> ConcreteOperatorCandidate {
@@ -360,7 +372,7 @@ pub(super) fn pointwise_operator_candidate(
 }
 
 pub(super) fn format_preserving_unary_candidate(
-    operator: MidOperator,
+    operator: OperatorFamily,
     format: TensorFormat,
 ) -> ConcreteOperatorCandidate {
     pointwise_operator_candidate(operator, [format.clone()], format)
@@ -369,11 +381,11 @@ pub(super) fn format_preserving_unary_candidate(
 }
 
 pub(super) fn gemm_plan(
-    operator: MidOperator,
+    operator: OperatorFamily,
     layouts: [Layout; 3],
     dispatch: OperatorDispatch,
 ) -> OperatorPlan {
-    let MidOperator::Gemm {
+    let OperatorFamily::Gemm {
         multiply: precision,
         ..
     } = operator
@@ -413,7 +425,7 @@ pub(super) fn amp_gemm_operator_candidate(
     output_columns: u32,
     tile_count: u16,
 ) -> ConcreteOperatorCandidate {
-    let operator = MidOperator::Gemm {
+    let operator = OperatorFamily::Gemm {
         options: GemmOptions::default(),
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),
@@ -468,7 +480,7 @@ pub(super) fn amp_grid_gemm_operator_candidate(
             memory_class,
         ),
     };
-    let operator = MidOperator::Gemm {
+    let operator = OperatorFamily::Gemm {
         options: GemmOptions::default(),
         multiply: precision,
         accumulate: gemm_accumulation_precision(precision),

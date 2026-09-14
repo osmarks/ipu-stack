@@ -1,6 +1,49 @@
 //! Shape-dependent implementation choices and local candidate pruning.
 
-use super::*;
+use crate::compile::{
+    AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking, GemmPlanConstraint,
+    PipelineConfig,
+};
+use crate::estimate::{CostModel, MemoryPeaks};
+use crate::graph::{Operation, OperationKind, ValueId};
+use crate::kernel::AccumulationPrecision;
+use crate::mid::ReductionStaging;
+use crate::tensor::Precision;
+use rayon::prelude::*;
+
+use crate::planner::bind::plan_fits_operator_memory;
+use crate::planner::cache::FragmentCache;
+use crate::planner::catalogue::{
+    ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy,
+    gemm_accumulation_precision, gemm_plan,
+};
+use crate::planner::operator::{
+    GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
+    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing,
+    StorageRequirements, alias_compatible,
+};
+use crate::tensor::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AxisTiling, BlockMajorOrder,
+    ElementOrder, GridOrder, Layout, MemoryClass, Padding, TensorAxis, TensorFormat, TensorShape,
+    TensorTiling, TensorType,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PlanMetrics {
+    pub(super) cycles: u64,
+    pub(super) memory: MemoryPeaks,
+}
+
+impl PlanMetrics {
+    pub(crate) fn dominates(self, other: Self) -> bool {
+        let memory = self.memory.objectives();
+        let other_memory = other.memory.objectives();
+        let no_worse = self.cycles <= other.cycles
+            && memory.into_iter().zip(other_memory).all(|(a, b)| a <= b);
+        no_worse && (self.cycles < other.cycles || memory != other_memory)
+    }
+}
 
 mod attention;
 mod demand;
@@ -105,7 +148,7 @@ fn direct_consumer_layouts(
     layouts
 }
 
-fn view_plan(operator: MidOperator, source: TensorFormat, layout: Layout) -> OperatorPlan {
+fn view_plan(operator: OperatorFamily, source: TensorFormat, layout: Layout) -> OperatorPlan {
     OperatorPlan {
         operator,
         dispatch: OperatorDispatch::View,
@@ -168,7 +211,7 @@ pub(super) fn plans(
             direct_consumer_layouts.to_vec()
         };
         for layout in layouts {
-            let plan = view_plan(MidOperator::View(view), input.format.clone(), layout);
+            let plan = view_plan(OperatorFamily::View(view), input.format.clone(), layout);
             if !plans.contains(&plan) {
                 plans.push(plan);
             }
@@ -203,7 +246,7 @@ pub(super) fn plans(
             input.format.clone()
         };
         plans.push(view_plan(
-            MidOperator::View(view),
+            OperatorFamily::View(view),
             source,
             row_major(output),
         ));
@@ -220,7 +263,7 @@ pub(super) fn plans(
         ));
         for layout in layouts {
             plans.push(view_plan(
-                MidOperator::Slice(slice),
+                OperatorFamily::Slice(slice),
                 input.format.clone(),
                 layout,
             ));
@@ -273,7 +316,7 @@ pub(super) fn plans(
                 [(false, AMP_INNER_BLOCK), (true, padded_key_rows)]
             {
                 let plan = OperatorPlan {
-                    operator: MidOperator::FlashAttention {
+                    operator: OperatorFamily::FlashAttention {
                         options,
                         accumulate: AccumulationPrecision::F32,
                     },
@@ -447,7 +490,7 @@ pub(super) fn plans(
     {
         let requested_precision = config.gemm_precisions.get(&operation.id).copied();
         let operator = match (candidate.operator(), requested_precision) {
-            (MidOperator::Gemm { options, .. }, Some(multiply)) => MidOperator::Gemm {
+            (OperatorFamily::Gemm { options, .. }, Some(multiply)) => OperatorFamily::Gemm {
                 options,
                 multiply,
                 accumulate: gemm_accumulation_precision(multiply),
@@ -547,7 +590,7 @@ pub(super) fn plans(
                     {
                         requirement.format.layout = layout.clone();
                         if let Some(tiling) =
-                            implementation::pointwise_input_tiling(input, &output_type)
+                            crate::tensor::broadcast_operand_tiling(input, &output_type)
                         {
                             requirement.format.layout.tiling = tiling;
                         }
@@ -569,7 +612,7 @@ pub(super) fn plans(
                     }
                     requirement.format.layout = actual.format.layout.clone();
                     candidate.requirements.output.format.layout = actual.format.layout.clone();
-                    if candidate.operator == MidOperator::Add {
+                    if candidate.operator == OperatorFamily::Add {
                         // Packed elementwise addition is layout transparent only
                         // for equal shapes. Suffix broadcasts require row-major
                         // traversal; their parameters are sliced during expansion.
@@ -626,7 +669,7 @@ pub(super) fn plans(
                             {
                                 requirement.format.layout = output_type.format.layout.clone();
                                 requirement.format.layout.tiling =
-                                    implementation::pointwise_input_tiling(input, &output_type)?;
+                                    crate::tensor::broadcast_operand_tiling(input, &output_type)?;
                             }
                             Some(variant)
                         })
@@ -690,7 +733,7 @@ pub(super) fn plans(
     }
     plans.retain(|plan| {
         (config.gemm_output_packing != GemmOutputPacking::Packed
-            || !matches!(plan.operator, MidOperator::Gemm { .. })
+            || !matches!(plan.operator, OperatorFamily::Gemm { .. })
             || plan
                 .requirements
                 .output
@@ -850,7 +893,7 @@ pub(super) fn independent_parameter_storage(
 /// A packed alternative keeps the compute grid but gives both producers and
 /// reductions the same panel order. Native layouts remain separate candidates.
 fn packed_gemm_output(plan: &OperatorPlan, output: &TensorShape) -> Option<OperatorPlan> {
-    let MidOperator::Gemm {
+    let OperatorFamily::Gemm {
         multiply: Precision::F16,
         ..
     } = plan.operator
@@ -906,7 +949,7 @@ fn packed_gemm_output(plan: &OperatorPlan, output: &TensorShape) -> Option<Opera
 }
 
 pub(super) fn parallel_reduction_candidates(
-    operator: MidOperator,
+    operator: OperatorFamily,
     tile_count: u16,
     inputs: &[TensorType],
     output: &TensorShape,
@@ -940,7 +983,7 @@ pub(super) fn parallel_reduction_candidates(
 }
 
 pub(super) fn parallel_reduction_candidates_for_orientation(
-    operator: MidOperator,
+    operator: OperatorFamily,
     tile_count: u16,
     inputs: &[TensorType],
     output: &TensorShape,
@@ -953,7 +996,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
     grouped_output: Option<GroupedOutputLayout>,
     output_demands: &[OutputDemand],
 ) -> Vec<OperatorPlan> {
-    let MidOperator::Gemm { multiply, .. } = operator else {
+    let OperatorFamily::Gemm { multiply, .. } = operator else {
         return Vec::new();
     };
     let inner_micro = if matches!(multiply, Precision::F8F143 { .. }) {
@@ -1647,7 +1690,7 @@ pub(super) fn retain_operator_candidates_for_demands(
         selected.insert(index);
     }
     // Preserve the storage extreme before latency/family slots fill the pool.
-    // Baseline selection adds the surrounding boundary conversion traffic.
+    // Candidate selection adds the surrounding boundary conversion traffic.
     if width > 1
         && let Some((index, _)) = ranked
             .iter()
@@ -1829,17 +1872,20 @@ pub(super) fn resolved_output_aliasing(
     }
 }
 
-pub(super) fn operator_matches(operation: &OperationKind, operator: MidOperator) -> bool {
+pub(super) fn operator_matches(operation: &OperationKind, operator: OperatorFamily) -> bool {
     match (operation, operator) {
-        (OperationKind::Gemm(expected), MidOperator::Gemm { options, .. }) => *expected == options,
-        (OperationKind::LayerNorm, MidOperator::LayerNorm) => true,
-        (OperationKind::Gelu, MidOperator::Gelu) => true,
-        (OperationKind::Add, MidOperator::Add) => true,
-        (OperationKind::View(expected), MidOperator::View(view)) => *expected == view,
-        (OperationKind::Slice(expected), MidOperator::Slice(slice)) => *expected == slice,
-        (OperationKind::FlashAttention(expected), MidOperator::FlashAttention { options, .. }) => {
+        (OperationKind::Gemm(expected), OperatorFamily::Gemm { options, .. }) => {
             *expected == options
         }
+        (OperationKind::LayerNorm, OperatorFamily::LayerNorm) => true,
+        (OperationKind::Gelu, OperatorFamily::Gelu) => true,
+        (OperationKind::Add, OperatorFamily::Add) => true,
+        (OperationKind::View(expected), OperatorFamily::View(view)) => *expected == view,
+        (OperationKind::Slice(expected), OperatorFamily::Slice(slice)) => *expected == slice,
+        (
+            OperationKind::FlashAttention(expected),
+            OperatorFamily::FlashAttention { options, .. },
+        ) => *expected == options,
         _ => false,
     }
 }

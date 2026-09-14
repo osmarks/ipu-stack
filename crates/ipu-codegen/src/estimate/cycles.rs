@@ -2,9 +2,10 @@
 
 use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic, maximum_shard_bytes};
 use crate::graph::TensorShape;
+use crate::planner::operator::OperatorPlan;
 use crate::{
-    AmpOrder, BlockMajorOrder, CopyPolicy, ElementOrder, Layout, OperatorPlan, Precision,
-    TensorFormat, TensorType,
+    AmpOrder, BlockMajorOrder, CopyPolicy, ElementOrder, Layout, Precision, TensorFormat,
+    TensorType,
 };
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
@@ -342,10 +343,9 @@ impl CostModel for Ipu21CostModel {
 mod tests {
     use super::*;
     use crate::estimate::ExchangeEndpointLoad;
-    use crate::{MidOperator, OperatorDispatch};
-    use crate::{
-        OperandRequirement, OutputAliasing, StorageRequirements, TensorFormat, TileKernelSpec,
-    };
+    use crate::planner::operator::{OperandRequirement, OutputAliasing, StorageRequirements};
+    use crate::planner::operator::{OperatorDispatch, OperatorFamily};
+    use crate::{TensorFormat, TileKernelSpec};
 
     const CASES: usize = 32;
 
@@ -500,8 +500,8 @@ mod tests {
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(tiles));
             let unsharded =
                 TensorType::new([rows, columns], Precision::F16, Layout::row_sharded(1));
-            for operator in [MidOperator::Gelu, MidOperator::Add] {
-                let sharded_cycles = crate::mid::implementation::implement(
+            for operator in [OperatorFamily::Gelu, OperatorFamily::Add] {
+                let sharded_cycles = crate::planner::fragments::build_fragment(
                     &OperatorPlan {
                         operator,
                         dispatch: pointwise_dispatch(),
@@ -511,7 +511,7 @@ mod tests {
                     &sharded,
                 )
                 .map_or(u64::MAX, |program| program.estimated_cycles);
-                let unsharded_cycles = crate::mid::implementation::implement(
+                let unsharded_cycles = crate::planner::fragments::build_fragment(
                     &OperatorPlan {
                         operator,
                         dispatch: pointwise_dispatch(),

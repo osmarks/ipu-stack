@@ -1,9 +1,18 @@
 //! Fuse compatible whole-device primitives before physical expansion.
 use super::rewrite::{apply_edits, single_use_producers};
-use super::*;
+use crate::kernel::TileKernelSpec;
+use crate::mid::{
+    Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, OperandIndexing,
+};
+use crate::tensor::{ElementOrder, Precision, TensorType};
+use std::collections::{BTreeMap, BTreeSet};
 
 impl MidProgram {
-    pub(super) fn with_elementwise_fusions(&self, config: &PipelineConfig) -> Option<Self> {
+    pub(crate) fn with_elementwise_fusions(
+        &self,
+        support_reservation: u64,
+        memory_budget: u64,
+    ) -> Option<Self> {
         let mut result = self.clone();
         let residual =
             super::residual::fuse(&mut result.operations, &mut result.values, &result.outputs);
@@ -13,10 +22,9 @@ impl MidProgram {
         let (before, _) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
         result.refresh_estimates()?;
         if result.estimated_cycles >= before.total
-            || !result.peak_memory.fits_ipu21_with_budget(
-                config.standard_memory_reservation_bytes,
-                config.tile_memory_budget_bytes,
-            )
+            || !result
+                .peak_memory
+                .fits_ipu21_with_budget(support_reservation, memory_budget)
         {
             return None;
         }
@@ -179,7 +187,7 @@ fn fuse_region(
 }
 
 // Shared with the optimistic regional search: known fusion is not a missing kernel.
-pub(super) fn compatible_fusion(
+pub(crate) fn compatible_fusion(
     kernel: &TileKernelSpec,
     left: &TensorType,
     right: &TensorType,
@@ -207,6 +215,18 @@ pub(super) fn compatible_fusion(
 
 #[cfg(test)]
 mod tests {
+    use crate::compile::PipelineConfig;
+    use crate::estimate::Ipu21CostModel;
+    use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
+    use crate::low::CopyPolicy;
+    use crate::mid::{CoordinateMapping, MidInput};
+    use crate::planner::catalogue::OperatorFormatPolicy;
+    use crate::planner::operator::OperatorFamily;
+    use crate::planner::test_support::lower;
+    use crate::tensor::{
+        AmpOrder, AxisTiling, Layout, Padding, TensorAxis, TensorFormat, TensorTiling,
+    };
+
     use super::*;
     #[test]
     fn gelu_moves_through_retile_into_fp8_consumer_owners() {
@@ -283,7 +303,10 @@ mod tests {
             ..MidProgram::default()
         };
         let fused = program
-            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .unwrap();
         assert_eq!(fused.operations.len(), 2);
         assert_eq!(fused.operations[0].inputs, [MidValueId(0)]);
@@ -311,13 +334,19 @@ mod tests {
         independent.operations.insert(2, work);
         assert!(
             independent
-                .with_elementwise_fusions(&PipelineConfig::new(independent.tile_count))
+                .with_elementwise_fusions(
+                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                )
                 .is_some()
         );
         independent.values.last_mut().unwrap().storage_group = MidValueId(0);
         assert!(
             independent
-                .with_elementwise_fusions(&PipelineConfig::new(independent.tile_count))
+                .with_elementwise_fusions(
+                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                )
                 .is_none()
         );
 
@@ -348,7 +377,10 @@ mod tests {
             output_aliases: vec![],
         });
         let fused_norm = norm
-            .with_elementwise_fusions(&PipelineConfig::new(norm.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .unwrap();
         assert_eq!(fused_norm.operations.len(), 4); // activation, gamma, beta copies + LN
         let last = fused_norm.operations.last().unwrap();
@@ -372,7 +404,10 @@ mod tests {
             output_aliases: vec![],
         });
         let fused_bias = bias
-            .with_elementwise_fusions(&PipelineConfig::new(bias.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .unwrap();
         assert_eq!(fused_bias.operations.len(), 3); // activation/bias copies + producer
         let last = fused_bias.operations.last().unwrap();
@@ -385,7 +420,10 @@ mod tests {
         program.outputs.push(MidValueId(1));
         assert!(
             program
-                .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+                .with_elementwise_fusions(
+                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                )
                 .is_none()
         );
     }
@@ -489,8 +527,10 @@ mod tests {
                     outputs: vec![MidValueId(4)],
                     ..MidProgram::default()
                 };
-                let fused =
-                    program.with_elementwise_fusions(&PipelineConfig::new(program.tile_count));
+                let fused = program.with_elementwise_fusions(
+                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                );
                 // The faster FP16 affine path makes separate LN + cast
                 // cheaper at this width, even for one row.
                 assert_eq!(fused.is_some(), !norm);
@@ -509,7 +549,10 @@ mod tests {
                 program.outputs.push(MidValueId(3));
                 assert!(
                     program
-                        .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+                        .with_elementwise_fusions(
+                            u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                            u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                        )
                         .is_none()
                 );
             }
@@ -550,7 +593,7 @@ mod tests {
                 config.operator_candidates.retain(|candidate| {
                     !candidate
                         .concrete()
-                        .is_some_and(|c| matches!(c.plan.operator, MidOperator::LayerNorm))
+                        .is_some_and(|c| matches!(c.plan.operator, OperatorFamily::LayerNorm))
                         || candidate.format_policy() == OperatorFormatPolicy::RowMajorRows
                 });
                 if norm {
@@ -572,7 +615,10 @@ mod tests {
                     config = config.with_input(x, format.clone()).with_input(rhs, format);
                 }
                 let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                let fused = mid.with_elementwise_fusions(&PipelineConfig::new(mid.tile_count));
+                let fused = mid.with_elementwise_fusions(
+                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                );
                 assert_eq!(fused.is_some(), !keep_sum, "norm={norm}");
                 if let Some(fused) = fused {
                     if !norm {
@@ -597,13 +643,25 @@ mod tests {
                         }
                         let (_, memory) =
                             crate::estimate::analyze_mid(&fresh, &BTreeMap::new()).unwrap();
-                        let unconstrained = fresh.with_elementwise_fusions(&config).unwrap();
+                        let unconstrained = fresh
+                            .with_elementwise_fusions(
+                                config.standard_memory_reservation_bytes,
+                                config.tile_memory_budget_bytes,
+                            )
+                            .unwrap();
                         assert!(unconstrained.peak_memory.total > memory.total);
                         let mut tight = config.clone();
                         tight.standard_memory_reservation_bytes = 0;
                         tight.tile_memory_budget_bytes = memory.total;
                         assert!(memory.fits_ipu21_with_budget(0, tight.tile_memory_budget_bytes));
-                        assert!(fresh.with_elementwise_fusions(&tight).is_none());
+                        assert!(
+                            fresh
+                                .with_elementwise_fusions(
+                                    tight.standard_memory_reservation_bytes,
+                                    tight.tile_memory_budget_bytes
+                                )
+                                .is_none()
+                        );
                     }
                     assert!(
                         fused.estimated_cycles

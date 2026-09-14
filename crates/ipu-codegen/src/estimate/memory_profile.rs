@@ -294,7 +294,7 @@ pub(crate) fn write(
     config: &PipelineConfig,
     program: &crate::MidProgram,
     scope: &str,
-) -> crate::LoweringResult<()> {
+) -> crate::planner::LoweringResult<()> {
     let Some(directory) = &config.memory_profile_directory else {
         return Ok(());
     };
@@ -313,7 +313,7 @@ pub(crate) fn write(
         &program.values,
         &Default::default(),
     )
-    .ok_or(crate::LoweringError::InvalidImplementation)?;
+    .ok_or(crate::planner::LoweringError::InvalidImplementation)?;
     let result = (|| -> Result<_, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(directory)?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -329,7 +329,7 @@ pub(crate) fn write(
         std::fs::write(path.with_extension("html"), html)?;
         Ok(path)
     })()
-    .map_err(|error| crate::LoweringError::MemoryProfile(error.to_string()))?;
+    .map_err(|error| crate::planner::LoweringError::MemoryProfile(error.to_string()))?;
     tracing::info!(path = %result.display(), scope,
         peak_step = profile.total_peak_step, effective_peak_bytes = profile.effective_peak_bytes,
         "wrote planner memory profile");
@@ -351,7 +351,8 @@ mod tests {
         let config = PipelineConfig::new(4)
             .with_automatic_input(input, crate::Precision::F16)
             .with_automatic_input(weight, crate::Precision::F16);
-        let program = crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let program =
+            crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut timeline = Timeline::default();
         mid::analyze_observed(&program, &BTreeMap::new(), &mut timeline).unwrap();
         let parameter = program
@@ -388,7 +389,8 @@ mod tests {
         for weight in weights {
             config = config.with_automatic_input(weight, Precision::F16);
         }
-        let program = crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let program =
+            crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
         let initial = program
             .inputs
             .iter()

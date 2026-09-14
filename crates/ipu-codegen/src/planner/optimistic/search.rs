@@ -1,4 +1,26 @@
-use super::*;
+use crate::compile::PipelineConfig;
+use crate::estimate::{Ipu21CostModel, MemoryPeaks, MemoryUsage};
+use crate::graph::{ComputeGraph, GraphInputKind, OperationKind, ValueId};
+use crate::planner::optimistic::ConversionPath;
+use crate::planner::optimistic::CycleEstimate;
+use crate::planner::optimistic::DiagnosticMidGraph;
+use crate::planner::optimistic::RegionRequest;
+use crate::planner::optimistic::SearchError;
+use crate::planner::optimistic::SearchOptions;
+use crate::planner::optimistic::SearchReport;
+use crate::planner::optimistic::Step;
+use crate::planner::optimistic::StepKind;
+use crate::planner::optimistic::Transform;
+use crate::planner::optimistic::TransformKind;
+use crate::planner::optimistic::Value;
+use crate::planner::optimistic::enumerate_conversions;
+use crate::planner::optimistic::invalid;
+use crate::planner::optimistic::truncate_with_baseline;
+use crate::planner::optimistic::valid_tensor;
+
+use crate::planner::candidates::{OutputDemands, plans};
+use crate::tensor::{Layout, MemoryClass, TensorFormat, TensorType};
+use std::collections::{BTreeMap, BTreeSet};
 type ConversionCache = std::collections::HashMap<(TensorType, TensorType), Vec<ConversionPath>>;
 
 #[derive(Clone, Default)]
@@ -205,7 +227,7 @@ pub fn plan_region(
         .collect::<BTreeSet<_>>();
     let demands = OutputDemands::new(ops, graph.value_shapes(), config);
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-    let fragments = super::super::implementation::FragmentCache::default();
+    let fragments = crate::planner::cache::FragmentCache::default();
     let mut conversion_cache = ConversionCache::new();
     let mut beam = vec![initial];
     let mut report = SearchReport::default();

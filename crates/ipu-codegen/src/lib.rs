@@ -16,7 +16,7 @@ mod kernel;
 mod low;
 mod memory;
 mod mid;
-pub use mid::optimistic;
+pub use planner::optimistic;
 mod compile;
 mod package;
 mod place;
@@ -24,6 +24,10 @@ mod planner;
 mod storage;
 mod tensor;
 mod tile;
+pub use compile::{
+    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking,
+    GemmPlanConstraint, PipelineConfig,
+};
 pub use compile::{
     ExpansionBenchmark, ExpansionTiming, PackageConfig, benchmark_mid_expansion,
     build_diagnostic_package, build_package, capture_exchange_baseline,
@@ -47,17 +51,16 @@ pub use low::{
     shard_storage_bytes,
 };
 pub(crate) use memory::*;
+pub use mid::ReductionStaging;
 pub(crate) use mid::*;
-pub use mid::{
-    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmOrientation,
-    GemmOutputPacking, GemmPlanConstraint, LocalOperandStaging, MidOperator, OperatorCandidate,
-    PipelineConfig, ReductionStaging,
-};
 pub use package::{
     CompiledPackage, DiagnosticShard, DiagnosticTensor, TileProgramData, build_tile_program_package,
 };
 pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
+// Compatibility name for planner choices; this is not an executable mid node.
+pub use planner::OperatorFamily as MidOperator;
+pub use planner::{GemmOrientation, LocalOperandStaging, OperatorCandidate};
 pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
 pub(crate) use tensor::*;

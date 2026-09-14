@@ -1,10 +1,18 @@
 //! Planner family choices, dispatch parameters and operand/result requirements.
 
-use super::*;
+use crate::graph::{AttentionOptions, GemmOptions};
+use crate::kernel::{AccumulationPrecision, TileKernelSpec};
+use crate::mid::ReductionStaging;
+use crate::planner::catalogue::blocked_gemm_dispatch;
+use crate::tensor::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisFactorView,
+    BlockMajorOrder, ElementOrder, GridOrder, Layout, Precision, TensorAxis, TensorFormat,
+    TensorShape, TensorType,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MidOperator {
+pub enum OperatorFamily {
     Gemm {
         options: GemmOptions,
         multiply: Precision,
@@ -51,8 +59,9 @@ impl GemmOrientation {
     }
 }
 
-/// Shape-independent recipe which expands into ordered device-wide exchange
-/// and tile-kernel phases after concrete shards are known.
+/// Selected family algorithm and blocking. Family construction consumes this
+/// choice and boundary tensor types to build executable mid operations; it is
+/// never retained as an operation to be expanded by low.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OperatorDispatch {
     LayerNorm {
@@ -111,32 +120,6 @@ pub struct ProductGrid {
     pub rows: u16,
     pub columns: u16,
     pub inner: u16,
-}
-
-/// Lifetime policy for partials reduced across a GEMM's K partitions.
-#[derive(
-    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-pub enum ReductionStaging {
-    /// Receive every remote partial into one packed buffer, then reduce once.
-    #[default]
-    Complete,
-    /// Receive and accumulate one remote partial at a time. This minimizes
-    /// temporary SRAM at the expense of additional exchange epochs and kernel
-    /// launches.
-    Streamed,
-    /// Receive at most this many remote partials per exchange epoch.
-    Batched(std::num::NonZeroU16),
-}
-
-impl ReductionStaging {
-    pub(crate) fn remote_partials_per_stage(self, remote: u64) -> u64 {
-        match self {
-            Self::Complete => remote.max(1),
-            Self::Streamed => 1,
-            Self::Batched(limit) => u64::from(limit.get()).min(remote.max(1)),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -280,20 +263,20 @@ pub(super) fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> b
         .map_or(true, |resolved| resolved.has_empty_shards())
 }
 
-pub(super) fn default_dispatch(operator: MidOperator) -> OperatorDispatch {
+pub(super) fn default_dispatch(operator: OperatorFamily) -> OperatorDispatch {
     match operator {
-        MidOperator::Gemm { .. } => blocked_gemm_dispatch(AMP_OUTPUT_COLUMN_BLOCK),
-        MidOperator::LayerNorm => OperatorDispatch::Pointwise {
+        OperatorFamily::Gemm { .. } => blocked_gemm_dispatch(AMP_OUTPUT_COLUMN_BLOCK),
+        OperatorFamily::LayerNorm => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::LayerNorm,
         },
-        MidOperator::Gelu => OperatorDispatch::Pointwise {
+        OperatorFamily::Gelu => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Gelu,
         },
-        MidOperator::Add => OperatorDispatch::Pointwise {
+        OperatorFamily::Add => OperatorDispatch::Pointwise {
             kernel: TileKernelSpec::Add,
         },
-        MidOperator::View(_) | MidOperator::Slice(_) => OperatorDispatch::View,
-        MidOperator::FlashAttention {
+        OperatorFamily::View(_) | OperatorFamily::Slice(_) => OperatorDispatch::View,
+        OperatorFamily::FlashAttention {
             options,
             accumulate,
         } => OperatorDispatch::Pointwise {
@@ -335,7 +318,7 @@ pub struct StorageRequirements {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OperatorPlan {
-    pub operator: MidOperator,
+    pub operator: OperatorFamily,
     pub dispatch: OperatorDispatch,
     pub requirements: StorageRequirements,
 }
@@ -426,7 +409,7 @@ impl OperatorPlan {
         }
         match (&self.operator, &self.dispatch) {
             (
-                MidOperator::Gemm {
+                OperatorFamily::Gemm {
                     options, multiply, ..
                 },
                 OperatorDispatch::BlockedGemm {
@@ -621,21 +604,21 @@ impl OperatorPlan {
                 Ok(())
             }
             (
-                MidOperator::LayerNorm,
+                OperatorFamily::LayerNorm,
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::LayerNorm,
                 },
             )
-            | (MidOperator::LayerNorm, OperatorDispatch::LayerNorm { .. })
+            | (OperatorFamily::LayerNorm, OperatorDispatch::LayerNorm { .. })
             | (
-                MidOperator::Gelu,
+                OperatorFamily::Gelu,
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::Gelu,
                     ..
                 },
             )
             | (
-                MidOperator::Add,
+                OperatorFamily::Add,
                 OperatorDispatch::Pointwise {
                     kernel: TileKernelSpec::Add,
                     ..
@@ -652,7 +635,7 @@ impl OperatorPlan {
                 }
             }
             (
-                MidOperator::FlashAttention {
+                OperatorFamily::FlashAttention {
                     options,
                     accumulate,
                 },
@@ -694,7 +677,7 @@ impl OperatorPlan {
                 }
             }
             (
-                MidOperator::FlashAttention {
+                OperatorFamily::FlashAttention {
                     options,
                     accumulate,
                 },
@@ -717,7 +700,7 @@ impl OperatorPlan {
                     Ok(())
                 }
             }
-            (MidOperator::Slice(slice), OperatorDispatch::View) => {
+            (OperatorFamily::Slice(slice), OperatorDispatch::View) => {
                 let [input] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };
@@ -729,7 +712,7 @@ impl OperatorPlan {
                     Ok(())
                 }
             }
-            (MidOperator::View(view), OperatorDispatch::View) => {
+            (OperatorFamily::View(view), OperatorDispatch::View) => {
                 let [input] = inputs else {
                     return Err(OperatorPlanError::OperandArity);
                 };

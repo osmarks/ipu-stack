@@ -1,87 +1,38 @@
 //! Deterministic whole-device lowering with explicit, canonical boundaries.
-use super::*;
-use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Recipe {
-    pub plans: BTreeMap<OperationId, OperatorPlan>,
-    pub open_boundaries: BTreeSet<ValueId>,
-    /// Initial capacity-baseline or legacy checkpoint requests; converted to
-    /// individual cast sites after expansion and never saved in this form.
-    #[serde(default, skip_serializing)]
-    pub early_casts: BTreeSet<OperationId>,
-    #[serde(default)]
-    pub cast_before_copies: BTreeSet<super::cast_order::CastSite>,
-    pub packing_rows: Option<u16>,
-    pub parallel_reductions: usize,
-    pub disjoint_copy_sources: bool,
-    #[serde(default)]
-    pub in_place_casts: Option<bool>,
-}
+use crate::compile::PipelineConfig;
+use crate::estimate::{CostModel, MemoryPeaks, region_peak_memory_with_multiplicity};
+use crate::graph::{
+    ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, ValueId,
+};
+use crate::mid::{
+    CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion, MidRepeat,
+    MidValueId,
+};
+use crate::planner::bind::{ValueBuilder, emit_selected, ensure_format, lookup};
+use crate::planner::cache::FragmentCache;
+use crate::planner::candidates::{CandidateSearch, OutputDemands};
+use crate::planner::catalogue::{
+    candidate_active_tile_counts, default_operator_candidates, operator_candidates_for_tile_count,
+    shape_aware_active_tile_counts,
+};
+use crate::planner::error::{LoweringError, LoweringResult};
+use crate::planner::operator::{OperandMaterialization, OperatorDispatch, OperatorPlan};
+use crate::planner::parameter_homes;
+use crate::planner::recipe::{Candidate, Recipe};
+use crate::tensor::{
+    AxisTiling, Layout, Padding, Precision, TensorAxis, TensorFormat, TensorShape, TensorTiling,
+    TensorType,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
-impl Recipe {
-    pub(crate) fn normalize(&mut self, config: &PipelineConfig) {
-        self.in_place_casts = Some(self.in_place_casts.unwrap_or(config.capacity_baseline));
-    }
-
-    pub(crate) fn changes(&self, before: &Self) -> impl std::fmt::Debug {
-        #[derive(Debug)]
-        #[allow(dead_code)] // Fields are consumed by Debug only.
-        struct Changes {
-            plans: BTreeSet<OperationId>,
-            boundaries: Vec<ValueId>,
-            casts: Vec<super::cast_order::CastSite>,
-            early_casts: Vec<OperationId>,
-            packing_rows: (Option<u16>, Option<u16>),
-            parallel_reductions: (usize, usize),
-            disjoint_copy_sources: (bool, bool),
-            in_place_casts: (Option<bool>, Option<bool>),
-        }
-        Changes {
-            plans: self
-                .plans
-                .keys()
-                .chain(before.plans.keys())
-                .copied()
-                .filter(|id| self.plans.get(id) != before.plans.get(id))
-                .collect(),
-            boundaries: self
-                .open_boundaries
-                .symmetric_difference(&before.open_boundaries)
-                .copied()
-                .collect(),
-            casts: self
-                .cast_before_copies
-                .symmetric_difference(&before.cast_before_copies)
-                .copied()
-                .collect(),
-            early_casts: self
-                .early_casts
-                .symmetric_difference(&before.early_casts)
-                .copied()
-                .collect(),
-            packing_rows: (before.packing_rows, self.packing_rows),
-            parallel_reductions: (before.parallel_reductions, self.parallel_reductions),
-            disjoint_copy_sources: (before.disjoint_copy_sources, self.disjoint_copy_sources),
-            in_place_casts: (before.in_place_casts, self.in_place_casts),
-        }
-    }
-}
-
-pub(crate) struct Baseline {
-    pub program: MidProgram,
-    pub recipe: Recipe,
-    pub alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
-    pub cast_sites: BTreeSet<super::cast_order::CastSite>,
-}
-
-pub(crate) fn lower(
+pub(crate) fn build_candidate(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
     fragments: &FragmentCache,
     recipe: &Recipe,
-) -> LoweringResult<Baseline> {
+) -> LoweringResult<Candidate> {
     let mut selected = select(graph, config, costs, fragments, recipe)?;
     let mut program = selected.program;
     selected.cast_sites = program.reorder_casts(
@@ -98,7 +49,12 @@ pub(crate) fn lower(
     selected.program = if config.diagnostic_checkpoints {
         program
     } else {
-        program.with_elementwise_fusions(config).unwrap_or(program)
+        program
+            .with_elementwise_fusions(
+                config.standard_memory_reservation_bytes,
+                config.tile_memory_budget_bytes,
+            )
+            .unwrap_or(program)
     };
     if !config.diagnostic_checkpoints {
         if let Some(rows) = recipe.packing_rows {
@@ -135,7 +91,7 @@ pub(crate) fn select(
     costs: &impl CostModel,
     fragments: &FragmentCache,
     recipe: &Recipe,
-) -> LoweringResult<Baseline> {
+) -> LoweringResult<Candidate> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -159,7 +115,7 @@ pub(crate) fn select(
         costs,
         fragments,
         recipe: recipe.clone(),
-        state: LoweringState::default(),
+        state: ValueBuilder::default(),
         values: BTreeMap::new(),
         alternatives: BTreeMap::new(),
         copies: BTreeMap::new(),
@@ -209,7 +165,7 @@ pub(crate) fn select(
         .iter()
         .map(|id| lookup(&builder.values, *id))
         .collect::<LoweringResult<Vec<_>>>()?;
-    ownership::assign_parameter_tiles(
+    parameter_homes::assign_parameter_tiles(
         &mut builder.state.values,
         &mut operations,
         &inputs
@@ -231,7 +187,7 @@ pub(crate) fn select(
         peak_memory: MemoryPeaks::default(),
     };
     program.validate()?;
-    Ok(Baseline {
+    Ok(Candidate {
         cast_sites: BTreeSet::new(),
         program,
         recipe: builder.recipe,
@@ -284,7 +240,7 @@ struct Builder<'a, C> {
     costs: &'a C,
     fragments: &'a FragmentCache,
     recipe: Recipe,
-    state: LoweringState,
+    state: ValueBuilder,
     values: BTreeMap<ValueId, MidValueId>,
     alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
     copies: BTreeMap<MidValueId, u32>,
@@ -402,7 +358,7 @@ impl<C: CostModel> Builder<'_, C> {
                         if !self.config.capacity_baseline {
                             let (inputs, output) = plan.tensor_types(&types, shape);
                             let implementation = self.fragments.get(plan, &inputs, &output)?;
-                            let mut state = LoweringState::default();
+                            let mut state = ValueBuilder::default();
                             let mut conversions = Vec::new();
                             for ((source, requirement), &automatic) in
                                 types.iter().zip(&plan.requirements.inputs).zip(&automatic)
@@ -440,7 +396,7 @@ impl<C: CostModel> Builder<'_, C> {
                         // Lower the actual boundary -> operator -> boundary sequence.
                         // The operator alone omits live source buffers and cast/pack
                         // temporaries, which can be larger than its own scratch.
-                        let mut state = LoweringState::default();
+                        let mut state = ValueBuilder::default();
                         let mut values = BTreeMap::new();
                         let mut initial = Vec::new();
                         for (index, (&origin, source)) in
@@ -450,7 +406,7 @@ impl<C: CostModel> Builder<'_, C> {
                             if automatic[index] && parameters[index] {
                                 source.format.layout.order =
                                     plan.requirements.inputs[index].format.layout.order;
-                                source.format.layout = ownership::compact_parameter_layout(
+                                source.format.layout = parameter_homes::compact_parameter_layout(
                                     &source,
                                     self.copies.get(&ids[index]).copied().unwrap_or(1),
                                     self.config,
@@ -470,6 +426,7 @@ impl<C: CostModel> Builder<'_, C> {
                             plan,
                             self.costs,
                             self.fragments,
+                            self.config.tile_count,
                             &mut values,
                             &mut state,
                             &mut sequence,
@@ -547,8 +504,9 @@ impl<C: CostModel> Builder<'_, C> {
                     let mut tensor = self.state.get(id).tensor_type.clone();
                     tensor.format.layout.order = requirement.format.layout.order;
                     let copies = self.copies.get(&id).copied().unwrap_or(1);
-                    let layout = ownership::compact_parameter_layout(&tensor, copies, self.config)
-                        .ok_or(LoweringError::NoCandidate(operation.id))?;
+                    let layout =
+                        parameter_homes::compact_parameter_layout(&tensor, copies, self.config)
+                            .ok_or(LoweringError::NoCandidate(operation.id))?;
                     self.state.retarget_automatic_input(id, layout);
                 }
             }
@@ -564,6 +522,7 @@ impl<C: CostModel> Builder<'_, C> {
                 &selected,
                 self.costs,
                 self.fragments,
+                self.config.tile_count,
                 &mut self.values,
                 &mut self.state,
                 &mut operations,
@@ -795,6 +754,8 @@ impl<C: CostModel> Builder<'_, C> {
 
 #[cfg(test)]
 mod tests {
+    use crate::estimate::{Ipu21CostModel, MemoizedCostModel};
+
     use super::*;
 
     #[test]
@@ -811,11 +772,11 @@ mod tests {
         let config = PipelineConfig::new(8)
             .with_automatic_input(x, Precision::F16)
             .with_automatic_input(weight, Precision::F16);
-        let baseline = lower(
+        let baseline = build_candidate(
             &graph,
             &config,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
+            &crate::planner::cache::FragmentCache::default(),
             &Recipe::default(),
         )
         .unwrap();
@@ -881,11 +842,11 @@ mod tests {
                 .unwrap()[0];
             graph.set_outputs([output]).unwrap();
             let costs = MemoizedCostModel::new(&Ipu21CostModel);
-            let baseline = lower(
+            let baseline = build_candidate(
                 &graph,
                 &config,
                 &costs,
-                &crate::mid::implementation::FragmentCache::default(),
+                &crate::planner::cache::FragmentCache::default(),
                 &Recipe::default(),
             )
             .unwrap();

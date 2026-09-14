@@ -1,8 +1,8 @@
 //! Portable search decisions, without physical addresses or scheduler caches.
+use crate::compile::PipelineConfig;
 use crate::graph::ComputeGraph;
-use crate::mid::PipelineConfig;
-use crate::mid::baseline::{Baseline, Recipe};
 use crate::package::{PackageBuildResult, invalid};
+use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -11,7 +11,7 @@ pub(crate) struct State {
     version: u32,
     context: String,
     pub recipe: Recipe,
-    pub alternatives: BTreeMap<crate::OperationId, Vec<crate::OperatorPlan>>,
+    pub alternatives: BTreeMap<crate::OperationId, Vec<crate::planner::operator::OperatorPlan>>,
     pub inputs: BTreeMap<crate::ValueId, crate::TensorFormat>,
     pub visited: Vec<Recipe>,
     pub mapping: Option<Vec<u16>>,
@@ -85,7 +85,7 @@ impl State {
     pub fn save(
         &mut self,
         config: &PipelineConfig,
-        incumbent: &Baseline,
+        incumbent: &Candidate,
         fixed: &PipelineConfig,
     ) -> PackageBuildResult<()> {
         let Some(path) = &config.save_search_state else {
@@ -174,7 +174,7 @@ fn context_difference(saved: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Ipu21CostModel;
+    use crate::estimate::Ipu21CostModel;
 
     #[test]
     fn legacy_graph_registry_preserves_graph_and_configuration_checks() {
@@ -241,11 +241,11 @@ mod tests {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(4).with_automatic_input(input, crate::Precision::F16);
         let mut state = State::load(&graph, &config, None).unwrap();
-        let selected = crate::mid::baseline::lower(
+        let selected = crate::planner::build_candidate(
             &graph,
             &config,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
+            &crate::planner::cache::FragmentCache::default(),
             &Recipe::default(),
         )
         .unwrap();

@@ -1,4 +1,19 @@
-use super::*;
+use crate::estimate::CostModel;
+use crate::estimate::Ipu21CostModel;
+use crate::kernel::TileKernelSpec;
+use crate::low::default_copy_policy;
+use crate::mid::cast_order;
+use crate::planner::optimistic::Assumption;
+use crate::planner::optimistic::CycleEstimate;
+use crate::planner::optimistic::SearchError;
+use crate::planner::optimistic::SearchOptions;
+use crate::planner::optimistic::Transform;
+use crate::planner::optimistic::TransformKind;
+use crate::planner::optimistic::invalid;
+use crate::planner::optimistic::truncate_with_baseline;
+use crate::planner::optimistic::valid_tensor;
+use crate::tensor::{AmpOrder, ElementOrder, Precision, TensorType};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default)]
 pub struct ConversionPath {

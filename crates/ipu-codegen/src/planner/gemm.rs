@@ -1,8 +1,18 @@
 //! Distributed GEMM decomposition and explicit independent partials.
 
-use super::*;
+use super::fragments::{FragmentBuilder, project_grid};
+use crate::kernel::{AccumulationPrecision, GemmKernelMode};
+use crate::mid::{Compute, MidOperationKind, MidValueId, Product, ProductAxes, ReductionStaging};
+use crate::planner::operator::{
+    GemmDistribution, GemmOrientation, LocalOperandStaging, OperatorFamily, OperatorPlan,
+    ProductGrid,
+};
+use crate::tensor::{
+    AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, MemoryClass, Padding, Precision,
+    TensorAxis, TensorTiling, TensorType, axis_tiling, same_distribution,
+};
 
-impl Builder {
+impl FragmentBuilder {
     pub(super) fn gemm(
         &mut self,
         plan: &OperatorPlan,
@@ -12,7 +22,7 @@ impl Builder {
         orientation: GemmOrientation,
         distribution: GemmDistribution,
     ) -> Option<MidValueId> {
-        let MidOperator::Gemm {
+        let OperatorFamily::Gemm {
             multiply,
             accumulate,
             ..
@@ -21,8 +31,8 @@ impl Builder {
             return None;
         };
         let (left, right) = orientation.operand_indices();
-        let left = MidValueId(left as u32);
-        let right = MidValueId(right as u32);
+        let left = MidValueId::from_index(left as u32);
+        let right = MidValueId::from_index(right as u32);
         let left_source_type = self.tensor(left).clone();
         let right_source_type = self.tensor(right).clone();
         let mut left_type = left_source_type.clone();
@@ -69,7 +79,7 @@ impl Builder {
                 let mut partial = plan.dispatch.gemm_partial_tensor(output);
                 // Partials follow compute rows, including padding/group boundaries;
                 // the final result may partition those rows differently.
-                let mut rows = *axis(&left_type, left_row)?;
+                let mut rows = *axis_tiling(&left_type, left_row)?;
                 rows.axis = TensorAxis::FromStart(output_row as u16);
                 let target = partial
                     .format
@@ -80,10 +90,10 @@ impl Builder {
                     .find(|dim| dim.axis.resolve(output.shape.0.len()) == Ok(output_row))?;
                 *target = rows;
                 let mut right_staging = right_type;
-                let mut inner = *axis(&left_type, left_inner)?;
+                let mut inner = *axis_tiling(&left_type, left_inner)?;
                 inner.axis = TensorAxis::FromStart(right_inner as u16);
                 inner.tile_stride = Some(column_partitions);
-                let mut column = *axis(&partial, output_column)?;
+                let mut column = *axis_tiling(&partial, output_column)?;
                 column.axis = TensorAxis::FromStart(right_column as u16);
                 column.tile_stride = Some(1);
                 right_staging.format.layout.tiling = TensorTiling {
@@ -158,7 +168,7 @@ impl Builder {
                     (&mut left_panel, &left_type, left_inner),
                     (&mut right_panel, &right_type, right_inner),
                 ] {
-                    if let Some(axis) = axis(input, inner_axis) {
+                    if let Some(axis) = axis_tiling(input, inner_axis) {
                         tensor.format.layout.tiling.axes.push(*axis);
                     }
                 }
@@ -225,7 +235,7 @@ impl Builder {
     }
 }
 
-impl Builder {
+impl FragmentBuilder {
     /// A batched product with independent row/column/K ownership, followed by
     /// redistribution (or a sum of explicit partials) into its consumer layout.
     pub(super) fn distributed_product(

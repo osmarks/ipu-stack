@@ -1,9 +1,8 @@
 use super::order::maximum_ready_matching;
 use super::*;
-use crate::{
-    ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat, lower,
-    lower_to_tiles, place,
-};
+use crate::estimate::Ipu21CostModel;
+use crate::planner::test_support::lower;
+use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles, place};
 use ipu_exchange::{patch_sender_instruction, sender_address_instruction_groups};
 
 #[test]
@@ -853,7 +852,7 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
                 layout: Layout::block_major_matrix(64, tiles),
             },
         );
-    let mid = crate::mid::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = crate::planner::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
     let expanded = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();
@@ -930,7 +929,8 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
 
 #[test]
 fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
-    use crate::{ComputeGraph, Ipu21CostModel, Layout, PipelineConfig, Precision, TensorFormat};
+    use crate::estimate::Ipu21CostModel;
+    use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat};
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [729, 1152]).unwrap();
     let parameters = (0..27)
@@ -959,7 +959,7 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
             },
         );
     }
-    let mid = crate::lower(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
     let expanded = crate::expand_tiles(&mid).unwrap();
     let low = crate::lower_to_tiles(&expanded, false);
     let placement = crate::place(&low).unwrap();

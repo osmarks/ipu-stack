@@ -57,7 +57,7 @@ impl MappingTraffic {
             .map(|score| {
                 score
                     .0
-                    .saturating_add(crate::IPU21_TARGET_COSTS.exchange_phase_cycles)
+                    .saturating_add(crate::estimate::IPU21_TARGET_COSTS.exchange_phase_cycles)
             })
             .collect()
     }

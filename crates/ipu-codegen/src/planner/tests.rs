@@ -1,5 +1,44 @@
-use super::*;
-
+use crate::compile::{
+    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmPlanConstraint,
+    PipelineConfig,
+};
+use crate::estimate::{CostModel, Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
+use crate::graph::{
+    AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId,
+};
+use crate::kernel::{AccumulationPrecision, TileKernelSpec};
+use crate::low::CopyPolicy;
+use crate::mid::{
+    Compute, CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue,
+    MidValueId, Product, ProductAxes, ReductionStaging, cast_order, expand_tiles,
+};
+use crate::planner::cache::FragmentCache;
+use crate::planner::candidates::{
+    CandidateSearch, OutputDemand, OutputDemands, PlanMetrics, gemm_plan_matches,
+    independent_parameter_storage, operator_candidate_compatibility, parallel_reduction_candidates,
+    plans, retain_operator_candidates,
+};
+use crate::planner::catalogue::{
+    AmpGridShape, AmpWeightPlacement, ConcreteOperatorCandidate, OperatorCandidate,
+    OperatorFormatPolicy, amp_gemm_operator_candidate, amp_grid_gemm_operator_candidate,
+    candidate_active_tile_counts, default_operator_candidates, gemm_accumulation_precision,
+    operator_candidates_for_tile_count, shape_aware_active_tile_counts,
+};
+use crate::planner::error::LoweringError;
+use crate::planner::operator::{
+    GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
+    OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing,
+    StorageRequirements, default_dispatch,
+};
+use crate::planner::recipe::Recipe;
+use crate::planner::{bind, build, candidates, test_support::lower};
+use crate::tensor::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisFactorView,
+    AxisTiling, BlockMajorOrder, ElementOrder, GridOrder, Layout, LayoutError, MemoryClass,
+    Padding, Precision, ShardExtent, TensorAxis, TensorFormat, TensorShape, TensorTiling,
+    TensorType,
+};
+use std::collections::{BTreeMap, BTreeSet};
 const RANDOM_CASES: usize = 128;
 
 #[test]
@@ -36,7 +75,7 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
         .with_automatic_input(x, Precision::F16)
         .with_automatic_input(gamma, Precision::F16)
         .with_automatic_input(beta, Precision::F16);
-    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
     assert!(mid.operations.iter().any(|op| matches!(
         op.kind,
         MidOperationKind::Compute(Compute::Kernel {
@@ -89,7 +128,7 @@ fn layernorm_distributes_batch_rows_without_splitting_features() {
                     .tile_count
                     == 1472
         });
-        let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
         let value = &mid.values[mid.outputs[0].index() as usize].tensor_type;
         let shards = value.format.layout.shard_extents(&value.shape).unwrap();
         assert_eq!(shards.len(), owners);
@@ -135,7 +174,7 @@ fn add_grid_uses_rows_before_splitting_columns() {
                     .tile_count
                     == 1472
         });
-        let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
         let tiling = &mid.values[mid.outputs[0].index() as usize]
             .tensor_type
             .format
@@ -175,7 +214,7 @@ fn single_row_add_can_keep_column_ownership() {
         let config = PipelineConfig::new(tiles)
             .with_input(x, format.clone())
             .with_input(y, format);
-        let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
         let output = &mid.values[mid.outputs[0].index() as usize].tensor_type;
         assert_eq!(output.format.layout, layout);
         assert_eq!(
@@ -207,19 +246,19 @@ fn fp8_mlp_can_quantize_before_replication() {
         .with_automatic_input(w1, fp8);
     config
         .operator_candidates
-        .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+        .retain(|c| !matches!(c.operator(), OperatorFamily::Gemm { .. }));
     config
         .operator_candidates
         .push(OperatorCandidate::fp8_gemm(1472, -4));
-    let mut recipe = baseline::Recipe::default();
+    let mut recipe = Recipe::default();
     recipe
         .early_casts
         .extend(graph.operations().iter().map(|op| op.id));
-    let lowered = baseline::lower(
+    let lowered = build::build_candidate(
         &graph,
         &config,
-        &crate::Ipu21CostModel,
-        &crate::mid::implementation::FragmentCache::default(),
+        &crate::estimate::Ipu21CostModel,
+        &crate::planner::cache::FragmentCache::default(),
         &recipe,
     )
     .unwrap();
@@ -244,7 +283,7 @@ fn fp8_conversion_precedes_operand_replication() {
     let mut graph = ComputeGraph::new();
     let host = graph.host_input("input", [512, 64]).unwrap();
     graph.gelu(host).unwrap();
-    let mut state = lowering::LoweringState::default();
+    let mut state = bind::ValueBuilder::default();
     let input_layout = Layout::amp_left(64, 64);
     let input = state.value(
         ValueId::from_index(0),
@@ -258,12 +297,12 @@ fn fp8_conversion_precedes_operand_replication() {
         },
     };
     let mut operations = Vec::new();
-    lowering::ensure_format(
+    bind::ensure_format(
         input,
         target.clone(),
         OperandMaterialization::Complete,
         graph.operations()[0].id,
-        &crate::Ipu21CostModel,
+        &crate::estimate::Ipu21CostModel,
         &mut state,
         &mut operations,
     );
@@ -277,7 +316,16 @@ fn fp8_conversion_precedes_operand_replication() {
     mid.reorder_casts(&sites, &BTreeSet::new());
     assert_eq!(mid.operations.len(), 2);
     let cast = &mid.operations[0];
-    assert!(rewrite::fp8_cast(cast, &mid.values).is_some());
+    assert!(matches!(
+        cast.kind,
+        MidOperationKind::Compute(Compute::Kernel {
+            kernel: TileKernelSpec::Cast {
+                from: Precision::F16,
+                to: Precision::F8F143 { .. }
+            },
+            ..
+        })
+    ));
     let packed = &value(&mid, cast.results[0]).tensor_type.format;
     assert_eq!(packed.layout, input_layout);
     assert_eq!(packed.precision, target.precision);
@@ -441,7 +489,7 @@ fn randomized_parallel_reduction_candidates_cover_uneven_three_axis_grids() {
             &TensorShape(vec![m, n]),
             &config,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
+            &crate::planner::cache::FragmentCache::default(),
             true,
             None,
             None,
@@ -526,7 +574,7 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
             Precision::F16,
             Layout::amp_output_grid(64, tiles, rows, columns, GridOrder::ColumnsFast),
         );
-        let operator = MidOperator::Gemm {
+        let operator = OperatorFamily::Gemm {
             options: GemmOptions::default(),
             multiply: Precision::F16,
             accumulate: AccumulationPrecision::F32,
@@ -546,10 +594,11 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
             requirements,
         };
         let standard_cost =
-            crate::mid::implementation::implement(&plan, &[left.clone(), standard], &output)
+            crate::planner::fragments::build_fragment(&plan, &[left.clone(), standard], &output)
                 .map_or(u64::MAX, |program| program.estimated_cycles);
-        let direct_cost = crate::mid::implementation::implement(&plan, &[left, direct], &output)
-            .map_or(u64::MAX, |program| program.estimated_cycles);
+        let direct_cost =
+            crate::planner::fragments::build_fragment(&plan, &[left, direct], &output)
+                .map_or(u64::MAX, |program| program.estimated_cycles);
         assert!(direct_cost < standard_cost);
     }
 }
@@ -679,8 +728,8 @@ impl CostModel for ColumnParityCost {
             Precision::F32
         };
         Some(match plan.operator {
-            MidOperator::Gemm { multiply, .. } if multiply == preferred => 0,
-            MidOperator::Gemm { .. } => 1,
+            OperatorFamily::Gemm { multiply, .. } if multiply == preferred => 0,
+            OperatorFamily::Gemm { .. } => 1,
             _ => 0,
         })
     }
@@ -786,7 +835,7 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         );
         let accumulate = gemm_accumulation_precision(multiply);
         let candidate = ConcreteOperatorCandidate::new(
-            MidOperator::Gemm {
+            OperatorFamily::Gemm {
                 options: GemmOptions::default(),
                 multiply,
                 accumulate,
@@ -998,13 +1047,13 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .with_input(attention_value, random_format(&mut random, tiles));
         config.operator_candidates = vec![
             ConcreteOperatorCandidate::new(
-                MidOperator::Gelu,
+                OperatorFamily::Gelu,
                 [OperandRequirement::new(gelu_input.clone())],
                 OperandRequirement::new(gelu_output.clone()),
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
             ConcreteOperatorCandidate::new(
-                MidOperator::Add,
+                OperatorFamily::Add,
                 [
                     OperandRequirement::new(add_left.clone()),
                     OperandRequirement::new(add_right.clone()),
@@ -1013,7 +1062,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             )
             .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0])),
             ConcreteOperatorCandidate::new(
-                MidOperator::FlashAttention {
+                OperatorFamily::FlashAttention {
                     options: AttentionOptions::default(),
                     accumulate: attention_accumulate,
                 },
@@ -1349,7 +1398,7 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
             OperatorCandidate::Concrete(concrete) => Some(concrete.plan),
             _ => None,
         })
-        .filter(|plan| matches!(plan.operator, MidOperator::Gemm { .. }))
+        .filter(|plan| matches!(plan.operator, OperatorFamily::Gemm { .. }))
         .collect::<Vec<_>>();
     assert!(
         candidates
@@ -1362,7 +1411,7 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
     let output = TensorShape::new([128, 64]);
     let rows = |plan: &OperatorPlan| {
         let (inputs, output) = plan.tensor_types(&inputs, &output);
-        crate::mid::implementation::implement(plan, &inputs, &output)
+        crate::planner::fragments::build_fragment(plan, &inputs, &output)
             .unwrap()
             .peak_memory
             .exchange_rows
@@ -1373,7 +1422,7 @@ fn operator_shortlists_stay_bounded_when_format_diversity_exceeds_width() {
         &inputs,
         &output,
         &Ipu21CostModel,
-        &crate::mid::implementation::FragmentCache::default(),
+        &crate::planner::cache::FragmentCache::default(),
         2,
     );
     assert!((2..=4).contains(&selected.len()));
@@ -1413,7 +1462,7 @@ fn uneven_mlp_products_preserve_global_coordinates() {
         .with_automatic_input(input, Precision::F16)
         .with_automatic_input(up, Precision::F16)
         .with_automatic_input(down, Precision::F16);
-    let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
     let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let useful: u64 = tiles
         .kernel_runs
@@ -1461,12 +1510,12 @@ fn blocked_attention_reserves_online_state_between_accumulator_rows() {
         .with_automatic_input(q, Precision::F16)
         .with_automatic_input(k, Precision::F16)
         .with_automatic_input(v, Precision::F16);
-    let mid = baseline::lower(
+    let mid = build::build_candidate(
         &graph,
         &config,
         &Ipu21CostModel,
-        &crate::mid::implementation::FragmentCache::default(),
-        &baseline::Recipe::default(),
+        &crate::planner::cache::FragmentCache::default(),
+        &Recipe::default(),
     )
     .unwrap()
     .program;
@@ -1506,7 +1555,7 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .with_automatic_input(query, Precision::F16)
         .with_automatic_input(key, Precision::F16)
         .with_automatic_input(value, Precision::F16);
-    let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+    let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
     let product = mid
         .operations
         .iter()
@@ -1577,12 +1626,12 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
                 reduction_staging: ReductionStaging::Complete,
                 local_weight_staging: LocalOperandStaging::Direct,
             });
-        let selected = baseline::select(
+        let selected = build::select(
             &graph,
             &config,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
-            &baseline::Recipe::default(),
+            &crate::planner::cache::FragmentCache::default(),
+            &Recipe::default(),
         )
         .unwrap();
         plans.push(selected.recipe.plans.values().next().unwrap().clone());
@@ -1607,7 +1656,7 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
         &inputs,
         &output,
         &Ipu21CostModel,
-        &crate::mid::implementation::FragmentCache::default(),
+        &crate::planner::cache::FragmentCache::default(),
         1,
     );
     assert_eq!(selected, vec![expected]);
@@ -1663,7 +1712,7 @@ fn unconstrained_mlp_shortlists_preserve_historical_memory_alternatives() {
             &inputs,
             &shape,
             &costs,
-            &crate::mid::implementation::FragmentCache::default(),
+            &crate::planner::cache::FragmentCache::default(),
             config.operator_candidate_limit,
         );
         for memory in [MemoryClass::Ipu21Standard, MemoryClass::Ipu21Interleaved] {
@@ -1797,7 +1846,7 @@ fn value_projection_retains_head_grouped_swapped_output_from_packed_activations(
             &[false, true],
             graph.value_shape(projection).unwrap(),
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
+            &crate::planner::cache::FragmentCache::default(),
         )
         .unwrap();
     let requested = OutputDemand {
@@ -1893,7 +1942,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
         config.attention_fp8_scales = scales;
-        let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
         let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
         let kernels = crate::KernelBuildPlan::from_program(&tiled).unwrap();
@@ -1954,7 +2003,7 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = super::lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = super::build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
         assert_eq!(
             mid.values[mid.outputs[0].index() as usize]
                 .tensor_type
@@ -2049,7 +2098,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         let mut graph = ComputeGraph::new();
         let host = graph.host_input("x", [rows, 128]).unwrap();
         graph.gelu(host).unwrap();
-        let mut state = lowering::LoweringState::default();
+        let mut state = bind::ValueBuilder::default();
         let input = state.value(
             host,
             TensorType::new([rows, 128], Precision::F16, Layout::row_sharded(1)),
@@ -2064,12 +2113,12 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         let mut operations = Vec::new();
         let mut results = Vec::new();
         for _ in 0..2 {
-            results.push(lowering::ensure_format(
+            results.push(bind::ensure_format(
                 input,
                 target.clone(),
                 OperandMaterialization::Complete,
                 graph.operations()[0].id,
-                &crate::Ipu21CostModel,
+                &crate::estimate::Ipu21CostModel,
                 &mut state,
                 &mut operations,
             ));
@@ -2188,7 +2237,7 @@ fn repeated_normalization_can_keep_parameters_compact() {
     graph.set_outputs([out]).unwrap();
     config.tile_memory_budget_bytes = 1500;
     config.standard_memory_reservation_bytes = 0;
-    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
     let (_, repeat) = mid
         .operations
         .iter()
@@ -2242,7 +2291,7 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
         .unwrap()[0];
     graph.set_outputs([y]).unwrap();
     config.operator_candidates = vec![OperatorCandidate::Concrete(ConcreteOperatorCandidate::new(
-        MidOperator::Gemm {
+        OperatorFamily::Gemm {
             options: crate::GemmOptions::default(),
             multiply: Precision::F16,
             accumulate: crate::AccumulationPrecision::F16,
@@ -2255,7 +2304,7 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
     ))];
     config.standard_memory_reservation_bytes = 0;
     config.tile_memory_budget_bytes = 80000;
-    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
     let repeat = mid
         .operations
         .iter()
@@ -2287,7 +2336,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
             layout: Layout::row_sharded(4),
         },
     ];
-    let mut state = lowering::LoweringState::default();
+    let mut state = bind::ValueBuilder::default();
     let input = state.value(
         ValueId::from_index(0),
         TensorType {
@@ -2299,7 +2348,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
     let mut graph = ComputeGraph::new();
     let source = graph.host_input("x", [16, 64]).unwrap();
     graph.gelu(source).unwrap();
-    let output = lowering::ensure_format(
+    let output = bind::ensure_format(
         input,
         formats[2].clone(),
         OperandMaterialization::DispatchSlices,
@@ -2310,7 +2359,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
     );
     let resolved =
         crate::estimate::region_program(4, &[input], &operations, &[output], &state.values);
-    let mut defined = BTreeSet::from([MidValueId(0)]);
+    let mut defined = BTreeSet::from([MidValueId::from_index(0)]);
     for op in &resolved.operations {
         assert!(
             op.read_values().all(|input| defined.contains(input)),
@@ -2396,7 +2445,7 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
     config
         .gemm_precisions
         .insert(repeat.body.operations[0].id, fp8);
-    let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+    let mid = lower(&graph, &config, &crate::estimate::Ipu21CostModel).unwrap();
     let resolved = mid;
     fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
         for op in ops {
@@ -2449,12 +2498,12 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
                 },
             );
         }
-        let late = baseline::lower(
+        let late = build::build_candidate(
             &graph,
             &config,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
-            &baseline::Recipe::default(),
+            &crate::planner::cache::FragmentCache::default(),
+            &Recipe::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2473,12 +2522,12 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             let mut recipe = late.recipe.clone();
             recipe.cast_before_copies.insert(*site);
             let serialized = serde_json::to_vec(&recipe).unwrap();
-            let recipe: baseline::Recipe = serde_json::from_slice(&serialized).unwrap();
-            let early = baseline::lower(
+            let recipe: Recipe = serde_json::from_slice(&serialized).unwrap();
+            let early = build::build_candidate(
                 &graph,
                 &config,
                 &Ipu21CostModel,
-                &crate::mid::implementation::FragmentCache::default(),
+                &crate::planner::cache::FragmentCache::default(),
                 &recipe,
             )
             .unwrap();
@@ -2487,11 +2536,11 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             let tiles = crate::expand_tiles(&early.program).unwrap();
             let low = crate::lower_to_tiles(&tiles, false);
             crate::KernelBuildPlan::from_program(&low).unwrap();
-            let replay = baseline::lower(
+            let replay = build::build_candidate(
                 &graph,
                 &config,
                 &Ipu21CostModel,
-                &crate::mid::implementation::FragmentCache::default(),
+                &crate::planner::cache::FragmentCache::default(),
                 &early.recipe,
             )
             .unwrap();

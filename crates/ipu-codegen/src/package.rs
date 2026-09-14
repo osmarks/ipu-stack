@@ -67,7 +67,7 @@ pub enum PackageBuildError {
     #[error("invalid package build: {0}")]
     Invalid(String),
     #[error("mid-level lowering failed: {0}")]
-    Mid(#[from] crate::LoweringError),
+    Mid(#[from] crate::planner::LoweringError),
     #[error("tile scheduling failed: {0}")]
     Low(#[from] crate::ExpansionError),
     #[error("kernel planning failed: {0}")]
@@ -855,7 +855,9 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComputeGraph, Ipu21CostModel, lower_baseline};
+    use crate::ComputeGraph;
+    use crate::estimate::Ipu21CostModel;
+    use crate::planner::build_baseline;
 
     #[test]
     fn package_assembly_maps_host_code_by_physical_tile() {
@@ -1027,7 +1029,7 @@ mod tests {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
         let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
         assert!(
             low.logical_values

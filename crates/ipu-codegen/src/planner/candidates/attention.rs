@@ -1,7 +1,9 @@
 //! Bounded independent product grids. Every combination is priced through its
 //! complete mid implementation, including redistribution and partial sums.
-use super::*;
 
+use crate::compile::{AttentionProducts, PipelineConfig};
+use crate::planner::operator::{OperatorDispatch, OperatorPlan, ProductGrid};
+use crate::tensor::TensorType;
 pub(super) fn product_variants(
     base: OperatorPlan,
     inputs: &[TensorType],

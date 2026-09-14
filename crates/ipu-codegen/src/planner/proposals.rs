@@ -1,12 +1,13 @@
 //! Enumerate explicit recipe changes without building or evaluating packages.
+
+use crate::compile::PipelineConfig;
 use crate::graph::ComputeGraph;
-use crate::mid::PipelineConfig;
-use crate::mid::baseline::{Baseline, Recipe};
+use crate::planner::{Candidate, Recipe};
 
 pub(crate) fn proposals(
     graph: &ComputeGraph,
     config: &PipelineConfig,
-    incumbent: &Baseline,
+    incumbent: &Candidate,
 ) -> Vec<Recipe> {
     fn visit<'a>(source: &'a [crate::Operation], operations: &mut Vec<&'a crate::Operation>) {
         for op in source {
@@ -110,8 +111,9 @@ pub(crate) fn proposals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mid::baseline;
-    use crate::{Ipu21CostModel, Precision};
+    use crate::Precision;
+    use crate::estimate::Ipu21CostModel;
+    use crate::planner::build;
     fn mlp() -> (ComputeGraph, PipelineConfig) {
         let mut graph = ComputeGraph::new();
         let x = graph.host_input("x", [32, 64]).unwrap();
@@ -132,19 +134,20 @@ mod tests {
     fn memoization_does_not_change_baseline_selection() {
         let (graph, mut config) = mlp();
         let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-        let fragments = crate::mid::implementation::FragmentCache::default();
+        let fragments = crate::planner::cache::FragmentCache::default();
         for capacity in [false, true] {
             config.capacity_baseline = capacity;
             let recipe = Recipe::default();
-            let direct = baseline::lower(
+            let direct = build::build_candidate(
                 &graph,
                 &config,
                 &Ipu21CostModel,
-                &crate::mid::implementation::FragmentCache::default(),
+                &crate::planner::cache::FragmentCache::default(),
                 &recipe,
             )
             .unwrap();
-            let memoized = baseline::lower(&graph, &config, &costs, &fragments, &recipe).unwrap();
+            let memoized =
+                build::build_candidate(&graph, &config, &costs, &fragments, &recipe).unwrap();
             assert_eq!(direct.program, memoized.program);
             assert!(direct.recipe == memoized.recipe);
         }

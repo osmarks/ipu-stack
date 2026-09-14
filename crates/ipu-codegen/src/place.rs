@@ -1228,9 +1228,11 @@ impl DisjointSets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::estimate::Ipu21CostModel;
+    use crate::planner::test_support::lower;
     use crate::{
-        ComputeGraph, Ipu21CostModel, KernelBuildPlan, Layout, PipelineConfig, Precision,
-        TensorFormat, lower, lower_to_tiles, materialize_kernel_run,
+        ComputeGraph, KernelBuildPlan, Layout, PipelineConfig, Precision, TensorFormat,
+        lower_to_tiles, materialize_kernel_run,
     };
 
     #[test]
@@ -1833,14 +1835,17 @@ mod tests {
             layout: Layout::row_sharded(4),
         };
         let mut config = PipelineConfig::new(4).with_input(input, format.clone());
-        config.operator_candidates = vec![crate::ConcreteOperatorCandidate::new(
-            crate::MidOperator::Gelu,
-            [crate::OperandRequirement::new(format.clone())],
-            crate::OperandRequirement::new(format),
-        )]
-        .into_iter()
-        .map(crate::OperatorCandidate::Concrete)
-        .collect();
+        config.operator_candidates =
+            vec![crate::planner::catalogue::ConcreteOperatorCandidate::new(
+                crate::planner::operator::OperatorFamily::Gelu,
+                [crate::planner::operator::OperandRequirement::new(
+                    format.clone(),
+                )],
+                crate::planner::operator::OperandRequirement::new(format),
+            )]
+            .into_iter()
+            .map(crate::planner::OperatorCandidate::Concrete)
+            .collect();
         let candidate = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut program = (*crate::expand_tiles(&candidate).unwrap()).clone();
         let work = program

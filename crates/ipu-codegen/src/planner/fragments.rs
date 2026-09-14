@@ -1,21 +1,25 @@
-//! Decompose selected algorithms into compact, whole-device tensor operations.
-//! No shard enumeration, tile calls, byte spans, or physical allocation occurs here.
-
-mod attention;
-mod cache;
-pub(crate) use cache::FragmentCache;
-mod gemm;
-mod layernorm;
-
-use super::*;
+//! Direct executable mid construction for selected operation families.
+//! Family algorithms share this value/operation builder; binding and costing
+//! consume the resulting MidProgram without another template expansion.
+use crate::graph::{GraphInputKind, ValueId};
+use crate::kernel::TileKernelSpec;
+use crate::mid::{
+    Compute, CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue,
+    MidValueId, OperandIndexing,
+};
+use crate::planner::operator::{OperatorDispatch, OperatorFamily, OperatorPlan, OutputAliasing};
+use crate::tensor::{
+    Precision, TensorTiling, TensorType, broadcast_operand_tiling, project_tiling,
+    same_distribution,
+};
 use std::sync::Arc;
 
-pub(crate) fn implement(
+pub(crate) fn build_fragment(
     plan: &OperatorPlan,
     inputs: &[TensorType],
     output: &TensorType,
 ) -> Option<Arc<MidProgram>> {
-    let mut b = Builder::new(inputs);
+    let mut b = FragmentBuilder::new(inputs);
     let result = match &plan.dispatch {
         OperatorDispatch::LayerNorm { parts } => b.layernorm(output, *parts)?,
         OperatorDispatch::Pointwise { kernel, .. } => {
@@ -30,9 +34,9 @@ pub(crate) fn implement(
             for (index, input) in inputs.iter().enumerate() {
                 let mut resident = input.clone();
                 if matches!(indexing, OperandIndexing::Elementwise { .. }) {
-                    resident.format.layout.tiling = pointwise_input_tiling(input, output)?;
+                    resident.format.layout.tiling = broadcast_operand_tiling(input, output)?;
                 }
-                operands.push(b.copy(MidValueId(index as u32), resident, vec![]));
+                operands.push(b.copy(MidValueId::from_index(index as u32), resident, vec![]));
             }
             let reuse = match &plan.requirements.output_aliasing {
                 OutputAliasing::MayAliasInputs(indices) => indices.iter().find_map(|&index| {
@@ -51,8 +55,8 @@ pub(crate) fn implement(
         }
         OperatorDispatch::View => {
             let mapping = match plan.operator {
-                MidOperator::View(view) => view.into(),
-                MidOperator::Slice(slice) => {
+                OperatorFamily::View(view) => view.into(),
+                OperatorFamily::Slice(slice) => {
                     let mut offsets = vec![0; inputs[0].shape.0.len()];
                     offsets[slice.axis] = slice.start;
                     CoordinateMapping {
@@ -63,7 +67,7 @@ pub(crate) fn implement(
                 _ => return None,
             };
             b.emit(
-                vec![MidValueId(0)],
+                vec![MidValueId::from_index(0)],
                 output.clone(),
                 MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
@@ -116,26 +120,12 @@ pub(crate) fn implement(
     Some(Arc::new(b.program))
 }
 
-/// Project the output's ownership onto non-broadcast operand dimensions.
-/// Replicating a whole multi-row parameter and then selecting its columns
-/// leaves strided views; partition it before dispatch instead.
-pub(super) fn pointwise_input_tiling(
-    input: &TensorType,
-    output: &TensorType,
-) -> Option<TensorTiling> {
-    let indexing = crate::tensor::Broadcast::new(&input.shape.0, &output.shape.0)?;
-    if input.shape == output.shape {
-        return Some(output.format.layout.tiling.clone());
-    }
-    project_tiling(output, |axis| indexing.input_axis(axis))
+pub(super) struct FragmentBuilder {
+    pub(super) program: MidProgram,
 }
 
-struct Builder {
-    program: MidProgram,
-}
-
-impl Builder {
-    fn new(inputs: &[TensorType]) -> Self {
+impl FragmentBuilder {
+    pub(super) fn new(inputs: &[TensorType]) -> Self {
         let mut b = Self {
             program: MidProgram::default(),
         };
@@ -150,8 +140,8 @@ impl Builder {
         b
     }
 
-    fn value(&mut self, tensor_type: TensorType) -> MidValueId {
-        let id = MidValueId(self.program.values.len() as u32);
+    pub(super) fn value(&mut self, tensor_type: TensorType) -> MidValueId {
+        let id = MidValueId::from_index(self.program.values.len() as u32);
         self.program.values.push(MidValue {
             id,
             tile_offset: 0,
@@ -162,11 +152,11 @@ impl Builder {
         id
     }
 
-    fn tensor(&self, value: MidValueId) -> &TensorType {
+    pub(super) fn tensor(&self, value: MidValueId) -> &TensorType {
         &self.program.values[value.index() as usize].tensor_type
     }
 
-    fn emit(
+    pub(super) fn emit(
         &mut self,
         inputs: Vec<MidValueId>,
         output: TensorType,
@@ -184,7 +174,7 @@ impl Builder {
         result
     }
 
-    fn cast(&mut self, input: MidValueId, precision: Precision) -> MidValueId {
+    pub(super) fn cast(&mut self, input: MidValueId, precision: Precision) -> MidValueId {
         let mut output = self.tensor(input).clone();
         let from = output.format.precision;
         if from == precision {
@@ -203,11 +193,16 @@ impl Builder {
         )
     }
 
-    fn copy(&mut self, input: MidValueId, output: TensorType, offsets: Vec<u32>) -> MidValueId {
+    pub(super) fn copy(
+        &mut self,
+        input: MidValueId,
+        output: TensorType,
+        offsets: Vec<u32>,
+    ) -> MidValueId {
         self.materialize(input, output, offsets, true)
     }
 
-    fn materialize(
+    pub(super) fn materialize(
         &mut self,
         input: MidValueId,
         output: TensorType,
@@ -239,7 +234,7 @@ impl Builder {
         )
     }
 
-    fn kernel(
+    pub(super) fn kernel(
         &mut self,
         inputs: Vec<MidValueId>,
         output: TensorType,
@@ -259,7 +254,7 @@ impl Builder {
         )
     }
 
-    fn compute(
+    pub(super) fn compute(
         &mut self,
         mut inputs: Vec<MidValueId>,
         output: TensorType,
@@ -279,19 +274,9 @@ impl Builder {
     }
 }
 
-fn axis(tensor: &TensorType, axis: usize) -> Option<&AxisTiling> {
-    tensor
-        .format
-        .layout
-        .tiling
-        .axes
-        .iter()
-        .find(|dim| dim.axis.resolve(tensor.shape.0.len()) == Ok(axis))
-}
-
 /// Project an output grid onto an operand's matching axis. Other distributed
 /// coordinates become replicas while their physical strides remain unchanged.
-fn project_grid(
+pub(super) fn project_grid(
     output: &TensorType,
     operand: &TensorType,
     output_axis: usize,
@@ -310,98 +295,4 @@ fn project_grid(
             None
         }
     })
-}
-
-/// Keep physical tile strides while omitted distributed axes become replicas.
-fn project_tiling(
-    output: &TensorType,
-    map_axis: impl Fn(usize) -> Option<usize>,
-) -> Option<TensorTiling> {
-    let tiling = &output.format.layout.tiling;
-    let mut replicas = tiling.replicas;
-    let mut axes = Vec::new();
-    for (dim, stride) in tiling.axes.iter().zip(tiling.axis_strides().ok()?) {
-        if let Some(mapped) = map_axis(dim.axis.resolve(output.shape.0.len()).ok()?) {
-            let mut dim = *dim;
-            dim.axis = TensorAxis::FromStart(mapped as u16);
-            dim.tile_stride = Some(u16::try_from(stride).ok()?);
-            axes.push(dim);
-        } else {
-            replicas = replicas.checked_mul(dim.partitions)?;
-        }
-    }
-    Some(TensorTiling {
-        tile_count: tiling.tile_count,
-        replicas,
-        axes,
-    })
-}
-
-/// Bind an executable fragment into a region. The family has already chosen
-/// every operation and declared the input contract; this only remaps values.
-/// Temporary ownership is relative to the selected result's owners.
-pub(crate) fn append_fragment(
-    fragment: &MidProgram,
-    inputs: &[MidValueId],
-    outputs: &[MidValueId],
-    source: Option<OperationId>,
-    values: &mut Vec<MidValue>,
-    operations: &mut Vec<MidOperation>,
-) -> Option<()> {
-    if fragment.inputs.len() != inputs.len() || fragment.outputs.len() != outputs.len() {
-        return None;
-    }
-    let output = values[outputs.first()?.index() as usize].clone();
-    let mut ids = vec![None; fragment.values.len()];
-    for (input, &value) in fragment.inputs.iter().zip(inputs) {
-        if fragment.values[input.value.index() as usize].tensor_type
-            != values[value.index() as usize].tensor_type
-        {
-            return None;
-        }
-        ids[input.value.index() as usize] = Some(value);
-    }
-    for (&from, &to) in fragment.outputs.iter().zip(outputs) {
-        ids[from.index() as usize] = Some(to);
-    }
-    for value in &fragment.values {
-        if ids[value.id.index() as usize].is_none() {
-            let id = MidValueId(values.len() as u32);
-            ids[value.id.index() as usize] = Some(id);
-            values.push(MidValue {
-                id,
-                tile_offset: output.tile_offset,
-                tensor_type: value.tensor_type.clone(),
-                origin: output.origin,
-                storage_group: id,
-            });
-        }
-    }
-    for step in &fragment.operations {
-        let mut step = step.clone();
-        step.source = source;
-        for value in step.inputs.iter_mut().chain(&mut step.results) {
-            *value = ids[value.index() as usize]?;
-        }
-        operations.push(step);
-    }
-    Some(())
-}
-
-pub(crate) fn same_distribution(a: &TensorType, b: &TensorType) -> bool {
-    a.shape == b.shape
-        && a.format.layout.tiling.tile_count == b.format.layout.tiling.tile_count
-        && a.format
-            .layout
-            .resolve(&a.shape)
-            .ok()
-            .zip(b.format.layout.resolve(&b.shape).ok())
-            .is_some_and(|(left, right)| {
-                left.padded_shape == right.padded_shape
-                    && (a.format.layout.tiling == b.format.layout.tiling
-                        || left.axes().zip(right.axes()).is_some_and(|(a, b)| {
-                            a.len() == b.len()
-                                && a.iter().zip(b).all(|(a, b)| a.same_partitioning(b))
-                        }))
-            })
 }

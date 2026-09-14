@@ -2,7 +2,7 @@
 //! rejected packages. No fake finalization callback stands in for evaluation.
 use super::*;
 use crate::Precision;
-use crate::mid::PipelineConfig;
+use crate::compile::PipelineConfig;
 use crate::package::PackageBuildError;
 use std::path::PathBuf;
 

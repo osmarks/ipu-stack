@@ -1,5 +1,13 @@
 use super::search::refresh;
-use super::*;
+use crate::graph::{Operation, OperationKind};
+use crate::kernel::TileKernelSpec;
+use crate::mid::{Compute, MidOperation, MidOperationKind, MidValue, MidValueId, OperandIndexing};
+use crate::planner::optimistic::Assumption;
+use crate::planner::optimistic::CycleEstimate;
+use crate::planner::optimistic::DiagnosticMidGraph;
+use crate::planner::optimistic::Step;
+use crate::planner::optimistic::StepKind;
+use std::collections::BTreeSet;
 
 pub(super) fn fuse(
     graph: &DiagnosticMidGraph,
@@ -159,7 +167,7 @@ fn known_fusion_cost(
         OperationKind::LayerNorm => TileKernelSpec::AddLayerNorm,
         _ => return None,
     };
-    if !super::super::elementwise::compatible_fusion(
+    if !crate::mid::elementwise::compatible_fusion(
         &kernel,
         &graph.values[group[0].inputs[0]].tensor,
         &graph.values[group[0].inputs[1]].tensor,
@@ -199,5 +207,5 @@ fn known_fusion_cost(
         estimated_cycles: 0,
         estimated_exchange_cycles: 0,
     };
-    super::super::rewrite::operation_cycles([&op], &values)
+    crate::estimate::operation_cycles([&op], &values)
 }

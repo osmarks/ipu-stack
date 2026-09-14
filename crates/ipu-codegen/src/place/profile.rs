@@ -354,7 +354,8 @@ fn write_html(profile: &Profile, output: &Path) -> PackageBuildResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComputeGraph, Ipu21CostModel, PipelineConfig};
+    use crate::estimate::Ipu21CostModel;
+    use crate::{ComputeGraph, PipelineConfig};
 
     #[test]
     fn rendering_splits_tiles_and_retains_reuse_geometry() {
@@ -434,7 +435,7 @@ mod tests {
                 },
             );
         }
-        let mid = crate::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
         let placement = place(&low).unwrap();
         let application = Application {

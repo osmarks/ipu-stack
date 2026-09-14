@@ -564,7 +564,12 @@ mod tests {
                     layout: crate::Layout::row_sharded(1),
                 },
             );
-            let mut mid = crate::lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+            let mut mid = crate::planner::test_support::lower(
+                &graph,
+                &config,
+                &crate::estimate::Ipu21CostModel,
+            )
+            .unwrap();
             // A valid whole-device program may leave active tiles unused by a region.
             mid.tile_count = 2;
             let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
@@ -642,7 +647,9 @@ mod tests {
                 layout: crate::Layout::row_sharded(1),
             },
         );
-        let mid = crate::lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
+        let mid =
+            crate::planner::test_support::lower(&graph, &config, &crate::estimate::Ipu21CostModel)
+                .unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
         let placement = crate::place(&low).unwrap();
         let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();

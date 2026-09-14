@@ -3,6 +3,14 @@
 //! This is deliberately not an executable-program API. Costs are estimates, not
 //! hardware bounds; hypotheses must be implemented and physically validated.
 //! See `docs/OPTIMISTIC_PLANNING.md` for the search space and its limits.
+use crate::estimate::MemoryPeaks;
+use crate::graph::Operation;
+use crate::graph::OperationId;
+use crate::graph::ValueId;
+use crate::tensor::TensorFormat;
+use crate::tensor::TensorType;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 mod conversion;
 mod fusion;
 mod report;
@@ -10,13 +18,13 @@ mod search;
 #[cfg(test)]
 mod tests;
 
-use super::*;
 pub use conversion::{ConversionPath, enumerate_conversions};
 pub use search::{plan_graph, plan_region};
 use std::ops::Range;
 use std::sync::Arc;
 // Expose the existing mid vocabulary, rather than a second layout/algorithm IR.
-pub use super::{MidProgram, OperatorPlan};
+pub use crate::mid::MidProgram;
+pub use crate::planner::operator::OperatorPlan;
 pub use crate::tensor::ElementOrder;
 
 /// Region boundary formats are fixed for one invocation. Internal formats are not.

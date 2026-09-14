@@ -1,5 +1,11 @@
 //! Shared graph queries and edit application for mid transformations.
-use super::*;
+use crate::estimate::operation_cycles;
+use crate::graph::OperationId;
+use crate::kernel::TileKernelSpec;
+use crate::low::CopyPolicy;
+use crate::mid::{Compute, MidOperation, MidOperationKind, MidValue, MidValueId, OperandIndexing};
+use crate::tensor::Precision;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Producers whose results have exactly one consuming operation and do not
 /// escape the region. Repeated operands within that consumer count once.
@@ -110,7 +116,7 @@ pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
         && a.tensor_type.format.precision == b.tensor_type.format.precision
         && a.tensor_type.format.layout.order == b.tensor_type.format.layout.order
         && a.tensor_type.format.layout.memory_class == b.tensor_type.format.layout.memory_class
-        && implementation::same_distribution(&a.tensor_type, &b.tensor_type)
+        && crate::tensor::same_distribution(&a.tensor_type, &b.tensor_type)
 }
 
 /// Source of a single-result coordinate-preserving copy. Shapes, precision,
@@ -157,17 +163,6 @@ pub(super) fn producer_through_copies(
         copies.push(index);
         value = input;
     }
-}
-
-/// Price complete replacement sequences with the same overflow and missing-cost rules.
-pub(super) fn operation_cycles<'a>(
-    operations: impl IntoIterator<Item = &'a MidOperation>,
-    values: &[MidValue],
-) -> Option<u64> {
-    operations.into_iter().try_fold(0u64, |sum, op| {
-        crate::estimate::operation_cost(op, values)
-            .map(|(cost, _, _)| sum.saturating_add(cost.total))
-    })
 }
 
 pub(super) fn fusion_pays<'a>(

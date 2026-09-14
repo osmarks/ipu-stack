@@ -1,6 +1,13 @@
 //! Preserve live residuals while fusing their addition with local statistics.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
-use super::*;
+use crate::kernel::TileKernelSpec;
+use crate::low::CopyPolicy;
+use crate::mid::{
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
+    OperandIndexing,
+};
+use crate::tensor::{ElementOrder, Padding, Precision, TensorAxis, TensorType};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn fuse(
     operations: &mut Vec<MidOperation>,
@@ -263,6 +270,13 @@ fn row_moments_type(tensor: &TensorType) -> Option<TensorType> {
 
 #[cfg(test)]
 mod tests {
+    use crate::compile::PipelineConfig;
+    use crate::estimate::Ipu21CostModel;
+    use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
+    use crate::mid::{MidInput, MidProgram};
+    use crate::planner::test_support::lower;
+    use crate::tensor::{AxisTiling, Layout};
+
     use super::*;
 
     #[test]
@@ -304,7 +318,10 @@ mod tests {
             .with_automatic_input(beta, Precision::F16);
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let fused = mid
-            .with_elementwise_fusions(&PipelineConfig::new(mid.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         assert!(
@@ -378,7 +395,10 @@ mod tests {
         }
         program.outputs = vec![MidValueId(4), MidValueId(5)];
         let fused = program
-            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .unwrap();
         assert_eq!(fused.outputs, program.outputs);
         assert_eq!(
@@ -476,7 +496,10 @@ mod tests {
         let norm_input = norm.inputs[0];
         program.operations.push(norm);
         let fused = program
-            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .unwrap();
         assert_eq!(fused.operations[0].results[1], MidValueId(4));
         assert_eq!(fused.operations.last().unwrap().inputs[0], norm_input);
@@ -510,7 +533,10 @@ mod tests {
             program.values[id].tensor_type.format.layout = feature_layout.clone();
         }
         let fused = program
-            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .with_elementwise_fusions(
+                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            )
             .expect("partial residual statistics should save a scan");
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         let placement = crate::place(&low).unwrap();

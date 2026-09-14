@@ -1,9 +1,23 @@
 //! Candidate eligibility for one whole-device operation.
 //! This boundary accepts tensor facts, never mutable planner state.
 
-use super::*;
-
-pub(in crate::mid) struct CandidateSearch<'a> {
+use crate::compile::{ConversionStreamingPolicy, PipelineConfig};
+use crate::estimate::CostModel;
+use crate::graph::{Operation, OperationKind, ValueId};
+use crate::planner::cache::FragmentCache;
+use crate::planner::candidates::direct_consumer_layouts;
+use crate::planner::candidates::{
+    GroupedOutputLayout, OutputDemands, grouped_output_layout, operator_matches, plans,
+    retain_operator_candidates_for_demands,
+};
+use crate::planner::catalogue::OperatorFormatPolicy;
+use crate::planner::error::{LoweringError, LoweringResult};
+use crate::planner::operator::{OperandMaterialization, OperatorPlan, OutputAliasing};
+use crate::tensor::{
+    AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, ElementOrder, TensorShape, TensorType,
+};
+use std::collections::{BTreeMap, BTreeSet};
+pub(in crate::planner) struct CandidateSearch<'a> {
     operation: &'a Operation,
     consumers: &'a [Operation],
     value_uses: &'a BTreeMap<ValueId, usize>,
@@ -13,7 +27,7 @@ pub(in crate::mid) struct CandidateSearch<'a> {
 }
 
 impl<'a> CandidateSearch<'a> {
-    pub(in crate::mid) fn new(
+    pub(in crate::planner) fn new(
         operation: &'a Operation,
         consumers: &'a [Operation],
         result_required: bool,
@@ -52,7 +66,7 @@ impl<'a> CandidateSearch<'a> {
         }
     }
 
-    pub(in crate::mid) fn generate(
+    pub(in crate::planner) fn generate(
         &self,
         input_types: &[TensorType],
         parameter_inputs: &[bool],

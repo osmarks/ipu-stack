@@ -1,9 +1,11 @@
 //! Bounded SRAM placement search after package support storage is reserved.
 
+#[cfg(test)]
+use crate::estimate::Ipu21CostModel;
 use crate::low::LowProgram;
 use crate::package::{PackageBuildResult, invalid};
 #[cfg(test)]
-use crate::{ComputeGraph, Ipu21CostModel, PipelineConfig, Precision, lower_to_tiles};
+use crate::{ComputeGraph, PipelineConfig, Precision, lower_to_tiles};
 use std::collections::BTreeSet;
 
 /// Screen geometry-derived embeddings by resource load, retaining one challenger.
@@ -218,7 +220,7 @@ mod tests {
         let output = graph.gelu(input).unwrap();
         graph.set_outputs([output]).unwrap();
         let config = PipelineConfig::new(4).with_automatic_input(input, Precision::F16);
-        let mid = crate::lower(&graph, &config, &Ipu21CostModel).unwrap();
+        let mid = crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut expanded = crate::expand_tiles(&mid).unwrap();
         let original = expanded.clone();
         let before = lower_to_tiles(&original, false);

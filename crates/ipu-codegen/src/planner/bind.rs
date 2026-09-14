@@ -1,70 +1,34 @@
 //! Apply whole-device selections and insert explicit format conversions.
 
-use super::*;
+use crate::compile::PipelineConfig;
+use crate::estimate::{CostModel, MemoryUsage};
+use crate::graph::{Operation, OperationId, OperationKind, ValueId};
+use crate::kernel::TileKernelSpec;
+use crate::low::default_copy_policy;
+use crate::mid::{
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
+    OperandIndexing, cast_order,
+};
 
-#[cfg(test)]
-pub fn lower(
-    graph: &ComputeGraph,
-    config: &PipelineConfig,
-    costs: &impl CostModel,
-) -> LoweringResult<MidProgram> {
-    // Operator/kernel tests exercise a neighborhood with exposed boundaries.
-    fn outputs(ops: &[Operation], ids: &mut BTreeSet<ValueId>) {
-        for op in ops {
-            ids.extend(&op.results);
-            if let OperationKind::Repeat(repeat) = &op.kind {
-                outputs(&repeat.body.operations, ids);
-            }
-        }
-    }
-    // These fixtures test operator lowering with explicit distributed host
-    // bindings, independently of the package baseline's coarser boundary policy.
-    let mut config = config.clone();
-    for input in graph
-        .inputs()
-        .iter()
-        .filter(|input| input.kind == GraphInputKind::Host)
-    {
-        if let Some(&precision) = config.automatic_inputs.get(&input.value) {
-            let rows = input
-                .shape
-                .0
-                .get(input.shape.0.len().saturating_sub(2))
-                .copied()
-                .unwrap_or(1);
-            config.inputs.insert(
-                input.value,
-                TensorFormat {
-                    precision,
-                    layout: Layout::row_sharded(u32::from(config.tile_count).min(rows) as u16),
-                },
-            );
-        }
-    }
-    let mut recipe = baseline::Recipe::default();
-    outputs(graph.operations(), &mut recipe.open_boundaries);
-    recipe
-        .early_casts
-        .extend(graph.operations().iter().map(|op| op.id));
-    let mut program =
-        baseline::select(graph, &config, costs, &FragmentCache::default(), &recipe)?.program;
-    program.compose_copies();
-    program
-        .refresh_estimates()
-        .ok_or(LoweringError::InvalidImplementation)?;
-    Ok(program)
-}
+use crate::planner::cache::FragmentCache;
+use crate::planner::error::{LoweringError, LoweringResult};
+use crate::planner::operator::{OperandMaterialization, OperatorPlan};
+
+use crate::tensor::{
+    AmpOrder, ElementOrder, Layout, Precision, TensorFormat, TensorShape, TensorType,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default, Clone)]
-pub(super) struct LoweringState {
+pub(super) struct ValueBuilder {
     pub(super) values: Vec<MidValue>,
     pub(super) automatic_inputs: BTreeSet<MidValueId>,
     pub(super) parameter_values: BTreeSet<MidValueId>,
 }
 
-impl LoweringState {
+impl ValueBuilder {
     pub(super) fn value(&mut self, origin: ValueId, tensor_type: TensorType) -> MidValueId {
-        let id = MidValueId(self.values.len() as u32);
+        let id = MidValueId::from_index(self.values.len() as u32);
         self.values.push(MidValue {
             id,
             tile_offset: 0,
@@ -87,7 +51,7 @@ impl LoweringState {
     }
 
     pub(super) fn get(&self, id: MidValueId) -> &MidValue {
-        &self.values[id.0 as usize]
+        &self.values[id.index() as usize]
     }
 
     pub(super) fn derived_value(
@@ -110,24 +74,8 @@ impl LoweringState {
         if !self.automatic_inputs.remove(&id) {
             return false;
         }
-        self.values[id.0 as usize].tensor_type.format.layout = layout;
+        self.values[id.index() as usize].tensor_type.format.layout = layout;
         true
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PlanMetrics {
-    pub(super) cycles: u64,
-    pub(super) memory: MemoryPeaks,
-}
-
-impl PlanMetrics {
-    pub(super) fn dominates(self, other: Self) -> bool {
-        let memory = self.memory.objectives();
-        let other_memory = other.memory.objectives();
-        let no_worse = self.cycles <= other.cycles
-            && memory.into_iter().zip(other_memory).all(|(a, b)| a <= b);
-        no_worse && (self.cycles < other.cycles || memory != other_memory)
     }
 }
 
@@ -140,8 +88,9 @@ pub(super) fn emit_selected(
     plan: &OperatorPlan,
     costs: &impl CostModel,
     fragments: &FragmentCache,
+    tile_count: u16,
     values: &mut BTreeMap<ValueId, MidValueId>,
-    state: &mut LoweringState,
+    state: &mut ValueBuilder,
     operations: &mut Vec<MidOperation>,
 ) -> LoweringResult<()> {
     let inputs = operation
@@ -180,11 +129,12 @@ pub(super) fn emit_selected(
     {
         state.parameter_values.insert(result);
     }
-    implementation::append_fragment(
+    crate::mid::append_fragment(
         &fragment,
         &bound,
         &[result],
         Some(operation.id),
+        tile_count,
         &mut state.values,
         operations,
     )
@@ -233,7 +183,7 @@ pub(super) fn ensure_format(
     materialization: OperandMaterialization,
     source: OperationId,
     costs: &impl CostModel,
-    state: &mut LoweringState,
+    state: &mut ValueBuilder,
     operations: &mut Vec<MidOperation>,
 ) -> MidValueId {
     let from = state.get(value).tensor_type.format.precision;

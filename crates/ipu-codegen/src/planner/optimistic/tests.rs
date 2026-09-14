@@ -1,5 +1,23 @@
-use super::*;
-
+use crate::compile::PipelineConfig;
+use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
+use crate::mid::{
+    CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
+};
+use crate::planner::catalogue::OperatorCandidate;
+use crate::planner::operator::OperatorFamily;
+use crate::planner::optimistic::RegionRequest;
+use crate::planner::optimistic::SearchError;
+use crate::planner::optimistic::SearchOptions;
+use crate::planner::optimistic::StepKind;
+use crate::planner::optimistic::TransformKind;
+use crate::planner::optimistic::enumerate_conversions;
+use crate::planner::optimistic::plan_graph;
+use crate::planner::optimistic::plan_region;
+use crate::planner::optimistic::valid_tensor;
+use crate::tensor::{
+    AmpOrder, ElementOrder, Layout, Precision, TensorFormat, TensorTiling, TensorType,
+};
+use std::collections::BTreeMap;
 fn format(precision: Precision, layout: Layout) -> TensorFormat {
     TensorFormat { precision, layout }
 }
@@ -205,13 +223,13 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
         inputs: vec![MidInput {
             name: "x".into(),
             kind: GraphInputKind::Host,
-            value: MidValueId(0),
+            value: MidValueId::from_index(0),
         }],
-        outputs: vec![MidValueId(1)],
+        outputs: vec![MidValueId::from_index(1)],
         operations: vec![MidOperation {
             source: None,
-            inputs: vec![MidValueId(0)],
-            results: vec![MidValueId(1)],
+            inputs: vec![MidValueId::from_index(0)],
+            results: vec![MidValueId::from_index(1)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
                 packing: crate::PackingPolicy::Automatic,
@@ -246,7 +264,7 @@ fn high_region_finds_fp8_opportunities_without_losing_its_reference() {
     }
     config
         .operator_candidates
-        .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+        .retain(|c| !matches!(c.operator(), OperatorFamily::Gemm { .. }));
     config
         .operator_candidates
         .push(OperatorCandidate::fp8_gemm(64, -4));

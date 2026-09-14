@@ -91,3 +91,7 @@ pub(crate) fn broadcast_shape(left: &[u32], right: &[u32]) -> Result<Vec<u32>, B
         })
         .collect()
 }
+
+pub(crate) use resolved::{
+    axis_tiling, broadcast_operand_tiling, project_tiling, same_distribution,
+};

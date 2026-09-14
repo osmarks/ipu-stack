@@ -1,6 +1,11 @@
 //! Storage donation for shrinking casts with a bank-separated output prefix.
-use super::*;
+use crate::kernel::TileKernelSpec;
 use crate::kernel::cast::{CAST_PREFIX_BYTES, CastChunks};
+use crate::mid::{
+    Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, OperandIndexing,
+};
+use crate::tensor::Precision;
+use std::collections::BTreeSet;
 
 impl MidProgram {
     pub(crate) fn reuse_cast_inputs(&mut self) {
@@ -137,6 +142,13 @@ fn donate(
 
 #[cfg(test)]
 mod tests {
+    use crate::estimate::MemoryPeaks;
+    use crate::graph::{GraphInputKind, ValueId};
+    use crate::low::CopyPolicy;
+    use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat};
+    use crate::tensor::{AmpOrder, ElementOrder, Layout, TensorTiling, TensorType};
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn fixture(order: ElementOrder, shape: &[u32]) -> MidProgram {

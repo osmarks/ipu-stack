@@ -1,304 +1,34 @@
 //! Executable whole-device copies, arithmetic and structured repetition.
-//! Selection/builders still live here during migration to the planner owner;
-//! mid values themselves contain no unresolved operator or conversion state.
-
-pub(crate) mod baseline;
+//! Planner choices/configuration live outside this language. Mid owns binding,
+//! composition and explicit transformations of already selected work.
+use crate::estimate::MemoryPeaks;
+use crate::graph::{GraphInputKind, OperationId, ValueId};
+use crate::tensor::TensorType;
+use std::collections::BTreeMap;
 pub(crate) mod cast;
-mod cast_order;
+pub(crate) mod cast_order;
+mod compute;
 mod copy;
-mod elementwise;
-pub mod optimistic;
+pub(crate) mod elementwise;
+mod fragment;
 mod output_fusion;
+mod ownership;
 mod packing;
 mod residual;
-mod rewrite;
+pub(crate) mod rewrite;
 mod validate;
-pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
-pub(crate) mod implementation;
-use implementation::FragmentCache;
-mod compute;
 pub use compute::*;
 pub use copy::CoordinateMapping;
-mod candidates;
-mod catalogue;
-mod lowering;
-mod operator;
-mod ownership;
-pub use crate::graph::AxisFactorView;
+pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
+pub(crate) use fragment::append_fragment;
+pub use validate::ProgramError;
 
-use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
-use crate::tensor::*;
-use crate::{CopyPolicy, default_copy_policy};
-use candidates::*;
-use catalogue::*;
-pub use catalogue::{ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy};
-#[cfg(test)]
-pub(crate) use lowering::lower;
-pub use operator::*;
-pub(crate) fn lower_baseline(
-    graph: &ComputeGraph,
-    config: &PipelineConfig,
-    costs: &impl CostModel,
-) -> LoweringResult<MidProgram> {
-    Ok(baseline::lower(
-        graph,
-        config,
-        costs,
-        &FragmentCache::default(),
-        &baseline::Recipe::default(),
-    )?
-    .program)
-}
 #[cfg(test)]
 pub(crate) fn expand_tiles(
     program: &MidProgram,
 ) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
     crate::low::expand::expand_tiles(program, true)
 }
-use lowering::*;
-
-#[cfg(test)]
-use crate::estimate::MemoizedCostModel;
-use crate::estimate::region_peak_memory_with_multiplicity;
-pub use crate::estimate::{
-    CostModel, IPU21_TARGET_COSTS, Ipu21CostModel, MemoryPeaks, MemoryUsage,
-};
-use crate::graph::{
-    AttentionOptions, ComputeGraph, GemmOptions, GraphInputKind, Operation, OperationId,
-    OperationKind, Repeat, TensorShape, ValueId,
-};
-use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
-
-/// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
-/// are keyed by the source graph operation and bypass candidate pruning and
-/// conservative whole-graph memory rejection. Concrete placement remains the
-/// final authority on whether the resulting package fits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GemmPlanConstraint {
-    pub source_operation: u32,
-    pub orientation: GemmOrientation,
-    pub row_partitions: u16,
-    pub column_partitions: u16,
-    pub inner_partitions: u16,
-    pub result_row_partitions: u16,
-    pub result_column_partitions: u16,
-    pub output_column_block: u32,
-    pub weight_memory_class: MemoryClass,
-    pub reduction_staging: ReductionStaging,
-    pub local_weight_staging: LocalOperandStaging,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum GemmOutputPacking {
-    #[default]
-    Automatic,
-    Native,
-    Packed,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PipelineConfig {
-    pub tile_count: u16,
-    /// Maximum ordered local search steps after establishing a baseline.
-    /// Parallel speculation can validate later proposals that an earlier
-    /// improvement invalidates; these do not advance the search.
-    pub optimization_steps: usize,
-    /// Resume a compatible mid-plan search checkpoint; steps are additional.
-    pub load_search_state: Option<std::path::PathBuf>,
-    /// Atomically save completed search progress after each selection.
-    pub save_search_state: Option<std::path::PathBuf>,
-    /// Prefer distributed boundaries and conversion-inclusive memory costs.
-    /// Experimental: smaller tensor peaks can still require larger exchange rows.
-    pub capacity_baseline: bool,
-    /// Compact endpoint-balanced exchange waves; None uses latency-oriented scheduling.
-    pub exchange_stream_words: Option<std::num::NonZeroU32>,
-    pub inputs: BTreeMap<ValueId, TensorFormat>,
-    /// Graph-boundary tensors whose layout may be selected by their first
-    /// consumer. Precision remains fixed, while packaging exposes the chosen
-    /// physical layout directly through the host binding.
-    pub automatic_inputs: BTreeMap<ValueId, Precision>,
-    /// Signatures available independently to each operation. Earlier entries
-    /// of the appropriate operation kind win when costs are equal.
-    pub operator_candidates: Vec<OperatorCandidate>,
-    /// Fixed operand precision for individual GEMMs, including operations inside Repeat.
-    pub gemm_precisions: BTreeMap<OperationId, Precision>,
-    /// Add near-capacity tile counts derived from graph tensor extents.
-    pub shape_aware_active_tile_counts: bool,
-    /// Per-operator catalogue breadth before local neighborhood evaluation.
-    pub operator_candidate_limit: usize,
-    /// Hard limit on actual compact encoded exchange tables per tile.
-    /// Set to u64::MAX to disable this limit.
-    pub exchange_table_budget_bytes: u64,
-    /// Static TX/RX fragments per tile, counted from concrete spans before
-    /// scheduling. Repeat bodies count once. Independent of encoded bytes.
-    /// Set to u64::MAX to disable this complexity limit.
-    pub exchange_transfer_limit_per_tile: u64,
-    /// Search-only penalty per estimated exchange-table byte. Does not change
-    /// reported execution cycles. Budget failures automatically retry with
-    /// stronger penalties to preserve simpler prefixes earlier in the graph.
-    pub exchange_table_cost_per_byte: u64,
-    /// Diagnostic constraints which retain only one GEMM plan family for the
-    /// named source operations.
-    pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
-    /// Compare native output with panel-packed projection output, or force a mode for diagnostics.
-    pub gemm_output_packing: GemmOutputPacking,
-    /// Maximum independent sums offered as one spatially distributed batch.
-    pub max_parallel_reductions: usize,
-    /// Standard-addressed SRAM retained for exchange tables, profiling data,
-    /// host commands, and generated tile programs built after planning.
-    pub standard_memory_reservation_bytes: u64,
-    /// Optional JSON/HTML estimator profiles for the baseline and local proposals.
-    /// These explain planner decisions, not concrete placement.
-    pub memory_profile_directory: Option<std::path::PathBuf>,
-    /// Maximum SRAM per tile available to planned values and the standard
-    /// reservation. Lower values emulate a model whose other persistent state
-    /// occupies the remainder of SRAM.
-    pub tile_memory_budget_bytes: u64,
-    pub profiling: bool,
-    /// Insert all-tile patched-breakpoint stops after semantic operators.
-    pub diagnostic_checkpoints: bool,
-    /// Emit exchange-scheduler lower bounds, per-tile role pressure, and
-    /// critical dependency chains while constructing the final package.
-    pub exchange_diagnostics: bool,
-    /// Controls whether one-use layout conversions may be populated as
-    /// bounded slices immediately before their consuming dispatch.
-    pub conversion_streaming: ConversionStreamingPolicy,
-    /// Restricts attention planning to one execution strategy for controlled
-    /// benchmarking; automatic planning retains both alternatives.
-    pub attention_strategy: AttentionStrategy,
-    pub attention_products: AttentionProducts,
-    /// Experimental materialized QK/PV operand scales; None retains F16/F32.
-    pub attention_fp8_scales: [Option<i8>; 2],
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ConversionStreamingPolicy {
-    /// Require complete converted values.
-    Never,
-    /// Prefer complete values, retaining streaming when materialization does
-    /// not fit the target memory budget.
-    #[default]
-    WhenRequired,
-    /// Stream every eligible conversion, primarily for diagnostics and
-    /// memory-constrained deployment experiments.
-    Always,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AttentionStrategy {
-    #[default]
-    Automatic,
-    Flash,
-    Materialized,
-}
-
-/// Restrict product-layout choices for controlled attention comparisons.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AttentionProducts {
-    #[default]
-    Automatic,
-    SharedRows,
-    QkOnly,
-    PvOnly,
-    Independent,
-}
-
-impl PipelineConfig {
-    pub fn new(tile_count: u16) -> Self {
-        Self {
-            tile_count,
-            memory_profile_directory: None,
-            inputs: BTreeMap::new(),
-            automatic_inputs: BTreeMap::new(),
-            operator_candidates: default_operator_candidates(tile_count),
-            gemm_precisions: BTreeMap::new(),
-            shape_aware_active_tile_counts: true,
-            optimization_steps: 8,
-            load_search_state: None,
-            save_search_state: None,
-            capacity_baseline: false,
-            exchange_stream_words: None,
-            operator_candidate_limit: 64,
-            exchange_table_budget_bytes: 80 * 1024,
-            exchange_transfer_limit_per_tile: 16_384,
-            exchange_table_cost_per_byte: 0,
-            gemm_plan_constraints: Vec::new(),
-            gemm_output_packing: GemmOutputPacking::Automatic,
-            max_parallel_reductions: 3,
-            standard_memory_reservation_bytes: u64::from(
-                crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
-            ),
-            tile_memory_budget_bytes: u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
-            profiling: false,
-            diagnostic_checkpoints: false,
-            exchange_diagnostics: false,
-            conversion_streaming: ConversionStreamingPolicy::WhenRequired,
-            attention_strategy: AttentionStrategy::Automatic,
-            attention_products: AttentionProducts::Automatic,
-            attention_fp8_scales: [None; 2],
-        }
-    }
-
-    pub fn with_input(mut self, value: ValueId, format: TensorFormat) -> Self {
-        self.inputs.insert(value, format);
-        self.automatic_inputs.remove(&value);
-        self
-    }
-
-    pub fn with_automatic_input(mut self, value: ValueId, precision: Precision) -> Self {
-        self.inputs.remove(&value);
-        self.automatic_inputs.insert(value, precision);
-        self
-    }
-
-    pub fn with_operator_candidate_limit(mut self, width: usize) -> Self {
-        self.operator_candidate_limit = width.max(1);
-        self
-    }
-
-    pub fn with_attention_products(mut self, products: AttentionProducts) -> Self {
-        self.attention_products = products;
-        self
-    }
-
-    pub fn with_attention_strategy(mut self, strategy: AttentionStrategy) -> Self {
-        self.attention_strategy = strategy;
-        self
-    }
-
-    pub fn with_gemm_plan_constraint(mut self, constraint: GemmPlanConstraint) -> Self {
-        self.gemm_plan_constraints
-            .retain(|existing| existing.source_operation != constraint.source_operation);
-        self.gemm_plan_constraints.push(constraint);
-        self
-    }
-
-    /// Restrict default operator planning to explicit active tile counts.
-    /// This is useful when evaluating a fixed occupancy rather than allowing
-    /// the planner to trade occupancy against communication and memory use.
-    pub fn with_active_tile_counts(mut self, counts: impl IntoIterator<Item = u16>) -> Self {
-        let mut seen = BTreeSet::new();
-        self.operator_candidates = counts
-            .into_iter()
-            .filter(|&count| count > 0 && count <= self.tile_count && seen.insert(count))
-            .flat_map(operator_candidates_for_tile_count)
-            .collect();
-        self.shape_aware_active_tile_counts = false;
-        self
-    }
-
-    pub fn with_standard_memory_reservation(mut self, bytes: u64) -> Self {
-        self.standard_memory_reservation_bytes = bytes;
-        self
-    }
-
-    pub fn with_tile_memory_budget(mut self, bytes: u64) -> Self {
-        self.tile_memory_budget_bytes = bytes;
-        self
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MidValueId(u32);
 
@@ -402,41 +132,9 @@ pub struct MidProgram {
     pub peak_memory: MemoryPeaks,
 }
 
-// Estimation policy is kept in `estimate` so this module remains focused on IR and lowering.
-
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum LoweringError {
-    #[error("selected operator implementation is invalid")]
-    InvalidImplementation,
-    #[error("invalid mid program: {0}")]
-    InvalidProgram(String),
-    #[error("cannot write planner memory profile: {0}")]
-    MemoryProfile(String),
-    #[error(transparent)]
-    Layout(#[from] LayoutError),
-    #[error(transparent)]
-    Storage(#[from] crate::storage::StorageError),
-    #[error("mid-level lowering requires a nonzero tile count")]
-    EmptyTileGroup,
-    #[error("no tensor type was supplied for graph input {0:?}")]
-    MissingInputType(ValueId),
-    #[error("graph has no stored shape for value {0:?}")]
-    MissingShape(ValueId),
-    #[error("operation {0:?} has no legal format candidate")]
-    NoCandidate(OperationId),
-    #[error(
-        "GEMM operation {0:?} has per-batch right operands; only weights broadcast across every batch dimension are currently supported"
-    )]
-    UnsupportedGemmBatching(OperationId),
-    #[error("internal lowering error: value {0:?} is unavailable")]
-    UnknownValue(ValueId),
-}
-
-pub type LoweringResult<T> = std::result::Result<T, LoweringError>;
-
 impl MidProgram {
     /// Refresh derived costs after constructing or rewriting a complete program.
-    pub(super) fn refresh_estimates(&mut self) -> Option<()> {
+    pub(crate) fn refresh_estimates(&mut self) -> Option<()> {
         self.validate().ok()?;
         let (cycles, peak) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
         self.estimated_cycles = cycles.total;
@@ -445,6 +143,3 @@ impl MidProgram {
         Some(())
     }
 }
-
-#[cfg(test)]
-mod tests;

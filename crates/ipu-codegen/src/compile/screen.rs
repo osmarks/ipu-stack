@@ -1,13 +1,17 @@
 //! Expand, screen, and place a concrete whole-device program.
 use super::placement;
+use crate::compile::PipelineConfig;
+#[cfg(test)]
+use crate::estimate::Ipu21CostModel;
 use crate::low::{LowProgram, lower_to_tiles};
-use crate::mid::PipelineConfig;
 #[cfg(test)]
 use crate::package::check_exchange_budget;
 use crate::package::{PackageBuildError, PackageBuildResult};
 use crate::place::place;
 #[cfg(test)]
-use crate::{ComputeGraph, Ipu21CostModel, Precision, lower_baseline};
+use crate::planner::build_baseline;
+#[cfg(test)]
+use crate::{ComputeGraph, Precision};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -94,7 +98,7 @@ mod tests {
             .with_automatic_input(x, Precision::F16)
             .with_automatic_input(gamma, Precision::F16)
             .with_automatic_input(beta, Precision::F16);
-        let baseline = lower_baseline(&graph, &config, &Ipu21CostModel).unwrap();
+        let baseline = build_baseline(&graph, &config, &Ipu21CostModel).unwrap();
         let expanded = crate::expand_tiles(&baseline).unwrap();
         let fragments = crate::estimate::program_footprint(&expanded)
             .unwrap()
@@ -115,7 +119,7 @@ mod tests {
             PackageBuildError::ExchangeTransferLimitExceeded { .. }
         ));
         config.exchange_transfer_limit_per_tile = 0;
-        let still_planned = [lower_baseline(&graph, &config, &Ipu21CostModel).unwrap()];
+        let still_planned = [build_baseline(&graph, &config, &Ipu21CostModel).unwrap()];
         assert!(expand_and_place(&still_planned[0], &config, None).is_err());
         config.exchange_transfer_limit_per_tile = u64::MAX;
         assert!(expand_and_place(&still_planned[0], &config, None).is_ok());

@@ -1,15 +1,23 @@
 //! Check executable bindings at construction and rewrite boundaries. Physical
 //! address/access legality is checked later, against concrete kernel calls.
 
-use super::{
-    LoweringError, LoweringResult, MidOperation, MidOperationKind, MidProgram, MidValueId,
-};
+use super::{MidOperation, MidOperationKind, MidProgram, MidValueId};
 use crate::{Compute, OperandIndexing, TileKernelSpec};
 use std::collections::BTreeSet;
 
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ProgramError {
+    #[error("invalid mid program: {0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Layout(#[from] crate::tensor::LayoutError),
+}
+
+type ProgramResult<T> = Result<T, ProgramError>;
+
 impl MidProgram {
-    pub(crate) fn validate(&self) -> LoweringResult<()> {
-        let invalid = |message| LoweringError::InvalidProgram(message);
+    pub(crate) fn validate(&self) -> ProgramResult<()> {
+        let invalid = |message| ProgramError::Invalid(message);
         for (index, value) in self.values.iter().enumerate() {
             if value.id.index() as usize != index
                 || value.storage_group.index() as usize >= self.values.len()
@@ -42,8 +50,8 @@ impl MidProgram {
         operations: &[MidOperation],
         yields: &[MidValueId],
         defined: &mut BTreeSet<MidValueId>,
-    ) -> LoweringResult<()> {
-        let invalid = |message| LoweringError::InvalidProgram(message);
+    ) -> ProgramResult<()> {
+        let invalid = |message| ProgramError::Invalid(message);
         let mut available = BTreeSet::new();
         let define = |id: MidValueId, defined: &mut BTreeSet<_>| {
             if id.index() as usize >= self.values.len() || !defined.insert(id) {
@@ -242,7 +250,8 @@ impl MidProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComputeGraph, Ipu21CostModel, PipelineConfig, Precision};
+    use crate::estimate::Ipu21CostModel;
+    use crate::{ComputeGraph, PipelineConfig, Precision};
 
     fn program(repeated: bool) -> MidProgram {
         let mut graph = ComputeGraph::new();
@@ -258,7 +267,7 @@ mod tests {
         };
         graph.set_outputs([y]).unwrap();
         let config = PipelineConfig::new(4).with_automatic_input(x, Precision::F16);
-        crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap()
+        crate::planner::test_support::lower(&graph, &config, &Ipu21CostModel).unwrap()
     }
 
     #[test]
@@ -267,15 +276,12 @@ mod tests {
         original.validate().unwrap();
         let mut forward = original.clone();
         forward.operations[0].inputs[0] = forward.outputs[0];
-        assert!(matches!(
-            forward.validate(),
-            Err(LoweringError::InvalidProgram(_))
-        ));
+        assert!(matches!(forward.validate(), Err(ProgramError::Invalid(_))));
         let mut duplicate = original.clone();
         duplicate.operations.push(duplicate.operations[0].clone());
         assert!(matches!(
             duplicate.validate(),
-            Err(LoweringError::InvalidProgram(_))
+            Err(ProgramError::Invalid(_))
         ));
         let mut alias = original;
         let operation = alias
@@ -289,10 +295,7 @@ mod tests {
             })
             .unwrap();
         operation.push((usize::MAX, 0));
-        assert!(matches!(
-            alias.validate(),
-            Err(LoweringError::InvalidProgram(_))
-        ));
+        assert!(matches!(alias.validate(), Err(ProgramError::Invalid(_))));
     }
 
     #[test]
@@ -309,9 +312,6 @@ mod tests {
             })
             .unwrap();
         body.operations[0].inputs[0] = outer;
-        assert!(matches!(
-            program.validate(),
-            Err(LoweringError::InvalidProgram(_))
-        ));
+        assert!(matches!(program.validate(), Err(ProgramError::Invalid(_))));
     }
 }

@@ -65,10 +65,18 @@ local to evaluation, which exposes both final scheduling and the one detailed
 address alternative. The finalization callback, `validate`, `ScheduledPlan` and
 separate `BuiltApplication` are removed. Failed alternatives cannot replace the
 incumbent schedule cache; accepted address alternatives promote their own cache.
-Recipe proposals and checkpoints are outside package; planner construction,
-configuration and scoped ownership still require migration.
-Complete family binding, planner module ownership and the other boundaries below remain
-to be refactored. The diagnoses below describe the
+Recipe proposals and checkpoints are outside package. Graph construction, family
+choices/catalogues, executable fragment construction/cache and persistent home
+selection now belong to planner; pipeline configuration belongs to compile.
+Mid no longer supplies those definitions through parent imports. Broadcast and
+ownership projection are neutral tensor geometry, while rewrite sequence costing
+belongs to estimate. Fragment binding checks complete input/output contracts,
+preserves ownership groups and relative offsets, remaps Repeat recursively, and
+connects returned inputs to requested result values with explicit identity copies.
+Invalid bindings cannot leave partially appended values or operations. Program
+validation has its own error type, independent of planning failures.
+Scoped ownership decisions and the remaining family storage, relocation, target
+and cache boundaries below still require work. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.
 

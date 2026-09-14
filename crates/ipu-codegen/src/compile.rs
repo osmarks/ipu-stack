@@ -1,23 +1,25 @@
 //! Compiler driver: search over executable mid candidates, then compile each
 //! through explicit expansion, support sizing, placement and exchange feedback.
 //! The accepted result owns one final placement, schedule, package and cache.
+pub(crate) mod config;
+pub use config::*;
 mod benchmark;
 mod placement;
 mod screen;
 pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
 
+use crate::estimate::Ipu21CostModel;
 use crate::estimate::memory_profile::write as memory_profile;
 use crate::graph::ComputeGraph;
 use crate::kernel::KernelBuildPlan;
 use crate::low::LowProgram;
 use crate::memory::TileMemoryMap;
-use crate::mid::baseline::{self, Baseline, Recipe};
-use crate::mid::{Ipu21CostModel, PipelineConfig};
 use crate::package::{
     self, CompiledPackage, DiagnosticCheckpoint, PackageBuildResult, active_topology, build_phase,
     diagnostic_tensor, invalid, package_inputs, package_multiply_precisions, package_precisions,
     validate_tile_count,
 };
+use crate::planner::{Candidate, Recipe, build};
 use crate::planner::{checkpoint, proposals};
 use ipu_elf::Toolchain;
 use ipu_exchange::Topology;
@@ -158,7 +160,7 @@ fn compile_graph(
     })?;
     let selected = build_phase("plan_package", || {
         let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-        let fragments = crate::mid::implementation::FragmentCache::default();
+        let fragments = crate::planner::cache::FragmentCache::default();
         let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
         let mut state = checkpoint::State::load(graph, config, tile_mapping)?;
         let mut fixed = config.clone();
@@ -166,7 +168,8 @@ fn compile_graph(
         if resuming {
             fixed.inputs = state.inputs.clone();
         }
-        let mut incumbent = baseline::lower(graph, &fixed, &costs, &fragments, &state.recipe)?;
+        let mut incumbent =
+            build::build_candidate(graph, &fixed, &costs, &fragments, &state.recipe)?;
         if resuming {
             incumbent.alternatives = state.alternatives.clone();
         }
@@ -247,7 +250,8 @@ fn compile_graph(
                     let span =
                         tracing::debug_span!("local_screen", round = state.attempts, proposal);
                     let _entered = span.enter();
-                    let candidate = baseline::lower(graph, &fixed, &costs, &fragments, &recipe);
+                    let candidate =
+                        build::build_candidate(graph, &fixed, &costs, &fragments, &recipe);
                     let candidate = match candidate {
                         Ok(candidate) => {
                             let visited = state.visited.contains(&candidate.recipe);
@@ -436,7 +440,7 @@ enum Skipped {
 /// mark aliases of a truncated or cancelled candidate as visited.
 struct ShortlistedCandidate {
     proposal: usize,
-    baseline: Baseline,
+    baseline: Candidate,
     recipes: Vec<Recipe>,
 }
 
@@ -603,7 +607,7 @@ pub fn capture_exchange_baseline(
     let planning = &config.pipeline;
     validate_tile_count(u32::from(planning.tile_count))?;
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-    let mid = crate::mid::lower_baseline(graph, planning, &costs)?;
+    let mid = crate::planner::build_baseline(graph, planning, &costs)?;
     let (low, placement, _) =
         screen::expand_and_place(&mid, planning, config.tile_mapping.as_deref())?;
     Ok(crate::exchange::capture_exchange_schedule(

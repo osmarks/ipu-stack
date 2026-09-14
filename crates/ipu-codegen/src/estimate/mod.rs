@@ -11,10 +11,12 @@ pub use exchange_storage::{ExchangeStorageEstimator, estimate_exchange_phase_sto
 mod memory;
 pub(crate) mod memory_profile;
 mod mid;
+#[cfg(test)]
+pub(crate) use mid::operation_cost;
 mod primitive;
 mod program;
 pub(crate) use mid::{
-    analyze as analyze_mid, analyze_with_budget, operation_cost,
+    analyze as analyze_mid, analyze_with_budget, operation_cycles,
     region_peak_memory_with_multiplicity, region_program,
 };
 pub(crate) use program::{

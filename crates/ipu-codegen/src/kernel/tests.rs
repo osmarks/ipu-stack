@@ -1,8 +1,10 @@
 use super::*;
+use crate::estimate::Ipu21CostModel;
+use crate::planner::test_support::lower;
 use crate::{
-    AccumulationPrecision, ComputeGraph, Ipu21CostModel, KernelAccess, KernelRequirements, Layout,
-    MemoryClass, PipelineConfig, ShardExtent, ShardView, TensorFormat, TensorTiling,
-    WorkProvenance, WorkReason, lower, lower_to_tiles,
+    AccumulationPrecision, ComputeGraph, KernelAccess, KernelRequirements, Layout, MemoryClass,
+    PipelineConfig, ShardExtent, ShardView, TensorFormat, TensorTiling, WorkProvenance, WorkReason,
+    lower_to_tiles,
 };
 
 #[test]
@@ -96,7 +98,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
             },
         )
         .with_automatic_input(weights, fp8);
-    config.operator_candidates = vec![crate::OperatorCandidate::fp8_gemm(64, -4)];
+    config.operator_candidates = vec![crate::planner::OperatorCandidate::fp8_gemm(64, -4)];
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
     let plan = KernelBuildPlan::from_program(&low).unwrap();
@@ -258,9 +260,9 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
         // independently of changes to the planner's relative strategy costs.
         config.operator_candidates.retain(|candidate| {
             matches!(candidate,
-            crate::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
-                crate::OperatorDispatch::BlockedGemm { orientation: crate::GemmOrientation::Normal,
-                    distribution: crate::GemmDistribution::OutputStationary, .. }))
+            crate::planner::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
+                crate::planner::operator::OperatorDispatch::BlockedGemm { orientation: crate::planner::operator::GemmOrientation::Normal,
+                    distribution: crate::planner::operator::GemmDistribution::OutputStationary, .. }))
         });
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(
@@ -588,7 +590,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
 
 #[test]
 fn packed_gemm_stores_bind_without_output_copies() {
-    let orientation = crate::GemmOrientation::Normal;
+    let orientation = crate::planner::operator::GemmOrientation::Normal;
     {
         for rows in [17, 96, 129] {
             let mut graph = ComputeGraph::new();
@@ -605,9 +607,9 @@ fn packed_gemm_stores_bind_without_output_copies() {
                 .with_input(right, format);
             config.gemm_output_packing = crate::GemmOutputPacking::Packed;
             config.operator_candidates.retain(|candidate| matches!(candidate,
-                crate::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
-                    crate::OperatorDispatch::BlockedGemm { orientation: candidate_orientation,
-                        distribution: crate::GemmDistribution::OutputStationary, .. } if candidate_orientation == orientation)));
+                crate::planner::OperatorCandidate::Concrete(candidate) if matches!(candidate.plan.dispatch,
+                    crate::planner::operator::OperatorDispatch::BlockedGemm { orientation: candidate_orientation,
+                        distribution: crate::planner::operator::GemmDistribution::OutputStationary, .. } if candidate_orientation == orientation)));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
             let build = KernelBuildPlan::from_program(&low).unwrap();

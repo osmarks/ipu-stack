@@ -1,5 +1,5 @@
 use crate::mid::Compute;
-use crate::mid::ConcreteOperatorCandidate;
+use crate::planner::catalogue::ConcreteOperatorCandidate;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
 fn lower_to_tiles(
     graph: &crate::MidProgram,
@@ -16,11 +16,15 @@ fn lower_to_tiles(
     Ok(crate::low::lower_to_tiles(&expected, checkpoints))
 }
 use super::*;
+use crate::estimate::Ipu21CostModel;
+use crate::planner::OperatorCandidate;
+use crate::planner::operator::{
+    GemmDistribution, OperandRequirement, OperatorDispatch, OperatorFamily, OutputAliasing,
+};
+use crate::planner::test_support::lower;
 use crate::{
-    AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GemmDistribution, GridOrder,
-    Ipu21CostModel, Layout, MemoryClass, MidOperator, OperandRequirement, OperatorCandidate,
-    OperatorDispatch, OutputAliasing, Padding, PipelineConfig, Precision, TensorAxis, TensorFormat,
-    TensorTiling, TileKernelSpec, lower,
+    AccumulationPrecision, AxisTiling, ComputeGraph, ElementOrder, GridOrder, Layout, MemoryClass,
+    Padding, PipelineConfig, Precision, TensorAxis, TensorFormat, TensorTiling, TileKernelSpec,
 };
 use std::collections::BTreeSet;
 
@@ -360,7 +364,7 @@ fn panel_construction_keeps_both_operand_casts_materialized() {
     config.operator_candidates.retain(|candidate| {
         matches!(
             candidate.operator(),
-            MidOperator::Gemm {
+            OperatorFamily::Gemm {
                 multiply: Precision::F16,
                 ..
             }
@@ -472,7 +476,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         let right = graph.parameter("right", [1, inner, columns]).unwrap();
         let product = graph.gemm(left, right).unwrap();
         graph.set_outputs([product]).unwrap();
-        let operator = MidOperator::Gemm {
+        let operator = OperatorFamily::Gemm {
             options: Default::default(),
             multiply: Precision::F16,
             accumulate: AccumulationPrecision::F32,
@@ -537,7 +541,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
         .with_dispatch(OperatorDispatch::BlockedGemm {
             inner_block: 64,
             output_column_block: output_columns,
-            orientation: crate::GemmOrientation::Normal,
+            orientation: crate::planner::operator::GemmOrientation::Normal,
             distribution: GemmDistribution::ParallelReduction {
                 row_partitions,
                 column_partitions,
@@ -694,7 +698,7 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
             .with_input(right0, right_format.clone())
             .with_input(right1, right_format.clone());
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            MidOperator::Gemm {
+            OperatorFamily::Gemm {
                 options: crate::GemmOptions::default(),
                 multiply: Precision::F16,
                 accumulate: crate::AccumulationPrecision::F16,
@@ -745,7 +749,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(tiles).with_input(input, tensor_format.clone());
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            MidOperator::Gelu,
+            OperatorFamily::Gelu,
             [OperandRequirement::new(tensor_format.clone())],
             OperandRequirement::new(tensor_format),
         )]
@@ -878,7 +882,7 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            MidOperator::Gelu,
+            OperatorFamily::Gelu,
             // GeLU preserves element order. Requesting its output format on
             // the operand makes the required local conversion explicit.
             [OperandRequirement::new(output_format.clone())],
@@ -949,7 +953,7 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format);
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
-            MidOperator::Gelu,
+            OperatorFamily::Gelu,
             [OperandRequirement::new(target_format.clone())],
             OperandRequirement::new(target_format),
         )]
@@ -1664,12 +1668,12 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                         && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
                 })
         });
-        let selected = crate::mid::baseline::select(
+        let selected = crate::planner::build::select(
             &graph,
             &config,
             &Ipu21CostModel,
-            &crate::mid::implementation::FragmentCache::default(),
-            &crate::mid::baseline::Recipe::default(),
+            &crate::planner::cache::FragmentCache::default(),
+            &crate::planner::Recipe::default(),
         )
         .unwrap();
         let plan = selected.recipe.plans.values().next().unwrap();
@@ -1712,9 +1716,9 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let inner = inner_blocks * 64;
         let columns = u32::from(column_partitions) * 64;
         let local_staging = if random.bool() {
-            crate::LocalOperandStaging::Direct
+            crate::planner::operator::LocalOperandStaging::Direct
         } else {
-            crate::LocalOperandStaging::MatchRemote
+            crate::planner::operator::LocalOperandStaging::MatchRemote
         };
         let mut graph = ComputeGraph::new();
         let left = graph.host_input("left", [rows, inner]).unwrap();
@@ -1755,21 +1759,23 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
         let mut config = PipelineConfig::new(tiles)
             .with_input(left, left_format.clone())
             .with_input(right, right_format.clone());
-        config.operator_candidates = vec![crate::ConcreteOperatorCandidate::new(
-            crate::MidOperator::Gemm {
-                options: crate::GemmOptions::default(),
-                multiply: Precision::F16,
-                accumulate: crate::AccumulationPrecision::F32,
-            },
-            [
-                crate::OperandRequirement::new(left_format),
-                crate::OperandRequirement::new(right_format).with_local_staging(local_staging),
-            ],
-            crate::OperandRequirement::new(output_format),
-        )]
-        .into_iter()
-        .map(OperatorCandidate::Concrete)
-        .collect();
+        config.operator_candidates =
+            vec![crate::planner::catalogue::ConcreteOperatorCandidate::new(
+                crate::planner::operator::OperatorFamily::Gemm {
+                    options: crate::GemmOptions::default(),
+                    multiply: Precision::F16,
+                    accumulate: crate::AccumulationPrecision::F32,
+                },
+                [
+                    crate::planner::operator::OperandRequirement::new(left_format),
+                    crate::planner::operator::OperandRequirement::new(right_format)
+                        .with_local_staging(local_staging),
+                ],
+                crate::planner::operator::OperandRequirement::new(output_format),
+            )]
+            .into_iter()
+            .map(OperatorCandidate::Concrete)
+            .collect();
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
@@ -1876,7 +1882,7 @@ fn repeat_binds_every_linear_fragment_including_rotated_owners() {
         layout: Layout::logical_linear(2, 16),
     };
     let mut candidate = ConcreteOperatorCandidate::new(
-        MidOperator::Add,
+        OperatorFamily::Add,
         vec![OperandRequirement::new(format.clone()); 2],
         OperandRequirement::new(format.clone()),
     );
@@ -2128,7 +2134,7 @@ fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
     graph.set_outputs(output).unwrap();
     let tensor_format = format(1);
     let mut candidate = ConcreteOperatorCandidate::new(
-        MidOperator::Gelu,
+        OperatorFamily::Gelu,
         [OperandRequirement::new(tensor_format.clone())],
         OperandRequirement::new(tensor_format.clone()),
     );
@@ -2399,7 +2405,7 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     let output = graph.gelu(input).unwrap();
     graph.set_outputs([output]).unwrap();
     let mut candidate = ConcreteOperatorCandidate::new(
-        MidOperator::Gelu,
+        OperatorFamily::Gelu,
         [OperandRequirement::new(format.clone())],
         OperandRequirement::new(format.clone()),
     );
@@ -2432,7 +2438,7 @@ fn local_casts_pair_corresponding_linear_fragments() {
         layout: Layout::logical_linear(2, 16),
     };
     let candidate = ConcreteOperatorCandidate::new(
-        MidOperator::Gelu,
+        OperatorFamily::Gelu,
         [OperandRequirement::new(target.clone())],
         OperandRequirement::new(target.clone()),
     );

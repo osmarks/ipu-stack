@@ -28,6 +28,8 @@ are less clean than their names suggest:
 Selection emits executable family fragments directly into the program. There
 is no `Operator` variant, nested implementation, deferred-input state, or
 resolution pass. `Recipe` retains the selected family parameters separately.
+The public `MidOperator` compatibility name aliases planner's `OperatorFamily`;
+it is not an executable mid node.
 Binding validation checks definitions, region scope, arity and alias indices at
 construction and rewrite boundaries. Numerical casts have one compute form;
 coordinate/layout movement has one Copy form with a selected movement policy.
@@ -50,7 +52,7 @@ inventory and emission observe the same live work.
 
 ```mermaid
 flowchart TD
-  G[ComputeGraph and PipelineConfig] --> P[baseline::select: choose operators and boundaries]
+  G[ComputeGraph and PipelineConfig] --> P[planner::build::select: construct selected operators and boundaries]
   R[Recipe: selections and rewrite choices] --> P
   P --> I[emit_selected: construct and bind executable family fragment]
   I --> W[Cast ordering, copy composition, fusions, ownership and storage rewrites]
@@ -68,7 +70,7 @@ flowchart TD
   A -. accepted incumbent guides next recipe .-> R
 ```
 
-[baseline::lower](../crates/ipu-codegen/src/mid/baseline.rs) controls the mid
+[planner::build_candidate](../crates/ipu-codegen/src/planner/build.rs) controls the mid
 rewrite order. [compile_graph](../crates/ipu-codegen/src/compile.rs)
 keeps a fully evaluated incumbent. [planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs)
 generates recipes without evaluating packages; the driver rebuilds their mid
@@ -77,6 +79,18 @@ candidates concurrently. It accepts the first improvement in shortlist order,
 not the best of an exhaustively evaluated beam. Logical input homes are fixed
 from the initial incumbent. A recipe is a search decision record; it is not
 another executable representation.
+
+The source sequence for high-to-mid construction is explicit: `planner/build.rs`
+walks operations and regions, `planner/candidates.rs` supplies choices, and
+`planner/bind.rs` prepares complete input formats and commits the chosen family.
+`planner/fragments.rs` dispatches to the connected GEMM, attention and layernorm
+constructors and supplies their shared copy/cast/compute builder. The cache holds
+ordinary executable `MidProgram`s keyed by the selected plan and complete input
+and output types. `mid/fragment.rs` substitutes those bindings; it does not resolve
+another representation. Persistent parameter-home selection belongs to
+`planner/parameter_homes.rs`, while selected executable owner rewrites remain in
+`mid/ownership.rs`. Cross-module imports name their owners instead of inheriting
+planner/tensor/configuration names through the mid module.
 
 The optional mapping search in
 [compile/placement.rs](../crates/ipu-codegen/src/compile/placement.rs) proposes
@@ -103,9 +117,11 @@ and addresses can change hazards and row sharing. Each speculative candidate own
 its schedule-cache snapshot; only the winner's final cache is promoted. The former
 `ScheduledPlan`, separate `BuiltApplication`, `validate` wrapper and finalization
 callback are removed. Checkpoints store recipes/progress in
-[planner/checkpoint.rs](../crates/ipu-codegen/src/planner/checkpoint.rs). The graph
-builder, family selection and pipeline configuration still need to move from mid
-to their planner/compiler owners, and mapping proposals still need scoped recipes.
+[planner/checkpoint.rs](../crates/ipu-codegen/src/planner/checkpoint.rs). The graph builder, family choices/catalogues, fragment cache and direct construction
+now live under [planner](../crates/ipu-codegen/src/planner/mod.rs).
+[compile/config.rs](../crates/ipu-codegen/src/compile/config.rs) owns pipeline
+configuration. Mid contains executable semantics, binding and rewrites. Mapping
+proposals still need scoped recipes.
 
 The reported final cycles still combine modelled kernel work with scheduled
 exchange horizons. They are not hardware measurements.
@@ -126,21 +142,24 @@ flowchart LR
   S --> Y[Output with selected ownership and order]
 ```
 
-1. [Candidate generation](../crates/ipu-codegen/src/mid/candidates.rs) and
-   [operator plans](../crates/ipu-codegen/src/mid/operator.rs) choose the grid,
+1. [Candidate generation](../crates/ipu-codegen/src/planner/candidates.rs) and
+   [operator plans](../crates/ipu-codegen/src/planner/operator.rs) choose the grid,
    precision, orientation, kernel blocking, result layout and reduction staging.
-   [ensure_format](../crates/ipu-codegen/src/mid/lowering.rs) prepares outer
+   [ensure_format](../crates/ipu-codegen/src/planner/bind.rs) prepares outer
    complete operand formats and numerical casts. Panel requirements leave
    layout movement to the family's copies, without inventing a converted value.
-2. [implementation/gemm.rs](../crates/ipu-codegen/src/mid/implementation/gemm.rs)
+2. [planner/gemm.rs](../crates/ipu-codegen/src/planner/gemm.rs)
    builds a compact mid fragment. Parallel GEMM emits ordinary copies, a
    `Compute::Product` with axes/blocking, a leading partials dimension, and
    `Compute::Sum`.
    Output-stationary GEMM instead exposes successive K-panel values and
    accumulating result versions. This is the owner of the distributed algorithm.
-3. [emit_selected](../crates/ipu-codegen/src/mid/lowering.rs) binds the fragment
-   immediately to actual region values. `append_fragment` remaps IDs without
-   selecting or rebuilding an implementation. The later parameter-home
+3. [emit_selected](../crates/ipu-codegen/src/planner/bind.rs) binds the fragment
+   immediately to actual region values. [append_fragment](../crates/ipu-codegen/src/mid/fragment.rs)
+   checks both input and result types, remaps nested Repeat bindings, and preserves
+   storage groups and relative ownership. A returned input is connected to a
+   distinct caller result by an explicit identity copy. Binding selects no algorithm
+   and leaves caller state untouched on failure. The later parameter-home
    transformation updates bindings and inserts any input-owner copies as part
    of that same transformation; there is no resolver repairing it afterward.
 4. [low/expand/gemm.rs](../crates/ipu-codegen/src/low/expand/gemm.rs)
@@ -157,8 +176,8 @@ flowchart LR
 The current `Compute::Sum` carries a distributed reduction axis and staging
 policy; the local `ReductionSum` kernel implements individual stages. Products
 have their own compute variant; ordinary kernel compute no longer has optional
-product axes. Both retain declared output aliases. Complete family binding
-remains in progress.
+product axes. Both retain declared output aliases. Fragment substitution now checks complete
+boundaries; the remaining kernel storage/access contracts are described below.
 
 However, its current implementation is narrower than the name: singleton partial
 axis outside the final matrix axes, FP16 contributors/results, matching element
@@ -174,8 +193,8 @@ The semantic relation is `Y[b,r,c] = X[b,r,c] + B[0,r,c]`.
 | Step | Current owner | Purpose |
 | --- | --- | --- |
 | Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph.rs), `infer_shape`, using [tensor.rs](../crates/ipu-codegen/src/tensor.rs) | Define valid logical computation |
-| Select output layout and compatible kernel | [mid/candidates.rs](../crates/ipu-codegen/src/mid/candidates.rs) | Choose distributed implementation |
-| Project output ownership onto non-broadcast input axes | [implementation/mod.rs](../crates/ipu-codegen/src/mid/implementation/mod.rs), `pointwise_input_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
+| Select output layout and compatible kernel | [planner/candidates.rs](../crates/ipu-codegen/src/planner/candidates.rs) | Choose distributed implementation |
+| Project output ownership onto non-broadcast input axes | [tensor/resolved.rs](../crates/ipu-codegen/src/tensor/resolved.rs), `broadcast_operand_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
 | Bind the declared operand relation to a resident fragment | [expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs), `elementwise_view` | Supply the local kernel with the needed coordinates |
 | Validate supported broadcast shape and encode strides/counts | [kernel/pointwise.rs](../crates/ipu-codegen/src/kernel/pointwise.rs), `call` | Match the actual kernel's address arithmetic |
 
@@ -343,7 +362,7 @@ storage saving on each shard. A physically valid cast need not be profitable.
 
 Other physical access contracts still have multiple owners:
 
-- [attention construction](../crates/ipu-codegen/src/mid/implementation/attention.rs)
+- [attention construction](../crates/ipu-codegen/src/planner/attention.rs)
   places FP32 statistics after probabilities inside a nominal F16/FP8 tensor.
   It crops probability copies to exclude the statistics; finite-padding reuse
   separately rejects attention kernels because their writes are not all F16.

@@ -1,7 +1,10 @@
 //! Distributed feature statistics followed by local affine normalization.
-use super::*;
+use super::fragments::FragmentBuilder;
+use crate::kernel::TileKernelSpec;
+use crate::mid::{MidValueId, OperandIndexing};
+use crate::tensor::{Precision, TensorAxis, TensorType, broadcast_operand_tiling};
 
-impl Builder {
+impl FragmentBuilder {
     pub(super) fn layernorm(&mut self, output: &TensorType, parts: u16) -> Option<MidValueId> {
         let rank = output.shape.0.len();
         let width = *output.shape.0.last()?;
@@ -10,9 +13,9 @@ impl Builder {
         }
         let mut inputs = Vec::new();
         for index in 0..3 {
-            let id = MidValueId(index);
+            let id = MidValueId::from_index(index);
             let mut tensor = self.tensor(id).clone();
-            tensor.format.layout.tiling = pointwise_input_tiling(&tensor, output)?;
+            tensor.format.layout.tiling = broadcast_operand_tiling(&tensor, output)?;
             inputs.push(self.copy(id, tensor, vec![]));
         }
         let mut moments = output.clone();

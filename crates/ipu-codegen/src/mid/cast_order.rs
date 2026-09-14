@@ -1,10 +1,21 @@
 //! Searchable cast motion on expanded mid graphs, including compound operators.
-use super::*;
+
+use crate::graph::OperationId;
+use crate::kernel::TileKernelSpec;
+use crate::mid::{
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
+    OperandIndexing,
+};
+use crate::tensor::{
+    AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
+    TensorFormat, TensorType,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Keep producer ownership while completing FP8's 32-element panels.
 /// This rewrite preference avoids an intermediate F16 pack; it does not define
 /// the set of representable tensor layouts or all legal kernel bindings.
-pub(super) fn producer_layout(input: &TensorType, target: &TensorFormat) -> Option<Layout> {
+pub(crate) fn producer_layout(input: &TensorType, target: &TensorFormat) -> Option<Layout> {
     let mut layout = cast_layout(input)?;
     if layout.order == ElementOrder::RowMajor && target.layout.order != ElementOrder::RowMajor {
         let resolved = layout.resolve(&input.shape).ok()?;
@@ -40,7 +51,7 @@ pub(super) fn producer_layout(input: &TensorType, target: &TensorFormat) -> Opti
         .then_some(layout)
 }
 
-pub(super) fn cast_layout(input: &TensorType) -> Option<Layout> {
+pub(crate) fn cast_layout(input: &TensorType) -> Option<Layout> {
     let mut layout = input.format.layout.clone();
     let axis_from_end = match layout.order {
         ElementOrder::Amp(AmpOrder::Left) => {
@@ -272,37 +283,67 @@ fn may_write_existing_storage(op: &MidOperation) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::estimate::MemoryPeaks;
+    use crate::graph::{GraphInputKind, ValueId};
+    use crate::low::CopyPolicy;
+    use crate::mid::{MidInput, MidRegion, MidRepeat, rewrite};
+    use crate::tensor::TensorTiling;
+
     use super::*;
 
     fn fixture() -> MidProgram {
-        let mut graph = ComputeGraph::new();
-        let x = graph.host_input("x", [8, 64]).unwrap();
-        graph.gelu(x).unwrap();
-        let mut state = lowering::LoweringState::default();
-        let input = state.value(
-            ValueId::from_index(0),
-            TensorType::new([8, 64], Precision::F16, Layout::amp_left(1, 64)),
-        );
         let mut layout = Layout::amp_left(1, 64);
+        let input = TensorType::new([8, 64], Precision::F16, layout.clone());
         layout.tiling = TensorTiling::replicated(4);
-        let mut operations = Vec::new();
-        let output = lowering::ensure_format(
-            input,
-            TensorFormat {
-                precision: Precision::F8F143 { scale_exponent: -4 },
-                layout,
+        let staging = TensorType::new([8, 64], Precision::F16, layout.clone());
+        let output = TensorType::new([8, 64], Precision::F8F143 { scale_exponent: -4 }, layout);
+        let values = [input, staging, output]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tensor_type)| {
+                let id = MidValueId(i as u32);
+                MidValue {
+                    id,
+                    tile_offset: 0,
+                    tensor_type,
+                    origin: ValueId::from_index(0),
+                    storage_group: MidValueId(0),
+                }
+            })
+            .collect();
+        let kinds = [
+            MidOperationKind::Copy {
+                mapping: CoordinateMapping::default(),
+                reuse_local: false,
+                policy: CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
             },
-            OperandMaterialization::Complete,
-            graph.operations()[0].id,
-            &Ipu21CostModel,
-            &mut state,
-            &mut operations,
-        );
+            MidOperationKind::Compute(Compute::cast(
+                Precision::F16,
+                Precision::F8F143 { scale_exponent: -4 },
+            )),
+        ];
         MidProgram {
             tile_count: 4,
-            values: state.values,
-            operations,
-            outputs: vec![output],
+            inputs: vec![MidInput {
+                name: "input".into(),
+                kind: GraphInputKind::Host,
+                value: MidValueId(0),
+            }],
+            values,
+            operations: kinds
+                .into_iter()
+                .enumerate()
+                .map(|(i, kind)| MidOperation {
+                    source: None,
+                    inputs: vec![MidValueId(i as u32)],
+                    results: vec![MidValueId(i as u32 + 1)],
+                    kind,
+                    estimated_cycles: 0,
+                    estimated_exchange_cycles: 0,
+                })
+                .collect(),
+            outputs: vec![MidValueId(2)],
             ..MidProgram::default()
         }
     }

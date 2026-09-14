@@ -2,17 +2,27 @@
 //! not selected implementations or execution costs. Views and layout-preserving
 //! GELU pass requests upstream; the forward planner prices every alternative.
 
-use super::*;
+use crate::compile::PipelineConfig;
+use crate::graph::{Operation, OperationKind, ValueId};
+use crate::planner::candidates::direct_consumer_layouts;
+use crate::planner::candidates::operator_matches;
+use crate::planner::catalogue::OperatorFormatPolicy;
+use crate::planner::operator::OperatorFamily;
+use crate::tensor::{
+    AmpOrder, AxisFactorView, ElementOrder, Layout, MicroPanelOrder, Precision, TensorAxis,
+    TensorShape,
+};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::mid) struct OutputDemand {
+pub(in crate::planner) struct OutputDemand {
     pub order: ElementOrder,
     pub column_groups: u16,
     pub inner_grain: u32,
 }
 
 impl OutputDemand {
-    pub(in crate::mid) fn matches(self, layout: &Layout, shape: &TensorShape) -> bool {
+    pub(in crate::planner) fn matches(self, layout: &Layout, shape: &TensorShape) -> bool {
         let order_matches = layout.order == self.order
             || layout.order.micro_panel_order().is_some()
                 && layout.order.micro_panel_order() == self.order.micro_panel_order();
@@ -75,10 +85,10 @@ impl OutputDemand {
 }
 
 #[derive(Default)]
-pub(in crate::mid) struct OutputDemands(BTreeMap<ValueId, Vec<OutputDemand>>);
+pub(in crate::planner) struct OutputDemands(BTreeMap<ValueId, Vec<OutputDemand>>);
 
 impl OutputDemands {
-    pub(in crate::mid) fn new(
+    pub(in crate::planner) fn new(
         operations: &[Operation],
         shapes: &BTreeMap<ValueId, TensorShape>,
         config: &PipelineConfig,
@@ -101,7 +111,7 @@ impl OutputDemands {
                         config.operator_candidates.iter().any(|candidate| {
                             matches!(
                                 candidate.operator(),
-                                MidOperator::Gemm {
+                                OperatorFamily::Gemm {
                                     multiply: Precision::F8F143 { .. },
                                     ..
                                 }
@@ -186,13 +196,16 @@ impl OutputDemands {
         }
     }
 
-    pub(in crate::mid) fn get(&self, value: ValueId) -> &[OutputDemand] {
+    pub(in crate::planner) fn get(&self, value: ValueId) -> &[OutputDemand] {
         self.0.get(&value).map_or(&[], Vec::as_slice)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::graph::ComputeGraph;
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]

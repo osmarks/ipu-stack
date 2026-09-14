@@ -1,5 +1,6 @@
-use super::*;
-
+use crate::planner::optimistic::DiagnosticMidGraph;
+use crate::planner::optimistic::SearchReport;
+use crate::planner::optimistic::StepKind;
 impl SearchReport {
     /// Best retained candidate with no known missing capability. This is not a
     /// claim that the production planner would select it or that placement fits.

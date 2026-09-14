@@ -1,8 +1,15 @@
 //! Distributed attention stages and bounded key-block materialization.
 
-use super::*;
+use super::fragments::{FragmentBuilder, project_grid};
+use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
+use crate::mid::{Compute, MidValueId, OperandIndexing, OperandWindow, Product, ProductAxes};
+use crate::planner::operator::ProductGrid;
+use crate::tensor::{
+    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder,
+    MemoryClass, Padding, Precision, TensorAxis, TensorType,
+};
 
-impl Builder {
+impl FragmentBuilder {
     pub(super) fn attention(
         &mut self,
         output: &TensorType,
@@ -36,9 +43,9 @@ impl Builder {
             operands: Default::default(),
             output_aliases: Vec::new(),
         };
-        let query = self.tensor(MidValueId(0)).clone();
-        let key = self.tensor(MidValueId(1)).clone();
-        let value = self.tensor(MidValueId(2)).clone();
+        let query = self.tensor(MidValueId::from_index(0)).clone();
+        let key = self.tensor(MidValueId::from_index(1)).clone();
+        let value = self.tensor(MidValueId::from_index(2)).clone();
         let rank = output.shape.0.len();
         if rank != 3 || key_block == 0 {
             return None;
@@ -49,9 +56,9 @@ impl Builder {
         query_type.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
         query_type.shape.0[2] = query_width;
         let query_buffer = if query_key_grid.is_some() {
-            MidValueId(0)
+            MidValueId::from_index(0)
         } else {
-            self.copy(MidValueId(0), query_type, vec![])
+            self.copy(MidValueId::from_index(0), query_type, vec![])
         };
         let mut scores_type = output.clone();
         scores_type.format.precision = Precision::F16;
@@ -119,9 +126,10 @@ impl Builder {
             .ok()?,
             column_block: AMP_COLUMN_MICRO as u16,
         });
-        let key_panels = self.prepare_attention_operand(MidValueId(1), &packed_key, key_block)?;
+        let key_panels =
+            self.prepare_attention_operand(MidValueId::from_index(1), &packed_key, key_block)?;
         let value_panels =
-            self.prepare_attention_operand(MidValueId(2), &packed_value, key_block)?;
+            self.prepare_attention_operand(MidValueId::from_index(2), &packed_value, key_block)?;
         // Quantize each unreplicated native panel once, before PV ownership
         // replicates it across query partitions.
         let value_panels = if let Some(scale_exponent) = fp8_scales[1] {
@@ -345,6 +353,8 @@ impl Builder {
 
 #[cfg(test)]
 mod tests {
+    use crate::tensor::{Layout, TensorFormat, TensorShape};
+
     use super::*;
 
     #[test]
@@ -356,7 +366,7 @@ mod tests {
                 layout: Layout::attention_output(1, 1),
             },
         };
-        let mut builder = Builder::new(&[
+        let mut builder = FragmentBuilder::new(&[
             tensor([1, 2, 72]),
             tensor([1, 729, 72]),
             tensor([1, 729, 72]),
@@ -417,9 +427,9 @@ mod tests {
         let mut resident = key.clone();
         resident.format.layout = Layout::attention_output(16, 1);
         resident.format.layout.order = ElementOrder::Amp(AmpOrder::TransposedRight);
-        let mut b = Builder::new(&[key]);
+        let mut b = FragmentBuilder::new(&[key]);
         let prepared = b
-            .prepare_attention_operand(MidValueId(0), &resident, 64)
+            .prepare_attention_operand(MidValueId::from_index(0), &resident, 64)
             .unwrap();
         assert_eq!(b.tensor(prepared).format.layout.tiling.tile_count, 192);
     }

@@ -1,6 +1,12 @@
 //! Fuse supported producer epilogues before or after redistribution.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
-use super::*;
+use crate::low::CopyPolicy;
+use crate::mid::{
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
+    OperandIndexing, cast_order,
+};
+use crate::tensor::{ElementOrder, TensorFormat};
+use std::collections::{BTreeMap, BTreeSet};
 
 // A producer may write a cast's explicit result when its F16 intermediate
 // has no other readers. Keep the separate path whenever it costs less.
@@ -15,7 +21,7 @@ pub(super) fn fuse(
         let mut ops = operations.clone();
         let mut vals = values.clone();
         if fuse_fp8_outputs_at(&mut ops, &mut vals, required, at_source)
-            && let Some(cycles) = super::rewrite::operation_cycles(&ops, &vals)
+            && let Some(cycles) = crate::estimate::operation_cycles(&ops, &vals)
             && best.as_ref().is_none_or(|(old, _, _)| cycles < *old)
         {
             best = Some((cycles, ops, vals));
@@ -247,7 +253,7 @@ fn fuse_fp8_outputs_at(
             for &parameter in &producer.inputs[1..] {
                 let old = &values[parameter.index() as usize];
                 let Some(tiling) =
-                    implementation::pointwise_input_tiling(&old.tensor_type, &input.tensor_type)
+                    crate::tensor::broadcast_operand_tiling(&old.tensor_type, &input.tensor_type)
                 else {
                     legal = false;
                     break;

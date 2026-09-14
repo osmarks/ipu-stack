@@ -1,6 +1,9 @@
 //! Coordinate-copy semantics and composition before tile expansion.
 
-use super::*;
+use crate::low::CopyPolicy;
+use crate::mid::{Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId};
+use crate::tensor::{AxisFactorView, TensorShape};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Map output coordinates back to the source: first add the window offsets,
 /// then apply the optional factor-axis view. Layout/storage order is separate.
@@ -341,6 +344,10 @@ pub(super) fn compose(
 
 #[cfg(test)]
 mod tests {
+    use crate::graph::ValueId;
+
+    use crate::tensor::{Layout, Precision, TensorFormat, TensorTiling, TensorType};
+
     use super::*;
 
     #[test]

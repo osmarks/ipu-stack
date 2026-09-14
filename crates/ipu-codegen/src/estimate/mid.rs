@@ -5,6 +5,16 @@ use super::*;
 use crate::Compute;
 use crate::{MidOperationKind, MidProgram, TileKernelSpec};
 
+/// Price complete replacement sequences with the same overflow and missing-cost rules.
+pub(crate) fn operation_cycles<'a>(
+    operations: impl IntoIterator<Item = &'a MidOperation>,
+    values: &[MidValue],
+) -> Option<u64> {
+    operations.into_iter().try_fold(0u64, |sum, op| {
+        operation_cost(op, values).map(|(cost, _, _)| sum.saturating_add(cost.total))
+    })
+}
+
 pub(crate) fn analyze(
     program: &MidProgram,
     copies: &BTreeMap<MidValueId, u32>,
@@ -529,7 +539,7 @@ pub(crate) fn operation_cost(
             let bytes = maximum_shard_bytes(output);
             let local_conversion = *policy == crate::CopyPolicy::LocalKernel;
             let same_ownership = local_conversion
-                || (crate::mid::implementation::same_distribution(input, output)
+                || (crate::tensor::same_distribution(input, output)
                     && values[operation.inputs[0].index() as usize].tile_offset
                         == values[operation.results[0].index() as usize].tile_offset);
             if !same_ownership

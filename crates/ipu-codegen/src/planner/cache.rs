@@ -2,8 +2,9 @@
 //! these programs; they neither construct them nor own this cache. Keys include
 //! the actual boundary types, including layout and precision.
 
-use super::implement;
-use crate::mid::{MidProgram, OperatorPlan};
+use super::fragments::build_fragment;
+use crate::mid::MidProgram;
+use crate::planner::operator::OperatorPlan;
 use crate::tensor::TensorType;
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
@@ -27,7 +28,7 @@ impl FragmentCache {
         let key = (plan.clone(), inputs.to_vec(), output.clone());
         let entry = self.entries.lock().unwrap().entry(key).or_default().clone();
         entry
-            .get_or_init(|| implement(plan, inputs, output))
+            .get_or_init(|| build_fragment(plan, inputs, output))
             .clone()
     }
 }
@@ -35,9 +36,9 @@ impl FragmentCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ConcreteOperatorCandidate, Layout, MidOperator, OperandRequirement, Precision, TensorFormat,
-    };
+    use crate::planner::catalogue::ConcreteOperatorCandidate;
+    use crate::planner::operator::{OperandRequirement, OperatorFamily};
+    use crate::{Layout, Precision, TensorFormat};
     use rayon::prelude::*;
 
     #[test]
@@ -45,7 +46,7 @@ mod tests {
         let cache = FragmentCache::default();
         let output = TensorType::new([16, 64], Precision::F16, Layout::row_sharded(4));
         let plan = ConcreteOperatorCandidate::new(
-            MidOperator::Gelu,
+            OperatorFamily::Gelu,
             [OperandRequirement::new(output.format.clone())],
             OperandRequirement::new(output.format.clone()),
         )
@@ -61,7 +62,7 @@ mod tests {
             .collect::<Vec<_>>();
         (0..32).into_par_iter().for_each(|index| {
             let inputs = std::slice::from_ref(&variants[index % variants.len()]);
-            let expected = implement(&plan, inputs, &output).unwrap();
+            let expected = build_fragment(&plan, inputs, &output).unwrap();
             let retained = cache.get(&plan, inputs, &output).unwrap();
             assert_eq!(retained, expected);
             retained.validate().unwrap();
