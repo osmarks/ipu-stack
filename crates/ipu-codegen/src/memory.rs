@@ -104,14 +104,12 @@ impl TileMemoryMap {
                 end: range.end,
             });
         };
-        let free = self.free.remove(index);
-        if free.start < range.start {
-            self.free.push(free.start..range.start);
-        }
-        if range.end < free.end {
-            self.free.push(range.end..free.end);
-        }
-        self.free.sort_by_key(|range| range.start);
+        let free = &self.free[index];
+        let remaining = [free.start..range.start, range.end..free.end];
+        self.free.splice(
+            index..=index,
+            remaining.into_iter().filter(|range| !range.is_empty()),
+        );
         let allocation = MemoryAllocation {
             name,
             range: range.clone(),
@@ -132,7 +130,7 @@ impl TileMemoryMap {
         {
             return Err(MemoryLayoutError::Invalid(request.name));
         }
-        for free in self.free.clone() {
+        for free in &self.free {
             let start = align_up(
                 free.start.max(request.bounds.start),
                 request.alignment,
@@ -253,6 +251,15 @@ mod tests {
                 .collect::<Vec<_>>();
             ranges.sort_by_key(|range| range.start);
             assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+            assert!(map.free.windows(2).all(|pair| pair[0].end < pair[1].start));
+            ranges.extend(map.free.clone());
+            ranges.sort_by_key(|range| range.start);
+            assert_eq!(ranges.first().unwrap().start, ipu_package::TILE_MEMORY_BASE);
+            assert_eq!(
+                ranges.last().unwrap().end,
+                ipu_package::TILE_MEMORY_BASE + ipu_package::TILE_MEMORY_SIZE
+            );
+            assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
         }
     }
 }
