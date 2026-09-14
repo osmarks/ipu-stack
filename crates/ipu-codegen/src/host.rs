@@ -33,13 +33,6 @@ struct PendingTransfer {
     file_offset: u64,
 }
 
-#[derive(Clone, Copy)]
-struct PacketCopy {
-    source: u32,
-    destination: u32,
-    words: u32,
-}
-
 pub(crate) struct HostPackagePlan {
     /// Maximum tile requirement without address-dependent packet deduplication.
     pub descriptor_bytes: u32,
@@ -336,16 +329,8 @@ fn plan_tile(
             packet_cache.insert(packet_words, source);
             source
         };
-        let packet = PacketCopy {
-            source: packet_source,
-            destination: if targets.is_empty() {
-                HOST_PACKET_ADDRESS + 8
-            } else {
-                HOST_PACKET_ADDRESS
-            },
-            words: packet_count,
-        };
-        let descriptors = descriptor_words(target, packet)?;
+        let descriptors =
+            descriptor_words(target, packet_source, packet_count, targets.is_empty())?;
         let descriptor_data = words(&descriptors);
         data_bytes = data_bytes
             .checked_add(packet_bytes)
@@ -412,9 +397,7 @@ fn phase_instructions(
     target: Option<Transfer>,
     targets: &[u16],
 ) -> PackageBuildResult<(Vec<u32>, Vec<u32>)> {
-    let target = target
-        .map(|transfer| target_program(transfer, HOST_PACKET_ADDRESS + 8))
-        .transpose()?;
+    let target = target.map(target_program).transpose()?;
     let xreq = (!targets.is_empty())
         .then(|| ipu_exchange::assemble_host_xreq_program_for_targets(targets, HOST_PACKET_ADDRESS))
         .transpose()?;
@@ -443,47 +426,44 @@ fn phase_instructions(
     })
 }
 
-fn target_program(
-    transfer: Transfer,
-    packet_address: u32,
-) -> PackageBuildResult<ipu_exchange::TileToHostProgram> {
+fn target_program(transfer: Transfer) -> PackageBuildResult<ipu_exchange::TileToHostProgram> {
     Ok(match transfer.direction {
         Direction::ToTile => ipu_exchange::assemble_host_to_tile_target_program(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
             transfer.bytes,
-            packet_address,
+            HOST_PACKET_ADDRESS + 8,
         )?,
         Direction::ToHost => ipu_exchange::assemble_tile_to_host_target_program(
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
             transfer.bytes,
-            packet_address,
+            HOST_PACKET_ADDRESS + 8,
             HOST_CLOSE_ADDRESS,
         )?,
     })
 }
 
-fn descriptor_words(target: Option<Transfer>, packet: PacketCopy) -> PackageBuildResult<Vec<u32>> {
+fn descriptor_words(
+    target: Option<Transfer>,
+    packet_source: u32,
+    packet_words: u32,
+    target_only: bool,
+) -> PackageBuildResult<[u32; 3]> {
     let copy_words = target
         .filter(|transfer| transfer.copy_destination.is_some())
         .map_or(0, |transfer| transfer.bytes / 4);
-    if copy_words >= 1 << 23 || packet.words >= 1 << 8 {
+    if copy_words >= 1 << 23 || packet_words >= 1 << 8 {
         return Err(invalid("host descriptor is not encodable"));
     }
-    let packet_destination = match packet.destination {
-        HOST_PACKET_ADDRESS => 0,
-        address if address == HOST_PACKET_ADDRESS + 8 => 1 << 23,
-        _ => return Err(invalid("host packet destination is not encodable")),
-    };
-    Ok(vec![
+    Ok([
         target
             .and_then(|transfer| transfer.copy_destination)
             .unwrap_or(0),
-        copy_words | packet_destination | (packet.words << 24),
-        packet.source,
+        copy_words | (u32::from(target_only) << 23) | (packet_words << 24),
+        packet_source,
     ])
 }
 
@@ -509,8 +489,8 @@ fn xreq_targets(physical_tile: u16, phase: &[Transfer]) -> PackageBuildResult<Ve
         .collect()
 }
 
-fn inactive_instructions() -> Vec<u32> {
-    vec![
+fn inactive_instructions() -> [u32; 3] {
+    [
         ipu_exchange::sans(1),
         ipu_exchange::SYNC_ANS_INSTRUCTION,
         ipu_exchange::RETURN_M10_INSTRUCTION,
