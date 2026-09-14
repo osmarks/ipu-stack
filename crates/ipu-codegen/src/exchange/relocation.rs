@@ -44,8 +44,7 @@ pub(super) fn relocate_repeat_rows(
             let sends = physical.activities[tile]
                 .iter()
                 .filter(|activity| activity.kind == ExchangeActivityKind::Send)
-                .map(|activity| &pending[activity.transfer as usize])
-                .collect::<Vec<_>>();
+                .map(|activity| &pending[activity.transfer as usize]);
             if physical.outgoing_bases[tile].is_none() {
                 // No common representable base: retain ordinary word patching.
                 let moving = encode_put_special_m(0xa7, 6)?;
@@ -80,10 +79,10 @@ pub(super) fn relocate_repeat_rows(
                 })
                 .transpose()?;
             for (instructions, transfer) in address_groups.into_iter().zip(sends) {
-                let bases = bases.as_ref().filter(|_| transfer.moving_source());
                 if !transfer.moving_source() {
                     continue;
                 }
+                let bases = bases.as_ref();
                 let count = transfer
                     .source_addresses
                     .len()
