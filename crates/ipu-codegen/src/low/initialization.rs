@@ -520,8 +520,6 @@ mod tests {
                                 iterated: vec![RepeatIterated {
                                     inputs: vec![BlockValueId(if case == 9 { 0 } else { 1 }); 3],
                                     argument: BlockValueId(if case == 8 { 0 } else { 3 }),
-                                    stride_bytes: 128,
-                                    alignment: 8,
                                 }],
                             }],
                             body,

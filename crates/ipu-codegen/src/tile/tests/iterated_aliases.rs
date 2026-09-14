@@ -152,6 +152,97 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
 }
 
 #[test]
+fn repeat_pointers_use_complete_placed_access_requirements() {
+    let (low, _) = iterated_sum(2);
+    for count in [1, 2] {
+        let mut graph = (*low.program).clone();
+        for run in &mut graph.kernel_runs {
+            for input in &mut std::sync::Arc::make_mut(&mut run.metadata)
+                .requirements
+                .inputs
+            {
+                input.alignment = 64;
+                input.access_tail_bytes = 96;
+            }
+        }
+        let BlockOperation::Repeat(repeat) = &mut graph.body.operations[0] else {
+            panic!("repeat")
+        };
+        repeat.count = count;
+        for binding in &mut repeat.bindings {
+            for sequence in &mut binding.iterated {
+                sequence.inputs.truncate(count as usize);
+            }
+        }
+        let low = lower_to_tiles(&std::sync::Arc::new(graph), false);
+        // The same sequence contract must work in either physical region.
+        for base in [
+            crate::memory::IPU21_DATA_BASE,
+            ipu_package::IPU21_INTERLEAVED_MEMORY_BASE,
+        ] {
+            let placement = crate::place::place_with_ranges(
+                &low,
+                &[(base, ipu_package::IPU21_APPLICATION_MEMORY_LIMIT)],
+            )
+            .unwrap();
+            let sequence = &low.repeat_runs[0].binding.iterated[0];
+            let stride = placement.sequence_strides[&sequence.argument];
+            assert!(stride >= 256 + 96 && stride.is_multiple_of(64));
+            for (index, shard) in sequence.inputs.iter().enumerate() {
+                assert_eq!(
+                    placement.shard_addresses[shard],
+                    placement.shard_addresses[&sequence.argument] + index as u32 * stride
+                );
+            }
+            let kernels = KernelBuildPlan::from_program(&low).unwrap();
+            let phases = crate::exchange::lower_exchanges(
+                &low,
+                &placement,
+                &ipu_exchange::Topology::c600(),
+                false,
+            )
+            .unwrap()
+            .phases;
+            let lowering =
+                TileProgramLowering::new(&low, &placement, &phases, &kernels, 0x100, 2, false)
+                    .unwrap();
+            let program = lowering.lower_tile(0).unwrap();
+            let TileStep::Repeat(repeat) = &program.steps[0] else {
+                panic!("repeat")
+            };
+            assert_eq!(repeat.iterated_pointers[0].stride_bytes, stride);
+        }
+    }
+}
+
+#[test]
+fn repeat_sequences_preserve_regular_offsets_between_shifted_aliases() {
+    let (low, _) = iterated_sum(1);
+    let sequence = &low.repeat_runs[0].binding.iterated[0];
+    let mut graph = (*low.program).clone();
+    for (index, shard) in sequence.inputs.iter().enumerate() {
+        let mut root = graph.shards[shard.index() as usize].clone();
+        root.id = BlockValueId::from_index(graph.shards.len() as u32);
+        root.definition = ShardDefinition::Staging;
+        graph.shards[shard.index() as usize].definition = ShardDefinition::ShiftedAlias {
+            source: root.id,
+            offset: index as i32 * 64,
+        };
+        graph.shards.push(root);
+    }
+    let projected = lower_to_tiles(&std::sync::Arc::new(graph), false);
+    let placement = place(&projected).unwrap();
+    let stride = placement.sequence_strides[&sequence.argument];
+    let first = placement.shard_addresses[&sequence.argument];
+    for (index, shard) in sequence.inputs.iter().enumerate() {
+        assert_eq!(
+            placement.shard_addresses[shard],
+            first + index as u32 * stride
+        );
+    }
+}
+
+#[test]
 fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
     let (low, mut placement) = iterated_sum(1);
     let argument = low.repeat_runs[0].binding.iterated[0].argument;

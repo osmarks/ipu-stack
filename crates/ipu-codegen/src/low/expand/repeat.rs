@@ -31,17 +31,6 @@ impl TileGraphBuilder {
                 return Err(ExpansionError::RepeatRequiresInPlace(index));
             }
         }
-        let iterated_requirements = repeat
-            .iterated_inputs
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                body_storage_requirement(
-                    repeat.body.arguments[expected_inputs + index],
-                    &repeat.body.operations,
-                )
-            })
-            .collect::<Vec<_>>();
         let body = self.build_region(&repeat.body.operations, false)?;
         let mut bindings = (0..self.tile_count)
             .map(|tile| BlockRepeatBinding {
@@ -88,25 +77,10 @@ impl TileGraphBuilder {
                     .iter()
                     .map(|value| self.corresponding_shard(*value, argument))
                     .collect::<ExpansionResult<Vec<_>>>()?;
-                let (alignment, access_tail) = iterated_requirements[index];
-                let mut strides = inputs
-                    .iter()
-                    .map(|shard| self.shard_stride(*shard, alignment, access_tail));
-                let stride_bytes = strides
-                    .next()
-                    .ok_or(ExpansionError::InvalidIteratedBlocks(index))??;
-                for stride in strides {
-                    if stride? != stride_bytes {
-                        return Err(ExpansionError::InvalidIteratedBlocks(index));
-                    }
-                }
                 let tile = self.shards[argument.index() as usize].tile;
-                bindings[usize::from(tile)].iterated.push(RepeatIterated {
-                    inputs,
-                    argument,
-                    stride_bytes,
-                    alignment,
-                });
+                bindings[usize::from(tile)]
+                    .iterated
+                    .push(RepeatIterated { inputs, argument });
             }
         }
         tiles
@@ -186,29 +160,6 @@ fn repeat_yield_can_alias(
         }
     }
     true
-}
-
-fn body_storage_requirement(value: MidValueId, operations: &[MidOperation]) -> (u32, u32) {
-    let mut alignment = 8;
-    let mut access_tail = 0;
-    for operation in operations {
-        for (index, input) in operation.inputs.iter().enumerate() {
-            if *input != value {
-                continue;
-            }
-            if let MidOperationKind::Primitive(crate::Primitive::Compute {
-                kernel: TileKernelSpec::Gemm { multiply, .. },
-                ..
-            }) = &operation.kind
-            {
-                alignment = alignment.max(32);
-                if index == 0 {
-                    access_tail = access_tail.max(8 * multiply.bytes() as u32);
-                }
-            }
-        }
-    }
-    (alignment, access_tail)
 }
 
 #[cfg(test)]

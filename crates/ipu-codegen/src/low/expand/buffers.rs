@@ -119,20 +119,6 @@ impl TileGraphBuilder {
             .ok_or(ExpansionError::UnknownValue(value))
     }
 
-    pub(super) fn shard_stride(
-        &self,
-        shard: BlockValueId,
-        alignment: u32,
-        access_tail: u32,
-    ) -> ExpansionResult<u32> {
-        let shard = &self.shards[shard.index() as usize];
-        shard_storage_bytes(shard)
-            .map_err(|_| ExpansionError::IdOverflow)?
-            .checked_add(access_tail)
-            .and_then(|bytes| bytes.checked_next_multiple_of(alignment.max(1)))
-            .ok_or(ExpansionError::IdOverflow)
-    }
-
     pub(super) fn push_packed_buffer(
         &mut self,
         tile: u16,

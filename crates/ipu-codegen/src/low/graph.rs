@@ -206,11 +206,9 @@ pub struct RepeatInvariant {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatIterated {
+    /// Placement derives a uniform physical stride from the body's access contracts.
     pub inputs: Vec<BlockValueId>,
     pub argument: BlockValueId,
-    /// Placement must assign entries consecutively at this byte stride.
-    pub stride_bytes: u32,
-    pub alignment: u32,
 }
 
 /// A device-wide region preserving each tile's operation order. Entries on

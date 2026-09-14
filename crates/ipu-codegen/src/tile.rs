@@ -329,40 +329,16 @@ fn lower_repeat(
     let mut overrides = BTreeMap::new();
     let mut pointers = Vec::with_capacity(repeat.binding.iterated.len());
     for (index, iterated) in repeat.binding.iterated.iter().enumerate() {
-        let initial_address = iterated
-            .inputs
-            .first()
-            .and_then(|input| placement.shard_addresses.get(input))
-            .copied()
+        let initial_address = *placement
+            .shard_addresses
+            .get(&iterated.argument)
             .ok_or(TileLoweringError::InvalidRepeat)?;
-        let stride_bytes = if let Some(second) = iterated.inputs.get(1) {
-            placement
-                .shard_addresses
-                .get(second)
-                .and_then(|address| address.checked_sub(initial_address))
-                .ok_or(TileLoweringError::InvalidRepeat)?
-        } else {
-            iterated.stride_bytes
-        };
-        for (iteration, input) in iterated.inputs.iter().enumerate() {
-            let expected = initial_address
-                .checked_add(
-                    stride_bytes
-                        .checked_mul(
-                            u32::try_from(iteration).map_err(|_| TileLoweringError::Overflow)?,
-                        )
-                        .ok_or(TileLoweringError::Overflow)?,
-                )
-                .ok_or(TileLoweringError::Overflow)?;
-            if placement.shard_addresses.get(input).copied() != Some(expected) {
-                return Err(TileLoweringError::InvalidRepeat);
-            }
-        }
+        let stride_bytes = *placement
+            .sequence_strides
+            .get(&iterated.argument)
+            .ok_or(TileLoweringError::InvalidRepeat)?;
         let index = u16::try_from(index).map_err(|_| TileLoweringError::Overflow)?;
         let address = TileAddress::RepeatPointer { index, offset: 0 };
-        if !stride_bytes.is_multiple_of(4) {
-            return Err(TileLoweringError::InvalidRepeat);
-        }
         overrides.insert(iterated.argument, address);
         pointers.push(RepeatPointer {
             initial_address,
@@ -765,6 +741,7 @@ mod tests {
             }],
         };
         let placement = Placement {
+            sequence_strides: BTreeMap::new(),
             auxiliary_allocations: Vec::new(),
             shard_addresses: BTreeMap::from([(id(0), 0x60000), (id(1), 0x70000)]),
             tile_auxiliary_ranges: vec![],

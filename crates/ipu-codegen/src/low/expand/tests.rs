@@ -1881,12 +1881,9 @@ fn randomized_repeats_remain_structured_per_tile() {
             assert_eq!(repeats.len(), 1, "case {case}");
             assert_eq!(repeats[0].count, count);
             assert_eq!(repeats[0].binding.iterated[0].inputs.len(), count as usize);
-            assert!(repeats[0].binding.iterated[0].stride_bytes > 0);
-            assert!(
-                repeats[0].binding.iterated[0]
-                    .stride_bytes
-                    .is_multiple_of(repeats[0].binding.iterated[0].alignment)
-            );
+            let placement = crate::place(&low).unwrap();
+            let stride = placement.sequence_strides[&repeats[0].binding.iterated[0].argument];
+            assert!(stride > 0 && stride.is_multiple_of(4));
             let carried = &repeats[0].binding.carried[0];
             assert_eq!(
                 low.shards[carried.argument.index() as usize].definition,

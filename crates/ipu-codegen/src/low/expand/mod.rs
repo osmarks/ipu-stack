@@ -56,8 +56,6 @@ pub enum ExpansionError {
     InvalidRepeat,
     #[error("repeat carried value {0} cannot alias its body argument")]
     RepeatRequiresInPlace(usize),
-    #[error("repeat iterated input {0} cannot be represented as equal contiguous blocks")]
-    InvalidIteratedBlocks(usize),
     #[error("too many logical shards or exchange phases")]
     IdOverflow,
     #[error("invalid tensor layout: {0}")]

@@ -117,6 +117,7 @@ mod tests {
             }],
         }]);
         let placement = |shift: u32| Placement {
+            sequence_strides: BTreeMap::new(),
             auxiliary_allocations: Vec::new(),
             shard_addresses: BTreeMap::from([
                 (source, 0x80000 + shift),

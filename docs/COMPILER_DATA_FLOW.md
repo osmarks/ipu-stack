@@ -268,14 +268,18 @@ showed 1,402 reported cycles versus 1,390 for work actually retained. The perman
 regression test now checks agreement between graph cost and projected execution,
 with and without Repeat, and checks that padding removal is idempotent.
 
-Several physical access contracts also have multiple owners:
+Repeat storage now has one sizing owner:
+[expand/repeat.rs](../crates/ipu-codegen/src/low/expand/repeat.rs) declares which
+values form each sequence, without scanning mid for GEMM-specific requirements.
+Placement combines the actual calls' alignment/tail requirements and aliases,
+chooses the reservation, validates every sequence member and returns its stride.
+Tile emission consumes `Placement.sequence_strides`; it does not infer stride
+from consecutive addresses. Empty shards can have zero stride. Tests exercise
+additional non-GEMM access requirements, single-iteration sequences and both
+physical SRAM regions.
 
-- [expand/repeat.rs](../crates/ipu-codegen/src/low/expand/repeat.rs) preliminarily
-  infers GEMM alignment and input tails to size iterated sequences.
-  [low/call.rs](../crates/ipu-codegen/src/low/call.rs) declares those facts again.
-  Placement recomputes stride from complete requirements; tile emission recovers
-  it from consecutive addresses. The late placement calculation is necessary
-  today and prevents treating the preliminary scan as authoritative.
+Other physical access contracts still have multiple owners:
+
 - `KernelRun` and `KernelRequirements` distinguish a primary output from
   `additional_outputs`. `MemoryOperand::Output` refers only to the primary one,
   so the element-separation contract cannot name another result.

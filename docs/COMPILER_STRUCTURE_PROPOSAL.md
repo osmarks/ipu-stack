@@ -1,6 +1,6 @@
 # Compiler structure proposal
 
-2026-09-14. Design only; no compiler changes in this pass. Based on source at
+2026-09-14. Design review, initially based on source at
 `1501698`; revised after discussion of reduction, the two mid states, and source
 comprehensibility. Read [current data flow](COMPILER_DATA_FLOW.md) for the concrete
 paths behind this proposal. Proposed function names below specify responsibilities
@@ -12,8 +12,9 @@ Implementation has started: padding removal now transforms the authoritative low
 graph before pure tile projection, and Repeat projections use the common storage
 binding record. The corresponding regression covers both straight-line and
 repeated execution. Exchange selection now takes policy separately from its cache,
-and replay rejects policy mismatches without expanding search. The diagnoses
-below describe the reviewed starting point;
+and replay rejects policy mismatches without expanding search. Repeat sequence
+sizing now belongs to placement; the preliminary GEMM scan and emission's stride
+reconstruction are removed. The diagnoses below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks implemented changes.
 
 ## Diagnosis

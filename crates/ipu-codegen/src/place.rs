@@ -21,6 +21,9 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub shard_addresses: BTreeMap<BlockValueId, u32>,
+    /// Actual sequence stride keyed by the Repeat body argument.
+    /// Empty shards may share an address and have zero stride.
+    pub sequence_strides: BTreeMap<BlockValueId, u32>,
     pub tile_auxiliary_ranges: Vec<Vec<(u32, u32)>>,
     pub auxiliary_allocations: Vec<Vec<AuxiliaryAllocation>>,
 }
@@ -54,7 +57,7 @@ pub enum PlacementError {
     IncompatibleAlias,
     #[error("repeat iterated placement constraints overlap incompatibly")]
     IteratedOverlap,
-    #[error("repeat iterated block is smaller than its required allocation")]
+    #[error("repeat inputs do not form a valid word-aligned sequence")]
     IteratedStride,
     #[error("tile {tile} has insufficient {class:?} SRAM for {bytes} bytes")]
     OutOfMemory {
@@ -181,12 +184,14 @@ pub(crate) fn place_with_auxiliary(
         })
         .collect::<Result<Vec<_>, PlacementError>>()?;
     let mut addresses = BTreeMap::new();
+    let mut sequence_strides = BTreeMap::new();
     let mut tile_auxiliary_ranges = vec![Vec::new(); tile_count];
     let mut auxiliary_allocations = vec![Vec::new(); tile_count];
-    for (tile, tile_addresses, unused, allocations) in tile_placements {
-        auxiliary_allocations[usize::from(tile)] = allocations;
-        addresses.extend(tile_addresses);
-        tile_auxiliary_ranges[usize::from(tile)] = unused;
+    for (tile, placed) in tile_placements.into_iter().enumerate() {
+        auxiliary_allocations[tile] = placed.auxiliary;
+        addresses.extend(placed.addresses);
+        sequence_strides.extend(placed.sequence_strides);
+        tile_auxiliary_ranges[tile] = placed.unused;
     }
 
     tracing::debug!(
@@ -197,6 +202,7 @@ pub(crate) fn place_with_auxiliary(
     );
     Ok(Placement {
         shard_addresses: addresses,
+        sequence_strides,
         tile_auxiliary_ranges,
         auxiliary_allocations,
     })
@@ -332,6 +338,13 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
     })
 }
 
+struct TilePlacement {
+    addresses: BTreeMap<BlockValueId, u32>,
+    sequence_strides: BTreeMap<BlockValueId, u32>,
+    unused: Vec<(u32, u32)>,
+    auxiliary: Vec<AuxiliaryAllocation>,
+}
+
 fn place_tile(
     program: &LowProgram,
     tile: u16,
@@ -339,15 +352,7 @@ fn place_tile(
     interleaved_offset: u32,
     analysis: &AllocationAnalysis,
     auxiliary: &[AuxiliaryRequest],
-) -> Result<
-    (
-        u16,
-        BTreeMap<BlockValueId, u32>,
-        Vec<(u32, u32)>,
-        Vec<AuxiliaryAllocation>,
-    ),
-    PlacementError,
-> {
+) -> Result<TilePlacement, PlacementError> {
     // Both access classes share region 1. A single lifetime-ordered arena
     // lets ordinary storage reuse dead interleaved buffers and vice versa.
     let mut addresses = BTreeMap::new();
@@ -366,6 +371,33 @@ fn place_tile(
         &mut addresses,
         auxiliary,
     )?;
+    let mut sequence_strides = BTreeMap::new();
+    for group in &analysis.tiles[usize::from(tile)].iterated {
+        // Bind the logical sequence after region selection and alias offsets
+        // are known. A singleton advances by its reservation size; a sequence
+        // of shifted aliases may advance differently from its backing roots.
+        let initial = addresses[&group.argument];
+        let stride = if let Some(second) = group.shards.get(1) {
+            addresses[second]
+                .checked_sub(initial)
+                .ok_or(PlacementError::IteratedStride)?
+        } else {
+            let root = analysis.root_of_member[group.shards[0].index() as usize];
+            let (start, end) = arena.root_spans[&root];
+            end - start
+        };
+        if !stride.is_multiple_of(4) {
+            return Err(PlacementError::IteratedStride);
+        }
+        for (iteration, shard) in group.shards.iter().enumerate() {
+            if u64::from(addresses[shard])
+                != u64::from(initial) + u64::from(stride) * iteration as u64
+            {
+                return Err(PlacementError::IteratedStride);
+            }
+        }
+        sequence_strides.insert(group.argument, stride);
+    }
     let allocations = auxiliary
         .iter()
         .enumerate()
@@ -377,7 +409,12 @@ fn place_tile(
             last: request.last,
         })
         .collect();
-    Ok((tile, addresses, arena.unused_ranges(), allocations))
+    Ok(TilePlacement {
+        addresses,
+        sequence_strides,
+        unused: arena.unused_ranges(),
+        auxiliary: allocations,
+    })
 }
 
 fn shards_by_tile(
@@ -525,8 +562,7 @@ fn collect_repeat_constraints(
             iterated.push(IteratedGroup {
                 tile: tile.tile,
                 shards: input.inputs.clone(),
-                stride: input.stride_bytes,
-                alignment: input.alignment,
+                argument: input.argument,
             });
         }
         collect_repeat_constraints(program, &repeat.body, sets, iterated)?;
@@ -727,7 +763,7 @@ fn allocation_requests(
                 .get(root)
                 .is_some_and(|others| roots.iter().any(|other| others.contains(other)))
         });
-        let alignment = group.alignment.max(
+        let alignment = 4.max(
             roots
                 .iter()
                 .map(|root| {
@@ -744,7 +780,7 @@ fn allocation_requests(
         );
         // Kernel access and loopback bank constraints are only complete after
         // expansion. Derive the physical repeat stride from those requirements.
-        let mut stride = group.stride;
+        let mut stride = 0;
         for root in &roots {
             stride = stride.max(allocation_bytes(
                 program,
@@ -1000,8 +1036,7 @@ struct AllocationRequest {
 struct IteratedGroup {
     tile: u16,
     shards: Vec<BlockValueId>,
-    stride: u32,
-    alignment: u32,
+    argument: BlockValueId,
 }
 
 #[derive(Clone)]
@@ -1696,7 +1731,7 @@ mod tests {
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut expanded = (*crate::expand_tiles(&mid).unwrap()).clone();
         // Bank constraints may be introduced during expansion, after mid has
-        // selected the iterated values' shapes and minimum strides.
+        // selected the iterated values' shapes.
         for run in &mut expanded.kernel_runs {
             if run.inputs.len() == 2 {
                 std::sync::Arc::make_mut(&mut run.metadata)
@@ -1738,7 +1773,9 @@ mod tests {
                         continue;
                     };
                     for input in &repeat.binding.iterated {
-                        assert!(input.stride_bytes < TILE_MEMORY_ELEMENT_SIZE);
+                        assert!(
+                            placement.sequence_strides[&input.argument] < TILE_MEMORY_ELEMENT_SIZE
+                        );
                         let output = placement.shard_addresses[&repeat.binding.carried[0].initial];
                         let element = |address| {
                             if address >= IPU21_INTERLEAVED_MEMORY_BASE {
@@ -1764,7 +1801,7 @@ mod tests {
                             assert_eq!(
                                 placement.shard_addresses[&pair[1]]
                                     - placement.shard_addresses[&pair[0]],
-                                input.stride_bytes
+                                placement.sequence_strides[&input.argument]
                             );
                         }
                         checked += 1;
@@ -1789,7 +1826,7 @@ mod tests {
             .entry(second_root)
             .or_default()
             .insert(first_root);
-        let (_, addresses, _, _) = place_tile(
+        let placed = place_tile(
             &low,
             0,
             &[(IPU21_DATA_BASE, IPU21_APPLICATION_MEMORY_LIMIT)],
@@ -1799,7 +1836,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            addresses[&group.shards[1]] - addresses[&group.shards[0]],
+            placed.addresses[&group.shards[1]] - placed.addresses[&group.shards[0]],
             TILE_MEMORY_ELEMENT_SIZE
         );
     }
