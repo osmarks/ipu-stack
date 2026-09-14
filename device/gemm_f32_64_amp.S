@@ -56,72 +56,7 @@
 	brnz $m5, .Lzero_row
 	exitz $mzero
 
-	.macro LOAD_AMP16_WEIGHTS
-	ld64putcs 0
-	ld64putcs 1
-	ld64putcs 2
-	ld64putcs 3
-	ld64putcs 4
-	ld64putcs 5
-	ld64putcs 6
-	ld64putcs 7
-	ld64putcs 32
-	ld64putcs 33
-	ld64putcs 34
-	ld64putcs 35
-	ld64putcs 36
-	ld64putcs 37
-	ld64putcs 38
-	ld64putcs 39
-	ld64putcs 8
-	ld64putcs 9
-	ld64putcs 10
-	ld64putcs 11
-	ld64putcs 12
-	ld64putcs 13
-	ld64putcs 14
-	ld64putcs 15
-	ld64putcs 40
-	ld64putcs 41
-	ld64putcs 42
-	ld64putcs 43
-	ld64putcs 44
-	ld64putcs 45
-	ld64putcs 46
-	ld64putcs 47
-	ld64putcs 16
-	ld64putcs 17
-	ld64putcs 18
-	ld64putcs 19
-	ld64putcs 20
-	ld64putcs 21
-	ld64putcs 22
-	ld64putcs 23
-	ld64putcs 48
-	ld64putcs 49
-	ld64putcs 50
-	ld64putcs 51
-	ld64putcs 52
-	ld64putcs 53
-	ld64putcs 54
-	ld64putcs 55
-	ld64putcs 24
-	ld64putcs 25
-	ld64putcs 26
-	ld64putcs 27
-	ld64putcs 28
-	ld64putcs 29
-	ld64putcs 30
-	ld64putcs 31
-	ld64putcs 56
-	ld64putcs 57
-	ld64putcs 58
-	ld64putcs 59
-	ld64putcs 60
-	ld64putcs 61
-	ld64putcs 62
-	ld64putcs 63
-	.endm
+#include "amp_weights.inc"
 
 	// Tile-kernel ABI for every row-specialized GEMM entry:
 	//   m2 output, m3 packed left, m4 packed right, m10 return address.

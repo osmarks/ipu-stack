@@ -10,7 +10,7 @@ not sources to rewrite.
 | Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed in the earlier pass | Broader candidate generation and lowering control flow |
 | Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed in the earlier pass | Remaining loader/protocol and command dispatch paths |
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
-| Device kernels/runtime | Dense packing supervisor loops consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
+| Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
 | Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal | Broader fixture export and placement tools |
 | Experiment scripts | Gather/packing/frontier scripts sampled | Remaining sweeps, analyses and their common file/command handling |
@@ -32,3 +32,9 @@ Device packing validation: the SDK compiled both old and new block-major and
 transposed-right kernels with identical allocated section bytes and normalized
 relocations. All 22 kernel selection tests passed. AMP-left packing retains its
 different destination stride and worker frame.
+
+GEMM/runtime validation: the SDK produced identical allocated section bytes
+and normalized relocations for FP32 GEMM, FP16 GEMM, all four FP16/FP8 ×
+standard/interleaved weight dispatchers, and the static runtime. The shared
+weight loader preserves its unrolled order and both instruction widths.
+The full codegen suite also passed: 295 tests, 5 ignored.

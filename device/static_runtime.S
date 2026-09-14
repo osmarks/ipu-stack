@@ -110,6 +110,17 @@ ipu_stack_static_worker_barrier_worker:
 	exitz $m15
 	.size ipu_stack_static_worker_barrier_worker, .-ipu_stack_static_worker_barrier_worker
 
+	// Count is positive on entry; all operands are advanced/consumed.
+	.macro copy_words source, destination, count
+.Lcopy_words_\@:
+	ld32 $m0, \source, $m15, 0
+	st32 $m0, \destination, $m15, 0
+	add \source, \source, 4
+	add \destination, \destination, 4
+	sub \count, \count, 1
+	brnz \count, .Lcopy_words_\@
+	.endm
+
 	.section .text.static_copy_u32,"ax",@progbits
 	// Runtime helper ABI: m2 destination, m3 source, m4 word count, m10 return.
 	.globl static_copy_u32
@@ -118,13 +129,7 @@ ipu_stack_static_worker_barrier_worker:
 static_copy_u32:
 	.supervisor
 	brz $m4, .Lcopy_u32_done
-.Lcopy_u32:
-	ld32 $m0, $m3, $m15, 0
-	st32 $m0, $m2, $m15, 0
-	add $m3, $m3, 4
-	add $m2, $m2, 4
-	sub $m4, $m4, 1
-	brnz $m4, .Lcopy_u32
+	copy_words $m3, $m2, $m4
 .Lcopy_u32_done:
 	br $m10
 	.size static_copy_u32, .-static_copy_u32
@@ -502,13 +507,7 @@ ipu_stack_static_host_run:
 	setzi $m1, HOST_PACKET_ADDRESS
 	add $m6, $m6, $m1
 	ld32 $m7, $m3, $m15, 2
-.Lhost_run_packet_copy:
-	ld32 $m0, $m7, $m15, 0
-	st32 $m0, $m6, $m15, 0
-	add $m7, $m7, 4
-	add $m6, $m6, 4
-	sub $m5, $m5, 1
-	brnz $m5, .Lhost_run_packet_copy
+	copy_words $m7, $m6, $m5
 .Lhost_run_call:
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
@@ -524,13 +523,7 @@ ipu_stack_static_host_run:
 	brz $m5, .Lhost_run_advance
 	ld32 $m6, $m3, $m15, 0
 	setzi $m7, ipu_stack_static_host_staging
-.Lhost_run_copy:
-	ld32 $m0, $m7, $m15, 0
-	st32 $m0, $m6, $m15, 0
-	add $m7, $m7, 4
-	add $m6, $m6, 4
-	sub $m5, $m5, 1
-	brnz $m5, .Lhost_run_copy
+	copy_words $m7, $m6, $m5
 .Lhost_run_advance:
 	add $m3, $m3, HOST_RUN_DESCRIPTOR_BYTES
 	sub $m2, $m2, 1
