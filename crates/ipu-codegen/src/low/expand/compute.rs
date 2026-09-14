@@ -52,7 +52,7 @@ impl TileGraphBuilder {
                         output_aliases,
                         &inputs_by_tile,
                         if donate_cast {
-                            -(crate::mid::cast::CAST_PREFIX_BYTES as i32)
+                            -(crate::kernel::cast::CAST_PREFIX_BYTES as i32)
                         } else {
                             0
                         },

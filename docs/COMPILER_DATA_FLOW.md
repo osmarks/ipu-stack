@@ -272,6 +272,12 @@ from consecutive addresses. Empty shards can have zero stride. Tests exercise
 additional non-GEMM access requirements, single-iteration sequences and both
 physical SRAM regions.
 
+The shifted FP16-to-FP8 cast similarly separates access geometry from the
+optimization that requests it. [kernel/cast.rs](../crates/ipu-codegen/src/kernel/cast.rs)
+defines the output prefix and safe chunks; mid donation, low call construction
+and costing consume that description. The mid rewrite separately requires a net
+storage saving on each shard. A physically valid cast need not be profitable.
+
 Other physical access contracts still have multiple owners:
 
 - `KernelRun` and `KernelRequirements` distinguish a primary output from

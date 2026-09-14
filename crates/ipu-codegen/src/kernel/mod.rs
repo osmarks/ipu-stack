@@ -3,6 +3,7 @@
 mod abi;
 mod attention;
 mod build;
+pub(crate) mod cast;
 pub(crate) mod cost;
 mod gemm;
 mod output;

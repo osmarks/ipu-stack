@@ -190,7 +190,7 @@ fn analyze_storage<const PER_TILE: bool>(
         let mut prefixes = vec![0u64; usize::from(layout.tiling.tile_count)];
         if shifted_inputs.contains(&value.id) {
             for (owner, _) in resolved.shard_extents().ok()? {
-                prefixes[usize::from(owner)] += u64::from(crate::mid::cast::CAST_PREFIX_BYTES);
+                prefixes[usize::from(owner)] += u64::from(crate::kernel::cast::CAST_PREFIX_BYTES);
             }
         }
         for owner in 0..owners {
@@ -447,7 +447,7 @@ pub(crate) fn operation_cost(
             ) && output_aliases == &[(0, 0)]
             {
                 let chunks =
-                    crate::mid::cast::CastChunks::new(out.format.layout.order, &out.shape.0)?;
+                    crate::kernel::cast::CastChunks::new(out.format.layout.order, &out.shape.0)?;
                 price.total = 0;
                 for (start, end) in chunks.ranges {
                     out.shape.0[chunks.axis] = end - start;

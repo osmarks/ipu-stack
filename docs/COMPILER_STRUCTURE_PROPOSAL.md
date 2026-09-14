@@ -26,8 +26,9 @@ copies enter one low movement owner with an explicit copy policy. Composition
 retains incompatible policy boundaries. Products now carry axes and blocking
 explicitly; GEMM expansion owns contraction and batch splitting, and Sum owns
 contributor grouping. Kernel append only records work. Callable specifications
-are owned by kernel rather than planner/operator. Operand indexing, complete
-family binding, planner module ownership and the other boundaries below remain
+are owned by kernel rather than planner/operator. Shifted FP16-to-FP8 cast
+chunking belongs to the cast family; donation profitability remains in mid.
+Operand indexing, complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

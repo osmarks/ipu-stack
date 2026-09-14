@@ -13,7 +13,7 @@ impl TileGraphBuilder {
             .iter()
             .map(|e| e.physical_end - e.start)
             .collect::<Vec<_>>();
-        let chunks = crate::mid::cast::CastChunks::new(
+        let chunks = crate::kernel::cast::CastChunks::new(
             run.requirements.output.format.layout.order,
             &dimensions,
         )
