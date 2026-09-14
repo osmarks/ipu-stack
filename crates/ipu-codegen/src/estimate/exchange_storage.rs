@@ -177,11 +177,8 @@ impl ExchangeStoragePhase {
         self.shareable[usize::from(tile)] = false;
     }
 
-    pub(crate) fn finish(self) -> Vec<u64> {
-        self.bytes
-            .into_iter()
-            .map(|bytes| bytes.next_multiple_of(8))
-            .collect()
+    pub(super) fn row_bytes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.bytes.iter().map(|bytes| bytes.next_multiple_of(8))
     }
 }
 
@@ -208,18 +205,14 @@ impl ExchangeStorageEstimator {
     /// Add a phase from a validated snapshot and return its unshared row sizes.
     pub fn add_phase(&mut self, problem: &crate::exchange::ExchangeScheduleProblem) -> Vec<u64> {
         let phase = captured_phase(self.bytes.len() as u16, problem);
-        let sizes = phase
-            .bytes
-            .iter()
-            .map(|bytes| bytes.next_multiple_of(8))
-            .collect();
+        let sizes = phase.row_bytes().collect();
         self.add(phase);
         sizes
     }
 
     pub(crate) fn add(&mut self, phase: ExchangeStoragePhase) {
-        for tile in 0..self.bytes.len() {
-            let bytes = phase.bytes[tile].next_multiple_of(8);
+        assert_eq!(phase.bytes.len(), self.bytes.len());
+        for (tile, bytes) in phase.row_bytes().enumerate() {
             if !phase.shareable[tile] {
                 self.bytes[tile] += bytes;
                 continue;
@@ -250,7 +243,7 @@ pub fn estimate_exchange_phase_storage(
     tile_count: u16,
     problem: &crate::exchange::ExchangeScheduleProblem,
 ) -> Vec<u64> {
-    captured_phase(tile_count, problem).finish()
+    captured_phase(tile_count, problem).row_bytes().collect()
 }
 
 fn captured_phase(

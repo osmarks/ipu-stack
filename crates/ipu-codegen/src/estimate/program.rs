@@ -241,7 +241,7 @@ pub(crate) fn exchange_phase_estimate(
     let traffic = geometry_traffic(program, phase, Some(&mut storage), geometry)?;
     Ok((
         super::cycles::exchange_endpoint_cycles(&traffic, 1),
-        storage.finish(),
+        storage.row_bytes().collect(),
     ))
 }
 
