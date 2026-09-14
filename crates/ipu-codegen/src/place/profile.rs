@@ -222,7 +222,7 @@ fn collect(
             .find(|image| image.physical_tile == u32::from(tile.physical))
         {
             for segment in &image.segments {
-                for (start, end) in uncovered(
+                for (start, end) in crate::memory::uncovered_ranges(
                     segment.address,
                     segment.address + segment.memory_size,
                     &occupied,
@@ -262,27 +262,6 @@ fn collect(
         labels: labels.values,
         tiles,
     })
-}
-
-fn uncovered(start: u32, end: u32, occupied: &[(u32, u32)]) -> Vec<(u32, u32)> {
-    let mut cursor = start;
-    let mut result = Vec::new();
-    for &(a, b) in occupied {
-        if a >= end {
-            break;
-        }
-        if b <= cursor {
-            continue;
-        }
-        if cursor < a {
-            result.push((cursor, a));
-        }
-        cursor = cursor.max(b);
-    }
-    if cursor < end {
-        result.push((cursor, end));
-    }
-    result
 }
 
 pub(crate) fn write(
@@ -427,10 +406,10 @@ mod tests {
     #[test]
     fn image_gaps_do_not_duplicate_tensor_or_support_allocations() {
         assert_eq!(
-            uncovered(10, 50, &[(0, 12), (20, 30), (35, 40), (48, 60)]),
+            crate::memory::uncovered_ranges(10, 50, &[(0, 12), (20, 30), (35, 40), (48, 60)]),
             vec![(12, 20), (30, 35), (40, 48)]
         );
-        assert!(uncovered(20, 30, &[(10, 40)]).is_empty());
+        assert!(crate::memory::uncovered_ranges(20, 30, &[(10, 40)]).is_empty());
     }
     #[test]
     fn report_covers_placed_aliases_and_reused_requests_exactly() {

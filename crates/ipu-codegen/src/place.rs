@@ -1132,43 +1132,17 @@ impl Arena {
 
     fn release(&mut self, base: u32, limit: u32) {
         self.free.push((base, limit));
-        self.free.sort_unstable();
-        let mut merged = Vec::<(u32, u32)>::with_capacity(self.free.len());
-        for range in self.free.drain(..) {
-            match merged.last_mut() {
-                Some(previous) if previous.1 == range.0 => previous.1 = range.1,
-                _ => merged.push(range),
-            }
-        }
-        self.free = merged;
+        self.free = crate::memory::merge_ranges(std::mem::take(&mut self.free));
     }
 
     fn unused_ranges(&self) -> Vec<(u32, u32)> {
         let merged = crate::memory::merge_ranges(self.occupied.clone());
-        let mut unused = Vec::new();
-        for &(base, limit) in &self.ranges {
+        self.ranges
+            .iter()
             // Even unused aperture bytes belong to the next host exchange.
-            if (base, limit) == HOST_SCRATCH_RANGE {
-                continue;
-            }
-            let mut cursor = base;
-            for &(occupied_base, occupied_limit) in &merged {
-                if occupied_limit <= cursor || occupied_base >= limit {
-                    continue;
-                }
-                if cursor < occupied_base {
-                    unused.push((cursor, occupied_base.min(limit)));
-                }
-                cursor = cursor.max(occupied_limit);
-                if cursor >= limit {
-                    break;
-                }
-            }
-            if cursor < limit {
-                unused.push((cursor, limit));
-            }
-        }
-        unused
+            .filter(|&&range| range != HOST_SCRATCH_RANGE)
+            .flat_map(|&(base, limit)| crate::memory::uncovered_ranges(base, limit, &merged))
+            .collect()
     }
 }
 

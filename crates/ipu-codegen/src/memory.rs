@@ -195,6 +195,28 @@ impl TileMemoryMap {
     }
 }
 
+/// Complement within `start..end` of occupied ranges sorted by start address.
+pub(crate) fn uncovered_ranges(start: u32, end: u32, occupied: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut cursor = start;
+    let mut result = Vec::new();
+    for &(a, b) in occupied {
+        if a >= end {
+            break;
+        }
+        if b <= cursor {
+            continue;
+        }
+        if cursor < a {
+            result.push((cursor, a));
+        }
+        cursor = cursor.max(b);
+    }
+    if cursor < end {
+        result.push((cursor, end));
+    }
+    result
+}
+
 /// Union occupied ranges, including aliases and adjacent allocations.
 pub(crate) fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
     ranges.sort_unstable();
