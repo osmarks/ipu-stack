@@ -251,7 +251,7 @@ impl TileGraphBuilder {
             } else {
                 None
             };
-            let (mut mappings, copy_order, exchange_order) = physical.map_or(
+            let (mappings, copy_order, exchange_order) = physical.map_or(
                 (mappings, copy_order, exchange_order),
                 |(mappings, order)| (mappings, order, order),
             );
@@ -286,13 +286,10 @@ impl TileGraphBuilder {
                 )?;
                 self.append_copy_clears(tiles, staging, &ranges, provenance)?;
             }
-            for (mut source, mut destination) in mappings.drain(..) {
+            for (mut source, mut destination) in mappings {
                 if let Some(staging) = staging {
                     destination.shard = staging;
-                    for extent in &mut source.extents {
-                        extent.physical_end = extent.logical_end;
-                    }
-                    for extent in &mut destination.extents {
+                    for extent in source.extents.iter_mut().chain(&mut destination.extents) {
                         extent.physical_end = extent.logical_end;
                     }
                 }
@@ -347,7 +344,6 @@ impl TileGraphBuilder {
                 }
             }
             if let Some(staging) = staging {
-                let destination = self.logical_view(destination_shard);
                 let staging = self.full_view(staging);
                 let tile = self.shards[destination_shard.index() as usize].tile;
                 if let Some(kernel) = plan
@@ -371,7 +367,7 @@ impl TileGraphBuilder {
                         &self.cache,
                         &self.shards,
                         &staging,
-                        &destination,
+                        &self.logical_view(destination_shard),
                         tile,
                         &mut batch.after,
                         CopyOrder::Semantic,
