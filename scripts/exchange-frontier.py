@@ -56,14 +56,16 @@ def render(rows, output):
     import matplotlib.pyplot as plt
     from matplotlib.ticker import FixedLocator, StrMethodFormatter
     plt.rcParams.update({'font.family': 'serif', 'font.size': 9, 'svg.fonttype': 'none'})
-    phases = sorted({r['phase'] for r in rows})
+    points_by_phase = {phase: [r for r in rows if r['phase'] == phase] for phase in phases}
     colors = {'priority': '#555555', 'stream': '#176ba0', 'balanced': '#c34f18'}
     for storage, label in [('maximum_row_bytes', 'Maximum row bytes per tile'),
                            ('total_row_bytes', 'Total row bytes across tiles')]:
         fig, axes = plt.subplots((len(phases)+1)//2, 2, figsize=(13, 3.5*((len(phases)+1)//2)), squeeze=False)
         for ax, phase in zip(axes.flat, phases):
-            points = [r for r in rows if r['phase'] == phase]
+            points = points_by_phase[phase]
             best = frontier(points, storage)
+            for point in points:
+                point[storage.removesuffix('_bytes') + '_frontier'] = point in best
             for family, color in colors.items():
                 for widths, marker in [('selected', 'o'), ('ordinary', 'x'), ('paired', '^')]:
                     group = [r for r in points if r['family'] == family
@@ -121,14 +123,8 @@ def render(rows, output):
         fig.savefig(output / f'{storage}.pdf')
         fig.savefig(output / f'{storage}.png', dpi=100)
         plt.close(fig)
-    chosen = []
-    for phase in phases:
-        points = [r for r in rows if r['phase'] == phase]
-        for r in points:
-            r['maximum_row_frontier'] = r in frontier(points, 'maximum_row_bytes')
-            r['total_row_frontier'] = r in frontier(points, 'total_row_bytes')
-            if r['maximum_row_frontier'] or r['total_row_frontier']:
-                chosen.append(r)
+    chosen = [r for points in points_by_phase.values() for r in points
+              if r['maximum_row_frontier'] or r['total_row_frontier']]
     write_tables(rows, chosen, output)
     (output / 'index.html').write_text('''<!doctype html><meta charset="utf-8">
 <title>Exchange scheduling frontiers</title>
