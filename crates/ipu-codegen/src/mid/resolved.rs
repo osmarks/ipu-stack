@@ -192,27 +192,22 @@ impl ResolvedLayout {
                     } else {
                         width
                     };
-                    let mut coordinates = vec![0u32; rank.saturating_sub(1)];
+                    let mut region = Vec::with_capacity(rank);
                     let mut linear_row = row;
                     for axis in (0..rank.saturating_sub(1)).rev() {
                         let extent = u64::from(shape.0[axis]);
-                        coordinates[axis] = u32::try_from(linear_row % extent)
+                        let coordinate = u32::try_from(linear_row % extent)
                             .map_err(|_| LayoutError::ExtentOverflow(rank))?;
                         linear_row /= extent;
+                        region.push(ShardExtent {
+                            axis: u16::try_from(axis)
+                                .map_err(|_| LayoutError::ExtentOverflow(rank))?,
+                            start: coordinate,
+                            logical_end: coordinate + 1,
+                            physical_end: coordinate + 1,
+                        });
                     }
-                    let mut region = coordinates
-                        .into_iter()
-                        .enumerate()
-                        .map(|(axis, coordinate)| {
-                            Ok(ShardExtent {
-                                axis: u16::try_from(axis)
-                                    .map_err(|_| LayoutError::ExtentOverflow(rank))?,
-                                start: coordinate,
-                                logical_end: coordinate + 1,
-                                physical_end: coordinate + 1,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, LayoutError>>()?;
+                    region.reverse();
                     region.push(ShardExtent {
                         axis: u16::try_from(rank - 1)
                             .map_err(|_| LayoutError::ExtentOverflow(rank))?,
