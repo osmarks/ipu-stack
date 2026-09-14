@@ -1045,17 +1045,7 @@ impl Arena {
                     .free
                     .iter()
                     .flat_map(|&(start, limit)| {
-                        if end <= start || limit <= base {
-                            return vec![(start, limit)];
-                        }
-                        let mut pieces = Vec::with_capacity(2);
-                        if start < base {
-                            pieces.push((start, base));
-                        }
-                        if end < limit {
-                            pieces.push((end, limit));
-                        }
-                        pieces
+                        crate::memory::uncovered_ranges(start, limit, &[(base, end)])
                     })
                     .collect();
             }
