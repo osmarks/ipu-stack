@@ -66,25 +66,37 @@ def mergeable(a, b):
     )
 
 
-def copy_loops(copies):
-    """Optimistic affine-loop descriptors, NOT measured generated kernel counts."""
-    count = 0
+def affine_tasks(copies, *, forward_only=False):
+    """Group copies in their given order; hardware tasks require forward strides."""
     i = 0
     while i < len(copies):
-        count += 1
-        if i + 1 == len(copies) or copies[i][2] != copies[i + 1][2]:
-            i += 1
-            continue
-        delta = tuple(copies[i + 1][j] - copies[i][j] for j in (0, 1))
-        j = i + 2
-        while (
-            j < len(copies)
-            and copies[j][2] == copies[i][2]
-            and tuple(copies[j][k] - copies[j - 1][k] for k in (0, 1)) == delta
-        ):
-            j += 1
-        i = j
-    return count
+        source, destination, size = copies[i]
+        rows, ss, ds = 1, size, size
+        if i + 1 < len(copies) and copies[i + 1][2] == size:
+            ss = copies[i + 1][0] - source
+            ds = copies[i + 1][1] - destination
+            if not forward_only or (ss >= 0 and ds >= 0):
+                rows = 2
+                while i + rows < len(copies) and copies[i + rows] == (
+                    source + rows * ss,
+                    destination + rows * ds,
+                    size,
+                ):
+                    rows += 1
+        yield {
+            "source": source,
+            "destination": destination,
+            "row_bytes": size,
+            "rows": rows,
+            "source_stride": ss if rows > 1 else size,
+            "destination_stride": ds if rows > 1 else size,
+        }
+        i += rows
+
+
+def copy_loops(copies):
+    """Optimistic affine-loop count, NOT measured generated kernel counts."""
+    return sum(1 for _ in affine_tasks(copies))
 
 
 def append_copy(copies, source, destination, size):

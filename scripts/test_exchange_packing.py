@@ -161,6 +161,40 @@ class PackingTests(unittest.TestCase):
         result, _ = packing.transform(phase, "both")
         self.assertEqual(len(result["transfers"]), 2)
 
+    def test_affine_tasks_preserve_order_and_stride_restrictions(self):
+        for source_stride, destination_stride in [(16, 8), (-16, 8), (0, 0), (8, -8)]:
+            copies = [
+                (64 + i * source_stride, 128 + i * destination_stride, 4)
+                for i in range(4)
+            ] + [(256, 256, 8)]
+            for forward_only in [False, True]:
+                tasks = list(packing.affine_tasks(copies, forward_only=forward_only))
+                reconstructed = [
+                    (
+                        task["source"] + row * task["source_stride"],
+                        task["destination"] + row * task["destination_stride"],
+                        task["row_bytes"],
+                    )
+                    for task in tasks
+                    for row in range(task["rows"])
+                ]
+                self.assertEqual(reconstructed, copies)
+                if forward_only:
+                    self.assertTrue(
+                        all(
+                            task["source_stride"] >= 0
+                            and task["destination_stride"] >= 0
+                            for task in tasks
+                        )
+                    )
+                expected = (
+                    5
+                    if forward_only and min(source_stride, destination_stride) < 0
+                    else 2
+                )
+                self.assertEqual(len(tasks), expected)
+        self.assertEqual(list(packing.affine_tasks([])), [])
+
     def test_contiguous_copies_and_affine_loops(self):
         copies = []
         packing.append_copy(copies, 0, 100, 4)

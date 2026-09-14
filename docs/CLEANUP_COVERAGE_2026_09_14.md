@@ -12,8 +12,8 @@ not sources to rewrite.
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
 | Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
-| Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal | Broader fixture export and placement tools |
-| Experiment scripts | Gather/packing/frontier scripts sampled | Remaining sweeps, analyses and their common file/command handling |
+| Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | Broader fixture export |
+| Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Pretrained fixture export and deeper sweep provenance/error handling |
 | Diagnostic harnesses | Shared bindings and logical packing reviewed | Standalone kernel fixtures and orchestration |
 
 Calibration validation: four tests from `tools/test*calibration*.py`; deterministic
@@ -38,3 +38,8 @@ and normalized relocations for FP32 GEMM, FP16 GEMM, all four FP16/FP8 ×
 standard/interleaved weight dispatchers, and the static runtime. The shared
 weight loader preserves its unrolled order and both instruction widths.
 The full codegen suite also passed: 295 tests, 5 ignored.
+
+Exchange experiment validation: ten reconstruction/geometry tests pass.
+On 2,000 deterministic copy sequences, both the optimistic loop count and the
+forward-only task descriptors match their previous independent implementations.
+Both changed scripts and their tests pass Ruff checks.

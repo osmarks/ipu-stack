@@ -21,35 +21,9 @@ spec.loader.exec_module(packing)
 
 
 def affine_tasks(copies):
-    copies = sorted(copies, key=lambda c: c[1])
-    tasks = []
-    i = 0
-    while i < len(copies):
-        source, destination, size = copies[i]
-        rows, ss, ds = 1, size, size
-        if i + 1 < len(copies) and copies[i + 1][2] == size:
-            ss = copies[i + 1][0] - source
-            ds = copies[i + 1][1] - destination
-            if ss >= 0 and ds >= 0:
-                rows = 2
-                while i + rows < len(copies) and copies[i + rows] == (
-                    source + rows * ss,
-                    destination + rows * ds,
-                    size,
-                ):
-                    rows += 1
-        tasks.append(
-            {
-                "source": source,
-                "destination": destination,
-                "row_bytes": size,
-                "rows": rows,
-                "source_stride": ss if rows > 1 else size,
-                "destination_stride": ds if rows > 1 else size,
-            }
-        )
-        i += rows
-    return tasks
+    return list(
+        packing.affine_tasks(sorted(copies, key=lambda c: c[1]), forward_only=True)
+    )
 
 
 def scratch_base(intervals, size, start, stop):
