@@ -893,3 +893,50 @@ fn unsupported_kernel_abis_fail_at_lookup() {
         );
     }
 }
+
+#[test]
+fn bias_gelu_rejects_broadcast_volume_overflow() {
+    let format = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_sharded(1),
+    };
+    let view = |shard, sizes: [u32; 2]| ShardView {
+        shard: BlockValueId(shard),
+        extents: sizes
+            .into_iter()
+            .enumerate()
+            .map(|(axis, size)| ShardExtent {
+                axis: axis as u16,
+                start: 0,
+                logical_end: size,
+                physical_end: size,
+            })
+            .collect(),
+    };
+    let kernel = TileKernelSpec::BiasGelu;
+    let mut run = KernelRun::new(
+        WorkProvenance {
+            operation: None,
+            value: None,
+            reason: WorkReason::OperatorKernel,
+        },
+        kernel.clone(),
+        vec![
+            crate::KernelOperand {
+                views: vec![view(0, [1, 2])],
+            },
+            crate::KernelOperand {
+                views: vec![view(1, [1, 2])],
+            },
+        ],
+        view(2, [1, 2]),
+        KernelRequirements::new(&kernel, [format.clone(), format.clone()], format),
+    );
+    validate_kernel_run(&run).unwrap();
+    // An unchecked u32 product wraps to the expected bias width of two.
+    run.inputs[1].views[0] = view(1, [2, (1 << 31) + 1]);
+    assert_eq!(
+        validate_kernel_run(&run),
+        Err(KernelAbiError::ElementCountOverflow)
+    );
+}
