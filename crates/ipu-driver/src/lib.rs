@@ -545,6 +545,9 @@ impl Device {
         physical_tile: u16,
         context: u32,
     ) -> Result<(), DriverError> {
+        if context >= 7 {
+            return Err(DriverError::Invalid("tile context out of range".into()));
+        }
         self.write_tile_debug(physical_tile, TDI_EXCEPTION_CLEAR, 1 << context)
     }
 
@@ -1852,6 +1855,29 @@ mod tests {
             config: bar.as_mut_ptr().cast(),
         });
         test(&device);
+    }
+
+    #[test]
+    fn exception_clear_validates_context_before_writing() {
+        with_test_bar(|device| {
+            for context in 0..7 {
+                device.clear_tile_exception(0, context).unwrap();
+                assert_eq!(
+                    device.read_tile_debug(0, TDI_EXCEPTION_CLEAR).unwrap(),
+                    1 << context
+                );
+            }
+            for context in [7, 16, 32, u32::MAX] {
+                assert!(matches!(
+                    device.clear_tile_exception(0, context),
+                    Err(DriverError::Invalid(_))
+                ));
+                assert_eq!(
+                    device.read_tile_debug(0, TDI_EXCEPTION_CLEAR).unwrap(),
+                    1 << 6
+                );
+            }
+        });
     }
 
     #[test]
