@@ -400,7 +400,7 @@ impl DataArena {
             .filter_map(|(index, &(base, limit))| {
                 let start = align_up(base, alignment).ok()?;
                 let end = start.checked_add(bytes)?;
-                (end <= limit).then_some((limit - end, index, start, end))
+                (end <= limit).then(|| (limit - end, index, start, end))
             })
             .min_by_key(|candidate| (candidate.0, candidate.2))
             .ok_or_else(|| {
@@ -568,6 +568,17 @@ fn align_up(value: u32, alignment: u32) -> PackageBuildResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_arena_skips_small_and_unalignable_holes() {
+        let mut arena = DataArena::new(&[(1, 3), (8, 12), (17, 40)]);
+        assert_eq!(arena.allocate(8, 8).unwrap(), 24);
+        assert_eq!(arena.allocate(8, 8).unwrap(), 32);
+        let remaining = arena.ranges.clone();
+        assert!(arena.allocate(8, 8).is_err());
+        assert_eq!(arena.ranges, remaining);
+        assert_eq!(arena.allocate(4, 4).unwrap(), 8);
+    }
 
     #[test]
     fn descriptor_reservation_survives_relocation_and_packet_deduplication() {
