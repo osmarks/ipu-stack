@@ -17,6 +17,7 @@ pub(super) fn select(
         let original = program.exchange_phases[index].clone();
         let start = program.shards.len();
         let Some(candidate) = candidate(program, &original)? else {
+            program.shards.truncate(start);
             continue;
         };
         let before = crate::estimate::exchange_phase_estimate(program, &original, analysis)?;
@@ -171,7 +172,6 @@ fn candidate(
     if plans.is_empty() {
         return Ok(None);
     }
-    let start = program.shards.len();
     let mut used = BTreeSet::new();
     let mut removed = BTreeSet::new();
     let mut gather = Vec::new();
@@ -191,7 +191,6 @@ fn candidate(
                 .rev()
                 .find(|t| !used.contains(t) && !excluded.contains(t))
             else {
-                program.shards.truncate(start);
                 return Ok(None);
             };
             let id = BlockValueId(
@@ -244,7 +243,6 @@ fn candidate(
                 adjacent
             }) && end == extents[row].physical_end;
             if covered != expected || !complete {
-                program.shards.truncate(start);
                 return Ok(None);
             }
             program.shards.push(relay);
