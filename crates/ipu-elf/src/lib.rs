@@ -687,8 +687,7 @@ fn align(value: usize, alignment: usize) -> Result<usize, ElfError> {
         return Err(ElfError::Link("non-power-of-two section alignment".into()));
     }
     value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
+        .checked_next_multiple_of(alignment)
         .ok_or_else(|| ElfError::Link("alignment overflow".into()))
 }
 

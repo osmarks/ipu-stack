@@ -215,8 +215,7 @@ pub(crate) fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 
 fn align_up(value: u32, alignment: u32, name: &'static str) -> Result<u32, MemoryLayoutError> {
     value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
+        .checked_next_multiple_of(alignment)
         .ok_or(MemoryLayoutError::Invalid(name))
 }
 

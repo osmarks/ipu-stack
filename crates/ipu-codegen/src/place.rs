@@ -1203,8 +1203,7 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, PlacementError> {
         return Err(PlacementError::Overflow);
     }
     value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
+        .checked_next_multiple_of(alignment)
         .ok_or(PlacementError::Overflow)
 }
 

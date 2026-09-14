@@ -139,8 +139,7 @@ impl TileGraphBuilder {
             .ok_or(ExpansionError::IdOverflow)?;
         let alignment = u64::from(alignment.max(1));
         let stride = bytes
-            .checked_add(alignment - 1)
-            .map(|bytes| bytes / alignment * alignment)
+            .checked_next_multiple_of(alignment)
             .ok_or(ExpansionError::IdOverflow)?;
         u32::try_from(stride).map_err(|_| ExpansionError::IdOverflow)
     }

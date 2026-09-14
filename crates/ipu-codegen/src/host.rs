@@ -560,8 +560,7 @@ fn words(words: &[u32]) -> Vec<u8> {
 
 fn align_up(value: u32, alignment: u32) -> PackageBuildResult<u32> {
     value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
+        .checked_next_multiple_of(alignment)
         .ok_or_else(|| invalid("host plan address overflow"))
 }
 
