@@ -39,22 +39,21 @@ impl MappingTraffic {
     /// Active C600 execution indices pair adjacent tiles. Width eligibility is
     /// optimistic about route encoding; exact scheduling verifies finalists.
     pub(crate) fn score(&self, mapping: &[u16], multiplicities: &[u64]) -> (u64, u128) {
-        self.phase_scores(mapping)
-            .into_iter()
-            .zip(multiplicities)
-            .fold((0u64, 0u128), |total, ((cycles, pressure), &count)| {
+        self.phase_scores(mapping).zip(multiplicities).fold(
+            (0u64, 0u128),
+            |total, ((cycles, pressure), &count)| {
                 (
                     total.0.saturating_add(cycles.saturating_mul(count)),
                     total
                         .1
                         .saturating_add(pressure.saturating_mul(u128::from(count))),
                 )
-            })
+            },
+        )
     }
 
     pub(crate) fn phase_cycles(&self, mapping: &[u16]) -> Vec<u64> {
         self.phase_scores(mapping)
-            .into_iter()
             .map(|score| {
                 score
                     .0
@@ -63,15 +62,14 @@ impl MappingTraffic {
             .collect()
     }
 
-    fn phase_scores(&self, mapping: &[u16]) -> Vec<(u64, u128)> {
+    fn phase_scores(&self, mapping: &[u16]) -> impl Iterator<Item = (u64, u128)> {
         let mut inverse = vec![0u16; self.tile_count];
         for (old, &new) in mapping.iter().enumerate() {
             inverse[usize::from(new)] = old as u16;
         }
         self.phases
             .iter()
-            .map(|phase| phase.score(mapping, &inverse))
-            .collect()
+            .map(move |phase| phase.score(mapping, &inverse))
     }
 }
 
@@ -236,7 +234,7 @@ mod tests {
                         sorted.sort_unstable();
                         if sorted == [0, 1, 2, 3] {
                             assert_eq!(
-                                traffic.phase_scores(&mapping),
+                                traffic.phase_scores(&mapping).collect::<Vec<_>>(),
                                 vec![match mapping
                                     .iter()
                                     .position(|&tile| tile == mapping[0] ^ 1)
