@@ -389,12 +389,11 @@ fn prune(mut states: Vec<State>, limit: usize, report: &mut SearchReport) -> Vec
         .iter()
         .find(|s| s.graph.assumptions.is_empty())
         .cloned();
-    let signature = |s: &State| {
+    fn signature(s: &State) -> impl Iterator<Item = (ValueId, &TensorType)> {
         s.live
             .iter()
-            .map(|(&v, &id)| (v, s.graph.values[id].tensor.clone()))
-            .collect::<Vec<_>>()
-    };
+            .map(|(&v, &id)| (v, &s.graph.values[id].tensor))
+    }
     let mut result: Vec<State> = Vec::new();
     let mut remainder = Vec::new();
     let mut unique = Vec::<State>::new();
@@ -412,11 +411,10 @@ fn prune(mut states: Vec<State>, limit: usize, report: &mut SearchReport) -> Vec
         unique.push(state);
     }
     for state in unique {
-        let sig = signature(&state);
         // Preserve different live output formats before filling the beam with
         // cost variants of a single distribution. Materialization caches differ,
         // so equal signatures alone are NOT enough for dominance elimination.
-        if result.iter().any(|s| signature(s) == sig) {
+        if result.iter().any(|s| signature(s).eq(signature(&state))) {
             remainder.push(state);
         } else {
             result.push(state);
