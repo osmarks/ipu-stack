@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 foldhash.workspace = true
+hashbrown.workspace = true
 ipu-exchange = { path = "../ipu-exchange" }
 ipu-driver = { path = "../ipu-driver" }
 ipu-elf = { path = "../ipu-elf" }

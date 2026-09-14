@@ -26,6 +26,7 @@ dotenvy = "0.15.7"
 fastrand = "2.3.0"
 foldhash = "0.2.0"
 half = "2.7.1"
+hashbrown = { version = "0.16.0", default-features = false, features = ["inline-more"] }
 hex = "0.4.3"
 libc = "0.2.180"
 object = { version = "0.39.1", features = ["read_core", "elf"] }

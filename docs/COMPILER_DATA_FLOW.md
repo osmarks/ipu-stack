@@ -174,10 +174,11 @@ not by itself specify which bytes move or whether storage can be reused.
 
 ```mermaid
 flowchart TD
-  V[View/slice or layout requirement] --> C[Copy: CoordinateMapping and CopyPolicy]
+  V[View/slice or layout requirement] --> C[Copy: mapping, traversal and packing policies]
   C --> M[movement: map output regions to source owners]
   M --> U[Reuse, direct panels or source unpacking]
-  U --> P[CopyPlan: coverage, direct exchange vs staging/packing]
+  U --> G[Storage geometry: coverage, alignment and fragment counts]
+  G --> P[Movement selection: direct exchange or destination packing]
   P --> Q[MaterializationBatch: before / exchange / after / kernels]
   Q --> X[Local copies, multicast groups and kernel runs]
 ```
@@ -195,12 +196,17 @@ Numerical conversion is a Compute with a Cast kernel. Copy composition cannot
 cross it. It also retains boundaries between incompatible explicit copy policies;
 it does not silently replace every selected policy with Automatic.
 
-[CopyPlan::for_destination](../crates/ipu-codegen/src/low/copy.rs) still computes
-uncovered padding and chooses direct word transfers versus staging/packing using
-estimated costs. Separating its pure geometry from this physical selection is
-still part of the refactor. [Storage](../crates/ipu-codegen/src/storage.rs) owns
-layout-to-byte traversal; relative local-copy descriptors and span coalescing are
-currently in low/copy.rs.
+[storage/movement.rs](../crates/ipu-codegen/src/storage/movement.rs) computes
+exact destination coverage, traversal alignment and direct-word fragment counts.
+It also owns span-stream matching, shared by local copies and exchange analysis.
+Coverage remains symbolic; its cached hole list is only evaluated when a clear
+needs it. It does not choose scratch or kernels. `select_destination_packing` in movement
+lowering consumes these facts and the Copy's `PackingPolicy`. Automatic retains
+the existing cost heuristic; forced direct or staged requests are checked, and
+copy composition retains their source/destination boundary. Kernel binding still
+needs the broader family-contract refactor. Clear emission widens exact holes to
+the fill implementation's write granularity. Relative local-copy descriptors and
+launch coalescing remain in low/copy.rs.
 
 Kernel construction still assembles parts of a call in
 [expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs); full binding through
@@ -322,7 +328,7 @@ reduction lowering.
 | --- | --- | --- |
 | `implementation::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | Owned by the search invocation, passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
 | `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
-| `ExpansionCache.plans` | Destination type/extents and ordered source mappings to `CopyPlan`, including staging decisions | Same search in production; bounded at 32,768 entries |
+| `ExpansionCache.geometry` | Byte interpretation, extents and ordered mappings to coverage/alignment/fragment facts; excludes ownership and packing policy | Same search in production; bounded at 32,768 entries |
 | `ExpansionCache.copies` | Normalized view geometry, copy order, same-buffer flag to relative local-copy descriptors | Same search; separately bounded at 32,768 entries |
 | `GeometryAnalysis` | Interned view traversals and source/recipient pair facts: bytes, fragments, receive spans | One candidate's expansion and footprint screen; also used to price tentative relays |
 | `CopyRegions.targets` | Requested logical region to clipped source regions/replica owners | One source set during a copy or conversion; avoids repeating intersection work for replicas |
@@ -331,10 +337,11 @@ reduction lowering.
 | `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order, normalized encoded rows and the policy under which they were selected | Incumbent plus speculative candidate snapshots; policy compatibility and physical replay are validated |
 | ELF artifact cache | Source/includes, effective flags, target and tool identity to immutable compiled objects | On disk across builds |
 
-[ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses custom
-hash buckets with full equality checks; both its fingerprints and bucket maps
-use the standard hasher. [GeometryAnalysis](../crates/ipu-codegen/src/estimate/geometry.rs)
-also uses standard hash maps. These are not all caches of the same computation.
+[ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses foldhash and
+`hashbrown::HashTable`, with full key equality. Borrowed lookups avoid allocating
+owned mapping lists on hits. Generation stays outside the lock; entries remain
+bounded. [GeometryAnalysis](../crates/ipu-codegen/src/estimate/geometry.rs) still
+uses standard hash maps. These are not all caches of the same computation.
 Family fragments are built by the constructor and consumed by costing;
 `CostModel` no longer constructs or caches executable programs.
 
@@ -350,10 +357,9 @@ captured transfers. Current defaults, search coverage and checkpoint configurati
 remain unchanged.
 
 The overlapping work is constructing, normalizing and matching byte geometry in
-copy realization and geometry costing. The cached `CopyPlan` additionally
-contains cost-dependent decisions, so it cannot simply become a global geometry
-cache. Its current coefficients are fixed; a configurable target/policy would
-need appropriate scoping or keying.
+copy realization and geometry costing. Destination geometry no longer retains
+cost-dependent staging decisions; changing the packing policy reuses those facts.
+The fragment width is fixed by the IPU21 exchange target for this cache's lifetime.
 
 [Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) found a useful
 MLP B2 improvement, marginal attention changes, and rejected broader fragment

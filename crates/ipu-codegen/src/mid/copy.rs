@@ -204,12 +204,15 @@ fn independent_prefix(
         .count()
 }
 
+// Forced packing belongs to the present source/destination site. Composition
+// preserves that boundary until it can prove the requested realization survives.
 fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool, CopyPolicy)> {
     match &operation.kind {
         MidOperationKind::Copy {
             mapping,
             reuse_local,
             policy,
+            packing: crate::PackingPolicy::Automatic,
         } if *policy != CopyPolicy::LocalKernel => Some((mapping.clone(), *reuse_local, *policy)),
         _ => None,
     }
@@ -324,6 +327,7 @@ pub(super) fn compose(
             operations[index].inputs[0] = input;
             operations[index].kind = MidOperationKind::Copy {
                 policy,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: next,
                 reuse_local,
             };
@@ -451,6 +455,7 @@ mod tests {
                 results: vec![MidValueId(index)],
                 kind: MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
+                    packing: crate::PackingPolicy::Automatic,
                     mapping: CoordinateMapping::default(),
                     reuse_local: true,
                 },

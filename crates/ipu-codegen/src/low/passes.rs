@@ -1,13 +1,13 @@
 //! Local transformations of expanded tile regions, before tile projection.
 
-use super::copy::{CopyOrder, CopyPattern};
+use super::copy::CopyPattern;
 use super::graph::{
     BlockOperation, BlockRegion, BlockValue, BlockValueId, ExchangePhase, ExchangePhaseId,
     LocalCopy, LocalCopyId, LogicalExchange, ShardView, TileGraph, WorkProvenance, WorkReason,
     storage_location, storage_root,
 };
 use super::view_byte_traversal;
-use crate::storage::{ByteSpan, StorageResult};
+use crate::storage::{ByteSpan, CopyOrder, StorageResult};
 use std::collections::BTreeMap;
 
 /// Move copy-only gaps before or after a shared exchange when they commute

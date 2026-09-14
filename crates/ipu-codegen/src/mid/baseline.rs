@@ -631,6 +631,7 @@ impl<C: CostModel> Builder<'_, C> {
                     results: vec![result],
                     kind: MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
+                        packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
                     },

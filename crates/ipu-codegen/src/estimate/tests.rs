@@ -324,6 +324,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             results: vec![id(2)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: false,
             },
@@ -404,6 +405,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
         results: vec![id(output)],
         kind: MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
+            packing: crate::PackingPolicy::Automatic,
             mapping: CoordinateMapping::default(),
             reuse_local: false,
         },
@@ -497,6 +499,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
             results: vec![values[1].id],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping {
                     offsets,
                     view: None,

@@ -336,6 +336,7 @@ pub enum MidOperationKind {
         mapping: CoordinateMapping,
         reuse_local: bool,
         policy: crate::CopyPolicy,
+        packing: crate::PackingPolicy,
     },
     Compute(Compute),
     Repeat(MidRepeat),

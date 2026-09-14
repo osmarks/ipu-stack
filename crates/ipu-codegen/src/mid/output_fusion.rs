@@ -182,6 +182,7 @@ fn fuse_fp8_outputs_at(
                     mapping: CoordinateMapping::default(),
                     reuse_local: false,
                     policy: CopyPolicy::DirectRetile,
+                    packing: crate::PackingPolicy::Automatic,
                 },
                 results: cast.results.clone(),
                 ..*cast
@@ -268,6 +269,7 @@ fn fuse_fp8_outputs_at(
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
                         policy: CopyPolicy::DirectRetile,
+                        packing: crate::PackingPolicy::Automatic,
                     },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,

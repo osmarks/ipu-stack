@@ -175,6 +175,7 @@ mod tests {
                     results: vec![MidValueId(1)],
                     kind: MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
+                        packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
                     },
@@ -351,6 +352,7 @@ mod tests {
             results: vec![MidValueId(3)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
@@ -372,6 +374,7 @@ mod tests {
             mapping: CoordinateMapping::default(),
             reuse_local: false,
             policy: CopyPolicy::LocalKernel,
+            packing: crate::PackingPolicy::Automatic,
         };
         mid.reuse_cast_inputs();
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();

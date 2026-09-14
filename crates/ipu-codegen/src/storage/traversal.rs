@@ -748,7 +748,7 @@ impl ByteTraversal {
             return Ok(left.chunks);
         }
         let mut count = 0;
-        crate::for_each_copy_span(self.spans(), other.spans(), |_, _, bytes| {
+        super::for_each_copy_span(self.spans(), other.spans(), |_, _, bytes| {
             count += u64::from(bytes.div_ceil(limit));
             Ok(())
         })?;
@@ -965,7 +965,7 @@ mod tests {
                                     .sum::<u64>()
                             );
                             let mut fragments = 0;
-                            crate::for_each_copy_span(
+                            super::for_each_copy_span(
                                 semantic.spans(),
                                 traversal.spans(),
                                 |_, _, bytes| {

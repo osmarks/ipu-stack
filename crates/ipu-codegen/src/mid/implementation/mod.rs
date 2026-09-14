@@ -57,6 +57,7 @@ pub(crate) fn implement(
                 output.clone(),
                 MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
+                    packing: crate::PackingPolicy::Automatic,
                     mapping,
                     reuse_local: false,
                 },
@@ -223,6 +224,7 @@ impl Builder {
             output,
             MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping {
                     offsets,
                     view: None,

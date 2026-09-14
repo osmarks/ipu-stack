@@ -30,6 +30,10 @@ are owned by kernel rather than planner/operator. Shifted FP16-to-FP8 cast
 chunking belongs to the cast family; donation profitability remains in mid.
 Exchange append now only records work too; the explicit low simplification pass
 owns copy motion and exchange grouping, including phase compaction through Repeat.
+Copy geometry now lives in storage, with exact coverage and shared span matching;
+movement lowering owns destination-packing selection from an explicit per-copy
+policy. The cache retains geometry instead of selected staging, uses foldhash and
+a hash table instead of custom buckets, and excludes ownership from geometry keys.
 Operand indexing, complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks

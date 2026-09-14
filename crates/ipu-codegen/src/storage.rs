@@ -1,5 +1,8 @@
 //! Conversion from logical shard views to physical byte ranges.
 
+mod movement;
+pub use movement::CopyOrder;
+pub(crate) use movement::{CopyGeometry, CopyMapping, for_each_copy_span, uncovered_bytes};
 mod traversal;
 pub(crate) use traversal::{ByteTraversal, StridedSpan, byte_traversal, panel_byte_traversal};
 

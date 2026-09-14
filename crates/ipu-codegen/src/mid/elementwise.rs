@@ -260,6 +260,7 @@ mod tests {
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
                         policy: CopyPolicy::DirectRetile,
+                        packing: crate::PackingPolicy::Automatic,
                     },
                 ),
                 operation(
@@ -451,6 +452,7 @@ mod tests {
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
                         policy: CopyPolicy::DirectRetile,
+                        packing: crate::PackingPolicy::Automatic,
                     },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,

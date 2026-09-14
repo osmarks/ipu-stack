@@ -195,6 +195,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
                 mappings,
                 CopyOrder::Physical,
                 exchange_order,
+                PackingPolicy::Automatic,
                 provenance,
                 &mut batch,
                 &mut region,
@@ -295,6 +296,7 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
             mappings,
             CopyOrder::Semantic,
             CopyOrder::Semantic,
+            PackingPolicy::Automatic,
             provenance,
             &mut batch,
             &mut region,
@@ -2030,6 +2032,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                             3,
                             MidOperationKind::Copy {
                                 policy: crate::CopyPolicy::Automatic,
+                                packing: crate::PackingPolicy::Automatic,
                                 mapping: CoordinateMapping::default(),
                                 reuse_local: true,
                             },
@@ -2521,7 +2524,15 @@ fn complete_panel_grid_stays_one_logical_exchange() {
     let mut batch = movement::MaterializationBatch::default();
     let mut body = BlockRegion::default();
     state
-        .prepare_mapped_views(mappings, order, order, provenance, &mut batch, &mut body)
+        .prepare_mapped_views(
+            mappings,
+            order,
+            order,
+            PackingPolicy::Automatic,
+            provenance,
+            &mut batch,
+            &mut body,
+        )
         .unwrap();
     state
         .append_materialization(batch, provenance, &mut body)
@@ -2636,6 +2647,7 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
             vec![(source, target), (clipped_source, clipped_target)],
             CopyOrder::Semantic,
             CopyOrder::Semantic,
+            PackingPolicy::Automatic,
             provenance,
             &mut batch,
             &mut body,

@@ -38,6 +38,7 @@ fn copied_columns(columns: u32) -> MidProgram {
             results: vec![MidValueId::from_index(1)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
@@ -176,6 +177,7 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
                 mapping: CoordinateMapping::default(),
                 reuse_local: false,
                 policy: CopyPolicy::DirectRetile,
+                packing: crate::PackingPolicy::Automatic,
             },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,

@@ -98,7 +98,9 @@ impl mid::MemoryObserver for Timeline {
     ) {
         let description = match &operation.kind {
             MidOperationKind::Compute(Compute::Kernel { kernel, .. }) => format!("{kernel:?}"),
-            MidOperationKind::Copy { policy, .. } => format!("Copy {policy:?}"),
+            MidOperationKind::Copy {
+                policy, packing, ..
+            } => format!("Copy {policy:?} {packing:?}"),
             MidOperationKind::Compute(compute) => format!("{compute:?}"),
             MidOperationKind::Repeat(repeat) => format!("Repeat {} boundary", repeat.count),
         };

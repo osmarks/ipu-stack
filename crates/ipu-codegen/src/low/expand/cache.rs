@@ -1,30 +1,34 @@
-//! Per-build caches for relative copy fragments and copy preparation plans.
-//! Phase assembly, alias
-//! mutation and deferred materialization stay in the caller.
-use super::*;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+//! Per-build caches for relative copy descriptors and destination geometry.
+//! Packing selection and low graph mutation remain in movement construction.
+use super::{ExpansionResult, view_byte_traversal};
+use crate::low::{BlockValue, BlockValueId, CopyOperation, LocalCopy, ShardView};
+use crate::mid::{ElementOrder, Precision, ShardExtent};
+use crate::storage::{CopyGeometry, CopyMapping, CopyOrder, ViewGeometry};
+use hashbrown::HashTable;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 const MAX_ENTRIES: usize = 32768;
 
+// Prehashed lookup compares borrowed views; hit paths do not clone the large
+// destination keys. HashTable owns probing/collision handling and reuses the
+// recorded hash when growing, avoiding a second hash or a vector per bucket.
 struct Memo<K, V> {
     entries: Mutex<Entries<K, V>>,
 }
 struct Entries<K, V> {
-    buckets: HashMap<u64, Vec<(K, Arc<V>)>>,
+    table: HashTable<(u64, K, Arc<V>)>,
     hits: u64,
     misses: u64,
-    count: usize,
 }
 impl<K, V> Default for Memo<K, V> {
     fn default() -> Self {
         Self {
             entries: Mutex::new(Entries {
-                buckets: HashMap::new(),
+                table: HashTable::new(),
                 hits: 0,
                 misses: 0,
-                count: 0,
             }),
         }
     }
@@ -33,10 +37,9 @@ impl<K: Eq, V> Memo<K, V> {
     fn get(&self, hash: u64, matches: impl Fn(&K) -> bool) -> Option<Arc<V>> {
         let mut state = self.entries.lock().unwrap();
         let found = state
-            .buckets
-            .get(&hash)
-            .and_then(|bucket| bucket.iter().find(|(key, _)| matches(key)))
-            .map(|(_, value)| Arc::clone(value));
+            .table
+            .find(hash, |(_, key, _)| matches(key))
+            .map(|(_, _, value)| Arc::clone(value));
         if found.is_some() {
             state.hits += 1;
         } else {
@@ -46,57 +49,70 @@ impl<K: Eq, V> Memo<K, V> {
     }
     fn insert(&self, hash: u64, key: K, value: Arc<V>, limit: usize) {
         let mut state = self.entries.lock().unwrap();
-        if state.count < limit {
-            let bucket = state.buckets.entry(hash).or_default();
-            if !bucket.iter().any(|(existing, _)| *existing == key) {
-                bucket.push((key, value));
-                state.count += 1;
-            }
+        if state.table.len() < limit
+            && state
+                .table
+                .find(hash, |(_, existing, _)| *existing == key)
+                .is_none()
+        {
+            state
+                .table
+                .insert_unique(hash, (hash, key, value), |entry| entry.0);
         }
     }
+
     fn has_capacity(&self, limit: usize) -> bool {
-        self.entries.lock().unwrap().count < limit
+        self.entries.lock().unwrap().table.len() < limit
     }
     fn stats(&self) -> (usize, u64, u64) {
         let state = self.entries.lock().unwrap();
-        (state.count, state.hits, state.misses)
+        (state.table.len(), state.hits, state.misses)
     }
 }
 
 #[derive(PartialEq, Eq, Hash)]
 struct CopyKey {
-    source: crate::storage::ViewGeometry,
-    destination: crate::storage::ViewGeometry,
+    source: ViewGeometry,
+    destination: ViewGeometry,
     order: CopyOrder,
     same_buffer: bool,
 }
 
 #[derive(PartialEq, Eq, Hash)]
-struct PlanSource {
-    format: TensorFormat,
+struct GeometrySource {
+    format: (Precision, ElementOrder),
     allocation: Vec<ShardExtent>,
     source: Vec<ShardExtent>,
     destination: Vec<ShardExtent>,
 }
 #[derive(PartialEq, Eq, Hash)]
-struct PlanKey {
-    destination: TensorType,
+struct GeometryKey {
+    destination: (Precision, ElementOrder),
     allocation: Vec<ShardExtent>,
-    mappings: Vec<PlanSource>,
+    mappings: Vec<GeometrySource>,
     order: CopyOrder,
+}
+
+// Relative traversal depends on byte interpretation. Shape, tile ownership,
+// replicas and bank class do not affect it and must not split cache entries.
+fn format_key(shard: &BlockValue) -> (Precision, ElementOrder) {
+    (
+        shard.tensor_type.format.precision,
+        shard.tensor_type.format.layout.order,
+    )
 }
 
 pub(crate) struct ExpansionCache {
     enabled: bool,
     copies: Memo<CopyKey, Vec<CopyOperation<()>>>,
-    plans: Memo<PlanKey, crate::CopyPlan>,
+    geometry: Memo<GeometryKey, CopyGeometry>,
 }
 impl Default for ExpansionCache {
     fn default() -> Self {
         Self {
             enabled: true,
             copies: Memo::default(),
-            plans: Memo::default(),
+            geometry: Memo::default(),
         }
     }
 }
@@ -111,28 +127,33 @@ impl ExpansionCache {
     pub(crate) fn stats(&self) -> (usize, u64, u64) {
         self.copies.stats()
     }
-    pub(crate) fn plan_stats(&self) -> (usize, u64, u64) {
-        self.plans.stats()
+    pub(crate) fn geometry_stats(&self) -> (usize, u64, u64) {
+        self.geometry.stats()
     }
 
-    pub(super) fn plan(
+    pub(super) fn geometry(
         &self,
         shards: &[BlockValue],
         mappings: &[(ShardView, ShardView)],
         destination: BlockValueId,
         order: CopyOrder,
-    ) -> ExpansionResult<Arc<crate::CopyPlan>> {
+    ) -> ExpansionResult<Arc<CopyGeometry>> {
         let shard = &shards[destination.index() as usize];
         let generate = || {
             let mappings = mappings
                 .iter()
-                .map(|(source, destination)| crate::CopyMapping {
+                .map(|(source, destination)| CopyMapping {
                     source: shards[source.shard.index() as usize].storage(),
                     source_extents: &source.extents,
                     destination_extents: &destination.extents,
                 })
                 .collect::<Vec<_>>();
-            crate::CopyPlan::for_destination(&shard.tensor_type, &shard.extents, &mappings, order)
+            CopyGeometry::analyze(
+                shard.storage(),
+                &mappings,
+                order,
+                ipu_exchange::MAX_TRANSFER_WORDS * 4,
+            )
         };
         if !self.enabled
             || (order != CopyOrder::Semantic
@@ -141,21 +162,21 @@ impl ExpansionCache {
         {
             return Ok(Arc::new(generate()?));
         }
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        shard.tensor_type.hash(&mut hash);
+        let mut hash = foldhash::fast::FixedState::default().build_hasher();
+        format_key(shard).hash(&mut hash);
         shard.extents.hash(&mut hash);
         order.hash(&mut hash);
         mappings.len().hash(&mut hash);
         for (source, destination) in mappings {
             let input = &shards[source.shard.index() as usize];
-            input.tensor_type.format.hash(&mut hash);
+            format_key(input).hash(&mut hash);
             input.extents.hash(&mut hash);
             source.extents.hash(&mut hash);
             destination.extents.hash(&mut hash);
         }
         let hash = hash.finish();
-        if let Some(plan) = self.plans.get(hash, |key| {
-            key.destination == shard.tensor_type
+        if let Some(geometry) = self.geometry.get(hash, |key| {
+            key.destination == format_key(shard)
                 && key.allocation == shard.extents
                 && key.order == order
                 && key.mappings.len() == mappings.len()
@@ -165,27 +186,27 @@ impl ExpansionCache {
                     .zip(mappings)
                     .all(|(key, (source, destination))| {
                         let input = &shards[source.shard.index() as usize];
-                        key.format == input.tensor_type.format
+                        key.format == format_key(input)
                             && key.allocation == input.extents
                             && key.source == source.extents
                             && key.destination == destination.extents
                     })
         }) {
-            return Ok(plan);
+            return Ok(geometry);
         }
-        if !self.plans.has_capacity(MAX_ENTRIES) {
+        if !self.geometry.has_capacity(MAX_ENTRIES) {
             return Ok(Arc::new(generate()?));
         }
-        let key = PlanKey {
-            destination: shard.tensor_type.clone(),
+        let key = GeometryKey {
+            destination: format_key(shard),
             allocation: shard.extents.clone(),
             order,
             mappings: mappings
                 .iter()
                 .map(|(source, destination)| {
                     let shard = &shards[source.shard.index() as usize];
-                    PlanSource {
-                        format: shard.tensor_type.format.clone(),
+                    GeometrySource {
+                        format: format_key(shard),
                         allocation: shard.extents.clone(),
                         source: source.extents.clone(),
                         destination: destination.extents.clone(),
@@ -193,9 +214,10 @@ impl ExpansionCache {
                 })
                 .collect(),
         };
-        let plan = Arc::new(generate()?);
-        self.plans.insert(hash, key, Arc::clone(&plan), MAX_ENTRIES);
-        Ok(plan)
+        let geometry = Arc::new(generate()?);
+        self.geometry
+            .insert(hash, key, Arc::clone(&geometry), MAX_ENTRIES);
+        Ok(geometry)
     }
 
     pub(super) fn copy(
@@ -237,12 +259,12 @@ impl ExpansionCache {
             return Ok(Arc::new(generate()?));
         }
         let key = CopyKey {
-            source: crate::storage::ViewGeometry::new(left.storage(), &source.extents)?,
-            destination: crate::storage::ViewGeometry::new(right.storage(), &destination.extents)?,
+            source: ViewGeometry::new(left.storage(), &source.extents)?,
+            destination: ViewGeometry::new(right.storage(), &destination.extents)?,
             order,
             same_buffer: source.shard == destination.shard,
         };
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut hash = foldhash::fast::FixedState::default().build_hasher();
         key.hash(&mut hash);
         let hash = hash.finish();
         if let Some(copies) = self.copies.get(hash, |existing| *existing == key) {
@@ -260,6 +282,8 @@ impl ExpansionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::low::ShardDefinition;
+    use crate::mid::{Layout, TensorType};
 
     #[test]
     fn memo_checks_full_keys_and_bounds_entries_even_on_hash_collisions() {
@@ -271,6 +295,19 @@ mod tests {
         assert_eq!(*memo.get(7, |key| *key == 2).unwrap(), 20);
         assert!(memo.get(7, |key| *key == 3).is_none());
         assert_eq!(memo.stats(), (2, 2, 1));
+
+        // Growth must retain the supplied fingerprints, even though they need
+        // not equal a hash recomputed from the owned key.
+        let memo = Memo::default();
+        for key in 0..1024 {
+            memo.insert(key % 7, key, Arc::new(key * 3), 1024);
+        }
+        for key in 0..1024 {
+            assert_eq!(
+                *memo.get(key % 7, |stored| *stored == key).unwrap(),
+                key * 3
+            );
+        }
     }
 
     #[test]
@@ -320,5 +357,62 @@ mod tests {
             }
         }
         assert_eq!(cache.stats(), (1, 1, 1));
+    }
+
+    #[test]
+    fn destination_geometry_ignores_ownership_but_tracks_byte_interpretation() {
+        let mut shards = (0..2)
+            .map(|id| BlockValue {
+                id: BlockValueId(id),
+                tile: id as u16,
+                tensor_type: TensorType::new([2, 64], Precision::F16, Layout::row_sharded(1)),
+                extents: vec![
+                    ShardExtent {
+                        axis: 0,
+                        start: 0,
+                        logical_end: 2,
+                        physical_end: 2,
+                    },
+                    ShardExtent {
+                        axis: 1,
+                        start: 0,
+                        logical_end: 64,
+                        physical_end: 64,
+                    },
+                ],
+                definition: ShardDefinition::Staging,
+            })
+            .collect::<Vec<_>>();
+        let views = shards
+            .iter()
+            .map(|shard| ShardView {
+                shard: shard.id,
+                extents: shard.extents.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mappings = [(views[0].clone(), views[1].clone())];
+        let cache = ExpansionCache::default();
+        let before = cache
+            .geometry(&shards, &mappings, BlockValueId(1), CopyOrder::Semantic)
+            .unwrap();
+        for shard in &mut shards {
+            shard.tile += 2;
+            shard.tensor_type.shape.0[0] *= 2;
+            shard.tensor_type.format.layout = Layout::row_sharded(2);
+            shard.tensor_type.format.layout.memory_class = crate::MemoryClass::Ipu21Interleaved;
+        }
+        let remapped = cache
+            .geometry(&shards, &mappings, BlockValueId(1), CopyOrder::Semantic)
+            .unwrap();
+        assert!(Arc::ptr_eq(&before, &remapped));
+        for shard in &mut shards {
+            shard.tensor_type.format.precision = Precision::F32;
+        }
+        let wider = cache
+            .geometry(&shards, &mappings, BlockValueId(1), CopyOrder::Semantic)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&before, &wider));
+        assert_eq!(wider.bytes, before.bytes * 2);
+        assert_eq!(cache.geometry_stats(), (2, 1, 2));
     }
 }

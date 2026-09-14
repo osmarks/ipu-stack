@@ -214,6 +214,7 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
             results: vec![MidValueId(1)],
             kind: MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
+                packing: crate::PackingPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },

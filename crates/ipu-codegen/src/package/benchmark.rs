@@ -13,7 +13,7 @@ pub struct ExpansionBenchmark {
     pub baseline: ExpansionTiming,
     /// Cache entries, hits and misses, respectively.
     pub fragment_cache: (usize, u64, u64),
-    pub copy_plan_cache: (usize, u64, u64),
+    pub copy_geometry_cache: (usize, u64, u64),
     /// Matching selections are opportunities, not validated reusable graph fragments.
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
 }
@@ -233,7 +233,7 @@ pub fn benchmark_mid_expansion(
         process_memory: memory,
         baseline: timing,
         fragment_cache: cache.stats(),
-        copy_plan_cache: cache.plan_stats(),
+        copy_geometry_cache: cache.geometry_stats(),
         selection_reuse: selections
             .into_iter()
             .map(|(kind, (occurrences, keys))| {

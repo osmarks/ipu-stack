@@ -373,6 +373,7 @@ pub(super) fn ensure_format(
                     mapping: CoordinateMapping::default(),
                     reuse_local: false,
                     policy,
+                    packing: crate::PackingPolicy::Automatic,
                 }
             },
             estimated_cycles: cost.cycles,

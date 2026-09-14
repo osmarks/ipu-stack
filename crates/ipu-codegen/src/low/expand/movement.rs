@@ -15,28 +15,21 @@ pub(super) struct MaterializationBatch {
 }
 
 impl TileGraphBuilder {
-    pub(super) fn copy_tensor(
-        &mut self,
-        operation: &MidOperation,
-        mapping: &crate::CoordinateMapping,
-        reuse_local: bool,
-        policy: CopyPolicy,
-        body: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        let mut batch = MaterializationBatch::default();
-        self.prepare_copy_tensor(operation, mapping, reuse_local, policy, &mut batch, body)?;
-        self.append_materialization(batch, operation_provenance(operation), body)
-    }
-
     pub(super) fn prepare_copy_tensor(
         &mut self,
         operation: &MidOperation,
-        mapping: &crate::CoordinateMapping,
-        reuse_local: bool,
-        policy: CopyPolicy,
         batch: &mut MaterializationBatch,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
+        let MidOperationKind::Copy {
+            ref mapping,
+            reuse_local,
+            policy,
+            packing,
+        } = operation.kind
+        else {
+            return Err(ExpansionError::InvalidCopyPlan);
+        };
         let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
         else {
             return Err(ExpansionError::ResultArity);
@@ -44,7 +37,9 @@ impl TileGraphBuilder {
         let inputs = self.value_shards(*input)?.to_vec();
         let outputs = self.value_shards(*output)?.to_vec();
         // Whole-buffer bindings require canonical storage with its own strides.
-        let reuse_local = reuse_local && !self.required_storage.contains(output);
+        let reuse_local = reuse_local
+            && packing == PackingPolicy::Automatic
+            && !self.required_storage.contains(output);
         let output_order = self.shards[outputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
@@ -54,7 +49,7 @@ impl TileGraphBuilder {
             .layout
             .order;
         if policy == CopyPolicy::LocalKernel {
-            if !mapping.is_identity() {
+            if !mapping.is_identity() || packing != PackingPolicy::Automatic {
                 return Err(ExpansionError::InvalidCopyPlan);
             }
             return self.local_rearrangement(operation, &inputs, &outputs, body);
@@ -77,7 +72,9 @@ impl TileGraphBuilder {
             .order;
         let (mappings, order) = if let Some(view) = mapping.view {
             let mappings = self.window_view_mappings(&inputs, &outputs, view, &mapping.offsets)?;
-            if let Some(physical) = self.micro_panel_mappings(mappings.clone())? {
+            if packing != PackingPolicy::Staged
+                && let Some(physical) = self.micro_panel_mappings(mappings.clone())?
+            {
                 physical
             } else if policy == CopyPolicy::DirectRetile {
                 return Err(ExpansionError::InvalidCopyPlan);
@@ -135,6 +132,7 @@ impl TileGraphBuilder {
             mappings,
             order,
             order,
+            packing,
             operation_provenance(operation),
             batch,
             body,
@@ -569,6 +567,7 @@ impl TileGraphBuilder {
         mappings: Vec<(ShardView, ShardView)>,
         copy_order: CopyOrder,
         exchange_order: CopyOrder,
+        packing: PackingPolicy,
         provenance: WorkProvenance,
         batch: &mut MaterializationBatch,
         tiles: &mut BlockRegion,
@@ -582,7 +581,8 @@ impl TileGraphBuilder {
         for (destination_shard, mappings) in grouped {
             // A clipped boundary on one destination must not expand complete
             // panel grids on every other destination into tiny rectangles.
-            let physical = if copy_order == CopyOrder::Semantic {
+            let physical = if copy_order == CopyOrder::Semantic && packing != PackingPolicy::Staged
+            {
                 self.micro_panel_mappings(mappings.clone())?
             } else {
                 None
@@ -592,9 +592,29 @@ impl TileGraphBuilder {
                 |(mappings, order)| (mappings, order, order),
             );
             let transfers = batch.transfers.entry(exchange_order).or_default();
-            let plan = self.copy_plan(&mappings, destination_shard, copy_order)?;
-            self.append_copy_clears(tiles, destination_shard, &plan.clear_ranges, provenance)?;
-            let staging = if let Some(staging) = &plan.staging {
+            let geometry =
+                self.cache
+                    .geometry(&self.shards, &mappings, destination_shard, copy_order)?;
+            let destination = &self.shards[destination_shard.index() as usize];
+            let preparation = select_destination_packing(
+                &destination.tensor_type,
+                &destination.extents,
+                &geometry,
+                packing,
+            )?;
+            // A pack kernel writes the complete physical output, including padding.
+            if preparation
+                .as_ref()
+                .is_none_or(|staging| staging.kernel.is_none())
+            {
+                self.append_copy_clears(
+                    tiles,
+                    destination_shard,
+                    geometry.uncovered()?,
+                    provenance,
+                )?;
+            }
+            let staging = if let Some(staging) = &preparation {
                 Some(self.push_shard(BlockValue {
                     id: BlockValueId(0),
                     tile: self.shards[destination_shard.index() as usize].tile,
@@ -607,17 +627,11 @@ impl TileGraphBuilder {
             };
             if let Some(staging) = staging {
                 let block = &self.shards[staging.index() as usize];
-                let coverage = mappings
-                    .iter()
-                    .map(|(source, destination)| crate::CopyMapping {
-                        source: self.shards[source.shard.index() as usize].storage(),
-                        source_extents: &source.extents,
-                        destination_extents: &destination.extents,
-                    })
-                    .collect::<Vec<_>>();
-                let ranges = crate::low::copy::uncovered_copy_bytes(
+                let ranges = crate::storage::uncovered_bytes(
                     block.storage(),
-                    &coverage,
+                    mappings
+                        .iter()
+                        .map(|(_, destination)| destination.extents.as_slice()),
                     CopyOrder::Semantic,
                 )?;
                 self.append_copy_clears(tiles, staging, &ranges, provenance)?;
@@ -682,8 +696,7 @@ impl TileGraphBuilder {
             if let Some(staging) = staging {
                 let staging = self.full_view(staging);
                 let tile = self.shards[destination_shard.index() as usize].tile;
-                if let Some(kernel) = plan
-                    .staging
+                if let Some(kernel) = preparation
                     .as_ref()
                     .and_then(|staging| staging.kernel.as_ref())
                 {
@@ -818,14 +831,86 @@ impl TileGraphBuilder {
         }
         view
     }
+}
 
-    pub(super) fn copy_plan(
-        &self,
-        mappings: &[(ShardView, ShardView)],
-        destination: BlockValueId,
-        copy_order: CopyOrder,
-    ) -> ExpansionResult<Arc<crate::CopyPlan>> {
-        self.cache
-            .plan(&self.shards, mappings, destination, copy_order)
+struct CopyStaging {
+    tensor_type: TensorType,
+    extents: Vec<ShardExtent>,
+    kernel: Option<TileKernelSpec>,
+}
+
+/// Select destination work from measured geometry and the copy's requested
+/// policy. Geometry caches remain reusable when this policy changes.
+fn select_destination_packing(
+    destination: &TensorType,
+    extents: &[ShardExtent],
+    geometry: &crate::storage::CopyGeometry,
+    policy: PackingPolicy,
+) -> ExpansionResult<Option<CopyStaging>> {
+    let transform = geometry.semantic
+        && (!geometry.destination_word_aligned
+            || (destination.format.layout.order != ElementOrder::RowMajor
+                && !geometry.same_element_order));
+    if !transform {
+        return match policy {
+            PackingPolicy::Staged => Err(ExpansionError::InvalidCopyPlan),
+            _ => Ok(None),
+        };
     }
+    let stage = match policy {
+        PackingPolicy::Automatic => {
+            let bytes = u64::from(geometry.bytes);
+            let clear_cycles = if geometry.padding {
+                crate::estimate::IPU21_TARGET_COSTS
+                    .kernel_launch_cycles
+                    .saturating_add(bytes.div_ceil(8 * 6))
+            } else {
+                0
+            };
+            let direct = geometry.fragments.is_some_and(|fragments| {
+                crate::estimate::exchange_work_cycles(
+                    bytes,
+                    fragments.saturating_mul(crate::estimate::EXCHANGE_FRAGMENT_CONTROLS),
+                )
+                .saturating_add(clear_cycles)
+                    < crate::estimate::row_major_pack_cycles(
+                        destination,
+                        bytes.div_ceil(destination.format.precision.bytes().max(1)),
+                    )
+            });
+            !direct
+        }
+        PackingPolicy::Direct if geometry.fragments.is_some() => false,
+        PackingPolicy::Staged => true,
+        _ => return Err(ExpansionError::InvalidCopyPlan),
+    };
+    if !stage {
+        return Ok(None);
+    }
+    let mut extents = extents.to_vec();
+    for extent in &mut extents {
+        extent.physical_end = extent.logical_end;
+    }
+    let tensor_type = TensorType {
+        shape: destination.shape.clone(),
+        format: TensorFormat {
+            precision: destination.format.precision,
+            layout: Layout::row_major(TensorTiling::replicated(1)),
+        },
+    };
+    let kernel = (destination.format.precision == Precision::F16
+        && matches!(
+            destination.format.layout.order,
+            ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
+                | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
+        ))
+    .then(|| TileKernelSpec::Rearrange {
+        from: tensor_type.format.layout.clone(),
+        to: destination.format.layout.clone(),
+    });
+    Ok(Some(CopyStaging {
+        tensor_type,
+        extents,
+        kernel,
+    }))
 }

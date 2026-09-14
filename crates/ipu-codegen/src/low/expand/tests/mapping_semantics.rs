@@ -305,6 +305,7 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                     inputs: vec![MidValueId::from_index(index as u32)],
                     results: vec![MidValueId::from_index(index as u32 + 1)],
                     kind: MidOperationKind::Copy {
+                        packing: crate::PackingPolicy::Automatic,
                         policy: match (case + index) % 3 {
                             0 => crate::CopyPolicy::Automatic,
                             1 if mapping.view.is_none() => crate::CopyPolicy::DirectRetile,
@@ -331,5 +332,90 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn forced_destination_packing_and_direct_transfers_preserve_the_same_values() {
+    for shape in [[32, 64], [33, 66], [64, 128]] {
+        let shapes = vec![TensorShape(shape.to_vec()); 3];
+        let mappings = vec![CoordinateMapping::default(); 2];
+        let mut sizes = vec![];
+        for packing in [PackingPolicy::Direct, PackingPolicy::Staged] {
+            let values = (0..3)
+                .map(|index| {
+                    let id = MidValueId::from_index(index);
+                    MidValue {
+                        id,
+                        tensor_type: TensorType::new(
+                            shape,
+                            Precision::F32,
+                            if index == 1 {
+                                Layout::block_major_matrix(32, 1)
+                            } else {
+                                Layout::row_sharded(1)
+                            },
+                        ),
+                        origin: ValueId::from_index(index),
+                        storage_group: id,
+                        tile_offset: index as u16,
+                    }
+                })
+                .collect();
+            let mut mid = MidProgram {
+                tile_count: 3,
+                values,
+                inputs: vec![MidInput {
+                    name: "input".into(),
+                    kind: GraphInputKind::Host,
+                    value: MidValueId::from_index(0),
+                }],
+                outputs: vec![MidValueId::from_index(2)],
+                operations: (0..2)
+                    .map(|index| MidOperation {
+                        source: None,
+                        inputs: vec![MidValueId::from_index(index)],
+                        results: vec![MidValueId::from_index(index + 1)],
+                        kind: MidOperationKind::Copy {
+                            policy: CopyPolicy::StageLogicalThenTransform,
+                            packing: if index == 0 {
+                                packing
+                            } else {
+                                PackingPolicy::Automatic
+                            },
+                            mapping: CoordinateMapping::default(),
+                            reuse_local: true,
+                        },
+                        estimated_cycles: 0,
+                        estimated_exchange_cycles: 0,
+                    })
+                    .collect(),
+                ..MidProgram::default()
+            };
+            mid.compose_copies();
+            assert_eq!(
+                mid.operations.len(),
+                2,
+                "preserve the explicitly selected packing site"
+            );
+            check_bytes(&mid, &shapes, &mappings)
+                .unwrap_or_else(|error| panic!("{shape:?} {packing:?}: {error}"));
+            sizes.push(expand_tiles(&mid, false).unwrap().shards.len());
+            if packing == PackingPolicy::Direct {
+                // Transposing individual halfwords cannot use this direct-word
+                // realization. A forced request must not silently pick staging.
+                for value in &mut mid.values {
+                    value.tensor_type.format.precision = Precision::F16;
+                }
+                assert!(matches!(
+                    expand_tiles(&mid, false),
+                    Err(ExpansionError::InvalidCopyPlan)
+                ));
+            }
+        }
+        assert!(
+            sizes[1] > sizes[0],
+            "staged selection must declare its extra scratch"
+        );
     }
 }

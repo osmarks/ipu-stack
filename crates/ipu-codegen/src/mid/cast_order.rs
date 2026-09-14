@@ -165,6 +165,7 @@ fn reorder_region(
         copy.inputs = vec![id];
         copy.kind = MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
+            packing: crate::PackingPolicy::Automatic,
             mapping: CoordinateMapping::default(),
             reuse_local: false,
         };
@@ -311,6 +312,7 @@ mod tests {
                 results: vec![source],
                 kind: MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
+                    packing: crate::PackingPolicy::Automatic,
                     mapping: CoordinateMapping::default(),
                     reuse_local: false,
                 },

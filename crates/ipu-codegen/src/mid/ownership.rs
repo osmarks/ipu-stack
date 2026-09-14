@@ -453,6 +453,7 @@ fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidV
                             results: vec![id],
                             kind: MidOperationKind::Copy {
                                 policy: crate::CopyPolicy::Automatic,
+                                packing: crate::PackingPolicy::Automatic,
                                 mapping: CoordinateMapping::default(),
                                 reuse_local: true,
                             },
@@ -544,6 +545,7 @@ mod tests {
                         kind: MidOperationKind::Copy {
                             mapping: CoordinateMapping::default(),
                             reuse_local: false,
+                            packing: crate::PackingPolicy::Automatic,
                             policy: default_copy_policy(
                                 &source.format.layout,
                                 &output.format.layout,
@@ -620,6 +622,7 @@ mod tests {
                 output,
                 MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
+                    packing: crate::PackingPolicy::Automatic,
                     mapping: CoordinateMapping {
                         offsets: vec![],
                         view: Some(AxisFactorView {

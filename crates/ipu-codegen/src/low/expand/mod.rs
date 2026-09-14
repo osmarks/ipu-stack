@@ -306,28 +306,15 @@ impl TileGraphBuilder {
                     },
                     &mut tiles,
                 )
-            } else if copies > 1 {
+            } else if copies != 0 {
                 let mut batch = movement::MaterializationBatch::default();
                 for operation in &operations[index..index + group] {
-                    let MidOperationKind::Copy {
-                        policy,
-                        mapping,
-                        reuse_local,
-                    } = &operation.kind
-                    else {
-                        unreachable!()
-                    };
-                    self.prepare_copy_tensor(
-                        operation,
-                        mapping,
-                        *reuse_local,
-                        *policy,
-                        &mut batch,
-                        &mut tiles,
-                    )?;
+                    self.prepare_copy_tensor(operation, &mut batch, &mut tiles)?;
                 }
                 let mut provenance = operation_provenance(operation);
-                provenance.value = None;
+                if copies > 1 {
+                    provenance.value = None;
+                }
                 if operations[index..index + group]
                     .iter()
                     .any(|next| next.source != operation.source)
@@ -340,11 +327,9 @@ impl TileGraphBuilder {
                     MidOperationKind::Compute(compute) => {
                         self.build_compute(operation, compute, &mut tiles)
                     }
-                    MidOperationKind::Copy {
-                        policy,
-                        mapping,
-                        reuse_local,
-                    } => self.copy_tensor(operation, mapping, *reuse_local, *policy, &mut tiles),
+                    MidOperationKind::Copy { .. } => {
+                        unreachable!("copy prefix includes its first operation")
+                    }
                     MidOperationKind::Repeat(repeat) => {
                         self.build_repeat(operation, repeat, &mut tiles)
                     }
@@ -412,21 +397,28 @@ impl TileGraphBuilder {
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
         let block = &self.shards[shard.index() as usize];
-        let padding = crate::low::copy::uncovered_copy_bytes(
+        let padding = crate::storage::uncovered_bytes(
             block.storage(),
-            &[crate::CopyMapping {
-                source: block.storage(),
-                source_extents: &block.extents,
-                destination_extents: &block.extents,
-            }],
+            [block.extents.as_slice()],
             CopyOrder::Semantic,
         )?;
         let padding_only = !padding.is_empty() && ranges == padding;
-        let mut ranges = ranges.iter().copied().peekable();
+        let bytes = shard_storage_bytes(block)?;
+        let mut ranges = ranges
+            .iter()
+            .map(|range| {
+                let start = range.offset / 8 * 8;
+                let end = (u64::from(range.offset) + u64::from(range.bytes)).div_ceil(8) * 8;
+                crate::ByteSpan {
+                    offset: start,
+                    bytes: end.min(u64::from(bytes)) as u32 - start,
+                }
+            })
+            .peekable();
         let launch_bytes = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles * 48;
         while let Some(mut range) = ranges.next() {
             while let Some(next) = ranges.peek()
-                && u64::from(next.offset - (range.offset + range.bytes)) <= launch_bytes
+                && u64::from(next.offset.saturating_sub(range.offset + range.bytes)) <= launch_bytes
             {
                 range.bytes = next.offset + next.bytes - range.offset;
                 ranges.next();

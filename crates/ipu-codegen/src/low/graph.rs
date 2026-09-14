@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::kernel::TileKernelSpec;
+use crate::storage::CopyOrder;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -133,6 +133,7 @@ fn distribute_region(
                     source: operation.source,
                     kind: MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
+                        packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
                     },
@@ -218,6 +219,7 @@ mod tests {
                     results: vec![MidValueId(1)],
                     kind: MidOperationKind::Copy {
                         policy: crate::CopyPolicy::Automatic,
+                        packing: crate::PackingPolicy::Automatic,
                         mapping: CoordinateMapping {
                             offsets: vec![],
                             view: view.then_some(AxisFactorView::new(2, 0, 2)),
