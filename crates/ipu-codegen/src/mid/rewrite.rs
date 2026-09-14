@@ -125,9 +125,7 @@ pub(super) fn producer_through_copies(
         let op = &operations[index];
         let identity = match &op.kind {
             MidOperationKind::Convert(_) => true,
-            MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => {
-                *mapping == CoordinateMapping::default()
-            }
+            MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => mapping.is_identity(),
             _ => false,
         };
         if !identity

@@ -534,7 +534,7 @@ pub(crate) fn operation_cost(
                 let payload = bytes.max(sends);
                 let identity = !matches!(&operation.kind,
                     MidOperationKind::Primitive(Primitive::Copy { mapping, .. })
-                    if *mapping != crate::CoordinateMapping::default());
+                    if !mapping.is_identity());
                 let fragments = identity
                     .then(|| super::movement::grid_fragments(input, output))
                     .flatten()

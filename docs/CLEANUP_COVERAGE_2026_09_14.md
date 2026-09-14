@@ -7,8 +7,8 @@ not sources to rewrite.
 
 | Component | Current coverage | Remaining examination |
 | --- | --- | --- |
-| Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed in the earlier pass | Broader candidate generation and lowering control flow |
-| Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed in the earlier pass | Remaining loader/protocol and command dispatch paths |
+| Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed; forward/reverse view adapters consolidated in low; identity-copy predicates unified | Broader candidate generation and lowering control flow |
+| Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed; redundant runtime error wrapper removed | Remaining loader/protocol and command dispatch paths |
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
 | Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
@@ -68,3 +68,8 @@ is removed. The low expansion suite passed (see /tmp/ipu-view-cleanup-tests.log)
 Runtime cleanup: removed the single-variant wrapper around DriverError and
 its thiserror dependency; RuntimeError remains a public alias. Workspace
 compilation passes. No callers pattern-matched the old wrapper in this tree.
+
+Identity mapping validation: an omitted-offset versus explicit-zero-offset
+copy regression failed before consolidation (exchange row estimate 18,436
+versus 4,612 bytes) and passes afterward. Cast motion, producer tracing and
+costing now use the same predicate. Full codegen suite: 296 passed, 5 ignored.

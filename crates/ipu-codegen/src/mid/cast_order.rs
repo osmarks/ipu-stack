@@ -65,7 +65,7 @@ fn reorder_region(
             let identity = match &copy.kind {
                 MidOperationKind::Convert(_) => true,
                 MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => {
-                    mapping.view.is_none() && mapping.offsets.iter().all(|&n| n == 0)
+                    mapping.is_identity()
                 }
                 _ => false,
             };

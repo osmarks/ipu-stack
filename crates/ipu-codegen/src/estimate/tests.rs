@@ -468,3 +468,44 @@ fn memory_retains_repeat_yields_until_the_backedge() {
     );
     assert_eq!(peak.maximum_standard_allocation, 512);
 }
+
+#[test]
+fn explicit_zero_copy_offsets_have_identity_cost() {
+    use crate::{
+        CoordinateMapping, MidOperation, MidOperationKind, MidValue, Primitive, TensorTiling,
+        ValueId,
+    };
+    let values = [
+        Layout::row_major(TensorTiling::replicated(1)),
+        Layout::row_major(TensorTiling::sharded(TensorAxis::FromEnd(1), 4)),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, layout)| MidValue {
+        id: MidValueId::from_index(index as u32),
+        origin: ValueId::from_index(index as u32),
+        storage_group: MidValueId::from_index(index as u32),
+        tile_offset: 0,
+        tensor_type: TensorType::new([128, 128], Precision::F16, layout),
+    })
+    .collect::<Vec<_>>();
+    let cost = |offsets| {
+        let op = MidOperation {
+            source: None,
+            inputs: vec![values[0].id],
+            results: vec![values[1].id],
+            kind: MidOperationKind::Primitive(Primitive::Copy {
+                mapping: CoordinateMapping {
+                    offsets,
+                    view: None,
+                },
+                reuse_local: false,
+            }),
+            estimated_cycles: 0,
+            estimated_exchange_cycles: 0,
+        };
+        let (cost, _, rows) = operation_cost(&op, &values).unwrap();
+        (cost.total, cost.exchange, rows)
+    };
+    assert_eq!(cost(vec![]), cost(vec![0, 0]));
+}

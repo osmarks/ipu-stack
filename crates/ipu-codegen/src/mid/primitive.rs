@@ -38,6 +38,11 @@ impl From<AxisFactorView> for CoordinateMapping {
 }
 
 impl CoordinateMapping {
+    /// Omitted offsets and explicit zero offsets preserve the same coordinates.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.view.is_none() && self.offsets.iter().all(|&offset| offset == 0)
+    }
+
     /// Compose output -> intermediate -> source without materializing the
     /// intermediate. Return None when the result needs more than one factor
     /// view, or when an intermediate supplies logical zero padding.
