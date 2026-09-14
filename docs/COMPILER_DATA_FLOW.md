@@ -115,10 +115,11 @@ flowchart LR
    bounded contributor buffers, and emits transfer/reduction stages. It bypasses
    seed or output copies when a compatible physical slice is usable directly.
 
-`Sum` is therefore a **distributed collective**, not the local `ReduceSum`
-kernel under another name. Its staging policy affects communication and scratch;
-its output layout permits different final owners. Erasing it into an ordinary
-pointwise kernel call would lose useful information.
+The current `Sum` carries a distributed reduction axis and staging policy; the
+local `ReduceSum` kernel implements individual stages. That distinction must
+survive, but it does not justify placing sum outside `Compute`: the other mid
+arithmetic also describes distributed work. The proposal puts sum under compute
+while retaining the axis, result ownership and staging parameters.
 
 However, its current implementation is narrower than the name: singleton partial
 axis outside the final matrix axes, FP16 contributors/results, matching element

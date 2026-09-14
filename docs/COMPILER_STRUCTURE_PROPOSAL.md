@@ -1,8 +1,10 @@
 # Compiler structure proposal
 
 2026-09-14. Design only; no compiler changes in this pass. Based on source at
-`1501698`. Read [current data flow](COMPILER_DATA_FLOW.md) for the concrete paths
-behind this proposal.
+`1501698`; revised after discussion of reduction, the two mid states, and source
+comprehensibility. Read [current data flow](COMPILER_DATA_FLOW.md) for the concrete
+paths behind this proposal. Proposed function names below specify responsibilities
+and call direction; they are not existing APIs.
 
 ## Diagnosis
 
@@ -40,11 +42,12 @@ or a new planning tier.
 
 ```mermaid
 flowchart TD
-  H[ComputeGraph: logical semantics] --> P[Planner: recipes, implementations, boundary choices]
+  H[ComputeGraph: logical semantics] --> P[Planner: choices and direct mid construction]
   P --> M[MidProgram: executable distributed operations only]
   M --> L[Low: concrete shard work and declared scratch]
-  L --> A[Placement and exchange scheduling]
-  A --> E[Address binding, linking and package construction]
+  L --> A[Compiler driver: placement and exchange scheduling]
+  A --> E[Package support sizing and emission]
+  E -. support reservations .-> A
   G[Tensor geometry: indexing, layout, byte traversal] --> P
   G --> L
   G --> C[Cost analysis]
@@ -64,44 +67,69 @@ contain unresolved requests for the planner to interpret.
 
 ### 1. Make mid an executable language
 
-The lasting mid variants should be distributed copy, distributed compute,
-distributed reduction and Repeat. Values retain shape, precision, layout and
-owner mapping. A mid operation never contains an optional implementation of
-itself or a deferred conversion promise.
+The lasting mid variants should be `Copy`, `Compute` and `Repeat`. Sum belongs
+under `Compute`, alongside products and other arithmetic. All of them describe
+distributed work. Values retain shape, precision, layout and owner mapping. A
+mid operation never contains an optional implementation of itself or a deferred
+conversion promise. With `Operator` and `Convert` gone, the outer `Primitive`
+wrapper is unnecessary too.
 
-Use the existing `Recipe` and semantic graph for unresolved selections. Keep
-operator alternatives, boundary demands and deferred bindings private to the
-planner. Instantiate valid mid fragments into one program once those bindings
-are known. This replaces mixed mid state; it should not create a second graph
-mirroring every semantic node merely to move the same ambiguity elsewhere.
+There should be exactly one high-to-mid construction:
+
+```text
+semantic GEMM + chosen algorithm parameters + actual input bindings
+    -> Copy A panels, Copy W panels, Compute::Product, Compute::Sum
+```
+
+For an output-stationary choice, the same builder instead emits bounded panels
+and accumulating product operations. The distinction is decided while building
+mid. `Compute::Product` contains the selected local blocking and contraction
+axes; it is not a selected high-level GEMM waiting to choose one of those graphs.
+
+`Recipe` is a map from semantic operation IDs to choice parameters, plus boundary
+and rewrite choices. It has no executable edges, invented values or nested
+implementations. The semantic graph supplies dependency order; the mid graph
+supplies execution. Moving today's selected-operator graph to a private planner
+type would retain the second layer and is explicitly not the proposed change.
 
 Concrete effects:
 
 - Remove `MidOperationKind::Operator` and `Convert` from executable mid.
-- Move selected-operator/deferred-binding records out of mid operations. The
-  existing fragment splicing and ID-remapping logic remains necessary, owned by
-  planner composition.
+- Replace `apply_selected_plan`'s construction of an `Operator` node with direct
+  family emission. Retain necessary fragment splicing and ID remapping as mid
+  construction utilities; they must not select algorithms or discover missing
+  implementations.
 - Express numerical casts as `Compute` and coordinate/layout movement as `Copy`.
   Preserve cast/pack fusion through supported kernel bindings. A conversion
   recipe can still contain several operations; it need not be one magic kernel.
-- Resolve `DispatchSlices` before constructing the executable mid value. Preserve
-  consumer-sized copies and deferred-view optimizations, rather than materializing
-  everything early to make the types easier.
+- A panel-consuming implementation receives the actual source value and emits
+  the slices it needs. Do not first invent a fully converted input with
+  `DispatchSlices` and subsequently delete it. A consumer requiring the whole
+  converted tensor receives an ordinary copy/cast result. Preserve these distinct
+  realizations without a deferred materialization state in mid.
+- Emit views as ordinary mapped copies. Consumer panel copies can compose with
+  them; an externally observed or multiply used view keeps the materialization
+  needed by its remaining users. Unsupported composition retains valid work.
+  Remove deferred-output offers, claims and restoration of their suppressed costs.
 - Remove duplicate recognition of casts/copies from rewrite helpers and estimators.
   They should inspect one executable form.
 - Validate the resulting program at construction/rewrite boundaries. Costing
   must not be responsible for discovering whether an unresolved variant remains.
 
-`CostModel::implementation` should move to the planner's implementation provider.
-A cost model can price a valid mid fragment without also owning the factory that
-constructs it. Keep the implementation cache beside that provider. This removes
-an actual responsibility cycle rather than hiding it behind another wrapper.
+Family emission and its fragment cache belong to the planner. Remove
+`CostModel::implementation`; costing consumes a valid mid fragment. A cached
+fragment is itself a `MidProgram` with declared inputs and outputs. Binding it
+must preserve its input contract, and its cache key must account for the boundary
+facts that affect emitted work. There is no fragment-template language followed
+by another expansion pass.
 
 The migration must preserve existing explicit conversion choices. For example,
 `LocalKernel`, direct retile and staging-before-pack must normalize to an
 appropriate kernel/movement recipe or an explicit movement policy. Dropping
 `Convert` and letting low infer whatever happens to work would not complete the
-refactor.
+refactor. Whole-program ownership changes remain ordinary mid transformations:
+they must update affected bindings/copies and costs, rather than depend on a later
+operator-resolution pass to repair compute placement.
 
 ### 2. Give movement one path and separate geometry from policy
 
@@ -207,16 +235,29 @@ The same capabilities should serve fusion legality. The current
 constitute a complete kernel contract. Prices remain approximate; sharing legal
 geometry does not turn them into cycle-exact instruction simulations.
 
-### 5. Retain distributed reduction explicitly
+### 5. Make reduction a compute family
 
-Keep `Sum` as a distributed collective. Its output layout, partials axis and
-staging policy carry useful information that a local kernel call cannot express.
-There is no benefit to an otherwise unused generic reduction enum merely to
-rename this variant.
+Put sum in the same compute dispatch as products, pointwise work and normalization.
+Its output layout, partials axis and selected staging policy remain explicit.
+Do not replace the current distinction with `Compute::{Local, Collective}`:
+products and pointwise work are distributed too.
+
+The compute interface must describe operand indexing and selected execution for
+each family, rather than assume every computation is one kernel invocation per
+output shard. Product expansion enumerates its contraction blocks; sum expansion
+enumerates contributors and bounded stages. Both construct low work directly.
+Neither returns another mid graph for a later pass to resolve.
+
+This also means separating fields currently conflated in `TileKernelSpec`:
+distributed compute parameters belong in mid, and a particular callable ABI is
+selected when binding local work. Reuse the existing family-specific parameter
+records where possible; do not keep a complete copy of both old and new enums
+joined by an adapter table.
 
 Separate three responsibilities currently spread through its implementation:
 
-- mid validates the mathematical reduction and selects staging/result ownership;
+- the planner selects staging/result ownership; mid validates the resulting
+  mathematical reduction and operand relationships;
 - backend reduction construction determines contributor groups, seed/staging
   buffers and direct physical output opportunities;
 - the selected reduction kernel validates its precision/layout/access contract.
@@ -230,6 +271,252 @@ Keep shared compact stage-count arithmetic where it is genuinely the same.
 Mid's conservative scratch estimate and low's concrete buffer allocation are
 not identical computations and should not be forced through tile expansion to
 eliminate a few separate expressions.
+
+## Concrete compiler control flow
+
+There are two algorithms to make visible: searching among whole-program
+candidates, and compiling one candidate with placement feedback. Put their two
+entry routines together in `compile.rs`. Requiring literally one function would
+combine a search loop with hundreds of lines of image construction. Merely moving
+`local::optimize` and its finalization callback to that file would leave the
+current problem unchanged.
+
+### Driver, planner and package interfaces
+
+| Owner | Entry and result | Decisions it owns |
+| --- | --- | --- |
+| `planner` | `build_candidate(graph, bindings, recipe) -> Candidate` | Choose unspecified algorithms; directly build and rewrite valid mid; report compact cost, normalized recipe and alternatives |
+| `planner` | `propose(graph, candidate) -> recipes` | Neighborhood enumeration, including joint producer/consumer choices; no package evaluation |
+| `compile` | `build_package(graph, config) -> CompiledPackage` | Baseline, shortlist, attempt budget, ordered concurrent evaluation, acceptance, checkpointing |
+| `compile` | `evaluate_candidate(mid, mapping, config, caches) -> built result` | Expansion, screening, provisional and final allocation/scheduling, bounded placement improvement, complete feasibility |
+| `package` | Support sizing/reservation and final emission functions | Linked images, host/tile program sizes, support ranges, address binding, capacity checks, serialization; no tensor search or exchange scheduling |
+| `estimate` | Mid, low and scheduled cost queries | Analysis of their supplied representation; no implementation construction |
+
+`Candidate` replaces the present `Baseline` record; it is a valid mid program
+with search metadata, not a new IR. `OperatorPlan` becomes planner choice data
+without deferred execution fields. Existing candidate-generation helpers move
+out of `mid`, along with baseline construction, recipes and checkpoint schema.
+Mid retains executable data structures, construction/composition and rewrites.
+Search selects rewrite options; the rewrites themselves consume and return mid.
+`PipelineConfig` also moves out of mid beside compiler/planner configuration;
+loading checkpoints and choosing exchange budgets are not IR responsibilities.
+Keep the public configuration API stable where practical rather than inventing
+a configuration wrapper for every helper.
+
+The outer routine should read in this order:
+
+```text
+compile runtime; create shared fragment/geometry caches
+load recipe, input bindings, visited choices and attempt count
+build baseline/resumed candidate as executable mid
+evaluate_candidate(baseline); fail the build if no feasible incumbent exists
+fix logical input homes and save the accepted checkpoint
+
+if the existing tile-mapping proposal is due:
+    propose mapping; evaluate_candidate with it
+    replace the incumbent only on a feasible scheduled-cost improvement
+    save checkpoint
+
+while attempt budget remains:
+    propose recipes from the accepted candidate
+    build valid mid candidates and compute compact costs concurrently
+    discard visited/invalid/non-improving candidates; deduplicate identical mid
+    sort and truncate using the current shortlist and budget rules
+    evaluate candidates concurrently, each with its own schedule-cache snapshot
+    choose the first feasible improvement in shortlist order
+    record completed prefix; replace the whole incumbent or retain it
+    save checkpoint; stop when the existing stopping rule applies
+
+return the accepted package and its diagnostics
+```
+
+This preserves current ordered `find_first` behavior, cancellation and recipe
+alias bookkeeping. It does not silently introduce a beam search or accept the
+first worker to finish. Rayon can still parallelize candidate construction and
+their internal work. Caches of immutable fragments/geometry are shared;
+speculative schedules remain separate and only the winner's cache is promoted.
+
+The planner neither invokes an evaluator nor receives a finalization callback.
+The driver directly calls `evaluate_candidate` and sees its result. A failed
+challenger cannot replace the incumbent's program, package or schedule cache.
+Checkpoint I/O stores choices and progress; it does not secretly launch search.
+
+### One candidate, including the real feedback
+
+`evaluate_candidate` should show this sequence directly. Each line crosses a
+specific, named boundary; there is no `validate` call that later turns out to
+compile and package the program through a callback.
+
+```text
+expand mid into low work; share geometry analysis with the footprint screen
+reject excessive transfer geometry before expensive scheduling
+apply the candidate's tile mapping; construct per-tile work indexes
+place tensors provisionally
+schedule exchanges against provisional addresses
+compile selected kernels and link runtime/kernel objects for sizing
+size and reserve linked code, host/tile code, rows, descriptors and profile data
+place tensors and auxiliary allocations in the resulting available ranges
+replay/rebuild exchanges against those final addresses
+
+score the existing alternative address placements cheaply
+if there is a promising alternative:
+    schedule only the best alternative, with a private cache snapshot
+    keep it only if its schedules improve and fit the reserved row capacity
+
+calculate scheduled cost using the retained final exchanges
+bind addresses and emit the package; check all measured capacities
+return final low work, placement, exchanges, package, cost and accepted cache
+```
+
+The provisional schedule is needed to measure row storage and generated control
+code. Those reservations change available tensor addresses. Final addresses can
+change row sharing and hazards, so schedule replay must be validated. These two
+passes remain visible; they are not a convergence loop or a license to retry with
+ever larger reservations. Preserve the current reserved-capacity checks and
+reject a candidate whose final rows/code do not fit.
+
+The current `placement::improve_exchange_placement` hides an allocator loop and a
+scheduler invocation. Split its reusable cheap conflict-scoring/proposal work
+from evaluation. Put the single detailed alternative evaluation and acceptance
+alongside the initial final placement in `evaluate_candidate`. Otherwise the
+supposedly explicit driver would still conceal one of its feedback paths.
+
+Support sizing is a real subprocedure, not a `finalize` synonym. It owns a
+connected calculation of code/descriptor/row reservations from the low program,
+linked objects and provisional exchanges. It cannot change tensor ownership,
+invoke tensor placement, or schedule exchanges. Final emission consumes the
+retained placement and exchanges and checks the reservations. The same emitters
+can continue to be used for sizing and emission; separate passes are not a reason
+to duplicate the encoding logic.
+
+The provisional placement and phases stay local to evaluation. Consolidate
+`ScheduledPlan` and the internal `BuiltApplication` result instead of returning a
+provisional placement in one object and a final placement in another. The returned
+record holds one final placement and phase set with the artifact they produced.
+Diagnostic and mapping consumers use explicitly selected data; a consumer that
+still needs provisional information must name that need. This ownership change
+must not accidentally alter the mapping heuristic without measuring it.
+
+## Connected construction, with concrete source owners
+
+The following boundaries are the implementation plan, rather than a request to
+add introductions to the existing collection of helpers.
+
+### Graph and GEMM construction
+
+`planner::build_candidate` owns a readable topological graph walk. For each
+semantic operation it looks up actual inputs, obtains choices from its family,
+constructs executable fragments for the choices it needs to cost, selects one,
+and commits it. It applies an explicit output-boundary copy when required.
+Repeat recursively uses that same construction with carried, invariant and
+sequence bindings; it is not passed through an operator-resolution layer.
+
+The family emission boundary is concrete: an operation, a choice, actual input
+values and required result formats go in; executable mid and its result values
+come out. It does not receive a cost model or select another choice internally.
+The graph builder owns enumeration, emission and ranking. After composition and
+the selected rewrites, it explicitly calls estimate analysis to refresh costs.
+This separates choosing, constructing and pricing without scattering the graph
+walk across those owners.
+
+Use one fragment-construction routine for both candidate costing and insertion.
+Currently `baseline::region` has a capacity-specific fragment-building branch,
+a different non-capacity cost path, and then `apply_selected_plan` constructs the
+selected form again. Keep different ranking policies and useful analytical
+shortcuts, but do not maintain separate recipes for what work each choice means.
+Live-through inputs and persistent sequence multiplicity are costing context;
+they must accompany the same executable fragment when measuring its peak.
+
+Within `planner/gemm.rs`, the family constructor reads as:
+
+1. Validate the chosen orientation, grid, precision and result requirements
+   against the actual inputs.
+2. For parallel reduction, derive left/right resident distributions and the
+   explicit partials tensor; emit their copies/casts, product, then sum.
+3. For output-stationary execution, derive resident panels and emit the bounded
+   panel/product sequence, or use already resident compatible inputs.
+4. Return the produced mid value(s).
+
+The distribution-specific steps belong together in that family, including the
+relationship between grid strides and partials. Shared builder operations such
+as `copy`, `cast`, `compute` and fragment insertion are meaningful reusable
+concepts. A separate helper for each successive local calculation is not needed.
+Ownership rebinding is explicit at construction/rewrite time; insertion does not
+infer a GEMM-specific anchor and then inject surprise copies.
+
+`low/expand/gemm.rs` owns the connected instantiation of an already selected
+product: intersect resident operands, enumerate local contraction blocks,
+bind calls through `kernel/gemm`, and append low work. Move `product_calls` and
+its GEMM-specific branches there from generic `expand/primitive.rs`. It does not
+choose the parallel-reduction versus output-stationary algorithm again.
+`low/expand/reduce.rs` similarly owns contributor grouping through emission of
+the selected sum stages, including the present `prepare_sum` entry logic.
+
+### Movement construction
+
+Replace `materialize.rs` and the shared realization portion of `conversion.rs`
+with one `low/expand/movement.rs` owner. Delete the legacy conversion entry path.
+Its main procedure maps a copy to source/destination regions, inspects their
+physical geometry, selects realizations, then emits the resulting batch. Keep
+that procedure and its policy beside each other. Do not retain a sequence of
+generic `prepare`/`build`/`materialize` helpers spread across those old files.
+
+Reusable helpers remain for coordinate composition, ownership intersections,
+byte traversal and coverage. Their signatures expose the actual objects they
+operate on; they do not take the entire planner or low builder to compute a pure
+fact. `CopyRegions` remains an ownership query; it must not choose a packing
+kernel. A relative local-copy descriptor remains low data; it must not price a
+distributed tensor movement. The batch of pre-exchange work, recipients and
+post-exchange work is local assembly state that gets consumed, not another
+retained program language.
+
+### Broadcast and kernel binding
+
+For Add, the semantic/indexing code provides the broadcast relation. The
+pointwise family constructor projects output ownership through that relation
+and emits required input copies. Generic low operand binding restricts the
+recorded relation to a shard. `kernel/pointwise` validates the local stride/format
+contract and derives ABI scalars, specialization and access requirements.
+That trace replaces the kernel-name exceptions in `expand/primitive.rs` and the
+separate broadcast reinterpretation in `pointwise.rs`.
+
+Family binding must own the corresponding decisions now spread through
+`low/call.rs`, `kernel/abi.rs`, specialization and late materialization. Generic
+dispatch delegates to that owner. Shared instruction encoders and view geometry
+remain shared; moving their code into every family would introduce duplication.
+Adding an Add-like fused kernel with an existing indexing relation should require
+its semantic/fusion rule and family implementation, without editing a low
+broadcast dispatch list or a second ABI-selection table.
+
+### What must be apparent from the source
+
+| Reader's question | Where the answer must be visible |
+| --- | --- |
+| Why was this candidate accepted or rejected? | Driver shortlist/evaluation/acceptance in `compile.rs`, with named failure stages |
+| What does this high GEMM become? | Its family constructor in `planner/gemm.rs`, showing copies, product and sum in order |
+| Why was this copy packed or staged? | The single movement selector, with facts and policy as explicit inputs |
+| Why does this operand broadcast and which coordinates are read? | Recorded indexing relation, followed by its restriction to a shard |
+| Why does this kernel require a tail, alignment or separate element? | Its family binding contract, reused by placement and call emission |
+| Which pass may alter ownership, aliasing or phase grouping? | Named mid rewrite or low transformation called by the relevant entry routine |
+
+Module introductions should describe their inputs, guarantees and decisions in
+those terms. Comments beside an algorithm should explain constraints such as
+partial independence, padding coverage or why final scheduling is repeated.
+Remove stale role descriptions; comments that merely expand a helper's name do
+not satisfy this requirement.
+
+Use explicit internal imports from the owning module. Public compatibility
+re-exports can remain, but internal `use super::*` and root imports must not hide
+whether a function belongs to planning, geometry or the backend. Keep single-use
+sequential steps in their procedure unless extraction exposes a substantial,
+independently understandable subalgorithm. There is no target file-length limit
+or requirement to make a file for every box in the diagram.
+
+Completion is a source-reading exercise as well as a test result: follow the
+GEMM, broadcast and movement examples from the entry routines without consulting
+this document. If their sequencing still depends on callbacks, implicit builder
+mutations in unrelated files, or representation-dependent accessor fallbacks,
+the refactor is unfinished.
 
 ## Hardware and runtime ownership
 
@@ -320,24 +607,27 @@ kernels.
 
 ## Migration and completion criteria
 
-The first substantial refactor should be **normalizing boundary conversions into
-executable mid and removing the second movement path end to end**. This reaches
-selection, rewrites, costing and expansion together. Moving constants can be a
-separate contained commit, but is not the main architectural result.
+First make the two driver routines explicit, preserving the existing search
+policy and evaluation order. Then replace selected-operator construction with
+direct executable mid construction, including boundary conversions and Repeat.
+Complete the single movement path and family binding as connected follow-through.
+Moving constants can be a separate contained commit, but is not the main
+architectural result.
 
 | Slice | Required endpoint | Code that should disappear or lose responsibility |
 | --- | --- | --- |
+| Compiler driver | One visible search loop and one visible candidate evaluation; package code consumes final placements/schedules | `local::optimize` finalization callback, `validate<T>` indirection, nested scheduling in package placement improvement, duplicated provisional/final result ownership |
 | Target/ABI ownership | One definition per hardware fact or shared protocol constant; compiler no longer imports driver for constants | Duplicate SRAM/register constants; generic instruction encoders and tile mapping misplaced in exchange; runtime policy mixed into architectural definitions |
-| Mid normalization and composition | Executable mid contains no unresolved operator or legacy conversion; existing conversion/early-cast choices preserved | Mixed-state accessors, low's unresolved-operator rejection branch, dual cast/copy recognition, duplicated conversion expansion |
+| Direct mid construction | Graph plus recipe emits only Copy, Compute and Repeat; both candidate costing and insertion use the same emitter | `Operator`, `Convert`, `Primitive` wrapper, `resolve_region`, `CostModel::implementation`, deferred offers/claims/cost restoration, dual cast/copy recognition |
 | Movement/geometry consolidation | One mapping-to-movement path, pure reusable facts, explicit physical selection | Independent identity-intersection path and repeated geometry-key/traversal construction; custom cache policy where no longer justified |
-| Operand and kernel binding | Existing indexing patterns reused without generic kernel-name exceptions; shape-dependent call legality checked before placement | Scattered broadcast inference and overlapping call/specialization/argument derivation |
-| Compiler orchestration | Search visibly owns incumbent/recipes; package construction consumes one candidate and returns the artifact/cost | Search responsibility hidden inside a package module; obsolete architecture prose and broad internal root re-exports masking ownership |
+| Compute and kernel binding | Sum is a compute family; existing indexing patterns reused without generic kernel-name exceptions; static call legality checked before placement | Separate top-level Sum, product/reduction-specific orchestration in generic expansion, scattered broadcast inference and overlapping call/specialization/argument derivation |
+| Source comprehensibility | The named entry routines show sequence and decisions; family/movement procedures own their construction end to end | Implicit cross-module builder mutations, single-use step scattering, broad internal re-exports that mask ownership, stale module explanations |
 
 Perform each slice as runnable commits and remove its old path before declaring
-it complete. The final slice should mostly move ownership of existing control
-flow, not add a new retry or planning system. Retain the necessary
+it complete. Do not stop after relocating selected-operator nodes into a private
+type or after renaming the movement files. Retain the necessary
 placement/scheduling feedback; package support really can change available SRAM
-and exchange behavior.
+and exchange behavior. Do not add a new retry or planning system.
 
 For each changed path, verify semantic mappings and numerical contracts, coverage
 and alias safety, Repeat residency and sequence behavior, and successful package

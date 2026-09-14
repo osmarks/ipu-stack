@@ -10,6 +10,10 @@ not a description of implemented behavior. In particular, current mid still
 mixes unresolved selections with executable operations, and low still has two
 movement entry paths.
 
+The proposal now specifies the [compiler driver and its feedback](COMPILER_STRUCTURE_PROPOSAL.md#concrete-compiler-control-flow)
+and [concrete source owners](COMPILER_STRUCTURE_PROPOSAL.md#connected-construction-with-concrete-source-owners),
+including direct high-to-mid construction and sum as a compute family.
+
 ## Workspace
 
 | Component | Current responsibility |
