@@ -105,6 +105,27 @@ fn direct_consumer_layouts(
     layouts
 }
 
+fn view_plan(
+    operator: MidOperator,
+    source: TensorFormat,
+    layout: Layout,
+    deferred_output: Option<DeferredOutputPlan>,
+) -> OperatorPlan {
+    OperatorPlan {
+        operator,
+        dispatch: OperatorDispatch::View,
+        requirements: StorageRequirements {
+            output: OperandRequirement::new(TensorFormat {
+                precision: source.precision,
+                layout,
+            }),
+            inputs: vec![OperandRequirement::new(source)],
+            output_aliasing: OutputAliasing::Fresh,
+        },
+        deferred_output,
+    }
+}
+
 pub(super) fn plans(
     operation: &Operation,
     inputs: &[TensorType],
@@ -152,24 +173,17 @@ pub(super) fn plans(
             direct_consumer_layouts.to_vec()
         };
         for layout in layouts {
-            let plan = OperatorPlan {
-                operator: MidOperator::View(view),
-                dispatch: OperatorDispatch::View,
-                requirements: StorageRequirements {
-                    inputs: vec![OperandRequirement::new(input.format.clone())],
-                    output: OperandRequirement::new(TensorFormat {
-                        precision: input.format.precision,
-                        layout,
-                    }),
-                    output_aliasing: OutputAliasing::Fresh,
-                },
-                deferred_output: Some(DeferredOutputPlan {
+            let plan = view_plan(
+                MidOperator::View(view),
+                input.format.clone(),
+                layout,
+                Some(DeferredOutputPlan {
                     source_input: 0,
                     transform: view,
                     unfused_cycles: 0,
                     unfused_exchange_cycles: 0,
                 }),
-            };
+            );
             if !plans.contains(&plan) {
                 plans.push(plan);
             }
@@ -203,19 +217,12 @@ pub(super) fn plans(
         } else {
             input.format.clone()
         };
-        plans.push(OperatorPlan {
-            operator: MidOperator::View(view),
-            dispatch: OperatorDispatch::View,
-            requirements: StorageRequirements {
-                inputs: vec![OperandRequirement::new(source)],
-                output: OperandRequirement::new(TensorFormat {
-                    precision: input.format.precision,
-                    layout: row_major(output),
-                }),
-                output_aliasing: OutputAliasing::Fresh,
-            },
-            deferred_output: None,
-        });
+        plans.push(view_plan(
+            MidOperator::View(view),
+            source,
+            row_major(output),
+            None,
+        ));
     }
     if let OperationKind::Slice(slice) = operation.kind
         && let [input] = inputs
@@ -228,19 +235,12 @@ pub(super) fn plans(
                 .max(1),
         ));
         for layout in layouts {
-            plans.push(OperatorPlan {
-                operator: MidOperator::Slice(slice),
-                dispatch: OperatorDispatch::View,
-                requirements: StorageRequirements {
-                    inputs: vec![OperandRequirement::new(input.format.clone())],
-                    output: OperandRequirement::new(TensorFormat {
-                        precision: input.format.precision,
-                        layout,
-                    }),
-                    output_aliasing: OutputAliasing::Fresh,
-                },
-                deferred_output: None,
-            });
+            plans.push(view_plan(
+                MidOperator::Slice(slice),
+                input.format.clone(),
+                layout,
+                None,
+            ));
         }
     }
     if let OperationKind::FlashAttention(options) = operation.kind
