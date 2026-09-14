@@ -1080,10 +1080,15 @@ impl Arena {
                         start = align_up(b, domain.alignment).ok()?;
                     }
                 }
-                (start <= domain.last).then_some((start, index, start + domain.bytes))
+                (start <= domain.last).then_some((
+                    (start >= IPU21_INTERLEAVED_MEMORY_BASE, start),
+                    index,
+                    start,
+                    start + domain.bytes,
+                ))
             })
-            .min_by_key(|&(start, index, _)| (start, index));
-        if let Some((start, index, end)) = candidate {
+            .min_by_key(|candidate| (candidate.0, candidate.1));
+        if let Some((_, index, start, end)) = candidate {
             let (base, limit) = self.free[index];
             self.free.remove(index);
             if base < start {
