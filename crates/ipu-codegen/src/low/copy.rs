@@ -274,8 +274,8 @@ fn coalesce_copies<Buffer: Clone>(copies: &[CopyOperation<Buffer>]) -> Vec<CopyO
 
 use crate::storage::{ByteTraversal, TensorStorage, byte_traversal, storage_bytes};
 use crate::{
-    AmpOrder, BlockMajorOrder, ElementOrder, Layout, MemoryClass, ShardExtent, TensorFormat,
-    TensorTiling, TensorType, TileKernelSpec,
+    AmpOrder, BlockMajorOrder, ElementOrder, Layout, ShardExtent, TensorFormat, TensorTiling,
+    TensorType, TileKernelSpec,
 };
 
 pub(crate) struct CopyMapping<'a> {
@@ -304,23 +304,16 @@ impl CopyPlan {
         mappings: &[CopyMapping<'_>],
         order: CopyOrder,
     ) -> StorageResult<Self> {
-        if order != CopyOrder::Semantic {
-            return Ok(Self {
-                clear_ranges: uncovered_copy_bytes(
-                    TensorStorage {
-                        format: &destination.format,
-                        extents,
-                    },
-                    mappings,
-                    order,
-                )?,
-                staging: None,
-            });
-        }
         let storage = TensorStorage {
             format: &destination.format,
             extents,
         };
+        if order != CopyOrder::Semantic {
+            return Ok(Self {
+                clear_ranges: uncovered_copy_bytes(storage, mappings, order)?,
+                staging: None,
+            });
+        }
         let mut fragments = 0u64;
         let mut word_aligned = true;
         let mut destination_unaligned = false;
@@ -372,11 +365,7 @@ impl CopyPlan {
                 shape: destination.shape.clone(),
                 format: TensorFormat {
                     precision: destination.format.precision,
-                    layout: Layout {
-                        order: ElementOrder::RowMajor,
-                        tiling: TensorTiling::replicated(1),
-                        memory_class: MemoryClass::Ipu21Standard,
-                    },
+                    layout: Layout::row_major(TensorTiling::replicated(1)),
                 },
             };
             let kernel = (destination.format.precision == super::Precision::F16

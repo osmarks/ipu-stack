@@ -126,22 +126,11 @@ impl TileGraphBuilder {
         access_tail: u32,
     ) -> ExpansionResult<u32> {
         let shard = &self.shards[shard.index() as usize];
-        let elements = shard
-            .extents
-            .iter()
-            .try_fold(1_u64, |elements, extent| {
-                elements.checked_mul(u64::from(extent.physical_end - extent.start))
-            })
-            .ok_or(ExpansionError::IdOverflow)?;
-        let bytes = elements
-            .checked_mul(shard.tensor_type.format.precision.bytes())
-            .and_then(|bytes| bytes.checked_add(u64::from(access_tail)))
-            .ok_or(ExpansionError::IdOverflow)?;
-        let alignment = u64::from(alignment.max(1));
-        let stride = bytes
-            .checked_next_multiple_of(alignment)
-            .ok_or(ExpansionError::IdOverflow)?;
-        u32::try_from(stride).map_err(|_| ExpansionError::IdOverflow)
+        shard_storage_bytes(shard)
+            .map_err(|_| ExpansionError::IdOverflow)?
+            .checked_add(access_tail)
+            .and_then(|bytes| bytes.checked_next_multiple_of(alignment.max(1)))
+            .ok_or(ExpansionError::IdOverflow)
     }
 
     pub(super) fn push_packed_buffer(
@@ -157,11 +146,7 @@ impl TileGraphBuilder {
             tensor_type: TensorType::new(
                 [elements],
                 precision,
-                Layout {
-                    order: ElementOrder::RowMajor,
-                    tiling: TensorTiling::replicated(1),
-                    memory_class: MemoryClass::Ipu21Standard,
-                },
+                Layout::row_major(TensorTiling::replicated(1)),
             ),
             extents: vec![ShardExtent {
                 axis: 0,
