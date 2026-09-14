@@ -505,67 +505,62 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     }
     debug!(?symbols, "resolved linked symbols");
 
-    for (object_index, file) in parsed.iter().enumerate() {
-        for section in file.sections() {
-            let Ok(place) = placement(&placements, object_index, section.index()) else {
-                continue;
-            };
-            for (offset, relocation) in section.relocations() {
-                let target = match relocation.target() {
-                    RelocationTarget::Symbol(index) => {
-                        let symbol = file.symbol_by_index(index)?;
-                        if symbol.is_undefined() {
-                            *symbols.get(symbol.name()?).ok_or_else(|| {
-                                ElfError::Link(format!(
-                                    "undefined symbol {}",
-                                    symbol.name().unwrap_or("?")
-                                ))
-                            })? as i64
-                        } else {
-                            match symbol.section() {
-                                SymbolSection::Absolute => symbol.address() as i64,
-                                _ => {
-                                    let target_section =
-                                        symbol.section_index().ok_or_else(|| {
-                                            ElfError::Link(
-                                                "relocation symbol has no section".into(),
-                                            )
-                                        })?;
-                                    let target_place =
-                                        placement(&placements, object_index, target_section)?;
-                                    i64::from(target_place.address) + symbol.address() as i64
-                                }
+    for place in &placements {
+        let object_index = place.object_index;
+        let file = &parsed[object_index];
+        let section = file.section_by_index(place.section_index)?;
+        for (offset, relocation) in section.relocations() {
+            let target = match relocation.target() {
+                RelocationTarget::Symbol(index) => {
+                    let symbol = file.symbol_by_index(index)?;
+                    if symbol.is_undefined() {
+                        *symbols.get(symbol.name()?).ok_or_else(|| {
+                            ElfError::Link(format!(
+                                "undefined symbol {}",
+                                symbol.name().unwrap_or("?")
+                            ))
+                        })? as i64
+                    } else {
+                        match symbol.section() {
+                            SymbolSection::Absolute => symbol.address() as i64,
+                            _ => {
+                                let target_section = symbol.section_index().ok_or_else(|| {
+                                    ElfError::Link("relocation symbol has no section".into())
+                                })?;
+                                let target_place =
+                                    placement(&placements, object_index, target_section)?;
+                                i64::from(target_place.address) + symbol.address() as i64
                             }
                         }
                     }
-                    RelocationTarget::Section(index) => {
-                        i64::from(placement(&placements, object_index, index)?.address)
-                    }
-                    other => {
-                        return Err(ElfError::Link(format!(
-                            "unsupported relocation target {other:?}"
-                        )));
-                    }
-                };
-                let value = target
-                    .checked_add(relocation.addend())
-                    .ok_or_else(|| ElfError::Link("relocation value overflow".into()))?;
-                if value < 0 {
-                    return Err(ElfError::Link("negative relocation value".into()));
                 }
-                let location = usize::try_from(offset)
-                    .map_err(|_| ElfError::Link("relocation offset overflow".into()))?;
-                let object::RelocationFlags::Elf { r_type } = relocation.flags() else {
-                    return Err(ElfError::Link("non-ELF relocation".into()));
-                };
-                apply_relocation(
-                    &mut image[place.offset..place.offset + place.size],
-                    location,
-                    r_type,
-                    value as u64,
-                    image_base,
-                )?;
+                RelocationTarget::Section(index) => {
+                    i64::from(placement(&placements, object_index, index)?.address)
+                }
+                other => {
+                    return Err(ElfError::Link(format!(
+                        "unsupported relocation target {other:?}"
+                    )));
+                }
+            };
+            let value = target
+                .checked_add(relocation.addend())
+                .ok_or_else(|| ElfError::Link("relocation value overflow".into()))?;
+            if value < 0 {
+                return Err(ElfError::Link("negative relocation value".into()));
             }
+            let location = usize::try_from(offset)
+                .map_err(|_| ElfError::Link("relocation offset overflow".into()))?;
+            let object::RelocationFlags::Elf { r_type } = relocation.flags() else {
+                return Err(ElfError::Link("non-ELF relocation".into()));
+            };
+            apply_relocation(
+                &mut image[place.offset..place.offset + place.size],
+                location,
+                r_type,
+                value as u64,
+                image_base,
+            )?;
         }
     }
     let entry = *symbols
