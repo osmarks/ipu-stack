@@ -48,28 +48,29 @@ mod sort_bench;
 pub(crate) struct ViewGeometry {
     precision: Precision,
     order: ElementOrder,
-    allocation: Vec<ShardExtent>,
-    view: Vec<ShardExtent>,
+    extents: Vec<[ShardExtent; 2]>,
 }
 impl ViewGeometry {
     pub(crate) fn new(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<Self> {
         validate_view(shard, view)?;
-        let mut allocation = shard.extents.to_vec();
-        let mut view = view.to_vec();
-        for (a, v) in allocation.iter_mut().zip(&mut view) {
-            let start = a.start;
-            a.start = 0;
-            a.logical_end -= start;
-            a.physical_end -= start;
-            v.start -= start;
-            v.logical_end -= start;
-            v.physical_end -= start;
-        }
+        let extents = shard
+            .extents
+            .iter()
+            .zip(view)
+            .map(|(&allocation, &view)| {
+                let mut pair = [allocation, view];
+                for extent in &mut pair {
+                    extent.start -= allocation.start;
+                    extent.logical_end -= allocation.start;
+                    extent.physical_end -= allocation.start;
+                }
+                pair
+            })
+            .collect();
         Ok(Self {
             precision: shard.format.precision,
             order: shard.format.layout.order,
-            allocation,
-            view,
+            extents,
         })
     }
 }
