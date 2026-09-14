@@ -508,11 +508,6 @@ fn build_package_from_objects(
         host_code_base,
         &provisional_auxiliary_ranges,
     )?;
-    let symbols = layout
-        .symbols
-        .clone()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
     let provisional_finalizer = TileProgramLowering::new(
         program,
         provisional_placement,
@@ -551,7 +546,7 @@ fn build_package_from_objects(
                 reserve_exchange_setup(&mut tile_program.steps);
                 let generated = emit(
                     &tile_program,
-                    &symbols,
+                    &layout.symbols,
                     host,
                     &CodegenOptions {
                         invocations,
@@ -816,7 +811,7 @@ fn build_package_from_objects(
             .map(|((tile_program, _), host)| {
                 Ok(emit(
                     tile_program,
-                    &symbols,
+                    &layout.symbols,
                     host,
                     &CodegenOptions {
                         invocations,
