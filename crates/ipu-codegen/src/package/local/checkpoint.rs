@@ -43,26 +43,22 @@ impl State {
         let mut state: Self = serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
-        // Version-one contexts included the removed deferred-view bookkeeping
-        // field in concrete catalogue entries. It was never a configuration
-        // choice. Normalize only the config portion, preserving graph names
-        // verbatim; recipe deserialization ignores the obsolete field too.
-        if state.version == 1 && state.context != context {
-            if let Some((graph_context, config_context)) = state.context.split_once('\n') {
-                let migrated = format!(
-                    "{graph_context}\n{}",
-                    config_context.replace(", deferred_output: None", "")
-                );
-                if migrated == context {
-                    state.context = migrated;
-                    tracing::info!("migrated checkpoint context without deferred-view metadata");
-                }
-            }
+        if state.version == 1
+            && state.context != context
+            && matches_legacy_context(graph, &state.context, &context)
+        {
+            state.context = context.clone();
+            tracing::info!("migrated checkpoint context without redundant bookkeeping");
         }
         if state.version != 1 || state.context != context {
-            return Err(invalid(
-                "search state does not match this graph/configuration or schema",
-            ));
+            let detail = if state.version != 1 {
+                format!("unsupported schema version {}", state.version)
+            } else {
+                context_difference(&state.context, &context)
+            };
+            return Err(invalid(format!(
+                "search state does not match this graph/configuration: {detail}"
+            )));
         }
         if !state.recipe.early_casts.is_empty()
             || state
@@ -115,9 +111,121 @@ impl State {
     }
 }
 
+/// Version-one contexts recorded implementation details alongside the graph.
+/// Accept only the exact former representation of the current graph: its value
+/// registry duplicated the shape keys, and its sequence counter was the length
+/// of the sequence list. Reconstructing those fields preserves all comparisons,
+/// including shapes, names, nested regions and the redundant fields themselves.
+fn matches_legacy_context(graph: &ComputeGraph, saved: &str, current: &str) -> bool {
+    let Some((saved_graph, saved_config)) = saved.split_once('\n') else {
+        return false;
+    };
+    let Some((current_graph, current_config)) = current.split_once('\n') else {
+        return false;
+    };
+    // Concrete catalogue entries also contained removed deferred-view metadata.
+    // This is deliberately restricted to the configuration, not graph names.
+    if saved_config.replace(", deferred_output: None", "") != current_config {
+        return false;
+    }
+    if saved_graph == current_graph {
+        return true;
+    }
+    // The root shape table is followed only by integer counters. Work backwards
+    // from there so metadata-looking text in an input name cannot be mistaken
+    // for a graph field.
+    let Some((prefix, tail)) = current_graph.rsplit_once(", shapes: ") else {
+        return false;
+    };
+    let Some(tail) = tail.strip_suffix(" }") else {
+        return false;
+    };
+    let values = graph
+        .value_shapes()
+        .keys()
+        .collect::<std::collections::BTreeSet<_>>();
+    saved_graph
+        == format!(
+            "{prefix}, values: {values:?}, shapes: {tail}, next_sequence: {} }}",
+            graph.sequences().len()
+        )
+}
+
+/// Keep checkpoint failures actionable without printing a whole graph or
+/// concealing a configuration difference behind one opaque equality check.
+fn context_difference(saved: &str, current: &str) -> String {
+    let offset = saved
+        .chars()
+        .zip(current.chars())
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| saved.chars().count().min(current.chars().count()));
+    let start = offset.saturating_sub(48);
+    let excerpt = |s: &str| s.chars().skip(start).take(144).collect::<String>();
+    format!(
+        "context differs at character {offset}; saved {:?}; current {:?}",
+        excerpt(saved),
+        excerpt(current)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_graph_registry_preserves_graph_and_configuration_checks() {
+        let name = "input, values: {ValueId(99)}, shapes: {}, next_sequence: 7";
+        let make_graph = |name: &str, width| {
+            let mut graph = ComputeGraph::new();
+            let input = graph.host_input(name, [4, width]).unwrap();
+            graph.value_sequence("sequence", [input]).unwrap();
+            let output = graph.gelu(input).unwrap();
+            graph.set_outputs([output]).unwrap();
+            graph
+        };
+        let graph = make_graph(name, 16);
+        let mut config = PipelineConfig::new(4)
+            .with_automatic_input(graph.inputs()[0].value, crate::Precision::F16);
+        let mut state = State::load(&graph, &config, None).unwrap();
+        state.attempts = 23;
+        let (_, config_context) = state.context.split_once('\n').unwrap();
+        // The old Debug representation, including both removed fields. Use
+        // explicit expected counters and IDs rather than the migration helper.
+        state.context = format!(
+            "ComputeGraph {{ inputs: {:?}, sequences: {:?}, operations: {:?}, outputs: {:?}, values: {{ValueId(0), ValueId(1)}}, shapes: {:?}, next_operation: 1, next_value: 2, next_sequence: 1 }}\n{config_context}",
+            graph.inputs(),
+            graph.sequences(),
+            graph.operations(),
+            graph.outputs(),
+            graph.value_shapes(),
+        );
+        let legacy = state.context.clone();
+        let path =
+            std::env::temp_dir().join(format!("ipu-graph-context-{}.json", std::process::id()));
+        config.load_search_state = Some(path.clone());
+        let write = |state: &State| {
+            std::fs::write(&path, serde_json::to_vec(state).unwrap()).unwrap();
+        };
+        write(&state);
+        let resumed = State::load(&graph, &config, None).unwrap();
+        assert_eq!(resumed.attempts, 23);
+        assert!(resumed.context.starts_with(&format!("{graph:?}\n")));
+        assert!(State::load(&make_graph(name, 32), &config, None).is_err());
+        assert!(State::load(&make_graph("different input", 16), &config, None).is_err());
+        assert!(State::load(&graph, &config, Some(&[0, 1, 2, 3])).is_err());
+        config.profiling = !config.profiling;
+        assert!(State::load(&graph, &config, None).is_err());
+        config.profiling = !config.profiling;
+        for malformed in [
+            legacy.replace("values: {ValueId(0), ValueId(1)}", "values: {ValueId(0)}"),
+            legacy.replace("next_sequence: 1 }", "next_sequence: 2 }"),
+        ] {
+            state.context = malformed;
+            write(&state);
+            assert!(State::load(&graph, &config, None).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn old_deferred_metadata_does_not_invalidate_search_decisions() {
