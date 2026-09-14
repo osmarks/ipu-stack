@@ -8,7 +8,6 @@ The Hessian block size controls reconstruction work, never scale granularity.
 
 import argparse
 import json
-import math
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,16 +15,15 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn.functional as F
-from quantize_siglip_f143 import (
+from f143 import (
+    accumulate_input_moments,
+    block_hessians,
     equalize_layernorm_group,
     project_f143,
     reconstruct_linear,
+    scale_for_maximum,
 )
 from safetensors.torch import save_file
-
-
-def scale_for(maximum):
-    return max(-32, min(31, math.ceil(math.log2(maximum / 240)))) if maximum else 0
 
 
 class Siglip:
@@ -70,21 +68,12 @@ class Siglip:
                     "maximum": 0.0,
                     "count": 0,
                     "sum": torch.zeros(rows.shape[1], device=self.device),
-                    "hessian": [
-                        torch.zeros(
-                            (min(self.block, rows.shape[1] - i),) * 2,
-                            device=self.device,
-                        )
-                        for i in range(0, rows.shape[1], self.block)
-                    ],
+                    "hessian": block_hessians(rows.shape[1], self.block, self.device),
                 }
             stats = self.stats[name]
             stats["maximum"] = max(stats["maximum"], rows.abs().max().item())
             stats["count"] += len(rows)
-            stats["sum"].add_(rows.sum(0))
-            for i, h in enumerate(stats["hessian"]):
-                part = rows[:, i * self.block : (i + 1) * self.block]
-                h.addmm_(part.T, part)
+            accumulate_input_moments(rows, stats["hessian"], stats["sum"])
         if self.quantize and (
             self.quantize_names is None or name in self.quantize_names
         ):
@@ -258,8 +247,8 @@ def main():
         model.collect = False
     for name, stats in model.stats.items():
         model.scales[name] = {
-            "activation": scale_for(stats["maximum"]),
-            "weight": scale_for(model.parameters[name + ".weight"].abs().max().item()),
+            "activation": scale_for_maximum(stats["maximum"]),
+            "weight": scale_for_maximum(model.parameters[name + ".weight"].abs().max().item()),
             "activation_maximum": stats["maximum"],
         }
     if args.scale_sharing == "repeat-role":

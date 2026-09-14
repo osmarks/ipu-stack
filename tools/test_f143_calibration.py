@@ -5,14 +5,37 @@ from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
-from quantize_siglip_f143 import (
+from f143 import (
+    accumulate_input_moments,
+    block_hessians,
     equalize_layernorm_group,
+    f143_tensor_scale,
     project_f143,
     reconstruct_linear,
+    scale_for_maximum,
 )
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_block_moments_match_dense_reference_with_partial_batches(self):
+        torch.manual_seed(3)
+        x = torch.randn(2, 5, 21, requires_grad=True)
+        hessians = block_hessians(21, 8, x.device)
+        total = torch.zeros(21)
+        for batch in x:
+            rows = accumulate_input_moments(batch, hessians, total)
+            self.assertFalse(rows.requires_grad)
+        flat = x.detach().reshape(-1, 21)
+        self.assertTrue(torch.allclose(total, flat.sum(0), atol=1e-6))
+        for start, hessian in zip(range(0, 21, 8), hessians):
+            part = flat[:, start : start + 8]
+            self.assertTrue(torch.allclose(hessian, part.T @ part, atol=2e-6))
+        for maximum in [0, 240, 241, 120, 1e-20, 1e20]:
+            self.assertEqual(
+                scale_for_maximum(maximum),
+                f143_tensor_scale(torch.tensor([maximum], dtype=torch.float64)),
+            )
+
     def test_gptq_keeps_one_tensor_scale_with_partial_hessian_blocks(self):
         torch.manual_seed(1)
         x = torch.randn(40, 21)
