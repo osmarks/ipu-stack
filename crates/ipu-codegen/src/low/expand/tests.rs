@@ -116,6 +116,25 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
             builder
                 .append_exchange_phase(vec![second], provenance, &mut region)
                 .unwrap();
+            // Appending records the requested sequence; motion is an explicit pass.
+            assert_eq!(builder.phases.len(), 2);
+            crate::low::passes::group_exchanges(
+                &mut region,
+                &mut builder.phases,
+                &builder.local_copies,
+                &builder.shards,
+            )
+            .unwrap();
+            assert_eq!(
+                crate::low::passes::group_exchanges(
+                    &mut region,
+                    &mut builder.phases,
+                    &builder.local_copies,
+                    &builder.shards
+                )
+                .unwrap(),
+                0
+            );
             assert_eq!(
                 builder.phases.len(),
                 if blocked { 2 } else { 1 },

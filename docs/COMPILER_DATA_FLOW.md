@@ -204,12 +204,12 @@ currently in low/copy.rs.
 
 Kernel construction still assembles parts of a call in
 [expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs); full binding through
-families remains to be done. `append_exchange_phase` can still move intervening
-local copies and merge an earlier exchange through
-[exchange_grouping.rs](../crates/ipu-codegen/src/low/expand/exchange_grouping.rs).
-The latter checks read/write hazards and respects compute, Repeat and checkpoint
-boundaries. These transformations currently happen during insertion, before the
-explicit low simplification and relay passes.
+families remains to be done. Both kernel and exchange append only record work.
+After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
+groups exchanges across commuting local copies, then merges adjacent copies.
+It checks read/write hazards against completed storage bindings and respects
+compute, Repeat and checkpoint boundaries. It compacts the exchange arena and
+remaps references in all regions before the relay and padding passes run.
 
 [buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs) also mediates borrowed
 storage. `full_view` resolves a borrowed binding automatically, while other paths

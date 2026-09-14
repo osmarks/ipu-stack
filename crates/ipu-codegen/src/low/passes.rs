@@ -1,7 +1,237 @@
 //! Local transformations of expanded tile regions, before tile projection.
 
-use super::*;
+use super::copy::{CopyOrder, CopyPattern};
+use super::graph::{
+    BlockOperation, BlockRegion, BlockValue, BlockValueId, ExchangePhase, ExchangePhaseId,
+    LocalCopy, LocalCopyId, LogicalExchange, ShardView, TileGraph, WorkProvenance, WorkReason,
+    storage_location, storage_root,
+};
+use super::view_byte_traversal;
+use crate::storage::{ByteSpan, StorageResult};
 use std::collections::BTreeMap;
+
+/// Move copy-only gaps before or after a shared exchange when they commute
+/// with every conflicting access. Scheduling still orders transfers within the
+/// merged phase; this pass does not choose their execution order.
+pub(super) fn group_exchanges(
+    region: &mut BlockRegion,
+    phases: &mut Vec<ExchangePhase>,
+    copies: &[LocalCopy],
+    shards: &[BlockValue],
+) -> StorageResult<usize> {
+    fn group_region(
+        region: &mut BlockRegion,
+        phases: &mut [ExchangePhase],
+        copies: &[LocalCopy],
+        shards: &[BlockValue],
+    ) -> StorageResult<usize> {
+        let mut previous: Option<(usize, ExchangePhaseId)> = None;
+        let mut merged = 0;
+        for mut operation in std::mem::take(&mut region.operations) {
+            match &mut operation {
+                BlockOperation::Repeat(repeat) => {
+                    merged += group_region(&mut repeat.body, phases, copies, shards)?;
+                    previous = None;
+                }
+                BlockOperation::Compute { .. } | BlockOperation::Checkpoint(..) => previous = None,
+                _ => {}
+            }
+            if let BlockOperation::Exchange(next) = operation {
+                if let Some((boundary, prior)) = previous {
+                    let prior_index = prior.index() as usize;
+                    let next_index = next.index() as usize;
+                    let provenance = phases[next_index].provenance;
+                    let between = &region.operations[boundary + 1..];
+                    if phases[prior_index].provenance.operation.is_some()
+                        && phases[prior_index].provenance.operation == provenance.operation
+                    {
+                        let sink =
+                            copies_commute(shards, copies, between, &phases[next_index].transfers)?;
+                        let hoist = !sink
+                            && copies_commute(
+                                shards,
+                                copies,
+                                between,
+                                &phases[prior_index].transfers,
+                            )?;
+                        if sink || hoist {
+                            if hoist {
+                                region.operations[boundary..].rotate_left(1);
+                                previous = Some((region.operations.len() - 1, prior));
+                            }
+                            let mut transfers = std::mem::take(&mut phases[next_index].transfers);
+                            let phase = &mut phases[prior_index];
+                            phase.transfers.append(&mut transfers);
+                            if phase.provenance != provenance {
+                                phase.provenance = WorkProvenance {
+                                    operation: provenance.operation,
+                                    value: None,
+                                    reason: WorkReason::OperatorInputs,
+                                };
+                            }
+                            merged += 1;
+                            continue;
+                        }
+                    }
+                }
+                previous = Some((region.operations.len(), next));
+            }
+            region.operations.push(operation);
+        }
+        Ok(merged)
+    }
+    fn remap(region: &mut BlockRegion, ids: &[Option<ExchangePhaseId>]) {
+        for op in &mut region.operations {
+            match op {
+                BlockOperation::Exchange(phase) => {
+                    *phase =
+                        ids[phase.index() as usize].expect("live exchange retains its transfers")
+                }
+                BlockOperation::Repeat(repeat) => remap(&mut repeat.body, ids),
+                _ => {}
+            }
+        }
+    }
+    let merged = group_region(region, phases, copies, shards)?;
+    if merged != 0 {
+        // Exchange consumers index this arena directly. Remove merged entries
+        // and update every region reference, including structured Repeat bodies.
+        let mut ids = vec![None; phases.len()];
+        for mut phase in std::mem::take(phases) {
+            if !phase.transfers.is_empty() {
+                let id = ExchangePhaseId(phases.len() as u32);
+                ids[phase.id.index() as usize] = Some(id);
+                phase.id = id;
+                phases.push(phase);
+            }
+        }
+        remap(region, &ids);
+    }
+    Ok(merged)
+}
+
+fn copies_commute(
+    shards: &[BlockValue],
+    local_copies: &[LocalCopy],
+    operations: &[BlockOperation],
+    transfers: &[LogicalExchange],
+) -> StorageResult<bool> {
+    if operations.is_empty() {
+        return Ok(true);
+    }
+    // Index only allocations touched by the copies. Large materializations
+    // must not compare every copy with every transfer in the phase.
+    let copies = operations
+        .iter()
+        .map(|operation| {
+            let BlockOperation::Copy { copy, .. } = operation else {
+                unreachable!()
+            };
+            &local_copies[copy.0 as usize]
+        })
+        .collect::<Vec<_>>();
+    let mut accesses = BTreeMap::<BlockValueId, Vec<(&ShardView, CopyOrder, bool)>>::new();
+    for copy in &copies {
+        accesses
+            .entry(storage_root(shards, copy.source))
+            .or_default();
+        accesses
+            .entry(storage_root(shards, copy.destination))
+            .or_default();
+    }
+    for transfer in transfers {
+        let order = transfer.span_order(shards);
+        if let Some(views) = accesses.get_mut(&storage_root(shards, transfer.source.shard)) {
+            views.push((&transfer.source, order, false));
+        }
+        for view in &transfer.destinations {
+            if let Some(views) = accesses.get_mut(&storage_root(shards, view.shard)) {
+                views.push((view, order, true));
+            }
+        }
+    }
+    for copy in copies {
+        // Moving in either direction must preserve RAW, WAR and WAW;
+        // read/read overlap is harmless. Stream geometry only for aliases.
+        for source in [true, false] {
+            let root = storage_root(
+                shards,
+                if source {
+                    copy.source
+                } else {
+                    copy.destination
+                },
+            );
+            for &(view, order, write) in &accesses[&root] {
+                if (!source || write) && copy_overlaps_view(shards, copy, source, view, order)? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn copy_overlaps_view(
+    shards: &[BlockValue],
+    copy: &LocalCopy,
+    source: bool,
+    view: &ShardView,
+    order: CopyOrder,
+) -> StorageResult<bool> {
+    let (shard, offset) = if source {
+        (copy.source, copy.source_offset)
+    } else {
+        (copy.destination, copy.destination_offset)
+    };
+    if storage_root(shards, shard) != storage_root(shards, view.shard) {
+        return Ok(false);
+    }
+    // Different alias origins need translated byte coordinates. Conservatively
+    // retain ordering here; these casts already form a compute boundary.
+    if storage_location(shards, shard).1 != storage_location(shards, view.shard).1 {
+        return Ok(true);
+    }
+    let (rows, bytes, stride) = match copy.pattern {
+        CopyPattern::Contiguous => (1, copy.bytes, 0),
+        CopyPattern::Strided {
+            rows,
+            row_bytes,
+            source_stride,
+            destination_stride,
+        } => (
+            rows,
+            row_bytes,
+            if source {
+                source_stride
+            } else {
+                destination_stride
+            },
+        ),
+    };
+    let traversal = view_byte_traversal(&shards[view.shard.index() as usize], view, order)?;
+    Ok(traversal
+        .spans()
+        .any(|span| strided_overlap(offset, rows, bytes, stride, span)))
+}
+/// Compare a span with an affine row sequence without enumerating its rows.
+fn strided_overlap(offset: u32, rows: u32, bytes: u32, stride: u32, span: ByteSpan) -> bool {
+    if rows == 0 || bytes == 0 || span.bytes == 0 {
+        return false;
+    }
+    let (offset, bytes, stride) = (u64::from(offset), u64::from(bytes), u64::from(stride));
+    let start = u64::from(span.offset);
+    let end = start + u64::from(span.bytes);
+    if stride == 0 {
+        return offset < end && start < offset + bytes;
+    }
+    let first = if start < offset + bytes {
+        0
+    } else {
+        (start - offset - bytes) / stride + 1
+    };
+    first < u64::from(rows) && offset + first * stride < end
+}
 
 /// Merge contiguous copies between distinct allocations while preserving each
 /// tile's compute order and all exchange/repeat/checkpoint boundaries.
@@ -65,7 +295,17 @@ fn compact_copies(region: &mut BlockRegion, old: &[LocalCopy], copies: &mut Vec<
     }
 }
 
-pub(super) fn simplify(program: &mut TileGraph) {
+pub(super) fn simplify(program: &mut TileGraph) -> StorageResult<()> {
+    let grouped = group_exchanges(
+        &mut program.body,
+        &mut program.exchange_phases,
+        &program.local_copies,
+        &program.shards,
+    )?;
+    if grouped != 0 {
+        tracing::debug!(grouped, "consolidated exchange boundaries");
+    }
+
     let roots = program
         .shards
         .iter()
@@ -75,13 +315,122 @@ pub(super) fn simplify(program: &mut TileGraph) {
     if merged != 0 {
         let old = std::mem::take(&mut program.local_copies);
         compact_copies(&mut program.body, &old, &mut program.local_copies);
-        tracing::debug!(merged, "merged adjacent mid copies");
+        tracing::debug!(merged, "merged adjacent low copies");
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::ComputeGraph;
+    use crate::low::graph::{BlockRepeat, KernelRunId};
+
+    #[test]
+    fn exchange_compaction_preserves_structured_execution_and_boundaries() {
+        // Distinct symbolic transfers let us compare the work before and after
+        // compaction without relying on the rewritten arena indices.
+        let mut graph = ComputeGraph::new();
+        let input = graph.host_input("input", [1]).unwrap();
+        let first = graph.gelu(input).unwrap();
+        graph.gelu(first).unwrap();
+        let operation = graph.operations()[0].id;
+        let provenance = WorkProvenance {
+            operation: Some(operation),
+            value: None,
+            reason: WorkReason::OperatorInputs,
+        };
+        let mut phases = (0..12)
+            .map(|id| ExchangePhase {
+                id: ExchangePhaseId(id),
+                provenance,
+                transfers: vec![LogicalExchange {
+                    source: ShardView {
+                        shard: BlockValueId(id),
+                        extents: vec![],
+                    },
+                    destinations: vec![ShardView {
+                        shard: BlockValueId(id + 12),
+                        extents: vec![],
+                    }],
+                    order: CopyOrder::Physical,
+                }],
+            })
+            .collect::<Vec<_>>();
+        phases[10].provenance.operation = Some(graph.operations()[1].id);
+        phases[11].provenance.operation = None;
+        let exchange = |id| BlockOperation::Exchange(ExchangePhaseId(id));
+        let repeat = |operations| {
+            BlockOperation::Repeat(Box::new(BlockRepeat {
+                provenance,
+                count: 3,
+                bindings: vec![],
+                body: BlockRegion { operations },
+            }))
+        };
+        let mut region = BlockRegion {
+            operations: vec![
+                exchange(0),
+                exchange(1),
+                BlockOperation::Compute {
+                    tile: 0,
+                    run: KernelRunId(0),
+                },
+                exchange(2),
+                exchange(3),
+                BlockOperation::Checkpoint(operation, 0),
+                exchange(4),
+                repeat(vec![
+                    exchange(5),
+                    exchange(6),
+                    repeat(vec![exchange(7), exchange(8)]),
+                ]),
+                exchange(9),
+                exchange(10),
+                exchange(11),
+            ],
+        };
+        fn execution(region: &BlockRegion, phases: &[ExchangePhase]) -> Vec<LogicalExchange> {
+            let mut transfers = vec![];
+            for operation in &region.operations {
+                match operation {
+                    BlockOperation::Exchange(id) => {
+                        transfers.extend_from_slice(&phases[id.index() as usize].transfers);
+                    }
+                    BlockOperation::Repeat(repeat) => {
+                        for _ in 0..repeat.count {
+                            transfers.extend(execution(&repeat.body, phases));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            transfers
+        }
+        let expected = execution(&region, &phases);
+        assert_eq!(
+            group_exchanges(&mut region, &mut phases, &[], &[]).unwrap(),
+            4
+        );
+        assert_eq!(execution(&region, &phases), expected);
+        let sizes = region
+            .walk()
+            .filter_map(|op| match op {
+                BlockOperation::Exchange(id) => {
+                    let phase = &phases[id.index() as usize];
+                    assert_eq!(phase.id, *id);
+                    Some(phase.transfers.len())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, [2, 2, 1, 2, 2, 1, 1, 1]);
+        assert_eq!(phases.len(), sizes.len());
+        assert_eq!(
+            group_exchanges(&mut region, &mut phases, &[], &[]).unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn merging_respects_tile_dependencies_boundaries_and_aliases() {
@@ -123,5 +472,26 @@ mod tests {
         assert_eq!(compact[0].bytes, 24);
         assert!(compact[1..].iter().all(|copy| copy.bytes == 8));
         assert_eq!(merge_copies(&mut region, &mut compact, &roots), 0);
+    }
+    #[test]
+    fn affine_overlap_matches_explicit_rows() {
+        let mut random = fastrand::Rng::with_seed(1729);
+        for _ in 0..10_000 {
+            let offset = random.u32(0..64);
+            let rows = random.u32(0..16);
+            let bytes = random.u32(0..32);
+            let stride = random.u32(0..64);
+            let span = ByteSpan {
+                offset: random.u32(0..1024),
+                bytes: random.u32(0..128),
+            };
+            let expected = bytes != 0
+                && span.bytes != 0
+                && (0..rows).any(|row| {
+                    let at = offset + row * stride;
+                    at < span.offset + span.bytes && span.offset < at + bytes
+                });
+            assert_eq!(strided_overlap(offset, rows, bytes, stride, span), expected);
+        }
     }
 }

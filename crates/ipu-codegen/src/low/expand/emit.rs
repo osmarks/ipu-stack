@@ -98,37 +98,11 @@ impl TileGraphBuilder {
 
     pub(super) fn append_exchange_phase(
         &mut self,
-        mut transfers: Vec<LogicalExchange>,
+        transfers: Vec<LogicalExchange>,
         provenance: WorkProvenance,
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         if transfers.is_empty() {
-            return Ok(());
-        }
-        if let Some(previous) = self
-            .phases
-            .last()
-            .filter(|phase| {
-                phase.provenance.operation.is_some()
-                    && phase.provenance.operation == provenance.operation
-            })
-            .map(|phase| phase.id)
-            && self.group_exchange_copies(previous, &transfers, tiles)?
-        {
-            let phase = &mut self.phases[previous.index() as usize];
-            phase.transfers.append(&mut transfers);
-            if phase.provenance != provenance {
-                phase.provenance = WorkProvenance {
-                    operation: provenance.operation,
-                    value: None,
-                    reason: WorkReason::OperatorInputs,
-                };
-            }
-            tracing::debug!(
-                phase = previous.index(),
-                operation = ?provenance.operation.map(OperationId::index),
-                "consolidated exchange transfers"
-            );
             return Ok(());
         }
         let id = ExchangePhaseId(

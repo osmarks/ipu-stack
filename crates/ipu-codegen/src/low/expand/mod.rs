@@ -2,7 +2,6 @@
 
 mod cache;
 mod emit;
-mod exchange_grouping;
 pub(crate) use cache::ExpansionCache;
 mod compute;
 
@@ -137,7 +136,7 @@ pub(crate) fn expand_tiles_analyzed(
     };
     let build_time = start.elapsed();
     let start = Instant::now();
-    crate::low::passes::simplify(&mut program);
+    crate::low::passes::simplify(&mut program)?;
     let simplify_time = start.elapsed();
     let start = Instant::now();
     relay::select(&mut program, analysis)?;
