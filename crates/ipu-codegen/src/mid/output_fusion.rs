@@ -220,7 +220,8 @@ fn fuse_fp8_outputs_at(
             product: None,
             output_aliases: Vec::new(),
         });
-        let mut new_values = values.clone();
+        let original_value_count = values.len();
+        let mut new_values = Vec::new();
         let mut copies = vec![];
         if redistributed {
             // Row reductions require complete rows; pointwise families may
@@ -262,7 +263,7 @@ fn fuse_fp8_outputs_at(
                     replacement.inputs.push(parameter);
                     continue;
                 }
-                value.id = MidValueId(new_values.len() as u32);
+                value.id = MidValueId((original_value_count + new_values.len()) as u32);
                 value.storage_group = value.id;
                 copies.push(MidOperation {
                     source: producer.source,
@@ -283,16 +284,17 @@ fn fuse_fp8_outputs_at(
                 continue;
             }
         }
+        values.append(&mut new_values);
         if !super::rewrite::fusion_pays(
             "consumer FP8 output",
             producer.source,
             [producer, cast],
             std::iter::once(&replacement).chain(&copies),
-            &new_values,
+            values,
         ) {
+            values.truncate(original_value_count);
             continue;
         }
-        *values = new_values;
         if !copies.is_empty() {
             preparation.insert(index, copies);
         }
