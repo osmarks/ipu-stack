@@ -1286,6 +1286,11 @@ impl<'a> Loader<'a> {
         attachments.attach(0, transport.data, transport.size)?;
         let guard = ExchangeBufferGuard::new(self.device)?;
         guard.restore_primary()?;
+        let wait = |context: &str| {
+            self.device
+                .wait_mark(pci::HSP_GS1_CONTROL, 0, Duration::from_secs(10))
+                .map_err(|error| DriverError::Timeout(format!("{context}: {error}")))
+        };
 
         for (batch, first) in (0..tile_count).step_by(TILES_PER_BATCH).enumerate() {
             let bytes = transport.bytes_mut();
@@ -1326,30 +1331,20 @@ impl<'a> Loader<'a> {
                 "submitting application tile batch"
             );
             self.device.set_mark(1)?;
-            self.device
-                .wait_mark(pci::HSP_GS1_CONTROL, 0, Duration::from_secs(10))
-                .map_err(|error| {
-                    DriverError::Timeout(format!("bootloader batch {batch}: {error}"))
-                })?;
+            wait(&format!("bootloader batch {batch}"))?;
         }
 
         transport.bytes_mut().fill(0xff);
         fence(Ordering::SeqCst);
-        self.device
-            .wait_mark(pci::HSP_GS1_CONTROL, 0, Duration::from_secs(10))
-            .map_err(|error| DriverError::Timeout(format!("before execute sentinel: {error}")))?;
+        wait("before execute sentinel")?;
         self.device.set_mark(1)?;
-        self.device
-            .wait_mark(pci::HSP_GS1_CONTROL, 0, Duration::from_secs(10))
-            .map_err(|error| DriverError::Timeout(format!("execute sentinel: {error}")))?;
+        wait("execute sentinel")?;
         self.device.set_mark(if final_mark == 0 {
             (tile_count / TILES_PER_BATCH) as u32
         } else {
             final_mark
         })?;
-        self.device
-            .wait_mark(pci::HSP_GS1_CONTROL, 0, Duration::from_secs(10))
-            .map_err(|error| DriverError::Timeout(format!("application initial sync: {error}")))?;
+        wait("application initial sync")?;
         guard.restore_all()?;
         info!(
             tile_count,
