@@ -638,18 +638,13 @@ fn balance_stream_chunks(
     }
     // Even slots are sending endpoints, odd slots receiving endpoints. A tile
     // can send and receive together; its paired sender occupies a second TX.
-    let endpoints = |index: usize| problem.transfers[index].pressure_resources(true);
     let mut loads = vec![(0u64, 0u64); 2 * usize::from(problem.tile_count)];
-    for (index, transfer) in problem.transfers.iter().enumerate() {
-        let work = u64::from(transfer.item_count().unwrap_or(transfer.words));
-        for endpoint in endpoints(index) {
-            loads[endpoint].1 += work;
-        }
-    }
     let mut waves = BTreeMap::<_, Vec<_>>::new();
     for ((wave, stream), mut indices) in chunks {
         indices.sort_unstable_by_key(|&index| rank[index].3);
-        let endpoints = endpoints(indices[0]).collect::<Vec<_>>();
+        let endpoints = problem.transfers[indices[0]]
+            .pressure_resources(true)
+            .collect::<Vec<_>>();
         let work = indices
             .iter()
             .map(|&index| {
@@ -657,6 +652,9 @@ fn balance_stream_chunks(
                 u64::from(transfer.item_count().unwrap_or(transfer.words))
             })
             .sum::<u64>();
+        for &endpoint in &endpoints {
+            loads[endpoint].1 += work;
+        }
         waves
             .entry(wave)
             .or_default()
