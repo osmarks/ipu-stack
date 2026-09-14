@@ -87,14 +87,14 @@ impl Timeline {
         times[tile] = times[tile].saturating_add(cycles);
     }
 
-    fn barrier(&mut self, cycles: u64) {
+    fn barrier(&mut self, cycles: u64, exchange: u64) {
         self.middle = Some(self.middle.map_or(cycles, |middle| {
             middle
                 .saturating_add(maximum(&self.tail))
                 .saturating_add(cycles)
         }));
         self.tail.fill(0);
-        self.exchange = self.exchange.saturating_add(cycles);
+        self.exchange = self.exchange.saturating_add(exchange);
     }
 
     fn repeat(&mut self, body: Self, count: u64) {
@@ -112,13 +112,10 @@ impl Timeline {
                 .map(|(tail, prefix)| tail.saturating_add(*prefix))
                 .max()
                 .unwrap_or(0);
-            // barrier() accounts this as exchange; replace that bookkeeping with
-            // the body's actual exchange contribution after composing latency.
-            let exchange = self.exchange;
             self.barrier(
                 middle.saturating_add(between.saturating_add(middle).saturating_mul(count - 1)),
+                body.exchange.saturating_mul(count),
             );
-            self.exchange = exchange.saturating_add(body.exchange.saturating_mul(count));
             for (tile, &cycles) in body.tail.iter().enumerate() {
                 self.local(tile, cycles);
             }
@@ -211,7 +208,10 @@ pub(crate) fn program_cycles_analyzed(
                         work.saturating_add(TARGET.local_copy_call_cycles),
                     );
                 }
-                BlockOperation::Exchange(phase) => timeline.barrier(phases[phase.index() as usize]),
+                BlockOperation::Exchange(phase) => {
+                    let cycles = phases[phase.index() as usize];
+                    timeline.barrier(cycles, cycles);
+                }
                 BlockOperation::Repeat(repeat) => timeline.repeat(
                     region(program, &repeat.body, phases, kernels),
                     u64::from(repeat.count),
@@ -607,7 +607,7 @@ mod tests {
             let mut body = Timeline::new(tiles);
             for &(tile, cycles) in &events {
                 if tile == tiles {
-                    body.barrier(cycles);
+                    body.barrier(cycles, cycles);
                 } else {
                     body.local(tile, cycles);
                 }
