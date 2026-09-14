@@ -924,16 +924,11 @@ fn diagnostic_tensor(
     let shards = low
         .value_shards(value)
         .iter()
-        .filter(|id| {
-            low.shards
-                .get(id.index() as usize)
-                .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
+        .filter_map(|id| {
+            let storage = low.shards.get(id.index() as usize)?;
+            (storage.definition != crate::ShardDefinition::Unmaterialized).then_some((id, storage))
         })
-        .map(|id| {
-            let storage = low
-                .shards
-                .get(id.index() as usize)
-                .ok_or_else(|| invalid("diagnostic low-level shard is missing"))?;
+        .map(|(id, storage)| {
             let address = placement
                 .shard_addresses
                 .get(id)
