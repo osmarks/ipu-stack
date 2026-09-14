@@ -14,7 +14,7 @@ not sources to rewrite.
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
 | Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | No additional duplication selected in the pretrained exporter |
 | Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Deeper sweep provenance/error handling |
-| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries share locked runtime loading and use HostSession::finish for deferred output completion; four share timestamp bindings | Remaining fixture assembly and fault diagnostics |
+| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries share locked runtime loading and use HostSession::finish for deferred output completion; four share timestamp bindings | Remaining fixture assembly; terminal-state polling now shares the model diagnostic checker |
 
 Calibration validation: four tests from `tools/test*calibration*.py`; deterministic
 comparison against the pre-extraction quantization functions produced identical
@@ -55,3 +55,8 @@ loader extraction; 14 unpack cases / 84,208 bytes pass on hardware. The runtime
 can only be borrowed from its owner, which drops it before releasing the lock.
 Pretrained fixture export and baseline/candidate entry points were also sampled;
 no further consolidation was selected from those portions in this pass.
+
+Completion diagnostic validation: model, softmax and kernel-equivalence
+paths now share the existing model terminal-state checker, including the
+completion marker, InvalidProgramCounter exception and halted workers. Four
+softmax hardware cases passed after extraction; all diagnostic targets compile.

@@ -254,44 +254,11 @@ fn main() -> Result<()> {
         }
     };
     let output = session.finish(&executed)?;
-    let completed_pc = application
-        .debug_symbols
-        .iter()
-        .find(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
-        .unwrap()
-        .address;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    for tile in &application.tiles {
-        let physical = tile.physical_tile as u16;
-        loop {
-            let state = runtime.device().tile_context_state(physical, 0)?;
-            if state == 0 {
-                break;
-            }
-            if state == 3
-                && runtime.device().read_tile_program_counter(physical, 0)? == completed_pc
-            {
-                ensure!(
-                    runtime
-                        .device()
-                        .read_tile_word(physical, tile.diagnostic_address)?
-                        == 1
-                );
-                break;
-            }
-            ensure!(
-                std::time::Instant::now() < deadline,
-                "tile {physical} did not finish"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        for worker in 1..=6 {
-            ensure!(
-                runtime.device().tile_context_state(physical, worker)? == 0,
-                "tile {physical} worker {worker} did not halt"
-            );
-        }
-    }
+    ipu_tests::completion::diagnose_completion(
+        runtime,
+        &application,
+        std::time::Duration::from_secs(10),
+    )?;
     fs::write(args.output.join("output.bin"), &output)?;
 
     let mut offset = 0;

@@ -1,4 +1,6 @@
 //! Shared infrastructure for standalone hardware diagnostics.
+pub mod completion;
+
 use anyhow::Result;
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
