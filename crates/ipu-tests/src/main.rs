@@ -1610,25 +1610,17 @@ fn run_reference(
             // Profiles contain changing counters, so compare only logical tensor bytes.
             if let Some(first) = &first_output {
                 let (binding, base) = application.output_binding("output.0")?;
-                for shard in &tensor.shards {
-                    let slice = binding
-                        .slices
-                        .iter()
-                        .find(|slice| {
-                            slice.tile == u32::from(shard.physical_tile)
-                                && slice.tile_address == shard.address
-                        })
-                        .context("output binding slice is missing")?;
-                    for (_, offset) in diagnostic::shard_elements(tensor, shard)? {
-                        let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
-                        let end = start + tensor.precision.bytes() as usize;
-                        anyhow::ensure!(
-                            first[start..end] == output[start..end],
-                            "inference {} changed output with identical inputs",
-                            index + 1
-                        );
-                    }
-                }
+                diagnostic::visit_binding_elements(binding, base, tensor, |_, range| {
+                    anyhow::ensure!(
+                        first
+                            .get(range.clone())
+                            .context("initial output is truncated")?
+                            == output.get(range).context("output is truncated")?,
+                        "inference {} changed output with identical inputs",
+                        index + 1
+                    );
+                    Ok(())
+                })?;
             } else if inferences > 1 {
                 first_output = Some(output.to_vec());
             }
@@ -2255,45 +2247,31 @@ fn verify_logical_output(
     let mut mismatches = Vec::new();
     let mut mismatch_count = 0usize;
     let mut checked = 0usize;
-    for shard in &tensor.shards {
-        let slice = binding
-            .slices
-            .iter()
-            .find(|slice| {
-                slice.tile == u32::from(shard.physical_tile) && slice.tile_address == shard.address
-            })
-            .context("output binding slice is missing")?;
-        for (index, offset) in diagnostic::shard_elements(tensor, shard)? {
-            let start = usize::try_from(base + slice.file_offset + u64::from(offset))?;
-            let width = tensor.precision.bytes() as usize;
-            let raw = bytes
-                .get(start..start + width)
-                .context("logical output exceeds host output")?;
-            let actual = match tensor.precision {
-                Precision::F16 => half_to_f32(u16::from_le_bytes(raw.try_into().unwrap())),
-                Precision::F32 => f32::from_le_bytes(raw.try_into().unwrap()),
-                Precision::F8F143 { scale_exponent } => {
-                    ipu_codegen::f143::f143_to_f32(raw[0], scale_exponent)
-                }
-            };
-            let reference = expected[index];
-            let error = (actual - reference).abs();
-            checked += 1;
-            maximum = maximum.max(error);
-            covered[index] = true;
-            actual_values[index] = actual;
-            if !actual.is_finite()
-                || !reference.is_finite()
-                || matches!(check,
-                ReferenceCheck::Elementwise((atol, rtol)) if error > atol + rtol * reference.abs())
-            {
-                mismatch_count += 1;
-                if mismatches.len() < 16 {
-                    mismatches.push((index, reference, actual, error));
-                }
+    diagnostic::visit_binding_elements(binding, base, tensor, |index, range| {
+        let actual = diagnostic::decode_value(
+            bytes
+                .get(range)
+                .context("logical output exceeds host output")?,
+            tensor.precision,
+        )?;
+        let reference = expected[index];
+        let error = (actual - reference).abs();
+        checked += 1;
+        maximum = maximum.max(error);
+        covered[index] = true;
+        actual_values[index] = actual;
+        if !actual.is_finite()
+            || !reference.is_finite()
+            || matches!(check,
+            ReferenceCheck::Elementwise((atol, rtol)) if error > atol + rtol * reference.abs())
+        {
+            mismatch_count += 1;
+            if mismatches.len() < 16 {
+                mismatches.push((index, reference, actual, error));
             }
         }
-    }
+        Ok(())
+    })?;
     if let Some(missing) = covered.iter().position(|covered| !covered) {
         bail!("output does not contain logical element {missing}");
     }
@@ -2834,6 +2812,27 @@ mod tests {
                 .unwrap();
             let (_, offset) = diagnostic::shard_elements(&tensor, shard)?[0];
             let offset = (slice.file_offset + u64::from(offset)) as usize;
+            let mut undersized = application.clone();
+            undersized.outputs[0]
+                .slices
+                .iter_mut()
+                .find(|slice| {
+                    slice.tile == u32::from(shard.physical_tile)
+                        && slice.tile_address == shard.address
+                })
+                .unwrap()
+                .size = 0;
+            assert!(
+                verify_logical_output(
+                    &undersized,
+                    &tensor,
+                    &packed,
+                    &expected,
+                    ReferenceCheck::Elementwise((0.0, 0.0))
+                )
+                .is_err(),
+                "a full host buffer must not hide an undersized shard binding"
+            );
             let mut corrupted = packed;
             if precision == Precision::F16 {
                 corrupted[offset..offset + 2].copy_from_slice(&f16::NAN.to_bits().to_le_bytes());

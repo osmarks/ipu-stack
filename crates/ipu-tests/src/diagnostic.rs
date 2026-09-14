@@ -231,7 +231,13 @@ fn compare_tensor(
             let word = *words
                 .entry((shard.physical_tile, word_address))
                 .or_insert(device.read_tile_word(shard.physical_tile, word_address)?);
-            actual.insert(index, decode_word(word, address & 0b11, tensor.precision)?);
+            actual.insert(
+                index,
+                decode_value(
+                    &word.to_le_bytes()[(address & 0b11) as usize..],
+                    tensor.precision,
+                )?,
+            );
         }
     }
     let mut mismatches = Vec::new();
@@ -319,13 +325,15 @@ pub(crate) fn shard_elements(
     Ok(result)
 }
 
-fn decode_word(word: u32, byte: u32, precision: Precision) -> Result<f32> {
+pub(crate) fn decode_value(bytes: &[u8], precision: Precision) -> Result<f32> {
+    let raw = bytes
+        .get(..precision.bytes() as usize)
+        .context("truncated diagnostic value")?;
     Ok(match precision {
-        Precision::F16 => super::half_to_f32(((word >> (byte * 8)) & 0xffff) as u16),
-        Precision::F32 if byte == 0 => f32::from_bits(word),
-        Precision::F32 => bail!("unaligned F32 diagnostic value"),
+        Precision::F16 => super::half_to_f32(u16::from_le_bytes(raw.try_into().unwrap())),
+        Precision::F32 => f32::from_le_bytes(raw.try_into().unwrap()),
         Precision::F8F143 { scale_exponent } => {
-            ipu_codegen::f143::f143_to_f32((word >> (byte * 8)) as u8, scale_exponent)
+            ipu_codegen::f143::f143_to_f32(raw[0], scale_exponent)
         }
     })
 }
@@ -406,30 +414,23 @@ pub(crate) fn pack_bindings(
             let tensor = &values[&metadata.value];
             let mut bytes = vec![0; usize::try_from(binding.byte_len()?)?];
             let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
-            for shard in &metadata.shards {
-                let slice = binding
-                    .slices
-                    .iter()
-                    .find(|slice| {
-                        slice.tile == u32::from(shard.physical_tile)
-                            && slice.tile_address == shard.address
-                    })
-                    .with_context(|| {
-                        format!("binding slice for {} shard is missing", binding.name)
-                    })?;
-                for (index, offset) in shard_elements(metadata, shard)? {
-                    if u64::from(offset) + metadata.precision.bytes() > slice.size {
-                        bail!("logical element exceeds binding {} shard", binding.name);
+            visit_binding_elements(binding, 0, metadata, |index, range| {
+                let destination = bytes
+                    .get_mut(range)
+                    .context("input binding exceeds host buffer")?;
+                let value = tensor.values[index];
+                match metadata.precision {
+                    Precision::F16 => {
+                        destination.copy_from_slice(&super::f32_to_half(value).to_le_bytes())
                     }
-                    encode_value(
-                        &mut bytes,
-                        usize::try_from(slice.file_offset + u64::from(offset))?,
-                        tensor.values[index],
-                        metadata.precision,
-                    )?;
-                    covered[index] = true;
+                    Precision::F32 => destination.copy_from_slice(&value.to_le_bytes()),
+                    Precision::F8F143 { scale_exponent } => {
+                        destination[0] = ipu_codegen::f143::f143_from_f32(value, scale_exponent)
+                    }
                 }
-            }
+                covered[index] = true;
+                Ok(())
+            })?;
             if let Some(missing) = covered.iter().position(|covered| !covered) {
                 bail!(
                     "binding {} does not store logical element {missing}",
@@ -442,14 +443,35 @@ pub(crate) fn pack_bindings(
     Ok(packed.concat())
 }
 
-fn encode_value(bytes: &mut [u8], offset: usize, value: f32, precision: Precision) -> Result<()> {
-    match precision {
-        Precision::F16 => {
-            bytes[offset..offset + 2].copy_from_slice(&super::f32_to_half(value).to_le_bytes())
-        }
-        Precision::F32 => bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes()),
-        Precision::F8F143 { scale_exponent } => {
-            bytes[offset] = ipu_codegen::f143::f143_from_f32(value, scale_exponent)
+/// Visit every stored logical element, including replicas, in shard order.
+/// Keep address validation shared by input packing and all output checks.
+pub(crate) fn visit_binding_elements(
+    binding: &Binding,
+    base: u64,
+    tensor: &DiagnosticTensor,
+    mut visit: impl FnMut(usize, std::ops::Range<usize>) -> Result<()>,
+) -> Result<()> {
+    for shard in &tensor.shards {
+        let slice = binding
+            .slices
+            .iter()
+            .find(|slice| {
+                slice.tile == u32::from(shard.physical_tile) && slice.tile_address == shard.address
+            })
+            .with_context(|| format!("binding slice for {} shard is missing", binding.name))?;
+        for (index, offset) in shard_elements(tensor, shard)? {
+            if u64::from(offset) + tensor.precision.bytes() > slice.size {
+                bail!("logical element exceeds binding {} shard", binding.name);
+            }
+            let start = usize::try_from(
+                base.checked_add(slice.file_offset)
+                    .and_then(|start| start.checked_add(u64::from(offset)))
+                    .context("binding file offset overflows")?,
+            )?;
+            let end = start
+                .checked_add(tensor.precision.bytes() as usize)
+                .context("binding file range overflows")?;
+            visit(index, start..end)?;
         }
     }
     Ok(())
