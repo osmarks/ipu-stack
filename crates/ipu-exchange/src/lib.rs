@@ -2731,23 +2731,6 @@ impl Topology {
         Ok(self.physical(sender_logical)? ^ 2)
     }
 
-    pub fn is_pair_primary(&self, logical: u16) -> Result<bool, ExchangeError> {
-        Ok(self.physical(logical)? & 2 == 0)
-    }
-
-    /// Direction and width control for one 64-bit route. Both borrowed lanes
-    /// follow the same fabric direction; the two members of a receiving pair
-    /// are not an ordinary two-direction multicast.
-    pub fn paired_send_control(
-        &self,
-        sender_logical: u16,
-        receiver_logical: u16,
-    ) -> Result<u8, ExchangeError> {
-        let sender = u32::from(self.physical(sender_logical)?);
-        let receiver = u32::from(self.physical(receiver_logical)?);
-        Ok(u8::try_from(direction(sender, receiver) | 4).expect("send control is three bits"))
-    }
-
     /// Whether this member of a double-width receiving pair owns the paired
     /// XPIC source-selection stream. This matches the SDK architecture
     /// helper `TPair_RxIsEarly`.
@@ -3071,68 +3054,6 @@ pub fn set_sender_control(row: &mut PlanRow, send_control: u8) -> Result<(), Exc
     found
         .then_some(())
         .ok_or(ExchangeError::Schedule("sender payload"))
-}
-
-/// Removes standalone source-mux writes while retaining their exact event
-/// advances. The secondary member of a paired 64-bit receiver uses this when
-/// the primary member owns both `INCOMING_MUX` selections.
-pub fn replace_xpic_controls_with_delays(program: &mut [u32]) -> Result<(), ExchangeError> {
-    for instruction in program {
-        if *instruction & OPCODE_MASK == DELAY_XPIC_OPCODE {
-            *instruction = delay(instruction_advance(*instruction) - 1);
-        } else if is_send_control(*instruction) || is_send_control_pair(*instruction) {
-            return Err(ExchangeError::Schedule(
-                "paired receiver has fused XPIC control",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Selects the paired XPIC stream for every standalone receive-mux write.
-/// Double-width receivers use stream one on the primary tile; stream zero is
-/// supplied by the paired incoming-mux register.
-pub fn select_paired_xpic_stream(program: &mut [u32]) -> Result<(), ExchangeError> {
-    let mut found = false;
-    for instruction in program {
-        if *instruction & OPCODE_MASK == DELAY_XPIC_OPCODE {
-            *instruction |= 1 << 13;
-            found = true;
-        } else if is_send_control(*instruction) || is_send_control_pair(*instruction) {
-            return Err(ExchangeError::Schedule(
-                "paired receiver has fused XPIC control",
-            ));
-        }
-    }
-    found
-        .then_some(())
-        .ok_or(ExchangeError::Schedule("paired receiver XPIC control"))
-}
-
-/// Replaces the selected physical source in standalone XPIC controls.
-pub fn patch_xpic_source(program: &mut [u32], source_physical: u16) -> Result<(), ExchangeError> {
-    if u32::from(source_physical) > 0x1fff {
-        return Err(ExchangeError::Tile(source_physical));
-    }
-    let instruction = program
-        .iter_mut()
-        .find(|instruction| {
-            **instruction & OPCODE_MASK == DELAY_XPIC_OPCODE
-                && **instruction & 0x1fff != TILE_MUX_EXCHANGE
-        })
-        .ok_or(ExchangeError::Schedule("receiver source control"))?;
-    *instruction = (*instruction & !0x1fff) | u32::from(source_physical);
-    Ok(())
-}
-
-/// Executable exchange row that reserves a borrowed tile resource without
-/// sending or receiving payload data.
-pub fn timed_idle_program(cycles: u32) -> Result<Vec<u32>, ExchangeError> {
-    let mut words = Vec::new();
-    let mut event_cycles = 0;
-    append_plain_delay(&mut words, &mut event_cycles, cycles)?;
-    words.push(RETURN_M10_INSTRUCTION);
-    Ok(words)
 }
 
 pub fn c600_logical_to_physical(logical: u16) -> u16 {
