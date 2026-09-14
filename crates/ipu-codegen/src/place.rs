@@ -1083,7 +1083,6 @@ impl Arena {
         );
         let candidate = request
             .domains(&self.free, self.interleaved_offset)
-            .into_iter()
             .filter_map(|(index, domain)| {
                 let mut start = domain.first;
                 for &(a, b) in &forbidden {

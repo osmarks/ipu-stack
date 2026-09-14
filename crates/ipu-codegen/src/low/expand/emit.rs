@@ -105,30 +105,31 @@ impl TileGraphBuilder {
         if transfers.is_empty() {
             return Ok(());
         }
-        if let Some(previous) = self.phases.last().map(|phase| phase.id)
-            && self.phases[previous.index() as usize]
-                .provenance
-                .operation
-                .is_some()
-            && self.phases[previous.index() as usize].provenance.operation == provenance.operation
+        if let Some(previous) = self
+            .phases
+            .last()
+            .filter(|phase| {
+                phase.provenance.operation.is_some()
+                    && phase.provenance.operation == provenance.operation
+            })
+            .map(|phase| phase.id)
+            && self.group_exchange_copies(previous, &transfers, tiles)?
         {
-            if self.group_exchange_copies(previous, &transfers, tiles)? {
-                let phase = &mut self.phases[previous.index() as usize];
-                phase.transfers.append(&mut transfers);
-                if phase.provenance != provenance {
-                    phase.provenance = WorkProvenance {
-                        operation: provenance.operation,
-                        value: None,
-                        reason: WorkReason::OperatorInputs,
-                    };
-                }
-                tracing::debug!(
-                    phase = previous.index(),
-                    operation = ?provenance.operation.map(OperationId::index),
-                    "consolidated exchange transfers"
-                );
-                return Ok(());
+            let phase = &mut self.phases[previous.index() as usize];
+            phase.transfers.append(&mut transfers);
+            if phase.provenance != provenance {
+                phase.provenance = WorkProvenance {
+                    operation: provenance.operation,
+                    value: None,
+                    reason: WorkReason::OperatorInputs,
+                };
             }
+            tracing::debug!(
+                phase = previous.index(),
+                operation = ?provenance.operation.map(OperationId::index),
+                "consolidated exchange transfers"
+            );
+            return Ok(());
         }
         let id = ExchangePhaseId(
             u32::try_from(self.phases.len()).map_err(|_| ExpansionError::IdOverflow)?,

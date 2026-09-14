@@ -361,9 +361,7 @@ pub(super) fn pointwise_operator_candidate(
 ) -> ConcreteOperatorCandidate {
     ConcreteOperatorCandidate::new(
         operator,
-        inputs
-            .into_iter()
-            .map(|format| OperandRequirement::new(format)),
+        inputs.into_iter().map(OperandRequirement::new),
         OperandRequirement::new(output),
     )
 }
