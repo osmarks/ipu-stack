@@ -3,18 +3,30 @@ use ipu_package::{ProfileExchangeActivityKind, ProfileReport, ProfileStepKind};
 use ipu_profile::cycle_origin;
 use std::{collections::HashMap, fs, path::Path};
 
-fn payload(report: &ProfileReport) -> serde_json::Value {
-    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-    struct StepKey {
-        phase: u32,
-        epoch: u32,
-        operation: u32,
-        kernel: u32,
-        metadata: u32,
-        kind: u8,
-        exchange_event_cycles: u32,
-    }
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Payload {
+    clock_hz: u64,
+    tile_count: usize,
+    sample_count: usize,
+    strings: Vec<String>,
+    metadata: Vec<u32>,
+    metadata_sets: Vec<[u32; 2]>,
+    activity_sets: Vec<Vec<[u32; 5]>>,
+    // phase, epoch, operation, kernel, metadata, kind, exchange event cycles
+    steps: Vec<[u32; 7]>,
+    tiles: Vec<Tile>,
+}
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Tile {
+    physical_tile: u32,
+    // step, relative start, duration, activity stream
+    samples: Vec<[u32; 4]>,
+}
+
+fn payload(report: &ProfileReport) -> Payload {
     fn intern<T: Clone + Eq + std::hash::Hash>(
         values: &mut Vec<T>,
         indices: &mut HashMap<T, u32>,
@@ -44,8 +56,8 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
     let mut metadata_indices = HashMap::<Vec<[u32; 2]>, u32>::new();
     let mut activity_sets = Vec::<Vec<[u32; 5]>>::new();
     let mut activity_indices = HashMap::<Vec<[u32; 5]>, u32>::new();
-    let mut steps = Vec::<StepKey>::new();
-    let mut step_indices = HashMap::<StepKey, u32>::new();
+    let mut steps = Vec::<[u32; 7]>::new();
+    let mut step_indices = HashMap::<[u32; 7], u32>::new();
     let base_cycle = cycle_origin(report);
     let tiles = report
         .tiles
@@ -67,28 +79,20 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
                         })
                         .collect::<Vec<_>>();
                     let metadata = intern(&mut metadata_sets, &mut metadata_indices, metadata);
-                    let step = StepKey {
-                        phase: sample.step.phase,
-                        epoch: sample.step.epoch,
-                        operation: intern_string(
-                            &mut strings,
-                            &mut string_indices,
-                            &sample.step.operation,
-                        ),
-                        kernel: intern_string(
-                            &mut strings,
-                            &mut string_indices,
-                            &sample.step.kernel,
-                        ),
+                    let step = [
+                        sample.step.phase,
+                        sample.step.epoch,
+                        intern_string(&mut strings, &mut string_indices, &sample.step.operation),
+                        intern_string(&mut strings, &mut string_indices, &sample.step.kernel),
                         metadata,
-                        kind: match sample.step.kind {
+                        match sample.step.kind {
                             ProfileStepKind::Exchange => 0,
                             ProfileStepKind::Compute => 1,
                             ProfileStepKind::Synchronization => 2,
                             ProfileStepKind::Idle => 3,
                         },
-                        exchange_event_cycles: sample.step.exchange_event_cycles,
-                    };
+                        sample.step.exchange_event_cycles,
+                    ];
                     let step = intern(&mut steps, &mut step_indices, step);
                     let activities = sample
                         .step
@@ -109,18 +113,18 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
                         })
                         .collect::<Vec<_>>();
                     let activities = intern(&mut activity_sets, &mut activity_indices, activities);
-                    serde_json::json!([
+                    [
                         step,
                         sample.start_cycle.wrapping_sub(base_cycle),
                         sample.end_cycle.wrapping_sub(sample.start_cycle),
                         activities,
-                    ])
+                    ]
                 })
                 .collect::<Vec<_>>();
-            serde_json::json!({
-                "physicalTile": tile.physical_tile,
-                "samples": samples,
-            })
+            Tile {
+                physical_tile: tile.physical_tile,
+                samples,
+            }
         })
         .collect::<Vec<_>>();
     let total_samples: usize = report.tiles.iter().map(|tile| tile.samples.len()).sum();
@@ -136,32 +140,17 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
             [start, count]
         })
         .collect::<Vec<_>>();
-    let steps = steps
-        .into_iter()
-        .map(|step| {
-            serde_json::json!([
-                step.phase,
-                step.epoch,
-                step.operation,
-                step.kernel,
-                step.metadata,
-                step.kind,
-                step.exchange_event_cycles,
-            ])
-        })
-        .collect::<Vec<_>>();
-    let payload = serde_json::json!({
-        "clockHz": report.clock_hz,
-        "tileCount": report.tiles.len(),
-        "sampleCount": total_samples,
-        "strings": strings,
-        "metadata": metadata,
-        "metadataSets": metadata_sets,
-        "activitySets": activity_sets,
-        "steps": steps,
-        "tiles": tiles,
-    });
-    payload
+    Payload {
+        clock_hz: report.clock_hz,
+        tile_count: report.tiles.len(),
+        sample_count: total_samples,
+        strings,
+        metadata,
+        metadata_sets,
+        activity_sets,
+        steps,
+        tiles,
+    }
 }
 
 const PROFILE_REPORT_HTML: &str = include_str!("profile_report.html");
@@ -170,24 +159,22 @@ const PROFILE_REPORT_HTML: &str = include_str!("profile_report.html");
 /// Each chunk is bounded by event count, except an indivisible single stream.
 pub(crate) fn write(report: &ProfileReport, output: &Path, single_file: bool) -> Result<()> {
     let mut data = payload(report);
-    if !single_file {
+    let data = if !single_file {
         let directory = output.with_extension("data");
         fs::create_dir_all(&directory)?;
         let directory_name = directory
             .file_name()
             .context("profile output needs a filename")?
             .to_string_lossy();
-        let serde_json::Value::Array(activities) = data["activitySets"].take() else {
-            unreachable!()
-        };
+        let mut activities = std::mem::take(&mut data.activity_sets);
         // Group streams by their earliest phase, so zooming one exchange does
         // not fetch chunks containing unrelated phases from every source tile.
-        let mut phase_keys = vec![(u64::MAX, u64::MAX); activities.len()];
-        for tile in data["tiles"].as_array().unwrap() {
-            for sample in tile["samples"].as_array().unwrap() {
-                let step = &data["steps"][sample[0].as_u64().unwrap() as usize];
-                let key = (step[1].as_u64().unwrap(), step[0].as_u64().unwrap());
-                let index = sample[3].as_u64().unwrap() as usize;
+        let mut phase_keys = vec![(u32::MAX, u32::MAX); activities.len()];
+        for tile in &data.tiles {
+            for sample in &tile.samples {
+                let step = &data.steps[sample[0] as usize];
+                let key = (step[1], step[0]);
+                let index = sample[3] as usize;
                 phase_keys[index] = phase_keys[index].min(key);
             }
         }
@@ -195,17 +182,16 @@ pub(crate) fn write(report: &ProfileReport, output: &Path, single_file: bool) ->
         order.sort_by_key(|&index| phase_keys[index]);
         let mut remap = vec![0; order.len()];
         for (new, &old) in order.iter().enumerate() {
-            remap[old] = new;
+            remap[old] = new as u32;
         }
-        for tile in data["tiles"].as_array_mut().unwrap() {
-            for sample in tile["samples"].as_array_mut().unwrap() {
-                sample[3] = serde_json::json!(remap[sample[3].as_u64().unwrap() as usize]);
+        for tile in &mut data.tiles {
+            for sample in &mut tile.samples {
+                sample[3] = remap[sample[3] as usize];
             }
         }
-        let mut activities = activities;
         let activities = order
             .into_iter()
-            .map(|index| activities[index].take())
+            .map(|index| std::mem::take(&mut activities[index]))
             .collect::<Vec<_>>();
         let mut chunks = Vec::new();
         let mut summaries = Vec::new();
@@ -214,7 +200,7 @@ pub(crate) fn write(report: &ProfileReport, output: &Path, single_file: bool) ->
         let mut events = 0;
         for (index, activity) in activities.iter().enumerate() {
             summaries.push(summarize(activity));
-            let count = activity.as_array().unwrap().len();
+            let count = activity.len();
             counts.push(count);
             events += count;
             if events >= 20_000 || index + 1 == activities.len() {
@@ -228,15 +214,17 @@ pub(crate) fn write(report: &ProfileReport, output: &Path, single_file: bool) ->
                 events = 0;
             }
         }
-        data["activitySets"] = serde_json::json!([]);
+        let mut data = serde_json::to_value(data)?;
         data["activitySummaries"] = serde_json::json!(summaries);
         data["activityCounts"] = serde_json::json!(counts);
         data["activityChunks"] = serde_json::json!(chunks);
         // URL-encode path components in the browser, including spaces and '#'.
         data["dataDirectory"] = serde_json::json!(directory_name);
         fs::write(directory.join("index.json"), serde_json::to_vec(&data)?)?;
-        data = serde_json::json!({"index": format!("{directory_name}/index.json")});
-    }
+        serde_json::json!({"index": format!("{directory_name}/index.json")})
+    } else {
+        serde_json::to_value(data)?
+    };
     let json = serde_json::to_string(&data)?
         .replace('<', "\\u003c")
         .replace('>', "\\u003e")
@@ -251,23 +239,19 @@ pub(crate) fn write(report: &ProfileReport, output: &Path, single_file: bool) ->
 // A bounded overview of each stream, independent of its number of transfers.
 // Each bin stores the dominant activity by duration, retaining paired/multicast
 // texture. Detailed streams remain lossless in the sidecar chunks.
-fn summarize(value: &serde_json::Value) -> serde_json::Value {
-    let activities = value.as_array().unwrap();
+fn summarize(activities: &[[u32; 5]]) -> (u32, String) {
     let mut events = Vec::with_capacity(activities.len() * 2);
     let mut end = 0;
-    for activity in activities {
-        let a = activity.as_array().unwrap();
-        let kind = a[0].as_u64().unwrap() as usize;
-        let start = a[1].as_u64().unwrap() as u32;
-        let stop = a[2].as_u64().unwrap() as u32;
-        let paired = a[4].as_u64().unwrap() != 0;
-        let multicast = a[3].as_u64().unwrap() > if paired { 2 } else { 1 };
+    for &[kind, start, stop, fanout, paired] in activities {
+        let kind = kind as usize;
+        let paired = paired != 0;
+        let multicast = fanout > if paired { 2 } else { 1 };
         events.push((start, kind, multicast, paired, 1i32));
         events.push((stop, kind, multicast, paired, -1));
         end = end.max(stop);
     }
     if end == 0 {
-        return serde_json::json!([0, ""]);
+        return (0, String::new());
     }
     events.sort_unstable_by_key(|e| e.0);
     let mut bins = [[0u64; 32]; 32];
@@ -306,7 +290,7 @@ fn summarize(value: &serde_json::Value) -> serde_json::Value {
             char::from(b'@' + code as u8)
         })
         .collect::<String>();
-    serde_json::json!([end, codes])
+    (end, codes)
 }
 
 #[cfg(test)]
@@ -314,17 +298,8 @@ mod tests {
     use super::*;
     #[test]
     fn stream_summary_keeps_gaps_bidirectionality_and_textures() {
-        let summary = summarize(&serde_json::json!([
-            [0, 0, 16, 4, 1],
-            [1, 8, 24, 1, 0],
-            [2, 28, 32, 0, 0]
-        ]));
-        let codes = summary[1]
-            .as_str()
-            .unwrap()
-            .bytes()
-            .map(|b| b - b'@')
-            .collect::<Vec<_>>();
+        let summary = summarize(&[[0, 0, 16, 4, 1], [1, 8, 24, 1, 0], [2, 28, 32, 0, 0]]);
+        let codes = summary.1.bytes().map(|b| b - b'@').collect::<Vec<_>>();
         assert_eq!(&codes[0..8], &[25; 8]);
         assert_eq!(&codes[8..16], &[27; 8]);
         assert_eq!(&codes[16..24], &[2; 8]);
@@ -369,11 +344,11 @@ mod tests {
                     .collect(),
             }],
         };
-        let before = payload(&report);
+        let before = serde_json::to_value(payload(&report)).unwrap();
         let mut duplicate = report.tiles[0].clone();
         duplicate.physical_tile = 7;
         report.tiles.push(duplicate);
-        let after = payload(&report);
+        let after = serde_json::to_value(payload(&report)).unwrap();
         for table in [
             "strings",
             "metadata",
@@ -405,7 +380,7 @@ mod tests {
             recovered.extend(values);
             assert_eq!(chunk[1].as_u64().unwrap() as usize, recovered.len());
         }
-        let original = payload(&report);
+        let original = serde_json::to_value(payload(&report)).unwrap();
         for (before, after) in original["tiles"][0]["samples"]
             .as_array()
             .unwrap()

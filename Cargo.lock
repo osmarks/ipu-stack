@@ -330,6 +330,7 @@ dependencies = [
  "ipu-package",
  "ipu-profile",
  "ipu-runtime",
+ "serde",
  "serde_json",
  "tracing",
 ]
