@@ -4,7 +4,18 @@ pub mod completion;
 use anyhow::Result;
 use ipu_package::{Application, Binding, RegionSlice};
 use ipu_runtime::Runtime;
-use std::{fs, path::Path};
+use std::{fs, path::PathBuf};
+
+/// Connection options shared by standalone kernel diagnostics.
+#[derive(clap::Args)]
+pub struct KernelDeviceOptions {
+    #[arg(long)]
+    pub sdk: PathBuf,
+    #[arg(long, default_value = "c600-init.ipucfg")]
+    pub configuration: PathBuf,
+    #[arg(long, default_value = "artifacts/layout-sweep/device.lock")]
+    pub device_lock: PathBuf,
+}
 
 /// Keep exclusive device access until the loaded runtime has been dropped.
 pub struct KernelDevice {
@@ -17,23 +28,18 @@ impl KernelDevice {
         &self.runtime
     }
 
-    pub fn load(
-        sdk: &Path,
-        configuration: &Path,
-        lock: &Path,
-        application: &Application,
-    ) -> Result<Self> {
+    pub fn load(options: &KernelDeviceOptions, application: &Application) -> Result<Self> {
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(lock)?;
+            .open(&options.device_lock)?;
         lock.lock()?;
-        let runtime = Runtime::open("/dev/ipu0", &fs::read(configuration)?)?;
+        let runtime = Runtime::open("/dev/ipu0", &fs::read(&options.configuration)?)?;
         runtime.load(
             application,
-            &fs::read(sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"))?,
+            &fs::read(options.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"))?,
             application.host_exchange.startup_mark,
         )?;
         Ok(Self {

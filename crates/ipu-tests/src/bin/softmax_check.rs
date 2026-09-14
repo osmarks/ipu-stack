@@ -25,18 +25,14 @@ struct Arguments {
         default_value = "1,2,15,16,17,31,64,65,729,768"
     )]
     keys: Vec<u32>,
-    #[arg(long)]
-    sdk: PathBuf,
+    #[command(flatten)]
+    device: ipu_tests::KernelDeviceOptions,
     #[arg(long)]
     reference: PathBuf,
     #[arg(long, default_value = "device/attention_softmax_f16.S")]
     kernel: PathBuf,
-    #[arg(long, default_value = "c600-init.ipucfg")]
-    configuration: PathBuf,
     #[arg(long, default_value = "artifacts/softmax-upgrade/check")]
     output: PathBuf,
-    #[arg(long, default_value = "artifacts/layout-sweep/device.lock")]
-    device_lock: PathBuf,
 }
 fn softmax_source(path: &std::path::Path) -> Result<String> {
     let mut source = String::new();
@@ -198,15 +194,10 @@ fn main() -> Result<()> {
         &programs,
         &data,
         &outputs,
-        &Toolchain::from_sdk(&args.sdk),
+        &Toolchain::from_sdk(&args.device.sdk),
         &wrapper,
     )?;
-    let device = ipu_tests::KernelDevice::load(
-        &args.sdk,
-        &args.configuration,
-        &args.device_lock,
-        &application,
-    )?;
+    let device = ipu_tests::KernelDevice::load(&args.device, &application)?;
     let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;

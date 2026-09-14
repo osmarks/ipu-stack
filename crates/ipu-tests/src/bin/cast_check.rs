@@ -11,8 +11,8 @@ use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
 struct Arguments {
-    #[arg(long)]
-    sdk: PathBuf,
+    #[command(flatten)]
+    device: ipu_tests::KernelDeviceOptions,
     #[arg(long, default_value = "device/cast_f8.cpp")]
     kernel: PathBuf,
     /// Compare a historical kernel which cannot pack row-major input.
@@ -21,12 +21,8 @@ struct Arguments {
     /// Compare shifted overlapping casts with disjoint casts, including guards.
     #[arg(long)]
     in_place_only: bool,
-    #[arg(long, default_value = "c600-init.ipucfg")]
-    configuration: PathBuf,
     #[arg(long, default_value = "artifacts/fp8-cast/check")]
     output: PathBuf,
-    #[arg(long, default_value = "artifacts/layout-sweep/device.lock")]
-    device_lock: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -35,7 +31,7 @@ fn main() -> Result<()> {
     fs::create_dir_all(&args.output)?;
     let device = PathBuf::from("device").canonicalize()?;
     let assembly = args.output.join("cast.S");
-    let status = std::process::Command::new(args.sdk.join("bin/popc"))
+    let status = std::process::Command::new(args.device.sdk.join("bin/popc"))
         .args([
             "--target",
             "ipu21",
@@ -397,15 +393,10 @@ fn main() -> Result<()> {
         &programs,
         &data,
         &outputs,
-        &Toolchain::from_sdk(&args.sdk),
+        &Toolchain::from_sdk(&args.device.sdk),
         &wrapper,
     )?;
-    let device = ipu_tests::KernelDevice::load(
-        &args.sdk,
-        &args.configuration,
-        &args.device_lock,
-        &application,
-    )?;
+    let device = ipu_tests::KernelDevice::load(&args.device, &application)?;
     let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;

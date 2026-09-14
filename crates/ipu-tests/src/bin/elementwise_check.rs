@@ -12,8 +12,8 @@ use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
 struct Arguments {
-    #[arg(long)]
-    sdk: PathBuf,
+    #[command(flatten)]
+    device: ipu_tests::KernelDeviceOptions,
     #[arg(long)]
     fp8: bool,
     #[arg(long, requires = "fp8")]
@@ -22,12 +22,8 @@ struct Arguments {
     residual: bool,
     #[arg(long, default_value = "device")]
     source: PathBuf,
-    #[arg(long, default_value = "c600-init.ipucfg")]
-    configuration: PathBuf,
     #[arg(long, default_value = "artifacts/elementwise-upgrade/check")]
     output: PathBuf,
-    #[arg(long, default_value = "artifacts/layout-sweep/device.lock")]
-    device_lock: PathBuf,
 }
 fn main() -> Result<()> {
     ipu_runtime::init_tracing();
@@ -104,7 +100,7 @@ fn main() -> Result<()> {
     for (index, (symbol, vertex, cpp, flags, wrapper, registers)) in kernels.into_iter().enumerate()
     {
         let assembly = args.output.join(format!("{symbol}.S"));
-        let status = std::process::Command::new(args.sdk.join("bin/popc"))
+        let status = std::process::Command::new(args.device.sdk.join("bin/popc"))
             .args(["--target", "ipu21", "-O2", "--S", "-I"])
             .arg(&args.source)
             .args(flags)
@@ -468,15 +464,10 @@ fn main() -> Result<()> {
         &programs,
         &data,
         &outputs,
-        &Toolchain::from_sdk(&args.sdk),
+        &Toolchain::from_sdk(&args.device.sdk),
         &wrapper,
     )?;
-    let device = ipu_tests::KernelDevice::load(
-        &args.sdk,
-        &args.configuration,
-        &args.device_lock,
-        &application,
-    )?;
+    let device = ipu_tests::KernelDevice::load(&args.device, &application)?;
     let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;

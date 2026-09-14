@@ -12,8 +12,8 @@ use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
 struct Arguments {
-    #[arg(long)]
-    sdk: PathBuf,
+    #[command(flatten)]
+    device: ipu_tests::KernelDeviceOptions,
     #[arg(long)]
     reference: PathBuf,
     #[arg(long, default_value = "device")]
@@ -29,12 +29,8 @@ struct Arguments {
     /// Exercise word-aligned views that cannot use 64-bit memory instructions.
     #[arg(long)]
     offset_four: bool,
-    #[arg(long, default_value = "c600-init.ipucfg")]
-    configuration: PathBuf,
     #[arg(long, default_value = "artifacts/layout-sweep/kernel-upgrade")]
     output: PathBuf,
-    #[arg(long, default_value = "artifacts/layout-sweep/device.lock")]
-    device_lock: PathBuf,
 }
 
 fn call(symbol: &str, output: u32, inputs: &[u32], arguments: &[u32]) -> TileStep {
@@ -281,15 +277,10 @@ exitz $mzero
         &programs,
         &data,
         &outputs,
-        &Toolchain::from_sdk(&args.sdk),
+        &Toolchain::from_sdk(&args.device.sdk),
         &wrapper,
     )?;
-    let device = ipu_tests::KernelDevice::load(
-        &args.sdk,
-        &args.configuration,
-        &args.device_lock,
-        &application,
-    )?;
+    let device = ipu_tests::KernelDevice::load(&args.device, &application)?;
     let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;
