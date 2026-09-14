@@ -813,21 +813,10 @@ impl Layout {
         row_partitions: u16,
         column_replicas: u16,
     ) -> Self {
-        if column_replicas == 1 && row_partitions == tile_count {
-            return Self::amp_output(tile_count);
-        }
-        Self {
-            order: ElementOrder::Amp(AmpOrder::Output),
-            tiling: TensorTiling {
-                tile_count,
-                replicas: column_replicas,
-                axes: vec![
-                    AxisTiling::new(TensorAxis::FromEnd(2), row_partitions, 1, Padding::Reject),
-                    AxisTiling::new(TensorAxis::FromEnd(1), 1, 64, Padding::Zero),
-                ],
-            },
-            memory_class: MemoryClass::Ipu21Interleaved,
-        }
+        let mut layout = Self::amp_output(row_partitions);
+        layout.tiling.tile_count = tile_count;
+        layout.tiling.replicas = column_replicas;
+        layout
     }
 }
 
