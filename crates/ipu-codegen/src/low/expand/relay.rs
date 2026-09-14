@@ -14,13 +14,13 @@ pub(super) fn select(
         {
             continue;
         }
-        let original = program.exchange_phases[index].clone();
+        let original = &program.exchange_phases[index];
         let start = program.shards.len();
-        let Some(candidate) = candidate(program, &original)? else {
+        let Some(candidate) = candidate(&mut program.shards, program.tile_count, original)? else {
             program.shards.truncate(start);
             continue;
         };
-        let before = crate::estimate::exchange_phase_estimate(program, &original, analysis)?;
+        let before = crate::estimate::exchange_phase_estimate(program, original, analysis)?;
         let after = crate::estimate::exchange_phase_estimate(program, &candidate, analysis)?;
         let mut scratch = vec![0u64; usize::from(program.tile_count)];
         for shard in &program.shards[start..] {
@@ -114,10 +114,11 @@ fn intersection(a: &[ShardExtent], b: &[ShardExtent]) -> Option<Vec<ShardExtent>
 }
 
 fn candidate(
-    program: &mut TileGraph,
+    shards: &mut Vec<BlockValue>,
+    tile_count: u16,
     phase: &ExchangePhase,
 ) -> ExpansionResult<Option<ExchangePhase>> {
-    let roots = |view: &ShardView| storage_root(&program.shards, view.shard);
+    let roots = |view: &ShardView| storage_root(shards, view.shard);
     let reads: BTreeSet<_> = phase.transfers.iter().map(|t| roots(&t.source)).collect();
     if phase
         .transfers
@@ -132,9 +133,9 @@ fn candidate(
         if transfer.destinations.len() < 2 || transfer.order == CopyOrder::Panels {
             continue;
         }
-        let source = &program.shards[transfer.source.shard.index() as usize];
+        let source = &shards[transfer.source.shard.index() as usize];
         if transfer.destinations.iter().any(|view| {
-            let target = &program.shards[view.shard.index() as usize];
+            let target = &shards[view.shard.index() as usize];
             source.tensor_type.format.precision != target.tensor_type.format.precision
                 || source.tensor_type.format.layout.order != target.tensor_type.format.layout.order
                 || view.extents != transfer.source.extents
@@ -153,10 +154,10 @@ fn candidate(
     let mut plans = Vec::new();
     let mut count = 0usize;
     for (destinations, transfers) in groups {
-        let shard = &program.shards[destinations[0].index() as usize];
+        let shard = &shards[destinations[0].index() as usize];
         if destinations
             .iter()
-            .any(|id| program.shards[id.index() as usize].extents != shard.extents)
+            .any(|id| shards[id.index() as usize].extents != shard.extents)
         {
             continue;
         }
@@ -164,7 +165,7 @@ fn candidate(
             continue;
         };
         count += panels.len();
-        if count > usize::from(program.tile_count) {
+        if count > usize::from(tile_count) {
             return Ok(None);
         }
         plans.push((destinations, transfers, panels));
@@ -177,35 +178,37 @@ fn candidate(
     let mut gather = Vec::new();
     let mut forward = Vec::new();
     for (destinations, transfers, panels) in plans {
-        let target = program.shards[destinations[0].index() as usize].clone();
-        let excluded =
-            destinations
-                .iter()
-                .map(|id| program.shards[id.index() as usize].tile)
-                .chain(transfers.iter().map(|&i| {
-                    program.shards[phase.transfers[i].source.shard.index() as usize].tile
-                }))
-                .collect::<BTreeSet<_>>();
+        let mut tensor_type = shards[destinations[0].index() as usize].tensor_type.clone();
+        tensor_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
+        let excluded = destinations
+            .iter()
+            .map(|id| shards[id.index() as usize].tile)
+            .chain(
+                transfers
+                    .iter()
+                    .map(|&i| shards[phase.transfers[i].source.shard.index() as usize].tile),
+            )
+            .collect::<BTreeSet<_>>();
         for extents in panels {
-            let Some(tile) = (0..program.tile_count)
+            let Some(tile) = (0..tile_count)
                 .rev()
                 .find(|t| !used.contains(t) && !excluded.contains(t))
             else {
                 return Ok(None);
             };
             let id = BlockValueId(
-                program
-                    .shards
+                shards
                     .len()
                     .try_into()
                     .map_err(|_| ExpansionError::IdOverflow)?,
             );
-            let mut relay = target.clone();
-            relay.id = id;
-            relay.tile = tile;
-            relay.extents = extents.clone();
-            relay.definition = ShardDefinition::ExchangeStaging;
-            relay.tensor_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
+            let relay = BlockValue {
+                id,
+                tile,
+                tensor_type: tensor_type.clone(),
+                extents: extents.clone(),
+                definition: ShardDefinition::ExchangeStaging,
+            };
             let expected = u64::from(shard_storage_bytes(&relay)?);
             let mut covered = 0u64;
             let mut parts = Vec::new();
@@ -245,7 +248,7 @@ fn candidate(
             if covered != expected || !complete {
                 return Ok(None);
             }
-            program.shards.push(relay);
+            shards.push(relay);
             used.insert(tile);
             gather.extend(parts);
             forward.push(LogicalExchange {
