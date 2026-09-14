@@ -90,7 +90,12 @@ impl Toolchain {
         flags: &[String],
     ) -> Result<KernelArtifact, ElfError> {
         let source = source.as_ref();
-        let cache = self.cached_artifact(source, flags)?;
+        let mut effective_flags = Vec::new();
+        if !flags.iter().any(|flag| flag.starts_with("-O")) {
+            effective_flags.push("-O2");
+        }
+        effective_flags.extend(flags.iter().map(String::as_str));
+        let cache = self.cached_artifact(source, &effective_flags)?;
         fs::create_dir_all(cache.gp.parent().unwrap())?;
         // A completed artifact is immutable. Serialize cache misses so another
         // process cannot inspect or overwrite partially generated files.
@@ -117,33 +122,26 @@ impl Toolchain {
         );
         let mut command = Command::new(&self.popc);
         command.arg("--target").arg(&self.target);
-        if !flags.iter().any(|flag| flag.starts_with("-O")) {
-            command.arg("-O2");
-        }
         // popc compiles C++ through a temporary file, so quoted local headers
         // also need the original source directory on its include path.
         if let Some(parent) = source.parent().filter(|p| !p.as_os_str().is_empty()) {
             command.arg("-I").arg(parent);
         }
-        command.args(flags).arg(source).arg("-o").arg(&cache.gp);
+        command
+            .args(&effective_flags)
+            .arg(source)
+            .arg("-o")
+            .arg(&cache.gp);
         run(&mut command, "popc")?;
 
-        let object_file = fs::File::create(&cache.object)?;
-        let mut extract = Command::new(&self.pop_objdump);
-        extract
-            .arg("extract")
-            .arg(&self.target)
-            .arg(&cache.gp)
-            .stdout(Stdio::from(object_file));
-        run(&mut extract, "pop-objdump extract")?;
-
-        let metadata_file = fs::File::create(&cache.metadata)?;
-        let mut dump = Command::new(&self.pop_objdump);
-        dump.arg("metadata")
-            .arg(&self.target)
-            .arg(&cache.gp)
-            .stdout(Stdio::from(metadata_file));
-        run(&mut dump, "pop-objdump metadata")?;
+        for (operation, path) in [("extract", &cache.object), ("metadata", &cache.metadata)] {
+            let mut dump = Command::new(&self.pop_objdump);
+            dump.arg(operation)
+                .arg(&self.target)
+                .arg(&cache.gp)
+                .stdout(Stdio::from(fs::File::create(path)?));
+            run(&mut dump, &format!("pop-objdump {operation}"))?;
+        }
         cache.inspect()?;
         info!(
             object = %cache.object.display(),
@@ -153,26 +151,19 @@ impl Toolchain {
         Ok(cache)
     }
 
-    fn cached_artifact(&self, source: &Path, flags: &[String]) -> Result<KernelArtifact, ElfError> {
+    fn cached_artifact(&self, source: &Path, flags: &[&str]) -> Result<KernelArtifact, ElfError> {
         let mut digest = Sha256::new();
         digest.update(b"ipu-stack-kernel-cache-v1\0");
         digest.update(self.target.as_bytes());
         digest.update([0]);
         hash_local_source(&mut digest, source, &mut HashSet::new())?;
-        if !flags.iter().any(|flag| flag.starts_with("-O")) {
-            digest.update(b"-O2\0");
-        }
         for flag in flags {
             digest.update(flag.as_bytes());
             digest.update([0]);
         }
         hash_tool_identity(&mut digest, &self.popc)?;
         hash_tool_identity(&mut digest, &self.pop_objdump)?;
-        let key = digest
-            .finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let key = hex::encode(digest.finalize());
         let directory = kernel_cache_root().join(key);
         Ok(KernelArtifact {
             gp: directory.join("kernel.gp"),
