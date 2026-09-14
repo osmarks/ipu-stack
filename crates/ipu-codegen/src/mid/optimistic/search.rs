@@ -37,10 +37,10 @@ impl State {
                 enumerate_conversions(&key.0, &key.1, tiles, options)?,
             );
         }
-        for path in cache[&key].clone() {
+        for path in &cache[&key] {
             let mut state = self.clone();
             let mut at = id;
-            for transform in path.steps {
+            for transform in &path.steps {
                 if let Some(existing) = state
                     .graph
                     .values
@@ -57,7 +57,7 @@ impl State {
                     outputs: vec![output],
                     cycles: transform.cycles,
                     assumptions: transform.assumptions.clone(),
-                    kind: StepKind::Transform(transform),
+                    kind: StepKind::Transform(transform.clone()),
                 });
                 at = output;
             }
@@ -150,18 +150,17 @@ pub fn plan_region(
         }
         defined.extend(op.results.iter().copied());
     }
-    if needed != request.inputs.keys().copied().collect() {
+    if !needed.iter().eq(request.inputs.keys()) {
         return Err(invalid(
             "boundary inputs must exactly cover region free values",
         ));
     }
-    let escaped = graph.operations()[request.operations.end..]
+    let missing_output = graph.operations()[request.operations.end..]
         .iter()
         .flat_map(|op| graph.operation_inputs(op))
         .chain(graph.outputs().iter().copied())
-        .filter(|v| defined.contains(v))
-        .collect::<BTreeSet<_>>();
-    if !escaped.is_subset(&request.outputs.keys().copied().collect())
+        .any(|v| defined.contains(&v) && !request.outputs.contains_key(&v));
+    if missing_output
         || request.outputs.is_empty()
         || request.outputs.keys().any(|v| !defined.contains(v))
     {
@@ -216,6 +215,17 @@ pub fn plan_region(
         let shape = graph
             .value_shape(op.results[0])
             .ok_or_else(|| invalid("unknown result"))?;
+        let remaining = ops[index + 1..]
+            .iter()
+            .flat_map(|op| op.inputs.iter())
+            .chain(request.outputs.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let parameter_inputs = op
+            .inputs
+            .iter()
+            .map(|v| parameters.contains(v))
+            .collect::<Vec<_>>();
         for (state_index, state) in beam.iter().enumerate() {
             let state_budget =
                 report.expanded + (operation_budget - report.expanded) / (beam.len() - state_index);
@@ -223,11 +233,6 @@ pub fn plan_region(
                 .inputs
                 .iter()
                 .map(|v| state.graph.values[state.live[v]].tensor.clone())
-                .collect::<Vec<_>>();
-            let parameter_inputs = op
-                .inputs
-                .iter()
-                .map(|v| parameters.contains(v))
                 .collect::<Vec<_>>();
             // Reuse unpruned production candidate construction and backward
             // consumer demands. In particular, do not apply its conversion
@@ -312,12 +317,6 @@ pub fn plan_region(
                         },
                         assumptions: BTreeSet::new(),
                     });
-                    let remaining = ops[index + 1..]
-                        .iter()
-                        .flat_map(|op| op.inputs.iter())
-                        .chain(request.outputs.keys())
-                        .copied()
-                        .collect::<BTreeSet<_>>();
                     child.live.retain(|v, _| remaining.contains(v));
                     refresh(&mut child.graph);
                     if !fits(&child.graph, config) {
@@ -386,13 +385,9 @@ pub fn plan_region(
 }
 
 fn score(graph: &DiagnosticMidGraph) -> (u64, u64, u64, usize) {
-    let cycles = graph
-        .steps
-        .iter()
-        .fold(CycleEstimate::default(), |sum, step| sum.plus(step.cycles));
     (
-        cycles.optimistic,
-        cycles.conservative,
+        graph.cycles.optimistic,
+        graph.cycles.conservative,
         graph.memory.total,
         graph.assumptions.len(),
     )
