@@ -367,9 +367,8 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
         .map(|bytes| object::File::parse(bytes.as_slice()))
         .collect::<Result<Vec<_>, _>>()?;
     let roots = std::iter::once(options.entry_symbol.as_str())
-        .chain(options.retained_symbols.iter().map(String::as_str))
-        .collect::<Vec<_>>();
-    let kept = reachable_sections(&parsed, &roots)?;
+        .chain(options.retained_symbols.iter().map(String::as_str));
+    let kept = reachable_sections(&parsed, roots)?;
     debug!(sections = kept.len(), "retained reachable sections");
     let mut placements = Vec::new();
     let mut cursor = 0usize;
@@ -495,8 +494,8 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
                         .ok_or_else(|| ElfError::Link("symbol address overflow".into()))?
                 }
             };
-            let name = symbol.name()?.to_owned();
-            if symbols.insert(name.clone(), value).is_some() {
+            let name = symbol.name()?;
+            if symbols.insert(name.to_owned(), value).is_some() {
                 return Err(ElfError::Link(format!("duplicate symbol {name}")));
             }
         }
@@ -602,9 +601,9 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     Ok(linked)
 }
 
-fn reachable_sections(
+fn reachable_sections<'a>(
     objects: &[object::File<'_>],
-    root_symbols: &[&str],
+    root_symbols: impl IntoIterator<Item = &'a str>,
 ) -> Result<HashSet<(usize, object::SectionIndex)>, ElfError> {
     let mut definitions = HashMap::new();
     for (object_index, file) in objects.iter().enumerate() {
@@ -613,9 +612,7 @@ fn reachable_sections(
                 continue;
             }
             if let (Ok(name), Some(section)) = (symbol.name(), symbol.section_index())
-                && definitions
-                    .insert(name.to_owned(), (object_index, section))
-                    .is_some()
+                && definitions.insert(name, (object_index, section)).is_some()
             {
                 return Err(ElfError::Link(format!("duplicate symbol {name}")));
             }
@@ -623,10 +620,10 @@ fn reachable_sections(
     }
     let mut kept = HashSet::new();
     let mut pending = root_symbols
-        .iter()
+        .into_iter()
         .map(|symbol| {
             definitions
-                .get(*symbol)
+                .get(symbol)
                 .copied()
                 .ok_or_else(|| ElfError::Link(format!("missing retained symbol {symbol}")))
         })
