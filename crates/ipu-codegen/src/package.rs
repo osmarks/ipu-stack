@@ -122,24 +122,7 @@ pub struct CompiledPackage {
     pub application: Application,
     pub inputs: Vec<DiagnosticTensor>,
     pub outputs: Vec<DiagnosticTensor>,
-    pub precisions: BTreeMap<ValueId, Precision>,
-    /// Selected operand precision of each semantic product (before accumulation).
-    pub multiply_precisions: BTreeMap<crate::OperationId, Precision>,
-    /// Exact physical exchange schedules retained for low-level diagnostics.
-    /// This is build metadata and is not serialized into the application.
-    pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
-    /// Address-resolved inputs to physical exchange scheduling and row codegen.
-    pub exchange_schedule: crate::ExchangeScheduleSnapshot,
-    /// Base address used when laying out the compact per-tile exchange table.
-    pub exchange_code_base: u32,
-}
-
-/// A loadable package plus the exact device storage visible at each semantic
-/// operator checkpoint.
-#[derive(Clone, Debug)]
-pub struct DiagnosticPackage {
-    pub application: Application,
-    pub inputs: Vec<DiagnosticTensor>,
+    /// Resumable operator checkpoints; empty for ordinary builds.
     pub checkpoints: Vec<DiagnosticCheckpoint>,
     pub precisions: BTreeMap<ValueId, Precision>,
     /// Selected operand precision of each semantic product (before accumulation).
@@ -196,7 +179,25 @@ pub fn build_package(
     graph: &ComputeGraph,
     config: &PackageConfig,
 ) -> PackageBuildResult<CompiledPackage> {
-    let (built, low) = build_package_artifacts(graph, config, false)?;
+    build_package_with_checkpoints(graph, config, false)
+}
+
+/// Builds an ordinary optimized package with resumable PBRK0 traps after each
+/// top-level operator and returns the storage map needed for non-invasive
+/// numerical inspection.
+pub fn build_diagnostic_package(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+) -> PackageBuildResult<CompiledPackage> {
+    build_package_with_checkpoints(graph, config, true)
+}
+
+fn build_package_with_checkpoints(
+    graph: &ComputeGraph,
+    config: &PackageConfig,
+    diagnostic: bool,
+) -> PackageBuildResult<CompiledPackage> {
+    let (built, low) = build_package_artifacts(graph, config, diagnostic)?;
     let topology = active_topology(low.tile_count)?;
     let inputs = package_inputs(&low, &built.placement, &topology)?;
     let outputs = low
@@ -213,31 +214,8 @@ pub fn build_package(
             )
         })
         .collect::<PackageBuildResult<Vec<_>>>()?;
-    let precisions = package_precisions(&low);
-    Ok(CompiledPackage {
-        application: built.application,
-        inputs,
-        outputs,
-        precisions,
-        multiply_precisions: package_multiply_precisions(&low),
-        exchange_phases: built.exchange_phases,
-        exchange_schedule: built.exchange_schedule,
-        exchange_code_base: built.exchange_code_base,
-    })
-}
-
-/// Builds an ordinary optimized package with resumable PBRK0 traps after each
-/// top-level operator and returns the storage map needed for non-invasive
-/// numerical inspection.
-pub fn build_diagnostic_package(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-) -> PackageBuildResult<DiagnosticPackage> {
-    let (built, low) = build_package_artifacts(graph, config, true)?;
-    let topology = active_topology(low.tile_count)?;
-    let inputs = package_inputs(&low, &built.placement, &topology)?;
     let mut checkpoints = Vec::new();
-    for (source, results) in &low.checkpoints {
+    for (source, results) in low.checkpoints.iter().filter(|_| diagnostic) {
         let source = *source;
         let tensors = results
             .iter()
@@ -268,9 +246,10 @@ pub fn build_diagnostic_package(
             tensors,
         });
     }
-    Ok(DiagnosticPackage {
+    Ok(CompiledPackage {
         application: built.application,
         inputs,
+        outputs,
         checkpoints,
         precisions: package_precisions(&low),
         multiply_precisions: package_multiply_precisions(&low),
