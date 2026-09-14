@@ -37,7 +37,7 @@ mod view;
 pub use view::AxisFactorView;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// Logical tensor dimensions. Shapes are semantic graph information; storage
 /// precision and physical layout are selected during mid-level lowering.
@@ -226,11 +226,9 @@ pub struct ComputeGraph {
     sequences: Vec<ValueSequence>,
     operations: Vec<Operation>,
     outputs: Vec<ValueId>,
-    values: BTreeSet<ValueId>,
     shapes: BTreeMap<ValueId, TensorShape>,
     next_operation: u32,
     next_value: u32,
-    next_sequence: u32,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -336,7 +334,7 @@ impl ComputeGraph {
     ) -> GraphResult<ValueSequenceId> {
         let name = nonempty(name)?;
         let values = values.into_iter().collect::<Vec<_>>();
-        validate_inputs(&self.values, &values)?;
+        validate_inputs(&self.shapes, &values)?;
         if let Some(first) = values.first().and_then(|value| self.shapes.get(value))
             && let Some(entry) = values
                 .iter()
@@ -344,8 +342,12 @@ impl ComputeGraph {
         {
             return Err(GraphError::SequenceShape { entry });
         }
-        let id = ValueSequenceId(self.next_sequence);
-        self.next_sequence += 1;
+        let id = ValueSequenceId(
+            self.sequences
+                .len()
+                .try_into()
+                .expect("too many value sequences"),
+        );
         self.sequences.push(ValueSequence { id, name, values });
         Ok(id)
     }
@@ -369,13 +371,12 @@ impl ComputeGraph {
         let carried = carried.into_iter().collect::<Vec<_>>();
         let invariants = invariants.into_iter().collect::<Vec<_>>();
         let iterated = iterated.into_iter().collect::<Vec<_>>();
-        validate_inputs(&self.values, &carried)?;
-        validate_inputs(&self.values, &invariants)?;
+        validate_inputs(&self.shapes, &carried)?;
+        validate_inputs(&self.shapes, &invariants)?;
         for &sequence in &iterated {
             let values = self
                 .sequences
-                .iter()
-                .find(|candidate| candidate.id == sequence)
+                .get(sequence.index() as usize)
                 .ok_or(GraphError::UnknownSequence(sequence))?;
             if values.values.len() < count as usize {
                 return Err(GraphError::ShortSequence {
@@ -446,7 +447,7 @@ impl ComputeGraph {
 
     pub fn set_outputs(&mut self, outputs: impl IntoIterator<Item = ValueId>) -> GraphResult<()> {
         let outputs = outputs.into_iter().collect::<Vec<_>>();
-        validate_inputs(&self.values, &outputs)?;
+        validate_inputs(&self.shapes, &outputs)?;
         self.outputs = outputs;
         Ok(())
     }
@@ -460,7 +461,6 @@ impl ComputeGraph {
         let name = nonempty(name)?;
         let value = ValueId(self.next_value);
         self.next_value += 1;
-        self.values.insert(value);
         self.shapes.insert(value, shape.clone());
         self.inputs.push(GraphInput {
             name,
@@ -475,7 +475,6 @@ impl ComputeGraph {
 pub struct RegionBuilder<'a> {
     arguments: Vec<ValueId>,
     operations: Vec<Operation>,
-    values: BTreeSet<ValueId>,
     shapes: BTreeMap<ValueId, TensorShape>,
     next_operation: &'a mut u32,
     next_value: &'a mut u32,
@@ -489,7 +488,6 @@ impl<'a> RegionBuilder<'a> {
         next_value: &'a mut u32,
     ) -> Self {
         Self {
-            values: arguments.iter().copied().collect(),
             shapes: arguments.iter().copied().zip(argument_shapes).collect(),
             arguments,
             operations: Vec::new(),
@@ -501,7 +499,7 @@ impl<'a> RegionBuilder<'a> {
     builder::graph_operations!();
 
     fn finish(self, yields: Vec<ValueId>) -> GraphResult<Region> {
-        validate_inputs(&self.values, &yields)?;
+        validate_inputs(&self.shapes, &yields)?;
         Ok(Region {
             arguments: self.arguments,
             operations: self.operations,
@@ -511,10 +509,8 @@ impl<'a> RegionBuilder<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn append_operation(
     operations: &mut Vec<Operation>,
-    values: &mut BTreeSet<ValueId>,
     shapes: &mut BTreeMap<ValueId, TensorShape>,
     next_operation: &mut u32,
     next_value: &mut u32,
@@ -523,12 +519,11 @@ fn append_operation(
     result_shapes: impl IntoIterator<Item = TensorShape>,
 ) -> GraphResult<Vec<ValueId>> {
     let inputs = inputs.into_iter().collect::<Vec<_>>();
-    validate_inputs(values, &inputs)?;
+    validate_inputs(shapes, &inputs)?;
     let id = OperationId(*next_operation);
     *next_operation += 1;
     let result_shapes = result_shapes.into_iter().collect::<Vec<_>>();
     let results = allocate_values(next_value, result_shapes.len());
-    values.extend(results.iter().copied());
     shapes.extend(results.iter().copied().zip(result_shapes));
     operations.push(Operation {
         id,
@@ -663,8 +658,8 @@ fn allocate_values(next_value: &mut u32, count: usize) -> Vec<ValueId> {
         .collect()
 }
 
-fn validate_inputs(values: &BTreeSet<ValueId>, inputs: &[ValueId]) -> GraphResult<()> {
-    if let Some(value) = inputs.iter().find(|value| !values.contains(value)) {
+fn validate_inputs(shapes: &BTreeMap<ValueId, TensorShape>, inputs: &[ValueId]) -> GraphResult<()> {
+    if let Some(value) = inputs.iter().find(|value| !shapes.contains_key(value)) {
         Err(GraphError::UnknownValue(*value))
     } else {
         Ok(())

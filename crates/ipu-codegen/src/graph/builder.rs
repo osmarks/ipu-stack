@@ -97,7 +97,6 @@ macro_rules! graph_operations {
         ) -> GraphResult<Vec<ValueId>> {
             append_operation(
                 &mut self.operations,
-                &mut self.values,
                 &mut self.shapes,
                 &mut self.next_operation,
                 &mut self.next_value,
@@ -113,7 +112,7 @@ macro_rules! graph_operations {
             inputs: impl IntoIterator<Item = ValueId>,
         ) -> GraphResult<ValueId> {
             let inputs = inputs.into_iter().collect::<Vec<_>>();
-            validate_inputs(&self.values, &inputs)?;
+            validate_inputs(&self.shapes, &inputs)?;
             let shape = infer_shape(&kind, &inputs, &self.shapes)?;
             Ok(self
                 .operation(kind, inputs, [shape])?
