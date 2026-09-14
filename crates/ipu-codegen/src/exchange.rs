@@ -1601,7 +1601,6 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
             continue;
         };
         let previous_bytes = previous.words * 4;
-        let combined_words = previous.words.checked_add(transfer.words);
         let contiguous = previous.source == transfer.source
             && previous.width == transfer.width
             && previous.source_shard == transfer.source_shard
@@ -1634,8 +1633,11 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
         // A merged phase may contain receive-then-forward dependencies. Do
         // not absorb a local write into a SEND that also reads those bytes;
         // memory_dependencies must still see the original ordered transfers.
-        let independent = contiguous
-            && combined_words.is_some_and(|words| {
+        let combined_words = previous
+            .words
+            .checked_add(transfer.words)
+            .filter(|&words| contiguous && words <= MAX_TRANSFER_WORDS)
+            .filter(|&words| {
                 let bytes = u64::from(words) * 4;
                 previous.destinations.iter().all(|&(tile, address)| {
                     tile != previous.source
@@ -1645,11 +1647,8 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
                         })
                 })
             });
-        if contiguous
-            && independent
-            && combined_words.is_some_and(|words| words <= MAX_TRANSFER_WORDS)
-        {
-            previous.words = combined_words.expect("checked above");
+        if let Some(words) = combined_words {
+            previous.words = words;
             previous.refresh_source_elements();
         } else {
             merged.push(transfer);
