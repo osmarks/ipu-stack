@@ -315,9 +315,7 @@ exitz $mzero
             }
         }
     })?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    let output = session.finish(&executed)?;
     let completed_pc = application
         .debug_symbols
         .iter()
@@ -356,7 +354,6 @@ exitz $mzero
             );
         }
     }
-    let output = session.collect(&executed)?;
     fs::write(args.output.join("output.bin"), &output)?;
     let mut position = cases.len() * 16;
     let mut maximum_error = [0f64; 2];

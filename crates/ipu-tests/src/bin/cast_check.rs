@@ -435,39 +435,7 @@ fn main() -> Result<()> {
     let mut session = runtime.host_session(&application)?;
     session.start()?;
     let call = session.invoke_streaming_deferred("run", &[0; 4])?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    // The final streaming phase is deferred. Wait for every supervisor before
-    // reading its host page, otherwise the last batch can still contain the
-    // preceding tensor chunk rather than the timestamps.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    for tile in &application.tiles {
-        let physical = tile.physical_tile as u16;
-        loop {
-            let state = runtime.device().tile_context_state(physical, 0)?;
-            if state == 0 {
-                break;
-            }
-            if state == 3 {
-                let completed = application
-                    .debug_symbols
-                    .iter()
-                    .find(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
-                    .map(|symbol| symbol.address);
-                ensure!(
-                    Some(runtime.device().read_tile_program_counter(physical, 0)?) == completed,
-                    "tile {physical} failed before completion"
-                );
-                break;
-            }
-            ensure!(
-                std::time::Instant::now() < deadline,
-                "tile {physical} did not finish"
-            );
-        }
-    }
-    let actual = session.collect(&call)?;
+    let actual = session.finish(&call)?;
     fs::write(args.output.join("output.bin"), &actual)?;
     ensure!(
         actual.starts_with(&expected),

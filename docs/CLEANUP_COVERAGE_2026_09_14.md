@@ -14,7 +14,7 @@ not sources to rewrite.
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
 | Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | Broader fixture export |
 | Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Pretrained fixture export and deeper sweep provenance/error handling |
-| Diagnostic harnesses | Shared bindings and logical packing reviewed | Standalone kernel fixtures and orchestration |
+| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries now use HostSession::finish for deferred output completion | Remaining fixture assembly and fault diagnostics |
 
 Calibration validation: four tests from `tools/test*calibration*.py`; deterministic
 comparison against the pre-extraction quantization functions produced identical
@@ -43,3 +43,9 @@ Exchange experiment validation: ten reconstruction/geometry tests pass.
 On 2,000 deterministic copy sequences, both the optimistic loop count and the
 forward-only task descriptors match their previous independent implementations.
 Both changed scripts and their tests pass Ruff checks.
+
+Diagnostic completion validation: all ipu-tests targets compile. Hardware
+unpack checks passed 14 cases / 84,208 bytes; FP8 cast checks passed 1,404
+cases / 7,517,232 bytes, including scales, tails, padding and shifted overlap.
+The softmax and kernel-equivalence binaries retain their additional context
+halt checks after the shared output handshake.

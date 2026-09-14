@@ -162,10 +162,7 @@ fn main() -> Result<()> {
     let mut session = runtime.host_session(&application)?;
     session.start()?;
     let call = session.invoke_streaming_deferred("run", &[0; 4])?;
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
-    let actual = session.collect(&call)?;
+    let actual = session.finish(&call)?;
     ensure!(
         actual.starts_with(&expected),
         "packing mismatch at byte {:?}",

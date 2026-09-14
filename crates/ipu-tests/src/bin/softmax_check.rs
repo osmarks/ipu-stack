@@ -260,9 +260,7 @@ fn main() -> Result<()> {
             return Err(e.into());
         }
     };
-    runtime
-        .device()
-        .write_sync_mark(ipu_driver::pci::HSP_GS2_CONTROL, 1)?;
+    let output = session.finish(&executed)?;
     let completed_pc = application
         .debug_symbols
         .iter()
@@ -301,7 +299,6 @@ fn main() -> Result<()> {
             );
         }
     }
-    let output = session.collect(&executed)?;
     fs::write(args.output.join("output.bin"), &output)?;
 
     let mut offset = 0;
