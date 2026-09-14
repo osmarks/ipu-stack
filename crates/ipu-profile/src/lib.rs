@@ -580,11 +580,6 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
             // numbers can overlap on different tiles, so union the group's
             // complete wall-clock coverage instead of summing phase unions.
             let phase_cycles = union_length(&mut accumulator.intervals);
-            let mean_cycles = if accumulator.durations.is_empty() {
-                0.0
-            } else {
-                accumulator.work_cycles as f64 / accumulator.durations.len() as f64
-            };
             GroupSummary {
                 name,
                 dimensions: accumulator.dimensions,
@@ -611,7 +606,7 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
                         accumulator.useful_cycles
                             / (phase_cycles as f64 * report.tiles.len() as f64)
                     }),
-                mean_cycles,
+                mean_cycles: accumulator.work_cycles as f64 / accumulator.durations.len() as f64,
                 p50_cycles: percentile(&accumulator.durations, 50),
                 p95_cycles: percentile(&accumulator.durations, 95),
                 maximum_cycles: accumulator.durations.last().copied().unwrap_or(0),
