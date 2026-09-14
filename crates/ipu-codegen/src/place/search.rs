@@ -268,17 +268,16 @@ impl Search<'_> {
                     let q = &self.requests[j];
                     let overlap =
                         q.lifetime.first <= r.lifetime.last && r.lifetime.first <= q.lifetime.last;
+                    let mut exclude = |a, b| {
+                        self.work += next[j].len();
+                        next[j] = next[j].iter().flat_map(|&d| d.without(a, b)).collect();
+                    };
                     if self.edges[index][j] {
                         for (a, b) in element_spans(start, end) {
-                            self.work += next[j].len();
-                            next[j] = next[j].iter().flat_map(|&d| d.without(a, b)).collect();
+                            exclude(a, b);
                         }
                     } else if overlap {
-                        self.work += next[j].len();
-                        next[j] = next[j]
-                            .iter()
-                            .flat_map(|&d| d.without(start, end))
-                            .collect();
+                        exclude(start, end);
                     }
                     if next[j].is_empty() {
                         viable = false;
