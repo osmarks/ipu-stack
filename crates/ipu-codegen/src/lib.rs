@@ -995,37 +995,24 @@ fn emit_host_phases(
         .any(|phase| phase.active)
         .then(|| symbol(symbols, HOST_RUN_SYMBOL))
         .transpose()?;
-    let mut index = 0;
-    while index < phases.len() {
-        let start = index;
-        if phases[start].active {
-            while index < phases.len()
-                && phases[index].active
-                && phases[index].address == phases[start].address
-            {
-                index += 1;
-            }
-            code.setzi(
-                2,
-                u32::try_from(index - start).map_err(|_| invalid("host run overflow"))?,
-            )?;
+    for run in phases.chunk_by(|a, b| a.active == b.active && (!a.active || a.address == b.address))
+    {
+        let first = &run[0];
+        code.setzi(
+            2,
+            u32::try_from(run.len()).map_err(|_| invalid("host run overflow"))?,
+        )?;
+        if first.active {
             code.setzi(
                 3,
-                phases[start]
+                first
                     .run_table
                     .ok_or_else(|| invalid("active host phase has no run table"))?,
             )?;
-            code.setzi(4, phases[start].address)?;
+            code.setzi(4, first.address)?;
             code.call(host_run.expect("active host phase has host runner"), 9)?;
         } else {
-            while index < phases.len() && !phases[index].active {
-                index += 1;
-            }
-            code.setzi(
-                2,
-                u32::try_from(index - start).map_err(|_| invalid("host run overflow"))?,
-            )?;
-            code.setzi(3, phases[start].address)?;
+            code.setzi(3, first.address)?;
             code.call(
                 repeat_call.expect("inactive host phase has repeat helper"),
                 9,
