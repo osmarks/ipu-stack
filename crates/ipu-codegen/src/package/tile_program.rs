@@ -69,11 +69,7 @@ pub fn build_tile_program_package(
         &kernels,
         &retained_runtime,
     )?;
-    let symbols = layout
-        .symbols
-        .clone()
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
+    let symbols = &layout.symbols;
     let mut memory = TileMemoryMap::new();
     reserve_linked_image(&mut memory, &layout, "linked runtime")?;
     // Explicit tile programs bring fixed data addresses; protect linked code
@@ -258,7 +254,7 @@ pub fn build_tile_program_package(
         let physical = topology.physical(program.tile)?;
         let generated = emit(
             program,
-            &symbols,
+            symbols,
             &host.programs[usize::from(physical)],
             &CodegenOptions {
                 code_address: sizing_address,
@@ -282,7 +278,7 @@ pub fn build_tile_program_package(
             let physical = topology.physical(program.tile)?;
             Ok(emit(
                 program,
-                &symbols,
+                symbols,
                 &host.programs[usize::from(physical)],
                 &CodegenOptions {
                     code_address,
@@ -293,12 +289,12 @@ pub fn build_tile_program_package(
         .collect::<PackageBuildResult<Vec<_>>>()?;
 
     let mut segments = vec![Vec::new(); usize::from(execution_tiles)];
-    for segment in &data {
+    for segment in data {
         let physical = topology.physical(segment.tile)?;
         segments[usize::from(physical)].push(Segment {
             address: segment.address,
             memory_size: u32::try_from(segment.data.len())?,
-            data: segment.data.clone(),
+            data: segment.data,
             flags: SEGMENT_READ | SEGMENT_WRITE,
         });
     }
