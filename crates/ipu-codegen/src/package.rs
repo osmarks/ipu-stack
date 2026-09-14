@@ -1,18 +1,16 @@
+//! Package support sizing, address binding and final image emission.
+//! Tensor search, placement and exchange scheduling belong to the compiler driver.
 mod bindings;
 use bindings::{PackageBindings, auxiliary_ranges};
-mod placement;
 mod profile;
 mod profile_work;
-use profile::{instrument_profile, profile_binding, profile_step_count};
-mod benchmark;
-mod local;
-mod validation;
-pub use benchmark::{ExpansionBenchmark, ExpansionTiming, benchmark_mid_expansion};
+use profile::{instrument_profile, profile_binding};
+mod support;
+pub(crate) use support::{PackageSupport, size_support};
 mod tile_program;
 pub use tile_program::build_tile_program_package;
-use validation::ScheduledPlan;
 
-use crate::graph::{ComputeGraph, OperationId, ValueId};
+use crate::graph::{OperationId, ValueId};
 use crate::host;
 use crate::low::LowProgram;
 use crate::memory::{
@@ -23,10 +21,9 @@ use crate::{
     COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
     PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
     SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering, WORKER_BARRIER_SYMBOL,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, lower_to_tiles, place,
-    shard_storage_bytes,
+    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, shard_storage_bytes,
 };
-use crate::{Ipu21CostModel, PipelineConfig, Precision, TileGraph, lower_baseline};
+use crate::{PipelineConfig, Precision, TileGraph};
 use ipu_driver::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_exchange::{ExchangeError, Topology, encode_br_m, encode_setzi_m};
@@ -40,7 +37,6 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::num::TryFromIntError;
-use std::path::PathBuf;
 use std::time::Instant;
 
 const ENTRY_BYTES: u32 = 8;
@@ -93,18 +89,6 @@ impl From<MemoryLayoutError> for PackageBuildError {
 }
 
 pub type PackageBuildResult<T> = std::result::Result<T, PackageBuildError>;
-
-#[derive(Clone, Debug)]
-pub struct PackageConfig {
-    /// Host-triggered inference calls after a single parameter upload.
-    pub invocations: u32,
-    pub toolchain: Toolchain,
-    pub runtime_source: PathBuf,
-    pub kernel_source_directory: PathBuf,
-    pub pipeline: PipelineConfig,
-    /// Optional bijection from planned tile indices to execution tile indices.
-    pub tile_mapping: Option<Vec<u16>>,
-}
 
 /// Data embedded in one logical tile image for a finalized tile-program package.
 #[derive(Clone, Debug)]
@@ -159,107 +143,9 @@ pub struct DiagnosticShard {
     pub storage: crate::BlockValue,
 }
 
-struct BuiltApplication {
-    application: Application,
-    support_memory: TileMemoryMap,
-    placement: crate::Placement,
-    exchange_phases: Vec<crate::PhysicalExchangePhase>,
-    exchange_schedule: crate::ExchangeScheduleSnapshot,
-    exchange_code_base: u32,
-}
-
-/// Compiles and packages a compute graph into a directly loadable IPU21
-/// application.
-#[tracing::instrument(
-    name = "ipu_codegen.package.build",
-    skip(graph, config),
-    fields(tile_count = config.pipeline.tile_count, operations = graph.operations().len())
-)]
-pub fn build_package(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-) -> PackageBuildResult<CompiledPackage> {
-    build_package_with_checkpoints(graph, config, false)
-}
-
-/// Builds an ordinary optimized package with resumable PBRK0 traps after each
-/// top-level operator and returns the storage map needed for non-invasive
-/// numerical inspection.
-pub fn build_diagnostic_package(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-) -> PackageBuildResult<CompiledPackage> {
-    build_package_with_checkpoints(graph, config, true)
-}
-
-fn build_package_with_checkpoints(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-    diagnostic: bool,
-) -> PackageBuildResult<CompiledPackage> {
-    let (built, low) = build_package_artifacts(graph, config, diagnostic)?;
-    let topology = active_topology(low.tile_count)?;
-    let inputs = package_inputs(&low, &built.placement, &topology)?;
-    let outputs = low
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(index, output)| {
-            diagnostic_tensor(
-                &low,
-                &built.placement,
-                &topology,
-                *output,
-                Some(format!("output.{index}")),
-            )
-        })
-        .collect::<PackageBuildResult<Vec<_>>>()?;
-    let mut checkpoints = Vec::new();
-    for (source, results) in low.checkpoints.iter().filter(|_| diagnostic) {
-        let source = *source;
-        let tensors = results
-            .iter()
-            .map(|&value| diagnostic_tensor(&low, &built.placement, &topology, value, None))
-            .collect::<PackageBuildResult<Vec<_>>>()?;
-        // A fully deferred view operation has no device work or independently
-        // materialized boundary to stop at; its consumer's checkpoint covers
-        // the fused mapping instead.
-        if tensors.iter().all(|tensor| tensor.shards.is_empty()) {
-            continue;
-        }
-        for tensor in &tensors {
-            tracing::debug!(
-                operation = source.index(),
-                value = tensor.value.index(),
-                shape = ?tensor.shape.0,
-                precision = ?tensor.precision,
-                shards = tensor.shards.len(),
-                order = ?tensor.shards.first().map(|shard| &shard.storage.tensor_type.format.layout.order),
-                memory_class = ?tensor.shards.first().map(|shard| shard.storage.tensor_type.format.layout.memory_class),
-                first_extents = ?tensor.shards.first().map(|shard| &shard.storage.extents),
-                "recorded diagnostic tensor"
-            );
-        }
-        checkpoints.push(DiagnosticCheckpoint {
-            operation: source,
-            breakpoint: (checkpoints.len() & 1) as u8,
-            tensors,
-        });
-    }
-    Ok(CompiledPackage {
-        application: built.application,
-        inputs,
-        outputs,
-        checkpoints,
-        precisions: package_precisions(&low),
-        multiply_precisions: package_multiply_precisions(&low),
-        exchange_phases: built.exchange_phases,
-        exchange_schedule: built.exchange_schedule,
-        exchange_code_base: built.exchange_code_base,
-    })
-}
-
-fn package_multiply_precisions(low: &TileGraph) -> BTreeMap<crate::OperationId, Precision> {
+pub(crate) fn package_multiply_precisions(
+    low: &TileGraph,
+) -> BTreeMap<crate::OperationId, Precision> {
     low.kernel_runs
         .iter()
         .filter_map(|run| {
@@ -271,7 +157,7 @@ fn package_multiply_precisions(low: &TileGraph) -> BTreeMap<crate::OperationId, 
         .collect()
 }
 
-fn package_precisions(mid: &TileGraph) -> BTreeMap<ValueId, Precision> {
+pub(crate) fn package_precisions(mid: &TileGraph) -> BTreeMap<ValueId, Precision> {
     let mut precisions = BTreeMap::new();
     // Canonical values precede implementation-local staging and accumulator
     // values, which share their producer's origin for profiling purposes.
@@ -283,7 +169,7 @@ fn package_precisions(mid: &TileGraph) -> BTreeMap<ValueId, Precision> {
     precisions
 }
 
-fn package_inputs(
+pub(crate) fn package_inputs(
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
@@ -302,397 +188,30 @@ fn package_inputs(
         .collect()
 }
 
-fn build_package_artifacts(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-    diagnostic_checkpoints: bool,
-) -> PackageBuildResult<(BuiltApplication, LowProgram)> {
-    validate_tile_count(u32::from(config.pipeline.tile_count))?;
-    let mut planning = config.pipeline.clone();
-    planning.diagnostic_checkpoints = diagnostic_checkpoints;
-    if diagnostic_checkpoints {
-        planning.profiling = false;
-    }
-    let runtime_artifact = build_phase("compile_runtime", || {
-        Ok(config
-            .toolchain
-            .compile(&config.runtime_source, "static_runtime", &[])?)
-    })?;
-    let (selected, built) = build_phase("plan_package", || {
-        local::optimize(
-            graph,
-            &planning,
-            config.tile_mapping.as_deref(),
-            |selected| {
-                let low = &selected.program;
-                let kernel_plan =
-                    build_phase("plan_kernels", || Ok(KernelBuildPlan::from_program(low)?))?;
-                let objects = build_phase("compile_kernels", || {
-                    let mut objects = vec![fs::read(&runtime_artifact.object)?];
-                    for compilation in &kernel_plan.compilations {
-                        let artifact = config.toolchain.compile(
-                            config.kernel_source_directory.join(compilation.source),
-                            &compilation.name,
-                            &compilation.flags,
-                        )?;
-                        objects.push(fs::read(&artifact.object)?);
-                    }
-                    Ok(objects)
-                })?;
-                build_package_from_objects(
-                    selected,
-                    &planning,
-                    &objects,
-                    &kernel_plan,
-                    config.invocations,
-                )
-            },
-        )
-    })?;
-    if let Some(directory) = &planning.memory_profile_directory {
-        crate::place::profile::write(
-            directory,
-            &selected.program,
-            &built.placement,
-            &built.support_memory,
-            &built.application,
-        )?;
-    }
-    Ok((built, selected.program))
-}
-
-fn build_package_from_objects(
-    selected: &mut ScheduledPlan,
+pub(crate) fn emit_package(
+    program: &LowProgram,
+    placement: &crate::Placement,
+    exchanges: &[crate::PhysicalExchangePhase],
+    support: &PackageSupport,
     config: &PipelineConfig,
-    objects: &[Vec<u8>],
-    kernel_plan: &KernelBuildPlan,
     invocations: u32,
-) -> PackageBuildResult<(u64, BuiltApplication)> {
-    let program = &selected.program;
-    let provisional_placement = &selected.placement;
-    let provisional_exchanges = &selected.phases;
-    let exchange_cache = &mut selected.cache;
+) -> PackageBuildResult<Application> {
     let topology = active_topology(program.tile_count)?;
-    let retained_runtime = runtime_retained_symbols(program, config);
-    let layout = build_phase("link_runtime", || {
-        link_runtime(
-            objects,
-            runtime_symbols(0, 0, 0)?,
-            kernel_plan,
-            &retained_runtime,
-        )
-    })?;
-    let linked_end = linked_end(&layout)?;
-    let mut memory = TileMemoryMap::new();
-    reserve_linked_image(&mut memory, &layout, "linked runtime and kernels")?;
-    reserve_fixed_runtime_memory(&mut memory)?;
-
-    let execution_tile_count = u16::try_from(Topology::c600().tile_count())?;
-    let exchange_table_bytes = crate::tile::compact_exchange_table_bytes(
-        provisional_exchanges,
-        execution_tile_count,
-        program.tile_count,
-    )?;
-    let mut repeat_bytes = vec![0usize; usize::from(program.tile_count)];
-    let mut arithmetic_savings = repeat_bytes.clone();
-    for phase in provisional_exchanges {
-        for (tile, patches) in phase.repeat_patches.iter().enumerate() {
-            for patch in patches {
-                let words = &patch.values;
-                repeat_bytes[tile] += 4 * words.len();
-                if crate::arithmetic_progression(words).is_some() {
-                    arithmetic_savings[tile] += 4 * words.len();
-                }
-            }
-        }
-    }
-    tracing::info!(
-        exchange_table_bytes,
-        maximum_uncompressed_repeat_patch_bytes = repeat_bytes.iter().max().copied().unwrap_or(0),
-        maximum_elided_arithmetic_patch_bytes =
-            arithmetic_savings.iter().max().copied().unwrap_or(0),
-        "exchange table and repeat patch storage"
-    );
-    validation::check_exchange_budget(u64::from(exchange_table_bytes), config)?;
-    let profile_requests = if config.profiling {
-        (0..execution_tile_count)
-            .map(|logical| {
-                let steps = if logical < program.tile_count {
-                    profile_step_count(program, &program.tiles[usize::from(logical)])
-                } else {
-                    profile::inactive_profile_work(program).len()
-                };
-                let bytes = u32::try_from(steps + 1)?
-                    .checked_mul(4)
-                    .ok_or_else(|| invalid("profile storage size overflow"))?;
-                Ok(vec![crate::place::AuxiliaryRequest {
-                    name: "cycle profile samples".into(),
-                    bytes,
-                    alignment: 4,
-                    first: 0,
-                    last: u32::MAX,
-                }])
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
-    // Addresses do not affect instruction sizing. Final emission and host
-    // bindings use the auxiliary allocations chosen alongside tensors.
-    let provisional_profile_addresses = config.profiling.then(|| {
-        vec![ipu_package::IPU21_INTERLEAVED_MEMORY_BASE; usize::from(execution_tile_count)]
-    });
     let execution_topology = Topology::c600();
-    let mut physical_to_logical = vec![None; usize::from(execution_tile_count)];
-    for logical in 0..execution_tile_count {
-        let physical = execution_topology.physical(logical)?;
-        physical_to_logical[usize::from(physical)] = Some(logical);
-    }
-    let physical_to_logical = physical_to_logical
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid("execution topology does not cover every physical tile"))?;
-    let provisional_bindings = PackageBindings::new(
-        program,
-        provisional_placement,
-        &topology,
-        &physical_to_logical,
-        provisional_profile_addresses.as_deref(),
-    )?;
-    let sizing_host_base = memory.next_free(
-        RUNTIME_EXECUTABLE_START,
-        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        4,
-        "host programs",
-    )?;
-    // Sizing does not emit these descriptor addresses. Do not depend on holes
-    // left by provisional tensor placement to discover the required reservation.
-    let provisional_auxiliary_ranges = vec![
-        vec![(
-            crate::IPU21_DATA_BASE,
-            ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
-        )];
-        usize::from(execution_tile_count)
-    ];
-    let provisional_host = host::plan(
-        &provisional_bindings.weights,
-        &provisional_bindings.inputs,
-        &provisional_bindings.outputs,
-        execution_tile_count,
-        sizing_host_base,
-        &provisional_auxiliary_ranges,
-    )?;
-    let host_code_bytes = provisional_host
-        .end
-        .checked_sub(sizing_host_base)
-        .ok_or_else(|| invalid("host program size underflow"))?;
-    let host_code = (host_code_bytes != 0)
-        .then(|| {
-            allocate_package_code(
-                &mut memory,
-                "host programs",
-                host_code_bytes,
-                8,
-                ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
-            )
-        })
-        .transpose()?;
-    let host_code_base = host_code
-        .as_ref()
-        .map_or(sizing_host_base, |code| code.range.start);
-    let provisional_host = host::plan(
-        &provisional_bindings.weights,
-        &provisional_bindings.inputs,
-        &provisional_bindings.outputs,
-        execution_tile_count,
-        host_code_base,
-        &provisional_auxiliary_ranges,
-    )?;
-    let provisional_finalizer = TileProgramLowering::new(
-        program,
-        provisional_placement,
-        provisional_exchanges,
-        kernel_plan,
-        // Sizing only: emission uses fixed-width address materialization.
-        RUNTIME_EXECUTABLE_START,
-        execution_tile_count,
-        false,
-    )?;
-    let sizing_code_address = memory.next_free(
-        RUNTIME_EXECUTABLE_START,
-        RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-        4,
-        "generated tile programs",
-    )?;
-    let generated_code_bytes = build_phase("size_tile_code", || {
-        physical_to_logical
-            .par_iter()
-            .enumerate()
-            .map(|(physical, &logical)| {
-                let host = &provisional_host.programs[physical];
-                let mut tile_program = provisional_finalizer.lower_tile(logical)?;
-                if let Some(addresses) = &provisional_profile_addresses {
-                    instrument_profile(
-                        program,
-                        provisional_exchanges,
-                        logical,
-                        u32::try_from(physical)?,
-                        &mut tile_program,
-                        addresses[usize::from(logical)],
-                    )?;
-                }
-                // Row sharing can change after final placement. Reserve its
-                // optional setup call through the same emitter used below.
-                reserve_exchange_setup(&mut tile_program.steps);
-                let generated = emit(
-                    &tile_program,
-                    &layout.symbols,
-                    host,
-                    &CodegenOptions {
-                        invocations,
-                        code_address: sizing_code_address,
-                        initial_profile_address: config.profiling.then_some(PROFILE_START_CYCLE),
-                        final_profile_address: config.profiling.then_some(PROFILE_END_CYCLE),
-                    },
-                )?;
-                Ok::<_, PackageBuildError>(u32::try_from(generated.bytes.len())?)
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .ok_or_else(|| invalid("execution topology has no tiles"))
-    })?;
-    tracing::info!(linked_end, host_code_base, host_code_bytes, generated_code_bytes,
-        exchange_table_bytes,
-        executable_ranges = ?memory.free_ranges(RUNTIME_EXECUTABLE_START..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT),
-        "placing generated tile programs");
-    let tile_code = (generated_code_bytes != 0)
-        .then(|| {
-            allocate_package_code(
-                &mut memory,
-                "generated tile programs",
-                generated_code_bytes,
-                8,
-                0,
-            )
-        })
-        .transpose()?;
-    let code_address = tile_code
-        .as_ref()
-        .map_or(sizing_code_address, |code| code.range.start);
-    // Code can share executable elements. Close their remaining holes only
-    // after all code is placed, before allocating writable rows/descriptors.
-    protect_executable_elements(
-        &mut memory,
-        layout
-            .segments
-            .iter()
-            .map(|segment| segment.range.clone())
-            .chain(
-                host_code
-                    .iter()
-                    .chain(tile_code.iter())
-                    .map(|code| code.reserved.clone()),
-            ),
-    )?;
-    let exchange_rows = (exchange_table_bytes != 0)
-        .then(|| {
-            memory.allocate(MemoryRequest {
-                name: "exchange row tables",
-                bytes: exchange_table_bytes,
-                // Executed exchange rows may not share an SRAM element with
-                // any transfer source or destination. Reserve whole elements
-                // at both ends so storage placement cannot use a prefix of the
-                // row table's first element.
-                alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_EXECUTABLE_MEMORY_LIMIT,
-                end_alignment: ipu_package::TILE_MEMORY_ELEMENT_SIZE,
-                guard_after: ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD,
-            })
-        })
-        .transpose()?;
-    let exchange_code_base = exchange_rows
-        .as_ref()
-        .map_or(crate::IPU21_DATA_BASE, |allocation| allocation.range.start);
-    // Reserve descriptors before tensors. Their contents depend on final addresses,
-    // but their undeduplicated size does not. Final host emission may still reuse
-    // packets, leaving part of this reservation unused.
-    let host_data_bytes = provisional_host.descriptor_bytes;
-    let host_data = (host_data_bytes != 0)
-        .then(|| {
-            memory.allocate(MemoryRequest {
-                name: "host descriptors",
-                bytes: host_data_bytes,
-                alignment: 4,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT,
-                end_alignment: 4,
-                guard_after: 0,
-            })
-        })
-        .transpose()?;
-    let mut available_ranges =
-        memory.free_ranges(crate::IPU21_DATA_BASE..ipu_package::IPU21_APPLICATION_MEMORY_LIMIT);
-    available_ranges.insert(0, crate::place::HOST_SCRATCH_RANGE);
-    tracing::info!(
-        linked_end,
-        profile_bytes = profile_requests
-            .iter()
-            .flatten()
-            .map(|r| r.bytes)
-            .max()
-            .unwrap_or(0),
-        exchange_table_bytes,
-        host_code_bytes,
-        host_data_bytes,
-        generated_code_bytes,
-        code_address,
-        ?available_ranges,
-        "allocated package support memory"
-    );
-    let placement = build_phase("place_storage", || {
-        Ok(crate::place::place_with_auxiliary(
-            program,
-            &available_ranges,
-            0,
-            &profile_requests,
-        )?)
-    })?;
-    let lowered_exchanges = build_phase("lower_exchanges", || {
-        Ok(crate::exchange::lower_exchanges_cached(
-            program,
-            &placement,
-            &topology,
-            config.exchange_stream_words,
-            config.exchange_diagnostics,
-            exchange_cache,
-        )?)
-    })?;
-    let (placement, lowered_exchanges) = build_phase("optimize_exchange_placement", || {
-        placement::improve_exchange_placement(
-            program,
-            &available_ranges,
-            &profile_requests,
-            &topology,
-            config.exchange_stream_words,
-            placement,
-            lowered_exchanges,
-            exchange_rows.as_ref().map_or(0, |storage| {
-                storage.reserved.end
-                    - ipu_package::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
-                    - storage.range.start
-            }),
-            exchange_cache,
-        )
-    })?;
-    let final_cost =
-        crate::estimate::scheduled_program_cycles(&program.program, &lowered_exchanges.phases)?;
-    tracing::info!(
-        final_cycles = final_cost.total,
-        final_exchange = final_cost.exchange,
-        "costed final placed program"
-    );
-    let exchange_schedule = lowered_exchanges.schedule_snapshot;
-    let exchanges = lowered_exchanges.phases;
+    let execution_tile_count = u16::try_from(execution_topology.tile_count())?;
+    let objects = &support.objects;
+    let kernel_plan = &support.kernel_plan;
+    let retained_runtime = &support.retained_runtime;
+    let layout = &support.layout;
+    let physical_to_logical = &support.physical_to_logical;
+    let code_address = support.code_address;
+    let generated_code_bytes = support.generated_code_bytes;
+    let host_code_base = support.host_code_base;
+    let host_code_bytes = support.host_code_bytes;
+    let host_data = &support.host_data;
+    let exchange_rows = &support.exchange_rows;
+    let exchange_code_base = support.exchange_code_base;
+    let available_ranges = &support.available_ranges;
     let profile_addresses = config.profiling.then(|| {
         placement
             .auxiliary_allocations
@@ -706,7 +225,7 @@ fn build_package_from_objects(
         outputs,
     } = PackageBindings::new(
         program,
-        &placement,
+        placement,
         &topology,
         &physical_to_logical,
         profile_addresses.as_deref(),
@@ -717,12 +236,12 @@ fn build_package_from_objects(
         .filter(|range| *range != crate::place::HOST_SCRATCH_RANGE)
         .collect::<Vec<_>>();
     let mut host_data_ranges = auxiliary_ranges(
-        &placement,
+        placement,
         &execution_topology,
         execution_tile_count,
         &inactive_auxiliary_ranges,
     )?;
-    if let Some(storage) = &host_data {
+    if let Some(storage) = host_data {
         for ranges in &mut host_data_ranges {
             ranges.push((storage.range.start, storage.range.end));
             ranges.sort_unstable();
@@ -752,14 +271,14 @@ fn build_package_from_objects(
     }
     let finalizer = TileProgramLowering::new(
         program,
-        &placement,
-        &exchanges,
+        placement,
+        exchanges,
         kernel_plan,
         exchange_code_base,
         execution_tile_count,
         true,
     )?;
-    if let Some(storage) = &exchange_rows {
+    if let Some(storage) = exchange_rows {
         // Placement can change row sharing and instruction alignment. The
         // entire SRAM element is already excluded from tensor storage, so
         // let final rows use its padding while retaining fetch look-ahead.
@@ -770,7 +289,7 @@ fn build_package_from_objects(
             capacity_bytes = capacity_end - storage.range.start,
             "checked final exchange table capacity"
         );
-        validation::check_exchange_budget(
+        check_exchange_budget(
             u64::from(finalizer.exchange_code_end() - storage.range.start),
             config,
         )?;
@@ -794,7 +313,7 @@ fn build_package_from_objects(
                     .map(|addresses| {
                         instrument_profile(
                             program,
-                            &exchanges,
+                            exchanges,
                             logical,
                             u32::try_from(physical_tile)?,
                             &mut tile_program,
@@ -843,7 +362,7 @@ fn build_package_from_objects(
     let tile_build = TileBuildContext {
         objects,
         kernel_plan,
-        retained_runtime: &retained_runtime,
+        retained_runtime,
         code_address,
         host_staging_address: host.staging_address,
     };
@@ -860,7 +379,7 @@ fn build_package_from_objects(
             })
             .collect::<PackageBuildResult<Vec<_>>>()
     })?;
-    let mut application = assemble_application(tiles, outputs, &layout, host)?;
+    let mut application = assemble_application(tiles, outputs, layout, host)?;
     for (physical, program) in generated.iter().enumerate() {
         add_generated_debug_map(
             &mut application,
@@ -873,17 +392,7 @@ fn build_package_from_objects(
     application.weights = weights;
     application.profile_tiles = profile_tiles;
     application.validate()?;
-    Ok((
-        final_cost.total,
-        BuiltApplication {
-            application,
-            support_memory: memory,
-            placement,
-            exchange_phases: exchanges,
-            exchange_schedule,
-            exchange_code_base,
-        },
-    ))
+    Ok(application)
 }
 
 /// Sizing-only patches account for exchange rows which become structurally
@@ -912,7 +421,7 @@ fn reserve_exchange_setup(steps: &mut [crate::TileStep]) {
     }
 }
 
-fn diagnostic_tensor(
+pub(crate) fn diagnostic_tensor(
     low: &LowProgram,
     placement: &crate::Placement,
     topology: &Topology,
@@ -1057,7 +566,7 @@ fn add_generated_debug_map(
     Ok(())
 }
 
-fn build_phase<T>(
+pub(crate) fn build_phase<T>(
     phase: &'static str,
     build: impl FnOnce() -> PackageBuildResult<T>,
 ) -> PackageBuildResult<T> {
@@ -1074,7 +583,7 @@ fn build_phase<T>(
     result
 }
 
-fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
+pub(crate) fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
     let maximum = Topology::c600().tile_count() as u32;
     if tile_count == 0 || !tile_count.is_multiple_of(TILES_PER_BATCH as u32) || tile_count > maximum
     {
@@ -1085,7 +594,7 @@ fn validate_tile_count(tile_count: u32) -> PackageBuildResult<()> {
     Ok(())
 }
 
-fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
+pub(crate) fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
     Ok(Topology::new(
         (0..tile_count)
             .map(ipu_exchange::c600_logical_to_physical)
@@ -1343,26 +852,10 @@ pub(crate) fn invalid(message: impl Into<String>) -> PackageBuildError {
     PackageBuildError::Invalid(message.into())
 }
 
-/// Capture address-resolved ordinary transfers before scheduling or linking.
-/// Capture the canonical baseline; failed placements remain errors.
-pub fn capture_exchange_baseline(
-    graph: &ComputeGraph,
-    config: &PackageConfig,
-) -> PackageBuildResult<crate::ExchangeScheduleSnapshot> {
-    let planning = &config.pipeline;
-    validate_tile_count(u32::from(planning.tile_count))?;
-    let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-    let mid = lower_baseline(graph, planning, &costs)?;
-    let (low, placement, _) =
-        validation::expand_and_place(&mid, planning, config.tile_mapping.as_deref())?;
-    Ok(crate::exchange::capture_exchange_schedule(
-        &low, &placement,
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ComputeGraph, Ipu21CostModel, lower_baseline};
 
     #[test]
     fn package_assembly_maps_host_code_by_physical_tile() {
@@ -1544,4 +1037,14 @@ mod tests {
         );
         assert_eq!(package_precisions(&low)[&y], Precision::F16);
     }
+}
+
+pub(crate) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> PackageBuildResult<()> {
+    if bytes > config.exchange_table_budget_bytes {
+        return Err(PackageBuildError::ExchangeBudgetExceeded {
+            bytes,
+            budget: config.exchange_table_budget_bytes,
+        });
+    }
+    Ok(())
 }

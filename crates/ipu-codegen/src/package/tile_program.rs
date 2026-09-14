@@ -3,7 +3,7 @@ use super::*;
 
 /// Builds an application from address-resolved tile programs.
 ///
-/// This is the low-level counterpart to [`build_package`]. It deliberately has
+/// This is the low-level counterpart to [`crate::build_package`]. It deliberately has
 /// no tensor bindings: callers supply initialized tile data and inspect it
 /// through driver diagnostics. A zero-payload `run` rendezvous starts execution
 /// after loading, so breakpoints in the program cannot race the loader.

@@ -1,15 +1,15 @@
 //! Expand, screen, and place a concrete whole-device program.
-use super::*;
+use super::placement;
+use crate::low::{LowProgram, lower_to_tiles};
+use crate::mid::PipelineConfig;
+#[cfg(test)]
+use crate::package::check_exchange_budget;
+use crate::package::{PackageBuildError, PackageBuildResult};
+use crate::place::place;
+#[cfg(test)]
+use crate::{ComputeGraph, Ipu21CostModel, Precision, lower_baseline};
 use std::sync::Arc;
-
-/// Selected work and its completed provisional allocation/schedule. Package
-/// sizing consumes these same artifacts before support storage changes addresses.
-pub(super) struct ScheduledPlan {
-    pub program: LowProgram,
-    pub placement: crate::Placement,
-    pub phases: Vec<crate::PhysicalExchangePhase>,
-    pub cache: crate::exchange::ExchangeScheduleCache,
-}
+use std::time::Instant;
 
 pub(super) fn expand_and_place(
     mid: &crate::MidProgram,
@@ -78,16 +78,6 @@ pub(super) fn expand_and_screen(
     Ok((low, footprint))
 }
 
-pub(super) fn check_exchange_budget(bytes: u64, config: &PipelineConfig) -> PackageBuildResult<()> {
-    if bytes > config.exchange_table_budget_bytes {
-        return Err(PackageBuildError::ExchangeBudgetExceeded {
-            bytes,
-            budget: config.exchange_table_budget_bytes,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,16 +109,7 @@ mod tests {
         config.exchange_table_budget_bytes = 1;
         assert!(check_exchange_budget(1, &config).is_ok());
         config.exchange_transfer_limit_per_tile = fragments - 1;
-        let error = super::local::optimize(
-            &graph,
-            &config,
-            None,
-            |_| -> PackageBuildResult<(u64, ())> {
-                panic!("over-limit plan reached package finalization")
-            },
-        )
-        .err()
-        .unwrap();
+        let error = expand_and_place(&baseline, &config, None).err().unwrap();
         assert!(matches!(
             error,
             PackageBuildError::ExchangeTransferLimitExceeded { .. }

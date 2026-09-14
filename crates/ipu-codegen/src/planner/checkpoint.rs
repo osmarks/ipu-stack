@@ -1,10 +1,13 @@
 //! Portable search decisions, without physical addresses or scheduler caches.
-use super::*;
+use crate::graph::ComputeGraph;
+use crate::mid::PipelineConfig;
+use crate::mid::baseline::{Baseline, Recipe};
+use crate::package::{PackageBuildResult, invalid};
 use std::collections::BTreeMap;
 use std::io::Write;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
-pub(in crate::package) struct State {
+pub(crate) struct State {
     version: u32,
     context: String,
     pub recipe: Recipe,
@@ -171,6 +174,7 @@ fn context_difference(saved: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Ipu21CostModel;
 
     #[test]
     fn legacy_graph_registry_preserves_graph_and_configuration_checks() {
@@ -237,7 +241,7 @@ mod tests {
         graph.set_outputs([output]).unwrap();
         let mut config = PipelineConfig::new(4).with_automatic_input(input, crate::Precision::F16);
         let mut state = State::load(&graph, &config, None).unwrap();
-        let selected = baseline::lower(
+        let selected = crate::mid::baseline::lower(
             &graph,
             &config,
             &Ipu21CostModel,

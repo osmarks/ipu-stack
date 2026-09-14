@@ -8,9 +8,10 @@ Older experiment reports explain history, not the current pipeline.
 ## Start here
 
 The public entry point is `build_package` in
-[package.rs](../crates/ipu-codegen/src/package.rs). It compiles the runtime, then
-calls `package/local::optimize` with a callback that builds a complete package.
-Even with zero optimization steps, it constructs and validates a baseline.
+[compile.rs](../crates/ipu-codegen/src/compile.rs). Its `compile_graph` routine
+compiles the runtime, loads search state and builds an executable baseline. It
+calls `evaluate_candidate` directly for the incumbent and shortlisted alternatives.
+Even with zero optimization steps, the baseline must produce a complete package.
 
 The compiler has three principal program representations, but the boundaries
 are less clean than their names suggest:
@@ -21,7 +22,7 @@ are less clean than their names suggest:
 | `MidProgram` | Executable whole-device `Copy`, `Compute` (including casts, products and sums), and `Repeat` | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
 | `TileGraph` | Shards, relative views, local copies, multicast source/recipient groups, kernel runs, structured control | Physical addresses, exact exchange instructions, linked symbols |
 | `LowProgram` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
-| `ScheduledPlan` | Low program, provisional placement, encoded exchange phases, reusable scheduling choices | Support-memory reservations and their final placement effects |
+| `EvaluatedCandidate` | Driver result: low program, final placement/exchanges, application, cost and accepted cache | No unresolved compilation work; search may replace the complete result |
 | `Application` | Tile images, host bindings/protocol, debug/profile metadata | Loading and execution |
 
 Selection emits executable family fragments directly into the program. There
@@ -60,14 +61,17 @@ flowchart TD
   T --> F[Detailed exchange-footprint screen]
   F --> L[Tile mapping and lower_to_tiles]
   L --> V[Provisional placement and exact exchange scheduling]
-  V --> B[Compile/link kernels, reserve support, finalize placement and exchanges]
-  B --> A[Application and modelled final cycles]
+  V --> S[package::size_support: link and reserve code, rows and auxiliaries]
+  S --> B[compile::evaluate_candidate: final placement and exchange replay]
+  B --> C[Score address alternatives; schedule at most one and check row capacity]
+  C --> A[package::emit_package: bind final addresses, emit and check capacities]
   A -. accepted incumbent guides next recipe .-> R
 ```
 
 [baseline::lower](../crates/ipu-codegen/src/mid/baseline.rs) controls the mid
-rewrite order. [local::optimize](../crates/ipu-codegen/src/package/local.rs)
-keeps a fully validated incumbent. It generates recipes, rebuilds their mid
+rewrite order. [compile_graph](../crates/ipu-codegen/src/compile.rs)
+keeps a fully evaluated incumbent. [planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs)
+generates recipes without evaluating packages; the driver rebuilds their mid
 programs, screens using compact estimated cycles, and evaluates promising
 candidates concurrently. It accepts the first improvement in shortlist order,
 not the best of an exhaustively evaluated beam. Logical input homes are fixed
@@ -75,7 +79,7 @@ from the initial incumbent. A recipe is a search decision record; it is not
 another executable representation.
 
 The optional mapping search in
-[package/placement.rs](../crates/ipu-codegen/src/package/placement.rs) proposes
+[compile/placement.rs](../crates/ipu-codegen/src/compile/placement.rs) proposes
 one permutation over the entire active tile set. `map_tiles` changes every
 shard and local work item together. This preserves their existing ownership
 relationships; it cannot choose a different embedding for one operator's
@@ -84,12 +88,24 @@ groups separately provide local rotations. The proposal records scoped owner-map
 choices and makes the existing global proposal a joint recipe change; it does
 not require searching independent maps immediately.
 
-[validation::expand_and_screen](../crates/ipu-codegen/src/package/validation.rs)
+[screen::expand_and_screen](../crates/ipu-codegen/src/compile/screen.rs)
 expands each retained candidate and checks transfer geometry before scheduling.
-The package callback then accounts for linked code, host support, exchange rows,
-profiling and tensor placement. Final addresses can change scheduling, so the
-provisional/final cycle is real. Cached ordering and widths are replayed and
-validated; cached physical addresses are not assumed valid.
+`evaluate_candidate` keeps provisional addresses local while
+[package/support.rs](../crates/ipu-codegen/src/package/support.rs) measures and
+reserves linked code, host/tile programs, rows, descriptors and profiling storage.
+Sizing never places tensors or schedules exchanges. The driver performs final
+placement and exchange replay, then explicitly evaluates the best cheap address
+proposal and retains it only if its exchanges improve within row capacity.
+Package emission consumes the retained result and checks all measured capacities.
+
+The provisional/final passes remain necessary: support changes available addresses,
+and addresses can change hazards and row sharing. Each speculative candidate owns
+its schedule-cache snapshot; only the winner's final cache is promoted. The former
+`ScheduledPlan`, separate `BuiltApplication`, `validate` wrapper and finalization
+callback are removed. Checkpoints store recipes/progress in
+[planner/checkpoint.rs](../crates/ipu-codegen/src/planner/checkpoint.rs). The graph
+builder, family selection and pipeline configuration still need to move from mid
+to their planner/compiler owners, and mapping proposals still need scoped recipes.
 
 The reported final cycles still combine modelled kernel work with scheduled
 exchange horizons. They are not hardware measurements.

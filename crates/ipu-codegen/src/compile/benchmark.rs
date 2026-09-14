@@ -1,7 +1,10 @@
 //! Compiler timings which stop before placement and exchange scheduling.
-use super::*;
 use crate::Compute;
+use crate::graph::ComputeGraph;
+use crate::mid::{Ipu21CostModel, PipelineConfig, lower_baseline};
+use crate::package::{PackageBuildResult, invalid};
 use std::sync::Arc;
+use std::{collections::BTreeMap, fs, time::Instant};
 
 #[derive(serde::Serialize)]
 pub struct ExpansionBenchmark {
@@ -86,7 +89,7 @@ pub fn benchmark_mid_expansion(
     let mut memory = BTreeMap::from([("start", process_memory())]);
     let start = Instant::now();
     let mid = if config.load_search_state.is_some() {
-        let state = super::local::checkpoint::State::load(graph, config, None)?;
+        let state = crate::planner::checkpoint::State::load(graph, config, None)?;
         let mut fixed = config.clone();
         fixed.inputs = state.inputs;
         crate::mid::baseline::lower(

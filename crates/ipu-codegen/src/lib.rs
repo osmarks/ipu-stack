@@ -17,11 +17,17 @@ mod low;
 mod memory;
 mod mid;
 pub use mid::optimistic;
+mod compile;
 mod package;
 mod place;
+mod planner;
 mod storage;
 mod tensor;
 mod tile;
+pub use compile::{
+    ExpansionBenchmark, ExpansionTiming, PackageConfig, benchmark_mid_expansion,
+    build_diagnostic_package, build_package, capture_exchange_baseline,
+};
 pub(crate) use exchange::*;
 pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityKind,
@@ -48,9 +54,7 @@ pub use mid::{
     PipelineConfig, ReductionStaging,
 };
 pub use package::{
-    CompiledPackage, DiagnosticShard, DiagnosticTensor, ExpansionBenchmark, ExpansionTiming,
-    PackageConfig, TileProgramData, benchmark_mid_expansion, build_diagnostic_package,
-    build_package, build_tile_program_package, capture_exchange_baseline,
+    CompiledPackage, DiagnosticShard, DiagnosticTensor, TileProgramData, build_tile_program_package,
 };
 pub use place::profile::render_memory_profile;
 pub(crate) use place::*;

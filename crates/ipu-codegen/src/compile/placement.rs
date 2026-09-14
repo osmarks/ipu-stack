@@ -1,6 +1,9 @@
 //! Bounded SRAM placement search after package support storage is reserved.
 
-use super::*;
+use crate::low::LowProgram;
+use crate::package::{PackageBuildResult, invalid};
+#[cfg(test)]
+use crate::{ComputeGraph, Ipu21CostModel, PipelineConfig, Precision, lower_to_tiles};
 use std::collections::BTreeSet;
 
 /// Screen geometry-derived embeddings by resource load, retaining one challenger.
@@ -103,24 +106,26 @@ pub(super) fn map_tiles(
     Ok(())
 }
 
-pub(super) fn improve_exchange_placement(
+pub(super) struct AddressProposal {
+    pub placement: crate::Placement,
+    pub baseline_score: u128,
+    pub score: u128,
+    pub offset: u32,
+}
+
+pub(super) fn propose_exchange_placement(
     program: &LowProgram,
     available_ranges: &[(u32, u32)],
     auxiliary: &[Vec<crate::place::AuxiliaryRequest>],
-    topology: &Topology,
-    stream_words: Option<std::num::NonZeroU32>,
-    baseline: crate::Placement,
-    exchanges: crate::exchange::LoweredExchanges,
-    row_capacity: u32,
-    cache: &crate::exchange::ExchangeScheduleCache,
-) -> PackageBuildResult<(crate::Placement, crate::exchange::LoweredExchanges)> {
+    baseline: &crate::Placement,
+) -> PackageBuildResult<Option<AddressProposal>> {
     if program.exchange_phases.is_empty() {
-        return Ok((baseline, exchanges));
+        return Ok(None);
     }
     let conflicts = crate::place::ExchangeConflicts::new(program)?;
-    let baseline_score = conflicts.score(&baseline);
+    let baseline_score = conflicts.score(baseline);
     if baseline_score == 0 {
-        return Ok((baseline, exchanges));
+        return Ok(None);
     }
     let mut best: Option<(u128, u32, crate::Placement)> = None;
     for offset in (4096..ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE).step_by(4096) {
@@ -144,53 +149,25 @@ pub(super) fn improve_exchange_placement(
             best = Some((score, offset, candidate));
         }
     }
-    // Scheduling remains expensive. Inspect only the best cheap candidate;
-    // keep the existing placement unless complete schedules improve.
-    let Some((score, offset, candidate)) = best else {
-        return Ok((baseline, exchanges));
-    };
-    let mut cache = cache.clone();
-    let candidate_exchanges = match crate::exchange::lower_exchanges_cached(
-        program,
-        &candidate,
-        topology,
-        stream_words,
-        false,
-        &mut cache,
-    ) {
-        Ok(exchanges) => exchanges,
-        Err(error) => {
-            tracing::info!(offset, %error, "rejected unschedulable exchange placement");
-            return Ok((baseline, exchanges));
-        }
-    };
+    Ok(best.map(|(score, offset, placement)| AddressProposal {
+        placement,
+        score,
+        offset,
+        baseline_score,
+    }))
+}
+
+pub(super) fn exchange_cycles(
+    program: &LowProgram,
+    phases: &[crate::PhysicalExchangePhase],
+) -> u64 {
     let multiplicities = exchange_multiplicities(program);
-    let cycles = |lowered: &crate::exchange::LoweredExchanges| -> u64 {
-        lowered
-            .phases
-            .iter()
-            .map(|phase| {
-                u64::from(phase.event_cycles)
-                    .saturating_mul(multiplicities[phase.id.index() as usize])
-            })
-            .fold(0, u64::saturating_add)
-    };
-    let baseline_cycles = cycles(&exchanges);
-    let candidate_cycles = cycles(&candidate_exchanges);
-    let row_bytes = crate::tile::compact_exchange_table_bytes(
-        &candidate_exchanges.phases,
-        u16::try_from(Topology::c600().tile_count())?,
-        program.tile_count,
-    )?;
-    let accepted = candidate_cycles < baseline_cycles && row_bytes <= row_capacity;
-    tracing::info!(offset, baseline_score = %baseline_score, score = %score,
-        baseline_cycles, candidate_cycles, row_bytes, row_capacity, accepted,
-        "evaluated exchange placement candidate");
-    if accepted {
-        Ok((candidate, candidate_exchanges))
-    } else {
-        Ok((baseline, exchanges))
-    }
+    phases
+        .iter()
+        .map(|phase| {
+            u64::from(phase.event_cycles).saturating_mul(multiplicities[phase.id.index() as usize])
+        })
+        .fold(0, u64::saturating_add)
 }
 
 fn exchange_multiplicities(program: &LowProgram) -> Vec<u64> {

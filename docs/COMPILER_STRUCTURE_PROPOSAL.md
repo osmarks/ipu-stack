@@ -58,6 +58,15 @@ specialization-reconstruction tables. Each family produces a complete build
 identity and encoded arguments; inventory and final emission use that same
 description. Shared FP8 output validation lives beside the fusion capabilities,
 and optimistic conversion checks query the cast/rearrangement families directly.
+The compiler now has direct search and candidate-evaluation routines in `compile.rs`.
+Package sizing returns concrete reservations without tensor placement or scheduling;
+final emission consumes the retained physical result. Provisional addresses remain
+local to evaluation, which exposes both final scheduling and the one detailed
+address alternative. The finalization callback, `validate`, `ScheduledPlan` and
+separate `BuiltApplication` are removed. Failed alternatives cannot replace the
+incumbent schedule cache; accepted address alternatives promote their own cache.
+Recipe proposals and checkpoints are outside package; planner construction,
+configuration and scoped ownership still require migration.
 Complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
