@@ -50,9 +50,11 @@ struct Work<'a> {
     exchange_described: bool,
 }
 
-fn kernels(samples: &[(u32, u64, u64, &CycleSample)]) -> Vec<KernelWork> {
+fn kernels<'a>(
+    samples: impl IntoIterator<Item = (u32, u64, u64, &'a CycleSample)>,
+) -> Vec<KernelWork> {
     let mut groups = BTreeMap::new();
-    for &(tile, start, end, sample) in samples {
+    for (tile, start, end, sample) in samples {
         let key = (&sample.step.operation, &sample.step.kernel);
         let (work, tiles) = groups.entry(key).or_insert_with(|| {
             (
@@ -162,12 +164,7 @@ pub fn phase_work(report: &ProfileReport, shared_clock: bool) -> Vec<PhaseWork> 
             let span = end - start;
             let cycles = work.samples.iter().map(|s| s.2 - s.1).sum::<u64>();
             let late = boundary.as_ref().map(|b| b.last_arriving_tile);
-            let late_samples = work
-                .samples
-                .iter()
-                .copied()
-                .filter(|s| Some(s.0) == late)
-                .collect::<Vec<_>>();
+            let late_samples = work.samples.iter().copied().filter(|s| Some(s.0) == late);
             let unattributed = boundary
                 .as_ref()
                 .and_then(|b| {
@@ -203,10 +200,10 @@ pub fn phase_work(report: &ProfileReport, shared_clock: bool) -> Vec<PhaseWork> 
                     cycles as f64 / (span as f64 * report.tiles.len() as f64)
                 },
                 exposed_preparation_cycles,
-                kernels: kernels(&work.samples),
+                kernels: kernels(work.samples.iter().copied()),
                 exchange: boundary,
                 exchange_occupancy,
-                late_tile_kernels: kernels(&late_samples),
+                late_tile_kernels: kernels(late_samples),
                 unattributed_before_barrier_cycles: unattributed,
             }
         })

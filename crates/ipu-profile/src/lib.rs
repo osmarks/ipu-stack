@@ -588,7 +588,7 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
             // Compute phase numbers are local schedule indices. Distinct
             // numbers can overlap on different tiles, so union the group's
             // complete wall-clock coverage instead of summing phase unions.
-            let phase_cycles = union_length(&accumulator.intervals);
+            let phase_cycles = union_length(&mut accumulator.intervals);
             let mean_cycles = if accumulator.durations.is_empty() {
                 0.0
             } else {
@@ -765,8 +765,7 @@ fn percentile(sorted: &[u32], percentage: usize) -> u32 {
     sorted[(sorted.len() - 1) * percentage / 100]
 }
 
-fn union_length(intervals: &[(u64, u64)]) -> u64 {
-    let mut intervals = intervals.to_vec();
+fn union_length(intervals: &mut [(u64, u64)]) -> u64 {
     intervals.sort_unstable();
     let Some(&(mut start, mut end)) = intervals.first() else {
         return 0;
