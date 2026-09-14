@@ -74,7 +74,9 @@ mid operation never contains an optional implementation of itself or a deferred
 conversion promise. With `Operator` and `Convert` gone, the outer `Primitive`
 wrapper is unnecessary too.
 
-There should be exactly one high-to-mid construction:
+Each selected implementation should construct executable mid directly. There
+are different constructors for different operation families and algorithms. A
+parallel-reduction GEMM is one example:
 
 ```text
 semantic GEMM + chosen algorithm parameters + actual input bindings
@@ -85,6 +87,9 @@ For an output-stationary choice, the same builder instead emits bounded panels
 and accumulating product operations. The distinction is decided while building
 mid. `Compute::Product` contains the selected local blocking and contraction
 axes; it is not a selected high-level GEMM waiting to choose one of those graphs.
+Pointwise operations, layernorm, attention and structured control have their own
+constructors. Sharing the executable language does not require sharing a GEMM
+decomposition, one universal constructor, or one implementation per operation.
 
 `Recipe` is a map from semantic operation IDs to choice parameters, plus boundary
 and rewrite choices. It has no executable edges, invented values or nested
@@ -127,9 +132,71 @@ The migration must preserve existing explicit conversion choices. For example,
 `LocalKernel`, direct retile and staging-before-pack must normalize to an
 appropriate kernel/movement recipe or an explicit movement policy. Dropping
 `Convert` and letting low infer whatever happens to work would not complete the
-refactor. Whole-program ownership changes remain ordinary mid transformations:
+refactor. Changes to selected value ownership remain ordinary mid transformations:
 they must update affected bindings/copies and costs, rather than depend on a later
 operator-resolution pass to repair compute placement.
+
+### Scope choices to the work they affect
+
+The current one-off tile-mapping search is too global to be the intended design.
+`package/placement::model_mapping` scores block-transpose permutations of all
+active tiles. `map_tiles` applies the winning permutation to every shard, local
+operation and Repeat binding. Mid separately supports `tile_offset` rotations
+per value/ownership group, but not those more general local embeddings.
+
+There are three different concepts to keep separate:
+
+- A tensor distribution determines which coordinates each owner ordinal holds.
+- An owner map assigns those ordinals to device tiles. This is a plan choice.
+- The target topology describes hardware tile identities and fabric connections.
+  It is a shared device fact, not a layout optimization variable.
+
+Let an operator or connected group propose owner maps for its produced values
+and intermediate distributions. The resulting maps belong to those values;
+one GEMM may use different maps for its partials and reduced output. Evolve the
+existing ownership-group/rotation representation to express reusable embeddings.
+Do not copy a full device-sized map into every operation or require every map to
+be a permutation of the entire active device.
+
+A consumer cannot independently reinterpret the producer's resident buffer as
+being on different tiles. Either its computation uses the existing ownership,
+it emits an input copy into the desired ownership, or a joint proposal changes
+the producer's output and affected consumer bindings. Shared values must have
+consistent homes; required alias and Repeat-sequence relationships must remain
+consistent too. Persistent parameters can keep one home while individual users
+choose different temporary compute distributions.
+
+Mapping proposals therefore join the ordinary recipe neighborhood, where their
+boundary movement is visible in mid and costed with the computation. Reuse the
+existing fabric-load model to screen promising embeddings; it must score the
+source and destination assignments relevant to each transfer. Its current
+whole-graph tile permutation argument is insufficient for that. There is no
+second mapping optimizer invoked once beside the main search loop. A uniform
+whole-graph remapping can still be represented as a joint choice or an explicit
+diagnostic override, rather than being the only available choice.
+
+Other current global switches should be scoped similarly:
+
+| Current choice | Appropriate scope |
+| --- | --- |
+| `Recipe::packing_rows` applied throughout the program | Each eligible packing/copy site or coupled preparation group |
+| `Recipe::in_place_casts` toggled for every eligible cast, including with every layout proposal | Each donation site and its producer; retain joint layout/donation proposals where needed |
+| `parallel_reductions` and `disjoint_copy_sources` rewrites across all regions | Particular independent reduction/preparation groups and their owner choices |
+| One `exchange_stream_words` setting | A default scheduling policy, with phase-specific choices where worth evaluating; this belongs to low scheduling, since phases can contain work from several semantic operations |
+| One address-placement offset used as a global alternative | An allocator heuristic, not an operator's layout; useful address/bank preferences concern allocation conflict groups under joint placement constraints |
+
+Global defaults and effort caps remain useful. They should initialize or bound
+local choices, not force unrelated sites to change together. Retain device-wide
+capacity checks: local decisions interact through live storage, exchange rows
+and phase grouping. Local scope does not imply independent feasibility.
+
+Use source-operation provenance and stable family-local sites for replayable
+mid choices, validating their applicability when rebuilding a changed recipe.
+Final phase numbers or incidental low arena indexes are unsuitable identities.
+Start with the existing small alternative sets and targeted joint proposals;
+do not enumerate the Cartesian product of all local settings or schedule every
+exchange variant. Search checkpoints retain these choices in the same search
+state, with explicit compatibility handling for old global settings.
 
 ### 2. Give movement one path and separate geometry from policy
 
@@ -288,7 +355,7 @@ current problem unchanged.
 | `planner` | `build_candidate(graph, bindings, recipe) -> Candidate` | Choose unspecified algorithms; directly build and rewrite valid mid; report compact cost, normalized recipe and alternatives |
 | `planner` | `propose(graph, candidate) -> recipes` | Neighborhood enumeration, including joint producer/consumer choices; no package evaluation |
 | `compile` | `build_package(graph, config) -> CompiledPackage` | Baseline, shortlist, attempt budget, ordered concurrent evaluation, acceptance, checkpointing |
-| `compile` | `evaluate_candidate(mid, mapping, config, caches) -> built result` | Expansion, screening, provisional and final allocation/scheduling, bounded placement improvement, complete feasibility |
+| `compile` | `evaluate_candidate(mid, config, caches) -> built result` | Expansion, screening, provisional and final allocation/scheduling, bounded placement improvement, complete feasibility |
 | `package` | Support sizing/reservation and final emission functions | Linked images, host/tile program sizes, support ranges, address binding, capacity checks, serialization; no tensor search or exchange scheduling |
 | `estimate` | Mid, low and scheduled cost queries | Analysis of their supplied representation; no implementation construction |
 
@@ -312,13 +379,8 @@ build baseline/resumed candidate as executable mid
 evaluate_candidate(baseline); fail the build if no feasible incumbent exists
 fix logical input homes and save the accepted checkpoint
 
-if the existing tile-mapping proposal is due:
-    propose mapping; evaluate_candidate with it
-    replace the incumbent only on a feasible scheduled-cost improvement
-    save checkpoint
-
 while attempt budget remains:
-    propose recipes from the accepted candidate
+    propose recipes, including scoped ownership/preparation choices
     build valid mid candidates and compute compact costs concurrently
     discard visited/invalid/non-improving candidates; deduplicate identical mid
     sort and truncate using the current shortlist and budget rules
@@ -330,8 +392,9 @@ while attempt budget remains:
 return the accepted package and its diagnostics
 ```
 
-This preserves current ordered `find_first` behavior, cancellation and recipe
-alias bookkeeping. It does not silently introduce a beam search or accept the
+This retains ordered `find_first` behavior, cancellation and recipe alias
+bookkeeping while extending the neighborhood's scope as described above.
+It does not silently introduce a beam search or accept the
 first worker to finish. Rayon can still parallelize candidate construction and
 their internal work. Caches of immutable fragments/geometry are shared;
 speculative schedules remain separate and only the winner's cache is promoted.
@@ -348,9 +411,9 @@ specific, named boundary; there is no `validate` call that later turns out to
 compile and package the program through a callback.
 
 ```text
-expand mid into low work; share geometry analysis with the footprint screen
+expand mid using its selected owner maps; share geometry analysis with screening
 reject excessive transfer geometry before expensive scheduling
-apply the candidate's tile mapping; construct per-tile work indexes
+construct per-tile work indexes
 place tensors provisionally
 schedule exchanges against provisional addresses
 compile selected kernels and link runtime/kernel objects for sizing
@@ -393,9 +456,10 @@ The provisional placement and phases stay local to evaluation. Consolidate
 `ScheduledPlan` and the internal `BuiltApplication` result instead of returning a
 provisional placement in one object and a final placement in another. The returned
 record holds one final placement and phase set with the artifact they produced.
-Diagnostic and mapping consumers use explicitly selected data; a consumer that
-still needs provisional information must name that need. This ownership change
-must not accidentally alter the mapping heuristic without measuring it.
+Diagnostic and optimization consumers use explicitly selected data; a consumer
+that still needs provisional information must name that need. Moving current
+control flow first can preserve behavior, but the one-off global mapping search
+is a migration starting point, not the final policy.
 
 ## Connected construction, with concrete source owners
 
@@ -488,6 +552,62 @@ Adding an Add-like fused kernel with an existing indexing relation should requir
 its semantic/fusion rule and family implementation, without editing a low
 broadcast dispatch list or a second ABI-selection table.
 
+### Low construction and storage access are part of the refactor
+
+The driver cleanup is a small part of this work. The current low builder also
+hides algorithm changes and representation repair inside generic-looking calls:
+
+| Current source behavior | Required owner and change |
+| --- | --- |
+| `expand/emit::append_kernel` recognizes GEMMs and splits outer batch dimensions into separate matrix calls | Product-family expansion constructs the complete local call sequence; appending a checked call records that call |
+| `append_exchange_phase` can invoke `group_exchange_copies`, move earlier copies and merge a previous exchange | The explicit low phase rewrite owns movement across exchange boundaries and phase merging; appending a phase records it |
+| `buffers::full_view` consults `borrowed_views`, while other callers must remember `resolve_read_view` before examining geometry | One storage/view binding interface resolves backing storage and logical selection before physical geometry or call validation |
+| `CopyPlan::for_destination` computes coverage, embeds IPU21 cost formulas, chooses staging and selects a packing kernel | Shared geometry supplies coverage/traversal facts; the movement selector owns the choice; the kernel family binds its implementation |
+| `emit::kernel_run` creates/interprets format requirements, while ABI validation and physical view checks happen elsewhere | Family binding receives the complete operands/results and constructs a checked address-independent call before append |
+| `mid::cast::CastChunks` and `CAST_PREFIX_BYTES` describe the shifted-buffer kernel's physical chunking; low imports them from mid | Cast-family access geometry describes that implementation; mid donation legality/cost and low chunk emission consume it |
+
+The existing low simplification entry point is a suitable owner for copy motion
+and exchange merging. Reuse its low graph and the current dependency checks;
+do not add a program representation or a second exchange scheduler. Preserve
+RAW/WAR/WAW ordering, alias displacement, Repeat and checkpoint boundaries when
+moving the existing optimization. The scheduling of receive-then-forward traffic
+remains the exchange scheduler's responsibility.
+
+Likewise, routing alternatives such as gather/pack/multicast should remain an
+explicit low transformation, as `relay::select` already is. Its added storage,
+copies and exchanges must be in the low graph consumed by costing and placement.
+Backend decisions that need shard geometry are legitimate; hiding them in data
+insertion or pure geometry APIs is the problem.
+
+Storage binding must preserve three separate facts: the backing allocation and
+signed byte displacement, the storage layout/strides used to address it, and the
+logical coordinates requested by the consumer. Borrowing a slice of a larger
+tensor does not give it the smaller tensor's row stride. A shifted FP8 alias of
+FP16 storage does not acquire FP16 element interpretation by following its root.
+Two views with the same root may still have different byte origins. These facts
+must come from the shared binding/geometry interface, rather than each copy,
+kernel, hazard checker and estimator reconstructing a subset of them.
+
+Keep the existing useful view and storage records, but stop exposing an
+unresolved borrowed placeholder as ordinary physical geometry. The low builder's
+storage owner resolves reads and declares writes/aliases; geometry and binding
+consumers receive the resulting view. When low construction finishes, every live
+access has concrete relative storage geometry. Unused logical/profiling entries
+need not own storage, and physical addresses still belong to placement. This
+does not require a new graph or a wrapper type for every step.
+
+The same family contracts must explain why an input needs canonical whole-buffer
+storage. Today `TileGraphBuilder::new` scans special cases for Sum, output aliases
+and Repeat to populate `required_storage`. Keep Repeat's structured binding
+constraints explicit, but derive computational access requirements from the
+selected family. A new computation should not need another unrelated scan
+exception before its kernel can safely read a view.
+
+The endpoint is a low construction that reads as: bind operand views, construct
+the selected local work, append it, then perform named low transformations.
+This is a substantive change to the lower-level code's contracts and mutation
+boundaries. Moving files or writing a clearer outer driver alone does not meet it.
+
 ### What must be apparent from the source
 
 | Reader's question | Where the answer must be visible |
@@ -497,6 +617,7 @@ broadcast dispatch list or a second ABI-selection table.
 | Why was this copy packed or staged? | The single movement selector, with facts and policy as explicit inputs |
 | Why does this operand broadcast and which coordinates are read? | Recorded indexing relation, followed by its restriction to a shard |
 | Why does this kernel require a tail, alignment or separate element? | Its family binding contract, reused by placement and call emission |
+| Which storage and strides does this borrowed or shifted view use? | The common storage/view binding and geometry interface |
 | Which pass may alter ownership, aliasing or phase grouping? | Named mid rewrite or low transformation called by the relevant entry routine |
 
 Module introductions should describe their inputs, guarantees and decisions in
@@ -607,20 +728,23 @@ kernels.
 
 ## Migration and completion criteria
 
-First make the two driver routines explicit, preserving the existing search
-policy and evaluation order. Then replace selected-operator construction with
-direct executable mid construction, including boundary conversions and Repeat.
-Complete the single movement path and family binding as connected follow-through.
-Moving constants can be a separate contained commit, but is not the main
-architectural result.
+The driver extraction can first preserve current behavior as a contained step.
+The main refactor spans direct executable mid construction, scoped choices,
+storage/view binding, movement realization and complete family call construction.
+It includes all supported operation families and Repeat. The scoped mapping
+neighborhood replaces the one-off global mapping search when owner maps are
+represented in mid; the latter is not the intended endpoint. Moving constants
+can be a separate contained commit.
 
 | Slice | Required endpoint | Code that should disappear or lose responsibility |
 | --- | --- | --- |
 | Compiler driver | One visible search loop and one visible candidate evaluation; package code consumes final placements/schedules | `local::optimize` finalization callback, `validate<T>` indirection, nested scheduling in package placement improvement, duplicated provisional/final result ownership |
 | Target/ABI ownership | One definition per hardware fact or shared protocol constant; compiler no longer imports driver for constants | Duplicate SRAM/register constants; generic instruction encoders and tile mapping misplaced in exchange; runtime policy mixed into architectural definitions |
 | Direct mid construction | Graph plus recipe emits only Copy, Compute and Repeat; both candidate costing and insertion use the same emitter | `Operator`, `Convert`, `Primitive` wrapper, `resolve_region`, `CostModel::implementation`, deferred offers/claims/cost restoration, dual cast/copy recognition |
+| Scoped choices | Owner embeddings and preparation/donation choices are attached to the values/sites/groups affected; complete candidates remain jointly validated | One-off global mapping search and `mapping_checked`, program-wide all-or-nothing rewrite choices as the only representation |
 | Movement/geometry consolidation | One mapping-to-movement path, pure reusable facts, explicit physical selection | Independent identity-intersection path and repeated geometry-key/traversal construction; custom cache policy where no longer justified |
 | Compute and kernel binding | Sum is a compute family; existing indexing patterns reused without generic kernel-name exceptions; static call legality checked before placement | Separate top-level Sum, product/reduction-specific orchestration in generic expansion, scattered broadcast inference and overlapping call/specialization/argument derivation |
+| Low construction and access | Appenders record work; storage binding resolves access geometry; explicit transformations own copy motion/routing/phase changes | Hidden GEMM splitting and exchange/copy motion in appenders, caller-by-caller borrowed-view repair, cast chunk implementation owned by mid |
 | Source comprehensibility | The named entry routines show sequence and decisions; family/movement procedures own their construction end to end | Implicit cross-module builder mutations, single-use step scattering, broad internal re-exports that mask ownership, stale module explanations |
 
 Perform each slice as runnable commits and remove its old path before declaring
@@ -640,6 +764,9 @@ pattern must modify. A refactor that only moves files or adds adapters without
 removing the previous paths has not met the objective. No credible percentage
 reduction can be promised from this source review alone.
 
-The design deliberately leaves the search algorithm and supported distributed
-layouts intact. It provides explicit places to improve them later without
-reconstructing the compiler's meaning from helper names and call history.
+The incumbent-search strategy can stay. Its choices become more appropriately
+scoped, and owner embeddings become more expressive; existing layouts remain
+representable. Those changes need explicit performance/feasibility comparisons
+in addition to the behavior-preserving ownership moves. The goal is to make the
+lower-level algorithms and data contracts understandable from their source, as
+well as make the overall compiler sequence visible.

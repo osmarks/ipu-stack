@@ -62,6 +62,15 @@ not the best of an exhaustively evaluated beam. Logical input homes are fixed
 from the initial incumbent. A recipe is a search decision record; it is not
 another executable representation.
 
+The optional mapping search in
+[package/placement.rs](../crates/ipu-codegen/src/package/placement.rs) proposes
+one permutation over the entire active tile set. `map_tiles` changes every
+shard and local work item together. This preserves their existing ownership
+relationships; it cannot choose a different embedding for one operator's
+outputs while leaving unrelated values alone. Mid's `tile_offset` and ownership
+groups separately provide local rotations. The proposal replaces the one-off
+global search with scoped owner-map choices in the ordinary neighborhood.
+
 [validation::expand_and_screen](../crates/ipu-codegen/src/package/validation.rs)
 expands each retained candidate and checks transfer geometry before scheduling.
 The package callback then accounts for linked code, host support, exchange rows,
@@ -195,6 +204,22 @@ The two entry paths do converge; they are not wholly duplicated engines. But
 requiring them both means rewrites and costs must recognize both `Copy` and
 `Convert`, and the selected conversion strategy does not fully describe the
 physical route later chosen by `CopyPlan`.
+
+There is additional control flow inside
+[expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs): `append_kernel`
+can split a GEMM into batch-matrix calls, while `append_exchange_phase` can move
+intervening local copies and merge an earlier exchange through
+[exchange_grouping.rs](../crates/ipu-codegen/src/low/expand/exchange_grouping.rs).
+The latter checks read/write hazards and respects compute, Repeat and checkpoint
+boundaries. These transformations currently happen during insertion, before the
+explicit low simplification and relay passes.
+
+[buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs) also mediates borrowed
+storage. `full_view` resolves a borrowed binding automatically, while other paths
+must call `resolve_read_view` before using physical geometry. That caller-dependent
+contract is separate from coordinate mapping and from following storage aliases
+with signed byte displacements. The proposal makes this access boundary explicit
+alongside movement and kernel binding.
 
 ## What each later representation is for
 
