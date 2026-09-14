@@ -69,13 +69,14 @@ pub(super) fn fuse(
         // The statistics must describe the version written by this add.
         if operations[previous + 1..index]
             .iter()
-            .any(|op| matches!(op.kind, MidOperationKind::Repeat(_)))
-            || operations[previous + 1..index]
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !identity_copies.contains(&(previous + 1 + i)))
-                .flat_map(|(_, op)| &op.results)
-                .any(|v| values[v.index() as usize].storage_group == value.storage_group)
+            .enumerate()
+            .any(|(i, op)| {
+                matches!(op.kind, MidOperationKind::Repeat(_))
+                    || (!identity_copies.contains(&(previous + 1 + i))
+                        && op.results.iter().any(|v| {
+                            values[v.index() as usize].storage_group == value.storage_group
+                        }))
+            })
         {
             continue;
         }
@@ -107,17 +108,20 @@ pub(super) fn fuse(
         } else {
             current.results[0]
         };
-        let mut fused = add.clone();
-        fused.results = vec![stats, sum];
-        fused.kind = MidOperationKind::Primitive(Primitive::Compute {
-            kernel: TileKernelSpec::AddLayerNormMoments,
-            operands: vec![OperandWindow::default(); 2],
-            product: None,
-            output_aliases: output_aliases
-                .iter()
-                .map(|&(_, input)| (1, input))
-                .collect(),
-        });
+        let fused = MidOperation {
+            inputs: add.inputs.clone(),
+            results: vec![stats, sum],
+            kind: MidOperationKind::Primitive(Primitive::Compute {
+                kernel: TileKernelSpec::AddLayerNormMoments,
+                operands: vec![OperandWindow::default(); 2],
+                product: None,
+                output_aliases: output_aliases
+                    .iter()
+                    .map(|&(_, input)| (1, input))
+                    .collect(),
+            }),
+            ..*add
+        };
         let mut apply = current.clone();
         if ordinary {
             apply.inputs[0] = if redistributed { input } else { sum };
