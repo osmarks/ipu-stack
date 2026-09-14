@@ -339,11 +339,10 @@ pub struct LinkedImage {
     pub symbols: BTreeMap<String, u32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkedSegment {
-    pub address: u32,
+    pub range: std::ops::Range<u32>,
     pub offset: usize,
-    pub size: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -576,15 +575,14 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
     let mut segments = Vec::<LinkedSegment>::new();
     for placement in &placements {
         if let Some(previous) = segments.last_mut()
-            && previous.address + previous.size as u32 == placement.address
-            && previous.offset + previous.size == placement.offset
+            && previous.range.end == placement.address
+            && previous.offset + previous.range.len() == placement.offset
         {
-            previous.size += placement.size;
+            previous.range.end += placement.size as u32;
         } else {
             segments.push(LinkedSegment {
-                address: placement.address,
+                range: placement.address..placement.address + placement.size as u32,
                 offset: placement.offset,
-                size: placement.size,
             });
         }
     }

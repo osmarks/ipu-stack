@@ -80,10 +80,7 @@ pub fn build_tile_program_package(
     // before admitting those externally supplied ranges.
     protect_executable_elements(
         &mut memory,
-        layout
-            .segments
-            .iter()
-            .map(|segment| segment.address..segment.address + segment.size as u32),
+        layout.segments.iter().map(|segment| segment.range.clone()),
     )?;
     memory.reserve(
         "host exchange aperture",

@@ -597,7 +597,7 @@ fn build_package_from_objects(
         layout
             .segments
             .iter()
-            .map(|segment| segment.address..segment.address + segment.size as u32)
+            .map(|segment| segment.range.clone())
             .chain(
                 host_code
                     .iter()
@@ -996,7 +996,7 @@ fn assemble_application(
         host_exchange: host.protocol,
         ..Application::default()
     };
-    add_linked_debug_map(&mut application, linked)?;
+    add_linked_debug_map(&mut application, linked);
     for (physical, segments) in host.segments.iter().enumerate() {
         for segment in segments {
             if segment.flags & SEGMENT_EXECUTE != 0 && segment.memory_size != 0 {
@@ -1012,15 +1012,12 @@ fn assemble_application(
     Ok(application)
 }
 
-fn add_linked_debug_map(
-    application: &mut Application,
-    linked: &LinkedImage,
-) -> PackageBuildResult<()> {
+fn add_linked_debug_map(application: &mut Application, linked: &LinkedImage) {
     for segment in &linked.segments {
         application.debug_regions.push(DebugRegion {
             physical_tile: DEBUG_ALL_TILES,
-            address: segment.address,
-            size: u32::try_from(segment.size)?,
+            address: segment.range.start,
+            size: segment.range.end - segment.range.start,
             name: "linked executable".into(),
         });
     }
@@ -1029,10 +1026,10 @@ fn add_linked_debug_map(
             .symbols
             .iter()
             .filter(|(_, address)| {
-                linked.segments.iter().any(|segment| {
-                    (segment.address..segment.address.saturating_add(segment.size as u32))
-                        .contains(address)
-                })
+                linked
+                    .segments
+                    .iter()
+                    .any(|segment| segment.range.contains(address))
             })
             .map(|(name, &address)| DebugSymbol {
                 name: name.clone(),
@@ -1042,7 +1039,6 @@ fn add_linked_debug_map(
     application
         .debug_symbols
         .sort_unstable_by_key(|symbol| symbol.address);
-    Ok(())
 }
 
 fn add_generated_debug_map(
@@ -1145,9 +1141,9 @@ fn build_tile(
         flags: SEGMENT_READ | SEGMENT_EXECUTE,
     }];
     segments.extend(linked.segments.iter().map(|segment| Segment {
-        address: segment.address,
-        memory_size: segment.size as u32,
-        data: linked.bytes[segment.offset..segment.offset + segment.size].to_vec(),
+        address: segment.range.start,
+        memory_size: segment.range.end - segment.range.start,
+        data: linked.bytes[segment.offset..segment.offset + segment.range.len()].to_vec(),
         flags: SEGMENT_READ | SEGMENT_EXECUTE,
     }));
     let mut exchange_rows = BTreeMap::<u32, Vec<u8>>::new();
@@ -1313,9 +1309,8 @@ fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
     linked
         .segments
         .iter()
-        .map(|segment| segment.address.checked_add(segment.size as u32))
-        .collect::<Option<Vec<_>>>()
-        .and_then(|ends| ends.into_iter().max())
+        .map(|segment| segment.range.end)
+        .max()
         .ok_or_else(|| invalid("linked runtime has no valid segments"))
 }
 
@@ -1325,11 +1320,7 @@ fn reserve_linked_image(
     name: &'static str,
 ) -> PackageBuildResult<()> {
     for segment in &linked.segments {
-        let end = segment
-            .address
-            .checked_add(u32::try_from(segment.size)?)
-            .ok_or_else(|| invalid("linked runtime segment range overflow"))?;
-        memory.reserve(name, segment.address..end)?;
+        memory.reserve(name, segment.range.clone())?;
     }
     Ok(())
 }
@@ -1431,19 +1422,16 @@ mod tests {
             bytes: vec![],
             segments: vec![
                 ipu_elf::LinkedSegment {
-                    address: base,
+                    range: base..base + 128,
                     offset: 0,
-                    size: 128,
                 },
                 ipu_elf::LinkedSegment {
-                    address: base + 256,
+                    range: base + 256..base + 256 + 128,
                     offset: 128,
-                    size: 128,
                 },
                 ipu_elf::LinkedSegment {
-                    address: base + element,
+                    range: base + element..base + element + 128,
                     offset: 256,
-                    size: 128,
                 },
             ],
             symbols: BTreeMap::new(),
@@ -1457,7 +1445,7 @@ mod tests {
             linked
                 .segments
                 .iter()
-                .map(|segment| segment.address..segment.address + segment.size as u32)
+                .map(|segment| segment.range.clone())
                 .chain([extra.reserved]),
         )
         .unwrap();
@@ -1483,14 +1471,12 @@ mod tests {
             symbols: BTreeMap::new(),
             segments: vec![
                 ipu_elf::LinkedSegment {
-                    address: base,
+                    range: base..base + 128,
                     offset: 0,
-                    size: 128,
                 },
                 ipu_elf::LinkedSegment {
-                    address: base + 3 * element,
+                    range: base + 3 * element..limit,
                     offset: 128,
-                    size: (limit - base - 3 * element) as usize,
                 },
             ],
         };
