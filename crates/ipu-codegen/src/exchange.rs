@@ -11,6 +11,7 @@ use order::{critical_neighborhood_order, point_to_point_matching_wave_order};
 mod replay;
 pub use replay::{
     ExchangeSchedulingPriority, schedule_exchange_problem, schedule_exchange_problem_with_priority,
+    select_exchange_schedule,
 };
 mod relocation;
 mod reuse;
@@ -223,6 +224,7 @@ pub(crate) fn lower_exchanges(
         program,
         placement,
         topology,
+        None,
         enable_diagnostics,
         &mut ExchangeScheduleCache::default(),
     )
@@ -420,6 +422,7 @@ pub(crate) fn lower_exchanges_cached(
     program: &LowProgram,
     placement: &Placement,
     topology: &Topology,
+    stream_words: Option<std::num::NonZeroU32>,
     enable_diagnostics: bool,
     cache: &mut ExchangeScheduleCache,
 ) -> Result<LoweredExchanges, ExchangeLoweringError> {
@@ -444,7 +447,14 @@ pub(crate) fn lower_exchanges_cached(
                 receive_counts,
                 incoming_bases,
                 optimized,
-            } = cache.select(phase.id, topology, pending, program.tile_count)?;
+            } = select_phase(
+                phase.id,
+                topology,
+                pending,
+                program.tile_count,
+                stream_words,
+                cache,
+            )?;
             let schedule_problem = schedule_problem(phase.id.index(), &pending);
             let mut destination_multiplicity = BTreeMap::new();
             for transfer in &pending {
@@ -492,7 +502,7 @@ pub(crate) fn lower_exchanges_cached(
                         &incoming_bases,
                         &receive_counts,
                         program.tile_count,
-                        cache.stream_words,
+                        stream_words,
                     )?;
                     tracing::info!(
                         phase = phase.id.index(),
@@ -1137,6 +1147,55 @@ fn optimize_owned_pending(
         incoming_bases,
         optimized,
     })
+}
+
+/// Select under the caller's scheduling policy, replaying only compatible work.
+/// Policy is an input to compilation; the cache merely records prior choices.
+fn select_phase(
+    phase: ExchangePhaseId,
+    topology: &Topology,
+    pending: Vec<PendingTransfer>,
+    tile_count: u16,
+    stream_words: Option<std::num::NonZeroU32>,
+    cache: &mut ExchangeScheduleCache,
+) -> Result<ScheduledPending, ExchangeLoweringError> {
+    let pending = packet::split_self_receive_conflicts(topology, pending)?;
+    let structure = reuse::structure_fingerprint(&pending, tile_count);
+    if let Some(recipe) = cache.phases.get(&phase)
+        && recipe.structure == structure
+        && recipe.stream_words == stream_words
+    {
+        match recipe.replay(topology, &pending, tile_count) {
+            Ok(Some(schedule)) => {
+                tracing::info!(
+                    phase = phase.index(),
+                    "reused exchange optimization after validating relocated rows"
+                );
+                return Ok(schedule);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(phase = phase.index(), %error, "exchange choices require reoptimization after placement")
+            }
+        }
+    }
+    let selected =
+        select_transfer_widths(phase.index(), topology, pending, tile_count, stream_words)?;
+    cache.phases.insert(
+        phase,
+        std::sync::Arc::new(reuse::ScheduleRecipe {
+            stream_words,
+            structure,
+            widths: selected
+                .pending
+                .iter()
+                .map(|transfer| transfer.width)
+                .collect(),
+            order: selected.optimized.schedule.order.clone(),
+            rows: reuse::normalized_rows(&selected.optimized.schedule)?,
+        }),
+    );
+    Ok(selected)
 }
 
 /// Compare complete width choices. A single width change can leave another

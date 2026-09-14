@@ -11,7 +11,9 @@ problems, including a reproduced disagreement about which work executes.
 Implementation has started: padding removal now transforms the authoritative low
 graph before pure tile projection, and Repeat projections use the common storage
 binding record. The corresponding regression covers both straight-line and
-repeated execution. The diagnoses below describe the reviewed starting point;
+repeated execution. Exchange selection now takes policy separately from its cache,
+and replay rejects policy mismatches without expanding search. The diagnoses
+below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks implemented changes.
 
 ## Diagnosis

@@ -26,7 +26,7 @@ pub use exchange::{
     EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityKind,
     ExchangeScheduleCache, ExchangeScheduleSnapshot, ExchangeSchedulingPriority,
     PhysicalExchangePhase, inactive_exchange_program, schedule_exchange_problem,
-    schedule_exchange_problem_with_priority, validate_exchange_schedule,
+    schedule_exchange_problem_with_priority, select_exchange_schedule, validate_exchange_schedule,
 };
 pub(crate) use graph::*;
 pub use graph::{

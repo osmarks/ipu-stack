@@ -14,6 +14,43 @@ pub enum ExchangeSchedulingPriority {
     BalancedStreams(u32),
 }
 
+/// Select ordinary/paired transfers through the production path, retaining
+/// the recipe for subsequent placement or benchmark replay.
+/// `stream_words` chooses compact balanced waves; `None` selects latency search.
+pub fn select_exchange_schedule(
+    tile_count: u16,
+    problem: &ExchangeScheduleProblem,
+    stream_words: Option<std::num::NonZeroU32>,
+    cache: &mut ExchangeScheduleCache,
+) -> Result<(ExchangeScheduleProblem, ExchangeScheduleRun), ExchangeLoweringError> {
+    validate_snapshot_tile_count(tile_count)?;
+    let topology = Topology::new(
+        (0..tile_count)
+            .map(ipu_exchange::c600_logical_to_physical)
+            .collect(),
+    )?;
+    let pending = pending_from_problem(tile_count, problem)?;
+    if pending
+        .iter()
+        .any(|transfer| transfer.width != ExchangeItemWidth::Word32)
+    {
+        return Err(ExchangeLoweringError::InvalidSnapshot(
+            "width selection requires an ordinary-transfer capture".into(),
+        ));
+    }
+    let selected = select_phase(
+        ExchangePhaseId::from_index(problem.phase),
+        &topology,
+        pending,
+        tile_count,
+        stream_words,
+        cache,
+    )?;
+    let problem = schedule_problem(problem.phase, &selected.pending);
+    let run = finish_exchange_run(problem.phase, selected.incoming_bases, selected.optimized)?;
+    Ok((problem, run))
+}
+
 pub fn schedule_exchange_problem(
     tile_count: u16,
     problem: &ExchangeScheduleProblem,

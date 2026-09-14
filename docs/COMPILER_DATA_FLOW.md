@@ -324,7 +324,7 @@ reduction lowering.
 | `CopyRegions.targets` | Requested logical region to clipped source regions/replica owners | One source set during a copy or conversion; avoids repeating intersection work for replicas |
 | `TileGraphBuilder.kernel_metadata` | Shared provenance/kernel/format access contracts, found by linear lookup | One expansion; operand views remain per call |
 | Timeline `KernelCosts` | Interned call metadata plus physical widths to cycles | One timeline evaluation |
-| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order and normalized encoded rows; also owns the `stream_words` scheduling setting | Incumbent plus speculative candidate snapshots; physical replay is validated |
+| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order, normalized encoded rows and the policy under which they were selected | Incumbent plus speculative candidate snapshots; policy compatibility and physical replay are validated |
 | ELF artifact cache | Source/includes, effective flags, target and tool identity to immutable compiled objects | On disk across builds |
 
 [ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses custom
@@ -337,10 +337,12 @@ standard hash maps. These are not all caches of the same computation.
 expansion. It is mutable lowering state, not a memoization cache, and cannot be
 shared between candidates.
 
-The exchange cache also invokes production algorithm selection using its stored
-stream setting. This is policy ownership as well as caching. Separating policy
-from cached results does not require evaluating more schedules; it makes the
-caller-selected default explicit and requires replay compatibility with it.
+Exchange selection receives `stream_words` explicitly from the pipeline policy,
+separately from the cache. The cache records which policy produced each entry;
+a policy change cannot reuse an earlier selection. The public
+`select_exchange_schedule` entry point applies this same production selection to
+captured transfers. Current defaults, search coverage and checkpoint configuration
+remain unchanged.
 
 The overlapping work is constructing, normalizing and matching byte geometry in
 copy realization and geometry costing. The cached `CopyPlan` additionally

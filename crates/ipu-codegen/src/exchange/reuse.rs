@@ -6,21 +6,21 @@ use std::sync::Arc;
 
 #[derive(Clone, Default)]
 pub struct ExchangeScheduleCache {
-    phases: BTreeMap<ExchangePhaseId, Arc<ScheduleRecipe>>,
-    pub(super) stream_words: Option<std::num::NonZeroU32>,
+    pub(super) phases: BTreeMap<ExchangePhaseId, Arc<ScheduleRecipe>>,
 }
 
 #[derive(Clone)]
-struct ScheduleRecipe {
-    structure: u64,
-    widths: Vec<ExchangeItemWidth>,
-    order: Vec<usize>,
-    rows: Vec<Vec<u32>>,
+pub(super) struct ScheduleRecipe {
+    pub(super) stream_words: Option<std::num::NonZeroU32>,
+    pub(super) structure: u64,
+    pub(super) widths: Vec<ExchangeItemWidth>,
+    pub(super) order: Vec<usize>,
+    pub(super) rows: Vec<Vec<u32>>,
 }
 
 // This is only a cheap rejection filter. Address-dependent dependencies and
 // timing are still rebuilt, validated, and compared against normalized rows.
-fn structure_fingerprint(pending: &[PendingTransfer], tile_count: u16) -> u64 {
+pub(super) fn structure_fingerprint(pending: &[PendingTransfer], tile_count: u16) -> u64 {
     let mut hash = std::hash::DefaultHasher::new();
     tile_count.hash(&mut hash);
     pending.len().hash(&mut hash);
@@ -37,7 +37,7 @@ fn structure_fingerprint(pending: &[PendingTransfer], tile_count: u16) -> u64 {
     hash.finish()
 }
 
-fn normalized_rows(
+pub(super) fn normalized_rows(
     schedule: &MaterializedSchedule,
 ) -> Result<Vec<Vec<u32>>, ExchangeLoweringError> {
     Ok(schedule
@@ -54,50 +54,8 @@ fn normalized_rows(
 }
 
 impl ExchangeScheduleCache {
-    /// Use address-ordered stream waves, prioritizing encoded storage over latency.
-    pub fn with_stream_words(stream_words: Option<std::num::NonZeroU32>) -> Self {
-        Self {
-            stream_words,
-            ..Self::default()
-        }
-    }
-
-    /// Select ordinary/paired transfers through the production path, retaining
-    /// the recipe for subsequent placement or benchmark replay.
-    pub fn schedule_problem(
-        &mut self,
-        tile_count: u16,
-        problem: &ExchangeScheduleProblem,
-    ) -> Result<(ExchangeScheduleProblem, ExchangeScheduleRun), ExchangeLoweringError> {
-        validate_snapshot_tile_count(tile_count)?;
-        let topology = Topology::new(
-            (0..tile_count)
-                .map(ipu_exchange::c600_logical_to_physical)
-                .collect(),
-        )?;
-        let pending = pending_from_problem(tile_count, problem)?;
-        if pending
-            .iter()
-            .any(|transfer| transfer.width != ExchangeItemWidth::Word32)
-        {
-            return Err(ExchangeLoweringError::InvalidSnapshot(
-                "width selection requires an ordinary-transfer capture".into(),
-            ));
-        }
-        let selected = self.select(
-            ExchangePhaseId::from_index(problem.phase),
-            &topology,
-            pending,
-            tile_count,
-        )?;
-        let problem = schedule_problem(problem.phase, &selected.pending);
-        let run = finish_exchange_run(problem.phase, selected.incoming_bases, selected.optimized)?;
-        Ok((problem, run))
-    }
-
     pub(super) fn take_phase(&mut self, phase: ExchangePhaseId) -> Self {
         Self {
-            stream_words: self.stream_words,
             phases: self
                 .phases
                 .remove(&phase)
@@ -110,59 +68,10 @@ impl ExchangeScheduleCache {
     pub(super) fn merge(&mut self, other: Self) {
         self.phases.extend(other.phases);
     }
-
-    pub(super) fn select(
-        &mut self,
-        phase: ExchangePhaseId,
-        topology: &Topology,
-        pending: Vec<PendingTransfer>,
-        tile_count: u16,
-    ) -> Result<ScheduledPending, ExchangeLoweringError> {
-        let pending = packet::split_self_receive_conflicts(topology, pending)?;
-        let structure = structure_fingerprint(&pending, tile_count);
-        if let Some(recipe) = self.phases.get(&phase)
-            && recipe.structure == structure
-        {
-            match recipe.replay(topology, &pending, tile_count) {
-                Ok(Some(schedule)) => {
-                    tracing::info!(
-                        phase = phase.index(),
-                        "reused exchange optimization after validating relocated rows"
-                    );
-                    return Ok(schedule);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::debug!(phase = phase.index(), %error, "exchange choices require reoptimization after placement")
-                }
-            }
-        }
-        let selected = select_transfer_widths(
-            phase.index(),
-            topology,
-            pending,
-            tile_count,
-            self.stream_words,
-        )?;
-        self.phases.insert(
-            phase,
-            Arc::new(ScheduleRecipe {
-                structure,
-                widths: selected
-                    .pending
-                    .iter()
-                    .map(|transfer| transfer.width)
-                    .collect(),
-                order: selected.optimized.schedule.order.clone(),
-                rows: normalized_rows(&selected.optimized.schedule)?,
-            }),
-        );
-        Ok(selected)
-    }
 }
 
 impl ScheduleRecipe {
-    fn replay(
+    pub(super) fn replay(
         &self,
         topology: &Topology,
         ordinary: &[PendingTransfer],
@@ -253,11 +162,11 @@ mod tests {
         ] {
             let topology = Topology::c600();
             let phase = ExchangePhaseId::from_index(0);
-            let mut cache = ExchangeScheduleCache::with_stream_words(words);
+            let mut cache = ExchangeScheduleCache::default();
             let mut child = cache.take_phase(phase);
-            assert_eq!(child.stream_words, words);
             let original = transfers();
-            let first = child.select(phase, &topology, original.clone(), 4).unwrap();
+            let first =
+                select_phase(phase, &topology, original.clone(), 4, words, &mut child).unwrap();
             if words.is_some() {
                 assert_eq!(first.optimized.selected_kind, "balanced-compact-streams");
             }
@@ -268,9 +177,8 @@ mod tests {
                 transfer.destinations[0].1 += 0x4000;
                 transfer.refresh_source_elements();
             }
-            let second = cache
-                .select(phase, &topology, relocated.clone(), 4)
-                .unwrap();
+            let second =
+                select_phase(phase, &topology, relocated.clone(), 4, words, &mut cache).unwrap();
             assert_eq!(second.optimized.selected_kind, "reused");
             assert_eq!(
                 normalized_rows(&first.optimized.schedule).unwrap(),
@@ -278,8 +186,31 @@ mod tests {
             );
             assert_eq!(second.pending[0].source_address(), 0x64000);
             relocated[0].words = 32;
-            let changed = cache.select(phase, &topology, relocated, 4).unwrap();
+            let changed = select_phase(phase, &topology, relocated, 4, words, &mut cache).unwrap();
             assert_ne!(changed.optimized.selected_kind, "reused");
+        }
+    }
+
+    #[test]
+    fn changed_policy_cannot_replay_another_policy_schedule() {
+        let topology = Topology::c600();
+        let phase = ExchangePhaseId::from_index(0);
+        let mut cache = ExchangeScheduleCache::default();
+        for words in [
+            None,
+            std::num::NonZeroU32::new(64),
+            std::num::NonZeroU32::new(256),
+            None,
+        ] {
+            let selected =
+                select_phase(phase, &topology, transfers(), 4, words, &mut cache).unwrap();
+            assert_ne!(selected.optimized.selected_kind, "reused");
+            let reused = select_phase(phase, &topology, transfers(), 4, words, &mut cache).unwrap();
+            assert_eq!(reused.optimized.selected_kind, "reused");
+            assert_eq!(
+                normalized_rows(&selected.optimized.schedule).unwrap(),
+                normalized_rows(&reused.optimized.schedule).unwrap()
+            );
         }
     }
 
@@ -387,6 +318,7 @@ mod tests {
             .is_err()
         );
         let recipe = ScheduleRecipe {
+            stream_words: None,
             structure: structure_fingerprint(&pending, 8),
             widths: vec![ExchangeItemWidth::Word32; pending.len()],
             order: aligned.order.clone(),

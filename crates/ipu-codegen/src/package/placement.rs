@@ -108,6 +108,7 @@ pub(super) fn improve_exchange_placement(
     available_ranges: &[(u32, u32)],
     auxiliary: &[Vec<crate::place::AuxiliaryRequest>],
     topology: &Topology,
+    stream_words: Option<std::num::NonZeroU32>,
     baseline: crate::Placement,
     exchanges: crate::exchange::LoweredExchanges,
     row_capacity: u32,
@@ -150,7 +151,12 @@ pub(super) fn improve_exchange_placement(
     };
     let mut cache = cache.clone();
     let candidate_exchanges = match crate::exchange::lower_exchanges_cached(
-        program, &candidate, topology, false, &mut cache,
+        program,
+        &candidate,
+        topology,
+        stream_words,
+        false,
+        &mut cache,
     ) {
         Ok(exchanges) => exchanges,
         Err(error) => {

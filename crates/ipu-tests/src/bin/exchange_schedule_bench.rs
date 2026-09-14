@@ -158,7 +158,12 @@ fn main() -> Result<()> {
         }
         let mut cache = ExchangeScheduleCache::default();
         if arguments.replay_cache {
-            let (selected, run) = cache.schedule_problem(snapshot.tile_count, captured)?;
+            let (selected, run) = ipu_codegen::select_exchange_schedule(
+                snapshot.tile_count,
+                captured,
+                None,
+                &mut cache,
+            )?;
             validate_exchange_schedule(snapshot.tile_count, &selected, &run.phase)?;
         }
         let mut relocated;
@@ -185,9 +190,13 @@ fn main() -> Result<()> {
                 if !arguments.replay_cache {
                     cache = ExchangeScheduleCache::default();
                 }
-                cache
-                    .schedule_problem(snapshot.tile_count, captured)
-                    .map(|(problem, run)| (std::borrow::Cow::Owned(problem), run))
+                ipu_codegen::select_exchange_schedule(
+                    snapshot.tile_count,
+                    captured,
+                    None,
+                    &mut cache,
+                )
+                .map(|(problem, run)| (std::borrow::Cow::Owned(problem), run))
             } else {
                 schedule_exchange_problem_with_priority(
                     snapshot.tile_count,

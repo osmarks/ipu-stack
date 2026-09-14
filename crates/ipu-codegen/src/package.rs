@@ -662,6 +662,7 @@ fn build_package_from_objects(
             program,
             &placement,
             &topology,
+            config.exchange_stream_words,
             config.exchange_diagnostics,
             exchange_cache,
         )?)
@@ -672,6 +673,7 @@ fn build_package_from_objects(
             &available_ranges,
             &profile_requests,
             &topology,
+            config.exchange_stream_words,
             placement,
             lowered_exchanges,
             exchange_rows.as_ref().map_or(0, |storage| {

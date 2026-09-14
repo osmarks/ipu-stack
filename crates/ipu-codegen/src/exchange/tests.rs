@@ -157,15 +157,26 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                         2,
                         "the pretrained-plan regression must split"
                     );
-                    let mut cache =
-                        ExchangeScheduleCache::with_stream_words(std::num::NonZeroU32::new(1024));
-                    let (selected, run) = cache.schedule_problem(1472, &problem).unwrap();
+                    let mut cache = ExchangeScheduleCache::default();
+                    let (selected, run) = select_exchange_schedule(
+                        1472,
+                        &problem,
+                        std::num::NonZeroU32::new(1024),
+                        &mut cache,
+                    )
+                    .unwrap();
                     validate_exchange_schedule(1472, &selected, &run.phase).unwrap();
                     let mut relocated = problem.clone();
                     for address in &mut relocated.transfers[0].source_addresses {
                         *address += 0x100;
                     }
-                    let (selected, run) = cache.schedule_problem(1472, &relocated).unwrap();
+                    let (selected, run) = select_exchange_schedule(
+                        1472,
+                        &relocated,
+                        std::num::NonZeroU32::new(1024),
+                        &mut cache,
+                    )
+                    .unwrap();
                     assert!(run.reused);
                     validate_exchange_schedule(1472, &selected, &run.phase).unwrap();
                 }

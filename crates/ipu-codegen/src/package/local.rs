@@ -14,8 +14,7 @@ pub(super) fn optimize<T: Send>(
 ) -> PackageBuildResult<(ScheduledPlan, T)> {
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
     let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
-    let mut schedules =
-        crate::ExchangeScheduleCache::with_stream_words(config.exchange_stream_words);
+    let mut schedules = crate::ExchangeScheduleCache::default();
     let mut state = checkpoint::State::load(graph, config, tile_mapping)?;
     let mut fixed = config.clone();
     let resuming = config.load_search_state.is_some();
@@ -297,8 +296,14 @@ fn validate<T>(
     let (program, _) = validation::expand_and_screen(mid, config, mapping, expansions)?;
     let placement = place(&program)?;
     let topology = active_topology(config.tile_count)?;
-    let exchanges =
-        crate::exchange::lower_exchanges_cached(&program, &placement, &topology, false, cache)?;
+    let exchanges = crate::exchange::lower_exchanges_cached(
+        &program,
+        &placement,
+        &topology,
+        config.exchange_stream_words,
+        false,
+        cache,
+    )?;
     let mut plan = ScheduledPlan {
         program,
         placement,
