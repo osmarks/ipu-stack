@@ -373,7 +373,8 @@ fn compact_matrix_layout(tensor: &TensorType, tiles: u16) -> Option<Layout> {
 /// Select persistent homes before capacity screening. Sequence members share
 /// one rotation; derived values follow that rotation but are not counted again.
 pub(super) fn assign_parameter_tiles(
-    values: &mut [MidValue],
+    values: &mut Vec<MidValue>,
+    operations: &mut Vec<MidOperation>,
     parameters: &[MidValueId],
     copies: &BTreeMap<MidValueId, u32>,
     tile_count: u16,
@@ -414,13 +415,58 @@ pub(super) fn assign_parameter_tiles(
         offsets.insert(group, offset);
     }
     let mut changed = false;
-    for value in values {
+    for value in values.iter_mut() {
         if let Some(&offset) = offsets.get(&value.storage_group) {
             changed |= value.tile_offset != offset;
             value.tile_offset = offset;
         }
     }
+    if changed {
+        bind_compute_owners(operations, values);
+    }
     Ok(changed)
+}
+
+/// Changing persistent homes is a mid transformation: every direct compute
+/// reader keeps its selected owners through an explicit copy. Copy consumers
+/// already express this ownership change in their result binding.
+fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidValue>) {
+    let mut result = Vec::with_capacity(operations.len());
+    for mut operation in std::mem::take(operations) {
+        match &mut operation.kind {
+            MidOperationKind::Repeat(repeat) => {
+                bind_compute_owners(&mut repeat.body.operations, values);
+            }
+            MidOperationKind::Primitive(Primitive::Compute { operands, .. }) => {
+                let offset = values[operation.results[0].index() as usize].tile_offset;
+                for input in operation.inputs.iter_mut().take(operands.len()) {
+                    if values[input.index() as usize].tile_offset != offset {
+                        let mut value = values[input.index() as usize].clone();
+                        value.id = MidValueId(values.len() as u32);
+                        value.tile_offset = offset;
+                        value.storage_group = value.id;
+                        let id = value.id;
+                        values.push(value);
+                        result.push(MidOperation {
+                            source: operation.source,
+                            inputs: vec![*input],
+                            results: vec![id],
+                            kind: MidOperationKind::Primitive(Primitive::Copy {
+                                mapping: CoordinateMapping::default(),
+                                reuse_local: true,
+                            }),
+                            estimated_cycles: 0,
+                            estimated_exchange_cycles: 0,
+                        });
+                        *input = id;
+                    }
+                }
+            }
+            _ => {}
+        }
+        result.push(operation);
+    }
+    *operations = result;
 }
 
 fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
@@ -746,13 +792,27 @@ mod tests {
         values[4].tensor_type =
             TensorType::new([8192], Precision::F16, Layout::logical_linear(8, 4));
         let parameters = [MidValueId(0), MidValueId(1), MidValueId(2), MidValueId(3)];
-        assign_parameter_tiles(&mut values, &parameters, &BTreeMap::new(), 8).unwrap();
+        assign_parameter_tiles(
+            &mut values,
+            &mut Vec::new(),
+            &parameters,
+            &BTreeMap::new(),
+            8,
+        )
+        .unwrap();
         assert_eq!(values[0].tile_offset, values[1].tile_offset);
         assert_eq!(values[2].tile_offset, values[4].tile_offset);
         assert_ne!(values[0].tile_offset, values[2].tile_offset);
         let offsets = values.iter().map(|v| v.tile_offset).collect::<Vec<_>>();
         values[4].tensor_type.shape = TensorShape(vec![16384]);
-        assign_parameter_tiles(&mut values, &parameters, &BTreeMap::new(), 8).unwrap();
+        assign_parameter_tiles(
+            &mut values,
+            &mut Vec::new(),
+            &parameters,
+            &BTreeMap::new(),
+            8,
+        )
+        .unwrap();
         assert_eq!(
             offsets,
             values.iter().map(|v| v.tile_offset).collect::<Vec<_>>()

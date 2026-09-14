@@ -3,8 +3,8 @@ fn lower_to_tiles(
     graph: &crate::MidProgram,
     checkpoints: bool,
 ) -> super::ExpansionResult<crate::LowProgram> {
-    let graph = crate::mid::implementation::resolve(graph.clone())
-        .ok_or(super::ExpansionError::InvalidOperatorPlan)?;
+    let mut graph = graph.clone();
+    graph.compose_copies();
     let cache = Arc::new(ExpansionCache::default());
     let expected = super::expand_tiles_cached(&graph, true, Arc::new(ExpansionCache::disabled()))?;
     for _ in 0..2 {
@@ -317,7 +317,7 @@ fn format(tiles: u16) -> TensorFormat {
 }
 
 #[test]
-fn streamed_conversion_does_not_require_an_adjacent_consumer() {
+fn panel_construction_keeps_both_operand_casts_materialized() {
     let mut graph = ComputeGraph::new();
     let left = graph.host_input("left", [8, 128]).unwrap();
     let right = graph.parameter("right", [128, 64]).unwrap();
@@ -341,28 +341,32 @@ fn streamed_conversion_does_not_require_an_adjacent_consumer() {
         )
     });
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    let streamed = mid
+    let casts = mid
         .operations
         .iter()
-        .enumerate()
-        .filter_map(|(index, operation)| {
-            let plan = operation.conversion_plan()?;
-            (plan.output.materialization == crate::OperandMaterialization::DispatchSlices)
-                .then_some((index, operation.results[0]))
+        .filter(|op| {
+            op.conversion_plan()
+                .is_some_and(|plan| plan.input.format.precision != plan.output.format.precision)
         })
         .collect::<Vec<_>>();
+    assert_eq!(casts.len(), 2);
     assert!(
-        streamed
+        casts
             .iter()
-            .any(|&(index, result)| !mid.operations[index + 1].inputs.contains(&result))
+            .all(|op| op.conversion_plan().unwrap().output.materialization
+                == crate::OperandMaterialization::Complete)
     );
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-    for (_, result) in streamed {
-        let value = low.value_shards(result);
-        assert!(value.iter().all(|shard| matches!(
-            low.shards[shard.index() as usize].definition,
-            ShardDefinition::Unmaterialized
-        )));
+    for cast in casts {
+        assert!(!low.value_shards(cast.results[0]).is_empty());
+        assert!(
+            low.value_shards(cast.results[0])
+                .iter()
+                .all(|shard| !matches!(
+                    low.shards[shard.index() as usize].definition,
+                    ShardDefinition::Unmaterialized
+                ))
+        );
     }
 }
 
@@ -527,7 +531,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .collect();
         let mid = lower(&graph, &config, &Ipu21CostModel)
             .unwrap_or_else(|error| panic!("case {case}: {error}"));
-        let compact = crate::mid::implementation::resolve(mid.clone()).unwrap();
+        let compact = mid.clone();
         let sum = compact
             .operations
             .iter()
@@ -684,12 +688,6 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
         .collect();
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        assert!(mid.operations.iter().all(|operation| {
-            operation.operator_plan().is_none_or(|plan| {
-                plan.requirements.inputs[1].format.layout.tiling.tile_count == owner_tiles
-                    && plan.requirements.output.format.layout.tiling.tile_count == compute_tiles
-            })
-        }));
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let parameter_tiles = |name: &str| {
             low.value_shards(
@@ -755,7 +753,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
 }
 
 #[test]
-fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
+fn randomized_panel_consumers_have_bounded_materialized_operands() {
     let mut random = fastrand::Rng::with_seed(0x7374_7265_616d);
     for case in 0..8 {
         let batch = random.u32(1..=4);
@@ -782,29 +780,13 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
         config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let deferred = mid
-            .operations
-            .iter()
-            .filter_map(|operation| {
-                operation.conversion_plan().and_then(|plan| {
-                    (plan.output.materialization == crate::OperandMaterialization::DispatchSlices)
-                        .then(|| operation.results[0])
-                })
-            })
-            .collect::<BTreeSet<_>>();
-        assert!(!deferred.is_empty(), "case {case}");
-        let consumers = mid
-            .operations
-            .iter()
-            .filter(|operation| {
-                operation
-                    .inputs
-                    .iter()
-                    .any(|input| deferred.contains(input))
-            })
-            .filter_map(|operation| operation.source)
-            .collect::<BTreeSet<_>>();
-
+        assert!(
+            mid.operations.iter().all(|op| op
+                .conversion_plan()
+                .is_none_or(
+                    |plan| plan.output.materialization == crate::OperandMaterialization::Complete
+                ))
+        );
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         for run in low
             .tiles
@@ -830,38 +812,8 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
                 "case {case}"
             );
         }
-        assert!(
-            low.exchange_phases
-                .iter()
-                .all(
-                    |phase| phase.provenance.reason != WorkReason::LayoutRearrangement
-                        || phase
-                            .provenance
-                            .value
-                            .is_none_or(|value| !deferred.contains(&value))
-                ),
-            "case {case}"
-        );
-        assert!(
-            low.exchange_phases
-                .iter()
-                .any(|phase| phase.provenance.reason == WorkReason::OperatorInputs),
-            "case {case}"
-        );
-        assert!(
-            deferred
-                .iter()
-                .flat_map(|&value| low.value_shards(value))
-                .all(|shard| low.shards[shard.index() as usize].definition
-                    == ShardDefinition::Unmaterialized),
-            "case {case}"
-        );
         for run in &low.kernel_runs {
-            if run
-                .provenance
-                .operation
-                .is_some_and(|operation| consumers.contains(&operation))
-            {
+            if matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
                 let input = &run.inputs[0].views[0];
                 assert_ne!(
                     low.shards[input.shard.index() as usize].definition,
@@ -1530,7 +1482,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let resolved = crate::mid::implementation::resolve(mid.clone()).unwrap();
+        let resolved = mid.clone();
         let uncached =
             super::expand_tiles_cached(&resolved, true, Arc::new(ExpansionCache::disabled()))
                 .unwrap();
@@ -1707,31 +1659,17 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                         && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
                 })
         });
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let operation = mid
-            .operations
-            .iter()
-            .find(|operation| matches!(operation.kind, MidOperationKind::Operator { .. }))
-            .unwrap();
-        let right_type = &mid.values[operation.inputs[1].index() as usize].tensor_type;
-        assert_eq!(
-            right_type.format.layout.order,
-            crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
-                row_block: 64,
-                column_block: crate::mid::AMP_COLUMN_MICRO as u16,
-            })
-        );
-        // Native host bindings exercise resident kernels independently of the
-        // canonical baseline's explicit activation/compact-weight conversions.
+        let selected = crate::mid::baseline::select(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &crate::mid::baseline::Recipe::default(),
+        )
+        .unwrap();
+        let plan = selected.recipe.plans.values().next().unwrap();
         let config = config
-            .with_input(
-                left,
-                mid.values[operation.inputs[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .clone(),
-            )
-            .with_input(right, right_type.format.clone());
+            .with_input(left, plan.requirements.inputs[0].format.clone())
+            .with_input(right, plan.requirements.inputs[1].format.clone());
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
@@ -2249,7 +2187,7 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                             },
                         );
                         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-                        let mut mid = crate::mid::implementation::resolve(mid).unwrap();
+                        let mut mid = mid;
                         assert_eq!(
                             mid.operations.len(),
                             if chain == 2 || chain == 3 { 2 } else { 1 }

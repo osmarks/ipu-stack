@@ -114,8 +114,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         inputs: &[TensorType],
         output: &TensorType,
     ) -> Option<Arc<crate::MidProgram>> {
-        let mut plan = plan.clone();
-        plan.deferred_output = None;
+        let plan = plan.clone();
         let key = (plan, inputs.to_vec(), output.clone());
         if let Some(retained) = self.implementations.lock().unwrap().get(&key).cloned() {
             return Some(retained);
@@ -546,7 +545,6 @@ mod tests {
                         operator,
                         dispatch: pointwise_dispatch(),
                         requirements: pointwise_requirements(sharded.format.clone()),
-                        deferred_output: None,
                     },
                     std::slice::from_ref(&sharded),
                     &sharded,
@@ -556,7 +554,6 @@ mod tests {
                         operator,
                         dispatch: pointwise_dispatch(),
                         requirements: pointwise_requirements(unsharded.format.clone()),
-                        deferred_output: None,
                     },
                     std::slice::from_ref(&unsharded),
                     &unsharded,

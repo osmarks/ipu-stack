@@ -317,157 +317,55 @@ fn project_tiling(
     })
 }
 
-/// Inline compact operator implementations into the same whole-device IR.
-/// This is algorithm decomposition, not tile expansion or another search.
-pub(crate) fn resolve(program: MidProgram) -> Option<MidProgram> {
-    resolve_rewriting(program, |_| {})
-}
-
-/// Expose all materialization boundaries to rewrites before composing copies.
-pub(crate) fn resolve_rewriting(
-    mut program: MidProgram,
-    rewrite: impl FnOnce(&mut MidProgram),
-) -> Option<MidProgram> {
-    program.operations = resolve_region(program.operations, &mut program.values, &program.outputs)?;
-    rewrite(&mut program);
-    super::copy::compose_region(&mut program.operations, &program.values, &program.outputs);
-    Some(program)
-}
-
-fn resolve_region(
-    operations: Vec<MidOperation>,
+/// Bind an executable fragment into a region. The family has already chosen
+/// every operation and declared the input contract; this only remaps values.
+/// Temporary ownership is relative to the selected result's owners.
+pub(crate) fn append_fragment(
+    fragment: &MidProgram,
+    inputs: &[MidValueId],
+    outputs: &[MidValueId],
+    source: Option<OperationId>,
     values: &mut Vec<MidValue>,
-    required: &[MidValueId],
-) -> Option<Vec<MidOperation>> {
-    // Only operator implementations can consume the pre-conversion source and
-    // materialize their own slices. Casts, copies and region bindings need the
-    // declared value, even if its eventual operator requested dispatch slices.
-    let materialized = required
-        .iter()
-        .chain(
-            operations
-                .iter()
-                .filter(|op| !matches!(op.kind, MidOperationKind::Operator { .. }))
-                .flat_map(MidOperation::read_values),
-        )
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut result = Vec::new();
-    let mut deferred = BTreeMap::<MidValueId, MidValueId>::new();
-    for mut operation in operations {
-        match &mut operation.kind {
-            MidOperationKind::Operator {
-                plan,
-                implementation,
-                ..
-            } => {
-                let input_ids = operation
-                    .inputs
-                    .iter()
-                    .map(|id| deferred.get(id).copied().unwrap_or(*id))
-                    .collect::<Vec<_>>();
-                let inputs = input_ids
-                    .iter()
-                    .map(|id| values[id.index() as usize].tensor_type.clone())
-                    .collect::<Vec<_>>();
-                let output_id = *operation.results.first()?;
-                let output = values[output_id.index() as usize].clone();
-                let fragment = if input_ids == operation.inputs {
-                    implementation.clone()
-                } else {
-                    None
-                }
-                .or_else(|| implement(plan, &inputs, &output.tensor_type))
-                .or_else(|| { tracing::debug!(source=?operation.source, ?plan, ?inputs, output=?output.tensor_type, "cannot resolve operator implementation"); None })?;
-                let anchor = match plan.dispatch {
-                    OperatorDispatch::BlockedGemm { orientation, .. } => {
-                        values[input_ids[orientation.operand_indices().0].index() as usize]
-                            .tile_offset
-                    }
-                    _ => output.tile_offset,
-                };
-                let mut ids = vec![None; fragment.values.len()];
-                for (input, &value) in fragment.inputs.iter().zip(&input_ids) {
-                    ids[input.value.index() as usize] = Some(value);
-                }
-                for (&source, &target) in fragment.outputs.iter().zip(&operation.results) {
-                    ids[source.index() as usize] = Some(target);
-                }
-                for value in &fragment.values {
-                    if ids[value.id.index() as usize].is_none() {
-                        let id = MidValueId(values.len() as u32);
-                        ids[value.id.index() as usize] = Some(id);
-                        values.push(MidValue {
-                            id,
-                            tile_offset: anchor,
-                            tensor_type: value.tensor_type.clone(),
-                            origin: output.origin,
-                            storage_group: id,
-                        });
-                    }
-                }
-                for step in &fragment.operations {
-                    let mut step = step.clone();
-                    step.source = operation.source;
-                    for value in step.inputs.iter_mut().chain(&mut step.results) {
-                        *value = ids[value.index() as usize]?;
-                    }
-                    if let MidOperationKind::Primitive(Primitive::Compute { operands, .. }) =
-                        &step.kind
-                    {
-                        let offset = values[step.results[0].index() as usize].tile_offset;
-                        for input in step.inputs.iter_mut().take(operands.len()) {
-                            if values[input.index() as usize].tile_offset != offset {
-                                let mut value = values[input.index() as usize].clone();
-                                value.id = MidValueId(values.len() as u32);
-                                value.tile_offset = offset;
-                                value.storage_group = value.id;
-                                let id = value.id;
-                                values.push(value);
-                                result.push(MidOperation {
-                                    source: operation.source,
-                                    inputs: vec![*input],
-                                    results: vec![id],
-                                    kind: MidOperationKind::Primitive(Primitive::Copy {
-                                        mapping: CoordinateMapping::default(),
-                                        reuse_local: true,
-                                    }),
-                                    estimated_cycles: 0,
-                                    estimated_exchange_cycles: 0,
-                                });
-                                *input = id;
-                            }
-                        }
-                    }
-                    result.push(step);
-                }
-            }
-            MidOperationKind::Repeat(repeat) => {
-                repeat.body.operations = resolve_region(
-                    std::mem::take(&mut repeat.body.operations),
-                    values,
-                    &repeat.body.yields,
-                )?;
-                result.push(operation);
-            }
-            MidOperationKind::Convert(plan) => {
-                if plan.output.materialization == OperandMaterialization::DispatchSlices
-                    && !operation.results.iter().any(|id| materialized.contains(id))
-                {
-                    let source = deferred
-                        .get(&operation.inputs[0])
-                        .copied()
-                        .unwrap_or(operation.inputs[0]);
-                    deferred.insert(operation.results[0], source);
-                    continue;
-                }
-                plan.output.materialization = OperandMaterialization::Complete;
-                result.push(operation);
-            }
-            MidOperationKind::Primitive(_) => result.push(operation),
+    operations: &mut Vec<MidOperation>,
+) -> Option<()> {
+    if fragment.inputs.len() != inputs.len() || fragment.outputs.len() != outputs.len() {
+        return None;
+    }
+    let output = values[outputs.first()?.index() as usize].clone();
+    let mut ids = vec![None; fragment.values.len()];
+    for (input, &value) in fragment.inputs.iter().zip(inputs) {
+        if fragment.values[input.value.index() as usize].tensor_type
+            != values[value.index() as usize].tensor_type
+        {
+            return None;
+        }
+        ids[input.value.index() as usize] = Some(value);
+    }
+    for (&from, &to) in fragment.outputs.iter().zip(outputs) {
+        ids[from.index() as usize] = Some(to);
+    }
+    for value in &fragment.values {
+        if ids[value.id.index() as usize].is_none() {
+            let id = MidValueId(values.len() as u32);
+            ids[value.id.index() as usize] = Some(id);
+            values.push(MidValue {
+                id,
+                tile_offset: output.tile_offset,
+                tensor_type: value.tensor_type.clone(),
+                origin: output.origin,
+                storage_group: id,
+            });
         }
     }
-    Some(result)
+    for step in &fragment.operations {
+        let mut step = step.clone();
+        step.source = source;
+        for value in step.inputs.iter_mut().chain(&mut step.results) {
+            *value = ids[value.index() as usize]?;
+        }
+        operations.push(step);
+    }
+    Some(())
 }
 
 pub(crate) fn same_distribution(a: &TensorType, b: &TensorType) -> bool {

@@ -105,12 +105,7 @@ fn direct_consumer_layouts(
     layouts
 }
 
-fn view_plan(
-    operator: MidOperator,
-    source: TensorFormat,
-    layout: Layout,
-    deferred_output: Option<DeferredOutputPlan>,
-) -> OperatorPlan {
+fn view_plan(operator: MidOperator, source: TensorFormat, layout: Layout) -> OperatorPlan {
     OperatorPlan {
         operator,
         dispatch: OperatorDispatch::View,
@@ -122,7 +117,6 @@ fn view_plan(
             inputs: vec![OperandRequirement::new(source)],
             output_aliasing: OutputAliasing::Fresh,
         },
-        deferred_output,
     }
 }
 
@@ -173,17 +167,7 @@ pub(super) fn plans(
             direct_consumer_layouts.to_vec()
         };
         for layout in layouts {
-            let plan = view_plan(
-                MidOperator::View(view),
-                input.format.clone(),
-                layout,
-                Some(DeferredOutputPlan {
-                    source_input: 0,
-                    transform: view,
-                    unfused_cycles: 0,
-                    unfused_exchange_cycles: 0,
-                }),
-            );
+            let plan = view_plan(MidOperator::View(view), input.format.clone(), layout);
             if !plans.contains(&plan) {
                 plans.push(plan);
             }
@@ -221,7 +205,6 @@ pub(super) fn plans(
             MidOperator::View(view),
             source,
             row_major(output),
-            None,
         ));
     }
     if let OperationKind::Slice(slice) = operation.kind
@@ -239,7 +222,6 @@ pub(super) fn plans(
                 MidOperator::Slice(slice),
                 input.format.clone(),
                 layout,
-                None,
             ));
         }
     }
@@ -314,7 +296,6 @@ pub(super) fn plans(
                         output: OperandRequirement::new(output_format.clone()),
                         output_aliasing: OutputAliasing::Fresh,
                     },
-                    deferred_output: None,
                 };
                 plans.extend(attention::product_variants(plan, inputs, config));
             }
@@ -451,7 +432,6 @@ pub(super) fn plans(
                         output: OperandRequirement::new(format),
                         output_aliasing: OutputAliasing::MayAliasInputs(vec![0]),
                     },
-                    deferred_output: None,
                 };
                 if !plans.contains(&plan) {
                     plans.push(plan);

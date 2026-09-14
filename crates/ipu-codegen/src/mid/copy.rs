@@ -2,6 +2,12 @@
 
 use super::*;
 
+impl MidProgram {
+    pub(crate) fn compose_copies(&mut self) {
+        compose_region(&mut self.operations, &self.values, &self.outputs);
+    }
+}
+
 /// Batch adjacent independent copies. Their local preparations precede one
 /// shared exchange. Diagnostic builds retain semantic checkpoint boundaries.
 pub(crate) fn independent_copy_prefix(

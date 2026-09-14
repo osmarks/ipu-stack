@@ -245,6 +245,11 @@ mod tests {
         };
         let mut program = MidProgram {
             tile_count: 12,
+            inputs: vec![MidInput {
+                name: "x".into(),
+                kind: GraphInputKind::Host,
+                value: MidValueId(0),
+            }],
             values,
             operations: vec![
                 operation(
@@ -331,6 +336,11 @@ mod tests {
                     Precision::F16,
                     Layout::row_major(TensorTiling::replicated(1)),
                 ),
+            });
+            norm.inputs.push(MidInput {
+                name: format!("parameter.{}", id.index()),
+                kind: GraphInputKind::Parameter,
+                value: id,
             });
             norm.operations[0].inputs.push(id);
         }
@@ -484,6 +494,13 @@ mod tests {
                 }
                 let mut program = MidProgram {
                     tile_count: 1,
+                    inputs: (0..if norm { 3 } else { 1 })
+                        .map(|index| MidInput {
+                            name: format!("input.{index}"),
+                            kind: GraphInputKind::Host,
+                            value: MidValueId(index),
+                        })
+                        .collect(),
                     values,
                     operations: vec![producer, copy, cast],
                     outputs: vec![MidValueId(4)],
@@ -571,8 +588,7 @@ mod tests {
                     };
                     config = config.with_input(x, format.clone()).with_input(rhs, format);
                 }
-                let mid = implementation::resolve(lower(&graph, &config, &Ipu21CostModel).unwrap())
-                    .unwrap();
+                let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
                 let fused = mid.with_elementwise_fusions(&PipelineConfig::new(mid.tile_count));
                 assert_eq!(fused.is_some(), !keep_sum, "norm={norm}");
                 if let Some(fused) = fused {

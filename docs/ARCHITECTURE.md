@@ -6,9 +6,9 @@ broadcast Add, mapped copies, physical packaging, and cache lifetimes.
 
 [Compiler structure proposal](COMPILER_STRUCTURE_PROPOSAL.md) records the
 2026-09-14 design review and proposed responsibility changes. It is a proposal,
-not a description of implemented behavior. In particular, current mid still
-mixes unresolved selections with executable operations, and low still has two
-movement entry paths.
+not a description of fully implemented behavior. Mid now contains executable
+operations only, but still has a separate Convert form, and low still has two
+movement entry paths. The data-flow document tracks the implemented boundaries.
 
 The proposal specifies [scoped ownership and preparation choices](COMPILER_STRUCTURE_PROPOSAL.md#scope-choices-to-the-work-they-affect),
 the [compiler driver and its feedback](COMPILER_STRUCTURE_PROPOSAL.md#concrete-compiler-control-flow),

@@ -82,13 +82,12 @@ pub(crate) fn lower(
     recipe: &Recipe,
 ) -> LoweringResult<Baseline> {
     let mut selected = select(graph, config, costs, recipe)?;
-    let program = implementation::resolve_rewriting(selected.program, |program| {
-        selected.cast_sites = program.reorder_casts(
-            &selected.recipe.cast_before_copies,
-            &selected.recipe.early_casts,
-        );
-    })
-    .ok_or(LoweringError::InvalidImplementation)?;
+    let mut program = selected.program;
+    selected.cast_sites = program.reorder_casts(
+        &selected.recipe.cast_before_copies,
+        &selected.recipe.early_casts,
+    );
+    program.compose_copies();
     selected.recipe.cast_before_copies.extend(
         selected.cast_sites.iter().copied().filter(|(source, _)| {
             source.is_some_and(|id| selected.recipe.early_casts.contains(&id))
@@ -200,7 +199,8 @@ pub(crate) fn select(
             value: id,
         });
     }
-    let operations = builder.region(graph.operations(), graph.outputs(), graph.value_shapes())?;
+    let mut operations =
+        builder.region(graph.operations(), graph.outputs(), graph.value_shapes())?;
     let outputs = graph
         .outputs()
         .iter()
@@ -208,6 +208,7 @@ pub(crate) fn select(
         .collect::<LoweringResult<Vec<_>>>()?;
     ownership::assign_parameter_tiles(
         &mut builder.state.values,
+        &mut operations,
         &inputs
             .iter()
             .filter(|input| input.kind == GraphInputKind::Parameter)
@@ -226,6 +227,7 @@ pub(crate) fn select(
         estimated_exchange_cycles: 0,
         peak_memory: MemoryPeaks::default(),
     };
+    program.validate()?;
     Ok(Baseline {
         cast_sites: BTreeSet::new(),
         program,
@@ -348,11 +350,6 @@ impl<C: CostModel> Builder<'_, C> {
             {
                 plans.retain(|plan| matches!(plan.dispatch, OperatorDispatch::Attention { .. }));
             }
-            let single_use_inputs = operation
-                .inputs
-                .iter()
-                .map(|id| uses.get(id) == Some(&1))
-                .collect::<Vec<_>>();
             let rank = |cycles, memory: MemoryPeaks| {
                 let (first, last) = if self.optimizing {
                     (cycles, memory.total)
@@ -407,7 +404,10 @@ impl<C: CostModel> Builder<'_, C> {
                                 ensure_format(
                                     id,
                                     requirement.format.clone(),
-                                    requirement.materialization,
+                                    // This baseline prices whole-input transitions even
+                                    // for panel candidates. Their bounded lifetime is
+                                    // represented by the family fragment's memory peak.
+                                    OperandMaterialization::Complete,
                                     operation.id,
                                     self.costs,
                                     &mut state,
@@ -454,16 +454,16 @@ impl<C: CostModel> Builder<'_, C> {
                             values.insert(origin, id);
                         }
                         let mut sequence = Vec::new();
-                        apply_selected_plan(
+                        emit_selected(
                             operation,
                             shape.clone(),
-                            plan.clone(),
-                            &single_use_inputs,
+                            plan,
                             self.costs,
                             &mut values,
                             &mut state,
                             &mut sequence,
-                        );
+                        )
+                        .ok()?;
                         let mut result = values[&operation.results[0]];
                         if !self.recipe.open_boundaries.contains(&operation.results[0]) {
                             let precision = state.get(result).tensor_type.format.precision;
@@ -501,14 +501,12 @@ impl<C: CostModel> Builder<'_, C> {
                             &live,
                             &state.values,
                         );
-                        let fragment = implementation::resolve_rewriting(fragment, |fragment| {
-                            if early_cast {
-                                fragment.reorder_casts(
-                                    &BTreeSet::new(),
-                                    &BTreeSet::from([operation.id]),
-                                );
-                            }
-                        })?;
+                        let mut fragment = fragment;
+                        if early_cast {
+                            fragment
+                                .reorder_casts(&BTreeSet::new(), &BTreeSet::from([operation.id]));
+                        }
+                        fragment.compose_copies();
                         let (cycles, memory) = crate::estimate::analyze_with_budget(
                             &fragment,
                             &BTreeMap::new(),
@@ -549,16 +547,15 @@ impl<C: CostModel> Builder<'_, C> {
                 .map(|id| self.state.get(*id).origin)
                 .collect::<BTreeSet<_>>();
             let previous_values = self.state.values.len();
-            apply_selected_plan(
+            emit_selected(
                 operation,
                 shape.clone(),
-                selected,
-                &single_use_inputs,
+                &selected,
                 self.costs,
                 &mut self.values,
                 &mut self.state,
                 &mut operations,
-            );
+            )?;
             // Materialized parameter copies are ordinary temporaries, not members
             // of the persistent sequence's ownership/replication group.
             for value in &mut self.state.values[previous_values..] {
@@ -592,7 +589,6 @@ impl<C: CostModel> Builder<'_, C> {
                 self.values.insert(output, id);
             }
         }
-        restore_unclaimed_deferred_costs(&mut operations);
         Ok(operations)
     }
 

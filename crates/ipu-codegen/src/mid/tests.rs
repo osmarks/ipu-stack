@@ -37,7 +37,7 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
         .with_automatic_input(gamma, Precision::F16)
         .with_automatic_input(beta, Precision::F16);
     let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
-    let resolved = implementation::resolve(mid.clone()).unwrap();
+    let resolved = mid.clone();
     assert!(resolved.operations.iter().any(|op| matches!(
         op.kind,
         MidOperationKind::Primitive(Primitive::Compute {
@@ -537,7 +537,6 @@ fn randomized_cycle_model_rewards_direct_interleaved_weight_loads() {
             operator,
             dispatch,
             requirements,
-            deferred_output: None,
         };
         let standard_cost =
             Ipu21CostModel.operator_cycles(&plan, &[left.clone(), standard], &output);
@@ -640,7 +639,10 @@ fn assert_operator_signature(
     inputs: &[TensorFormat],
     output: TensorFormat,
 ) {
-    assert_eq!(operation.inputs.len(), inputs.len());
+    let MidOperationKind::Primitive(Primitive::Compute { operands, .. }) = &operation.kind else {
+        panic!("expected compute")
+    };
+    assert_eq!(operands.len(), inputs.len());
     for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
         assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
     }
@@ -810,30 +812,38 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let operator = lowered
             .operations
             .iter()
-            .find(|operation| matches!(operation.kind, MidOperationKind::Operator { .. }))
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Gemm { .. },
+                        ..
+                    })
+                )
+            })
             .unwrap();
-        let MidOperationKind::Operator {
-            plan:
-                OperatorPlan {
-                    operator:
-                        MidOperator::Gemm {
-                            multiply: selected_multiply,
-                            accumulate: selected_accumulate,
-                            ..
-                        },
+        let MidOperationKind::Primitive(Primitive::Compute {
+            kernel:
+                TileKernelSpec::Gemm {
+                    multiply: selected_multiply,
+                    accumulate: selected_accumulate,
                     ..
                 },
             ..
-        } = operator.kind
+        }) = operator.kind
         else {
             panic!("random case {case}: expected GEMM");
         };
         assert_eq!(selected_multiply, multiply, "random case {case}");
         assert_eq!(selected_accumulate, accumulate, "random case {case}");
+        let left = &value(&lowered, operator.inputs[0]).tensor_type.format;
         assert_eq!(
-            &value(&lowered, operator.inputs[0]).tensor_type.format,
-            &candidate.plan.requirements.inputs[0].format,
-            "random case {case}"
+            left.precision,
+            candidate.plan.requirements.inputs[0].format.precision
+        );
+        assert_eq!(
+            left.layout.order,
+            candidate.plan.requirements.inputs[0].format.layout.order
         );
         let selected_right = &value(&lowered, operator.inputs[1]).tensor_type.format;
         assert_eq!(
@@ -907,14 +917,10 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             .operations
             .iter()
             .filter_map(|operation| match operation.kind {
-                MidOperationKind::Operator {
-                    plan:
-                        OperatorPlan {
-                            operator: MidOperator::Gemm { multiply, .. },
-                            ..
-                        },
+                MidOperationKind::Primitive(Primitive::Compute {
+                    kernel: TileKernelSpec::Gemm { multiply, .. },
                     ..
-                } => Some(multiply),
+                }) => Some(multiply),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -923,21 +929,13 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             vec![Precision::F16, Precision::F32],
             "random case {case}"
         );
-        for operation in lowered.operations.iter().filter(|operation| {
-            matches!(
-                operation.kind,
-                MidOperationKind::Operator {
-                    plan: OperatorPlan {
-                        operator: MidOperator::Gemm { .. },
-                        ..
-                    },
-                    ..
-                }
-            )
-        }) {
-            let requirements = &operation.operator_plan().unwrap().requirements;
+        for &output in &lowered.outputs {
             assert_eq!(
-                requirements.output.format.layout.memory_class,
+                value(&lowered, output)
+                    .tensor_type
+                    .format
+                    .layout
+                    .memory_class,
                 MemoryClass::Ipu21Interleaved
             );
         }
@@ -1031,22 +1029,27 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
         let operators = lowered
             .operations
             .iter()
-            .filter(|operation| matches!(operation.kind, MidOperationKind::Operator { .. }))
+            .filter(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Gelu | TileKernelSpec::Add,
+                        ..
+                    })
+                )
+            })
             .collect::<Vec<_>>();
-        assert_eq!(operators.len(), 3, "random case {case}");
+        assert_eq!(operators.len(), 2, "random case {case}");
         let gelu = operators
             .iter()
             .copied()
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::Gelu,
-                            ..
-                        },
+                    MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Gelu,
                         ..
-                    }
+                    })
                 )
             })
             .expect("random graph retains its GeLU");
@@ -1056,49 +1059,31 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::Add,
-                            ..
-                        },
+                    MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::Add,
                         ..
-                    }
+                    })
                 )
             })
             .expect("random graph retains its add");
-        let attention = operators
-            .iter()
-            .copied()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::FlashAttention { .. },
-                            ..
-                        },
-                        ..
-                    }
-                )
-            })
-            .expect("random graph retains its attention");
         assert_operator_signature(&lowered, gelu, &[gelu_input], gelu_output.clone());
-        assert_eq!(
-            gelu.operator_plan().unwrap().requirements.output_aliasing,
-            OutputAliasing::MayAliasInputs(vec![0])
+        assert!(
+            matches!(&gelu.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) if !output_aliases.is_empty())
         );
         assert_operator_signature(&lowered, add, &[add_left, add_right], add_output);
-        assert_eq!(
-            add.operator_plan().unwrap().requirements.output_aliasing,
-            OutputAliasing::MayAliasInputs(vec![0])
+        assert!(
+            matches!(&add.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) if !output_aliases.is_empty())
         );
-        assert!(matches!(
-            attention.kind,
-            MidOperationKind::Operator { plan: OperatorPlan { operator: MidOperator::FlashAttention { options, .. }, .. }, .. }
-                if options == AttentionOptions::default()
-        ));
+        assert!(lowered.operations.iter().any(|op| matches!(
+            op.kind,
+            MidOperationKind::Primitive(Primitive::Compute {
+                kernel: TileKernelSpec::FlashAttention { .. }
+                    | TileKernelSpec::AttentionSoftmax { .. },
+                ..
+            })
+        )));
         assert_eq!(
-            value(&lowered, attention.results[0]).tensor_type.shape.0,
+            value(&lowered, lowered.outputs[1]).tensor_type.shape.0,
             vec![batch, query_rows, value_channels],
             "random case {case}"
         );
@@ -1177,7 +1162,7 @@ fn randomized_repeat_lowering_retains_sequences_without_unrolling() {
 }
 
 #[test]
-fn randomized_single_use_views_are_claimed_by_slice_consumers() {
+fn randomized_single_use_views_compose_into_panel_copies() {
     let mut random = fastrand::Rng::with_seed(0x6465_6665_7272_6564);
     for case in 0..RANDOM_CASES / 32 {
         let heads = random.u32(2..=6);
@@ -1211,68 +1196,26 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
         config.conversion_streaming = ConversionStreamingPolicy::Always;
 
         let lowered = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let producers = lowered
+        let compact = &lowered;
+        // View outputs with no remaining users need no separate allocation.
+        assert!(compact.operations.iter().all(|op| {
+            !op.results
+                .iter()
+                .any(|&id| split.contains(&compact.values[id.index() as usize].origin))
+        }));
+        let consumer = compact
             .operations
             .iter()
-            .filter(|operation| {
+            .find(|op| {
                 matches!(
-                    operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::View(_),
-                            ..
-                        },
+                    op.kind,
+                    MidOperationKind::Primitive(Primitive::Compute {
+                        kernel: TileKernelSpec::AttentionSoftmax { .. },
                         ..
-                    }
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(producers.len(), split.len(), "random case {case}");
-        assert!(
-            producers.iter().all(|operation| {
-                operation.estimated_cycles == 0
-                    && operation
-                        .operator_plan()
-                        .is_some_and(|plan| plan.deferred_output.is_some())
-            }),
-            "random case {case}"
-        );
-        let consumer = lowered
-            .operations
-            .iter()
-            .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::FlashAttention { .. },
-                            ..
-                        },
-                        ..
-                    }
+                    })
                 )
             })
             .unwrap();
-        let claims = consumer.deferred_inputs();
-        assert_eq!(claims.len(), split.len(), "random case {case}");
-        assert!(claims.iter().all(Option::is_some), "random case {case}");
-        let compact = implementation::resolve(lowered.clone()).unwrap();
-        for claim in claims.iter().flatten() {
-            assert!(
-                compact
-                    .operations
-                    .iter()
-                    .all(|op| !op.results.contains(&claim.producer)),
-                "claimed view must not be separately materialized"
-            );
-        }
-
-        assert!(
-            compact
-                .operations
-                .iter()
-                .all(|op| !matches!(op.kind, MidOperationKind::Operator { .. }))
-        );
         assert!(compact.operations.iter().any(|op| matches!(
             op.kind,
             MidOperationKind::Primitive(Primitive::Copy {
@@ -1335,7 +1278,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
             .count();
         assert!(
             attention_phases > 0,
-            "random case {case}: deferred movement must be priced"
+            "random case {case}: panel movement must be priced"
         );
         assert!(
             attention_phases
@@ -1351,7 +1294,7 @@ fn randomized_single_use_views_are_claimed_by_slice_consumers() {
 }
 
 #[test]
-fn randomized_unclaimed_deferred_offers_restore_materialization_cost() {
+fn randomized_observed_views_retain_materialization_and_cost() {
     let mut random = fastrand::Rng::with_seed(0x756e_636c_6169_6d65);
     for case in 0..RANDOM_CASES / 8 {
         let batch = random.u32(1..=4);
@@ -1374,18 +1317,18 @@ fn randomized_unclaimed_deferred_offers_restore_materialization_cost() {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Operator {
-                        plan: OperatorPlan {
-                            operator: MidOperator::View(_),
-                            ..
-                        },
-                        ..
-                    }
-                )
+                    MidOperationKind::Primitive(Primitive::Copy { .. })
+                ) && operation.results.contains(&lowered.outputs[0])
             })
             .unwrap();
-        assert!(operation.operator_plan().unwrap().deferred_output.is_none());
-        assert!(operation.estimated_cycles != 0, "random case {case}");
+        assert!(
+            crate::estimate::operation_cost(operation, &lowered.values)
+                .unwrap()
+                .0
+                .total
+                != 0,
+            "random case {case}"
+        );
     }
 }
 
@@ -1437,23 +1380,8 @@ fn selected_mid_size_is_independent_of_tile_count() {
         let config = PipelineConfig::new(tiles)
             .with_active_tile_counts([tiles])
             .with_input(input, format(Precision::F16, Layout::row_sharded(tiles)));
-        let recipe = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        assert!(
-            crate::low::expand::expand_tiles(&recipe, true).is_err(),
-            "low must reject unresolved operator recipes"
-        );
-        let selected = implementation::resolve(recipe.clone()).unwrap();
-        assert!(selected.operations.iter().all(|op| matches!(
-            op.kind,
-            MidOperationKind::Primitive(_) | MidOperationKind::Convert(_)
-        )));
-        let mut fresh = recipe.clone();
-        for op in &mut fresh.operations {
-            if let MidOperationKind::Operator { implementation, .. } = &mut op.kind {
-                *implementation = None;
-            }
-        }
-        assert_eq!(selected, implementation::resolve(fresh.clone()).unwrap());
+        let selected = lower(&graph, &config, &Ipu21CostModel).unwrap();
+        assert!(crate::low::expand::expand_tiles(&selected, true).is_ok());
         assert!(crate::estimate::analyze_mid(&selected, &BTreeMap::new()).is_some());
         sizes.push((selected.values.len(), selected.operations.len()));
     }
@@ -1640,14 +1568,14 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
                 reduction_staging: ReductionStaging::Complete,
                 local_weight_staging: LocalOperandStaging::Direct,
             });
-        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        plans.push(
-            mid.operations
-                .iter()
-                .find_map(|op| op.operator_plan())
-                .unwrap()
-                .clone(),
-        );
+        let selected = baseline::select(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &baseline::Recipe::default(),
+        )
+        .unwrap();
+        plans.push(selected.recipe.plans.values().next().unwrap().clone());
     }
     let inputs = [
         TensorType::new([1, 729, 1152], Precision::F16, Layout::row_sharded(1472)),
@@ -2254,7 +2182,7 @@ fn repeated_normalization_can_keep_parameters_compact() {
             assert_eq!(value.tile_offset, first.tile_offset);
         }
     }
-    let resolved = implementation::resolve(mid).unwrap();
+    let resolved = mid;
     let (_, peak) = crate::estimate::analyze_mid(&resolved, &BTreeMap::new()).unwrap();
     assert!(peak.fits_ipu21_with_budget(0, 1500), "{peak:?}");
 }
@@ -2315,7 +2243,7 @@ fn repeated_gemm_can_materialize_concentrated_weights_inside_the_body() {
         .unwrap();
     let parameter = &mid.values[repeat.iterated_inputs[0][0].index() as usize];
     assert!(parameter.tensor_type.format.layout.tiling.tile_count > 2);
-    let resolved = implementation::resolve(mid).unwrap();
+    let resolved = mid;
     let (_, peak) = crate::estimate::analyze_mid(&resolved, &BTreeMap::new()).unwrap();
     assert!(peak.fits_ipu21_with_budget(0, 80000), "{peak:?}");
 }
@@ -2336,52 +2264,29 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
             layout: Layout::row_sharded(4),
         },
     ];
-    let mut program = MidProgram::default();
-    program.tile_count = 4;
-    program.values = formats
-        .iter()
-        .enumerate()
-        .map(|(index, format)| MidValue {
-            id: MidValueId(index as u32),
-            tile_offset: 0,
-            origin: ValueId::from_index(0),
-            storage_group: MidValueId(index as u32),
-            tensor_type: TensorType {
-                shape: TensorShape(vec![16, 64]),
-                format: format.clone(),
-            },
-        })
-        .collect();
-    program.inputs.push(MidInput {
-        name: "x".into(),
-        kind: GraphInputKind::Host,
-        value: MidValueId(0),
-    });
-    program.outputs = vec![MidValueId(2)];
-    program.operations = (0..2)
-        .map(|index| MidOperation {
-            source: None,
-            inputs: vec![MidValueId(index)],
-            results: vec![MidValueId(index + 1)],
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
-            kind: MidOperationKind::Convert(ConversionPlan {
-                input: OperandRequirement::new(formats[index as usize].clone()),
-                output: OperandRequirement::new(formats[index as usize + 1].clone())
-                    .with_materialization(if index == 0 {
-                        OperandMaterialization::DispatchSlices
-                    } else {
-                        OperandMaterialization::Complete
-                    }),
-                strategy: if index == 0 {
-                    ConversionStrategy::DirectRetile
-                } else {
-                    ConversionStrategy::LocalKernel
-                },
-            }),
-        })
-        .collect();
-    let resolved = implementation::resolve(program).unwrap();
+    let mut state = lowering::LoweringState::default();
+    let input = state.value(
+        ValueId::from_index(0),
+        TensorType {
+            shape: TensorShape(vec![16, 64]),
+            format: formats[0].clone(),
+        },
+    );
+    let mut operations = Vec::new();
+    let mut graph = ComputeGraph::new();
+    let source = graph.host_input("x", [16, 64]).unwrap();
+    graph.gelu(source).unwrap();
+    let output = lowering::ensure_format(
+        input,
+        formats[2].clone(),
+        OperandMaterialization::DispatchSlices,
+        graph.operations()[0].id,
+        &Ipu21CostModel,
+        &mut state,
+        &mut operations,
+    );
+    let resolved =
+        crate::estimate::region_program(4, &[input], &operations, &[output], &state.values);
     let mut defined = BTreeSet::from([MidValueId(0)]);
     for op in &resolved.operations {
         assert!(
@@ -2467,7 +2372,7 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
         .gemm_precisions
         .insert(repeat.body.operations[0].id, fp8);
     let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
-    let resolved = implementation::resolve(mid).unwrap();
+    let resolved = mid;
     fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
         for op in ops {
             match &op.kind {

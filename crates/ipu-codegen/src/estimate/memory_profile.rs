@@ -101,7 +101,6 @@ impl mid::MemoryObserver for Timeline {
             MidOperationKind::Primitive(primitive) => format!("{primitive:?}"),
             MidOperationKind::Convert(plan) => format!("Convert {:?}", plan.strategy),
             MidOperationKind::Repeat(repeat) => format!("Repeat {} boundary", repeat.count),
-            MidOperationKind::Operator { .. } => "Operator".into(),
         };
         let mut roots = BTreeMap::new();
         for value in &self.values {
@@ -227,7 +226,7 @@ fn profile(
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<Profile> {
     let mut program =
-        mid::resolved_region(config.tile_count, initial, operations, outputs, values)?;
+        mid::composed_region(config.tile_count, initial, operations, outputs, values)?;
     for input in &mut program.inputs {
         let origin = program.values[input.value.index() as usize].origin;
         if let Some(source) = graph.inputs().iter().find(|source| source.value == origin) {
@@ -350,10 +349,7 @@ mod tests {
         let config = PipelineConfig::new(4)
             .with_automatic_input(input, crate::Precision::F16)
             .with_automatic_input(weight, crate::Precision::F16);
-        let program = crate::mid::implementation::resolve(
-            crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap(),
-        )
-        .unwrap();
+        let program = crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut timeline = Timeline::default();
         mid::analyze_observed(&program, &BTreeMap::new(), &mut timeline).unwrap();
         let parameter = program
@@ -390,10 +386,7 @@ mod tests {
         for weight in weights {
             config = config.with_automatic_input(weight, Precision::F16);
         }
-        let program = crate::mid::implementation::resolve(
-            crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap(),
-        )
-        .unwrap();
+        let program = crate::mid::lower(&graph, &config, &Ipu21CostModel).unwrap();
         let initial = program
             .inputs
             .iter()

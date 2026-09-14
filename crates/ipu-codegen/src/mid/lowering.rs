@@ -46,7 +46,12 @@ pub fn lower(
     recipe
         .early_casts
         .extend(graph.operations().iter().map(|op| op.id));
-    Ok(baseline::select(graph, &config, costs, &recipe)?.program)
+    let mut program = baseline::select(graph, &config, costs, &recipe)?.program;
+    program.compose_copies();
+    program
+        .refresh_estimates()
+        .ok_or(LoweringError::InvalidImplementation)?;
+    Ok(program)
 }
 
 #[derive(Default, Clone)]
@@ -125,220 +130,69 @@ impl PlanMetrics {
     }
 }
 
-pub(super) fn deferred_claims(operations: &[MidOperation]) -> BTreeSet<MidValueId> {
-    operations
-        .iter()
-        .flat_map(|operation| operation.deferred_inputs().iter().flatten())
-        .map(|input| input.producer)
-        .collect()
-}
-
-pub(super) fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) -> bool {
-    let mut changed = false;
-    let claims = deferred_claims(operations);
-    for operation in operations {
-        let Some(offer) = operation
-            .operator_plan()
-            .and_then(|plan| plan.deferred_output)
-        else {
-            continue;
-        };
-        if operation
-            .results
-            .first()
-            .is_some_and(|result| !claims.contains(result))
-        {
-            changed = true;
-            operation.estimated_cycles = offer.unfused_cycles;
-            operation.estimated_exchange_cycles = offer.unfused_exchange_cycles;
-            if let MidOperationKind::Operator { plan, .. } = &mut operation.kind {
-                plan.deferred_output = None;
-            }
-        }
-    }
-    changed
-}
-
-pub(super) fn apply_selected_plan(
+/// Construct the selected family directly from the values available in this
+/// region. A panel requirement leaves layout movement to that family's copies;
+/// casts and complete operands are materialized before binding the fragment.
+pub(super) fn emit_selected(
     operation: &Operation,
     output_shape: TensorShape,
-    mut plan: OperatorPlan,
-    single_use_inputs: &[bool],
+    plan: &OperatorPlan,
     costs: &impl CostModel,
     values: &mut BTreeMap<ValueId, MidValueId>,
     state: &mut LoweringState,
     operations: &mut Vec<MidOperation>,
-) {
-    let input_ids = operation
+) -> LoweringResult<()> {
+    let inputs = operation
         .inputs
         .iter()
         .map(|value| values[value])
         .collect::<Vec<_>>();
-    let original_input_ids = input_ids.clone();
-    let mut source_types = Vec::with_capacity(input_ids.len());
-    let mut converted = Vec::with_capacity(input_ids.len());
-    for (value, requirement) in input_ids.into_iter().zip(&plan.requirements.inputs) {
-        let conversion_start = operations.len();
-        let converted_value = ensure_format(
-            value,
+    let mut bound = Vec::with_capacity(inputs.len());
+    for (&input, requirement) in inputs.iter().zip(&plan.requirements.inputs) {
+        bound.push(ensure_format(
+            input,
             requirement.format.clone(),
             requirement.materialization,
             operation.id,
             costs,
             state,
             operations,
-        );
-        let streamed_source = operations[conversion_start..]
-            .last_mut()
-            .and_then(|conversion| {
-                let streamed = conversion.conversion_plan().is_some_and(|plan| {
-                    plan.output.materialization == OperandMaterialization::DispatchSlices
-                });
-                if streamed {
-                    conversion.estimated_cycles = 0;
-                    conversion.estimated_exchange_cycles = 0;
-                    conversion.inputs.first().copied()
-                } else {
-                    None
-                }
-            });
-        let source_value = streamed_source.unwrap_or(converted_value);
-        source_types.push(state.get(source_value).tensor_type.clone());
-        converted.push(converted_value);
+        ));
     }
-    let result = state.value(
-        operation.results[0],
-        TensorType {
-            shape: output_shape,
-            format: plan.requirements.output.format.clone(),
-        },
-    );
-    // A logical view may remain an alias of resident parameter storage.
-    // Keep its read-only provenance until an actual materialization occurs.
+    let output = TensorType {
+        shape: output_shape,
+        format: plan.requirements.output.format.clone(),
+    };
+    let input_types = bound
+        .iter()
+        .map(|&id| state.get(id).tensor_type.clone())
+        .collect::<Vec<_>>();
+    let fragment = costs
+        .implementation(plan, &input_types, &output)
+        .ok_or(LoweringError::InvalidImplementation)?;
+    let result = state.value(operation.results[0], output);
     if matches!(
         operation.kind,
         OperationKind::View(_) | OperationKind::Slice(_)
-    ) && original_input_ids
-        .iter()
-        .any(|id| state.parameter_values.contains(id))
+    ) && inputs.iter().any(|id| state.parameter_values.contains(id))
     {
         state.parameter_values.insert(result);
     }
-    let converted_types = converted
-        .iter()
-        .map(|value| state.get(*value).tensor_type.clone())
-        .collect::<Vec<_>>();
-    let implementation =
-        costs.implementation(&plan, &converted_types, &state.get(result).tensor_type);
-    let mut operator_cycles = costs
-        .operator_cycle_override(&plan, &converted_types, &state.get(result).tensor_type)
-        .unwrap_or_else(|| {
-            implementation
-                .as_ref()
-                .map_or(u64::MAX, |p| p.estimated_cycles)
-        });
-    let mut operator_exchange_cycles = implementation
-        .as_ref()
-        .map_or(0, |p| p.estimated_exchange_cycles);
-    // Preliminary transition prices remain useful for custom planning models.
-    // Normal detailed ranking evaluates the emitted region, including movement.
-    for ((source, input), requirement) in source_types
-        .iter()
-        .zip(&converted_types)
-        .zip(&plan.requirements.inputs)
-    {
-        if requirement.materialization == OperandMaterialization::DispatchSlices
-            && source.format.layout != input.format.layout
-        {
-            let cost = costs.rearrangement_cost(
-                &input.shape,
-                input.format.precision,
-                layout_conversion_strategy(&source.format.layout, &input.format.layout),
-                &source.format.layout,
-                &input.format.layout,
-            );
-            operator_cycles = operator_cycles.saturating_add(cost.cycles);
-            operator_exchange_cycles =
-                operator_exchange_cycles.saturating_add(cost.exchange_cycles);
-        }
-    }
-    let mut deferred_inputs = vec![None; converted.len()];
-    for (input_index, ((&original, &converted), requirement)) in original_input_ids
-        .iter()
-        .zip(&converted)
-        .zip(&plan.requirements.inputs)
-        .enumerate()
-    {
-        let conversion_is_streamed = original == converted
-            || operations.iter().any(|candidate| {
-                candidate.inputs.as_slice() == [original]
-                    && candidate.results.as_slice() == [converted]
-                    && candidate.conversion_plan().is_some_and(|conversion| {
-                        conversion.output.materialization == OperandMaterialization::DispatchSlices
-                    })
-            });
-        if !conversion_is_streamed
-            || !single_use_inputs.get(input_index).copied().unwrap_or(false)
-            || requirement.materialization != OperandMaterialization::DispatchSlices
-        {
-            continue;
-        }
-        let Some(producer_index) = operations
-            .iter()
-            .position(|candidate| candidate.results.as_slice() == [original])
-        else {
-            continue;
-        };
-        let Some(offered) = operations[producer_index]
-            .operator_plan()
-            .and_then(|producer| producer.deferred_output)
-        else {
-            continue;
-        };
-        let Some(&source) = operations[producer_index].inputs.get(offered.source_input) else {
-            continue;
-        };
-        deferred_inputs[input_index] = Some(DeferredInputPlan {
-            producer: original,
-            source,
-            transform: offered.transform,
-        });
-    }
-    tracing::trace!(
-        source = operation.id.index(),
-        cycles = operator_cycles,
-        dispatch = ?plan.dispatch,
-        input_layouts = ?converted_types
-            .iter()
-            .map(|input| &input.format.layout)
-            .collect::<Vec<_>>(),
-        output_layout = ?state.get(result).tensor_type.format.layout,
-        "costed operator plan"
-    );
-    if let Some(offer) = &mut plan.deferred_output {
-        offer.unfused_cycles = operator_cycles;
-        offer.unfused_exchange_cycles = operator_exchange_cycles;
-        operator_cycles = 0;
-        operator_exchange_cycles = 0;
-    }
-    operations.push(MidOperation {
-        source: Some(operation.id),
-        inputs: converted,
-        results: vec![result],
-        kind: MidOperationKind::Operator {
-            plan,
-            deferred_inputs,
-            implementation,
-        },
-        estimated_cycles: operator_cycles,
-        estimated_exchange_cycles: operator_exchange_cycles,
-    });
+    implementation::append_fragment(
+        &fragment,
+        &bound,
+        &[result],
+        Some(operation.id),
+        &mut state.values,
+        operations,
+    )
+    .ok_or(LoweringError::InvalidImplementation)?;
     values.insert(operation.results[0], result);
+    Ok(())
 }
 
-// Refresh all recipes: applying a plan may fuse or remove earlier operations,
-// so adding only the newest operation would retain obsolete conversion costs.
-// Cached operator fragments avoid resolving/cloning the whole prefix here.
+// Cheap necessary memory check for individual operands. The executable
+// fragment's liveness analysis accounts for simultaneous operands and scratch.
 pub(super) fn plan_fits_operator_memory(
     plan: &OperatorPlan,
     inputs: &[TensorType],
@@ -459,15 +313,24 @@ pub(super) fn ensure_format(
         },
         target,
     ];
-    for format in formats {
+    for (index, format) in formats.iter().enumerate() {
         let input = state.get(value).tensor_type.clone();
-        if input.format == format {
+        if &input.format == format {
             continue;
         }
         let output = TensorType {
             shape: input.shape.clone(),
-            format,
+            format: format.clone(),
         };
+        // A panel consumer emits its own copies from this source. A layout
+        // needed by a following cast is complete, because that cast reads it.
+        if materialization == OperandMaterialization::DispatchSlices
+            && formats[index..]
+                .iter()
+                .all(|next| next.precision == input.format.precision)
+        {
+            continue;
+        }
         // Share quantization on the producer's owners, not the much larger
         // replicated consumer operands whose lifetimes should remain local.
         if let Some(existing) = operations
@@ -506,11 +369,7 @@ pub(super) fn ensure_format(
             results: vec![result],
             kind: MidOperationKind::Convert(ConversionPlan {
                 input: OperandRequirement::new(input.format),
-                output: OperandRequirement::new(output.format).with_materialization(if cast {
-                    OperandMaterialization::Complete
-                } else {
-                    materialization
-                }),
+                output: OperandRequirement::new(output.format),
                 strategy,
             }),
             estimated_cycles: cost.cycles,

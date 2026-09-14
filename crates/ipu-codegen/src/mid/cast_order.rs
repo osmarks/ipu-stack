@@ -318,12 +318,11 @@ mod tests {
             },
         );
         mid.values.push(original);
-        let rewritten = implementation::resolve_rewriting(mid, |program| {
-            let sites = program.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
-            assert_eq!(sites.len(), 1);
-            program.reorder_casts(&sites, &BTreeSet::new());
-        })
-        .unwrap();
+        let mut rewritten = mid;
+        let sites = rewritten.reorder_casts(&BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(sites.len(), 1);
+        rewritten.reorder_casts(&sites, &BTreeSet::new());
+        rewritten.compose_copies();
         let cast = rewritten
             .operations
             .iter()

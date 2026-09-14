@@ -293,8 +293,7 @@ mod tests {
             .with_automatic_input(r, Precision::F16)
             .with_automatic_input(gamma, Precision::F16)
             .with_automatic_input(beta, Precision::F16);
-        let mid =
-            implementation::resolve(lower(&graph, &config, &Ipu21CostModel).unwrap()).unwrap();
+        let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let fused = mid
             .with_elementwise_fusions(&PipelineConfig::new(mid.tile_count))
             .unwrap();

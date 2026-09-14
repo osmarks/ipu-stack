@@ -1,6 +1,6 @@
 # Compiler data flow
 
-Source review: 2026-09-14, with the subsequent low-work refactor incorporated.
+Source review: 2026-09-14, with direct mid construction and low-work ownership incorporated.
 This describes the current implementation.
 [Structural proposal](COMPILER_STRUCTURE_PROPOSAL.md) describes the proposed changes.
 Older experiment reports explain history, not the current pipeline.
@@ -18,16 +18,18 @@ are less clean than their names suggest:
 | Representation | What it contains | What remains undecided |
 | --- | --- | --- |
 | `ComputeGraph` | Shaped semantic operations, parameters, outputs and structured Repeat | Precision, distribution, kernels, movement, storage |
-| `MidProgram` during selection | Chosen operator plans, optional cached mid implementations, conversions, deferred inputs, values with formats/ownership | Inlining, deferred movement, rewrites |
-| `MidProgram` after resolution and rewrites | Whole-device `Compute`, mapped `Copy`, `Sum`, **remaining `Convert`**, and Repeat | Tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
+| `MidProgram` | Executable whole-device `Compute`, mapped `Copy`, `Sum`, remaining `Convert`, and Repeat | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
 | `TileGraph` | Shards, relative views, local copies, multicast source/recipient groups, kernel runs, structured control | Physical addresses, exact exchange instructions, linked symbols |
 | `LowProgram` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
 | `ScheduledPlan` | Low program, provisional placement, encoded exchange phases, reusable scheduling choices | Support-memory reservations and their final placement effects |
 | `Application` | Tile images, host bindings/protocol, debug/profile metadata | Loading and execution |
 
-The two mid rows are **states of the same Rust type**, not separate checked
-interfaces. `resolve` removes `Operator` but can leave `Convert`. Low rejects
-an unresolved `Operator` at runtime. This is a significant source of ambiguity.
+Selection emits executable family fragments directly into the program. There
+is no `Operator` variant, nested implementation, deferred-input state, or
+resolution pass. `Recipe` retains the selected family parameters separately.
+Binding validation checks definitions, region scope, arity and alias indices at
+construction and rewrite boundaries. The remaining `Convert` and outer
+`Primitive` wrapper are still scheduled for unification with Copy/Compute.
 
 `TileGraph` owns the live operation list and finite-scratch requirement.
 `LowProgram` shares its arenas and derives per-tile indexes without changing
@@ -40,10 +42,9 @@ inventory and emission observe the same live work.
 flowchart TD
   G[ComputeGraph and PipelineConfig] --> P[baseline::select: choose operators and boundaries]
   R[Recipe: selections and rewrite choices] --> P
-  P --> U[Mixed MidProgram: Operator / Convert / Primitive / Repeat]
-  U --> I[implementation::resolve_rewriting: inline and bind]
+  P --> I[emit_selected: construct and bind executable family fragment]
   I --> W[Cast ordering, copy composition, fusions, ownership and storage rewrites]
-  W --> M[Resolved MidProgram: Primitive / Convert / Repeat]
+  W --> M[Executable MidProgram: Primitive / Convert / Repeat]
   M --> E[low::expand: shard enumeration and physical realization]
   E --> O[Low simplification, relay selection and padding removal]
   O --> T[TileGraph]
@@ -104,17 +105,18 @@ flowchart LR
    [operator plans](../crates/ipu-codegen/src/mid/operator.rs) choose the grid,
    precision, orientation, kernel blocking, result layout and reduction staging.
    [ensure_format](../crates/ipu-codegen/src/mid/lowering.rs) prepares outer
-   operand formats, possibly recording deferred movement.
+   complete operand formats and numerical casts. Panel requirements leave
+   layout movement to the family's copies, without inventing a converted value.
 2. [implementation/gemm.rs](../crates/ipu-codegen/src/mid/implementation/gemm.rs)
    builds a compact mid fragment. Parallel GEMM emits ordinary copies, a
    `Compute` with `ProductAxes`, a leading partials dimension, and `Sum`.
    Output-stationary GEMM instead exposes successive K-panel values and
    accumulating result versions. This is the owner of the distributed algorithm.
-3. [implementation::resolve_region](../crates/ipu-codegen/src/mid/implementation/mod.rs)
-   splices that fragment into the selected program, remaps value IDs, assigns
-   ownership offsets, and inserts copies when compute operands need a different
-   owner rotation. It can rebuild a fragment when deferred inputs change its
-   actual input types.
+3. [emit_selected](../crates/ipu-codegen/src/mid/lowering.rs) binds the fragment
+   immediately to actual region values. `append_fragment` remaps IDs without
+   selecting or rebuilding an implementation. The later parameter-home
+   transformation updates bindings and inserts any input-owner copies as part
+   of that same transformation; there is no resolver repairing it afterward.
 4. [low/expand/primitive.rs](../crates/ipu-codegen/src/low/expand/primitive.rs)
    finds resident operand shards. `product_calls` enumerates local K/column
    blocks, chooses initialize/accumulate for those calls, clips logical work
@@ -320,7 +322,7 @@ reduction lowering.
 
 | Cache or retained analysis | Contents and key | Lifetime / owner |
 | --- | --- | --- |
-| `MemoizedCostModel.implementations` | `(OperatorPlan, input types, output type)` to compact mid fragment; ignores deferred-output marker | One `package/local::optimize` call; shared across candidate work |
+| `MemoizedCostModel.implementations` | `(OperatorPlan, input types, output type)` to executable mid fragment | One `package/local::optimize` call; shared across candidate work |
 | `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
 | `ExpansionCache.plans` | Destination type/extents and ordered source mappings to `CopyPlan`, including staging decisions | Same search in production; bounded at 32,768 entries |
 | `ExpansionCache.copies` | Normalized view geometry, copy order, same-buffer flag to relative local-copy descriptors | Same search; separately bounded at 32,768 entries |

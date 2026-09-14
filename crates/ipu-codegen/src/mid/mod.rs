@@ -11,6 +11,7 @@ mod output_fusion;
 mod packing;
 mod residual;
 mod rewrite;
+mod validate;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 mod primitive;
@@ -42,9 +43,7 @@ pub(crate) fn lower_baseline(
 pub(crate) fn expand_tiles(
     program: &MidProgram,
 ) -> crate::ExpansionResult<std::sync::Arc<crate::TileGraph>> {
-    let program = implementation::resolve(program.clone())
-        .ok_or(crate::ExpansionError::InvalidOperatorPlan)?;
-    crate::low::expand::expand_tiles(&program, true)
+    crate::low::expand::expand_tiles(program, true)
 }
 use lowering::*;
 
@@ -321,11 +320,6 @@ pub struct MidValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
     Primitive(Primitive),
-    Operator {
-        plan: OperatorPlan,
-        deferred_inputs: Vec<Option<DeferredInputPlan>>,
-        implementation: Option<std::sync::Arc<MidProgram>>,
-    },
     Convert(ConversionPlan),
     Repeat(MidRepeat),
 }
@@ -348,22 +342,6 @@ impl MidOperation {
             _ => &[],
         };
         self.inputs.iter().chain(sequences.iter().flatten())
-    }
-
-    pub fn operator_plan(&self) -> Option<&OperatorPlan> {
-        match &self.kind {
-            MidOperationKind::Operator { plan, .. } => Some(plan),
-            _ => None,
-        }
-    }
-
-    pub fn deferred_inputs(&self) -> &[Option<DeferredInputPlan>] {
-        match &self.kind {
-            MidOperationKind::Operator {
-                deferred_inputs, ..
-            } => deferred_inputs,
-            _ => &[],
-        }
     }
 
     pub fn conversion_plan(&self) -> Option<&ConversionPlan> {
@@ -401,8 +379,8 @@ pub struct MidInput {
     pub value: MidValueId,
 }
 
-/// Whole-device tensor program. Search recipes retain compact implementations;
-/// final selection inlines those primitives before low enumerates tiles.
+/// Executable whole-device tensor program. Families append their operations
+/// directly during selection; low then enumerates the concrete shard work.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MidProgram {
     pub tile_count: u16,
@@ -421,6 +399,8 @@ pub struct MidProgram {
 pub enum LoweringError {
     #[error("selected operator implementation is invalid")]
     InvalidImplementation,
+    #[error("invalid mid program: {0}")]
+    InvalidProgram(String),
     #[error("cannot write planner memory profile: {0}")]
     MemoryProfile(String),
     #[error(transparent)]
@@ -448,6 +428,7 @@ pub type LoweringResult<T> = std::result::Result<T, LoweringError>;
 impl MidProgram {
     /// Refresh derived costs after constructing or rewriting a complete program.
     pub(super) fn refresh_estimates(&mut self) -> Option<()> {
+        self.validate().ok()?;
         let (cycles, peak) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
         self.estimated_cycles = cycles.total;
         self.estimated_exchange_cycles = cycles.exchange;

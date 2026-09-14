@@ -101,7 +101,6 @@ impl ConcreteOperatorCandidate {
                     output,
                     output_aliasing: OutputAliasing::Fresh,
                 },
-                deferred_output: None,
             },
             format_policy: OperatorFormatPolicy::Concrete,
         }
@@ -405,7 +404,6 @@ pub(super) fn gemm_plan(
             }),
             output_aliasing: OutputAliasing::Fresh,
         },
-        deferred_output: None,
     }
 }
 

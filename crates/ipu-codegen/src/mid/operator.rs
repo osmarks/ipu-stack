@@ -160,23 +160,6 @@ pub enum OperatorDispatch {
     View,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DeferredOutputPlan {
-    pub source_input: usize,
-    pub transform: AxisFactorView,
-    /// Cost restored if no later consumer claims this offer.
-    pub unfused_cycles: u64,
-    /// Exchange portion of `unfused_cycles`, restored with the offer.
-    pub unfused_exchange_cycles: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DeferredInputPlan {
-    pub producer: MidValueId,
-    pub source: MidValueId,
-    pub transform: AxisFactorView,
-}
-
 /// Which operand remains resident while a blocked whole-device GEMM is run.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GemmDistribution {
@@ -433,9 +416,6 @@ pub struct OperatorPlan {
     pub operator: MidOperator,
     pub dispatch: OperatorDispatch,
     pub requirements: StorageRequirements,
-    /// A view transformation offered by this plan. It is materialized normally
-    /// unless a later plan records a matching entry in `deferred_inputs`.
-    pub deferred_output: Option<DeferredOutputPlan>,
 }
 
 /// Address-independent recipe for materializing a format conversion.

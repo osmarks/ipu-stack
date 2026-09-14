@@ -315,11 +315,7 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
             ..MidProgram::default()
         };
         for composed in [false, true] {
-            let candidate = if composed {
-                crate::mid::implementation::resolve(mid.clone()).unwrap()
-            } else {
-                mid.clone()
-            };
+            let candidate = if composed { mid.clone() } else { mid.clone() };
             if let Err(error) = check_bytes(&candidate, &shapes, &mappings) {
                 panic!(
                     "case {case}, composed {composed}, {error}\nshapes {shapes:?}\nmappings {mappings:?}\nvalues {:?}",

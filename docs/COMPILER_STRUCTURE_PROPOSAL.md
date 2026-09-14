@@ -14,8 +14,14 @@ binding record. The corresponding regression covers both straight-line and
 repeated execution. Exchange selection now takes policy separately from its cache,
 and replay rejects policy mismatches without expanding search. Repeat sequence
 sizing now belongs to placement; the preliminary GEMM scan and emission's stride
-reconstruction are removed. The diagnoses below describe the reviewed starting point;
-[current data flow](COMPILER_DATA_FLOW.md) tracks implemented changes.
+reconstruction are removed. Selection now directly binds executable family
+fragments: `Operator`, nested implementations, deferred offers/claims and the
+resolution pass are removed. Parameter-home changes insert their own required
+copies, and a binding validator checks constructed/rewritten mid programs.
+`Convert`, the primitive wrapper, cost-owned fragment caching and the other
+boundaries below remain to be refactored. The diagnoses below describe the
+reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
+implemented changes.
 
 ## Diagnosis
 

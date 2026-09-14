@@ -207,9 +207,6 @@ impl TileGraphBuilder {
         ) {
             for operation in operations {
                 used.extend(operation.read_values().chain(&operation.results).copied());
-                for deferred in operation.deferred_inputs().iter().flatten() {
-                    used.extend([deferred.source, deferred.producer]);
-                }
                 // These ABIs bind or reshape an entire canonical allocation;
                 // a borrowed view with different backing strides is insufficient.
                 match &operation.kind {
@@ -351,7 +348,6 @@ impl TileGraphBuilder {
                     MidOperationKind::Repeat(repeat) => {
                         self.build_repeat(operation, repeat, &mut tiles)
                     }
-                    MidOperationKind::Operator { .. } => Err(ExpansionError::InvalidOperatorPlan),
                     MidOperationKind::Convert(plan) => {
                         self.build_conversion(operation, plan, &mut tiles)
                     }
@@ -362,7 +358,6 @@ impl TileGraphBuilder {
                     operation = index,
                     source = ?operation.source.map(OperationId::index),
                     kind = ?operation.kind,
-                    plan = ?operation.operator_plan(),
                     conversion = ?operation.conversion_plan(),
                     inputs = ?operation.inputs,
                     results = ?operation.results,
@@ -484,9 +479,7 @@ fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
             MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => {
                 WorkReason::OperatorInputs
             }
-            MidOperationKind::Operator { .. } | MidOperationKind::Primitive(_) => {
-                WorkReason::OperatorKernel
-            }
+            MidOperationKind::Primitive(_) => WorkReason::OperatorKernel,
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },
     }

@@ -570,7 +570,6 @@ pub(crate) fn operation_cost(
                     .saturating_add(Ipu21CostModel.cast_format_cycles(input, &output.format));
             }
         }
-        MidOperationKind::Operator { .. } => return None,
         MidOperationKind::Repeat(_) => unreachable!(),
     }
     Some((price, scratch, rows))
@@ -645,20 +644,20 @@ pub(crate) fn region_estimate(
     values: &[MidValue],
     allocation_multiplicity: &BTreeMap<MidValueId, u32>,
 ) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let program = resolved_region(config.tile_count, initial, operations, outputs, values)?;
+    let program = composed_region(config.tile_count, initial, operations, outputs, values)?;
     analyze_with_budget(&program, allocation_multiplicity, config)
 }
 
-pub(super) fn resolved_region(
+pub(super) fn composed_region(
     tile_count: u16,
     initial: &[MidValueId],
     operations: &[MidOperation],
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> Option<MidProgram> {
-    crate::mid::implementation::resolve(region_program(
-        tile_count, initial, operations, outputs, values,
-    ))
+    let mut program = region_program(tile_count, initial, operations, outputs, values);
+    program.compose_copies();
+    Some(program)
 }
 
 pub(crate) fn region_program(
@@ -668,20 +667,6 @@ pub(crate) fn region_program(
     outputs: &[MidValueId],
     values: &[MidValue],
 ) -> MidProgram {
-    let mut outputs = outputs.to_vec();
-    // A pending view still needs its source storage at the region boundary.
-    for operation in operations.iter().rev() {
-        if let Some(offer) = operation
-            .operator_plan()
-            .and_then(|plan| plan.deferred_output)
-            && operation
-                .results
-                .iter()
-                .any(|result| outputs.contains(result))
-        {
-            outputs.push(operation.inputs[offer.source_input]);
-        }
-    }
     crate::MidProgram {
         tile_count,
         inputs: initial
@@ -694,7 +679,7 @@ pub(crate) fn region_program(
             .collect(),
         values: values.to_vec(),
         operations: operations.to_vec(),
-        outputs,
+        outputs: outputs.to_vec(),
         ..crate::MidProgram::default()
     }
 }
