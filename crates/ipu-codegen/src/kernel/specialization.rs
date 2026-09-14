@@ -178,7 +178,6 @@ pub(super) struct KernelInventory {
     pub(super) exact_symbols: BTreeSet<&'static str>,
     pub(super) rows:
         BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<(u32, GemmKernelMode)>>,
-    pub(super) fp8_casts: BTreeSet<(u64, u64)>,
     pub(super) rearrangements: BTreeSet<(RearrangeTarget, u32, u32, u32, u32)>,
     pub(super) unpacks: BTreeSet<(UnpackSource, u32, u32, u32, u32)>,
     pub(super) attention: BTreeSet<AttentionKernelShape>,
@@ -201,12 +200,6 @@ impl KernelInventory {
                     }
                     if let KernelSymbols::Exact(symbol) = abi.symbols {
                         self.exact_symbols.insert(symbol);
-                        if let TileKernelSpec::Cast { from, to } = kernel
-                            && (matches!(from, Precision::F8F143 { .. })
-                                || matches!(to, Precision::F8F143 { .. }))
-                        {
-                            self.fp8_casts.insert((from.bytes(), to.bytes()));
-                        }
                         continue;
                     }
                     match KernelSpecialization::from_run(run)? {

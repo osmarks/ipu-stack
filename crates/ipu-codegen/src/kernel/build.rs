@@ -31,7 +31,6 @@ impl KernelBuildPlan {
         let KernelInventory {
             exact_symbols,
             rows,
-            fp8_casts,
             rearrangements,
             unpacks,
             attention,
@@ -94,26 +93,15 @@ impl KernelBuildPlan {
                 &[3, 4, 2, 5, 6, 7],
             );
         }
-        for (symbol, extra) in [
-            ("gelu_tanh_approx_f16", None),
-            ("bias_gelu_f16", Some("-DGELU_WITH_BIAS")),
+        for (source, symbol, extra) in [
+            ("gelu_f16.S", "gelu_tanh_approx_f16", None),
+            ("gelu_f16.S", "bias_gelu_f16", Some("-DGELU_WITH_BIAS")),
+            ("gelu_f8.S", "gelu_f8", None),
+            ("gelu_f8.S", "bias_gelu_f8", Some("-DGELU_WITH_BIAS")),
         ] {
             if exact_symbols.contains(symbol) {
                 plan.compilations.push(KernelCompilation {
-                    source: "gelu_f16.S",
-                    name: symbol.into(),
-                    flags: extra.into_iter().map(str::to_owned).collect(),
-                    retained_symbols: vec![symbol.into()],
-                });
-            }
-        }
-        for (symbol, extra) in [
-            ("gelu_f8", None),
-            ("bias_gelu_f8", Some("-DGELU_WITH_BIAS")),
-        ] {
-            if exact_symbols.contains(symbol) {
-                plan.compilations.push(KernelCompilation {
-                    source: "gelu_f8.S",
+                    source,
                     name: symbol.into(),
                     flags: extra.into_iter().map(str::to_owned).collect(),
                     retained_symbols: vec![symbol.into()],
@@ -146,17 +134,24 @@ impl KernelBuildPlan {
                 &[3, 4, 5, 6, 2, 7, 8, 9],
             );
         }
-        for (from, to) in fp8_casts {
-            let name = |bytes| match bytes {
-                1 => "f8",
-                2 => "f16",
-                _ => "f32",
-            };
-            let symbol = format!("cast_{}_{}", name(from), name(to));
+        // Scales are call arguments, so all FP8 scales share these recipes.
+        let f8 = Precision::F8F143 { scale_exponent: 0 };
+        for (from, to) in [
+            (f8, f8),
+            (f8, Precision::F16),
+            (f8, Precision::F32),
+            (Precision::F16, f8),
+            (Precision::F32, f8),
+        ] {
+            let symbol = cast_symbol(from, to);
+            if !exact_symbols.contains(symbol) {
+                continue;
+            }
+            let (from, to) = (from.bytes(), to.bytes());
             let vertex = format!("Cast{from}To{to}");
             let wrapper = plan.add_vertex(
                 "cast_f8.cpp",
-                &symbol,
+                symbol,
                 &vertex,
                 vec![
                     "-O2".into(),
