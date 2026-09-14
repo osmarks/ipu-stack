@@ -433,19 +433,16 @@ pub(super) fn validate_tile_program(
     }
 
     for expected in schedule.senders.iter() {
-        let covering = actual_sends
+        let mut end = None;
+        let contiguous = actual_sends
             .iter()
             .filter(|(start, end, _)| *start < expected.end_cycles && expected.start_cycles < *end)
-            .collect::<Vec<_>>();
-        if covering.is_empty()
-            || covering
-                .first()
-                .is_none_or(|entry| entry.0 != expected.start_cycles)
-            || covering
-                .last()
-                .is_none_or(|entry| entry.1 != expected.end_cycles)
-            || covering.windows(2).any(|pair| pair[0].1 != pair[1].0)
-        {
+            .all(|&(start, next, _)| {
+                let adjacent = start == end.unwrap_or(expected.start_cycles);
+                end = Some(next);
+                adjacent
+            });
+        if !contiguous || end != Some(expected.end_cycles) {
             return Err(ExchangeError::Schedule("encoded sender interval mismatch"));
         }
     }
