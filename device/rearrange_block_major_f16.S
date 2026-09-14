@@ -10,39 +10,9 @@
 #define REARRANGE_PHYSICAL_ROWS 64
 #endif
 
-	.text
-	.allow_optimizations
-	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
-
-	.section .text.REARRANGE_CALL_SYMBOL,"ax",@progbits
-	.globl REARRANGE_CALL_SYMBOL
-	.p2align 2
-	.type REARRANGE_CALL_SYMBOL,@function
-REARRANGE_CALL_SYMBOL:
-	.supervisor
-	// Kernel ABI: m2 destination, m3 source, m4 logical rows,
-	// m5 physical rows, m6 target order, m7 logical columns,
-	// m8 physical columns, m9 matrices, m10 return address.
-	add $m11, $m11, -16
-.Lrearrange_matrix:
-	st32 $m3, $m11, $m15, 0
-	st32 $m2, $m11, $m15, 1
-	st32 $m4, $m11, $m15, 2
-	st32 $m7, $m11, $m15, 3
-	setzi $m0, .Lrearrange_block_major_f16_worker
-	runall $m0, $m11, 0
-	sync SYNC_COMPUTE_SET
-	mul $m0, $m4, $m7
-	shl $m0, $m0, 1
-	add $m3, $m3, $m0
-	mul $m0, $m5, $m8
-	shl $m0, $m0, 1
-	add $m2, $m2, $m0
-	sub $m9, $m9, 1
-	brnz $m9, .Lrearrange_matrix
-	add $m11, $m11, 16
-	br $m10
-	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL
+#define REARRANGE_ARGUMENTS $m3,$m2,$m4,$m7
+#define REARRANGE_WORKER .Lrearrange_block_major_f16_worker
+#include "rearrange_call.inc"
 
 	// Transpose each 2x2 F16 cell while converting a row-major RxN matrix
 	// into Rx16-panel block-major coefficient order. Each 64-bit source load

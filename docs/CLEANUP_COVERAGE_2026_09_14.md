@@ -10,7 +10,7 @@ not sources to rewrite.
 | Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed in the earlier pass | Broader candidate generation and lowering control flow |
 | Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed in the earlier pass | Remaining loader/protocol and command dispatch paths |
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
-| Device kernels/runtime | Source inventory taken | Compare kernel families and shared assembly support; preserve independent numerical references |
+| Device kernels/runtime | Dense packing supervisor loops consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
 | Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal | Broader fixture export and placement tools |
 | Experiment scripts | Gather/packing/frontier scripts sampled | Remaining sweeps, analyses and their common file/command handling |
@@ -27,3 +27,8 @@ fixture with two retained sections linked a valid cross-section reference to
 the expected bytes; moving the relocation offset beyond its originating
 section was rejected. Field tests cover opcode preservation, maximum values,
 misalignment, truncation, and `usize::MAX` offsets.
+
+Device packing validation: the SDK compiled both old and new block-major and
+transposed-right kernels with identical allocated section bytes and normalized
+relocations. All 22 kernel selection tests passed. AMP-left packing retains its
+different destination stride and worker frame.

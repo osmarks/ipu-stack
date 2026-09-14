@@ -4,34 +4,9 @@
 #define REARRANGE_CALL_SYMBOL rearrange_row_major_to_amp_f16_transposed_right
 #endif
 
-	.text
-	.allow_optimizations
-	.set SYNC_COMPUTE_SET, TEXCH_SYNCZONE_LOCAL
-
-	.section .text.REARRANGE_CALL_SYMBOL,"ax",@progbits
-	.globl REARRANGE_CALL_SYMBOL
-	.p2align 2
-	.type REARRANGE_CALL_SYMBOL,@function
-REARRANGE_CALL_SYMBOL:
-	.supervisor
-	add $m11, $m11, -16
-.Lrearrange_matrix:
-	st32 $m3, $m11, $m15, 0
-	st32 $m2, $m11, $m15, 1
-	setzi $m0, .Lrearrange_transposed_right_f16_worker
-	runall $m0, $m11, 0
-	sync SYNC_COMPUTE_SET
-	mul $m0, $m4, $m7
-	shl $m0, $m0, 1
-	add $m3, $m3, $m0
-	mul $m0, $m5, $m8
-	shl $m0, $m0, 1
-	add $m2, $m2, $m0
-	sub $m9, $m9, 1
-	brnz $m9, .Lrearrange_matrix
-	add $m11, $m11, 16
-	br $m10
-	.size REARRANGE_CALL_SYMBOL, .-REARRANGE_CALL_SYMBOL
+#define REARRANGE_ARGUMENTS $m3,$m2
+#define REARRANGE_WORKER .Lrearrange_transposed_right_f16_worker
+#include "rearrange_call.inc"
 
 	// Specialized 64x16 row-major to transposed coefficient-panel packing. Each
 	// input row is one contiguous 32-byte load channel; ld*putcs destinations
