@@ -152,10 +152,11 @@ pub(crate) fn program_cycles_analyzed(
     exchange: Option<&[u64]>,
     geometry: &mut GeometryAnalysis,
 ) -> ExpansionResult<ProgramCycles> {
+    let estimated;
     let phases = if let Some(costs) = exchange {
-        costs.to_vec()
+        costs
     } else {
-        program
+        estimated = program
             .exchange_phases
             .iter()
             .map(|phase| {
@@ -166,7 +167,8 @@ pub(crate) fn program_cycles_analyzed(
                     controls = traffic.maximum_controls(), cycles, "estimated logical exchange");
                 Ok(cycles)
             })
-            .collect::<ExpansionResult<Vec<_>>>()?
+            .collect::<ExpansionResult<Vec<_>>>()?;
+        &estimated
     };
     fn region<'a>(
         program: &'a TileGraph,
@@ -224,7 +226,7 @@ pub(crate) fn program_cycles_analyzed(
     Ok(region(
         program,
         &program.body,
-        &phases,
+        phases,
         &mut std::collections::HashMap::new(),
     )
     .cycles())
