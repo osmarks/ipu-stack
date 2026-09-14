@@ -152,10 +152,10 @@ impl KernelSpecialization {
                 Self::Rearrange(rearrangement_specialization(
                     RearrangeTarget::from_order(to.order)
                         .ok_or(KernelAbiError::RequirementMismatch)?,
-                    matrix_extent(run, true, false)?,
-                    matrix_extent(run, false, false)?,
-                    matrix_extent(run, true, true)?,
-                    matrix_extent(run, false, true)?,
+                    matrix_extent(&run.output, true, false)?,
+                    matrix_extent(&run.output, false, false)?,
+                    matrix_extent(&run.output, true, true)?,
+                    matrix_extent(&run.output, false, true)?,
                 ))
             }
             TileKernelSpec::Rearrange { from, to } if to.order == ElementOrder::RowMajor => {

@@ -181,15 +181,15 @@ pub(crate) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
 }
 
 pub(crate) fn matrix_extent(
-    run: &KernelRun,
+    view: &ShardView,
     logical: bool,
     columns: bool,
 ) -> Result<u32, KernelAbiError> {
-    let rank = run.output.extents.len();
+    let rank = view.extents.len();
     let axis = rank
         .checked_sub(if columns { 1 } else { 2 })
         .ok_or(KernelAbiError::RequirementMismatch)?;
-    let extent = &run.output.extents[axis];
+    let extent = &view.extents[axis];
     Ok(if logical {
         extent.logical_end - extent.start
     } else {
@@ -207,16 +207,7 @@ pub(crate) fn input_matrix_extent(
         .first()
         .and_then(|operand| operand.views.first())
         .ok_or(KernelAbiError::RequirementMismatch)?;
-    let rank = view.extents.len();
-    let axis = rank
-        .checked_sub(if columns { 1 } else { 2 })
-        .ok_or(KernelAbiError::RequirementMismatch)?;
-    let extent = &view.extents[axis];
-    Ok(if logical {
-        extent.logical_end - extent.start
-    } else {
-        extent.physical_end - extent.start
-    })
+    matrix_extent(view, logical, columns)
 }
 
 pub(crate) fn matrix_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
