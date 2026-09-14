@@ -121,28 +121,16 @@ pub(super) fn split_mapping_at_panel_boundaries(
             let length = (width - offset)
                 .min(source_remaining)
                 .min(destination_remaining);
-            let source_start = source.start + offset;
-            let destination_start = destination.start + offset;
-            ranges.push((
+            let piece = |extent: ShardExtent| {
+                let start = extent.start + offset;
                 ShardExtent {
-                    axis: source.axis,
-                    start: source_start,
-                    logical_end: source
-                        .logical_end
-                        .min(source_start + length)
-                        .max(source_start),
-                    physical_end: source_start + length,
-                },
-                ShardExtent {
-                    axis: destination.axis,
-                    start: destination_start,
-                    logical_end: destination
-                        .logical_end
-                        .min(destination_start + length)
-                        .max(destination_start),
-                    physical_end: destination_start + length,
-                },
-            ));
+                    axis: extent.axis,
+                    start,
+                    logical_end: extent.logical_end.min(start + length).max(start),
+                    physical_end: start + length,
+                }
+            };
+            ranges.push((piece(source), piece(destination)));
             offset += length;
         }
         Ok(ranges)
