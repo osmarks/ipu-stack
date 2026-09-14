@@ -383,18 +383,13 @@ impl Layout {
             let group_extent = extent / u32::from(tiling.padding_groups);
             let remainder = group_extent % tiling.padding_multiple;
             if remainder != 0 {
-                match tiling.padding {
-                    Padding::Reject => {
-                        return Err(LayoutError::IndivisibleAxis {
-                            axis,
-                            extent: group_extent,
-                            block_size: tiling.padding_multiple,
-                        });
-                    }
-                    Padding::Zero => {}
+                if tiling.padding == Padding::Reject {
+                    return Err(LayoutError::IndivisibleAxis {
+                        axis,
+                        extent: group_extent,
+                        block_size: tiling.padding_multiple,
+                    });
                 }
-            }
-            if remainder != 0 && tiling.padding == Padding::Zero {
                 let padded_group_extent = group_extent
                     .checked_add(tiling.padding_multiple - remainder)
                     .ok_or(LayoutError::ExtentOverflow(axis))?;
@@ -421,14 +416,8 @@ impl Layout {
         if has_regular_tile_mapping(&self.tiling, &strides) {
             return Ok(TensorShape(dimensions));
         }
-        let coordinate_count = self
-            .tiling
-            .axes
-            .iter()
-            .try_fold(1usize, |count, axis| {
-                count.checked_mul(usize::from(axis.partitions))
-            })
-            .ok_or(LayoutError::TileCountOverflow)?;
+        // The validated tile count is replicas times the axis-partition product.
+        let coordinate_count = usize::from(self.tiling.tile_count / self.tiling.replicas);
         let mut coordinate_copies = vec![0u16; coordinate_count];
         for tile in 0..self.tiling.tile_count {
             let coordinate = self
