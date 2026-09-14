@@ -71,11 +71,7 @@ pub(super) fn expand_and_screen(
     {
         return Err(crate::TileLoweringError::InvalidLocalCopy {
             tile: low.shards[copy.source.index() as usize].tile,
-            source_shard: copy.source,
-            source_offset: copy.source_offset,
-            destination_shard: copy.destination,
-            destination_offset: copy.destination_offset,
-            bytes: copy.bytes,
+            copy: copy.clone(),
         }
         .into());
     }

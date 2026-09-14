@@ -61,17 +61,8 @@ pub enum TileLoweringError {
         kind: crate::ExchangeActivityKind,
         data_address: u32,
     },
-    #[error(
-        "tile {tile} local copy {source_shard:?}+{source_offset} -> {destination_shard:?}+{destination_offset} has invalid addresses or byte count {bytes}"
-    )]
-    InvalidLocalCopy {
-        tile: u16,
-        source_shard: BlockValueId,
-        source_offset: u32,
-        destination_shard: BlockValueId,
-        destination_offset: u32,
-        bytes: u32,
-    },
+    #[error("tile {tile} has invalid local copy addresses or geometry: {copy:?}")]
+    InvalidLocalCopy { tile: u16, copy: crate::LocalCopy },
 }
 
 struct PlacedExchange {
@@ -228,11 +219,7 @@ fn lower_work(
             TileWorkRef::LocalCopy(copy) => {
                 let invalid = || TileLoweringError::InvalidLocalCopy {
                     tile: tile.tile,
-                    source_shard: copy.source,
-                    source_offset: copy.source_offset,
-                    destination_shard: copy.destination,
-                    destination_offset: copy.destination_offset,
-                    bytes: copy.bytes,
+                    copy: copy.clone(),
                 };
                 let (symbol, arguments) = local_copy_call(copy).ok_or_else(invalid)?;
                 let resolve = |shard, offset| {
