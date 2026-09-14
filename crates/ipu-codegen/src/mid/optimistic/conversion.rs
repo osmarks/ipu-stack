@@ -296,7 +296,7 @@ fn local_supported(a: &TensorType, b: &TensorType, kind: &TransformKind) -> bool
         _ => return false,
     };
     let requirements =
-        crate::KernelRequirements::new(&kernel, [a.format.clone()], b.format.clone());
+        crate::KernelRequirements::new(&kernel, [a.format.clone()], vec![b.format.clone()]);
     crate::tile_kernel_abi(&kernel, &requirements).is_ok()
 }
 

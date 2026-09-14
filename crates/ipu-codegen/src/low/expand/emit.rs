@@ -8,7 +8,7 @@ impl TileGraphBuilder {
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
         mut inputs: Vec<KernelOperand>,
-        output: ShardView,
+        outputs: Vec<ShardView>,
     ) -> ExpansionResult<KernelRun> {
         for view in inputs.iter_mut().flat_map(|operand| &mut operand.views) {
             self.resolve_read_view(view)?;
@@ -22,13 +22,19 @@ impl TileGraphBuilder {
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
             Ok(&self.shards[view.shard.index() as usize].tensor_type.format)
         };
-        let output_format = &self.shards[output.shard.index() as usize]
-            .tensor_type
-            .format;
+        if outputs.is_empty() {
+            return Err(ExpansionError::ResultArity);
+        }
+        let output_format =
+            |view: &ShardView| &self.shards[view.shard.index() as usize].tensor_type.format;
         for metadata in &self.kernel_metadata {
             if metadata.provenance == provenance
                 && metadata.kernel == kernel
-                && metadata.requirements.output.format == *output_format
+                && metadata.requirements.outputs.len() == outputs.len()
+                && outputs
+                    .iter()
+                    .zip(&metadata.requirements.outputs)
+                    .all(|(view, requirement)| *output_format(view) == requirement.format)
                 && metadata.requirements.inputs.len() == inputs.len()
                 && inputs
                     .iter()
@@ -39,10 +45,9 @@ impl TileGraphBuilder {
             {
                 return Ok(KernelRun {
                     product_flops: None,
-                    additional_outputs: Vec::new(),
                     metadata: Arc::clone(metadata),
                     inputs,
-                    output,
+                    outputs,
                 });
             }
         }
@@ -50,8 +55,12 @@ impl TileGraphBuilder {
             .iter()
             .map(|operand| format(operand).cloned())
             .collect::<ExpansionResult<Vec<_>>>()?;
-        let requirements = KernelRequirements::new(&kernel, formats, output_format.clone());
-        let run = KernelRun::new(provenance, kernel, inputs, output, requirements);
+        let requirements = KernelRequirements::new(
+            &kernel,
+            formats,
+            outputs.iter().map(|view| output_format(view).clone()),
+        );
+        let run = KernelRun::new(provenance, kernel, inputs, outputs, requirements);
         self.kernel_metadata.push(Arc::clone(&run.metadata));
         Ok(run)
     }

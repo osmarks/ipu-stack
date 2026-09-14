@@ -5,7 +5,7 @@ use crate::kernel::TileKernelSpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryOperand {
-    Output,
+    Output(u16),
     Input(u16),
 }
 
@@ -30,8 +30,7 @@ impl KernelAccess {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelRequirements {
     pub inputs: Vec<KernelAccess>,
-    pub output: KernelAccess,
-    pub additional_outputs: Vec<KernelAccess>,
+    pub outputs: Vec<KernelAccess>,
     pub distinct_elements: Vec<Vec<MemoryOperand>>,
 }
 
@@ -39,7 +38,7 @@ impl KernelRequirements {
     pub fn new(
         kernel: &TileKernelSpec,
         inputs: impl IntoIterator<Item = TensorFormat>,
-        output: TensorFormat,
+        outputs: impl IntoIterator<Item = TensorFormat>,
     ) -> Self {
         let alignment = match kernel {
             TileKernelSpec::Gemm { .. } => 32,
@@ -52,8 +51,10 @@ impl KernelRequirements {
                 .into_iter()
                 .map(|format| KernelAccess::new(format, alignment))
                 .collect(),
-            output: KernelAccess::new(output, alignment),
-            additional_outputs: Vec::new(),
+            outputs: outputs
+                .into_iter()
+                .map(|format| KernelAccess::new(format, alignment))
+                .collect(),
             distinct_elements: Vec::new(),
         };
         if let TileKernelSpec::Gemm { multiply, .. } = kernel
@@ -62,7 +63,7 @@ impl KernelRequirements {
             left.access_tail_bytes = 8 * multiply.bytes() as u32;
             requirements
                 .distinct_elements
-                .push(vec![MemoryOperand::Output, MemoryOperand::Input(0)]);
+                .push(vec![MemoryOperand::Output(0), MemoryOperand::Input(0)]);
         }
         requirements
     }
@@ -160,8 +161,8 @@ pub(crate) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, K
 }
 
 pub(crate) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
-    let rank = run.output.extents.len();
-    let output_order = &run.requirements.output.format.layout.order;
+    let rank = run.outputs[0].extents.len();
+    let output_order = &run.requirements.outputs[0].format.layout.order;
     let matrix_column_axis = rank
         .checked_sub(if output_order.gemm_output_transposed() {
             2
@@ -169,7 +170,7 @@ pub(crate) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
             1
         })
         .ok_or(KernelAbiError::MissingGemmRows)?;
-    run.output
+    run.outputs[0]
         .extents
         .iter()
         .enumerate()

@@ -151,33 +151,40 @@ pub struct KernelRun {
     pub product_flops: Option<[u64; 2]>,
     pub(crate) metadata: Arc<KernelRunMetadata>,
     pub inputs: Vec<KernelOperand>,
-    pub output: ShardView,
-    /// Additional writes, with the same lifetime and scheduling semantics as output.
-    pub additional_outputs: Vec<ShardView>,
+    /// All result bindings in the family's declared order.
+    pub outputs: Vec<ShardView>,
 }
 
 impl KernelRun {
-    pub fn outputs(&self) -> impl Iterator<Item = &ShardView> {
-        std::iter::once(&self.output).chain(&self.additional_outputs)
+    pub(crate) fn operand_views(&self, operand: MemoryOperand) -> Option<&[ShardView]> {
+        match operand {
+            MemoryOperand::Input(index) => self
+                .inputs
+                .get(usize::from(index))
+                .map(|operand| operand.views.as_slice()),
+            MemoryOperand::Output(index) => self
+                .outputs
+                .get(usize::from(index))
+                .map(std::slice::from_ref),
+        }
     }
 
     pub fn new(
         provenance: WorkProvenance,
         kernel: TileKernelSpec,
         inputs: Vec<KernelOperand>,
-        output: ShardView,
+        outputs: Vec<ShardView>,
         requirements: KernelRequirements,
     ) -> Self {
         Self {
             product_flops: None,
-            additional_outputs: Vec::new(),
             metadata: Arc::new(KernelRunMetadata {
                 provenance,
                 kernel,
                 requirements,
             }),
             inputs,
-            output,
+            outputs,
         }
     }
 }

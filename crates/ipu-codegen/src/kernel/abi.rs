@@ -60,11 +60,12 @@ pub enum ScalarValue {
 pub struct KernelAbi {
     pub symbols: KernelSymbols,
     pub inputs: usize,
+    pub outputs: usize,
     pub scalar_arguments: &'static [ScalarValue],
 }
 
 pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>, KernelAbiError> {
-    let count = element_count(&run.output.extents)?;
+    let count = element_count(&run.outputs[0].extents)?;
     abi.scalar_arguments
         .iter()
         .map(|argument| match argument {
@@ -72,15 +73,16 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
             ScalarValue::InputRows => Ok(element_count(&run.inputs[0].views[0].extents)?
                 / input_matrix_extent(run, false, true)?),
             ScalarValue::OutputScale => {
-                fp8_scale_argument(match run.requirements.output.format.precision {
+                fp8_scale_argument(match run.requirements.outputs[0].format.precision {
                     Precision::F8F143 { scale_exponent } => i32::from(scale_exponent),
                     _ => 0,
                 })
             }
             ScalarValue::PackedOutput => Ok(u32::from(
-                run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left),
+                run.requirements.outputs[0].format.layout.order
+                    == ElementOrder::Amp(AmpOrder::Left),
             )),
-            ScalarValue::FlattenedRows => Ok(count / matrix_extent(&run.output, true, true)?),
+            ScalarValue::FlattenedRows => Ok(count / matrix_extent(&run.outputs[0], true, true)?),
             ScalarValue::QueryRows => gemm_rows(run),
             ScalarValue::KeyRows => match &run.kernel {
                 TileKernelSpec::AttentionSoftmax { key_columns, .. } => Ok(*key_columns),
@@ -127,7 +129,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                     if *argument == ScalarValue::CastSourceMetadata
                         && from == Precision::F16
                         && run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
-                        && run.requirements.output.format.layout.order
+                        && run.requirements.outputs[0].format.layout.order
                             == ElementOrder::Amp(AmpOrder::Left)
                     {
                         let physical = input_matrix_extent(run, false, false)?;
@@ -157,7 +159,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
             },
             ScalarValue::CastRowMajorColumns => Ok(
                 if run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
-                    && run.requirements.output.format.layout.order
+                    && run.requirements.outputs[0].format.layout.order
                         == ElementOrder::Amp(AmpOrder::Left)
                 {
                     input_matrix_extent(run, false, true)?
@@ -169,7 +171,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                 // Row-major packing derives the allocation size from rows and
                 // stride; use this field for the readable column prefix.
                 if run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
-                    && run.requirements.output.format.layout.order
+                    && run.requirements.outputs[0].format.layout.order
                         == ElementOrder::Amp(AmpOrder::Left)
                 {
                     let logical = input_matrix_extent(run, true, true)?;
@@ -190,16 +192,16 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                         to: Precision::F8F143 { .. }
                     }
                 ) {
-                    let order = run.requirements.output.format.layout.order;
+                    let order = run.requirements.outputs[0].format.layout.order;
                     if order.fp8_cast_panel_rows(1, 1) == 0 {
                         return Ok(0);
                     }
-                    let columns = matrix_extent(&run.output, false, true)?;
-                    let rows = element_count(&run.output.extents)? / columns;
+                    let columns = matrix_extent(&run.outputs[0], false, true)?;
+                    let rows = element_count(&run.outputs[0].extents)? / columns;
                     if order == ElementOrder::Amp(AmpOrder::Left)
                         && rows == 1
                         && element_count(&run.inputs[0].views[0].extents)?
-                            == element_count(&run.output.extents)?
+                            == element_count(&run.outputs[0].extents)?
                         && input_matrix_extent(run, true, true)?
                             == input_matrix_extent(run, false, true)?
                         && input_matrix_extent(run, true, false)?
@@ -208,8 +210,7 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
                         return Ok(0);
                     }
                     u32::try_from(
-                        run.requirements
-                            .output
+                        run.requirements.outputs[0]
                             .format
                             .layout
                             .order
@@ -230,11 +231,11 @@ pub(super) fn scalar_values(run: &KernelRun, abi: &KernelAbi) -> Result<Vec<u32>
             },
             ScalarValue::WordsPerWorker => output_byte_count(run).map(|bytes| bytes / 8 / 6),
             ScalarValue::RemainderWorkers => output_byte_count(run).map(|bytes| bytes / 8 % 6),
-            ScalarValue::LogicalRows => matrix_extent(&run.output, true, false),
-            ScalarValue::PhysicalRows => matrix_extent(&run.output, false, false),
+            ScalarValue::LogicalRows => matrix_extent(&run.outputs[0], true, false),
+            ScalarValue::PhysicalRows => matrix_extent(&run.outputs[0], false, false),
             ScalarValue::Matrices => matrix_count(run),
-            ScalarValue::LogicalColumns => matrix_extent(&run.output, true, true),
-            ScalarValue::PhysicalColumns => matrix_extent(&run.output, false, true),
+            ScalarValue::LogicalColumns => matrix_extent(&run.outputs[0], true, true),
+            ScalarValue::PhysicalColumns => matrix_extent(&run.outputs[0], false, true),
             ScalarValue::TargetOrder => match &run.kernel {
                 TileKernelSpec::Rearrange {
                     to: crate::Layout { order, .. },
@@ -269,8 +270,8 @@ pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> 
     if let TileKernelSpec::FillZero { bytes, .. } = run.kernel {
         return Ok(bytes);
     }
-    let precision = run.requirements.output.format.precision;
-    element_count(&run.output.extents)?
+    let precision = run.requirements.outputs[0].format.precision;
+    element_count(&run.outputs[0].extents)?
         .checked_mul(
             u32::try_from(precision.bytes()).map_err(|_| KernelAbiError::ElementCountOverflow)?,
         )
@@ -281,7 +282,11 @@ pub fn tile_kernel_abi(
     kernel: &TileKernelSpec,
     requirements: &KernelRequirements,
 ) -> Result<KernelAbi, KernelAbiError> {
-    let precision = requirements.output.format.precision;
+    let outputs = 1 + usize::from(matches!(kernel, TileKernelSpec::AddLayerNormMoments));
+    if requirements.outputs.len() != outputs {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let precision = requirements.outputs[0].format.precision;
     let (symbols, inputs, scalars): (_, usize, &'static [ScalarValue]) = match kernel {
         TileKernelSpec::FillZero { .. } => (
             KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
@@ -506,12 +511,24 @@ pub fn tile_kernel_abi(
     Ok(KernelAbi {
         symbols,
         inputs,
+        outputs,
         scalar_arguments: scalars,
     })
 }
 
 pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError> {
     let kernel = &run.kernel;
+    if run.inputs.len() != run.requirements.inputs.len()
+        || run.outputs.len() != run.requirements.outputs.len()
+        || run
+            .requirements
+            .distinct_elements
+            .iter()
+            .flatten()
+            .any(|&operand| run.operand_views(operand).is_none())
+    {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
     let abi = tile_kernel_abi(kernel, &run.requirements)?;
     if run.inputs.len() != abi.inputs {
         return Err(KernelAbiError::PointerArity {
@@ -519,10 +536,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             actual: run.inputs.len(),
         });
     }
-    let additional = usize::from(matches!(kernel, TileKernelSpec::AddLayerNormMoments));
-    if run.additional_outputs.len() != additional
-        || run.requirements.additional_outputs.len() != additional
-    {
+    if run.outputs.len() != abi.outputs {
         return Err(KernelAbiError::RequirementMismatch);
     }
     if let Some(index) = run
@@ -532,10 +546,10 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     {
         return Err(KernelAbiError::FragmentedOperand(index));
     }
-    if additional != 0
+    if matches!(kernel, TileKernelSpec::AddLayerNormMoments)
         && (run.inputs[0].views[0].extents != run.inputs[1].views[0].extents
-            || run.additional_outputs[0].extents != run.inputs[0].views[0].extents
-            || run.requirements.additional_outputs[0].format != run.requirements.inputs[0].format
+            || run.outputs[1].extents != run.inputs[0].views[0].extents
+            || run.requirements.outputs[1].format != run.requirements.inputs[0].format
             || run.requirements.inputs[1].format != run.requirements.inputs[0].format)
     {
         return Err(KernelAbiError::RequirementMismatch);
@@ -550,21 +564,21 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         let panel_rows = scalar_values(run, &abi)?[3];
         let input = &run.inputs[0].views[0];
         let row_pack = run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
-            && run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left);
+            && run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left);
         if (run.requirements.inputs[0].format.layout.order
-            != run.requirements.output.format.layout.order
+            != run.requirements.outputs[0].format.layout.order
             && !row_pack)
-            || input.extents.len() != run.output.extents.len()
+            || input.extents.len() != run.outputs[0].extents.len()
             || input
                 .extents
                 .iter()
-                .zip(&run.output.extents)
+                .zip(&run.outputs[0].extents)
                 .enumerate()
                 .any(|(axis, (from, to))| {
                     let width = from.physical_end - from.start;
                     let target_width = to.physical_end - to.start;
                     width != target_width
-                        && !(run.requirements.output.format.layout.order
+                        && !(run.requirements.outputs[0].format.layout.order
                             == ElementOrder::Amp(AmpOrder::Left)
                             && axis + 1 == input.extents.len()
                             && if row_pack {
@@ -575,10 +589,10 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
                             })
                 })
             || (row_pack
-                && (!matrix_extent(&run.output, false, true)?.is_multiple_of(32)
+                && (!matrix_extent(&run.outputs[0], false, true)?.is_multiple_of(32)
                     || !input_matrix_extent(run, false, true)?.is_multiple_of(4)))
             || (panel_rows != 0
-                && !element_count(&run.output.extents)?.is_multiple_of(
+                && !element_count(&run.outputs[0].extents)?.is_multiple_of(
                     panel_rows
                         .checked_mul(32)
                         .ok_or(KernelAbiError::ElementCountOverflow)?,
@@ -610,15 +624,15 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             && extent.physical_end == extent.logical_end
             && run.requirements.inputs[0].format.precision == Precision::F16
             && run.requirements.inputs[0].format.layout.order == ElementOrder::RowMajor
-            && run.requirements.output.format.layout.order == ElementOrder::RowMajor
+            && run.requirements.outputs[0].format.layout.order == ElementOrder::RowMajor
             && match kernel {
                 TileKernelSpec::LayerNormMoments | TileKernelSpec::AddLayerNormMoments => {
-                    run.requirements.output.format.precision == Precision::F32
-                        && element_count(&run.output.extents)? == rows * 2
+                    run.requirements.outputs[0].format.precision == Precision::F32
+                        && element_count(&run.outputs[0].extents)? == rows * 2
                 }
                 TileKernelSpec::LayerNormApply { parts } => {
                     *parts >= 1
-                        && run.requirements.output.format.precision == Precision::F16
+                        && run.requirements.outputs[0].format.precision == Precision::F16
                         && run.requirements.inputs[1..3]
                             .iter()
                             .all(|input| input.format.precision == Precision::F16)
@@ -636,30 +650,30 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::RequirementMismatch);
         }
     }
-    let output_capability = kernel.output_capability(run.requirements.output.format.precision);
+    let output_capability = kernel.output_capability(run.requirements.outputs[0].format.precision);
     let fp8_producer = output_capability.is_some();
     if let Some(capability) = output_capability {
         let input = &run.inputs[0].views[0];
         let width = input_matrix_extent(run, false, true)?;
-        let columns = matrix_extent(&run.output, false, true)?;
+        let columns = matrix_extent(&run.outputs[0], false, true)?;
         let packed =
-            run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left);
+            run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left);
         if width == 0
             || !width.is_multiple_of(capability.column_multiple)
             || run.inputs.len() != capability.operands
             || input_matrix_extent(run, true, true)? != width
             || !capability
                 .output_orders
-                .contains(&run.requirements.output.format.layout.order)
+                .contains(&run.requirements.outputs[0].format.layout.order)
             || columns
                 != if packed {
                     width.next_multiple_of(32)
                 } else {
                     width
                 }
-            || input.extents.len() != run.output.extents.len()
+            || input.extents.len() != run.outputs[0].extents.len()
             || input.extents[..input.extents.len() - 1]
-                != run.output.extents[..run.output.extents.len() - 1]
+                != run.outputs[0].extents[..run.outputs[0].extents.len() - 1]
             || run.requirements.inputs.iter().any(|r| {
                 r.format.precision != Precision::F16
                     || r.format.layout.order != capability.input_order
@@ -673,10 +687,10 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         TileKernelSpec::LayerNorm | TileKernelSpec::AddLayerNorm
     ) && !fp8_producer
     {
-        let width = matrix_extent(&run.output, true, true)?;
+        let width = matrix_extent(&run.outputs[0], true, true)?;
         if width == 0
             || !width.is_multiple_of(2)
-            || matrix_extent(&run.output, false, true)? != width
+            || matrix_extent(&run.outputs[0], false, true)? != width
         {
             return Err(KernelAbiError::RequirementMismatch);
         }
@@ -685,7 +699,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             .inputs
             .iter()
             .any(|r| r.format.precision != Precision::F16)
-            || run.requirements.output.format.layout.order != ElementOrder::RowMajor
+            || run.requirements.outputs[0].format.layout.order != ElementOrder::RowMajor
         {
             return Err(KernelAbiError::RequirementMismatch);
         }
@@ -693,7 +707,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
     if matches!(kernel, TileKernelSpec::Add) {
         for operand in &run.inputs {
             let input = &operand.views[0].extents;
-            let output = &run.output.extents;
+            let output = &run.outputs[0].extents;
             if input.len() > output.len() {
                 return Err(KernelAbiError::RequirementMismatch);
             }
@@ -716,23 +730,23 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         TileKernelSpec::BiasGelu | TileKernelSpec::AddLayerNorm
     ) && !fp8_producer
     {
-        let width = matrix_extent(&run.output, true, true)?;
+        let width = matrix_extent(&run.outputs[0], true, true)?;
         if !width.is_multiple_of(2)
             || width == 0
-            || run.requirements.output.format.precision != Precision::F16
-            || run.requirements.output.format.layout.order != ElementOrder::RowMajor
+            || run.requirements.outputs[0].format.precision != Precision::F16
+            || run.requirements.outputs[0].format.layout.order != ElementOrder::RowMajor
             || run
                 .requirements
                 .inputs
                 .iter()
                 .any(|input| input.format.precision != Precision::F16)
-            || run.inputs[0].views[0].extents != run.output.extents
+            || run.inputs[0].views[0].extents != run.outputs[0].extents
         {
             return Err(KernelAbiError::RequirementMismatch);
         }
         let right = &run.inputs[1].views[0].extents;
         if matches!(kernel, TileKernelSpec::AddLayerNorm) {
-            if right != &run.output.extents {
+            if right != &run.outputs[0].extents {
                 return Err(KernelAbiError::RequirementMismatch);
             }
         } else if element_count(right)? != width {
@@ -750,7 +764,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
             return Err(KernelAbiError::RequirementMismatch);
         };
         let divisor = 2;
-        let count = element_count(&run.output.extents)?;
+        let count = element_count(&run.outputs[0].extents)?;
         if !count.is_multiple_of(divisor) {
             return Err(KernelAbiError::UnsupportedElementCount {
                 symbol,
@@ -760,7 +774,7 @@ pub fn validate_kernel_run(run: &KernelRun) -> Result<KernelAbi, KernelAbiError>
         }
     }
     if let TileKernelSpec::ReductionSum { partials } = kernel {
-        let count = element_count(&run.output.extents)?;
+        let count = element_count(&run.outputs[0].extents)?;
         if *partials < 2 || !count.is_multiple_of(8) {
             return Err(KernelAbiError::UnsupportedElementCount {
                 symbol: "reduce_sum_f16",
@@ -787,12 +801,12 @@ pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static 
         return None;
     };
     if input.format.precision != Precision::F16
-        || requirements.output.format.precision != Precision::F16
+        || requirements.outputs[0].format.precision != Precision::F16
     {
         return None;
     }
     let input_layout = &input.format.layout;
-    let output_layout = &requirements.output.format.layout;
+    let output_layout = &requirements.outputs[0].format.layout;
     (input_layout == output_layout).then_some("gelu_tanh_approx_f16")
 }
 

@@ -278,6 +278,14 @@ from consecutive addresses. Empty shards can have zero stride. Tests exercise
 additional non-GEMM access requirements, single-iteration sequences and both
 physical SRAM regions.
 
+Kernel results have one indexed representation: `KernelRun.outputs` binds every
+result before the call is interned, and `KernelRequirements.outputs` describes
+the corresponding accesses. `MemoryOperand::Output(index)` can name any result
+in an element-separation constraint. Placement, lifetimes and ABI validation use
+these same bindings. The worker ABI's register order still puts result zero
+before inputs and subsequent results; that calling convention does not divide
+the storage model into primary and additional outputs.
+
 The shifted FP16-to-FP8 cast similarly separates access geometry from the
 optimization that requests it. [kernel/cast.rs](../crates/ipu-codegen/src/kernel/cast.rs)
 defines the output prefix and safe chunks; mid donation, low call construction
@@ -286,9 +294,6 @@ storage saving on each shard. A physically valid cast need not be profitable.
 
 Other physical access contracts still have multiple owners:
 
-- `KernelRun` and `KernelRequirements` distinguish a primary output from
-  `additional_outputs`. `MemoryOperand::Output` refers only to the primary one,
-  so the element-separation contract cannot name another result.
 - [attention construction](../crates/ipu-codegen/src/mid/implementation/attention.rs)
   places FP32 statistics after probabilities inside a nominal F16/FP8 tensor.
   It crops probability copies to exclude the statistics; finite-padding reuse

@@ -34,6 +34,8 @@ Copy geometry now lives in storage, with exact coverage and shared span matching
 movement lowering owns destination-packing selection from an explicit per-copy
 policy. The cache retains geometry instead of selected staging, uses foldhash and
 a hash table instead of custom buckets, and excludes ownership from geometry keys.
+Low kernel calls now bind all results together in one indexed list, with matching
+access requirements; element-separation constraints can name every result.
 Operand indexing, complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks

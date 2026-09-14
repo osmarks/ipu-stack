@@ -315,11 +315,11 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
         vec![KernelOperand {
             views: vec![view(source)],
         }],
-        view(output),
+        vec![view(output)],
         KernelRequirements::new(
             &kernel,
             [shards[source.index() as usize].tensor_type.format.clone()],
-            shards[output.index() as usize].tensor_type.format.clone(),
+            vec![shards[output.index() as usize].tensor_type.format.clone()],
         ),
     );
     let call = materialize_kernel_run(

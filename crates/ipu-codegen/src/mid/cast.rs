@@ -246,7 +246,7 @@ mod tests {
             for run in &low.kernel_runs {
                 crate::validate_kernel_run(run).unwrap();
                 let src = &run.inputs[0].views[0];
-                let dst = &run.output;
+                let dst = &run.outputs[0];
                 let spans = |v: &crate::ShardView| {
                     let spans =
                         crate::view_byte_spans(&low.shards[v.shard.index() as usize], v).unwrap();
@@ -391,7 +391,7 @@ mod tests {
             let crate::ShardDefinition::ShiftedAlias {
                 source: donor,
                 offset: -32768,
-            } = low.shards[run.output.shard.index() as usize].definition
+            } = low.shards[run.outputs[0].shard.index() as usize].definition
             else {
                 panic!("donated output")
             };
@@ -401,7 +401,7 @@ mod tests {
             }
             assert_eq!(
                 placement.shard_addresses[&donor],
-                placement.shard_addresses[&run.output.shard] + 32768
+                placement.shard_addresses[&run.outputs[0].shard] + 32768
             );
         }
     }

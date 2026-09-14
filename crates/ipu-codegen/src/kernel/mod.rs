@@ -59,9 +59,7 @@ pub fn materialize_kernel_run(
     overrides: &BTreeMap<BlockValueId, TileAddress>,
 ) -> Result<ComputeStep, KernelMaterializationError> {
     let call = plan.call(run)?;
-    let packed_group = run
-        .requirements
-        .output
+    let packed_group = run.requirements.outputs[0]
         .format
         .layout
         .order
@@ -76,11 +74,9 @@ pub fn materialize_kernel_run(
             )
         });
     if let Some(group) = packed_group {
-        let shard = &shards[run.output.shard.index() as usize];
-        let column = run.output.extents.len()
-            - if run
-                .requirements
-                .output
+        let shard = &shards[run.outputs[0].shard.index() as usize];
+        let column = run.outputs[0].extents.len()
+            - if run.requirements.outputs[0]
                 .format
                 .layout
                 .order
@@ -90,15 +86,15 @@ pub fn materialize_kernel_run(
             } else {
                 1
             };
-        let row = if column + 1 == run.output.extents.len() {
+        let row = if column + 1 == run.outputs[0].extents.len() {
             column - 1
         } else {
             column + 1
         };
-        let extent = run.output.extents[column];
+        let extent = run.outputs[0].extents[column];
         let start = extent.start - shard.extents[column].start;
         let end = extent.physical_end - shard.extents[column].start;
-        if run.output.extents[row] != shard.extents[row]
+        if run.outputs[0].extents[row] != shard.extents[row]
             || !gemm_rows(run)?.is_multiple_of(16)
             || !start.is_multiple_of(16)
             || end <= start
@@ -126,11 +122,11 @@ pub fn materialize_kernel_run(
         let base = resolve_shard_address(shards, shard_addresses, overrides, view.shard)?;
         add_address_offset(base, span.offset)
     };
-    let mut output_address = resolve(&run.output, packed_group.is_some())?;
+    let mut output_address = resolve(&run.outputs[0], packed_group.is_some())?;
     if let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel {
         let output_spans = view_byte_traversal(
-            &shards[run.output.shard.index() as usize],
-            &run.output,
+            &shards[run.outputs[0].shard.index() as usize],
+            &run.outputs[0],
             crate::CopyOrder::Physical,
         )?;
         let allocation_bytes = output_spans
@@ -146,15 +142,13 @@ pub fn materialize_kernel_run(
         }
         output_address = add_address_offset(output_address, offset)?;
     }
+    // The worker ABI puts result zero in R2, followed by inputs and then the
+    // remaining results. This register order does not distinguish result storage.
     let input_addresses = run
         .inputs
         .iter()
         .map(|operand| resolve(&operand.views[0], false))
-        .chain(
-            run.additional_outputs
-                .iter()
-                .map(|view| resolve(view, false)),
-        )
+        .chain(run.outputs.iter().skip(1).map(|view| resolve(view, false)))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
         symbol: call.symbol,

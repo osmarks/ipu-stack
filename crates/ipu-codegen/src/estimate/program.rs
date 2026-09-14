@@ -11,7 +11,11 @@ fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> 
         run.inputs
             .iter()
             .map(|i| i.views.first().map(|v| v.extents.as_slice()))
-            .chain(run.outputs().map(|output| Some(output.extents.as_slice())))
+            .chain(
+                run.outputs
+                    .iter()
+                    .map(|output| Some(output.extents.as_slice())),
+            )
     }
     let variants = costs
         .entry(std::sync::Arc::as_ptr(&run.metadata))
@@ -328,7 +332,7 @@ fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
             let access = run.requirements.inputs.get(index)?;
             Some(geometry(operand.views.first()?, &access.format))
         },
-        geometry(&run.output, &run.requirements.output.format),
+        geometry(&run.outputs[0], &run.requirements.outputs[0].format),
     )
 }
 

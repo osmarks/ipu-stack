@@ -9,19 +9,17 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
         // Physical local copies may contain padding without a semantic view.
         return None;
     };
-    let logical: u64 = run
-        .output
+    let logical: u64 = run.outputs[0]
         .extents
         .iter()
         .map(|e| u64::from(e.logical_end.saturating_sub(e.start)))
         .product();
-    let physical: u64 = run
-        .output
+    let physical: u64 = run.outputs[0]
         .extents
         .iter()
         .map(|e| u64::from(e.physical_end - e.start))
         .product();
-    let precision = run.requirements.output.format.precision;
+    let precision = run.requirements.outputs[0].format.precision;
     // Usual allocation alignment permits the ACC/SQACC statistics loops.
     // Small/tail widths use the pair loops; addresses are not available here.
     let statistics_width = run

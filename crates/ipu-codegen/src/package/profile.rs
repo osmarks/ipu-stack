@@ -367,7 +367,7 @@ fn profile_step(
             });
             description.metadata.push(ProfileMetadata {
                 name: "outputElements".into(),
-                value: view_logical_elements(&run.output).to_string(),
+                value: view_logical_elements(&run.outputs[0]).to_string(),
             });
             for (operand, input) in run.inputs.iter().enumerate() {
                 description.metadata.push(ProfileMetadata {

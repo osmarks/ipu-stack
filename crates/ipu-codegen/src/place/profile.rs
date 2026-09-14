@@ -474,7 +474,8 @@ mod tests {
                 // This must also exclude deliberate writable aliases of parameters.
                 for run in &low.kernel_runs {
                     assert!(
-                        run.outputs()
+                        run.outputs
+                            .iter()
                             .all(|out| !allocation.shards.contains(&out.shard.index()))
                     );
                 }

@@ -56,7 +56,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
             assert!(expanded.kernel_runs.len() > usize::from(tiles));
             for run in &expanded.kernel_runs {
                 assert_eq!(
-                    run.inputs[0].views[0].extents, run.output.extents,
+                    run.inputs[0].views[0].extents, run.outputs[0].extents,
                     "shape {shape:?}, tiles {tiles}"
                 );
                 crate::validate_kernel_run(run).unwrap();
@@ -91,7 +91,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 });
                 let expanded = expand_tiles(&norm, false).unwrap();
                 for run in &expanded.kernel_runs {
-                    assert_eq!(run.inputs[0].views[0].extents, run.output.extents);
+                    assert_eq!(run.inputs[0].views[0].extents, run.outputs[0].extents);
                     crate::validate_kernel_run(run).unwrap();
                 }
             }

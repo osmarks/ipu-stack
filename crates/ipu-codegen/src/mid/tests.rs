@@ -49,7 +49,7 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
     let mut applies = 0;
     for run in &low.kernel_runs {
         if matches!(run.kernel, TileKernelSpec::LayerNormMoments) {
-            assert_eq!(run.requirements.output.format.precision, Precision::F32);
+            assert_eq!(run.requirements.outputs[0].format.precision, Precision::F32);
             crate::validate_kernel_run(run).unwrap();
             moments += 1;
         }
@@ -1272,8 +1272,8 @@ fn randomized_single_use_views_compose_into_panel_copies() {
                 );
             }
             assert_eq!(
-                run.requirements.output.format,
-                tiled.shards[run.output.shard.index() as usize]
+                run.requirements.outputs[0].format,
+                tiled.shards[run.outputs[0].shard.index() as usize]
                     .tensor_type
                     .format
             );
@@ -1426,7 +1426,7 @@ fn uneven_mlp_products_preserve_global_coordinates() {
         if !matches!(run.kernel, TileKernelSpec::Gemm { .. }) {
             continue;
         }
-        let output = &run.output.extents;
+        let output = &run.outputs[0].extents;
         let left = &run.inputs[0].views[0].extents;
         let right = &run.inputs[1].views[0].extents;
         let bounds = |e: &ShardExtent| (e.start, e.logical_end, e.physical_end);
@@ -1479,7 +1479,7 @@ fn blocked_attention_reserves_online_state_between_accumulator_rows() {
             ..
         } = run.kernel
         {
-            let columns = run.output.extents.last().unwrap();
+            let columns = run.outputs[0].extents.last().unwrap();
             assert!(columns.logical_end - columns.start >= value_dimension + 2);
             assert!(columns.physical_end - columns.start >= 80);
             intermediate += 1;
@@ -1908,7 +1908,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
                 run.kernel,
                 TileKernelSpec::AttentionSoftmax { .. }
             ) && matches!(
-                run.requirements.output.format.precision,
+                run.requirements.outputs[0].format.precision,
                 Precision::F8F143 { .. }
             )));
             // Quantization precedes query replication on unreplicated V panels.
@@ -1919,10 +1919,10 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
                     to: Precision::F8F143 { .. }
                 }
             ) && matches!(
-                run.requirements.output.format.layout.order,
+                run.requirements.outputs[0].format.layout.order,
                 ElementOrder::BlockMajor(BlockMajorOrder::Matrix { row_block: 64, .. })
             )
-                && run.requirements.output.format.layout.tiling.replicas == 1));
+                && run.requirements.outputs[0].format.layout.tiling.replicas == 1));
         }
     }
 }

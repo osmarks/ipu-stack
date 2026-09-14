@@ -170,10 +170,10 @@ impl TileGraphBuilder {
                         KernelOperand { views: vec![l] },
                         KernelOperand { views: vec![r] },
                     ],
-                    destination,
+                    vec![destination],
                 )?;
                 let flattens_outer_rows = matches!(
-                    run.requirements.output.format.layout.order,
+                    run.requirements.outputs[0].format.layout.order,
                     ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
                 );
                 // Count after batch splitting: each local call owns only its
@@ -186,8 +186,7 @@ impl TileGraphBuilder {
                                 .saturating_sub(e.start),
                         )
                     };
-                    let rows: u64 = run
-                        .output
+                    let rows: u64 = run.outputs[0]
                         .extents
                         .iter()
                         .enumerate()
@@ -195,7 +194,7 @@ impl TileGraphBuilder {
                         .map(|(_, &e)| size(e, None))
                         .product();
                     let cols =
-                        size(run.output.extents[output_column], axes.valid_columns).min(size(
+                        size(run.outputs[0].extents[output_column], axes.valid_columns).min(size(
                             run.inputs[1].views[0].extents[right_column],
                             axes.valid_columns,
                         ));
@@ -204,8 +203,7 @@ impl TileGraphBuilder {
                             run.inputs[1].views[0].extents[right_inner],
                             axes.valid_inner,
                         ));
-                    let physical: u64 = run
-                        .output
+                    let physical: u64 = run.outputs[0]
                         .extents
                         .iter()
                         .map(|e| u64::from(e.physical_end - e.start))
@@ -214,8 +212,8 @@ impl TileGraphBuilder {
                         Some([2 * rows * cols * inner, 2 * physical * u64::from(width)]);
                     self.append_kernel(body, tile, run)
                 };
-                if run.output.extents.len() > 2 && !flattens_outer_rows {
-                    let mut coordinates = vec![0; run.output.extents.len() - 2];
+                if run.outputs[0].extents.len() > 2 && !flattens_outer_rows {
+                    let mut coordinates = vec![0; run.outputs[0].extents.len() - 2];
                     let mut matrices = Vec::new();
                     split_gemm_matrices(&run, 0, &mut coordinates, &mut matrices)?;
                     if matrices.len() > 1 {
@@ -239,8 +237,7 @@ fn split_gemm_matrices(
     runs: &mut Vec<KernelRun>,
 ) -> ExpansionResult<()> {
     if axis < coordinates.len() {
-        let extent = run
-            .output
+        let extent = run.outputs[0]
             .extents
             .get(axis)
             .ok_or(ExpansionError::InvalidOperatorPlan)?;
@@ -255,7 +252,7 @@ fn split_gemm_matrices(
     }
 
     let mut matrix = run.clone();
-    narrow_gemm_matrix_view(&mut matrix.output, coordinates)?;
+    narrow_gemm_matrix_view(&mut matrix.outputs[0], coordinates)?;
     for operand in &mut matrix.inputs {
         for view in &mut operand.views {
             narrow_gemm_matrix_view(view, coordinates)?;

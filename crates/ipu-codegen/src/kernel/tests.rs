@@ -69,7 +69,7 @@ fn packed_add_keeps_padding_in_dense_operand_views() {
     for run in &low.kernel_runs {
         if matches!(run.kernel, TileKernelSpec::Add) {
             assert_eq!(
-                run.requirements.output.format.layout.order,
+                run.requirements.outputs[0].format.layout.order,
                 ElementOrder::Amp(AmpOrder::Left)
             );
             packed_adds += 1;
@@ -118,10 +118,10 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     casts += 1;
                     assert_eq!(
                         run.requirements.inputs[0].format.layout.order,
-                        run.requirements.output.format.layout.order
+                        run.requirements.outputs[0].format.layout.order
                     );
                     assert_ne!(
-                        run.requirements.output.format.layout.order,
+                        run.requirements.outputs[0].format.layout.order,
                         ElementOrder::RowMajor
                     );
                     let abi = validate_kernel_run(run).unwrap();
@@ -135,7 +135,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     gemms += 1;
                     assert_eq!(multiply, fp8);
                     assert_eq!(accumulate, AccumulationPrecision::F16);
-                    assert_eq!(run.requirements.output.format.precision, Precision::F16);
+                    assert_eq!(run.requirements.outputs[0].format.precision, Precision::F16);
                     assert_eq!(
                         scalar_values(run, &validate_kernel_run(run).unwrap()).unwrap(),
                         vec![(-8i32) as u32]
@@ -201,7 +201,7 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                 output_columns: 16,
             },
             Vec::new(),
-            ShardView {
+            vec![ShardView {
                 shard: BlockValueId::from_index(0),
                 extents: [outer, semantic_rows, semantic_columns]
                     .into_iter()
@@ -213,11 +213,10 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
                         physical_end,
                     })
                     .collect(),
-            },
+            }],
             KernelRequirements {
-                additional_outputs: Vec::new(),
                 inputs: Vec::new(),
-                output: KernelAccess::new(format, 8),
+                outputs: vec![KernelAccess::new(format, 8)],
                 distinct_elements: Vec::new(),
             },
         );
@@ -260,9 +259,8 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
         };
         let operand = KernelAccess::new(format, 8);
         let requirements = KernelRequirements {
-            additional_outputs: Vec::new(),
             inputs: vec![operand.clone(), operand.clone()],
-            output: operand,
+            outputs: vec![operand],
             distinct_elements: Vec::new(),
         };
         let abi = tile_kernel_abi(
@@ -416,9 +414,8 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
             )
         };
         let requirements = KernelRequirements {
-            additional_outputs: Vec::new(),
             inputs: vec![requirement(input_layout)],
-            output: requirement(output_layout),
+            outputs: vec![requirement(output_layout)],
             distinct_elements: Vec::new(),
         };
         let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
@@ -522,9 +519,8 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                     views: vec![output.clone()],
                 })
                 .collect(),
-            output,
+            vec![output],
             KernelRequirements {
-                additional_outputs: Vec::new(),
                 inputs: vec![
                     KernelAccess::new(
                         TensorFormat {
@@ -535,7 +531,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                     );
                     inputs
                 ],
-                output: KernelAccess::new(format, 8),
+                outputs: vec![KernelAccess::new(format, 8)],
                 distinct_elements: Vec::new(),
             },
         );
@@ -635,7 +631,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
             padding_only: false,
         },
         Vec::new(),
-        ShardView {
+        vec![ShardView {
             shard: shard.id,
             extents: vec![ShardExtent {
                 axis: 0,
@@ -643,11 +639,10 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
                 logical_end: 64,
                 physical_end: 64,
             }],
-        },
+        }],
         KernelRequirements {
-            additional_outputs: Vec::new(),
             inputs: Vec::new(),
-            output: KernelAccess::new(tensor_type.format, 8),
+            outputs: vec![KernelAccess::new(tensor_type.format, 8)],
             distinct_elements: Vec::new(),
         },
     );
@@ -677,7 +672,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
                 padding_only: false,
             },
             run.inputs.clone(),
-            run.output.clone(),
+            vec![run.outputs[0].clone()],
             run.requirements.clone(),
         );
         assert!(materialize(&run).is_err(), "offset={offset} bytes={bytes}");
@@ -722,8 +717,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
                 products += 1;
                 assert!(gemm_rows(run).unwrap().is_multiple_of(16));
                 assert_eq!(
-                    run.requirements
-                        .output
+                    run.requirements.outputs[0]
                         .format
                         .layout
                         .order
@@ -734,10 +728,10 @@ fn packed_gemm_stores_bind_without_output_copies() {
                     materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new())
                         .unwrap();
                 assert!(step.symbol.contains("packed64"));
-                let source = &low.shards[run.output.shard.index() as usize];
+                let source = &low.shards[run.outputs[0].shard.index() as usize];
                 assert_eq!(
                     source.tensor_type.format.layout.order,
-                    run.requirements.output.format.layout.order
+                    run.requirements.outputs[0].format.layout.order
                 );
             }
             assert!(products > 0);
@@ -779,11 +773,10 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
             vec![crate::KernelOperand {
                 views: vec![view(0)],
             }],
-            view(1),
+            vec![view(1)],
             KernelRequirements {
-                additional_outputs: Vec::new(),
                 inputs: vec![KernelAccess::new(format(Precision::F32), 8)],
-                output: KernelAccess::new(format(Precision::F16), 8),
+                outputs: vec![KernelAccess::new(format(Precision::F16), 8)],
                 distinct_elements: Vec::new(),
             },
         );
@@ -886,7 +879,7 @@ fn unsupported_kernel_abis_fail_at_lookup() {
             to: format.layout.clone(),
         },
     ] {
-        let requirements = KernelRequirements::new(&kernel, [format.clone()], format.clone());
+        let requirements = KernelRequirements::new(&kernel, [format.clone()], vec![format.clone()]);
         assert_eq!(
             tile_kernel_abi(&kernel, &requirements),
             Err(KernelAbiError::Unavailable(kernel))
@@ -929,8 +922,8 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
                 views: vec![view(1, [1, 2])],
             },
         ],
-        view(2, [1, 2]),
-        KernelRequirements::new(&kernel, [format.clone(), format.clone()], format),
+        vec![view(2, [1, 2])],
+        KernelRequirements::new(&kernel, [format.clone(), format.clone()], vec![format]),
     );
     validate_kernel_run(&run).unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.

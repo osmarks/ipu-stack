@@ -129,8 +129,7 @@ impl KernelSpecialization {
                 *output_columns,
                 *mode,
                 gemm_rows(run)?,
-                run.requirements
-                    .output
+                run.requirements.outputs[0]
                     .format
                     .layout
                     .order
@@ -141,7 +140,7 @@ impl KernelSpecialization {
             TileKernelSpec::AttentionSoftmax { .. } | TileKernelSpec::AttentionMerge { .. } => {
                 Self::stage(
                     kernel,
-                    run.requirements.output.format.precision,
+                    run.requirements.outputs[0].format.precision,
                     run.requirements
                         .inputs
                         .get(1)
@@ -152,10 +151,10 @@ impl KernelSpecialization {
                 Self::Rearrange(rearrangement_specialization(
                     RearrangeTarget::from_order(to.order)
                         .ok_or(KernelAbiError::RequirementMismatch)?,
-                    matrix_extent(&run.output, true, false)?,
-                    matrix_extent(&run.output, false, false)?,
-                    matrix_extent(&run.output, true, true)?,
-                    matrix_extent(&run.output, false, true)?,
+                    matrix_extent(&run.outputs[0], true, false)?,
+                    matrix_extent(&run.outputs[0], false, false)?,
+                    matrix_extent(&run.outputs[0], true, true)?,
+                    matrix_extent(&run.outputs[0], false, true)?,
                 ))
             }
             TileKernelSpec::Rearrange { from, to } if to.order == ElementOrder::RowMajor => {

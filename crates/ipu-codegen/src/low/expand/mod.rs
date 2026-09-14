@@ -446,7 +446,7 @@ impl TileGraphBuilder {
                     padding_only,
                 },
                 Vec::new(),
-                self.full_view(shard),
+                vec![self.full_view(shard)],
             )?;
             self.append_kernel(tiles, tile, run)
         }

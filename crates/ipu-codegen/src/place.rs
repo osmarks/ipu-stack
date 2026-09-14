@@ -9,7 +9,7 @@ pub(crate) use exchange::ExchangeConflicts;
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::{BlockValueId, ShardDefinition};
-use crate::{MemoryClass, MemoryOperand};
+use crate::MemoryClass;
 use crate::{StorageError, shard_storage_bytes};
 use ipu_package::{
     IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
@@ -505,7 +505,7 @@ fn touch_work(
             for view in run.inputs.iter().flat_map(|operand| &operand.views) {
                 touch(view.shard);
             }
-            for output in run.outputs() {
+            for output in run.outputs.iter() {
                 touch(output.shard);
             }
         }
@@ -580,17 +580,15 @@ fn collect_requirements(
         match work {
             TileWorkRef::Kernel(run) => {
                 let inputs = &run.requirements.inputs;
-                let output = &run.requirements.output;
                 for operands in &run.requirements.distinct_elements {
                     let groups = operands
                         .iter()
-                        .map(|operand| match operand {
-                            MemoryOperand::Output => vec![run.output.shard.index() as usize],
-                            MemoryOperand::Input(index) => run.inputs[usize::from(*index)]
-                                .views
+                        .map(|&operand| {
+                            run.operand_views(operand)
+                                .expect("kernel constraints refer to bound operands")
                                 .iter()
                                 .map(|view| view.shard.index() as usize)
-                                .collect(),
+                                .collect()
                         })
                         .collect::<Vec<Vec<usize>>>();
                     for (index, group) in groups.iter().enumerate() {
@@ -611,12 +609,7 @@ fn collect_requirements(
                         );
                     }
                 }
-                apply_requirement(&mut requirements[run.output.shard.index() as usize], output);
-                for (view, requirement) in run
-                    .additional_outputs
-                    .iter()
-                    .zip(&run.requirements.additional_outputs)
-                {
+                for (view, requirement) in run.outputs.iter().zip(&run.requirements.outputs) {
                     apply_requirement(&mut requirements[view.shard.index() as usize], requirement);
                 }
             }
@@ -1395,7 +1388,7 @@ mod tests {
                 .map(|id| analysis.root_of_member[id.index() as usize])
                 .collect::<BTreeSet<_>>();
             for run in &low.kernel_runs {
-                assert!(run.outputs().all(|out| {
+                assert!(run.outputs.iter().all(|out| {
                     !roots.contains(&analysis.root_of_member[out.shard.index() as usize])
                 }));
             }
@@ -1738,7 +1731,7 @@ mod tests {
                     .requirements
                     .distinct_elements
                     .push(vec![
-                        crate::MemoryOperand::Output,
+                        crate::MemoryOperand::Output(0),
                         crate::MemoryOperand::Input(1),
                     ]);
             }
@@ -1957,8 +1950,10 @@ mod tests {
                                 let mut ranges = Vec::new();
                                 for operand in operands {
                                     let shards = match operand {
-                                        MemoryOperand::Output => vec![run.output.shard],
-                                        MemoryOperand::Input(index) => run.inputs
+                                        crate::MemoryOperand::Output(index) => {
+                                            vec![run.outputs[usize::from(*index)].shard]
+                                        }
+                                        crate::MemoryOperand::Input(index) => run.inputs
                                             [usize::from(*index)]
                                         .views
                                         .iter()

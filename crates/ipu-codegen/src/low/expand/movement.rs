@@ -195,7 +195,7 @@ impl TileGraphBuilder {
                 vec![KernelOperand {
                     views: vec![self.full_view(source_shard)],
                 }],
-                self.full_view(staging),
+                vec![self.full_view(staging)],
             )?;
             self.append_kernel(tiles, tile, run)?;
             staging_shards.push(staging);
@@ -241,7 +241,7 @@ impl TileGraphBuilder {
                 vec![KernelOperand {
                     views: vec![self.full_view(input)],
                 }],
-                self.full_view(output),
+                vec![self.full_view(output)],
             )?;
             self.append_kernel(tiles, tile, run)?;
         }
@@ -708,7 +708,7 @@ impl TileGraphBuilder {
                             vec![KernelOperand {
                                 views: vec![staging],
                             }],
-                            self.full_view(destination_shard),
+                            vec![self.full_view(destination_shard)],
                         )?,
                     ));
                 } else {

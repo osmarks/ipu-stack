@@ -14,13 +14,13 @@ impl TileGraphBuilder {
             .map(|e| e.physical_end - e.start)
             .collect::<Vec<_>>();
         let chunks = crate::kernel::cast::CastChunks::new(
-            run.requirements.output.format.layout.order,
+            run.requirements.outputs[0].format.layout.order,
             &dimensions,
         )
         .ok_or(ExpansionError::InvalidOperatorPlan)?;
         for (start, end) in chunks.ranges {
             let mut part = run.clone();
-            for view in [&mut part.inputs[0].views[0], &mut part.output] {
+            for view in [&mut part.inputs[0].views[0], &mut part.outputs[0]] {
                 let extent = &mut view.extents[chunks.axis];
                 let base = extent.start;
                 extent.start = base + start;

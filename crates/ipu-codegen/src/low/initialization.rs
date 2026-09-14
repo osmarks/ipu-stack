@@ -63,11 +63,11 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
                 let ignores_padding = matches!(run.kernel, TileKernelSpec::Cast {
                     from: Precision::F16, to: Precision::F8F143 { .. }
                 } | TileKernelSpec::Gelu)
-                    && matches!(run.requirements.output.format.precision, Precision::F8F143 { .. })
+                    && matches!(run.requirements.outputs[0].format.precision, Precision::F8F143 { .. })
                     && block.tensor_type.format.precision == Precision::F16
                     && block.tensor_type.format.layout.order == ElementOrder::RowMajor
-                    && matches!(run.requirements.output.format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
-                    && (run.kernel == TileKernelSpec::Gelu || run.requirements.output.format.layout.order == ElementOrder::Amp(AmpOrder::Left))
+                    && matches!(run.requirements.outputs[0].format.layout.order, ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor)
+                    && (run.kernel == TileKernelSpec::Gelu || run.requirements.outputs[0].format.layout.order == ElementOrder::Amp(AmpOrder::Left))
                     && view.extents == block.extents
                     && columns.is_some_and(|axis| (axis.logical_end - axis.start).is_multiple_of(4))
                     // Matrix-row padding is skipped by the packed row bounds;
@@ -85,7 +85,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
             }
         }
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
-            forbidden.extend(run.outputs().map(|view| root(view.shard)));
+            forbidden.extend(run.outputs.iter().map(|view| root(view.shard)));
         }
     }
     candidates.retain(|id| !forbidden.contains(id));
@@ -99,7 +99,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
                     padding_only: true,
                     ..
                 }
-            ) && candidates.contains(&root(run.output.shard))
+            ) && candidates.contains(&root(run.outputs[0].shard))
             {
                 removed += 1;
                 return false;
@@ -156,7 +156,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
                 let run = &program.kernel_runs[run.0 as usize];
                 if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
                     // Arithmetic results are not known-zero-padded parameters.
-                    for output in run.outputs() {
+                    for output in run.outputs.iter() {
                         incoming
                             .entry(root(output.shard))
                             .or_default()
@@ -207,7 +207,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
             }
         }
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
-            forbidden.extend(run.outputs().map(|output| root(output.shard)));
+            forbidden.extend(run.outputs.iter().map(|output| root(output.shard)));
         }
     }
     candidates.retain(|shard| !forbidden.contains(shard));
@@ -223,28 +223,30 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
                 bytes,
                 padding_only: true,
             } = run.kernel
-                && candidates.contains(&storage_root(shards, run.output.shard))
+                && candidates.contains(&storage_root(shards, run.outputs[0].shard))
             {
                 // Keep discarded row padding zero: arbitrary nonzero rows
                 // could overflow even though their outputs are unobserved.
-                let ranges = valid_row_ranges.entry(run.output.shard).or_insert_with(|| {
-                    let shard = &shards[run.output.shard.index() as usize];
-                    let mut rows = shard.extents.clone();
-                    let rank = rows.len();
-                    let inner = match shard.tensor_type.format.layout.order {
-                        ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor => {
-                            rank.checked_sub(1)?
+                let ranges = valid_row_ranges
+                    .entry(run.outputs[0].shard)
+                    .or_insert_with(|| {
+                        let shard = &shards[run.outputs[0].shard.index() as usize];
+                        let mut rows = shard.extents.clone();
+                        let rank = rows.len();
+                        let inner = match shard.tensor_type.format.layout.order {
+                            ElementOrder::Amp(AmpOrder::Left) | ElementOrder::RowMajor => {
+                                rank.checked_sub(1)?
+                            }
+                            ElementOrder::Amp(AmpOrder::TransposedLeft) => rank.checked_sub(2)?,
+                            _ => return None,
+                        };
+                        for (axis, extent) in rows.iter_mut().enumerate() {
+                            if axis != inner {
+                                extent.physical_end = extent.logical_end;
+                            }
                         }
-                        ElementOrder::Amp(AmpOrder::TransposedLeft) => rank.checked_sub(2)?,
-                        _ => return None,
-                    };
-                    for (axis, extent) in rows.iter_mut().enumerate() {
-                        if axis != inner {
-                            extent.physical_end = extent.logical_end;
-                        }
-                    }
-                    crate::storage::byte_traversal(shard.storage(), &rows, true).ok()
-                });
+                        crate::storage::byte_traversal(shard.storage(), &rows, true).ok()
+                    });
                 if !ranges.as_ref().is_some_and(|ranges| {
                     ranges.spans().any(|range| {
                         range.offset <= offset
@@ -307,11 +309,10 @@ mod tests {
                 },
                 kernel,
                 inputs,
-                view(output),
+                vec![view(output)],
                 KernelRequirements {
-                    additional_outputs: Vec::new(),
                     inputs: Vec::new(),
-                    output: KernelAccess::new(tensor_type.format.clone(), 8),
+                    outputs: vec![KernelAccess::new(tensor_type.format.clone(), 8)],
                     distinct_elements: Vec::new(),
                 },
             )
@@ -470,8 +471,9 @@ mod tests {
             from: Precision::F16,
             to: Precision::F8F143 { scale_exponent: -4 },
         };
-        metadata.requirements.output.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
-        metadata.requirements.output.format.precision = Precision::F8F143 { scale_exponent: -4 };
+        metadata.requirements.outputs[0].format.layout.order = ElementOrder::Amp(AmpOrder::Left);
+        metadata.requirements.outputs[0].format.precision =
+            Precision::F8F143 { scale_exponent: -4 };
         for case in 0..11 {
             let mut program = baseline.clone();
             let graph = &mut program;

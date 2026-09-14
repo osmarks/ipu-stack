@@ -215,7 +215,8 @@ fn check_bytes(
                 let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel else {
                     return Err(format!("unexpected kernel {:?}", run.kernel));
                 };
-                let start = (placement.shard_addresses[&run.output.shard] + offset) as usize / 4;
+                let start =
+                    (placement.shard_addresses[&run.outputs[0].shard] + offset) as usize / 4;
                 memory[usize::from(*tile)][start..start + bytes as usize / 4].fill(0);
             }
             _ => return Err(format!("unexpected operation {operation:?}")),

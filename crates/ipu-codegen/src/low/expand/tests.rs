@@ -324,7 +324,7 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
             vec![KernelOperand {
                 views: vec![logical.clone()],
             }],
-            builder.full_view(source),
+            vec![builder.full_view(source)],
         )
         .unwrap();
     assert_eq!(run.inputs[0].views[0], builder.full_view(source));
@@ -640,7 +640,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                 .collect::<BTreeSet<_>>();
             let packed_results = reduction_runs
                 .iter()
-                .map(|run| run.output.shard)
+                .map(|run| run.outputs[0].shard)
                 .collect::<BTreeSet<_>>();
             let copied_outputs = low
                 .local_copies
@@ -770,7 +770,7 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
             .collect::<Vec<_>>();
         assert_eq!(runs.len(), rows as usize, "random case {case}");
         assert!(runs.iter().all(|run| {
-            run.output
+            run.outputs[0]
                 .extents
                 .iter()
                 .all(|extent| extent.start < extent.physical_end)
@@ -819,14 +819,14 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
                 _ => None,
             })
         {
-            let output = &low.shards[run.output.shard.index() as usize];
+            let output = &low.shards[run.outputs[0].shard.index() as usize];
             let flattens_outer_rows = matches!(
                 output.tensor_type.format.layout.order,
                 ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
             );
             assert!(
                 flattens_outer_rows
-                    || run.output.extents[..run.output.extents.len() - 2]
+                    || run.outputs[0].extents[..run.outputs[0].extents.len() - 2]
                         .iter()
                         .all(|extent| extent.physical_end - extent.start == 1),
                 "case {case}"
@@ -903,7 +903,7 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
                     tile.tile
                 );
                 assert_eq!(
-                    low.shards[run.output.shard.index() as usize].tile,
+                    low.shards[run.outputs[0].shard.index() as usize].tile,
                     tile.tile
                 );
             }
@@ -1398,7 +1398,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
                 if let TileWorkRef::Kernel(run) = work {
                     crate::validate_kernel_run(run).unwrap();
                     assert_eq!(
-                        low.shards[run.output.shard.index() as usize].tile,
+                        low.shards[run.outputs[0].shard.index() as usize].tile,
                         tile.tile
                     );
                     assert!(
@@ -1549,8 +1549,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                 else {
                     unreachable!()
                 };
-                let output_key = run
-                    .output
+                let output_key = run.outputs[0]
                     .extents
                     .iter()
                     .map(|extent| (extent.start, extent.physical_end))
@@ -1573,7 +1572,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
                         .any(|extent| { extent.physical_end - extent.start == kernel_inner })
                 );
                 assert!(
-                    run.output
+                    run.outputs[0]
                         .extents
                         .iter()
                         .any(|extent| { extent.physical_end - extent.start == kernel_columns })
@@ -2051,7 +2050,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
     let target = placement.shard_addresses[&repeat.binding.carried[0].result];
     assert!(
         low.work(&repeat.body).any(|work| match work {
-            TileWorkRef::Kernel(run) => placement.shard_addresses[&run.output.shard] == target,
+            TileWorkRef::Kernel(run) => placement.shard_addresses[&run.outputs[0].shard] == target,
             TileWorkRef::LocalCopy(copy) => placement.shard_addresses[&copy.destination] == target,
             _ => false,
         }),
@@ -2420,7 +2419,7 @@ fn in_place_pointwise_handles_multiple_linear_shards_per_tile() {
     let low = lower_to_tiles(&mid, false).unwrap();
     assert!(low.kernel_runs.len() > 4);
     for run in &low.kernel_runs {
-        let result = &low.shards[run.output.shard.index() as usize];
+        let result = &low.shards[run.outputs[0].shard.index() as usize];
         let ShardDefinition::WritableAlias(source) = result.definition else {
             panic!("expected in-place GeLU: {result:?}");
         };
@@ -2468,7 +2467,7 @@ fn local_casts_pair_corresponding_linear_fragments() {
         .collect::<Vec<_>>();
     assert_eq!(casts.len(), 8);
     for run in casts {
-        assert_eq!(run.inputs[0].views[0].extents, run.output.extents);
+        assert_eq!(run.inputs[0].views[0].extents, run.outputs[0].extents);
     }
 }
 

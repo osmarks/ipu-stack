@@ -312,11 +312,11 @@ impl TileGraphBuilder {
                                     views: vec![self.full_view(remote)],
                                 },
                             ],
-                            if direct_output && stage + 1 == reduction_stages {
+                            vec![if direct_output && stage + 1 == reduction_stages {
                                 destination.clone()
                             } else {
                                 self.full_view(stage_result)
-                            },
+                            }],
                         )?,
                     ));
                 }
@@ -547,15 +547,16 @@ mod tests {
                             })
                             .collect::<Vec<_>>();
                         let span = view_byte_traversal(
-                            &builder.shards[run.output.shard.index() as usize],
-                            &run.output,
+                            &builder.shards[run.outputs[0].shard.index() as usize],
+                            &run.outputs[0],
                             CopyOrder::Physical,
                         )
                         .unwrap()
                         .contiguous_span()
                         .unwrap();
                         let offset = span.offset as usize / 2;
-                        memory[run.output.shard.index() as usize][offset..offset + result.len()]
+                        memory[run.outputs[0].shard.index() as usize]
+                            [offset..offset + result.len()]
                             .copy_from_slice(&result);
                     }
                     _ => panic!("unexpected sum operation"),
@@ -570,7 +571,7 @@ mod tests {
                         builder
                             .kernel_runs
                             .iter()
-                            .any(|run| run.output.shard == output)
+                            .any(|run| run.outputs[0].shard == output)
                     );
                     assert!(
                         !builder
@@ -659,7 +660,7 @@ mod tests {
             builder
                 .kernel_runs
                 .iter()
-                .all(|run| run.output.shard != output)
+                .all(|run| run.outputs[0].shard != output)
         );
         assert!(
             builder

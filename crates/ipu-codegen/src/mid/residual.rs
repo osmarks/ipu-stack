@@ -370,7 +370,19 @@ mod tests {
             vec![MidValueId(6), MidValueId(4)]
         );
         assert_eq!(fused.operations[1].inputs[0], MidValueId(4));
-        let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
+        let mut expanded = (*crate::expand_tiles(&fused).unwrap()).clone();
+        for run in &mut expanded.kernel_runs {
+            if run.kernel == TileKernelSpec::AddLayerNormMoments {
+                std::sync::Arc::make_mut(&mut run.metadata)
+                    .requirements
+                    .distinct_elements
+                    .push(vec![
+                        crate::MemoryOperand::Output(0),
+                        crate::MemoryOperand::Output(1),
+                    ]);
+            }
+        }
+        let low = crate::lower_to_tiles(&std::sync::Arc::new(expanded), false);
         let placement = crate::place(&low).unwrap();
         let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut sums = 0;
@@ -386,7 +398,27 @@ mod tests {
             .unwrap();
             if run.kernel == TileKernelSpec::AddLayerNormMoments {
                 sums += 1;
-                assert_eq!(run.additional_outputs.len(), 1);
+                assert_eq!(run.outputs.len(), 2);
+                let mut occupied = BTreeSet::new();
+                for view in &run.outputs {
+                    let shard = &low.shards[view.shard.index() as usize];
+                    let elements = crate::exchange::effective_memory_elements(
+                        placement.shard_addresses[&view.shard],
+                        crate::shard_storage_bytes(shard).unwrap().div_ceil(4),
+                    );
+                    for element in elements {
+                        assert!(occupied.insert(element));
+                    }
+                }
+                let mut invalid = run.clone();
+                invalid.outputs.pop();
+                assert!(crate::validate_kernel_run(&invalid).is_err());
+                let mut invalid = run.clone();
+                std::sync::Arc::make_mut(&mut invalid.metadata)
+                    .requirements
+                    .distinct_elements
+                    .push(vec![crate::MemoryOperand::Output(2)]);
+                assert!(crate::validate_kernel_run(&invalid).is_err());
                 assert_eq!(call.input_addresses.len(), 3);
                 assert_ne!(call.output_address, call.input_addresses[2]);
                 assert_eq!(call.arguments, vec![1, 9216]);

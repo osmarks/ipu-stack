@@ -388,7 +388,7 @@ mod tests {
             .iter()
             .find(|run| matches!(run.kernel, TileKernelSpec::AttentionSoftmax { .. }))
             .unwrap()
-            .output
+            .outputs[0]
             .shard;
         // The five PV groups consume 800 columns. The first 768 are weights;
         // [768, 784) contains FP32 metadata that can encode FP16 NaNs.

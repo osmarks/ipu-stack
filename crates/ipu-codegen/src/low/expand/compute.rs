@@ -100,28 +100,20 @@ impl TileGraphBuilder {
                             }
                         })
                         .collect::<ExpansionResult<Vec<_>>>()?;
-                    let mut run = self.kernel_run(
+                    let mut results = vec![self.full_view(output)];
+                    for &value in operation.results.iter().skip(1) {
+                        let shard = self.local_shard(value, tile)?;
+                        results.push(self.full_view(shard));
+                    }
+                    let run = self.kernel_run(
                         operation_provenance(operation),
                         kernel.clone(),
                         inputs
                             .into_iter()
                             .map(|view| KernelOperand { views: vec![view] })
                             .collect(),
-                        self.full_view(output),
+                        results,
                     )?;
-                    for &value in operation.results.iter().skip(1) {
-                        let shard = self.local_shard(value, tile)?;
-                        let view = self.full_view(shard);
-                        let format = self.shards[shard.index() as usize]
-                            .tensor_type
-                            .format
-                            .clone();
-                        Arc::make_mut(&mut run.metadata)
-                            .requirements
-                            .additional_outputs
-                            .push(crate::KernelAccess::new(format, 8));
-                        run.additional_outputs.push(view);
-                    }
                     if donate_cast {
                         self.append_in_place_cast(body, tile, run)?;
                     } else {
