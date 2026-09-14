@@ -136,20 +136,18 @@ pub(crate) fn conversion_traffic(
     let source_groups = groups(from)?;
     let destination_groups = groups(to)?;
     let element_bytes = precision.bytes();
-    let mut remote = HashSet::<(u16, Vec<(u32, u32)>)>::new();
+    let mut remote = HashMap::<(u16, Vec<(u32, u32)>), u64>::new();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
         let mut intersections = Vec::with_capacity(source_groups.len());
+        let mut destination_bytes = 0u64;
         for (source, source_tiles) in &source_groups {
             let Some(extents) = intersect_ranges(source, destination) else {
                 continue;
             };
-            intersections.push((extents, source_tiles));
-        }
-        let mut destination_bytes = 0u64;
-        for (extents, _) in &intersections {
-            let bytes = range_elements(extents).saturating_mul(element_bytes);
+            let bytes = range_elements(&extents).saturating_mul(element_bytes);
             destination_bytes = destination_bytes.saturating_add(bytes);
+            intersections.push((extents, source_tiles, bytes));
         }
         traffic.maximum_destination_bytes =
             traffic.maximum_destination_bytes.max(destination_bytes);
@@ -161,15 +159,14 @@ pub(crate) fn conversion_traffic(
             let mut remote_fragments = 0u64;
             let mut local_bytes = 0u64;
             let mut local_intersections = 0u64;
-            for (extents, source_tiles) in &intersections {
-                let bytes = range_elements(extents).saturating_mul(element_bytes);
+            for &(ref extents, source_tiles, bytes) in &intersections {
                 if source_tiles.binary_search(&destination_tile).is_ok() {
                     local_bytes = local_bytes.saturating_add(bytes);
                     local_intersections = local_intersections.saturating_add(1);
                 } else {
                     remote_bytes = remote_bytes.saturating_add(bytes);
                     remote_fragments = remote_fragments.saturating_add(1);
-                    remote.insert((source_tiles[0], extents.clone()));
+                    remote.insert((source_tiles[0], extents.clone()), bytes);
                 }
             }
             traffic
@@ -180,12 +177,8 @@ pub(crate) fn conversion_traffic(
                 traffic.maximum_local_intersections.max(local_intersections);
         }
     }
-    for (source, extents) in remote {
-        traffic.exchange.add_outgoing(
-            source,
-            range_elements(&extents).saturating_mul(element_bytes),
-            1,
-        );
+    for ((source, _), bytes) in remote {
+        traffic.exchange.add_outgoing(source, bytes, 1);
     }
     Some(traffic)
 }
