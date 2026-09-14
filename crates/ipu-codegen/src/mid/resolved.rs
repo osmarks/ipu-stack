@@ -24,16 +24,14 @@ impl ResolvedAxis {
     }
 
     pub(crate) fn complete_panels_except_tail(&self, grain: u32) -> bool {
-        self.partitions
-            .iter()
+        self.extent_sizes()
             .take(self.partitions.len().saturating_sub(1))
-            .all(|part| (part.physical_end - part.start).is_multiple_of(grain))
+            .all(|extent| extent.is_multiple_of(grain))
     }
 
     pub(crate) fn extents_are_multiple_of(&self, grain: u32) -> bool {
-        self.partitions
-            .iter()
-            .all(|part| (part.physical_end - part.start).is_multiple_of(grain))
+        self.extent_sizes()
+            .all(|extent| extent.is_multiple_of(grain))
     }
 
     pub(crate) fn same_partitioning(&self, other: &Self) -> bool {
@@ -46,19 +44,11 @@ impl ResolvedAxis {
     }
 
     pub(crate) fn maximum_extent(&self) -> u32 {
-        self.partitions
-            .iter()
-            .map(|part| part.physical_end - part.start)
-            .max()
-            .unwrap_or(0)
+        self.extent_sizes().max().unwrap_or(0)
     }
 
     pub(crate) fn minimum_extent(&self) -> u32 {
-        self.partitions
-            .iter()
-            .map(|part| part.physical_end - part.start)
-            .min()
-            .unwrap_or(0)
+        self.extent_sizes().min().unwrap_or(0)
     }
 }
 
@@ -148,12 +138,7 @@ impl ResolvedLayout {
         }
         self.axes
             .iter()
-            .map(|axis| {
-                axis.partitions
-                    .iter()
-                    .map(|part| u64::from(part.physical_end - part.start))
-                    .sum::<u64>()
-            })
+            .map(|axis| axis.extent_sizes().map(u64::from).sum::<u64>())
             .fold(u64::from(self.replicas), u64::saturating_mul)
     }
 

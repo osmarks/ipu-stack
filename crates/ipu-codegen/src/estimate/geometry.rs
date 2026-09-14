@@ -1,24 +1,17 @@
 //! Geometry facts shared by execution and table-storage analysis. Tile bindings,
 //! transmit lanes and pointer continuation remain in the consuming phase walk.
-use crate::storage::{ByteTraversal, ViewGeometry};
+use crate::storage::{ByteTraversal, StridedSpan, ViewGeometry};
 use crate::{CopyOrder, ExpansionResult, ShardView, TileGraph};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 const LIMIT: u32 = ipu_exchange::MAX_TRANSFER_WORDS * 4;
 
-#[derive(Clone, Copy)]
-pub(super) struct ReceiveRows {
-    pub offset: u32,
-    pub bytes: u32,
-    pub rows: u32,
-    pub stride: u32,
-}
 pub(super) struct CopyGeometry {
     pub bytes: u64,
     pub fragments: u64,
     pub long_fragments: u64,
-    pub receives: Vec<ReceiveRows>,
+    pub receives: Vec<StridedSpan>,
 }
 impl CopyGeometry {
     fn new(source: &ByteTraversal, target: &ByteTraversal) -> ExpansionResult<Self> {
@@ -31,7 +24,8 @@ impl CopyGeometry {
         if result.bytes != target.byte_len() {
             return Err(crate::storage::StorageError::InvalidView.into());
         }
-        let mut append = |offset, bytes: u32, rows: u32, stride| {
+        let mut append = |span: StridedSpan| {
+            let StridedSpan { bytes, rows, .. } = span;
             if bytes == 0 {
                 return;
             }
@@ -39,18 +33,18 @@ impl CopyGeometry {
             result.long_fragments += u64::from(rows)
                 * (u64::from(bytes / LIMIT) * u64::from(LIMIT > 256)
                     + u64::from(bytes % LIMIT > 256));
-            result.receives.push(ReceiveRows {
-                offset,
-                bytes,
-                rows,
-                stride,
-            });
+            result.receives.push(span);
         };
         if let Some((_, target)) = source.regular_copy(target) {
-            append(target.offset, target.bytes, target.rows, target.stride);
+            append(target);
         } else {
             crate::for_each_copy_span(source.spans(), target.spans(), |_, offset, bytes| {
-                append(offset, bytes, 1, bytes);
+                append(StridedSpan {
+                    offset,
+                    bytes,
+                    rows: 1,
+                    stride: bytes,
+                });
                 Ok(())
             })?;
         }
