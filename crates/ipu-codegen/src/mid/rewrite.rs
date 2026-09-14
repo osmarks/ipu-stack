@@ -135,3 +135,37 @@ pub(super) fn producer_through_copies(
         value = op.inputs[0];
     }
 }
+
+/// Price complete replacement sequences with the same overflow and missing-cost rules.
+pub(super) fn operation_cycles<'a>(
+    operations: impl IntoIterator<Item = &'a MidOperation>,
+    values: &[MidValue],
+) -> Option<u64> {
+    operations.into_iter().try_fold(0u64, |sum, op| {
+        crate::estimate::operation_cost(op, values)
+            .map(|(cost, _, _)| sum.saturating_add(cost.total))
+    })
+}
+
+pub(super) fn fusion_pays<'a>(
+    fusion: &'static str,
+    source: Option<OperationId>,
+    before: impl IntoIterator<Item = &'a MidOperation>,
+    after: impl IntoIterator<Item = &'a MidOperation>,
+    values: &[MidValue],
+) -> bool {
+    let separate_cycles = operation_cycles(before, values);
+    let fused_cycles = operation_cycles(after, values);
+    let keep = separate_cycles
+        .zip(fused_cycles)
+        .is_some_and(|(a, b)| b < a);
+    tracing::debug!(
+        fusion,
+        ?source,
+        ?separate_cycles,
+        ?fused_cycles,
+        keep,
+        "priced fusion"
+    );
+    keep
+}

@@ -59,6 +59,10 @@ impl State {
             state.visited.clear();
             tracing::info!("migrating legacy cast choices; cleared obsolete search visits");
         }
+        state.recipe.normalize(config);
+        for recipe in &mut state.visited {
+            recipe.normalize(config);
+        }
         tracing::info!(path = %path.display(), attempts = state.attempts, "loaded mid-plan search state");
         Ok(state)
     }

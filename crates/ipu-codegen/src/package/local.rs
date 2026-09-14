@@ -89,48 +89,104 @@ pub(super) fn optimize<T: Send>(
 
     state.save(config, &incumbent, &fixed)?;
     while state.attempts < budget_end {
-        // Indexed collection preserves proposal order for equal-cost ties.
-        let mut pending = proposals(graph, config, &incumbent)
-            .par_iter()
-            .filter(|recipe| !state.visited.contains(recipe))
-            .filter_map(
-                |recipe| match baseline::lower(graph, &fixed, &costs, recipe) {
+        let proposed = proposals(graph, config, &incumbent);
+        let proposed_count = proposed.len();
+        let screened = proposed
+            .into_par_iter()
+            .enumerate()
+            .filter(|(_, recipe)| !state.visited.contains(recipe))
+            .map(|(proposal, recipe)| {
+                let span = tracing::debug_span!("local_screen", round = state.attempts, proposal);
+                let _entered = span.enter();
+                let candidate = baseline::lower(graph, &fixed, &costs, &recipe);
+                let candidate = match candidate {
                     Ok(candidate) => {
                         let visited = state.visited.contains(&candidate.recipe);
+                        let keep = !visited
+                            && candidate.program.estimated_cycles
+                                < incumbent.program.estimated_cycles;
                         tracing::debug!(
-                            incumbent_cycles = incumbent.program.estimated_cycles,
-                            candidate_cycles = candidate.program.estimated_cycles,
-                            visited,
-                            changed_operations = ?candidate.recipe.plans.iter().filter_map(|(id, plan)|
-                                (incumbent.recipe.plans.get(id) != Some(plan)).then_some(id.index())).collect::<Vec<_>>(),
-                            changed_casts = ?candidate.recipe.cast_before_copies.symmetric_difference(&incumbent.recipe.cast_before_copies).collect::<Vec<_>>(),
-                            opened_boundaries = ?candidate.recipe.open_boundaries.difference(&incumbent.recipe.open_boundaries)
-                                .map(|id| id.index()).collect::<Vec<_>>(),
+                            incumbent_estimate = incumbent.program.estimated_cycles,
+                            candidate_estimate = candidate.program.estimated_cycles,
+                            visited, keep, delta = ?candidate.recipe.changes(&incumbent.recipe),
                             "screened local recipe"
                         );
-                        (!visited && candidate.program.estimated_cycles < incumbent.program.estimated_cycles)
-                            .then_some(candidate)
+                        if keep {
+                            Ok(candidate)
+                        } else if visited {
+                            Err(Skipped::Visited)
+                        } else {
+                            Err(Skipped::NotCheaper)
+                        }
                     }
                     Err(error) => {
                         tracing::debug!(%error, "discarded invalid local recipe");
-                        None
+                        Err(Skipped::Invalid)
                     }
-                },
-            )
+                };
+                (proposal, recipe, candidate)
+            })
             .collect::<Vec<_>>();
-        pending.sort_by_key(|candidate| candidate.program.estimated_cycles);
-        pending.dedup_by(|a, b| a.program == b.program);
+        let mut visited = proposed_count - screened.len();
+        let mut invalid = 0;
+        let mut not_cheaper = 0;
+        let mut deduplicated = 0;
+        let mut pending: Vec<Candidate> = Vec::new();
+        for (proposal, raw, result) in screened {
+            let candidate = match result {
+                Ok(candidate) => candidate,
+                Err(reason) => {
+                    match reason {
+                        Skipped::Invalid => invalid += 1,
+                        Skipped::NotCheaper => not_cheaper += 1,
+                        Skipped::Visited => {
+                            visited += 1;
+                            if !state.visited.contains(&raw) {
+                                state.visited.push(raw);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            if let Some(same) = pending
+                .iter_mut()
+                .find(|old| old.baseline.program == candidate.program)
+            {
+                same.recipes.extend([raw, candidate.recipe]);
+                deduplicated += 1;
+            } else {
+                let recipes = vec![raw, candidate.recipe.clone()];
+                pending.push(Candidate {
+                    proposal,
+                    baseline: candidate,
+                    recipes,
+                });
+            }
+        }
+        pending.sort_by_key(|candidate| candidate.baseline.program.estimated_cycles);
+        let truncated = pending.len().saturating_sub(budget_end - state.attempts);
         pending.truncate(budget_end - state.attempts);
+        tracing::info!(
+            round = state.attempts,
+            proposed = proposed_count,
+            invalid,
+            visited,
+            not_cheaper,
+            deduplicated,
+            truncated,
+            shortlisted = pending.len(),
+            "screened local search round"
+        );
         if pending.is_empty() {
+            state.save(config, &incumbent, &fixed)?;
             break;
         }
         for (index, candidate) in pending.iter().enumerate() {
-            memory_profile(
-                graph,
-                &fixed,
-                &candidate.program,
-                &format!("local-{}-candidate-{index}", state.attempts),
-            )?;
+            let scope = format!("local-{}-candidate-{index}", state.attempts);
+            if let Err(error) = memory_profile(graph, &fixed, &candidate.baseline.program, &scope) {
+                tracing::warn!(%error, scope, "skipped candidate memory profile");
+            }
         }
         tracing::info!(
             candidates = pending.len(),
@@ -146,10 +202,11 @@ pub(super) fn optimize<T: Send>(
             .enumerate()
             .map(|(index, candidate)| {
                 let attempt = state.attempts + index;
-                let span = tracing::info_span!("local_candidate", attempt);
+                let span =
+                    tracing::info_span!("local_candidate", attempt, proposal = candidate.proposal);
                 let _entered = span.enter();
                 let result = validate(
-                    &candidate.program,
+                    &candidate.baseline.program,
                     &fixed,
                     state.mapping.as_deref(),
                     Arc::clone(&expansions),
@@ -174,28 +231,19 @@ pub(super) fn optimize<T: Send>(
             .flatten();
         let Some((index, plan, candidate_cycles, built)) = winner else {
             state.attempts += pending.len();
-            state
-                .visited
-                .extend(pending.into_iter().map(|candidate| candidate.recipe));
+            remember(&mut state.visited, pending.iter());
             state.save(config, &incumbent, &fixed)?;
-            // A truncated shortlist may have further unevaluated proposals.
-            continue;
+            // All shortlisted programs failed. A truncated tail is available
+            // on resume; otherwise the unchanged incumbent has no new proposals.
+            break;
         };
-        state.visited.extend(
-            pending[..=index]
-                .iter()
-                .map(|candidate| candidate.recipe.clone()),
-        );
-        let mut candidate = pending.swap_remove(index);
+        remember(&mut state.visited, pending[..=index].iter());
+        let mut candidate = pending.swap_remove(index).baseline;
         tracing::info!(
             attempt = state.attempts + index,
             before = cycles,
             after = candidate_cycles,
-            changed_operations = ?candidate.recipe.plans.iter().filter_map(|(id, plan)|
-                (incumbent.recipe.plans.get(id) != Some(plan)).then_some(id.index())).collect::<Vec<_>>(),
-            changed_casts = ?candidate.recipe.cast_before_copies.symmetric_difference(&incumbent.recipe.cast_before_copies).collect::<Vec<_>>(),
-            opened_boundaries = ?candidate.recipe.open_boundaries.difference(&incumbent.recipe.open_boundaries)
-                .map(|id| id.index()).collect::<Vec<_>>(),
+            delta = ?candidate.recipe.changes(&incumbent.recipe),
             "accepted local layout improvement"
         );
         state.attempts += index + 1;
@@ -210,6 +258,31 @@ pub(super) fn optimize<T: Send>(
         state.save(config, &incumbent, &fixed)?;
     }
     Ok((selected, artifact))
+}
+
+enum Skipped {
+    Invalid,
+    Visited,
+    NotCheaper,
+}
+
+/// All recipes lowering to one program travel together until validation. Do not
+/// mark aliases of a truncated or cancelled candidate as visited.
+struct Candidate {
+    proposal: usize,
+    baseline: Baseline,
+    recipes: Vec<Recipe>,
+}
+
+fn remember<'a>(visited: &mut Vec<Recipe>, candidates: impl IntoIterator<Item = &'a Candidate>) {
+    for recipe in candidates
+        .into_iter()
+        .flat_map(|candidate| &candidate.recipes)
+    {
+        if !visited.contains(recipe) {
+            visited.push(recipe.clone());
+        }
+    }
 }
 
 fn memory_profile(
@@ -450,12 +523,19 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ipu-search-{}.json", fastrand::u64(..)));
         config.optimization_steps = 1;
         config.save_search_state = Some(path.clone());
+        let validated = std::sync::Mutex::new(Vec::new());
         for _ in 0..2 {
             let first = std::sync::atomic::AtomicBool::new(true);
-            optimize(&graph, &config, None, |_| {
+            optimize(&graph, &config, None, |plan| {
                 if first.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     Ok((1, ()))
                 } else {
+                    let mut validated = validated.lock().unwrap();
+                    assert!(
+                        !validated.contains(&plan.program),
+                        "revalidated an equivalent rejected program"
+                    );
+                    validated.push(plan.program.clone());
                     Err(invalid("test candidate fails placement"))
                 }
             })
@@ -464,9 +544,60 @@ mod tests {
         }
         let state = checkpoint::State::load(&graph, &config, None).unwrap();
         assert_eq!(state.attempts, 2);
-        assert_eq!(state.visited.len(), 2);
-        assert!(state.visited[0] != state.visited[1]);
+        assert_eq!(validated.lock().unwrap().len(), 2);
+        assert!(
+            state.visited.len() > state.attempts,
+            "equivalent recipes must be remembered together"
+        );
+        assert!(
+            state
+                .visited
+                .iter()
+                .all(|recipe| recipe.in_place_casts == Some(false)
+                    || recipe.in_place_casts == Some(true))
+        );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn candidate_profile_failure_keeps_validated_package() {
+        let (graph, mut config) = mlp();
+        let directory =
+            std::env::temp_dir().join(format!("ipu-profile-failure-{}", fastrand::u64(..)));
+        config.memory_profile_directory = Some(directory.clone());
+        config.optimization_steps = 1;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = optimize(&graph, &config, None, |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                std::fs::remove_dir_all(&directory).unwrap();
+                // A regular file deterministically prevents subsequent diagnostic writes.
+                std::fs::write(&directory, b"blocked").unwrap();
+                Ok((1, "incumbent"))
+            } else {
+                Err(invalid("test candidate is infeasible"))
+            }
+        });
+        std::fs::remove_file(directory).unwrap();
+        assert_eq!(result.unwrap().1, "incumbent");
+        assert!(calls.load(std::sync::atomic::Ordering::Relaxed) > 1);
+    }
+
+    #[test]
+    fn implicit_cast_policy_has_one_checkpoint_identity() {
+        for capacity_baseline in [false, true] {
+            let config = PipelineConfig {
+                capacity_baseline,
+                ..PipelineConfig::new(8)
+            };
+            let mut implicit = Recipe::default();
+            let mut explicit = Recipe {
+                in_place_casts: Some(capacity_baseline),
+                ..Recipe::default()
+            };
+            implicit.normalize(&config);
+            explicit.normalize(&config);
+            assert!(implicit == explicit);
+        }
     }
 
     #[test]

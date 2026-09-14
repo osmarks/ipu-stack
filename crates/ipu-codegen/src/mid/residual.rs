@@ -177,23 +177,15 @@ pub(super) fn fuse(
         } else {
             None
         };
-        let cost = |op: &MidOperation| {
-            crate::estimate::operation_cost(op, values).map(|(cost, _, _)| cost.total)
-        };
-        let before = cost(add)
-            .zip(cost(current))
-            .map(|(a, b)| a.saturating_add(b));
-        let after = cost(&fused)
-            .zip(if ordinary { cost(&apply) } else { Some(0) })
-            .zip(stats_copy.as_ref().map_or(Some(0), cost))
-            .map(|((a, b), c)| a.saturating_add(b).saturating_add(c));
-        tracing::debug!(target: "ipu_codegen::mid::residual", source = ?current.source,
-            parts = statistic_parts, redistributed, ?before, ?after,
-            "priced residual/statistics fusion");
-        if before
-            .zip(after)
-            .is_none_or(|(before, after)| after >= before)
-        {
+        if !super::rewrite::fusion_pays(
+            "residual/statistics",
+            current.source,
+            [add, current],
+            std::iter::once(&fused)
+                .chain(ordinary.then_some(&apply))
+                .chain(stats_copy.as_ref()),
+            values,
+        ) {
             values.truncate(old_value_count);
             continue;
         }
@@ -305,7 +297,9 @@ mod tests {
             .with_automatic_input(beta, Precision::F16);
         let mid =
             implementation::resolve(lower(&graph, &config, &Ipu21CostModel).unwrap()).unwrap();
-        let fused = mid.with_elementwise_fusions().unwrap();
+        let fused = mid
+            .with_elementwise_fusions(&PipelineConfig::new(mid.tile_count))
+            .unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         assert!(
             low.kernel_runs
@@ -378,7 +372,9 @@ mod tests {
             });
         }
         program.outputs = vec![MidValueId(4), MidValueId(5)];
-        let fused = program.with_elementwise_fusions().unwrap();
+        let fused = program
+            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .unwrap();
         assert_eq!(fused.outputs, program.outputs);
         assert_eq!(
             fused.operations[0].results,
@@ -441,7 +437,9 @@ mod tests {
         }
         let norm_input = norm.inputs[0];
         program.operations.push(norm);
-        let fused = program.with_elementwise_fusions().unwrap();
+        let fused = program
+            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .unwrap();
         assert_eq!(fused.operations[0].results[1], MidValueId(4));
         assert_eq!(fused.operations.last().unwrap().inputs[0], norm_input);
         assert_eq!(fused.outputs, program.outputs);
@@ -482,7 +480,7 @@ mod tests {
             }
         }
         let fused = program
-            .with_elementwise_fusions()
+            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
             .expect("partial residual statistics should save a scan");
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         let placement = crate::place(&low).unwrap();

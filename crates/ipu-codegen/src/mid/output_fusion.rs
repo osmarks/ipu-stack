@@ -10,17 +10,12 @@ pub(super) fn fuse(
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
 ) -> bool {
-    let cost = |ops: &[MidOperation], vals: &[MidValue]| {
-        ops.iter().try_fold(0u64, |sum, op| {
-            crate::estimate::operation_cost(op, vals).map(|(c, _, _)| sum.saturating_add(c.total))
-        })
-    };
     let mut best = None;
     for at_source in [false, true] {
         let mut ops = operations.clone();
         let mut vals = values.clone();
         if fuse_fp8_outputs_at(&mut ops, &mut vals, required, at_source)
-            && let Some(cycles) = cost(&ops, &vals)
+            && let Some(cycles) = super::rewrite::operation_cycles(&ops, &vals)
             && best.as_ref().is_none_or(|(old, _, _)| cycles < *old)
         {
             best = Some((cycles, ops, vals));
@@ -241,18 +236,17 @@ fn fuse_fp8_outputs_at(
                 }),
                 ..cast.clone()
             };
-            let before = std::iter::once(previous)
-                .chain(identity_copies.iter().copied())
-                .chain([index])
-                .try_fold(0u64, |sum, i| {
-                    crate::estimate::operation_cost(&operations[i], values)
-                        .map(|(c, _, _)| sum.saturating_add(c.total))
-                });
             values.push(value);
-            let after = crate::estimate::operation_cost(&fused, values)
-                .zip(crate::estimate::operation_cost(&copy, values))
-                .map(|((a, _, _), (b, _, _))| a.total.saturating_add(b.total));
-            if before.zip(after).is_none_or(|(a, b)| b >= a) {
+            if !super::rewrite::fusion_pays(
+                "source FP8 output",
+                producer.source,
+                std::iter::once(previous)
+                    .chain(identity_copies.iter().copied())
+                    .chain([index])
+                    .map(|i| &operations[i]),
+                [&fused, &copy],
+                values,
+            ) {
                 values.pop();
                 continue;
             }
@@ -335,18 +329,13 @@ fn fuse_fp8_outputs_at(
                 continue;
             }
         }
-        let copy_cost = copies.iter().try_fold(0u64, |total, op| {
-            crate::estimate::operation_cost(op, &new_values)
-                .map(|(cost, _, _)| total.saturating_add(cost.total))
-        });
-        let prices = crate::estimate::operation_cost(&producer, values)
-            .zip(crate::estimate::operation_cost(&cast, values))
-            .zip(crate::estimate::operation_cost(&replacement, &new_values));
-        if prices.is_none_or(|(((a, _, _), (b, _, _)), (c, _, _))| {
-            copy_cost.is_none_or(|extra| {
-                c.total.saturating_add(extra) >= a.total.saturating_add(b.total)
-            })
-        }) {
+        if !super::rewrite::fusion_pays(
+            "consumer FP8 output",
+            producer.source,
+            [&producer, &cast],
+            std::iter::once(&replacement).chain(&copies),
+            &new_values,
+        ) {
             continue;
         }
         *values = new_values;

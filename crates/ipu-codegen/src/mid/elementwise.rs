@@ -3,7 +3,7 @@ use super::rewrite::{apply_edits, single_use_producers};
 use super::*;
 
 impl MidProgram {
-    pub(super) fn with_elementwise_fusions(&self) -> Option<Self> {
+    pub(super) fn with_elementwise_fusions(&self, config: &PipelineConfig) -> Option<Self> {
         let mut result = self.clone();
         let residual =
             super::residual::fuse(&mut result.operations, &mut result.values, &result.outputs);
@@ -12,7 +12,12 @@ impl MidProgram {
         }
         let (before, _) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;
         result.refresh_estimates()?;
-        if result.estimated_cycles >= before.total {
+        if result.estimated_cycles >= before.total
+            || !result.peak_memory.fits_ipu21_with_budget(
+                config.standard_memory_reservation_bytes,
+                config.tile_memory_budget_bytes,
+            )
+        {
             return None;
         }
         Some(result)
@@ -38,7 +43,7 @@ fn fuse_region(
             kernel,
             operands,
             product: None,
-            ..
+            output_aliases: consumer_aliases,
         }) = &current.kind
         else {
             continue;
@@ -65,7 +70,7 @@ fn fuse_region(
             kernel: TileKernelSpec::Add,
             operands: add_operands,
             product: None,
-            ..
+            output_aliases: add_aliases,
         }) = &add.kind
         else {
             continue;
@@ -112,35 +117,58 @@ fn fuse_region(
                 || step
                     .results
                     .iter()
+                    .chain(step.read_values())
                     .any(|id| groups.contains(&values[id.index() as usize].storage_group))
         }) {
             continue;
         }
         let mut inputs = add.inputs[..2].to_vec();
         inputs.extend_from_slice(&current.inputs[1..operands.len()]);
-        let reuse_input = inputs.iter().position(|id| {
-            let value = &values[id.index() as usize];
-            value.storage_group == output_value.storage_group && value.tensor_type == *output_type
-        });
+        let reuse_input = inputs
+            .iter()
+            .position(|id| {
+                let value = &values[id.index() as usize];
+                value.storage_group == output_value.storage_group
+                    && value.tensor_type == *output_type
+            })
+            .or_else(|| {
+                // Alias edges need not have been folded into storage_group yet.
+                // Preserve the proven Add -> consumer alias chain in the replacement.
+                consumer_aliases
+                    .iter()
+                    .any(|&(result, alias)| result == 0 && current.inputs[alias] == input)
+                    .then(|| {
+                        add_aliases.iter().find_map(|&(result, input)| {
+                            let value = &values[add.inputs[input].index() as usize];
+                            (result == 0
+                                && value.tensor_type == *output_type
+                                && value.tile_offset == output_value.tile_offset)
+                                .then(|| inputs.iter().position(|id| *id == add.inputs[input]))
+                                .flatten()
+                        })
+                    })
+                    .flatten()
+            });
         let arity = inputs.len();
         let mut replacement = current.clone();
         replacement.inputs = inputs;
         replacement.kind = MidOperationKind::Primitive(Primitive::Compute {
-            kernel: fused,
+            kernel: fused.clone(),
             operands: vec![OperandWindow::default(); arity],
             product: None,
             output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
         });
-        let prices = crate::estimate::operation_cost(add, values)
-            .zip(crate::estimate::operation_cost(current, values))
-            .zip(crate::estimate::operation_cost(&replacement, values));
-        tracing::debug!(source = ?current.source, kernel = ?replacement.kind,
-            separate_cycles = ?prices.map(|(((a, _, _), (b, _, _)), _)| a.total.saturating_add(b.total)),
-            fused_cycles = ?prices.map(|(_, (cost, _, _))| cost.total),
-            "priced elementwise fusion");
-        if prices.is_none_or(|(((a, _, _), (b, _, _)), (fused, _, _))| {
-            fused.total >= a.total.saturating_add(b.total)
-        }) {
+        if !super::rewrite::fusion_pays(
+            if fused == TileKernelSpec::BiasGelu {
+                "BiasGelu"
+            } else {
+                "AddLayerNorm"
+            },
+            current.source,
+            [add, current],
+            [&replacement],
+            values,
+        ) {
             continue;
         }
         operations[index] = replacement;
@@ -251,7 +279,9 @@ mod tests {
             outputs: vec![MidValueId(3)],
             ..MidProgram::default()
         };
-        let fused = program.with_elementwise_fusions().unwrap();
+        let fused = program
+            .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+            .unwrap();
         assert_eq!(fused.operations.len(), 2);
         assert_eq!(fused.operations[0].inputs, [MidValueId(0)]);
         assert_eq!(fused.operations[1].inputs, [MidValueId(2)]);
@@ -276,9 +306,17 @@ mod tests {
         independent.outputs.push(extra.id);
         independent.values.push(extra);
         independent.operations.insert(2, work);
-        assert!(independent.with_elementwise_fusions().is_some());
+        assert!(
+            independent
+                .with_elementwise_fusions(&PipelineConfig::new(independent.tile_count))
+                .is_some()
+        );
         independent.values.last_mut().unwrap().storage_group = MidValueId(0);
-        assert!(independent.with_elementwise_fusions().is_none());
+        assert!(
+            independent
+                .with_elementwise_fusions(&PipelineConfig::new(independent.tile_count))
+                .is_none()
+        );
 
         let mut norm = program.clone();
         for _ in 0..2 {
@@ -302,7 +340,9 @@ mod tests {
             product: None,
             output_aliases: vec![],
         });
-        let fused_norm = norm.with_elementwise_fusions().unwrap();
+        let fused_norm = norm
+            .with_elementwise_fusions(&PipelineConfig::new(norm.tile_count))
+            .unwrap();
         assert_eq!(fused_norm.operations.len(), 4); // activation, gamma, beta copies + LN
         let last = fused_norm.operations.last().unwrap();
         assert_eq!(last.inputs.len(), 3);
@@ -325,7 +365,9 @@ mod tests {
             product: None,
             output_aliases: vec![],
         });
-        let fused_bias = bias.with_elementwise_fusions().unwrap();
+        let fused_bias = bias
+            .with_elementwise_fusions(&PipelineConfig::new(bias.tile_count))
+            .unwrap();
         assert_eq!(fused_bias.operations.len(), 3); // activation/bias copies + producer
         let last = fused_bias.operations.last().unwrap();
         assert_eq!(last.inputs.len(), 2);
@@ -335,7 +377,11 @@ mod tests {
             crate::validate_kernel_run(run).unwrap();
         }
         program.outputs.push(MidValueId(1));
-        assert!(program.with_elementwise_fusions().is_none());
+        assert!(
+            program
+                .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+                .is_none()
+        );
     }
 
     #[test]
@@ -443,7 +489,8 @@ mod tests {
                     outputs: vec![MidValueId(4)],
                     ..MidProgram::default()
                 };
-                let fused = program.with_elementwise_fusions();
+                let fused =
+                    program.with_elementwise_fusions(&PipelineConfig::new(program.tile_count));
                 // The faster FP16 affine path makes separate LN + cast
                 // cheaper at this width, even for one row.
                 assert_eq!(fused.is_some(), !norm);
@@ -460,7 +507,11 @@ mod tests {
                     assert_eq!(call.arguments, expected);
                 }
                 program.outputs.push(MidValueId(3));
-                assert!(program.with_elementwise_fusions().is_none());
+                assert!(
+                    program
+                        .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))
+                        .is_none()
+                );
             }
         }
     }
@@ -522,9 +573,39 @@ mod tests {
                 }
                 let mid = implementation::resolve(lower(&graph, &config, &Ipu21CostModel).unwrap())
                     .unwrap();
-                let fused = mid.with_elementwise_fusions();
+                let fused = mid.with_elementwise_fusions(&PipelineConfig::new(mid.tile_count));
                 assert_eq!(fused.is_some(), !keep_sum, "norm={norm}");
                 if let Some(fused) = fused {
+                    if !norm {
+                        let (_, before_memory) =
+                            crate::estimate::analyze_mid(&mid, &BTreeMap::new()).unwrap();
+                        assert!(
+                            fused.peak_memory.total <= before_memory.total,
+                            "lost the input alias chain"
+                        );
+                        // Keeping the consumer output fresh prevents alias chaining;
+                        // delaying the bias read can then increase the live peak.
+                        let mut fresh = mid.clone();
+                        for op in &mut fresh.operations {
+                            if let MidOperationKind::Primitive(Primitive::Compute {
+                                kernel: TileKernelSpec::Gelu,
+                                output_aliases,
+                                ..
+                            }) = &mut op.kind
+                            {
+                                output_aliases.clear();
+                            }
+                        }
+                        let (_, memory) =
+                            crate::estimate::analyze_mid(&fresh, &BTreeMap::new()).unwrap();
+                        let unconstrained = fresh.with_elementwise_fusions(&config).unwrap();
+                        assert!(unconstrained.peak_memory.total > memory.total);
+                        let mut tight = config.clone();
+                        tight.standard_memory_reservation_bytes = 0;
+                        tight.tile_memory_budget_bytes = memory.total;
+                        assert!(memory.fits_ipu21_with_budget(0, tight.tile_memory_budget_bytes));
+                        assert!(fresh.with_elementwise_fusions(&tight).is_none());
+                    }
                     assert!(
                         fused.estimated_cycles
                             < crate::estimate::analyze_mid(&mid, &BTreeMap::new())

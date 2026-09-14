@@ -19,6 +19,55 @@ pub(crate) struct Recipe {
     pub in_place_casts: Option<bool>,
 }
 
+impl Recipe {
+    pub(crate) fn normalize(&mut self, config: &PipelineConfig) {
+        self.in_place_casts = Some(self.in_place_casts.unwrap_or(config.capacity_baseline));
+    }
+
+    pub(crate) fn changes(&self, before: &Self) -> impl std::fmt::Debug {
+        #[derive(Debug)]
+        #[allow(dead_code)] // Fields are consumed by Debug only.
+        struct Changes {
+            plans: BTreeSet<OperationId>,
+            boundaries: Vec<ValueId>,
+            casts: Vec<super::cast_order::CastSite>,
+            early_casts: Vec<OperationId>,
+            packing_rows: (Option<u16>, Option<u16>),
+            parallel_reductions: (usize, usize),
+            disjoint_copy_sources: (bool, bool),
+            in_place_casts: (Option<bool>, Option<bool>),
+        }
+        Changes {
+            plans: self
+                .plans
+                .keys()
+                .chain(before.plans.keys())
+                .copied()
+                .filter(|id| self.plans.get(id) != before.plans.get(id))
+                .collect(),
+            boundaries: self
+                .open_boundaries
+                .symmetric_difference(&before.open_boundaries)
+                .copied()
+                .collect(),
+            casts: self
+                .cast_before_copies
+                .symmetric_difference(&before.cast_before_copies)
+                .copied()
+                .collect(),
+            early_casts: self
+                .early_casts
+                .symmetric_difference(&before.early_casts)
+                .copied()
+                .collect(),
+            packing_rows: (before.packing_rows, self.packing_rows),
+            parallel_reductions: (before.parallel_reductions, self.parallel_reductions),
+            disjoint_copy_sources: (before.disjoint_copy_sources, self.disjoint_copy_sources),
+            in_place_casts: (before.in_place_casts, self.in_place_casts),
+        }
+    }
+}
+
 pub(crate) struct Baseline {
     pub program: MidProgram,
     pub recipe: Recipe,
@@ -49,7 +98,7 @@ pub(crate) fn lower(
     selected.program = if config.diagnostic_checkpoints {
         program
     } else {
-        program.with_elementwise_fusions().unwrap_or(program)
+        program.with_elementwise_fusions(config).unwrap_or(program)
     };
     if !config.diagnostic_checkpoints {
         if let Some(rows) = recipe.packing_rows {
@@ -76,6 +125,7 @@ pub(crate) fn lower(
         .program
         .refresh_estimates()
         .ok_or(LoweringError::InvalidImplementation)?;
+    selected.recipe.normalize(config);
     Ok(selected)
 }
 
