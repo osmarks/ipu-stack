@@ -9,8 +9,8 @@ mod primitive;
 mod materialize;
 
 mod buffers;
-mod conversion;
 mod cast;
+mod conversion;
 mod copies;
 mod gemm;
 mod mapping;
@@ -25,8 +25,8 @@ use crate::storage::{ByteSpan, StorageError};
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, ConversionStrategy, CopyOrder, ElementOrder,
     KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
-    MidProgram, MidRepeat, MidValueId, Precision, ShardExtent, TensorTiling,
-    TensorType, TileKernelSpec,
+    MidProgram, MidRepeat, MidValueId, Precision, ShardExtent, TensorTiling, TensorType,
+    TileKernelSpec,
 };
 #[cfg(test)]
 pub use copies::view_byte_spans;
@@ -103,49 +103,24 @@ pub(crate) fn expand_tiles_analyzed(
     let mut state = TileGraphBuilder::new(graph)?;
     state.cache = cache;
     let body = state.build_region(&graph.operations, checkpoints)?;
-    let inputs = graph
+    for value in graph
         .inputs
         .iter()
-        .map(|input| {
-            Ok(ProgramInput {
-                name: input.name.clone(),
-                kind: input.kind,
-                value: input.value,
-                shards: state.value_shards(input.value)?.to_vec(),
-            })
-        })
-        .collect::<ExpansionResult<_>>()?;
-    let outputs = graph
-        .outputs
-        .iter()
-        .map(|value| {
-            Ok(ValueBlocks {
-                value: *value,
-                shards: state.value_shards(*value)?.to_vec(),
-            })
-        })
-        .collect::<ExpansionResult<_>>()?;
-    let values = graph
-        .values
-        .iter()
-        .filter_map(|value| {
-            let shards = &state.canonical[value.id.index() as usize];
-            (!shards.is_empty()).then(|| ValueBlocks {
-                value: value.id,
-                shards: shards.clone(),
-            })
-        })
-        .collect();
+        .map(|input| input.value)
+        .chain(graph.outputs.iter().copied())
+    {
+        state.value_shards(value)?;
+    }
     let mut program = TileGraph {
         tile_count: graph.tile_count,
         shards: state.shards,
         exchange_phases: state.phases,
-        inputs,
+        inputs: graph.inputs.clone(),
         body,
         kernel_runs: state.kernel_runs,
         local_copies: state.local_copies,
-        values,
-        outputs,
+        value_shards: state.canonical,
+        outputs: graph.outputs.clone(),
         logical_values: graph.values.clone(),
         checkpoints: graph
             .operations

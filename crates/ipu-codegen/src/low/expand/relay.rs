@@ -364,7 +364,7 @@ mod tests {
             local_copies: vec![],
             inputs: vec![],
             outputs: vec![],
-            values: vec![],
+            value_shards: vec![],
             logical_values: vec![],
             checkpoints: vec![],
             estimated_cycles: 0,

@@ -2,7 +2,6 @@
 //! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
 use super::*;
-use crate::GraphInputKind;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -71,20 +70,6 @@ pub struct BlockValue {
     pub tensor_type: TensorType,
     pub extents: Vec<ShardExtent>,
     pub definition: ShardDefinition,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProgramInput {
-    pub name: String,
-    pub kind: GraphInputKind,
-    pub value: MidValueId,
-    pub shards: Vec<BlockValueId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ValueBlocks {
-    pub value: MidValueId,
-    pub shards: Vec<BlockValueId>,
 }
 
 /// One source view may populate arbitrary corresponding views on several
@@ -265,16 +250,23 @@ pub struct TileGraph {
     pub tile_count: u16,
     pub shards: Vec<BlockValue>,
     pub exchange_phases: Vec<ExchangePhase>,
-    pub inputs: Vec<ProgramInput>,
+    pub inputs: Vec<MidInput>,
     pub body: BlockRegion,
     pub kernel_runs: Vec<KernelRun>,
     pub local_copies: Vec<LocalCopy>,
-    pub values: Vec<ValueBlocks>,
-    pub outputs: Vec<ValueBlocks>,
+    /// Canonical shards indexed by MidValueId; empty for unmaterialized values.
+    pub value_shards: Vec<Vec<BlockValueId>>,
+    pub outputs: Vec<MidValueId>,
     pub logical_values: Vec<MidValue>,
     pub checkpoints: Vec<(OperationId, Vec<MidValueId>)>,
     pub estimated_cycles: u64,
     pub estimated_exchange_cycles: u64,
+}
+
+impl TileGraph {
+    pub fn value_shards(&self, value: MidValueId) -> &[BlockValueId] {
+        &self.value_shards[value.index() as usize]
+    }
 }
 
 pub(crate) fn storage_root(shards: &[BlockValue], shard: BlockValueId) -> BlockValueId {

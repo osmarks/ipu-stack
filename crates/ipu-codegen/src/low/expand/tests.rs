@@ -358,13 +358,11 @@ fn streamed_conversion_does_not_require_an_adjacent_consumer() {
     );
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
     for (_, result) in streamed {
-        let value = low.values.iter().find(|value| value.value == result);
-        assert!(
-            value.is_none_or(|value| value.shards.iter().all(|shard| matches!(
-                low.shards[shard.index() as usize].definition,
-                ShardDefinition::Unmaterialized
-            )))
-        );
+        let value = low.value_shards(result);
+        assert!(value.iter().all(|shard| matches!(
+            low.shards[shard.index() as usize].definition,
+            ShardDefinition::Unmaterialized
+        )));
     }
 }
 
@@ -582,11 +580,13 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             "case {case}"
         );
         let parameter_shards = low
-            .inputs
-            .iter()
-            .find(|input| input.kind == crate::GraphInputKind::Parameter)
-            .unwrap()
-            .shards
+            .value_shards(
+                low.inputs
+                    .iter()
+                    .find(|input| input.kind == crate::GraphInputKind::Parameter)
+                    .unwrap()
+                    .value,
+            )
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
@@ -603,8 +603,8 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .count();
         assert!(direct_parameter_runs > 0, "case {case}");
         if (result_row_partitions, result_column_partitions) != (1, 1) {
-            let output_shards = low.outputs[0]
-                .shards
+            let output_shards = low
+                .value_shards(low.outputs[0])
                 .iter()
                 .copied()
                 .collect::<BTreeSet<_>>();
@@ -619,8 +619,9 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
                 .map(|copy| copy.destination)
                 .collect::<BTreeSet<_>>();
             assert!(
-                output_shards.iter().all(|output|
-                    copied_outputs.contains(output) || packed_results.contains(output)),
+                output_shards.iter().all(
+                    |output| copied_outputs.contains(output) || packed_results.contains(output)
+                ),
                 "case {case}: every distributed result shard must be written by a reduction or its copy"
             );
         }
@@ -691,14 +692,16 @@ fn randomized_parameter_owner_groups_pack_independently_of_compute_tiles() {
         }));
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         let parameter_tiles = |name: &str| {
-            low.inputs
-                .iter()
-                .find(|input| input.name == name)
-                .unwrap()
-                .shards
-                .iter()
-                .map(|shard| low.shards[shard.index() as usize].tile)
-                .collect::<BTreeSet<_>>()
+            low.value_shards(
+                low.inputs
+                    .iter()
+                    .find(|input| input.name == name)
+                    .unwrap()
+                    .value,
+            )
+            .iter()
+            .map(|shard| low.shards[shard.index() as usize].tile)
+            .collect::<BTreeSet<_>>()
         };
         let first = parameter_tiles("right.0");
         let second = parameter_tiles("right.1");
@@ -846,10 +849,9 @@ fn randomized_dispatch_streaming_defers_one_use_rearrangements() {
             "case {case}"
         );
         assert!(
-            low.values
+            deferred
                 .iter()
-                .filter(|value| deferred.contains(&value.value))
-                .flat_map(|value| &value.shards)
+                .flat_map(|&value| low.value_shards(value))
                 .all(|shard| low.shards[shard.index() as usize].definition
                     == ShardDefinition::Unmaterialized),
             "case {case}"
@@ -1645,8 +1647,11 @@ fn randomized_odd_capacities_use_nonempty_active_tile_subsets() {
 
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert_eq!(low.tile_count, capacity, "case {case}");
-        assert_eq!(low.outputs[0].shards.len(), usize::from(selected_tiles));
-        for &shard in &low.outputs[0].shards {
+        assert_eq!(
+            low.value_shards(low.outputs[0]).len(),
+            usize::from(selected_tiles)
+        );
+        for &shard in low.value_shards(low.outputs[0]) {
             assert!(
                 low.shards[shard.index() as usize]
                     .extents
@@ -1828,7 +1833,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
             .div_ceil(u32::from(inner_partitions))
             .saturating_mul(columns.div_ceil(u32::from(column_partitions)))
             .saturating_mul(2);
-        assert!(low.inputs[1].shards.iter().all(|shard| {
+        assert!(low.value_shards(low.inputs[1].value).iter().all(|shard| {
             crate::shard_storage_bytes(&low.shards[shard.index() as usize])
                 == Ok(expected_weight_bytes)
         }));
@@ -2142,7 +2147,7 @@ fn repeat_preserves_shared_initial_values() {
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, false).unwrap();
         let placement = crate::place(&low).unwrap();
-        let initial = placement.shard_addresses[&low.inputs[0].shards[0]];
+        let initial = placement.shard_addresses[&low.value_shards(low.inputs[0].value)[0]];
         let repeat = &low.repeat_runs[0];
         for binding in &repeat.carried {
             let result = placement.shard_addresses[&binding.result];
@@ -2279,7 +2284,7 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                                 ]
                             })
                             .collect::<Vec<_>>();
-                        let input_shard = low.inputs[0].shards[0].index() as usize;
+                        let input_shard = low.value_shards(low.inputs[0].value)[0].index() as usize;
                         buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
                         for work in low.work(&low.tiles[0]) {
                             let copy = match work {
@@ -2322,7 +2327,7 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                             }
                         }
                         let window_shape = &mid.values[result.index() as usize].tensor_type.shape.0;
-                        let actual = &buffers[low.outputs[0].shards[0].index() as usize];
+                        let actual = &buffers[low.value_shards(low.outputs[0])[0].index() as usize];
                         for source in 0..shape.iter().product::<u32>() {
                             let mut index = source;
                             let mut coordinates = vec![0; rank];

@@ -53,8 +53,8 @@ fn exported_copies_have_complete_storage_and_preserve_identity_reuse() {
         let mid = copied_columns(columns);
         let graph = expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
-        let input = low.inputs[0].shards[0];
-        let output = low.outputs[0].shards[0];
+        let input = low.value_shards(low.inputs[0].value)[0];
+        let output = low.value_shards(low.outputs[0])[0];
         assert_ne!(
             low.shards[output.index() as usize].definition,
             ShardDefinition::Unmaterialized
@@ -132,7 +132,7 @@ fn packed_halfword_sources_are_gathered_before_word_exchange() {
             .iter()
             .any(|phase| !phase.transfers.is_empty())
     );
-    let source = low.inputs[0].shards[0];
+    let source = low.value_shards(low.inputs[0].value)[0];
     assert!(
         low.local_copies
             .iter()
@@ -184,13 +184,8 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
     }
     let graph = expand_tiles(&mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
-    let source = low.inputs[0].shards[0];
-    let placeholder = low
-        .values
-        .iter()
-        .find(|value| value.value == mid.values[1].id)
-        .unwrap()
-        .shards[0];
+    let source = low.value_shards(low.inputs[0].value)[0];
+    let placeholder = low.value_shards(mid.values[1].id)[0];
     assert_eq!(
         low.shards[placeholder.index() as usize].definition,
         ShardDefinition::Unmaterialized
@@ -290,7 +285,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         .unwrap();
     crate::validate_kernel_run(run).unwrap();
     let scalar = &run.inputs[1].views[0];
-    assert_eq!(scalar.shard, graph.inputs[0].shards[0]);
+    assert_eq!(scalar.shard, graph.value_shards(graph.inputs[0].value)[0]);
     assert!(
         scalar
             .extents
@@ -343,12 +338,8 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
         mid.values.push(result);
         let graph = expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
-        let copied = low
-            .values
-            .iter()
-            .find(|value| value.value == mid.values[1].id)
-            .unwrap();
-        for &shard in &copied.shards {
+        let copied = low.value_shards(mid.values[1].id);
+        for &shard in copied {
             assert_ne!(
                 low.shards[shard.index() as usize].definition,
                 ShardDefinition::Unmaterialized
@@ -358,9 +349,9 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             crate::validate_kernel_run(run).unwrap();
         }
         let placement = crate::place(&low).unwrap();
-        for &shard in &copied.shards {
-            let source = low.inputs[0]
-                .shards
+        for &shard in copied {
+            let source = low
+                .value_shards(low.inputs[0].value)
                 .iter()
                 .find(|id| {
                     low.shards[id.index() as usize].tile == low.shards[shard.index() as usize].tile
@@ -372,10 +363,10 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             );
         }
         if !sum {
-            let output = low.outputs[1].shards[0];
+            let output = low.value_shards(low.outputs[1])[0];
             assert_eq!(
                 placement.shard_addresses[&output],
-                placement.shard_addresses[&copied.shards[0]]
+                placement.shard_addresses[&copied[0]]
             );
         }
     }

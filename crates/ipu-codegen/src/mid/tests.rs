@@ -2397,7 +2397,7 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         .chain(
             low.inputs
                 .iter()
-                .flat_map(|input| &input.shards)
+                .flat_map(|input| low.value_shards(input.value))
                 .map(|&id| crate::storage_root(&low.shards, id)),
         )
         .collect::<BTreeSet<_>>();

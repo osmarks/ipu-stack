@@ -209,7 +209,7 @@ fn build_package_with_checkpoints(
                 &low,
                 &built.placement,
                 &topology,
-                output.value,
+                *output,
                 Some(format!("output.{index}")),
             )
         })
@@ -931,36 +931,31 @@ fn diagnostic_tensor(
         .logical_values
         .get(value.index() as usize)
         .ok_or_else(|| invalid("diagnostic mid-level value is missing"))?;
-    let low_value = low.values.iter().find(|candidate| candidate.value == value);
-    let shards = if let Some(low_value) = low_value {
-        low_value
-            .shards
-            .iter()
-            .filter(|id| {
-                low.shards
-                    .get(id.index() as usize)
-                    .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
+    let shards = low
+        .value_shards(value)
+        .iter()
+        .filter(|id| {
+            low.shards
+                .get(id.index() as usize)
+                .is_some_and(|shard| shard.definition != crate::ShardDefinition::Unmaterialized)
+        })
+        .map(|id| {
+            let storage = low
+                .shards
+                .get(id.index() as usize)
+                .ok_or_else(|| invalid("diagnostic low-level shard is missing"))?;
+            let address = placement
+                .shard_addresses
+                .get(id)
+                .copied()
+                .ok_or_else(|| invalid("diagnostic shard placement is missing"))?;
+            Ok(DiagnosticShard {
+                physical_tile: topology.physical(storage.tile)?,
+                address,
+                storage: storage.clone(),
             })
-            .map(|id| {
-                let storage = low
-                    .shards
-                    .get(id.index() as usize)
-                    .ok_or_else(|| invalid("diagnostic low-level shard is missing"))?;
-                let address = placement
-                    .shard_addresses
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| invalid("diagnostic shard placement is missing"))?;
-                Ok(DiagnosticShard {
-                    physical_tile: topology.physical(storage.tile)?,
-                    address,
-                    storage: storage.clone(),
-                })
-            })
-            .collect::<PackageBuildResult<Vec<_>>>()?
-    } else {
-        Vec::new()
-    };
+        })
+        .collect::<PackageBuildResult<Vec<_>>>()?;
     Ok(DiagnosticTensor {
         name,
         value: mid_value.origin,

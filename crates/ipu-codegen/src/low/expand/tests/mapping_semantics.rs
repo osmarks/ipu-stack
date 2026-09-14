@@ -131,7 +131,7 @@ fn check_bytes(
         let data = &mut memory[usize::from(shard.tile)];
         data.resize(data.len().max(words), u32::MAX);
     }
-    for &id in &low.inputs[0].shards {
+    for &id in low.value_shards(low.inputs[0].value) {
         let shard = &low.shards[id.index() as usize];
         let widths = shard
             .extents
@@ -221,7 +221,7 @@ fn check_bytes(
             _ => return Err(format!("unexpected operation {operation:?}")),
         }
     }
-    for &id in &low.outputs[0].shards {
+    for &id in low.value_shards(low.outputs[0]) {
         let shard = &low.shards[id.index() as usize];
         let widths = shard
             .extents

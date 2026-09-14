@@ -65,7 +65,12 @@ fn collect(
     let names = program
         .inputs
         .iter()
-        .flat_map(|input| input.shards.iter().map(move |shard| (*shard, input)))
+        .flat_map(|input| {
+            program
+                .value_shards(input.value)
+                .iter()
+                .map(move |shard| (*shard, input))
+        })
         .collect::<BTreeMap<_, _>>();
     let mut labels = Labels::default();
     let mut tiles = (0..application.tiles.len())
@@ -484,7 +489,7 @@ mod tests {
             .iter()
             .filter(|input| input.kind == crate::GraphInputKind::Parameter)
         {
-            for shard in &input.shards {
+            for shard in low.value_shards(input.value) {
                 let tile = &report.tiles[usize::from(low.shards[shard.index() as usize].tile)];
                 let allocation = tile
                     .allocations

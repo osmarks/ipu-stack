@@ -28,7 +28,7 @@ impl PackageBindings {
                 placement,
                 topology,
                 input.name.clone(),
-                &input.shards,
+                program.value_shards(input.value),
             )?);
         }
         let mut outputs = program
@@ -41,7 +41,7 @@ impl PackageBindings {
                     placement,
                     topology,
                     format!("output.{index}"),
-                    &output.shards,
+                    program.value_shards(*output),
                 )
             })
             .collect::<PackageBuildResult<Vec<_>>>()?;

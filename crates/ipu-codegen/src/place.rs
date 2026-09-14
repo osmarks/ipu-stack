@@ -416,11 +416,11 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
         program
             .outputs
             .iter()
-            .flat_map(|output| output.shards.iter().copied()),
+            .flat_map(|output| program.value_shards(*output).iter().copied()),
     );
     let mut lifetimes = vec![Lifetime::default(); program.shards.len()];
     for input in &program.inputs {
-        for shard in &input.shards {
+        for shard in program.value_shards(input.value) {
             lifetimes[shard.index() as usize].touch(0);
             // initialize uploads parameters once; every subsequent run needs them.
             if input.kind == crate::GraphInputKind::Parameter {
@@ -1396,8 +1396,8 @@ mod tests {
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
             let analysis = analyze_allocations(&low).unwrap();
-            let roots = low.inputs[0]
-                .shards
+            let roots = low
+                .value_shards(low.inputs[0].value)
                 .iter()
                 .map(|id| analysis.root_of_member[id.index() as usize])
                 .collect::<BTreeSet<_>>();
@@ -1875,10 +1875,10 @@ mod tests {
             .unwrap()
             .clone();
         program.body.operations.extend([work.clone(), work]);
-        program.outputs[0].shards.reverse();
+        program.value_shards[program.outputs[0].index() as usize].reverse();
         let low = lower_to_tiles(&std::sync::Arc::new(program), false);
         let lifetimes = collect_lifetimes(&low);
-        for &id in &low.outputs[0].shards {
+        for &id in low.value_shards(low.outputs[0]) {
             let tile = low.shards[id.index() as usize].tile;
             assert_eq!(
                 lifetimes[id.index() as usize].last,
@@ -2034,11 +2034,7 @@ mod tests {
             let placement = place(&low).unwrap();
             for tile in 0..tiles {
                 let shard = |value| {
-                    low.values
-                        .iter()
-                        .find(|v| v.value == value)
-                        .unwrap()
-                        .shards
+                    low.value_shards(value)
                         .iter()
                         .copied()
                         .find(|id| low.shards[id.index() as usize].tile == tile)

@@ -73,7 +73,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
         graph
             .outputs
             .iter()
-            .flat_map(|output| output.shards.iter().map(|&id| root(id))),
+            .flat_map(|output| graph.value_shards(*output).iter().map(|&id| root(id))),
     );
     forbidden.extend(repeat_bound_storage(program));
     candidates.retain(|id| !forbidden.contains(id));
@@ -121,7 +121,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         .inputs
         .iter()
         .filter(|input| input.kind == crate::GraphInputKind::Parameter)
-        .flat_map(|input| input.shards.iter().copied())
+        .flat_map(|input| program.value_shards(input.value).iter().copied())
         .collect::<BTreeSet<_>>();
     let root = |id| storage_root(&program.shards, id);
     let mut parameter_storage = parameters
@@ -209,7 +209,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         forbidden.insert(root(copy.source));
     }
     for output in &program.outputs {
-        forbidden.extend(output.shards.iter().map(|&id| root(id)));
+        forbidden.extend(program.value_shards(*output).iter().map(|&id| root(id)));
     }
     forbidden.extend(repeat_bound_storage(program));
     candidates.retain(|shard| !forbidden.contains(shard));
@@ -334,11 +334,10 @@ mod tests {
                 })
                 .collect(),
             exchange_phases: Vec::new(),
-            inputs: vec![ProgramInput {
+            inputs: vec![MidInput {
                 name: "weights".into(),
                 kind: crate::GraphInputKind::Parameter,
                 value: MidValueId::from_index(0),
-                shards: vec![BlockValueId(1)],
             }],
             body: BlockRegion::default(),
             kernel_runs: vec![
@@ -372,7 +371,7 @@ mod tests {
                 ),
             ],
             local_copies: Vec::new(),
-            values: Vec::new(),
+            value_shards: vec![vec![BlockValueId(1)], vec![BlockValueId(0)]],
             outputs: Vec::new(),
             logical_values: Vec::new(),
             checkpoints: Vec::new(),
@@ -416,10 +415,7 @@ mod tests {
                     graph.shards[0].extents[0].logical_end = 1;
                     graph.kernel_runs[1].inputs[0].views[0].extents[0].logical_end = 1;
                 }
-                2 => graph.outputs.push(ValueBlocks {
-                    value: MidValueId::from_index(0),
-                    shards: vec![BlockValueId(0)],
-                }),
+                2 => graph.outputs.push(MidValueId::from_index(1)),
                 3 => graph.local_copies.push(LocalCopy {
                     source: BlockValueId(0),
                     source_offset: 0,
@@ -531,10 +527,7 @@ mod tests {
                             padding_only: true,
                         };
                 }
-                _ => graph.outputs.push(ValueBlocks {
-                    value: MidValueId::from_index(0),
-                    shards: vec![BlockValueId(0)],
-                }),
+                _ => graph.outputs.push(MidValueId::from_index(1)),
             }
             reuse_finite_padding(&mut program);
             assert_eq!(program.tiles[0].work.len(), 2, "case {case}");
