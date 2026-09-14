@@ -252,6 +252,7 @@ fn captured_phase(
 ) -> ExchangeStoragePhase {
     let mut phase = ExchangeStoragePhase::new(tile_count);
     for transfer in &problem.transfers {
+        let bytes = u64::from(transfer.words) * 4;
         phase.send(transfer.source, 1, u64::from(transfer.words > 64));
         if transfer.source_addresses.len() > 1 {
             phase.disable_sharing(transfer.source);
@@ -260,15 +261,11 @@ fn captured_phase(
             phase.connection(
                 transfer.source,
                 destination.tile,
-                u64::from(transfer.words) * 4,
+                bytes,
                 transfer.width == crate::exchange::ExchangeItemWidth::Paired64,
                 transfer.destinations.len(),
             );
-            phase.receive(
-                destination.tile,
-                u64::from(destination.address),
-                u64::from(transfer.words) * 4,
-            );
+            phase.receive(destination.tile, u64::from(destination.address), bytes);
         }
     }
     phase

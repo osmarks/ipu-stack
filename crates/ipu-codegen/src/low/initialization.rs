@@ -139,7 +139,6 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         if !matches!(run.kernel, TileKernelSpec::FillZero { .. }) {
             // Arithmetic results are not known-zero-padded parameters.
             for output in run.outputs() {
-                parameter_storage.remove(&root(output.shard));
                 incoming
                     .entry(root(output.shard))
                     .or_default()
