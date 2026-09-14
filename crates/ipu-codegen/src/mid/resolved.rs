@@ -143,8 +143,10 @@ impl ResolvedLayout {
     }
 
     pub(crate) fn maximum_tile_elements(&self) -> u64 {
-        if self.linear_grain.is_some() {
-            return self.tile_elements(0);
+        if let Some(grain) = self.linear_grain {
+            return (self.shape.elements() / u64::from(grain))
+                .div_ceil(u64::from(self.tile_count))
+                .saturating_mul(u64::from(grain));
         }
         self.axes
             .iter()
@@ -379,12 +381,15 @@ impl Layout {
             let group_extent = extent / u32::from(tiling.padding_groups);
             let remainder = group_extent % tiling.padding_multiple;
             if remainder != 0 {
-                if tiling.padding == Padding::Reject {
-                    return Err(LayoutError::IndivisibleAxis {
-                        axis,
-                        extent: group_extent,
-                        block_size: tiling.padding_multiple,
-                    });
+                match tiling.padding {
+                    Padding::Reject => {
+                        return Err(LayoutError::IndivisibleAxis {
+                            axis,
+                            extent: group_extent,
+                            block_size: tiling.padding_multiple,
+                        });
+                    }
+                    Padding::Zero => {}
                 }
                 let padded_group_extent = group_extent
                     .checked_next_multiple_of(tiling.padding_multiple)

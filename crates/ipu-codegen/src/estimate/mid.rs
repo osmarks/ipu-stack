@@ -129,9 +129,8 @@ fn analyze_storage<const PER_TILE: bool>(
             _ => {}
         }
     }
-    // Unions point downward, so each parent's root is already flattened.
     for id in 0..parent.len() {
-        parent[id] = parent[parent[id]];
+        parent[id] = root(&parent, id);
     }
     let roots = parent;
     let mut element = vec![false; roots.len()];
