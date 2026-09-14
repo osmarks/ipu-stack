@@ -1585,32 +1585,9 @@ impl<'a> HostSession<'a> {
         if self.attached_pages.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
-        let call = self
-            .protocol
-            .calls
-            .iter()
-            .find(|call| call.name == name)
-            .cloned()
-            .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
-        let expected = call
-            .inputs
-            .iter()
-            .map(|slice| slice.file_offset + slice.size)
-            .max()
-            .unwrap_or(0) as usize;
-        if input.len() != expected {
-            return Err(DriverError::Invalid(format!(
-                "{} expects {expected} bytes",
-                call.name
-            )));
-        }
-        let output_size = call
-            .outputs
-            .iter()
-            .map(|slice| slice.file_offset + slice.size)
-            .max()
-            .unwrap_or(0) as usize;
-        self.streamed_output = Some((vec![0; output_size], 0));
+        let call = self.resolve_call(name)?;
+        validate_input(&call, input)?;
+        self.streamed_output = Some((vec![0; host_data_size(&call.outputs)], 0));
         self.write_command(&call)?;
 
         let input_batches = host_batch_ranges(&call.input_batch_ends);
@@ -1625,14 +1602,12 @@ impl<'a> HostSession<'a> {
                 } else {
                     let output = batch - input_batches.len();
                     if output != 0 {
-                        for slice in &call.outputs[output_batches[output - 1].clone()] {
-                            capture_output_slice(
-                                &mut session.storage,
-                                &session.pages,
-                                slice,
-                                session.streamed_output.as_mut().unwrap(),
-                            )?;
-                        }
+                        capture_output(
+                            &session.storage,
+                            &session.pages,
+                            &call.outputs[output_batches[output - 1].clone()],
+                            session.streamed_output.as_mut().unwrap(),
+                        )?;
                     }
                 }
                 fence(Ordering::SeqCst);
@@ -1661,23 +1636,30 @@ impl<'a> HostSession<'a> {
     /// Copy completed transfers from host storage without driving the device.
     /// Use [`Self::finish`] if the final output transfer is still deferred.
     pub fn collect(&mut self, call: &HostCall) -> Result<Vec<u8>, DriverError> {
-        if let Some(mut output) = self.streamed_output.take() {
-            for slice in call.outputs.iter().skip(output.1) {
-                capture_output_slice(&mut self.storage, &self.pages, slice, &mut output)?;
-            }
-            return Ok(output.0);
-        }
-        copy_output(&mut self.storage, &self.pages, call)
+        let mut output = self
+            .streamed_output
+            .take()
+            .unwrap_or_else(|| (vec![0; host_data_size(&call.outputs)], 0));
+        capture_output(
+            &self.storage,
+            &self.pages,
+            &call.outputs[output.1..],
+            &mut output,
+        )?;
+        Ok(output.0)
     }
 
-    pub fn prepare(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
-        let call = self
-            .protocol
+    fn resolve_call(&self, name: &str) -> Result<HostCall, DriverError> {
+        self.protocol
             .calls
             .iter()
             .find(|call| call.name == name)
             .cloned()
-            .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
+            .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))
+    }
+
+    pub fn prepare(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
+        let call = self.resolve_call(name)?;
         copy_input(&mut self.storage, &self.pages, &call, input)?;
         poison_output(&mut self.storage, &self.pages, &call)?;
         self.write_command(&call)?;
@@ -1700,13 +1682,7 @@ impl<'a> HostSession<'a> {
         if self.attached_pages.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
-        let call = self
-            .protocol
-            .calls
-            .iter()
-            .find(|call| call.name == name)
-            .cloned()
-            .ok_or_else(|| DriverError::Invalid(format!("unknown host call {name}")))?;
+        let call = self.resolve_call(name)?;
         self.drive(call)
     }
 
@@ -1811,24 +1787,32 @@ fn poison_output(
     Ok(())
 }
 
-fn copy_input(
-    storage: &mut HostBuffer,
-    pages: &HashMap<u32, HostPageRange>,
-    call: &HostCall,
-    input: &[u8],
-) -> Result<(), DriverError> {
-    let expected = call
-        .inputs
+fn host_data_size(slices: &[ipu_package::HostSlice]) -> usize {
+    slices
         .iter()
         .map(|slice| slice.file_offset + slice.size)
         .max()
-        .unwrap_or(0) as usize;
+        .unwrap_or(0) as usize
+}
+
+fn validate_input(call: &HostCall, input: &[u8]) -> Result<(), DriverError> {
+    let expected = host_data_size(&call.inputs);
     if input.len() != expected {
         return Err(DriverError::Invalid(format!(
             "{} expects {expected} bytes",
             call.name
         )));
     }
+    Ok(())
+}
+
+fn copy_input(
+    storage: &mut HostBuffer,
+    pages: &HashMap<u32, HostPageRange>,
+    call: &HostCall,
+    input: &[u8],
+) -> Result<(), DriverError> {
+    validate_input(call, input)?;
     for slice in &call.inputs {
         copy_input_slice(storage, pages, slice, input)?;
     }
@@ -1851,47 +1835,25 @@ fn copy_input_slice(
     Ok(())
 }
 
-fn capture_output_slice(
-    storage: &mut HostBuffer,
+fn capture_output(
+    storage: &HostBuffer,
     pages: &HashMap<u32, HostPageRange>,
-    slice: &ipu_package::HostSlice,
+    slices: &[ipu_package::HostSlice],
     output: &mut (Vec<u8>, usize),
 ) -> Result<(), DriverError> {
-    let page = pages
-        .get(&slice.page)
-        .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
-    let source = page.offset + slice.page_offset as usize;
-    let destination = slice.file_offset as usize;
+    // The entire batch has completed DMA before its staging pages are read.
     fence(Ordering::SeqCst);
-    output.0[destination..destination + slice.size as usize]
-        .copy_from_slice(&storage.bytes()[source..source + slice.size as usize]);
-    output.1 += 1;
-    Ok(())
-}
-
-fn copy_output(
-    storage: &mut HostBuffer,
-    pages: &HashMap<u32, HostPageRange>,
-    call: &HostCall,
-) -> Result<Vec<u8>, DriverError> {
-    let size = call
-        .outputs
-        .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .unwrap_or(0) as usize;
-    let mut output = vec![0; size];
-    fence(Ordering::SeqCst);
-    for slice in &call.outputs {
+    for slice in slices {
         let page = pages
             .get(&slice.page)
             .ok_or_else(|| DriverError::Invalid("missing output page".into()))?;
         let source = page.offset + slice.page_offset as usize;
         let destination = slice.file_offset as usize;
-        output[destination..destination + slice.size as usize]
-            .copy_from_slice(&storage.bytes_mut()[source..source + slice.size as usize]);
+        output.0[destination..destination + slice.size as usize]
+            .copy_from_slice(&storage.bytes()[source..source + slice.size as usize]);
+        output.1 += 1;
     }
-    Ok(output)
+    Ok(())
 }
 
 pub fn frame_tile(physical_tile: u32, image: &[u8]) -> Result<Vec<u8>, DriverError> {
@@ -1969,6 +1931,41 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0xff)
         );
+    }
+
+    #[test]
+    fn batch_capture_preserves_outputs_when_staging_pages_are_reused() {
+        let mut storage = HostBuffer::new(128).unwrap();
+        let pages = HashMap::from([(
+            1,
+            HostPageRange {
+                offset: 32,
+                size: 64,
+            },
+        )]);
+        let mut first = host_slice(1, 8, 4);
+        first.file_offset = 4;
+        let mut second = first.clone();
+        second.file_offset = 0;
+        let slices = [first, second];
+        let mut output = (vec![0; host_data_size(&slices)], 0);
+        storage.bytes_mut()[40..44].copy_from_slice(&[1, 2, 3, 4]);
+        capture_output(&storage, &pages, &slices[..1], &mut output).unwrap();
+        assert_eq!(output, (vec![0, 0, 0, 0, 1, 2, 3, 4], 1));
+        storage.bytes_mut()[40..44].copy_from_slice(&[5, 6, 7, 8]);
+        capture_output(&storage, &pages, &slices[1..], &mut output).unwrap();
+        assert_eq!(output, (vec![5, 6, 7, 8, 1, 2, 3, 4], 2));
+
+        // A completed non-streaming call uses the same batch path.
+        let mut disjoint = slices.clone();
+        disjoint[0].page_offset = 16;
+        storage.bytes_mut()[48..52].copy_from_slice(&[1, 2, 3, 4]);
+        let mut complete = (vec![0; host_data_size(&disjoint)], 0);
+        capture_output(&storage, &pages, &disjoint, &mut complete).unwrap();
+        assert_eq!(complete, output);
+        capture_output(&storage, &pages, &[], &mut complete).unwrap();
+        assert_eq!(complete, output);
+        assert!(capture_output(&storage, &HashMap::new(), &slices, &mut complete).is_err());
     }
 
     #[test]
