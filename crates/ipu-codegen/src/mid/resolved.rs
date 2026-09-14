@@ -285,13 +285,9 @@ impl AxisTiling {
                 block_size: self.shard_padding_multiple,
             });
         }
-        let physical_width = if remainder == 0 {
-            allocated
-        } else {
-            allocated
-                .checked_add(self.shard_padding_multiple - remainder)
-                .ok_or(LayoutError::ExtentOverflow(0))?
-        };
+        let physical_width = allocated
+            .checked_next_multiple_of(self.shard_padding_multiple)
+            .ok_or(LayoutError::ExtentOverflow(0))?;
         let group_logical_base = group
             .checked_mul(logical_group_extent)
             .ok_or(LayoutError::ExtentOverflow(0))?;
@@ -391,7 +387,7 @@ impl Layout {
                     });
                 }
                 let padded_group_extent = group_extent
-                    .checked_add(tiling.padding_multiple - remainder)
+                    .checked_next_multiple_of(tiling.padding_multiple)
                     .ok_or(LayoutError::ExtentOverflow(axis))?;
                 dimensions[axis] = padded_group_extent
                     .checked_mul(u32::from(tiling.padding_groups))
