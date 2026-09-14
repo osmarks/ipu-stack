@@ -449,16 +449,14 @@ fn descriptor_words(
     packet_words: u32,
     target_only: bool,
 ) -> PackageBuildResult<[u32; 3]> {
-    let copy_words = target
-        .filter(|transfer| transfer.copy_destination.is_some())
-        .map_or(0, |transfer| transfer.bytes / 4);
+    let (destination, copy_words) = target
+        .and_then(|transfer| Some((transfer.copy_destination?, transfer.bytes / 4)))
+        .unwrap_or_default();
     if copy_words >= 1 << 23 || packet_words >= 1 << 8 {
         return Err(invalid("host descriptor is not encodable"));
     }
     Ok([
-        target
-            .and_then(|transfer| transfer.copy_destination)
-            .unwrap_or(0),
+        destination,
         copy_words | (u32::from(target_only) << 23) | (packet_words << 24),
         packet_source,
     ])
