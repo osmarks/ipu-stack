@@ -90,8 +90,6 @@ def gather(phase, tile_count, shards=1, direct_receive=False, context=None):
             )
             for t in receivers
         }
-        cursor = sum(t["words"] * 4 for t in transfers)
-        incoming = scratch_base(reads[leader], cursor, 0x50000, 0x80000)
         copies, cursor = [], 0
         items = sorted(transfers, key=lambda t: (t["source"], t["source_addresses"]))
         for t in items:
@@ -100,17 +98,6 @@ def gather(phase, tile_count, shards=1, direct_receive=False, context=None):
             offset = offsets.pop()
             size = t["words"] * 4
             copies.append((cursor, offset, size))
-            item = dict(
-                t, destinations=[{"tile": leader, "address": incoming + cursor}]
-            )
-            if (
-                gathered
-                and gathered[-1]["words"] + item["words"] <= packing.MAX_TRANSFER_WORDS
-                and packing.mergeable(gathered[-1], item)
-            ):
-                gathered[-1]["words"] += item["words"]
-            else:
-                gathered.append(item)
             cursor += size
         intervals = []
         for _, offset, size in sorted(copies, key=lambda c: c[1]):
@@ -120,7 +107,26 @@ def gather(phase, tile_count, shards=1, direct_receive=False, context=None):
             else:
                 intervals.append((offset, offset + size))
         end = intervals[-1][1]
-        outgoing = scratch_base(writes[leader], end, 0x80000, 0xC0000)
+        outgoing = scratch_base(
+            reads[leader] + writes[leader] if direct_receive else writes[leader],
+            end, 0x80000, 0xC0000,
+        )
+        incoming = (
+            outgoing if direct_receive
+            else scratch_base(reads[leader], cursor, 0x50000, 0x80000)
+        )
+        for t, (source, destination, _) in zip(items, copies):
+            address = outgoing + destination if direct_receive else incoming + source
+            item = dict(t, destinations=[{"tile": leader, "address": address}])
+            if (
+                not direct_receive
+                and gathered
+                and gathered[-1]["words"] + item["words"] <= packing.MAX_TRANSFER_WORDS
+                and packing.mergeable(gathered[-1], item)
+            ):
+                gathered[-1]["words"] += item["words"]
+            else:
+                gathered.append(item)
         # Preserve existing operand padding rather than transmitting holes.
         for begin, stop in intervals:
             for offset in range(begin, stop, packing.MAX_TRANSFER_WORDS * 4):
@@ -136,32 +142,6 @@ def gather(phase, tile_count, shards=1, direct_receive=False, context=None):
                         "width": "Word32",
                     }
                 )
-        tasks = affine_tasks(copies)
-        if direct_receive:
-            # Receive each fragment at its final packed offset. This trades
-            # larger gather rows for eliminating the packing pass entirely.
-            outgoing = scratch_base(
-                reads[leader] + writes[leader], end, 0x80000, 0xC0000
-            )
-            gathered = [t for t in gathered if t["destinations"][0]["tile"] != leader]
-            for t in items:
-                offset = next(
-                    d["address"] - bases[d["tile"]] for d in t["destinations"]
-                )
-                gathered.append(
-                    dict(
-                        t, destinations=[{"tile": leader, "address": outgoing + offset}]
-                    )
-                )
-            for t in broadcast:
-                if t["source"] == leader:
-                    offset = (
-                        t["destinations"][0]["address"]
-                        - bases[t["destinations"][0]["tile"]]
-                    )
-                    t["source_addresses"] = [outgoing + offset]
-            incoming = outgoing
-            tasks = []
         cases.append(
             {
                 "phase": phase["phase"],
@@ -170,7 +150,7 @@ def gather(phase, tile_count, shards=1, direct_receive=False, context=None):
                 "input_bytes": cursor,
                 "input_address": incoming,
                 "output_address": outgoing,
-                "tasks": tasks,
+                "tasks": [] if direct_receive else affine_tasks(copies),
             }
         )
     first, last = (

@@ -228,9 +228,20 @@ class GatherTests(unittest.TestCase):
                 for batch in range(2)
             ],
         }
+        # Direct receives need no packed-input scratch. Occupy that entire
+        # range on every possible relay, while leaving outgoing scratch free.
+        context = {
+            "transfers": phase["transfers"] + [
+                transfer(tile, [address], [(3, address)], 4096)
+                for tile in range(8, 16)
+                for address in range(0x50000, 0x80000, 0x4000)
+            ]
+        }
         for shards in [1, 2, 4]:
             for direct in [False, True]:
-                first, last, cases = gather.gather(phase, 16, shards, direct)
+                first, last, cases = gather.gather(
+                    phase, 16, shards, direct, context if direct else None
+                )
                 memory, expected = {}, {}
                 for t in phase["transfers"]:
                     for offset in range(0, t["words"] * 4, 4):
