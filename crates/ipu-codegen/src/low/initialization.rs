@@ -9,13 +9,22 @@
 use super::*;
 use std::collections::BTreeSet;
 
-// A Repeat binding can expose these bytes to readers under another shard ID.
-// Scratch local to its body has no such additional readers.
-fn repeat_bound_storage(program: &LowProgram) -> BTreeSet<BlockValueId> {
+// These readers have no kernel-specific proof that padding can be ignored.
+// Repeat bindings can expose bytes to readers under another shard ID; scratch
+// local to the body has no such additional readers.
+fn non_kernel_read_storage(program: &LowProgram) -> BTreeSet<BlockValueId> {
     program
-        .repeat_runs
+        .exchange_phases
         .iter()
-        .flat_map(RepeatRun::bound_shards)
+        .flat_map(|phase| phase.transfers.iter().map(|transfer| transfer.source.shard))
+        .chain(program.local_copies.iter().map(|copy| copy.source))
+        .chain(
+            program
+                .outputs
+                .iter()
+                .flat_map(|&output| program.value_shards(output).iter().copied()),
+        )
+        .chain(program.repeat_runs.iter().flat_map(RepeatRun::bound_shards))
         .map(|id| storage_root(&program.shards, id))
         .collect()
 }
@@ -26,7 +35,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
     let graph = &program.program;
     let root = |id| storage_root(&graph.shards, id);
     let mut candidates = BTreeSet::new();
-    let mut forbidden = BTreeSet::new();
+    let mut forbidden = non_kernel_read_storage(program);
     for run in &graph.kernel_runs {
         for input in &run.inputs {
             for view in &input.views {
@@ -60,22 +69,6 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut LowProgram) {
             forbidden.extend(run.outputs().map(|view| root(view.shard)));
         }
     }
-    for phase in &graph.exchange_phases {
-        forbidden.extend(
-            phase
-                .transfers
-                .iter()
-                .map(|transfer| root(transfer.source.shard)),
-        );
-    }
-    forbidden.extend(graph.local_copies.iter().map(|copy| root(copy.source)));
-    forbidden.extend(
-        graph
-            .outputs
-            .iter()
-            .flat_map(|output| graph.value_shards(*output).iter().map(|&id| root(id))),
-    );
-    forbidden.extend(repeat_bound_storage(program));
     candidates.retain(|id| !forbidden.contains(id));
     let mut removed = 0;
     let mut keep = |work: &TileWork| {
@@ -117,16 +110,13 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
     {
         return;
     }
-    let parameters = program
+    let root = |id| storage_root(&program.shards, id);
+    let mut parameter_storage = program
         .inputs
         .iter()
         .filter(|input| input.kind == crate::GraphInputKind::Parameter)
         .flat_map(|input| program.value_shards(input.value).iter().copied())
-        .collect::<BTreeSet<_>>();
-    let root = |id| storage_root(&program.shards, id);
-    let mut parameter_storage = parameters
-        .iter()
-        .map(|&id| root(id))
+        .map(root)
         .collect::<BTreeSet<_>>();
     let mut incoming = std::collections::BTreeMap::<BlockValueId, BTreeSet<BlockValueId>>::new();
     for copy in &program.local_copies {
@@ -175,7 +165,7 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
         }
     }
     let mut candidates = BTreeSet::new();
-    let mut forbidden = BTreeSet::new();
+    let mut forbidden = non_kernel_read_storage(program);
     for run in &program.kernel_runs {
         // Parameter packing supplies exact zero coefficients beyond logical K.
         // Only the activation operand can therefore tolerate arbitrary finite K
@@ -200,18 +190,6 @@ pub(super) fn reuse_finite_padding(program: &mut LowProgram) {
             forbidden.extend(run.outputs().map(|output| root(output.shard)));
         }
     }
-    for phase in &program.exchange_phases {
-        for exchange in &phase.transfers {
-            forbidden.insert(root(exchange.source.shard));
-        }
-    }
-    for copy in &program.local_copies {
-        forbidden.insert(root(copy.source));
-    }
-    for output in &program.outputs {
-        forbidden.extend(program.value_shards(*output).iter().map(|&id| root(id)));
-    }
-    forbidden.extend(repeat_bound_storage(program));
     candidates.retain(|shard| !forbidden.contains(shard));
     let graph = &program.program;
     let kernels = &graph.kernel_runs;
