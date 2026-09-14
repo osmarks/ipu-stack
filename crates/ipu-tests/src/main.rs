@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, ValueEnum};
 use half::f16;
 use ipu_codegen::{
@@ -1608,7 +1608,7 @@ fn run_reference(
             )?);
             // Profiles contain changing counters, so compare only logical tensor bytes.
             if let Some(first) = &first_output {
-                let (binding, base) = output_binding(application, "output.0")?;
+                let (binding, base) = application.output_binding("output.0")?;
                 for shard in &tensor.shards {
                     let slice = binding
                         .slices
@@ -2100,8 +2100,16 @@ fn run_siglip_mlp_benchmark(
     let peak_tflops = clock_hz as f64 * f64::from(execution_tiles) * 128.0 / 1.0e12;
     println!(
         "workload=siglip-mlp-f16-b{batch}-t{tokens}-d{dimension}-h{hidden_dimension}-n{blocks} benchmark=siglip-mlp-f16 batch={batch} tokens={tokens} rows={rows} dimension={dimension} hiddenDimension={hidden_dimension} blocks={blocks} biases=false activeTiles={active_tiles} executionTiles={execution_tiles} inputBytes={} weightBytes={} cycles={cycles} minimumTileCycles={minimum_cycles} deviceMicroseconds={:.3} effectiveGemmTflops={tflops:.3} peakTflops={peak_tflops:.3} efficiencyPercent={:.2} maximumAbsoluteError={maximum_absolute_error:.6}",
-        application.inputs.iter().map(binding_size).sum::<u64>(),
-        application.weights.iter().map(binding_size).sum::<u64>(),
+        application
+            .inputs
+            .iter()
+            .map(Binding::byte_len)
+            .sum::<Result<u64, _>>()?,
+        application
+            .weights
+            .iter()
+            .map(Binding::byte_len)
+            .sum::<Result<u64, _>>()?,
         seconds * 1.0e6,
         tflops / peak_tflops * 100.0,
     );
@@ -2236,7 +2244,7 @@ fn verify_logical_output(
     expected: &[f32],
     check: ReferenceCheck,
 ) -> Result<f32> {
-    let (binding, base) = output_binding(application, "output.0")?;
+    let (binding, base) = application.output_binding("output.0")?;
     if expected.len() != usize::try_from(tensor.shape.elements())? {
         bail!("logical output metadata is inconsistent with its reference");
     }
@@ -2310,7 +2318,7 @@ fn verify_logical_output(
 }
 
 fn binding_u32_values(application: &Application, bytes: &[u8], name: &str) -> Result<Vec<u32>> {
-    let (binding, base) = output_binding(application, name)?;
+    let (binding, base) = application.output_binding(name)?;
     let mut values = Vec::with_capacity(binding.slices.len());
     for slice in &binding.slices {
         if slice.size != 4 {
@@ -2329,21 +2337,8 @@ fn binding_u32_values(application: &Application, bytes: &[u8], name: &str) -> Re
     Ok(values)
 }
 
-fn output_binding<'a>(application: &'a Application, name: &str) -> Result<(&'a Binding, u64)> {
-    let mut base = 0u64;
-    for binding in &application.outputs {
-        if binding.name == name {
-            return Ok((binding, base));
-        }
-        base = base
-            .checked_add(binding_size(binding))
-            .context("host output binding offset overflow")?;
-    }
-    bail!("package has no {name} output binding")
-}
-
 fn binding_tile_count(application: &Application, name: &str) -> Result<u16> {
-    let (binding, _) = output_binding(application, name)?;
+    let (binding, _) = application.output_binding(name)?;
     let tiles = binding
         .slices
         .iter()
@@ -2351,15 +2346,6 @@ fn binding_tile_count(application: &Application, name: &str) -> Result<u16> {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
     u16::try_from(tiles).context("binding tile count exceeds u16")
-}
-
-fn binding_size(binding: &Binding) -> u64 {
-    binding
-        .slices
-        .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .unwrap_or(0)
 }
 
 /// Constants describe logical tensors too: padding must remain zero when the
@@ -2411,12 +2397,8 @@ fn packed_binding(
     binding: &Binding,
     mut value: impl FnMut(u16, u32, u32) -> Result<u16>,
 ) -> Result<Vec<u8>> {
-    let total = binding
-        .slices
-        .iter()
-        .map(|slice| slice.file_offset + slice.size)
-        .max()
-        .context("binding has no slices")?;
+    ensure!(!binding.slices.is_empty(), "binding has no slices");
+    let total = binding.byte_len()?;
     let mut bytes = vec![0; usize::try_from(total)?];
     for (logical_tile, slice) in binding.slices.iter().enumerate() {
         if slice.size == 0 {

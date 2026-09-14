@@ -218,7 +218,7 @@ fn collect(
             append_slice(&mut result, direction, slice, base)?;
         }
         *cursor = cursor
-            .checked_add(binding_size(binding)?)
+            .checked_add(binding.byte_len()?)
             .ok_or_else(|| invalid("host binding offset overflow"))?;
     }
     Ok(result)
@@ -257,16 +257,6 @@ fn append_slice(
         remaining -= bytes;
     }
     Ok(())
-}
-
-fn binding_size(binding: &Binding) -> PackageBuildResult<u64> {
-    binding.slices.iter().try_fold(0, |size, slice| {
-        slice
-            .file_offset
-            .checked_add(slice.size)
-            .map(|end| size.max(end))
-            .ok_or_else(|| invalid("binding size overflow"))
-    })
 }
 
 fn batch(

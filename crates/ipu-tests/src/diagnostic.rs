@@ -404,7 +404,7 @@ pub(crate) fn pack_bindings(
                 .find(|tensor| tensor.name.as_deref() == Some(binding.name.as_str()))
                 .with_context(|| format!("diagnostic metadata for {} is missing", binding.name))?;
             let tensor = &values[&metadata.value];
-            let mut bytes = vec![0; usize::try_from(super::binding_size(binding))?];
+            let mut bytes = vec![0; usize::try_from(binding.byte_len()?)?];
             let mut covered = vec![false; usize::try_from(metadata.shape.elements())?];
             for shard in &metadata.shards {
                 let slice = binding

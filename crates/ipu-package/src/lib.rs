@@ -103,6 +103,21 @@ pub struct Binding {
     pub slices: Vec<RegionSlice>,
 }
 
+impl Binding {
+    /// Length of the host file region, including gaps and overlapping replicas.
+    pub fn byte_len(&self) -> Result<u64, PackageError> {
+        self.slices.iter().try_fold(0, |size, slice| {
+            slice
+                .file_offset
+                .checked_add(slice.size)
+                .map(|end| size.max(end))
+                .ok_or_else(|| {
+                    PackageError::Invalid(format!("binding {} file range overflows", self.name))
+                })
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPage {
     pub index: u32,
@@ -301,6 +316,7 @@ impl Application {
                     binding.name
                 )));
             }
+            binding.byte_len()?;
             for slice in &binding.slices {
                 let end = slice
                     .tile_address
@@ -576,25 +592,28 @@ impl Application {
         Ok(image)
     }
 
+    /// Locate a binding within the concatenated host output buffer.
+    pub fn output_binding(&self, name: &str) -> Result<(&Binding, u64), PackageError> {
+        let mut base = 0u64;
+        for binding in &self.outputs {
+            if binding.name == name {
+                return Ok((binding, base));
+            }
+            base = base
+                .checked_add(binding.byte_len()?)
+                .ok_or_else(|| PackageError::Invalid("output binding size overflow".into()))?;
+        }
+        Err(PackageError::Invalid(format!(
+            "application has no {name} output binding"
+        )))
+    }
+
     pub fn profile_report(
         &self,
         output: &[u8],
         clock_hz: u64,
     ) -> Result<ProfileReport, PackageError> {
-        let mut binding_base = 0u64;
-        let mut profile_binding = None;
-        for binding in &self.outputs {
-            if binding.name == PROFILE_CYCLES_BINDING {
-                profile_binding = Some(binding);
-                break;
-            }
-            binding_base = binding_base
-                .checked_add(binding_size(binding))
-                .ok_or_else(|| PackageError::Invalid("output binding size overflow".into()))?;
-        }
-        let binding = profile_binding.ok_or_else(|| {
-            PackageError::Invalid("application has no cycle profile binding".into())
-        })?;
+        let (binding, binding_base) = self.output_binding(PROFILE_CYCLES_BINDING)?;
         let slices = binding
             .slices
             .iter()
@@ -651,14 +670,6 @@ impl Application {
     }
 }
 
-fn binding_size(binding: &Binding) -> u64 {
-    binding
-        .slices
-        .iter()
-        .map(|slice| slice.file_offset.saturating_add(slice.size))
-        .max()
-        .unwrap_or(0)
-}
 fn validate_host_batch_ends(
     call: &HostCall,
     direction: &str,
@@ -945,6 +956,42 @@ mod tests {
             }],
         });
         app
+    }
+
+    #[test]
+    fn binding_extents_and_output_offsets_share_checked_file_geometry() {
+        let mut binding = Binding {
+            name: "values".into(),
+            dtype: "u8".into(),
+            shape: vec![16],
+            slices: vec![],
+        };
+        assert_eq!(binding.byte_len().unwrap(), 0);
+        binding.slices = [12, 0, 12]
+            .into_iter()
+            .map(|offset| RegionSlice {
+                tile: 0,
+                tile_address: TILE_MEMORY_BASE,
+                file_offset: offset,
+                size: 4,
+            })
+            .collect();
+        // Replicas and holes affect the extent, not a sum of slice sizes.
+        assert_eq!(binding.byte_len().unwrap(), 16);
+        let mut app = sample();
+        app.outputs = vec![
+            binding.clone(),
+            Binding {
+                name: "next".into(),
+                ..binding.clone()
+            },
+        ];
+        assert_eq!(app.output_binding("next").unwrap().1, 16);
+        assert!(app.output_binding("absent").is_err());
+        app.outputs[0].slices[0].file_offset = u64::MAX;
+        assert!(app.outputs[0].byte_len().is_err());
+        assert!(app.output_binding("next").is_err());
+        assert!(app.validate().is_err());
     }
 
     #[test]
