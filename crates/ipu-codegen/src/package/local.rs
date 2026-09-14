@@ -376,16 +376,17 @@ fn proposals(graph: &ComputeGraph, config: &PipelineConfig, incumbent: &Baseline
     }
 
     for operation in &operations {
-        if let Some(alternatives) = incumbent.alternatives.get(&operation.id) {
-            for plan in alternatives
-                .iter()
-                .filter(|plan| incumbent.recipe.plans.get(&operation.id) != Some(plan))
-                .take(4)
-            {
-                let mut recipe = incumbent.recipe.clone();
-                recipe.plans.insert(operation.id, plan.clone());
-                candidates.push(recipe);
-            }
+        let alternatives = incumbent
+            .alternatives
+            .get(&operation.id)
+            .into_iter()
+            .flatten()
+            .filter(|plan| incumbent.recipe.plans.get(&operation.id) != Some(plan))
+            .take(4);
+        for plan in alternatives.clone() {
+            let mut recipe = incumbent.recipe.clone();
+            recipe.plans.insert(operation.id, plan.clone());
+            candidates.push(recipe);
         }
         for &output in &operation.results {
             if graph.outputs().contains(&output)
@@ -409,16 +410,10 @@ fn proposals(graph: &ComputeGraph, config: &PipelineConfig, incumbent: &Baseline
             }
             // A store format and its consumer can need to change together;
             // neither isolated change need improve the canonical baseline.
-            if let Some(alternatives) = incumbent.alternatives.get(&operation.id) {
-                for plan in alternatives
-                    .iter()
-                    .filter(|plan| incumbent.recipe.plans.get(&operation.id) != Some(plan))
-                    .take(4)
-                {
-                    let mut joint = recipe.clone();
-                    joint.plans.insert(operation.id, plan.clone());
-                    candidates.push(joint);
-                }
+            for plan in alternatives.clone() {
+                let mut joint = recipe.clone();
+                joint.plans.insert(operation.id, plan.clone());
+                candidates.push(joint);
             }
             candidates.push(recipe);
         }
