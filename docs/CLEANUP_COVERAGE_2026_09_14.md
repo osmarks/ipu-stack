@@ -60,3 +60,7 @@ Completion diagnostic validation: model, softmax and kernel-equivalence
 paths now share the existing model terminal-state checker, including the
 completion marker, InvalidProgramCounter exception and halted workers. Four
 softmax hardware cases passed after extraction; all diagnostic targets compile.
+
+View adapter cleanup: logical-range to shard-extent translation now belongs
+to low expansion and is shared by forward and reversed views; mid/view.rs
+is removed. The low expansion suite passed (see /tmp/ipu-view-cleanup-tests.log).

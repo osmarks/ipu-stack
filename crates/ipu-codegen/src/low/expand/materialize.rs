@@ -242,18 +242,9 @@ impl TileGraphBuilder {
                             .collect::<Vec<_>>();
                         ranges[merge] = (stream, stream + 1);
                         ranges[split] = (start, end);
-                        let target = view
-                            .map_slice(source_shape, &output_shape, &ranges)
-                            .ok_or(ExpansionError::InvalidOperatorPlan)?
-                            .into_iter()
-                            .enumerate()
-                            .map(|(axis, (start, end))| ShardExtent {
-                                axis: axis as u16,
-                                start,
-                                logical_end: end,
-                                physical_end: end,
-                            })
-                            .collect::<Vec<_>>();
+                        let target =
+                            view_source_extents(view, source_shape, &output_shape, &ranges)
+                                .ok_or(ExpansionError::InvalidOperatorPlan)?;
                         for (source_extents, source) in regions.intersections(&target, tile) {
                             let mut destination_extents = source_extents.clone();
                             destination_extents[merge].start = stream;
@@ -285,8 +276,15 @@ impl TileGraphBuilder {
                 stream_extents[merge].start = stream;
                 stream_extents[merge].logical_end = stream + 1;
                 stream_extents[merge].physical_end = stream + 1;
-                let (target, column_base) = view
-                    .source_extents(source_shape, &output_shape, &stream_extents)
+                let ranges = stream_extents
+                    .iter()
+                    .map(|extent| (extent.start, extent.logical_end))
+                    .collect::<Vec<_>>();
+                let target = view_source_extents(view, source_shape, &output_shape, &ranges)
+                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
+                let column_base = target[split]
+                    .start
+                    .checked_sub(stream_extents[split].start)
                     .ok_or(ExpansionError::InvalidOperatorPlan)?;
                 for (mut source_extents, source) in regions.intersections(&target, tile) {
                     let mut destination_extents = source_extents.clone();

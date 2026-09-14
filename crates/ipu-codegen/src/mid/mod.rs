@@ -22,7 +22,6 @@ mod lowering;
 mod operator;
 mod ownership;
 mod resolved;
-mod view;
 pub use crate::graph::AxisFactorView;
 
 use candidates::*;

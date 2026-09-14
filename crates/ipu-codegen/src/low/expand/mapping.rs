@@ -1,6 +1,28 @@
 //! Intersections and physical micro-panel geometry for block views.
 
 use super::*;
+use crate::TensorShape;
+
+/// Adapt logical view geometry to low-level shard regions.
+pub(super) fn view_source_extents(
+    view: AxisFactorView,
+    source: &TensorShape,
+    output: &TensorShape,
+    ranges: &[(u32, u32)],
+) -> Option<Vec<ShardExtent>> {
+    view.map_slice(source, output, ranges)?
+        .into_iter()
+        .enumerate()
+        .map(|(axis, (start, end))| {
+            Some(ShardExtent {
+                axis: u16::try_from(axis).ok()?,
+                start,
+                logical_end: end,
+                physical_end: end,
+            })
+        })
+        .collect()
+}
 
 pub(super) fn intersect_extents(
     left: &[ShardExtent],
