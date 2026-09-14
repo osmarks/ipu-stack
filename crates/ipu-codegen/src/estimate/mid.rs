@@ -129,11 +129,13 @@ fn analyze_storage<const PER_TILE: bool>(
             _ => {}
         }
     }
-    let roots = (0..parent.len())
-        .map(|id| root(&parent, id))
-        .collect::<Vec<_>>();
-    let mut element = vec![false; parent.len()];
-    let mut tail = vec![0; parent.len()];
+    // Unions point downward, so each parent's root is already flattened.
+    for id in 0..parent.len() {
+        parent[id] = parent[parent[id]];
+    }
+    let roots = parent;
+    let mut element = vec![false; roots.len()];
+    let mut tail = vec![0; roots.len()];
     for (operation, _) in &steps {
         if let MidOperationKind::Primitive(Primitive::Compute {
             kernel: TileKernelSpec::Gemm { multiply, .. },
@@ -160,8 +162,8 @@ fn analyze_storage<const PER_TILE: bool>(
             .then(|| operation.inputs[0])
         })
         .collect::<std::collections::BTreeSet<_>>();
-    let mut bytes = vec![vec![0u64; tiles]; parent.len()];
-    let mut classes = vec![MemoryClass::Ipu21Standard; parent.len()];
+    let mut bytes = vec![vec![0u64; tiles]; roots.len()];
+    let mut classes = vec![MemoryClass::Ipu21Standard; roots.len()];
     for value in &program.values {
         let id = roots[value.id.index() as usize];
         let class = value.tensor_type.format.layout.memory_class;
@@ -232,7 +234,7 @@ fn analyze_storage<const PER_TILE: bool>(
         );
         classes[id] = class;
     }
-    let mut last = vec![0usize; parent.len()];
+    let mut last = vec![0usize; roots.len()];
     for (index, (operation, _)) in steps.iter().enumerate() {
         for value in operation.inputs.iter().chain(&operation.results) {
             last[roots[value.index() as usize]] = index;
@@ -266,7 +268,7 @@ fn analyze_storage<const PER_TILE: bool>(
             last[roots[value.index() as usize]] = steps.len();
         }
     }
-    let mut live = vec![false; parent.len()];
+    let mut live = vec![false; roots.len()];
     for input in &program.inputs {
         live[roots[input.value.index() as usize]] = true;
     }
