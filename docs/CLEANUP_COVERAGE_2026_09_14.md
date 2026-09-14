@@ -1,20 +1,23 @@
 # Cross-component cleanup coverage
 
 The earlier Rust cleanup is committed through `59862e8`; its full workspace
-check passed 394 tests with 7 ignored. This broader pass remains in progress.
+check passed 394 tests with 7 ignored. This broader pass is complete: each
+component below was reviewed, selected changes are committed, and no selected
+cleanup remains outstanding. This is an audit disposition, not a claim that
+no future simplification can be found.
 Generated artifacts and historical benchmark outputs are reference material,
 not sources to rewrite.
 
-| Component | Current coverage | Remaining examination |
+| Component | Current coverage | Review disposition |
 | --- | --- | --- |
-| Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed; forward/reverse view adapters consolidated in low; identity-copy predicates unified | Broader candidate generation and lowering control flow |
+| Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed; forward/reverse view adapters consolidated in low; identity-copy predicates unified | Candidate generation, ranking and baseline lowering also reviewed; retained separate accounting paths because they model different boundaries |
 | Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed; redundant runtime error wrapper removed | Loader, host invocation and CLI dispatch inspected; no further extraction selected |
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
-| Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
+| Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | C++ cast/rearrangement scaffolding simplified; other arithmetic families retained where their instruction/dataflow contracts differ |
 | Profile viewers | All three viewers inspected; runtime canvas setup and coordinate conversion consolidated | No additional cross-viewer extraction selected: placement uses virtual rows/DPR scaling; runtime uses event-count-bounded chunks and accounting segments |
 | Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | No additional duplication selected in the pretrained exporter |
-| Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Deeper sweep provenance/error handling |
-| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries share locked runtime loading and use HostSession::finish for deferred output completion; four share timestamp bindings | Remaining fixture assembly; terminal-state polling now shares the model diagnostic checker |
+| Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Resume/provenance and failure handling reviewed; independent sweep policies retained |
+| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries share locked runtime loading and use HostSession::finish for deferred output completion; four share timestamp bindings | Terminal-state polling shares the model checker; kernel-specific fixture assembly and numerical references remain independent |
 
 Calibration validation: four tests from `tools/test*calibration*.py`; deterministic
 comparison against the pre-extraction quantization functions produced identical
@@ -84,3 +87,25 @@ library; package-load and host-run commands have distinct completion policies.
 The driver already shares phase handshakes and output capture. Additional
 wrappers for its short attachment checks were not selected. Both Rust profile
 report tests pass after the viewer change.
+
+Final device inspection: constant/runtime dimension selection in rearrange_f16.cpp
+now uses constant-folded expressions; cast_f8.cpp no longer has a single-use
+field macro. Ten old/new SDK objects (three packing orders, static/dynamic
+dimensions, and four cast type pairs) have identical allocated bytes and
+normalized relocations.
+
+## Final verification
+
+- Full workspace: 396 passed, 0 failed, 7 ignored (27 suite results).
+- Python: 10 exchange-experiment tests and 8 calibration/placement tests passed.
+- Changed Rust files pass rustfmt; git diff --check passes.
+- Browser, hardware, ELF fixture and SDK object-equivalence evidence is recorded
+  above; numerical reference implementations retain their independence.
+- 13 commits after `59862e8`; approximately 390 fewer non-test source lines.
+  The line count excludes standalone tests and Rust cfg(test) tails, including
+  the shared modules added by this pass.
+- The only tracked worktree change left is the user's pre-existing `TODO` edit.
+  Existing untracked artifacts and review/callgraph files were preserved.
+
+Full test logs: `/tmp/ipu-cleanup-final-workspace.log`,
+`/tmp/ipu-cleanup-final-python.log`, `/tmp/ipu-cleanup-final-format.log`.

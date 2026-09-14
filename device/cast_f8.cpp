@@ -154,21 +154,18 @@ static __attribute__((always_inline)) inline void castFullRows(
 }
 
 #endif
-// For FP16
-// packing, sourceMetadata holds row bounds and sourceExtent readable columns.
-#define CAST_FIELDS \
-  Input<Vector<Source, VectorLayout::ONE_PTR>> source; \
-  Output<Vector<Destination, VectorLayout::ONE_PTR>> destination; \
-  unsigned elements; \
-  int sourceMetadata; \
-  int destinationScale; \
-  unsigned panelRows; \
-  unsigned sourceExtent; \
-  unsigned rowMajorColumns;
-
 class CAST_VERTEX : public MultiVertex {
 public:
-  CAST_FIELDS
+  Input<Vector<Source, VectorLayout::ONE_PTR>> source;
+  Output<Vector<Destination, VectorLayout::ONE_PTR>> destination;
+  unsigned elements;
+  // For FP16 packing, sourceMetadata holds row bounds and sourceExtent
+  // holds the readable column count.
+  int sourceMetadata;
+  int destinationScale;
+  unsigned panelRows;
+  unsigned sourceExtent;
+  unsigned rowMajorColumns;
   bool compute(unsigned worker) {
     // Assembly writes cannot change the immutable call descriptor. Keep its
     // fields in registers rather than reloading them after each memory clobber.
@@ -369,5 +366,3 @@ public:
 #endif
   }
 };
-
-#undef CAST_FIELDS

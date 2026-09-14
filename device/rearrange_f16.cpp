@@ -48,26 +48,14 @@ public:
     constexpr unsigned inner = REARRANGE_INNER_DIMENSION;
     constexpr unsigned innerBlock = REARRANGE_ROW_BLOCK;
     constexpr unsigned columnBlock = REARRANGE_COLUMN_BLOCK;
-#if REARRANGE_LOGICAL_ROWS == 0
-    const unsigned logicalRowCount = logicalRows;
-#else
-    constexpr unsigned logicalRowCount = REARRANGE_LOGICAL_ROWS;
-#endif
-#if REARRANGE_PHYSICAL_ROWS == 0
-    const unsigned physicalRowCount = physicalRows;
-#else
-    constexpr unsigned physicalRowCount = REARRANGE_PHYSICAL_ROWS;
-#endif
-#if REARRANGE_LOGICAL_COLUMNS == 0
-    const unsigned logicalColumnCount = logicalColumns;
-#else
-    constexpr unsigned logicalColumnCount = REARRANGE_LOGICAL_COLUMNS;
-#endif
-#if REARRANGE_PHYSICAL_COLUMNS == 0
-    const unsigned physicalColumnCount = physicalColumns;
-#else
-    constexpr unsigned physicalColumnCount = REARRANGE_PHYSICAL_COLUMNS;
-#endif
+    const unsigned logicalRowCount =
+        REARRANGE_LOGICAL_ROWS ? REARRANGE_LOGICAL_ROWS : logicalRows;
+    const unsigned physicalRowCount =
+        REARRANGE_PHYSICAL_ROWS ? REARRANGE_PHYSICAL_ROWS : physicalRows;
+    const unsigned logicalColumnCount =
+        REARRANGE_LOGICAL_COLUMNS ? REARRANGE_LOGICAL_COLUMNS : logicalColumns;
+    const unsigned physicalColumnCount =
+        REARRANGE_PHYSICAL_COLUMNS ? REARRANGE_PHYSICAL_COLUMNS : physicalColumns;
     const unsigned *sourceWords = reinterpret_cast<const unsigned *>(&source[0]);
     unsigned *destinationWords = reinterpret_cast<unsigned *>(&destination[0]);
     for (unsigned matrix = 0; matrix < matrices; ++matrix) {
