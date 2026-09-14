@@ -2,10 +2,8 @@ use ipu_package::{Application, HostCall, HostExchange, TILE_MEMORY_BASE};
 use object::{Object, ObjectSegment};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs;
 use std::io;
 use std::os::fd::RawFd;
-use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{Ordering, fence};
 use std::time::{Duration, Instant};
@@ -1150,10 +1148,6 @@ impl HostBuffer {
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.data, self.size) }
     }
-
-    pub fn attach(&self, device: &Device, index: u32) -> Result<(), DriverError> {
-        device.attach_buffer(index, self.data, self.size)
-    }
 }
 
 impl Drop for HostBuffer {
@@ -1283,7 +1277,8 @@ impl<'a> Loader<'a> {
                 "tile count is not complete loader batches".into(),
             ));
         }
-        self.install_bootloader(tile_count)?;
+        self.device
+            .initialize_tile_memory(tile_count, &self.bootloader)?;
         self.device
             .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
         let mut transport = HostBuffer::new(TRANSPORT_SIZE)?;
@@ -1361,11 +1356,6 @@ impl<'a> Loader<'a> {
             "application loaded and initial synchronization completed"
         );
         Ok(())
-    }
-
-    fn install_bootloader(&self, tile_count: usize) -> Result<(), DriverError> {
-        self.device
-            .initialize_tile_memory(tile_count, &self.bootloader)
     }
 }
 
@@ -1831,13 +1821,6 @@ pub fn frame_tile(physical_tile: u32, image: &[u8]) -> Result<Vec<u8>, DriverErr
         destination[FRAME_SIZE - FRAME_TRAILER_SIZE..].fill(0xff);
     }
     Ok(output)
-}
-
-pub fn read_configuration(path: impl AsRef<Path>) -> Result<Vec<u8>, DriverError> {
-    fs::read(path).map_err(|source| DriverError::Io {
-        operation: "read configuration image",
-        source,
-    })
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, DriverError> {
