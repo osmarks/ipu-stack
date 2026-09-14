@@ -1,9 +1,9 @@
 //! Expanded tile storage, calls and movement, before physical placement.
 //! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
-use super::call::{KernelRequirements, MemoryOperand};
 use crate::graph::OperationId;
 use crate::kernel::TileKernelSpec;
+use crate::kernel::{KernelRequirements, MemoryOperand};
 use crate::mid::{MidInput, MidValue, MidValueId};
 use crate::storage::CopyOrder;
 use crate::tensor::{ShardExtent, TensorType};
@@ -160,6 +160,7 @@ impl KernelRun {
         }
     }
 
+    #[cfg(test)]
     pub fn new(
         provenance: WorkProvenance,
         kernel: TileKernelSpec,

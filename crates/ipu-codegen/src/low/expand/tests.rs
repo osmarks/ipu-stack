@@ -319,7 +319,7 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
         extents: builder.shards[reused.index() as usize].extents.clone(),
     };
     let run = builder
-        .kernel_run(
+        .bind_kernel(
             provenance,
             TileKernelSpec::Gelu,
             vec![logical.clone()],
@@ -850,7 +850,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
 }
 
 #[test]
-fn randomized_tile_local_gelu_reorders_without_exchange() {
+fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
     let mut random = fastrand::Rng::with_seed(0x6765_6c75);
     for case in 0..CASES {
         let row_partitions = 1_u16 << random.u32(0..=3);
@@ -879,7 +879,9 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
         let mut config = PipelineConfig::new(tiles).with_input(input, input_format.clone());
         config.operator_candidates = vec![ConcreteOperatorCandidate::new(
             MidOperator::Gelu,
-            [OperandRequirement::new(input_format)],
+            // GeLU preserves element order. Requesting its output format on
+            // the operand makes the required local conversion explicit.
+            [OperandRequirement::new(output_format.clone())],
             OperandRequirement::new(output_format),
         )]
         .into_iter()

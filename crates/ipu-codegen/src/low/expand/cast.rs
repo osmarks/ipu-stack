@@ -2,25 +2,33 @@
 use super::*;
 
 impl TileGraphBuilder {
-    pub(super) fn append_in_place_cast(
+    pub(super) fn build_shifted_cast(
         &mut self,
         body: &mut BlockRegion,
         tile: u16,
-        run: KernelRun,
+        provenance: WorkProvenance,
+        kernel: TileKernelSpec,
+        input: ShardView,
+        output: ShardView,
     ) -> ExpansionResult<()> {
-        let dimensions = run.inputs[0]
+        let dimensions = input
             .extents
             .iter()
             .map(|e| e.physical_end - e.start)
             .collect::<Vec<_>>();
         let chunks = crate::kernel::cast::CastChunks::new(
-            run.requirements.outputs[0].format.layout.order,
+            self.shards[output.shard.index() as usize]
+                .tensor_type
+                .format
+                .layout
+                .order,
             &dimensions,
         )
         .ok_or(ExpansionError::InvalidOperatorPlan)?;
         for (start, end) in chunks.ranges {
-            let mut part = run.clone();
-            for view in [&mut part.inputs[0], &mut part.outputs[0]] {
+            let mut input = input.clone();
+            let mut output = output.clone();
+            for view in [&mut input, &mut output] {
                 let extent = &mut view.extents[chunks.axis];
                 let base = extent.start;
                 extent.start = base + start;
@@ -32,7 +40,8 @@ impl TileGraphBuilder {
             }
             // Output is 32 KiB before input; chunk geometry guarantees
             // disjoint memory elements and no writes into unread input.
-            self.append_kernel(body, tile, part)?;
+            let run = self.bind_kernel(provenance, kernel.clone(), vec![input], vec![output])?;
+            self.append_kernel(body, tile, run)?;
         }
         Ok(())
     }

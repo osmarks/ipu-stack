@@ -157,19 +157,37 @@ impl TileGraphBuilder {
                         crate::GemmWeightLoad::Standard
                     },
                 };
-                let run = self.kernel_run(provenance, kernel, vec![l, r], vec![destination])?;
                 let flattens_outer_rows = matches!(
-                    run.requirements.outputs[0].format.layout.order,
+                    self.shards[output.index() as usize]
+                        .tensor_type
+                        .format
+                        .layout
+                        .order,
                     ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
                 );
                 let mut matrices = Vec::new();
-                if run.outputs[0].extents.len() > 2 && !flattens_outer_rows {
-                    let mut coordinates = vec![0; run.outputs[0].extents.len() - 2];
-                    split_gemm_matrices(&run, &self.shards, 0, &mut coordinates, &mut matrices)?;
+                if destination.extents.len() > 2 && !flattens_outer_rows {
+                    let mut coordinates = vec![0; destination.extents.len() - 2];
+                    split_gemm_matrices(
+                        &[l, r],
+                        &destination,
+                        &self.shards,
+                        0,
+                        &mut coordinates,
+                        &mut matrices,
+                    )?;
+                } else {
+                    matrices.push(([l, r], destination));
                 }
                 // Count after batch splitting: each local call owns only its
                 // selected matrix, including its own logical padding bounds.
-                let mut append = |mut run: KernelRun| -> ExpansionResult<()> {
+                for (inputs, destination) in matrices {
+                    let mut run = self.bind_kernel(
+                        provenance,
+                        kernel.clone(),
+                        inputs.into(),
+                        vec![destination],
+                    )?;
                     let size = |e: ShardExtent, bound: Option<u32>| {
                         u64::from(
                             e.logical_end
@@ -196,14 +214,7 @@ impl TileGraphBuilder {
                         .product();
                     run.product_flops =
                         Some([2 * rows * cols * inner, 2 * physical * u64::from(width)]);
-                    self.append_kernel(body, tile, run)
-                };
-                if !matrices.is_empty() {
-                    for matrix in matrices {
-                        append(matrix)?;
-                    }
-                } else {
-                    append(run)?;
+                    self.append_kernel(body, tile, run)?;
                 }
             }
         }
@@ -211,44 +222,37 @@ impl TileGraphBuilder {
     }
 }
 
+/// Select final matrix views before constructing a kernel call. A batch extent
+/// of one is broadcast only when the corresponding logical tensor axis is one.
 fn split_gemm_matrices(
-    run: &KernelRun,
+    inputs: &[ShardView; 2],
+    output: &ShardView,
     shards: &[BlockValue],
     axis: usize,
     coordinates: &mut [u32],
-    runs: &mut Vec<KernelRun>,
+    matrices: &mut Vec<([ShardView; 2], ShardView)>,
 ) -> ExpansionResult<()> {
     if axis < coordinates.len() {
-        let extent = run.outputs[0]
-            .extents
-            .get(axis)
-            .ok_or(ExpansionError::InvalidOperatorPlan)?;
+        let extent = output.extents[axis];
         if extent.logical_end != extent.physical_end {
             return Err(ExpansionError::InvalidOperatorPlan);
         }
         for coordinate in extent.start..extent.physical_end {
             coordinates[axis] = coordinate;
-            split_gemm_matrices(run, shards, axis + 1, coordinates, runs)?;
+            split_gemm_matrices(inputs, output, shards, axis + 1, coordinates, matrices)?;
         }
         return Ok(());
     }
 
-    let mut matrix = run.clone();
-    let output_shape = &shards[run.outputs[0].shard.index() as usize]
-        .tensor_type
-        .shape
-        .0;
-    narrow_gemm_matrix_view(
-        &mut matrix.outputs[0],
-        output_shape,
-        output_shape,
-        coordinates,
-    )?;
-    for view in &mut matrix.inputs {
+    let output_shape = &shards[output.shard.index() as usize].tensor_type.shape.0;
+    let mut output = output.clone();
+    narrow_gemm_matrix_view(&mut output, output_shape, output_shape, coordinates)?;
+    let mut inputs = inputs.clone();
+    for view in &mut inputs {
         let shape = &shards[view.shard.index() as usize].tensor_type.shape.0;
         narrow_gemm_matrix_view(view, shape, output_shape, coordinates)?;
     }
-    runs.push(matrix);
+    matrices.push((inputs, output));
     Ok(())
 }
 

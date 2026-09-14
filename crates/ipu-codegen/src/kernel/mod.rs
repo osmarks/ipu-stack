@@ -2,6 +2,7 @@
 
 mod abi;
 mod attention;
+mod binding;
 mod build;
 pub(crate) mod cast;
 pub(crate) mod cost;
@@ -14,17 +15,17 @@ pub use spec::*;
 #[cfg(test)]
 mod tests;
 pub(crate) use abi::*;
+pub(crate) use attention::{AttentionKernelShape, attention_shape};
+pub(crate) use binding::*;
 pub(crate) use build::*;
+pub(crate) use gemm::gemm_rows;
 use specialization::*;
 
+use crate::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
-    AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AttentionKernelShape, KernelAbiError, attention_shape,
-    gemm_rows, input_matrix_extent, matrix_count, matrix_extent,
-};
-use crate::{
-    AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder,
-    KernelRequirements, KernelRun, LowProgram, Precision, StepProfile, StorageError, TileAddress,
-    TileWorkList, TileWorkRef, view_byte_traversal,
+    AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, KernelRun,
+    LowProgram, Precision, StepProfile, StorageError, TileAddress, TileWorkList, TileWorkRef,
+    view_byte_traversal,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,20 +33,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct PlannedKernelCall {
     pub symbol: String,
     pub arguments: Vec<u32>,
-}
-
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum KernelMaterializationError {
-    #[error(transparent)]
-    Abi(#[from] KernelAbiError),
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("shard {0} has no assigned address")]
-    UnplacedShard(u32),
-    #[error("kernel operand view of shard {shard} has {spans} physical byte spans")]
-    FragmentedView { shard: u32, spans: usize },
-    #[error("placed kernel address overflowed")]
-    AddressOverflow,
 }
 
 /// Resolves one scheduled call after placement has assigned each shard base.
@@ -57,98 +44,23 @@ pub fn materialize_kernel_run(
     shard_addresses: &BTreeMap<BlockValueId, u32>,
     plan: &KernelBuildPlan,
     overrides: &BTreeMap<BlockValueId, TileAddress>,
-) -> Result<ComputeStep, KernelMaterializationError> {
+) -> Result<ComputeStep, KernelError> {
     let call = plan.call(run)?;
-    let packed_group = run.requirements.outputs[0]
-        .format
-        .layout
-        .order
-        .gemm_output_group()
-        .filter(|_| {
-            matches!(
-                run.kernel,
-                TileKernelSpec::Gemm {
-                    multiply: Precision::F16,
-                    ..
-                }
-            )
-        });
-    if let Some(group) = packed_group {
-        let shard = &shards[run.outputs[0].shard.index() as usize];
-        let column = run.outputs[0].extents.len()
-            - if run.requirements.outputs[0]
-                .format
-                .layout
-                .order
-                .gemm_output_transposed()
-            {
-                2
-            } else {
-                1
-            };
-        let row = if column + 1 == run.outputs[0].extents.len() {
-            column - 1
-        } else {
-            column + 1
-        };
-        let extent = run.outputs[0].extents[column];
-        let start = extent.start - shard.extents[column].start;
-        let end = extent.physical_end - shard.extents[column].start;
-        if run.outputs[0].extents[row] != shard.extents[row]
-            || !gemm_rows(run)?.is_multiple_of(16)
-            || !start.is_multiple_of(16)
-            || end <= start
-            || start / group != (end - 1) / group
-        {
-            return Err(KernelAbiError::RequirementMismatch.into());
-        }
-    }
-    let resolve = |view: &crate::ShardView, packed: bool| {
-        let shard = shards.get(view.shard.index() as usize).ok_or(
-            KernelMaterializationError::UnplacedShard(view.shard.index()),
-        )?;
-        let spans = view_byte_traversal(shard, view, crate::CopyOrder::Physical)?;
-        let span = if packed {
-            spans.spans().next()
-        } else {
-            spans.contiguous_span()
-        };
-        let Some(span) = span else {
-            return Err(KernelMaterializationError::FragmentedView {
-                shard: view.shard.index(),
-                spans: spans.span_count() as usize,
-            });
-        };
+    let resolve = |operand: MemoryOperand| {
+        let view = run
+            .operand_view(operand)
+            .ok_or(KernelAbiError::RequirementMismatch)?;
+        let offset = view_offset(run, operand, shards)?;
         let base = resolve_shard_address(shards, shard_addresses, overrides, view.shard)?;
-        add_address_offset(base, span.offset)
+        add_address_offset(base, offset)
     };
-    let mut output_address = resolve(&run.outputs[0], packed_group.is_some())?;
-    if let TileKernelSpec::FillZero { offset, bytes, .. } = run.kernel {
-        let output_spans = view_byte_traversal(
-            &shards[run.outputs[0].shard.index() as usize],
-            &run.outputs[0],
-            crate::CopyOrder::Physical,
-        )?;
-        let allocation_bytes = output_spans
-            .contiguous_span()
-            .ok_or(StorageError::InvalidView)?
-            .bytes;
-        if !offset.is_multiple_of(8)
-            || offset
-                .checked_add(bytes)
-                .is_none_or(|end| end > allocation_bytes)
-        {
-            return Err(StorageError::InvalidView.into());
-        }
-        output_address = add_address_offset(output_address, offset)?;
-    }
+    let output_address = resolve(MemoryOperand::Output(0))?;
     // The worker ABI puts result zero in R2, followed by inputs and then the
     // remaining results. This register order does not distinguish result storage.
-    let input_addresses = run
-        .inputs
-        .iter()
-        .map(|operand| resolve(operand, false))
-        .chain(run.outputs.iter().skip(1).map(|view| resolve(view, false)))
+    let input_addresses = (0..run.inputs.len())
+        .map(|index| MemoryOperand::Input(index as u16))
+        .chain((1..run.outputs.len()).map(|index| MemoryOperand::Output(index as u16)))
+        .map(resolve)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
         symbol: call.symbol,
@@ -162,7 +74,7 @@ pub fn materialize_kernel_run(
 pub(crate) fn add_address_offset(
     address: TileAddress,
     offset: u32,
-) -> Result<TileAddress, KernelMaterializationError> {
+) -> Result<TileAddress, KernelError> {
     add_address_displacement(address, i64::from(offset))
 }
 
@@ -171,7 +83,7 @@ pub(crate) fn resolve_shard_address(
     addresses: &BTreeMap<BlockValueId, u32>,
     overrides: &BTreeMap<BlockValueId, TileAddress>,
     shard: BlockValueId,
-) -> Result<TileAddress, KernelMaterializationError> {
+) -> Result<TileAddress, KernelError> {
     if !overrides.is_empty()
         && let Some((base, displacement)) = crate::storage_chain(shards, shard)
             .find_map(|(source, offset)| overrides.get(&source).map(|&base| (base, offset)))
@@ -182,21 +94,20 @@ pub(crate) fn resolve_shard_address(
         .get(&shard)
         .copied()
         .map(TileAddress::Absolute)
-        .ok_or(KernelMaterializationError::UnplacedShard(shard.index()))
+        .ok_or(KernelError::UnplacedShard(shard.index()))
 }
 
 fn add_address_displacement(
     address: TileAddress,
     displacement: i64,
-) -> Result<TileAddress, KernelMaterializationError> {
+) -> Result<TileAddress, KernelError> {
     let offset = |base: i64| {
         base.checked_add(displacement)
-            .ok_or(KernelMaterializationError::AddressOverflow)
+            .ok_or(KernelError::AddressOverflow)
     };
     Ok(match address {
         TileAddress::Absolute(address) => TileAddress::Absolute(
-            u32::try_from(offset(i64::from(address))?)
-                .map_err(|_| KernelMaterializationError::AddressOverflow)?,
+            u32::try_from(offset(i64::from(address))?).map_err(|_| KernelError::AddressOverflow)?,
         ),
         TileAddress::RepeatPointer {
             index,
@@ -204,7 +115,7 @@ fn add_address_displacement(
         } => TileAddress::RepeatPointer {
             index,
             offset: i32::try_from(offset(i64::from(existing))?)
-                .map_err(|_| KernelMaterializationError::AddressOverflow)?,
+                .map_err(|_| KernelError::AddressOverflow)?,
         },
     })
 }

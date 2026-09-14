@@ -432,7 +432,7 @@ fn block_major_matrix_index(
         .ok_or(StorageError::Overflow)
 }
 
-fn validate_view(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<()> {
+pub(crate) fn validate_view(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<()> {
     if view.len() != shard.extents.len()
         || view.iter().zip(shard.extents).any(|(view, shard)| {
             shard.start > shard.logical_end

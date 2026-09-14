@@ -190,7 +190,7 @@ impl TileGraphBuilder {
                 extents: source.extents.clone(),
                 definition: ShardDefinition::Staging,
             })?;
-            let run = self.kernel_run(
+            let run = self.bind_kernel(
                 provenance,
                 TileKernelSpec::Rearrange { from, to },
                 vec![self.full_view(source_shard)],
@@ -231,7 +231,7 @@ impl TileGraphBuilder {
                 return Err(ExpansionError::InvalidCopyPlan);
             }
             let tile = destination.tile;
-            let run = self.kernel_run(
+            let run = self.bind_kernel(
                 operation_provenance(operation),
                 TileKernelSpec::Rearrange {
                     from: source.tensor_type.format.layout.clone(),
@@ -699,7 +699,7 @@ impl TileGraphBuilder {
                 {
                     batch.kernels.push((
                         tile,
-                        self.kernel_run(
+                        self.bind_kernel(
                             provenance,
                             kernel.clone(),
                             vec![staging],

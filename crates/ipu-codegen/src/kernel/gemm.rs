@@ -2,6 +2,71 @@
 
 use super::*;
 
+/// Packed stores use the leading address of one column group, with the row
+/// permutation encoded by the GEMM. Other outputs require a contiguous view.
+pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool, KernelAbiError> {
+    if !matches!(
+        run.kernel,
+        TileKernelSpec::Gemm {
+            multiply: Precision::F16,
+            ..
+        }
+    ) {
+        return Ok(false);
+    }
+    let order = run.requirements.outputs[0].format.layout.order;
+    let Some(group) = order.gemm_output_group() else {
+        return Ok(false);
+    };
+    let view = &run.outputs[0];
+    let column = view
+        .extents
+        .len()
+        .checked_sub(if order.gemm_output_transposed() { 2 } else { 1 })
+        .ok_or(KernelAbiError::MissingGemmRows)?;
+    let row = if column + 1 == view.extents.len() {
+        column
+            .checked_sub(1)
+            .ok_or(KernelAbiError::MissingGemmRows)?
+    } else {
+        column + 1
+    };
+    let extent = view.extents[column];
+    let start = extent.start - shard.extents[column].start;
+    let end = extent.physical_end - shard.extents[column].start;
+    if view.extents[row] != shard.extents[row]
+        || !gemm_rows(run)?.is_multiple_of(16)
+        || !start.is_multiple_of(16)
+        || end <= start
+        || start / group != (end - 1) / group
+    {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    Ok(true)
+}
+
+pub(crate) fn gemm_rows(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    let rank = run.outputs[0].extents.len();
+    let output_order = &run.requirements.outputs[0].format.layout.order;
+    let matrix_column_axis = rank
+        .checked_sub(if output_order.gemm_output_transposed() {
+            2
+        } else {
+            1
+        })
+        .ok_or(KernelAbiError::MissingGemmRows)?;
+    run.outputs[0]
+        .extents
+        .iter()
+        .enumerate()
+        .filter(|(axis, _)| *axis != matrix_column_axis)
+        .try_fold(1u32, |rows, extent| {
+            rows.checked_mul(extent.1.physical_end - extent.1.start)
+        })
+        .filter(|&rows| rows != 0)
+        .ok_or(KernelAbiError::MissingGemmRows)
+}
+
 pub(super) fn specialized_gemm_symbol(
     prefix: &str,
     mode: GemmKernelMode,

@@ -370,6 +370,9 @@ mod tests {
         for value in &mut mid.values {
             value.tensor_type.format.layout.tiling = TensorTiling::linear(1, 32);
         }
+        // Exercise a real local packing kernel before donation. An AMP-left
+        // to AMP-left "rearrange" has no kernel and used to escape this test.
+        mid.values[0].tensor_type.format.layout.order = ElementOrder::RowMajor;
         mid.operations[0].kind = MidOperationKind::Copy {
             mapping: CoordinateMapping::default(),
             reuse_local: false,

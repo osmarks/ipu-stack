@@ -1,12 +1,10 @@
 //! Tile expansion and per-tile work, followed by placement and code generation.
 
-mod call;
 mod copy;
 pub(crate) mod expand;
 mod graph;
 mod initialization;
 mod passes;
-pub(crate) use call::*;
 pub use copy::*;
 #[cfg(test)]
 pub use expand::view_byte_spans;

@@ -108,16 +108,29 @@ impl TileGraphBuilder {
                     let results = results
                         .into_iter()
                         .map(|shard| self.full_view(shard))
-                        .collect();
-                    let run = self.kernel_run(
-                        operation_provenance(operation),
-                        kernel.clone(),
-                        inputs,
-                        results,
-                    )?;
+                        .collect::<Vec<_>>();
                     if donate_cast {
-                        self.append_in_place_cast(body, tile, run)?;
+                        let [input]: [ShardView; 1] = inputs
+                            .try_into()
+                            .map_err(|_| ExpansionError::InvalidOperatorPlan)?;
+                        let [output]: [ShardView; 1] = results
+                            .try_into()
+                            .map_err(|_| ExpansionError::ResultArity)?;
+                        self.build_shifted_cast(
+                            body,
+                            tile,
+                            operation_provenance(operation),
+                            kernel.clone(),
+                            input,
+                            output,
+                        )?;
                     } else {
+                        let run = self.bind_kernel(
+                            operation_provenance(operation),
+                            kernel.clone(),
+                            inputs,
+                            results,
+                        )?;
                         self.append_kernel(body, tile, run)?;
                     }
                 }

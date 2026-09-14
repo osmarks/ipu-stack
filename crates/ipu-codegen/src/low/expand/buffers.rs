@@ -3,6 +3,26 @@
 use super::*;
 
 impl TileGraphBuilder {
+    pub(super) fn bind_kernel(
+        &mut self,
+        provenance: WorkProvenance,
+        kernel: TileKernelSpec,
+        mut inputs: Vec<ShardView>,
+        outputs: Vec<ShardView>,
+    ) -> ExpansionResult<KernelRun> {
+        for view in &mut inputs {
+            self.resolve_read_view(view)?;
+        }
+        Ok(KernelRun::bind(
+            provenance,
+            kernel,
+            inputs,
+            outputs,
+            &self.shards,
+            &mut self.kernel_metadata,
+        )?)
+    }
+
     pub(super) fn storage_root(&self, shard: BlockValueId) -> BlockValueId {
         crate::storage_root(&self.shards, shard)
     }

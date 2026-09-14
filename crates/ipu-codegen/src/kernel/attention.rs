@@ -2,6 +2,69 @@
 //! every stage shares its worker code across query-row counts.
 
 use super::*;
+use crate::ShardView;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AttentionKernelShape {
+    pub(crate) matrices: u32,
+    pub(crate) query_rows: u32,
+    pub(crate) key_rows: u32,
+    pub(crate) query_dimension: u32,
+    pub(crate) value_dimension: u32,
+    pub(crate) scale_bits: u32,
+}
+
+pub(crate) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
+    let TileKernelSpec::FlashAttention {
+        options,
+        accumulate,
+    } = &run.kernel
+    else {
+        return Err(KernelAbiError::RequirementMismatch);
+    };
+    if options.causal || *accumulate != crate::AccumulationPrecision::F32 {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let [query, key, value] = run.inputs.as_slice() else {
+        return Err(KernelAbiError::RequirementMismatch);
+    };
+    let extents = |view: &ShardView| {
+        view.extents
+            .iter()
+            .map(|extent| extent.physical_end - extent.start)
+            .collect::<Vec<_>>()
+    };
+    let query = extents(query);
+    let key = extents(key);
+    let value = extents(value);
+    if query.len() < 2 || query.len() != key.len() || query.len() != value.len() {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let rank = query.len();
+    if query[..rank - 2] != key[..rank - 2]
+        || query[..rank - 2] != value[..rank - 2]
+        || query[rank - 1] != key[rank - 1]
+        || key[rank - 2] != value[rank - 2]
+    {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let matrices = query[..rank - 2]
+        .iter()
+        .try_fold(1u32, |product, &extent| product.checked_mul(extent))
+        .ok_or(KernelAbiError::ElementCountOverflow)?;
+    let scale = options
+        .scale
+        .as_value()
+        .unwrap_or_else(|| 1.0 / (query[rank - 1] as f32).sqrt());
+    Ok(AttentionKernelShape {
+        matrices,
+        query_rows: query[rank - 2],
+        key_rows: key[rank - 2],
+        query_dimension: query[rank - 1],
+        value_dimension: value[rank - 1],
+        scale_bits: scale.to_bits(),
+    })
+}
 
 impl KernelBuildPlan {
     pub(super) fn add_attention(&mut self, shape: AttentionKernelShape) {

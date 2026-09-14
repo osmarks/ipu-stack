@@ -31,7 +31,7 @@ pub struct TileProgramLowering<'a> {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TileLoweringError {
     #[error(transparent)]
-    Kernel(#[from] crate::KernelMaterializationError),
+    Kernel(#[from] crate::KernelError),
     #[error(transparent)]
     ExchangeDiagnostic(#[from] crate::ExchangeLoweringError),
     #[error("tile schedule refers to an unknown exchange phase")]

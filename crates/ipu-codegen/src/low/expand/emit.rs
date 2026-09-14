@@ -3,55 +3,6 @@
 use super::*;
 
 impl TileGraphBuilder {
-    pub(super) fn kernel_run(
-        &mut self,
-        provenance: WorkProvenance,
-        kernel: TileKernelSpec,
-        mut inputs: Vec<ShardView>,
-        outputs: Vec<ShardView>,
-    ) -> ExpansionResult<KernelRun> {
-        for view in &mut inputs {
-            self.resolve_read_view(view)?;
-        }
-        // Intern the contract before allocating its formats/requirements. Operand
-        // views vary by tile; the kernel and storage contracts usually do not.
-        let format =
-            |view: &ShardView| &self.shards[view.shard.index() as usize].tensor_type.format;
-        if outputs.is_empty() {
-            return Err(ExpansionError::ResultArity);
-        }
-        for metadata in &self.kernel_metadata {
-            if metadata.provenance == provenance
-                && metadata.kernel == kernel
-                && metadata.requirements.outputs.len() == outputs.len()
-                && outputs
-                    .iter()
-                    .zip(&metadata.requirements.outputs)
-                    .all(|(view, requirement)| *format(view) == requirement.format)
-                && metadata.requirements.inputs.len() == inputs.len()
-                && inputs
-                    .iter()
-                    .zip(&metadata.requirements.inputs)
-                    .all(|(operand, requirement)| *format(operand) == requirement.format)
-            {
-                return Ok(KernelRun {
-                    product_flops: None,
-                    metadata: Arc::clone(metadata),
-                    inputs,
-                    outputs,
-                });
-            }
-        }
-        let requirements = KernelRequirements::new(
-            &kernel,
-            inputs.iter().map(|view| format(view).clone()),
-            outputs.iter().map(|view| format(view).clone()),
-        );
-        let run = KernelRun::new(provenance, kernel, inputs, outputs, requirements);
-        self.kernel_metadata.push(Arc::clone(&run.metadata));
-        Ok(run)
-    }
-
     pub(super) fn append_physical_phase(
         &mut self,
         transfers: BTreeMap<ShardView, Vec<ShardView>>,

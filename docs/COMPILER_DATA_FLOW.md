@@ -222,9 +222,15 @@ needs the broader family-contract refactor. Clear emission widens exact holes to
 the fill implementation's write granularity. Relative local-copy descriptors and
 launch coalescing remain in low/copy.rs.
 
-Kernel construction still assembles parts of a call in
-[expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs); full binding through
-families remains to be done. Both kernel and exchange append only record work.
+Kernel construction resolves read views in
+[buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs), then calls
+`KernelRun::bind` in [kernel/binding.rs](../crates/ipu-codegen/src/kernel/binding.rs).
+That owner interns access requirements and checks the ABI, scalar arguments,
+specialization and relative physical views before the call enters low. GEMM
+batch selection and shifted cast chunking select the final views first; neither
+mutates an already bound call. Both kernel and exchange append only record work.
+The remaining family refactor consolidates the ABI's family-specific decisions
+and shares their capabilities with planning and costing.
 After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
 groups exchanges across commuting local copies, then merges adjacent copies.
 It checks read/write hazards against completed storage bindings and respects
@@ -240,9 +246,11 @@ alongside movement and kernel binding.
 
 ## What each later representation is for
 
-- `KernelRun` retains relative views, kernel specification and access requirements.
-  It is not yet a fully checked executable call: ABI validation, specialization,
-  scalar construction and some view-contiguity checks occur later in `kernel`.
+- `KernelRun` retains checked relative views, kernel specification and shared
+  access requirements. Binding validates the current implementation's ABI,
+  specialization, scalars and physical view interpretation before placement.
+  Those cheap derived fields are not copied into every call. Final emission
+  uses the same derivation and adds placed or Repeat-relative base addresses.
 - `LogicalExchange` stores one source with multiple recipient views. Physical
   addresses, message lengths, pairing and hazard ordering are resolved in
   [codegen/exchange.rs](../crates/ipu-codegen/src/exchange.rs). The encoding and

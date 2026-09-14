@@ -20,10 +20,9 @@ use crate::low::*;
 use crate::mid::Compute;
 use crate::storage::{ByteSpan, StorageError};
 use crate::{
-    AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder,
-    KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
-    MidProgram, MidRepeat, MidValueId, Precision, ShardExtent, TensorTiling, TensorType,
-    TileKernelSpec,
+    AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder, Layout,
+    LayoutError, MemoryClass, MidOperation, MidOperationKind, MidProgram, MidRepeat, MidValueId,
+    Precision, ShardExtent, TensorTiling, TensorType, TileKernelSpec,
 };
 #[cfg(test)]
 pub use copies::view_byte_spans;
@@ -56,6 +55,8 @@ pub enum ExpansionError {
     IdOverflow,
     #[error("invalid tensor layout: {0}")]
     Layout(#[from] LayoutError),
+    #[error("invalid kernel binding: {0}")]
+    Kernel(#[from] crate::kernel::KernelError),
     #[error("invalid tensor storage view: {0}")]
     Storage(#[from] StorageError),
 }
@@ -438,7 +439,7 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<()> {
         let tile = self.shards[shard.index() as usize].tile;
         {
-            let run = self.kernel_run(
+            let run = self.bind_kernel(
                 provenance,
                 TileKernelSpec::FillZero {
                     offset: range.offset,

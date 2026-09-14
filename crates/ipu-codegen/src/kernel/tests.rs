@@ -920,3 +920,90 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
         Err(KernelAbiError::ElementCountOverflow)
     );
 }
+
+#[test]
+fn binding_checks_backing_strides_before_placement() {
+    let provenance = WorkProvenance {
+        operation: None,
+        value: None,
+        reason: WorkReason::OperatorKernel,
+    };
+    let tensor = crate::TensorType::new([4, 16], Precision::F16, Layout::row_sharded(1));
+    let extents = tensor.format.layout.shard_extents(&tensor.shape).unwrap()[0]
+        .1
+        .clone();
+    let shards = (0..2)
+        .map(|index| BlockValue {
+            id: BlockValueId(index),
+            tile: 0,
+            tensor_type: tensor.clone(),
+            extents: extents.clone(),
+            definition: crate::ShardDefinition::Staging,
+        })
+        .collect::<Vec<_>>();
+    for rows in 1..=4 {
+        for columns in [4, 8, 16] {
+            let views = shards
+                .iter()
+                .map(|shard| {
+                    let mut extents = shard.extents.clone();
+                    extents[0].logical_end = rows;
+                    extents[0].physical_end = rows;
+                    extents[1].logical_end = columns;
+                    extents[1].physical_end = columns;
+                    ShardView {
+                        shard: shard.id,
+                        extents,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let bound = KernelRun::bind(
+                provenance,
+                TileKernelSpec::Gelu,
+                vec![views[0].clone()],
+                vec![views[1].clone()],
+                &shards,
+                &mut Vec::new(),
+            );
+            // Slicing columns retains the backing row stride. It is dense
+            // only for a single row or for complete rows of that storage.
+            if rows == 1 || columns == 16 {
+                let run = bound.unwrap();
+                let addresses = BTreeMap::from([(shards[0].id, 0x60000), (shards[1].id, 0x70000)]);
+                materialize_kernel_run(
+                    &run,
+                    &shards,
+                    &addresses,
+                    &KernelBuildPlan::default(),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            } else {
+                assert!(matches!(bound, Err(KernelError::FragmentedView { .. })));
+            }
+        }
+    }
+    let mut output = tensor.format;
+    output.layout.order = ElementOrder::Amp(AmpOrder::Left);
+    let mut incompatible = shards.clone();
+    incompatible[1].tensor_type.format = output;
+    assert!(matches!(
+        KernelRun::bind(
+            provenance,
+            TileKernelSpec::Gelu,
+            vec![ShardView {
+                shard: shards[0].id,
+                extents: extents.clone()
+            }],
+            vec![ShardView {
+                shard: shards[1].id,
+                extents
+            }],
+            &incompatible,
+            &mut Vec::new(),
+        ),
+        Err(KernelError::Abi(KernelAbiError::Unavailable(
+            TileKernelSpec::Gelu
+        )))
+    ));
+}

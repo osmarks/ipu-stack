@@ -294,7 +294,7 @@ impl TileGraphBuilder {
                     };
                     stages[stage].runs.push((
                         owner.tile,
-                        self.kernel_run(
+                        self.bind_kernel(
                             provenance,
                             TileKernelSpec::ReductionSum {
                                 partials: u16::try_from(chunk.len() + 1)
