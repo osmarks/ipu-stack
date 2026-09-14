@@ -29,14 +29,6 @@ pub enum SortBy {
     Name,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepKind {
-    Exchange,
-    Compute,
-    Synchronization,
-    Idle,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataFilter {
     pub name: String,
@@ -47,7 +39,7 @@ pub struct MetadataFilter {
 pub struct Query {
     pub group_by: GroupBy,
     pub sort_by: SortBy,
-    pub kind: Option<StepKind>,
+    pub kind: Option<ProfileStepKind>,
     pub kernel: Option<String>,
     pub operation_contains: Option<String>,
     pub tiles: BTreeSet<u32>,
@@ -688,7 +680,7 @@ fn matches_query(
     offset: u64,
     sample_duration: u32,
 ) -> bool {
-    if query.kind.is_some_and(|kind| kind != kind_of(sample))
+    if query.kind.is_some_and(|kind| kind != sample.step.kind)
         || query
             .kernel
             .as_ref()
@@ -753,21 +745,12 @@ fn group_key(query: &Query, tile: u32, sample: &CycleSample) -> (String, BTreeMa
     (name, dimensions)
 }
 
-fn kind_of(sample: &CycleSample) -> StepKind {
-    match sample.step.kind {
-        ProfileStepKind::Exchange => StepKind::Exchange,
-        ProfileStepKind::Compute => StepKind::Compute,
-        ProfileStepKind::Synchronization => StepKind::Synchronization,
-        ProfileStepKind::Idle => StepKind::Idle,
-    }
-}
-
 fn kind_name(sample: &CycleSample) -> &'static str {
-    match kind_of(sample) {
-        StepKind::Exchange => "exchange",
-        StepKind::Compute => "compute",
-        StepKind::Synchronization => "synchronization",
-        StepKind::Idle => "idle",
+    match sample.step.kind {
+        ProfileStepKind::Exchange => "exchange",
+        ProfileStepKind::Compute => "compute",
+        ProfileStepKind::Synchronization => "synchronization",
+        ProfileStepKind::Idle => "idle",
     }
 }
 
@@ -1111,7 +1094,7 @@ mod tests {
         let result = query(
             &report,
             &Query {
-                kind: Some(StepKind::Compute),
+                kind: Some(ProfileStepKind::Compute),
                 sample_limit: 2,
                 shared_clock: true,
                 ..Query::default()

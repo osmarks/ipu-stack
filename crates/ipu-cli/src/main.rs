@@ -3,10 +3,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use ipu_driver::{Device, block_device_interrupt_signals};
 use ipu_elf::{LinkOptions, Toolchain, inspect_object, link, source_tree_digest};
-use ipu_package::{Application, ProfileReport};
+use ipu_package::{Application, ProfileReport, ProfileStepKind};
 use ipu_profile::{
-    GroupBy, Query, SortBy, StepKind, calibrate_profiles, exchange_activity_summary,
-    exchange_boundaries, phase_work, query,
+    GroupBy, Query, SortBy, calibrate_profiles, exchange_activity_summary, exchange_boundaries,
+    phase_work, query,
 };
 use ipu_runtime::Runtime;
 use std::collections::{BTreeSet, HashMap};
@@ -531,10 +531,10 @@ fn main() -> Result<()> {
                         ProfileSort::Name => SortBy::Name,
                     },
                     kind: kind.map(|kind| match kind {
-                        ProfileKind::Compute => StepKind::Compute,
-                        ProfileKind::Exchange => StepKind::Exchange,
-                        ProfileKind::Synchronization => StepKind::Synchronization,
-                        ProfileKind::Idle => StepKind::Idle,
+                        ProfileKind::Compute => ProfileStepKind::Compute,
+                        ProfileKind::Exchange => ProfileStepKind::Exchange,
+                        ProfileKind::Synchronization => ProfileStepKind::Synchronization,
+                        ProfileKind::Idle => ProfileStepKind::Idle,
                     }),
                     kernel,
                     operation_contains,
