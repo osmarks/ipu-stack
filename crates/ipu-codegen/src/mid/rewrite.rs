@@ -111,6 +111,21 @@ pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
         && implementation::same_distribution(&a.tensor_type, &b.tensor_type)
 }
 
+/// Source of a single-result coordinate-preserving copy. Shapes, precision,
+/// and placement may still differ; each rewrite checks the constraints it needs.
+pub(super) fn coordinate_copy_source(op: &MidOperation) -> Option<MidValueId> {
+    let ([input], [_]) = (op.inputs.as_slice(), op.results.as_slice()) else {
+        return None;
+    };
+    match &op.kind {
+        MidOperationKind::Convert(_) => Some(*input),
+        MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) if mapping.is_identity() => {
+            Some(*input)
+        }
+        _ => None,
+    }
+}
+
 /// Walk coordinate-preserving copies, optionally requiring identical storage.
 /// Callers check extra readers and intervening writes before rewriting them.
 pub(super) fn producer_through_copies(
@@ -123,30 +138,23 @@ pub(super) fn producer_through_copies(
     loop {
         let index = operations.iter().rposition(|op| op.results == [value])?;
         let op = &operations[index];
-        let identity = match &op.kind {
-            MidOperationKind::Convert(_) => true,
-            MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => mapping.is_identity(),
-            _ => false,
+        let Some(input) = coordinate_copy_source(op) else {
+            return Some((value, index, copies));
         };
-        if !identity
-            || op.inputs.len() != 1
-            || values[value.index() as usize].tensor_type.shape
-                != values[op.inputs[0].index() as usize].tensor_type.shape
+        if values[value.index() as usize].tensor_type.shape
+            != values[input.index() as usize].tensor_type.shape
             || values[value.index() as usize].tensor_type.format.precision
-                != values[op.inputs[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .precision
+                != values[input.index() as usize].tensor_type.format.precision
             || (identity_only
                 && !same_storage(
                     &values[value.index() as usize],
-                    &values[op.inputs[0].index() as usize],
+                    &values[input.index() as usize],
                 ))
         {
             return Some((value, index, copies));
         }
         copies.push(index);
-        value = op.inputs[0];
+        value = input;
     }
 }
 

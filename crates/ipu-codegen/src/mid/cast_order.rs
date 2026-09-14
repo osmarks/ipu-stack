@@ -62,17 +62,12 @@ fn reorder_region(
         let mut best = None;
         while let Some(&previous) = producers.get(&input) {
             let copy = &operations[previous];
-            let identity = match &copy.kind {
-                MidOperationKind::Convert(_) => true,
-                MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) => {
-                    mapping.is_identity()
-                }
-                _ => false,
+            let Some(source) = super::rewrite::coordinate_copy_source(copy) else {
+                break;
             };
-            if previous >= index || !identity || copy.inputs.len() != 1 || copy.results != [input] {
+            if previous >= index || copy.results != [input] {
                 break;
             }
-            let source = copy.inputs[0];
             let from = &values[source.index() as usize];
             let to = &values[input.index() as usize];
             if from.tensor_type.shape.0.len() != to.tensor_type.shape.0.len()
