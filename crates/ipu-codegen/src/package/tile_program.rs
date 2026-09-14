@@ -324,35 +324,13 @@ pub fn build_tile_program_package(
             &context,
         )?);
     }
-    tiles.sort_unstable_by_key(|tile| tile.physical_tile);
-    let mut application = Application {
-        tiles,
-        ..Application::default()
-    };
-    add_linked_debug_map(&mut application, &layout)?;
+    let mut application = assemble_application(tiles, Vec::new(), &layout, host)?;
     for (logical, program) in generated.iter().enumerate() {
         let physical = u32::from(topology.physical(u16::try_from(logical)?)?);
         add_generated_debug_map(&mut application, physical, code_address, program)?;
     }
-    application.outputs.push(Binding {
-        name: "completion".into(),
-        dtype: "u32".into(),
-        shape: vec![1],
-        slices: vec![RegionSlice {
-            tile: 0,
-            tile_address: COMPLETION_ADDRESS,
-            file_offset: 0,
-            size: 4,
-        }],
-    });
     application.outputs.extend(run_outputs);
     application.inputs.push(launch);
-    application.entry_points.push(EntryPoint {
-        name: "run".into(),
-        command: 0,
-        external_syncs: 0,
-    });
-    application.host_exchange = host.protocol;
     application.validate()?;
     Ok(application)
 }

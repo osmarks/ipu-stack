@@ -889,11 +889,7 @@ fn build_package_from_objects(
             })
             .collect::<PackageBuildResult<Vec<_>>>()
     })?;
-    let mut application = Application {
-        tiles,
-        ..Application::default()
-    };
-    add_linked_debug_map(&mut application, &layout)?;
+    let mut application = assemble_application(tiles, outputs, &layout, host)?;
     for (physical, program) in generated.iter().enumerate() {
         add_generated_debug_map(
             &mut application,
@@ -901,41 +897,10 @@ fn build_package_from_objects(
             code_address,
             program,
         )?;
-        for segment in &host.segments[physical] {
-            if segment.flags & SEGMENT_EXECUTE != 0 && segment.memory_size != 0 {
-                application.debug_regions.push(DebugRegion {
-                    physical_tile: u32::try_from(physical)?,
-                    address: segment.address,
-                    size: segment.memory_size,
-                    name: "host exchange program".into(),
-                });
-            }
-        }
     }
-    application
-        .tiles
-        .sort_unstable_by_key(|tile| tile.physical_tile);
     application.inputs = inputs;
     application.weights = weights;
-    application.outputs = outputs;
     application.profile_tiles = profile_tiles;
-    application.outputs.push(Binding {
-        name: "completion".into(),
-        dtype: "u32".into(),
-        shape: vec![1],
-        slices: vec![RegionSlice {
-            tile: 0,
-            tile_address: COMPLETION_ADDRESS,
-            file_offset: 0,
-            size: 4,
-        }],
-    });
-    application.entry_points.push(EntryPoint {
-        name: "run".into(),
-        command: 0,
-        external_syncs: 0,
-    });
-    application.host_exchange = host.protocol;
     application.validate()?;
     Ok((
         final_cost.total,
@@ -1024,6 +989,53 @@ fn diagnostic_tensor(
         precision: mid_value.tensor_type.format.precision,
         shards,
     })
+}
+
+/// Common package metadata for graph lowering and explicit tile programs.
+/// Callers attach their bindings and generated-code debug maps before validation.
+fn assemble_application(
+    mut tiles: Vec<TileImage>,
+    mut outputs: Vec<Binding>,
+    linked: &LinkedImage,
+    host: host::HostPackagePlan,
+) -> PackageBuildResult<Application> {
+    tiles.sort_unstable_by_key(|tile| tile.physical_tile);
+    outputs.push(Binding {
+        name: "completion".into(),
+        dtype: "u32".into(),
+        shape: vec![1],
+        slices: vec![RegionSlice {
+            tile: 0,
+            tile_address: COMPLETION_ADDRESS,
+            file_offset: 0,
+            size: 4,
+        }],
+    });
+    let mut application = Application {
+        tiles,
+        outputs,
+        entry_points: vec![EntryPoint {
+            name: "run".into(),
+            command: 0,
+            external_syncs: 0,
+        }],
+        host_exchange: host.protocol,
+        ..Application::default()
+    };
+    add_linked_debug_map(&mut application, linked)?;
+    for (physical, segments) in host.segments.iter().enumerate() {
+        for segment in segments {
+            if segment.flags & SEGMENT_EXECUTE != 0 && segment.memory_size != 0 {
+                application.debug_regions.push(DebugRegion {
+                    physical_tile: u32::try_from(physical)?,
+                    address: segment.address,
+                    size: segment.memory_size,
+                    name: "host exchange program".into(),
+                });
+            }
+        }
+    }
+    Ok(application)
 }
 
 fn add_linked_debug_map(
@@ -1389,6 +1401,51 @@ pub fn capture_exchange_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_assembly_maps_host_code_by_physical_tile() {
+        let linked = LinkedImage {
+            base: SUPPORT_START,
+            entry: SUPPORT_START,
+            bytes: vec![],
+            segments: vec![],
+            symbols: BTreeMap::new(),
+        };
+        let segment = |address, memory_size, flags| Segment {
+            address,
+            memory_size,
+            flags,
+            data: vec![],
+        };
+        let host = host::HostPackagePlan {
+            descriptor_bytes: 0,
+            programs: vec![],
+            segments: vec![
+                vec![segment(100, 8, SEGMENT_READ)],
+                vec![
+                    segment(200, 12, SEGMENT_EXECUTE),
+                    segment(300, 0, SEGMENT_EXECUTE),
+                ],
+            ],
+            protocol: Default::default(),
+            end: 0,
+            staging_address: 0,
+        };
+        let application = assemble_application(vec![], vec![], &linked, host).unwrap();
+        assert_eq!(application.debug_regions.len(), 1);
+        let region = &application.debug_regions[0];
+        assert_eq!(
+            (region.physical_tile, region.address, region.size),
+            (1, 200, 12)
+        );
+        assert_eq!(region.name, "host exchange program");
+        assert_eq!(application.outputs[0].name, "completion");
+        assert_eq!(
+            application.outputs[0].slices[0].tile_address,
+            COMPLETION_ADDRESS
+        );
+        assert_eq!(application.entry_points[0].name, "run");
+    }
 
     #[test]
     fn linked_sections_protect_their_complete_memory_elements() {
