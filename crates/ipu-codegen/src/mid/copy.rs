@@ -151,9 +151,11 @@ pub(super) fn compose(
             reuse_local &= previous_reuse;
             input = source;
             removed.insert(producer);
+        }
+        if input != operations[index].inputs[0] {
             operations[index].inputs[0] = input;
             operations[index].kind = MidOperationKind::Primitive(Primitive::Copy {
-                mapping: next.clone(),
+                mapping: next,
                 reuse_local,
             });
             operations[index].estimated_cycles = 0;
