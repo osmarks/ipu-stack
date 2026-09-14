@@ -50,32 +50,16 @@ pub(super) fn intersect_extents_with_shared_padding(
     left: &[ShardExtent],
     right: &[ShardExtent],
 ) -> Option<Vec<ShardExtent>> {
-    if left.len() != right.len() {
-        return None;
+    let mut extents = intersect_extents(left, right)?;
+    for ((extent, left), right) in extents.iter_mut().zip(left).zip(right) {
+        if extent.logical_end == left.logical_end && extent.logical_end == right.logical_end {
+            extent.physical_end += left
+                .physical_end
+                .saturating_sub(left.logical_end)
+                .min(right.physical_end.saturating_sub(right.logical_end));
+        }
     }
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| {
-            let start = left.start.max(right.start);
-            let logical_end = left.logical_end.min(right.logical_end);
-            (start < logical_end).then(|| {
-                let shared_tail =
-                    if logical_end == left.logical_end && logical_end == right.logical_end {
-                        left.physical_end
-                            .saturating_sub(left.logical_end)
-                            .min(right.physical_end.saturating_sub(right.logical_end))
-                    } else {
-                        0
-                    };
-                ShardExtent {
-                    axis: left.axis,
-                    start,
-                    logical_end,
-                    physical_end: logical_end + shared_tail,
-                }
-            })
-        })
-        .collect()
+    Some(extents)
 }
 
 pub(super) fn split_mapping_at_panel_boundaries(
