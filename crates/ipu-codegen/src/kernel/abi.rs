@@ -23,12 +23,6 @@ pub enum KernelSymbols {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KernelAvailability {
-    Implemented,
-    Required,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarValue {
     ElementCount,
     FlattenedRows,
@@ -65,7 +59,6 @@ pub enum ScalarValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelAbi {
     pub symbols: KernelSymbols,
-    pub availability: KernelAvailability,
     pub inputs: usize,
     pub scalar_arguments: &'static [ScalarValue],
 }
@@ -293,212 +286,169 @@ pub fn tile_kernel_abi(
     requirements: &KernelRequirements,
 ) -> Result<KernelAbi, KernelAbiError> {
     let precision = requirements.output.format.precision;
-    let (symbols, availability, inputs, scalars): (_, _, usize, &'static [ScalarValue]) =
-        match kernel {
-            TileKernelSpec::FillZero { .. } => (
-                KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
-                KernelAvailability::Implemented,
-                0,
-                &[ScalarValue::WordsPerWorker, ScalarValue::RemainderWorkers],
-            ),
-            TileKernelSpec::Gemm {
-                multiply,
-                accumulate,
-                weights,
-                ..
-            } => {
-                if requirements.inputs.len() != 2 {
-                    return Err(KernelAbiError::RequirementMismatch);
-                }
-                if *weights == GemmWeightLoad::Interleaved && *multiply == Precision::F32 {
-                    return Err(KernelAbiError::RequirementMismatch);
-                }
-                if matches!(multiply, Precision::F8F143 { .. })
-                    && (*accumulate != crate::AccumulationPrecision::F16
-                        || precision != Precision::F16)
-                {
-                    return Err(KernelAbiError::RequirementMismatch);
-                }
-                let scalars: &'static [ScalarValue] =
-                    if matches!(multiply, Precision::F8F143 { .. }) {
-                        &[ScalarValue::ScaleExponent]
-                    } else {
-                        &[]
-                    };
-                (
-                    KernelSymbols::Specialized,
-                    KernelAvailability::Implemented,
-                    2,
-                    scalars,
-                )
+    let (symbols, inputs, scalars): (_, usize, &'static [ScalarValue]) = match kernel {
+        TileKernelSpec::FillZero { .. } => (
+            KernelSymbols::Exact(crate::FILL_ZERO_U64_SYMBOL),
+            0,
+            &[ScalarValue::WordsPerWorker, ScalarValue::RemainderWorkers],
+        ),
+        TileKernelSpec::Gemm {
+            multiply,
+            accumulate,
+            weights,
+            ..
+        } => {
+            if requirements.inputs.len() != 2 {
+                return Err(KernelAbiError::RequirementMismatch);
             }
-            TileKernelSpec::AddLayerNormMoments => (
-                KernelSymbols::Exact("add_layer_norm_moments"),
-                KernelAvailability::Implemented,
-                2,
-                &[ScalarValue::InputRows, ScalarValue::InputColumns],
-            ),
-            TileKernelSpec::LayerNormMoments => (
-                KernelSymbols::Exact("layer_norm_moments"),
-                KernelAvailability::Implemented,
-                1,
-                &[ScalarValue::FlattenedRows, ScalarValue::InputColumns],
-            ),
-            TileKernelSpec::LayerNormApply { .. } => (
-                KernelSymbols::Exact("layer_norm_apply"),
-                KernelAvailability::Implemented,
-                4,
-                &[
-                    ScalarValue::FlattenedRows,
-                    ScalarValue::LogicalColumns,
-                    ScalarValue::FeaturePartitions,
-                ],
-            ),
-            TileKernelSpec::LayerNorm if matches!(precision, Precision::F8F143 { .. }) => (
-                KernelSymbols::Exact("layer_norm_f8"),
-                KernelAvailability::Implemented,
-                3,
-                &[
-                    ScalarValue::InputRows,
-                    ScalarValue::InputColumns,
-                    ScalarValue::OutputScale,
-                    ScalarValue::PackedOutput,
-                ],
-            ),
-            TileKernelSpec::LayerNorm => (
-                KernelSymbols::Exact("layer_norm_f16"),
-                if precision == Precision::F16 {
-                    KernelAvailability::Implemented
-                } else {
-                    KernelAvailability::Required
-                },
-                3,
-                &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
-            ),
-            TileKernelSpec::BiasGelu if matches!(precision, Precision::F8F143 { .. }) => (
-                KernelSymbols::Exact("bias_gelu_f8"),
-                KernelAvailability::Implemented,
-                2,
-                &[
-                    ScalarValue::InputRows,
-                    ScalarValue::InputColumns,
-                    ScalarValue::OutputScale,
-                    ScalarValue::PackedOutput,
-                    ScalarValue::PhysicalColumns,
-                ],
-            ),
-            TileKernelSpec::BiasGelu => (
-                KernelSymbols::Exact("bias_gelu_f16"),
-                KernelAvailability::Implemented,
-                2,
-                &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
-            ),
-            TileKernelSpec::AddLayerNorm => (
-                KernelSymbols::Exact("add_layer_norm_f16"),
-                KernelAvailability::Implemented,
-                4,
-                &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
-            ),
-            TileKernelSpec::Gelu if matches!(precision, Precision::F8F143 { .. }) => (
-                KernelSymbols::Exact("gelu_f8"),
-                KernelAvailability::Implemented,
-                1,
-                &[
-                    ScalarValue::InputRows,
-                    ScalarValue::InputColumns,
-                    ScalarValue::OutputScale,
-                    ScalarValue::PackedOutput,
-                    ScalarValue::InputPhysicalColumns,
-                    ScalarValue::PhysicalColumns,
-                ],
-            ),
-            TileKernelSpec::Gelu => {
-                let symbol = gelu_symbol(requirements).unwrap_or("unsupported_gelu");
-                (
-                    KernelSymbols::Exact(symbol),
-                    if symbol == "unsupported_gelu" {
-                        KernelAvailability::Required
-                    } else {
-                        KernelAvailability::Implemented
-                    },
-                    1,
-                    &[ScalarValue::ElementCount],
-                )
+            if *weights == GemmWeightLoad::Interleaved && *multiply == Precision::F32 {
+                return Err(KernelAbiError::RequirementMismatch);
             }
-            TileKernelSpec::ReductionSum { .. } => {
-                if precision != Precision::F16 {
-                    return Err(KernelAbiError::RequirementMismatch);
-                }
-                (
-                    KernelSymbols::Exact("reduce_sum_f16"),
-                    KernelAvailability::Implemented,
-                    2,
-                    &[ScalarValue::NumPartials, ScalarValue::ElementCount],
-                )
+            if matches!(multiply, Precision::F8F143 { .. })
+                && (*accumulate != crate::AccumulationPrecision::F16 || precision != Precision::F16)
+            {
+                return Err(KernelAbiError::RequirementMismatch);
             }
-            TileKernelSpec::Add => (
-                exact_symbol(precision, "add_f16", "add_f32"),
-                if precision == Precision::F16 {
-                    KernelAvailability::Implemented
-                } else {
-                    KernelAvailability::Required
-                },
-                2,
-                &[
-                    ScalarValue::ElementCount,
-                    ScalarValue::LeftBroadcastStride,
-                    ScalarValue::RightBroadcastStride,
-                ],
-            ),
-            TileKernelSpec::FlashAttention { .. } => (
-                KernelSymbols::Specialized,
-                if requirements.output.format.precision == Precision::F32
-                    && requirements
-                        .inputs
-                        .iter()
-                        .all(|input| input.format.precision == Precision::F16)
-                {
-                    KernelAvailability::Implemented
-                } else {
-                    KernelAvailability::Required
-                },
-                3,
-                &[],
-            ),
-            TileKernelSpec::AttentionSoftmax { .. } => (
-                KernelSymbols::Specialized,
-                KernelAvailability::Implemented,
+            let scalars: &'static [ScalarValue] = if matches!(multiply, Precision::F8F143 { .. }) {
+                &[ScalarValue::ScaleExponent]
+            } else {
+                &[]
+            };
+            (KernelSymbols::Specialized, 2, scalars)
+        }
+        TileKernelSpec::AddLayerNormMoments => (
+            KernelSymbols::Exact("add_layer_norm_moments"),
+            2,
+            &[ScalarValue::InputRows, ScalarValue::InputColumns],
+        ),
+        TileKernelSpec::LayerNormMoments => (
+            KernelSymbols::Exact("layer_norm_moments"),
+            1,
+            &[ScalarValue::FlattenedRows, ScalarValue::InputColumns],
+        ),
+        TileKernelSpec::LayerNormApply { .. } => (
+            KernelSymbols::Exact("layer_norm_apply"),
+            4,
+            &[
+                ScalarValue::FlattenedRows,
+                ScalarValue::LogicalColumns,
+                ScalarValue::FeaturePartitions,
+            ],
+        ),
+        TileKernelSpec::LayerNorm if matches!(precision, Precision::F8F143 { .. }) => (
+            KernelSymbols::Exact("layer_norm_f8"),
+            3,
+            &[
+                ScalarValue::InputRows,
+                ScalarValue::InputColumns,
+                ScalarValue::OutputScale,
+                ScalarValue::PackedOutput,
+            ],
+        ),
+        TileKernelSpec::LayerNorm if precision == Precision::F16 => (
+            KernelSymbols::Exact("layer_norm_f16"),
+            3,
+            &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+        ),
+        TileKernelSpec::BiasGelu if matches!(precision, Precision::F8F143 { .. }) => (
+            KernelSymbols::Exact("bias_gelu_f8"),
+            2,
+            &[
+                ScalarValue::InputRows,
+                ScalarValue::InputColumns,
+                ScalarValue::OutputScale,
+                ScalarValue::PackedOutput,
+                ScalarValue::PhysicalColumns,
+            ],
+        ),
+        TileKernelSpec::BiasGelu => (
+            KernelSymbols::Exact("bias_gelu_f16"),
+            2,
+            &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+        ),
+        TileKernelSpec::AddLayerNorm => (
+            KernelSymbols::Exact("add_layer_norm_f16"),
+            4,
+            &[ScalarValue::FlattenedRows, ScalarValue::LogicalColumns],
+        ),
+        TileKernelSpec::Gelu if matches!(precision, Precision::F8F143 { .. }) => (
+            KernelSymbols::Exact("gelu_f8"),
+            1,
+            &[
+                ScalarValue::InputRows,
+                ScalarValue::InputColumns,
+                ScalarValue::OutputScale,
+                ScalarValue::PackedOutput,
+                ScalarValue::InputPhysicalColumns,
+                ScalarValue::PhysicalColumns,
+            ],
+        ),
+        TileKernelSpec::Gelu => {
+            let symbol = gelu_symbol(requirements)
+                .ok_or_else(|| KernelAbiError::Unavailable(kernel.clone()))?;
+            (
+                KernelSymbols::Exact(symbol),
                 1,
-                &[
-                    ScalarValue::QueryRows,
-                    ScalarValue::KeyRows,
-                    ScalarValue::SplitSoftmaxRows,
-                ],
-            ),
-            TileKernelSpec::AttentionMerge { final_block, .. } => (
+                &[ScalarValue::ElementCount],
+            )
+        }
+        TileKernelSpec::ReductionSum { .. } => {
+            if precision != Precision::F16 {
+                return Err(KernelAbiError::RequirementMismatch);
+            }
+            (
+                KernelSymbols::Exact("reduce_sum_f16"),
+                2,
+                &[ScalarValue::NumPartials, ScalarValue::ElementCount],
+            )
+        }
+        TileKernelSpec::Add if precision == Precision::F16 => (
+            KernelSymbols::Exact("add_f16"),
+            2,
+            &[
+                ScalarValue::ElementCount,
+                ScalarValue::LeftBroadcastStride,
+                ScalarValue::RightBroadcastStride,
+            ],
+        ),
+        TileKernelSpec::FlashAttention { .. }
+            if precision == Precision::F32
+                && requirements
+                    .inputs
+                    .iter()
+                    .all(|input| input.format.precision == Precision::F16) =>
+        {
+            (KernelSymbols::Specialized, 3, &[])
+        }
+        TileKernelSpec::AttentionSoftmax { .. } => (
+            KernelSymbols::Specialized,
+            1,
+            &[
+                ScalarValue::QueryRows,
+                ScalarValue::KeyRows,
+                ScalarValue::SplitSoftmaxRows,
+            ],
+        ),
+        TileKernelSpec::AttentionMerge { final_block, .. }
+            if precision == Precision::F32 || (precision == Precision::F16 && *final_block) =>
+        {
+            (
                 KernelSymbols::Specialized,
-                if precision == Precision::F32 || (precision == Precision::F16 && *final_block) {
-                    KernelAvailability::Implemented
-                } else {
-                    KernelAvailability::Required
-                },
                 if precision == Precision::F16 { 3 } else { 2 },
                 &[
                     ScalarValue::InitialBlock,
                     ScalarValue::FinalBlock,
                     ScalarValue::QueryRows,
                 ],
-            ),
-            TileKernelSpec::Cast { from, to } => (
+            )
+        }
+        TileKernelSpec::Cast { from, to }
+            if (*from, *to) == (Precision::F32, Precision::F16)
+                || matches!(from, Precision::F8F143 { .. })
+                || matches!(to, Precision::F8F143 { .. }) =>
+        {
+            (
                 KernelSymbols::Exact(cast_symbol(*from, *to)),
-                if (*from, *to) == (Precision::F32, Precision::F16)
-                    || matches!(from, Precision::F8F143 { .. })
-                    || matches!(to, Precision::F8F143 { .. })
-                {
-                    KernelAvailability::Implemented
-                } else {
-                    KernelAvailability::Required
-                },
                 1,
                 if matches!(from, Precision::F8F143 { .. })
                     || matches!(to, Precision::F8F143 { .. })
@@ -514,58 +464,54 @@ pub fn tile_kernel_abi(
                 } else {
                     &[ScalarValue::ElementCount]
                 },
-            ),
-            TileKernelSpec::Rearrange { from, to }
-                if precision == Precision::F16
-                    && UnpackSource::from_order(from.order).is_some()
-                    && to.order == ElementOrder::RowMajor =>
-            {
-                (
-                    KernelSymbols::Specialized,
-                    KernelAvailability::Implemented,
-                    1,
-                    &[
-                        ScalarValue::Matrices,
-                        ScalarValue::LogicalRows,
-                        ScalarValue::PhysicalRows,
-                        ScalarValue::LogicalColumns,
-                        ScalarValue::PhysicalColumns,
-                    ],
-                )
-            }
-            TileKernelSpec::Rearrange { from, to }
-                if precision == Precision::F16
-                    && from.order == ElementOrder::RowMajor
-                    && matches!(
-                        to.order,
-                        ElementOrder::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-                            | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                    ) =>
-            {
-                (
-                    KernelSymbols::Specialized,
-                    KernelAvailability::Implemented,
-                    1,
-                    &[
-                        ScalarValue::LogicalRows,
-                        ScalarValue::PhysicalRows,
-                        ScalarValue::TargetOrder,
-                        ScalarValue::LogicalColumns,
-                        ScalarValue::PhysicalColumns,
-                        ScalarValue::Matrices,
-                    ],
-                )
-            }
-            TileKernelSpec::Rearrange { .. } => (
-                KernelSymbols::Exact("rearrange"),
-                KernelAvailability::Required,
+            )
+        }
+        TileKernelSpec::Rearrange { from, to }
+            if precision == Precision::F16
+                && UnpackSource::from_order(from.order).is_some()
+                && to.order == ElementOrder::RowMajor =>
+        {
+            (
+                KernelSymbols::Specialized,
                 1,
-                &[],
-            ),
-        };
+                &[
+                    ScalarValue::Matrices,
+                    ScalarValue::LogicalRows,
+                    ScalarValue::PhysicalRows,
+                    ScalarValue::LogicalColumns,
+                    ScalarValue::PhysicalColumns,
+                ],
+            )
+        }
+        TileKernelSpec::Rearrange { from, to }
+            if precision == Precision::F16
+                && from.order == ElementOrder::RowMajor
+                && RearrangeTarget::from_order(to.order).is_some() =>
+        {
+            (
+                KernelSymbols::Specialized,
+                1,
+                &[
+                    ScalarValue::LogicalRows,
+                    ScalarValue::PhysicalRows,
+                    ScalarValue::TargetOrder,
+                    ScalarValue::LogicalColumns,
+                    ScalarValue::PhysicalColumns,
+                    ScalarValue::Matrices,
+                ],
+            )
+        }
+        TileKernelSpec::LayerNorm
+        | TileKernelSpec::Add
+        | TileKernelSpec::FlashAttention { .. }
+        | TileKernelSpec::AttentionMerge { .. }
+        | TileKernelSpec::Cast { .. }
+        | TileKernelSpec::Rearrange { .. } => {
+            return Err(KernelAbiError::Unavailable(kernel.clone()));
+        }
+    };
     Ok(KernelAbi {
         symbols,
-        availability,
         inputs,
         scalar_arguments: scalars,
     })
@@ -862,18 +808,6 @@ pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static 
     let input_layout = &input.format.layout;
     let output_layout = &requirements.output.format.layout;
     (input_layout == output_layout).then_some("gelu_tanh_approx_f16")
-}
-
-pub(super) fn exact_symbol(
-    precision: Precision,
-    f16_symbol: &'static str,
-    f32_symbol: &'static str,
-) -> KernelSymbols {
-    KernelSymbols::Exact(match precision {
-        Precision::F16 => f16_symbol,
-        Precision::F32 => f32_symbol,
-        Precision::F8F143 { .. } => "unsupported_f8_kernel",
-    })
 }
 
 pub(super) fn cast_symbol(from: Precision, to: Precision) -> &'static str {

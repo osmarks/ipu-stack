@@ -194,10 +194,6 @@ impl KernelInventory {
             match work {
                 TileWorkRef::Kernel(run) => {
                     let abi = validate_kernel_run(run)?;
-                    let kernel = &run.kernel;
-                    if abi.availability != KernelAvailability::Implemented {
-                        return Err(KernelAbiError::Unavailable(kernel.clone()));
-                    }
                     if let KernelSymbols::Exact(symbol) = abi.symbols {
                         self.exact_symbols.insert(symbol);
                         continue;

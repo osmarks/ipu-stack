@@ -277,7 +277,6 @@ fn randomized_gemm_abis_resolve_to_retained_symbols() {
             &requirements,
         )
         .unwrap();
-        assert_eq!(abi.availability, KernelAvailability::Implemented);
         assert!(matches!(abi.symbols, KernelSymbols::Specialized));
         assert_eq!(abi.inputs, 2);
     }
@@ -423,7 +422,6 @@ fn randomized_gelu_abis_select_supported_layout_paths() {
             distinct_elements: Vec::new(),
         };
         let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
-        assert_eq!(abi.availability, KernelAvailability::Implemented);
         assert_eq!(abi.inputs, 1);
         assert_eq!(abi.scalar_arguments, &[ScalarValue::ElementCount]);
         assert_eq!(abi.symbols, KernelSymbols::Exact("gelu_tanh_approx_f16"));
@@ -867,4 +865,31 @@ fn worker_stack_support_follows_cpp_recipes() {
     .unwrap();
     assert_eq!(plan.compilations.len(), 1);
     assert_eq!(plan.compilations[0].source, "attention_softmax_f16.S");
+}
+
+#[test]
+fn unsupported_kernel_abis_fail_at_lookup() {
+    let format = TensorFormat {
+        precision: Precision::F32,
+        layout: Layout::row_sharded(1),
+    };
+    for kernel in [
+        TileKernelSpec::Add,
+        TileKernelSpec::LayerNorm,
+        TileKernelSpec::Gelu,
+        TileKernelSpec::Cast {
+            from: Precision::F16,
+            to: Precision::F32,
+        },
+        TileKernelSpec::Rearrange {
+            from: format.layout.clone(),
+            to: format.layout.clone(),
+        },
+    ] {
+        let requirements = KernelRequirements::new(&kernel, [format.clone()], format.clone());
+        assert_eq!(
+            tile_kernel_abi(&kernel, &requirements),
+            Err(KernelAbiError::Unavailable(kernel))
+        );
+    }
 }

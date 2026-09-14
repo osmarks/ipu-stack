@@ -305,8 +305,7 @@ fn local_supported(a: &TensorType, b: &TensorType, kind: &TransformKind) -> bool
     };
     let requirements =
         crate::KernelRequirements::new(&kernel, [a.format.clone()], b.format.clone());
-    crate::tile_kernel_abi(&kernel, &requirements)
-        .is_ok_and(|abi| abi.availability == crate::KernelAvailability::Implemented)
+    crate::tile_kernel_abi(&kernel, &requirements).is_ok()
 }
 
 // AMP-left consists of contiguous row fragments, unlike AMP output's lane
