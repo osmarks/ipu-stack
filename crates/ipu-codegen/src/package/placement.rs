@@ -73,7 +73,7 @@ pub(super) fn map_tiles(
     };
     let mut sorted = mapping.to_vec();
     sorted.sort_unstable();
-    if sorted != (0..graph.tile_count).collect::<Vec<_>>() {
+    if !sorted.into_iter().eq(0..graph.tile_count) {
         return Err(invalid(
             "tile mapping must be a bijection over active tiles",
         ));
@@ -121,7 +121,7 @@ pub(super) fn improve_exchange_placement(
     if baseline_score == 0 {
         return Ok((baseline, exchanges));
     }
-    let mut candidates = Vec::new();
+    let mut best: Option<(u128, u32, crate::Placement)> = None;
     for offset in (4096..ipu_package::IPU21_INTERLEAVED_ELEMENT_SIZE).step_by(4096) {
         let candidate = match crate::place::place_with_auxiliary(
             program,
@@ -135,14 +135,17 @@ pub(super) fn improve_exchange_placement(
         };
         let score = conflicts.score(&candidate);
         tracing::debug!(offset, score = %score, "scored exchange placement");
-        if score < baseline_score {
-            candidates.push((score, offset, candidate));
+        if score < baseline_score
+            && best.as_ref().is_none_or(|(best_score, best_offset, _)| {
+                (score, offset) < (*best_score, *best_offset)
+            })
+        {
+            best = Some((score, offset, candidate));
         }
     }
-    candidates.sort_by_key(|(score, offset, _)| (*score, *offset));
     // Scheduling remains expensive. Inspect only the best cheap candidate;
     // keep the existing placement unless complete schedules improve.
-    let Some((score, offset, candidate)) = candidates.into_iter().next() else {
+    let Some((score, offset, candidate)) = best else {
         return Ok((baseline, exchanges));
     };
     let mut cache = cache.clone();
