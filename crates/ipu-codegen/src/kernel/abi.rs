@@ -438,13 +438,11 @@ pub fn tile_kernel_abi(
                 ],
             )
         }
-        TileKernelSpec::Cast { from, to }
-            if (*from, *to) == (Precision::F32, Precision::F16)
-                || matches!(from, Precision::F8F143 { .. })
-                || matches!(to, Precision::F8F143 { .. }) =>
-        {
+        TileKernelSpec::Cast { from, to } => {
+            let symbol = cast_symbol(*from, *to)
+                .ok_or_else(|| KernelAbiError::Unavailable(kernel.clone()))?;
             (
-                KernelSymbols::Exact(cast_symbol(*from, *to)),
+                KernelSymbols::Exact(symbol),
                 1,
                 if matches!(from, Precision::F8F143 { .. })
                     || matches!(to, Precision::F8F143 { .. })
@@ -501,7 +499,6 @@ pub fn tile_kernel_abi(
         | TileKernelSpec::Add
         | TileKernelSpec::FlashAttention { .. }
         | TileKernelSpec::AttentionMerge { .. }
-        | TileKernelSpec::Cast { .. }
         | TileKernelSpec::Rearrange { .. } => {
             return Err(KernelAbiError::Unavailable(kernel.clone()));
         }
@@ -799,15 +796,14 @@ pub(super) fn gelu_symbol(requirements: &KernelRequirements) -> Option<&'static 
     (input_layout == output_layout).then_some("gelu_tanh_approx_f16")
 }
 
-pub(super) fn cast_symbol(from: Precision, to: Precision) -> &'static str {
-    match (from, to) {
-        (Precision::F16, Precision::F32) => "cast_f16_f32",
+pub(super) fn cast_symbol(from: Precision, to: Precision) -> Option<&'static str> {
+    Some(match (from, to) {
         (Precision::F32, Precision::F16) => "cast_f32_f16",
         (Precision::F8F143 { .. }, Precision::F16) => "cast_f8_f16",
         (Precision::F8F143 { .. }, Precision::F32) => "cast_f8_f32",
         (Precision::F16, Precision::F8F143 { .. }) => "cast_f16_f8",
         (Precision::F32, Precision::F8F143 { .. }) => "cast_f32_f8",
         (Precision::F8F143 { .. }, Precision::F8F143 { .. }) => "cast_f8_f8",
-        _ => "cast_identity",
-    }
+        _ => return None,
+    })
 }

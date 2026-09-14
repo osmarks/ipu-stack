@@ -143,7 +143,7 @@ impl KernelBuildPlan {
             (Precision::F16, f8),
             (Precision::F32, f8),
         ] {
-            let symbol = cast_symbol(from, to);
+            let symbol = cast_symbol(from, to).expect("FP8 cast implementation");
             if !exact_symbols.contains(symbol) {
                 continue;
             }
