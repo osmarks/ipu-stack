@@ -33,12 +33,8 @@ impl KernelBuildPlan {
         ),
         used: BTreeSet<(u32, GemmKernelMode)>,
     ) {
-        let values = used
-            .iter()
-            .map(|&(rows, _)| rows)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut values = used.iter().map(|&(rows, _)| rows).collect::<Vec<_>>();
+        values.dedup();
         let (source, prefix) = match precision {
             Precision::F16 => ("gemm_f16_amp.S", "f16"),
             Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
@@ -107,13 +103,13 @@ impl KernelBuildPlan {
         for pair in values.chunks(2) {
             let small = pair[0];
             let large = *pair.last().expect("nonempty GEMM row pair");
-            let symbols = [
+            let variants = [
                 (GemmKernelMode::Initialize, "small", small),
                 (GemmKernelMode::Initialize, "large", large),
                 (GemmKernelMode::Accumulate, "small", small),
                 (GemmKernelMode::Accumulate, "large", large),
-            ]
-            .map(|(mode, size, _)| {
+            ];
+            let symbols = variants.map(|(mode, size, _)| {
                 specialized_gemm_symbol(
                     prefix,
                     mode,
@@ -125,39 +121,6 @@ impl KernelBuildPlan {
                     large,
                 )
             });
-            for (mode, row_index) in [
-                (GemmKernelMode::Initialize, 0usize),
-                (GemmKernelMode::Accumulate, 2usize),
-            ] {
-                if used.contains(&(small, mode)) {
-                    self.symbols.insert(
-                        KernelSpecialization::Gemm(
-                            precision,
-                            weights,
-                            inner_block,
-                            output_columns,
-                            mode,
-                            small,
-                            output_group,
-                        ),
-                        symbols[row_index].clone(),
-                    );
-                }
-                if pair.len() == 2 && used.contains(&(large, mode)) {
-                    self.symbols.insert(
-                        KernelSpecialization::Gemm(
-                            precision,
-                            weights,
-                            inner_block,
-                            output_columns,
-                            mode,
-                            large,
-                            output_group,
-                        ),
-                        symbols[row_index + 1].clone(),
-                    );
-                }
-            }
             let single_rows = pair.len() == 1;
             let mut flags = vec![
                 format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
@@ -187,16 +150,25 @@ impl KernelBuildPlan {
             }
             let retained_symbols = symbols
                 .into_iter()
+                .zip(variants)
                 .enumerate()
-                .filter_map(|(index, symbol)| {
-                    let mode = if index < 2 {
-                        GemmKernelMode::Initialize
-                    } else {
-                        GemmKernelMode::Accumulate
-                    };
-                    let rows = if index % 2 == 0 { small } else { large };
-                    (used.contains(&(rows, mode)) && (index % 2 == 0 || !single_rows))
-                        .then_some(symbol)
+                .filter_map(|(index, (symbol, (mode, _, rows)))| {
+                    if !used.contains(&(rows, mode)) || (index % 2 != 0 && single_rows) {
+                        return None;
+                    }
+                    self.symbols.insert(
+                        KernelSpecialization::Gemm(
+                            precision,
+                            weights,
+                            inner_block,
+                            output_columns,
+                            mode,
+                            rows,
+                            output_group,
+                        ),
+                        symbol.clone(),
+                    );
+                    Some(symbol)
                 })
                 .collect();
             self.compilations.push(KernelCompilation {
