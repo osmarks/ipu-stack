@@ -129,14 +129,18 @@ pub(super) fn build_scheduled_program(
     }
     let mut event_cycles = resume.cycles;
     let mut event_index = resume.events;
-    for sender_index in resume.senders..senders.len() {
-        let sender = &senders[sender_index];
-        let split = events.partition_point(|event| event.cycles <= sender.start_cycles);
+    // The final boundary drains receive-only work through the phase horizon.
+    for sender_index in resume.senders..=senders.len() {
+        let sender = senders.get(sender_index);
+        let boundary = sender.map_or(horizon_cycles, |sender| sender.start_cycles);
+        let split = sender.map_or(events.len(), |_| {
+            events.partition_point(|event| event.cycles <= boundary)
+        });
         append_receive_events_record(
             &mut words,
             &mut event_cycles,
             &events.slice(event_index..split),
-            sender.start_cycles,
+            boundary,
             true,
             |consumed, words, cycles, lookahead| {
                 checkpoints.push(Checkpoint {
@@ -149,6 +153,7 @@ pub(super) fn build_scheduled_program(
             },
         )?;
         event_index = split;
+        let Some(sender) = sender else { break };
         let split = events.partition_point(|event| event.cycles <= sender.end_cycles);
         append_sender_message(
             &mut words,
@@ -165,22 +170,6 @@ pub(super) fn build_scheduled_program(
             lookahead: None,
         });
     }
-    append_receive_events_record(
-        &mut words,
-        &mut event_cycles,
-        &events.slice(event_index..events.len()),
-        horizon_cycles,
-        true,
-        |consumed, words, cycles, lookahead| {
-            checkpoints.push(Checkpoint {
-                senders: senders.len(),
-                events: event_index + consumed,
-                words,
-                cycles,
-                lookahead,
-            })
-        },
-    )?;
     words.push(RETURN_M10_INSTRUCTION);
     debug_assert_eq!(plan_event_cycles(&words.to_vec())?, horizon_cycles);
     Ok(EncodedSchedule {
