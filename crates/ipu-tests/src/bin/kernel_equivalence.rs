@@ -8,7 +8,6 @@ use ipu_codegen::{
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::Runtime;
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
@@ -289,19 +288,13 @@ exitz $mzero
         &Toolchain::from_sdk(&args.sdk),
         &wrapper,
     )?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&args.device_lock)?;
-    lock.lock()?;
-    let runtime = Runtime::open("/dev/ipu0", &fs::read(args.configuration)?)?;
-    runtime.load(
+    let device = ipu_tests::KernelDevice::load(
+        &args.sdk,
+        &args.configuration,
+        &args.device_lock,
         &application,
-        &fs::read(args.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"))?,
-        application.host_exchange.startup_mark,
     )?;
+    let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;
     let executed = session.invoke_streaming_deferred("run", &[0; 4]).inspect_err(|_| {

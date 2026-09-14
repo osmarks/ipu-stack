@@ -7,7 +7,6 @@ use ipu_codegen::{
 };
 use ipu_elf::Toolchain;
 use ipu_package::{Binding, RegionSlice};
-use ipu_runtime::Runtime;
 use std::{fs, path::PathBuf};
 
 #[derive(Parser)]
@@ -125,19 +124,7 @@ fn main() -> Result<()> {
             shape: vec![expected.len() as u32],
             slices,
         },
-        Binding {
-            name: "cycles".into(),
-            dtype: "u32".into(),
-            shape: vec![cases.len() as u32, 2],
-            slices: (0..cases.len())
-                .map(|tile| RegionSlice {
-                    tile: u32::from(ipu_exchange::c600_logical_to_physical(tile as u16)),
-                    tile_address: 0x7f000,
-                    file_offset: (tile * 8) as u64,
-                    size: 8,
-                })
-                .collect(),
-        },
+        ipu_tests::cycle_binding(cases.len().try_into()?, 0x7f000),
     ];
     let application = build_tile_program_package(
         &programs,
@@ -146,19 +133,13 @@ fn main() -> Result<()> {
         &Toolchain::from_sdk(&args.sdk),
         &PathBuf::from("device/static_runtime.S"),
     )?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&args.device_lock)?;
-    lock.lock()?;
-    let runtime = Runtime::open("/dev/ipu0", &fs::read(args.configuration)?)?;
-    runtime.load(
+    let device = ipu_tests::KernelDevice::load(
+        &args.sdk,
+        &args.configuration,
+        &args.device_lock,
         &application,
-        &fs::read(args.sdk.join("bin/ipu/tile_bootloader_cc_ipu21.elf"))?,
-        application.host_exchange.startup_mark,
     )?;
+    let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;
     let call = session.invoke_streaming_deferred("run", &[0; 4])?;

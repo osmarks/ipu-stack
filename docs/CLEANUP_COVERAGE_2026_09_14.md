@@ -12,9 +12,9 @@ not sources to rewrite.
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
 | Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
 | Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
-| Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | Broader fixture export |
-| Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Pretrained fixture export and deeper sweep provenance/error handling |
-| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries now use HostSession::finish for deferred output completion | Remaining fixture assembly and fault diagnostics |
+| Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | No additional duplication selected in the pretrained exporter |
+| Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Deeper sweep provenance/error handling |
+| Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries share locked runtime loading and use HostSession::finish for deferred output completion; four share timestamp bindings | Remaining fixture assembly and fault diagnostics |
 
 Calibration validation: four tests from `tools/test*calibration*.py`; deterministic
 comparison against the pre-extraction quantization functions produced identical
@@ -49,3 +49,9 @@ unpack checks passed 14 cases / 84,208 bytes; FP8 cast checks passed 1,404
 cases / 7,517,232 bytes, including scales, tails, padding and shifted overlap.
 The softmax and kernel-equivalence binaries retain their additional context
 halt checks after the shared output handshake.
+
+Diagnostic setup validation: all diagnostic targets compile after the shared
+loader extraction; 14 unpack cases / 84,208 bytes pass on hardware. The runtime
+can only be borrowed from its owner, which drops it before releasing the lock.
+Pretrained fixture export and baseline/candidate entry points were also sampled;
+no further consolidation was selected from those portions in this pass.
