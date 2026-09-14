@@ -104,7 +104,7 @@ fn disjoint_sources(
             .sum::<u32>();
         if sources.len() > 1 && total <= u32::from(tile_count) {
             let offset = values[sources[0].index() as usize].tile_offset;
-            changed |= rotate_owners(values, tile_count, &sources, offset);
+            changed |= rotate_owners(values, tile_count, sources, offset);
         }
         index += count.max(1);
     }
@@ -119,17 +119,16 @@ fn overlap_reductions(
     limit: usize,
 ) -> bool {
     let groups = values.iter().map(|v| v.storage_group).collect::<Vec<_>>();
-    let accesses = |ids: &[MidValueId]| {
-        ids.iter()
-            .map(|id| groups[id.index() as usize])
-            .collect::<BTreeSet<_>>()
+    let overlaps = |a: &[MidValueId], b: &[MidValueId]| {
+        a.iter().any(|a| {
+            b.iter()
+                .any(|b| groups[a.index() as usize] == groups[b.index() as usize])
+        })
     };
     let conflicts = |a: &MidOperation, b: &MidOperation| {
-        let ar = accesses(&a.inputs);
-        let aw = accesses(&a.results);
-        let br = accesses(&b.inputs);
-        let bw = accesses(&b.results);
-        !aw.is_disjoint(&br) || !aw.is_disjoint(&bw) || !ar.is_disjoint(&bw)
+        overlaps(&a.results, &b.inputs)
+            || overlaps(&a.results, &b.results)
+            || overlaps(&a.inputs, &b.results)
     };
     let mut eligible = BTreeSet::new();
     let mut used = BTreeSet::new();
@@ -202,7 +201,7 @@ fn overlap_reductions(
         rotate_owners(
             values,
             tile_count,
-            &sums.iter().map(|sum| sum.results[0]).collect::<Vec<_>>(),
+            sums.iter().map(|sum| sum.results[0]),
             offset,
         );
         start = insertion + sums.len();
@@ -227,11 +226,11 @@ fn owner_count(values: &[MidValue], value: MidValueId) -> u32 {
 fn rotate_owners(
     values: &mut [MidValue],
     tile_count: u16,
-    sources: &[MidValueId],
+    sources: impl IntoIterator<Item = MidValueId>,
     mut offset: u16,
 ) -> bool {
     let mut changed = false;
-    for &source in sources {
+    for source in sources {
         let group = values[source.index() as usize].storage_group;
         for alias in values
             .iter_mut()
