@@ -2,20 +2,9 @@
 
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProfileStepKind {
-    Exchange,
-    Compute,
-    Synchronization,
-    Idle,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProfileExchangeActivityKind {
-    Send,
-    Receive,
-    PartnerBusy,
-}
+pub use super::profile_capnp::{
+    ExchangeActivityKind as ProfileExchangeActivityKind, StepKind as ProfileStepKind,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileExchangeActivity {
@@ -135,12 +124,7 @@ impl ProfileStep {
         output.set_phase(self.phase);
         output.set_epoch(self.epoch);
         output.set_operation(&self.operation);
-        output.set_kind(match self.kind {
-            ProfileStepKind::Exchange => profile_capnp::StepKind::Exchange,
-            ProfileStepKind::Compute => profile_capnp::StepKind::Compute,
-            ProfileStepKind::Synchronization => profile_capnp::StepKind::Synchronization,
-            ProfileStepKind::Idle => profile_capnp::StepKind::Idle,
-        });
+        output.set_kind(self.kind);
         output.set_kernel(&self.kernel);
         output.set_exchange_event_cycles(self.exchange_event_cycles);
         let mut metadata = output.reborrow().init_metadata(self.metadata.len() as u32);
@@ -154,15 +138,7 @@ impl ProfileStep {
             .init_exchange_activities(self.exchange_activities.len() as u32);
         for (index, activity) in self.exchange_activities.iter().enumerate() {
             let mut output_activity = activities.reborrow().get(index as u32);
-            output_activity.set_kind(match activity.kind {
-                ProfileExchangeActivityKind::Send => profile_capnp::ExchangeActivityKind::Send,
-                ProfileExchangeActivityKind::Receive => {
-                    profile_capnp::ExchangeActivityKind::Receive
-                }
-                ProfileExchangeActivityKind::PartnerBusy => {
-                    profile_capnp::ExchangeActivityKind::PartnerBusy
-                }
-            });
+            output_activity.set_kind(activity.kind);
             output_activity.set_start_cycle(activity.start_cycle);
             output_activity.set_end_cycle(activity.end_cycle);
             output_activity.set_fanout(activity.fanout);
@@ -178,12 +154,7 @@ impl ProfileStep {
             phase: step.get_phase(),
             epoch: step.get_epoch(),
             operation: step.get_operation()?.to_str()?.into(),
-            kind: match step.get_kind()? {
-                profile_capnp::StepKind::Exchange => ProfileStepKind::Exchange,
-                profile_capnp::StepKind::Compute => ProfileStepKind::Compute,
-                profile_capnp::StepKind::Synchronization => ProfileStepKind::Synchronization,
-                profile_capnp::StepKind::Idle => ProfileStepKind::Idle,
-            },
+            kind: step.get_kind()?,
             kernel: step.get_kernel()?.to_str()?.into(),
             metadata: step
                 .get_metadata()?
@@ -202,17 +173,7 @@ impl ProfileStep {
                     Ok(ProfileExchangeActivity {
                         fanout: activity.get_fanout(),
                         paired: activity.get_paired(),
-                        kind: match activity.get_kind()? {
-                            profile_capnp::ExchangeActivityKind::Send => {
-                                ProfileExchangeActivityKind::Send
-                            }
-                            profile_capnp::ExchangeActivityKind::Receive => {
-                                ProfileExchangeActivityKind::Receive
-                            }
-                            profile_capnp::ExchangeActivityKind::PartnerBusy => {
-                                ProfileExchangeActivityKind::PartnerBusy
-                            }
-                        },
+                        kind: activity.get_kind()?,
                         start_cycle: activity.get_start_cycle(),
                         end_cycle: activity.get_end_cycle(),
                     })
