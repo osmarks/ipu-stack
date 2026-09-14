@@ -515,17 +515,7 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
     } else {
         initial_sample_entry_span(report, shared_base)
     };
-    let profile_span_cycles = report
-        .tiles
-        .iter()
-        .flat_map(|tile| &tile.samples)
-        .map(|sample| {
-            u64::from(sample.start_cycle.wrapping_sub(shared_base))
-                .saturating_add(u64::from(duration(sample)))
-                .saturating_sub(crop)
-        })
-        .max()
-        .unwrap_or(0);
+    let mut profile_span_cycles = 0;
     let mut groups = HashMap::<String, Accumulator>::new();
     let mut candidates = Vec::new();
     let mut matched_sample_count = 0;
@@ -536,6 +526,7 @@ pub fn query(report: &ProfileReport, query: &Query) -> QueryReport {
             let raw_end = raw_offset.saturating_add(u64::from(duration(sample)));
             let offset = raw_offset.saturating_sub(crop);
             let end = raw_end.saturating_sub(crop);
+            profile_span_cycles = profile_span_cycles.max(end);
             let sample_duration = u32::try_from(end.saturating_sub(offset)).unwrap_or(u32::MAX);
             if sample_duration == 0 {
                 continue;
