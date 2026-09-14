@@ -72,12 +72,9 @@ pub(crate) fn plan(
         });
     }
 
-    let mut weight_cursor = 0;
-    let mut input_cursor = 0;
-    let mut output_cursor = 0;
-    let pending_weights = collect(weights, Direction::ToTile, &mut weight_cursor)?;
-    let pending_inputs = collect(inputs, Direction::ToTile, &mut input_cursor)?;
-    let pending_outputs = collect(outputs, Direction::ToHost, &mut output_cursor)?;
+    let pending_weights = collect(weights, Direction::ToTile)?;
+    let pending_inputs = collect(inputs, Direction::ToTile)?;
+    let pending_outputs = collect(outputs, Direction::ToHost)?;
     let participating = pending_weights
         .iter()
         .chain(&pending_inputs)
@@ -196,18 +193,14 @@ pub(crate) fn plan(
     })
 }
 
-fn collect(
-    bindings: &[Binding],
-    direction: Direction,
-    cursor: &mut u64,
-) -> PackageBuildResult<Vec<PendingTransfer>> {
+fn collect(bindings: &[Binding], direction: Direction) -> PackageBuildResult<Vec<PendingTransfer>> {
+    let mut cursor = 0u64;
     let mut result = Vec::new();
     for binding in bindings {
-        let base = *cursor;
         for slice in &binding.slices {
-            append_slice(&mut result, direction, slice, base)?;
+            append_slice(&mut result, direction, slice, cursor)?;
         }
-        *cursor = cursor
+        cursor = cursor
             .checked_add(binding.byte_len()?)
             .ok_or_else(|| invalid("host binding offset overflow"))?;
     }
@@ -314,7 +307,9 @@ fn plan_tile(
     let mut calls = Vec::with_capacity(phases.len());
     let mut packet_cache = HashMap::<Vec<u32>, u32>::new();
     for phase in phases {
-        if !active(physical_tile, phase) {
+        let target = target(physical_tile, phase);
+        let targets = xreq_targets(physical_tile, phase)?;
+        if target.is_none() && targets.is_empty() {
             calls.push(HostPhase {
                 address: follower,
                 active: false,
@@ -322,34 +317,35 @@ fn plan_tile(
             });
             continue;
         }
-        let (instructions, packet_words) = phase_instructions(physical_tile, phase)?;
+        let (instructions, packet_words) = phase_instructions(physical_tile, target, &targets)?;
         cursor = align_up(cursor, 8)?;
         let address = cursor;
         let data = words(&instructions);
         cursor += u32::try_from(data.len())?;
         segments.push(segment(address, data, SEGMENT_READ | SEGMENT_EXECUTE));
-        let packet_bytes = u32::try_from(packet_words.len())?
+        let packet_count = u32::try_from(packet_words.len())?;
+        let packet_bytes = packet_count
             .checked_mul(4)
             .ok_or_else(|| invalid("host data size overflow"))?;
         let packet_source = if let Some(&source) = packet_cache.get(&packet_words) {
             source
         } else {
             let packet_data = words(&packet_words);
-            let source = data_arena.allocate(u32::try_from(packet_data.len())?, 4)?;
+            let source = data_arena.allocate(packet_bytes, 4)?;
             segments.push(segment(source, packet_data, SEGMENT_READ));
-            packet_cache.insert(packet_words.clone(), source);
+            packet_cache.insert(packet_words, source);
             source
         };
         let packet = PacketCopy {
             source: packet_source,
-            destination: if xreq_targets(physical_tile, phase)?.is_empty() {
+            destination: if targets.is_empty() {
                 HOST_PACKET_ADDRESS + 8
             } else {
                 HOST_PACKET_ADDRESS
             },
-            words: u32::try_from(packet_words.len())?,
+            words: packet_count,
         };
-        let descriptors = descriptor_words(physical_tile, phase, packet)?;
+        let descriptors = descriptor_words(target, packet)?;
         let descriptor_data = words(&descriptors);
         data_bytes = data_bytes
             .checked_add(packet_bytes)
@@ -413,16 +409,14 @@ impl DataArena {
 
 fn phase_instructions(
     physical_tile: u16,
-    phase: &[Transfer],
+    target: Option<Transfer>,
+    targets: &[u16],
 ) -> PackageBuildResult<(Vec<u32>, Vec<u32>)> {
-    let target = target(physical_tile, phase)
+    let target = target
         .map(|transfer| target_program(transfer, HOST_PACKET_ADDRESS + 8))
         .transpose()?;
-    let targets = xreq_targets(physical_tile, phase)?;
     let xreq = (!targets.is_empty())
-        .then(|| {
-            ipu_exchange::assemble_host_xreq_program_for_targets(&targets, HOST_PACKET_ADDRESS)
-        })
+        .then(|| ipu_exchange::assemble_host_xreq_program_for_targets(targets, HOST_PACKET_ADDRESS))
         .transpose()?;
     Ok(match (target, xreq) {
         (Some(target), Some(xreq)) => {
@@ -472,12 +466,7 @@ fn target_program(
     })
 }
 
-fn descriptor_words(
-    physical_tile: u16,
-    phase: &[Transfer],
-    packet: PacketCopy,
-) -> PackageBuildResult<Vec<u32>> {
-    let target = target(physical_tile, phase);
+fn descriptor_words(target: Option<Transfer>, packet: PacketCopy) -> PackageBuildResult<Vec<u32>> {
     let copy_words = target
         .filter(|transfer| transfer.copy_destination.is_some())
         .map_or(0, |transfer| transfer.bytes / 4);
@@ -518,11 +507,6 @@ fn xreq_targets(physical_tile: u16, phase: &[Transfer]) -> PackageBuildResult<Ve
             },
         )
         .collect()
-}
-
-fn active(physical_tile: u16, phase: &[Transfer]) -> bool {
-    target(physical_tile, phase).is_some()
-        || xreq_targets(physical_tile, phase).is_ok_and(|targets| !targets.is_empty())
 }
 
 fn inactive_instructions() -> Vec<u32> {
