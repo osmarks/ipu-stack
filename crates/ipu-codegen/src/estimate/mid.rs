@@ -2,7 +2,8 @@
 //! tensor program and axis partitions, not the number of tile IR objects.
 
 use super::*;
-use crate::{MidOperationKind, MidProgram, Primitive, TileKernelSpec};
+use crate::Compute;
+use crate::{MidOperationKind, MidProgram, TileKernelSpec};
 
 pub(crate) fn analyze(
     program: &MidProgram,
@@ -104,7 +105,7 @@ fn analyze_storage<const PER_TILE: bool>(
     };
     for (operation, _) in &steps {
         match &operation.kind {
-            MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) => {
+            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
                 for &(output, input) in output_aliases {
                     alias(operation.results[output], operation.inputs[input]);
                 }
@@ -136,7 +137,7 @@ fn analyze_storage<const PER_TILE: bool>(
     let mut element = vec![false; roots.len()];
     let mut tail = vec![0; roots.len()];
     for (operation, _) in &steps {
-        if let MidOperationKind::Primitive(Primitive::Compute {
+        if let MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Gemm { multiply, .. },
             ..
         }) = &operation.kind
@@ -154,7 +155,7 @@ fn analyze_storage<const PER_TILE: bool>(
     let shifted_inputs = steps
         .iter()
         .filter_map(|(operation, _)| {
-            matches!(&operation.kind, MidOperationKind::Primitive(Primitive::Compute {
+            matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Cast { from: Precision::F16, to: Precision::F8F143 { .. } },
             output_aliases, ..
         }) if output_aliases == &[(0, 0)])
@@ -409,7 +410,7 @@ pub(crate) fn operation_cost(
     let mut rows = 0;
     let mut price = ProgramCycles::default();
     match &operation.kind {
-        MidOperationKind::Primitive(Primitive::Compute {
+        MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands,
             product,
@@ -485,7 +486,7 @@ pub(crate) fn operation_cost(
                 }
             }
         }
-        MidOperationKind::Primitive(Primitive::Sum { axis, staging }) => {
+        MidOperationKind::Compute(Compute::Sum { axis, staging }) => {
             let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);
             let remote = contributors.saturating_sub(1);
             let bytes = maximum_shard_bytes(output);
@@ -508,11 +509,10 @@ pub(crate) fn operation_cost(
                     crate::kernel::cost::f16_reduction_cycles(elements, tail + 1)
                 });
         }
-        MidOperationKind::Primitive(Primitive::Copy { .. }) | MidOperationKind::Convert(_) => {
+        MidOperationKind::Copy { policy, .. } => {
             let input = tensor(operation.inputs[0]);
             let bytes = maximum_shard_bytes(output);
-            let local_conversion = matches!(&operation.kind, MidOperationKind::Convert(plan)
-                if plan.strategy == crate::ConversionStrategy::LocalKernel);
+            let local_conversion = *policy == crate::CopyPolicy::LocalKernel;
             let same_ownership = local_conversion
                 || (crate::mid::implementation::same_distribution(input, output)
                     && values[operation.inputs[0].index() as usize].tile_offset
@@ -520,10 +520,10 @@ pub(crate) fn operation_cost(
             if !same_ownership
                 || matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::Copy {
+                    MidOperationKind::Copy {
                         mapping: crate::CoordinateMapping { view: Some(_), .. },
                         ..
-                    })
+                    }
                 )
             {
                 let destinations = u64::from(output.format.layout.tiling.tile_count);
@@ -534,7 +534,7 @@ pub(crate) fn operation_cost(
                     .min(maximum_shard_bytes(input));
                 let payload = bytes.max(sends);
                 let identity = !matches!(&operation.kind,
-                    MidOperationKind::Primitive(Primitive::Copy { mapping, .. })
+                    MidOperationKind::Copy { mapping, .. }
                     if !mapping.is_identity());
                 let fragments = identity
                     .then(|| super::movement::grid_fragments(input, output))
@@ -563,11 +563,6 @@ pub(crate) fn operation_cost(
                         row_major_pack_cycles(&out, elements)
                     },
                 );
-            }
-            if input.format.precision != output.format.precision {
-                price.total = price
-                    .exchange
-                    .saturating_add(Ipu21CostModel.cast_format_cycles(input, &output.format));
             }
         }
         MidOperationKind::Repeat(_) => unreachable!(),

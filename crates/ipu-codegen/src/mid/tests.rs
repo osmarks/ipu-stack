@@ -37,10 +37,9 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
         .with_automatic_input(gamma, Precision::F16)
         .with_automatic_input(beta, Precision::F16);
     let mid = lower(&graph, &config, &crate::Ipu21CostModel).unwrap();
-    let resolved = mid.clone();
-    assert!(resolved.operations.iter().any(|op| matches!(
+    assert!(mid.operations.iter().any(|op| matches!(
         op.kind,
-        MidOperationKind::Primitive(Primitive::Compute {
+        MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::LayerNormApply { .. },
             ..
         })
@@ -629,16 +628,19 @@ fn assert_conversions_are_explicit(lowered: &MidProgram, operations: &[MidOperat
         };
         let before = &value(lowered, *input).tensor_type;
         let after = &value(lowered, *result).tensor_type;
-        if let MidOperationKind::Convert(plan) = &operation.kind {
-            assert_eq!(plan.input.format, before.format);
-            assert_eq!(plan.output.format, after.format);
-            assert_eq!(before.shape, after.shape);
-            if before.format.precision != after.format.precision {
-                assert_eq!(before.format.layout, after.format.layout);
-                assert_eq!(plan.strategy, ConversionStrategy::LocalKernel);
-            } else {
-                assert_ne!(before.format.layout, after.format.layout);
+        match &operation.kind {
+            MidOperationKind::Compute(Compute::Kernel {
+                kernel: TileKernelSpec::Cast { from, to },
+                ..
+            }) => {
+                assert_eq!(before.format.precision, *from);
+                assert_eq!(after.format.precision, *to);
+                assert_eq!(before.shape, after.shape);
             }
+            MidOperationKind::Copy { .. } => {
+                assert_eq!(before.format.precision, after.format.precision)
+            }
+            _ => {}
         }
     }
 }
@@ -649,7 +651,7 @@ fn assert_operator_signature(
     inputs: &[TensorFormat],
     output: TensorFormat,
 ) {
-    let MidOperationKind::Primitive(Primitive::Compute { operands, .. }) = &operation.kind else {
+    let MidOperationKind::Compute(Compute::Kernel { operands, .. }) = &operation.kind else {
         panic!("expected compute")
     };
     assert_eq!(operands.len(), inputs.len());
@@ -691,7 +693,7 @@ impl CostModel for ColumnParityCost {
         &self,
         _shape: &TensorShape,
         _precision: Precision,
-        _strategy: ConversionStrategy,
+        _strategy: CopyPolicy,
         _from: &Layout,
         _to: &Layout,
     ) -> crate::estimate::RearrangementCost {
@@ -825,14 +827,14 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::Compute {
+                    MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Gemm { .. },
                         ..
                     })
                 )
             })
             .unwrap();
-        let MidOperationKind::Primitive(Primitive::Compute {
+        let MidOperationKind::Compute(Compute::Kernel {
             kernel:
                 TileKernelSpec::Gemm {
                     multiply: selected_multiply,
@@ -927,7 +929,7 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             .operations
             .iter()
             .filter_map(|operation| match operation.kind {
-                MidOperationKind::Primitive(Primitive::Compute {
+                MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gemm { multiply, .. },
                     ..
                 }) => Some(multiply),
@@ -1042,7 +1044,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .filter(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::Compute {
+                    MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Gelu | TileKernelSpec::Add,
                         ..
                     })
@@ -1056,7 +1058,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::Compute {
+                    MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Gelu,
                         ..
                     })
@@ -1069,7 +1071,7 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::Compute {
+                    MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Add,
                         ..
                     })
@@ -1078,15 +1080,15 @@ fn randomized_non_gemm_lowering_honors_operator_plans() {
             .expect("random graph retains its add");
         assert_operator_signature(&lowered, gelu, &[gelu_input], gelu_output.clone());
         assert!(
-            matches!(&gelu.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) if !output_aliases.is_empty())
+            matches!(&gelu.kind, MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) if !output_aliases.is_empty())
         );
         assert_operator_signature(&lowered, add, &[add_left, add_right], add_output);
         assert!(
-            matches!(&add.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) if !output_aliases.is_empty())
+            matches!(&add.kind, MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) if !output_aliases.is_empty())
         );
         assert!(lowered.operations.iter().any(|op| matches!(
             op.kind,
-            MidOperationKind::Primitive(Primitive::Compute {
+            MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::FlashAttention { .. }
                     | TileKernelSpec::AttentionSoftmax { .. },
                 ..
@@ -1219,7 +1221,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
             .find(|op| {
                 matches!(
                     op.kind,
-                    MidOperationKind::Primitive(Primitive::Compute {
+                    MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::AttentionSoftmax { .. },
                         ..
                     })
@@ -1228,14 +1230,14 @@ fn randomized_single_use_views_compose_into_panel_copies() {
             .unwrap();
         assert!(compact.operations.iter().any(|op| matches!(
             op.kind,
-            MidOperationKind::Primitive(Primitive::Copy {
+            MidOperationKind::Copy {
                 mapping: CoordinateMapping { view: Some(_), .. },
                 ..
-            })
+            }
         )));
         assert!(compact.operations.iter().any(|op| matches!(
             op.kind,
-            MidOperationKind::Primitive(Primitive::Compute {
+            MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::AttentionSoftmax { .. },
                 ..
             })
@@ -1243,7 +1245,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
         for op in &compact.operations {
             if matches!(
                 op.kind,
-                MidOperationKind::Primitive(Primitive::Compute {
+                MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gemm { .. } | TileKernelSpec::AttentionSoftmax { .. },
                     ..
                 })
@@ -1296,7 +1298,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
                     .operations
                     .iter()
                     .filter(|op| op.source == consumer.source
-                        && matches!(op.kind, MidOperationKind::Primitive(Primitive::Copy { .. })))
+                        && matches!(op.kind, MidOperationKind::Copy { .. }))
                     .count(),
             "random case {case}: {attention_phases} attention exchange phases"
         );
@@ -1325,10 +1327,8 @@ fn randomized_observed_views_retain_materialization_and_cost() {
             .operations
             .iter()
             .find(|operation| {
-                matches!(
-                    operation.kind,
-                    MidOperationKind::Primitive(Primitive::Copy { .. })
-                ) && operation.results.contains(&lowered.outputs[0])
+                matches!(operation.kind, MidOperationKind::Copy { .. })
+                    && operation.results.contains(&lowered.outputs[0])
             })
             .unwrap();
         assert!(
@@ -1518,7 +1518,7 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .find(|op| {
             matches!(
                 op.kind,
-                MidOperationKind::Primitive(Primitive::Compute {
+                MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gemm {
                         inner_block: 128,
                         ..
@@ -2327,14 +2327,17 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         defined.extend(&op.results);
     }
     assert_eq!(resolved.operations.len(), 2);
-    assert_eq!(
-        resolved.operations[0]
-            .conversion_plan()
-            .unwrap()
-            .output
-            .materialization,
-        OperandMaterialization::Complete
-    );
+    assert!(matches!(
+        resolved.operations[0].kind,
+        MidOperationKind::Copy { .. }
+    ));
+    assert!(matches!(
+        resolved.operations[1].kind,
+        MidOperationKind::Compute(Compute::Kernel {
+            kernel: TileKernelSpec::Cast { .. },
+            ..
+        })
+    ));
     let low = crate::lower_to_tiles(&crate::expand_tiles(&resolved).unwrap(), false);
     let written = low
         .exchange_phases
@@ -2407,7 +2410,7 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
     fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
         for op in ops {
             match &op.kind {
-                MidOperationKind::Primitive(Primitive::Compute {
+                MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gemm { multiply, .. },
                     ..
                 }) => {

@@ -58,7 +58,7 @@ fn fuse_fp8_outputs_at(
             continue;
         }
         let producer = &operations[previous];
-        let MidOperationKind::Primitive(Primitive::Compute {
+        let MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands,
             product: None,
@@ -174,7 +174,7 @@ fn fuse_fp8_outputs_at(
             value.storage_group = value.id;
             let mut fused = producer.clone();
             fused.results = vec![value.id];
-            fused.kind = MidOperationKind::Primitive(Primitive::Compute {
+            fused.kind = MidOperationKind::Compute(Compute::Kernel {
                 kernel: kernel.clone(),
                 operands: operands.clone(),
                 product: None,
@@ -182,11 +182,11 @@ fn fuse_fp8_outputs_at(
             });
             let copy = MidOperation {
                 inputs: vec![value.id],
-                kind: MidOperationKind::Convert(ConversionPlan {
-                    input: OperandRequirement::new(value.tensor_type.format.clone()),
-                    output: OperandRequirement::new(output.tensor_type.format.clone()),
-                    strategy: ConversionStrategy::DirectRetile,
-                }),
+                kind: MidOperationKind::Copy {
+                    mapping: CoordinateMapping::default(),
+                    reuse_local: false,
+                    policy: CopyPolicy::DirectRetile,
+                },
                 results: cast.results.clone(),
                 ..*cast
             };
@@ -214,7 +214,7 @@ fn fuse_fp8_outputs_at(
         if redistributed {
             replacement.inputs = cast.inputs.clone();
         }
-        replacement.kind = MidOperationKind::Primitive(Primitive::Compute {
+        replacement.kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: kernel.clone(),
             operands: operands.clone(),
             product: None,
@@ -269,11 +269,11 @@ fn fuse_fp8_outputs_at(
                     source: producer.source,
                     inputs: vec![parameter],
                     results: vec![value.id],
-                    kind: MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(old.tensor_type.format.clone()),
-                        output: OperandRequirement::new(value.tensor_type.format.clone()),
-                        strategy: ConversionStrategy::DirectRetile,
-                    }),
+                    kind: MidOperationKind::Copy {
+                        mapping: CoordinateMapping::default(),
+                        reuse_local: false,
+                        policy: CopyPolicy::DirectRetile,
+                    },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 });

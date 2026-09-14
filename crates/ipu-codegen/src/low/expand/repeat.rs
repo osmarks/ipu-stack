@@ -109,9 +109,7 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
-    if let MidOperationKind::Primitive(crate::Primitive::Compute { output_aliases, .. }) =
-        &operation.kind
-    {
+    if let MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) = &operation.kind {
         return output_aliases.iter().any(|&(output, input)| {
             operation.results[output] == value
                 && value_can_alias(operation.inputs[input], target, operations)
@@ -143,13 +141,13 @@ fn repeat_yield_can_alias(
             return false;
         }
         match &operation.kind {
-            MidOperationKind::Primitive(crate::Primitive::Copy {
+            MidOperationKind::Copy {
                 reuse_local: true, ..
-            }) if operation.inputs.iter().any(|input| aliases.contains(input)) => {
+            } if operation.inputs.iter().any(|input| aliases.contains(input)) => {
                 // Internal copies may become local views during expansion.
                 aliases.extend(operation.results.iter().copied());
             }
-            MidOperationKind::Primitive(crate::Primitive::Compute { output_aliases, .. }) => {
+            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
                 for &(output, input) in output_aliases {
                     if aliases.contains(&operation.inputs[input]) {
                         aliases.insert(operation.results[output]);
@@ -165,7 +163,7 @@ fn repeat_yield_can_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CoordinateMapping, OperandWindow, Primitive};
+    use crate::{Compute, CoordinateMapping, OperandWindow};
 
     #[test]
     fn carried_storage_remains_live_through_reused_copy_inputs() {
@@ -174,22 +172,25 @@ mod tests {
             source: None,
             inputs: vec![id(input)],
             results: vec![id(output)],
-            kind: MidOperationKind::Primitive(kind),
+            kind: kind,
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         };
-        let gelu = || Primitive::Compute {
-            kernel: TileKernelSpec::Gelu,
-            operands: vec![OperandWindow::default()],
-            product: None,
-            output_aliases: vec![],
+        let gelu = || {
+            MidOperationKind::Compute(Compute::Kernel {
+                kernel: TileKernelSpec::Gelu,
+                operands: vec![OperandWindow::default()],
+                product: None,
+                output_aliases: vec![],
+            })
         };
         for reuse_local in [false, true] {
             let operations = vec![
                 op(
                     0,
                     2,
-                    Primitive::Copy {
+                    MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local,
                     },

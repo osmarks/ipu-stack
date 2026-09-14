@@ -418,38 +418,6 @@ pub struct OperatorPlan {
     pub requirements: StorageRequirements,
 }
 
-/// Address-independent recipe for materializing a format conversion.
-///
-/// Layouts determine the logical shard regions and relative physical spans;
-/// final tile identities and SRAM addresses remain a low-level concern.  The
-/// same recipe is consumed by the cost model and by tile-program lowering so
-/// planning cannot silently price a different conversion from the one emitted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ConversionStrategy {
-    /// Run one tile-local kernel over corresponding resident shards.
-    LocalKernel,
-    /// Exchange logical intersections directly into the destination layout.
-    DirectRetile,
-    /// Exchange logical values into row-major staging, then transform locally
-    /// into the destination element order.
-    StageLogicalThenTransform,
-}
-
-pub fn layout_conversion_strategy(from: &Layout, to: &Layout) -> ConversionStrategy {
-    if from.order == to.order {
-        ConversionStrategy::DirectRetile
-    } else {
-        ConversionStrategy::StageLogicalThenTransform
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ConversionPlan {
-    pub input: OperandRequirement,
-    pub output: OperandRequirement,
-    pub strategy: ConversionStrategy,
-}
-
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Hash)]
 pub enum OperatorPlanError {
     #[error("operator plan operand arity does not match its requirements")]

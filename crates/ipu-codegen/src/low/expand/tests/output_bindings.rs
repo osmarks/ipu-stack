@@ -1,7 +1,7 @@
 use super::*;
+use crate::mid::Compute;
 use crate::{
-    ConversionPlan, CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandRequirement,
-    OperandWindow, Primitive, TensorAxis, ValueId,
+    CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandWindow, TensorAxis, ValueId,
 };
 
 fn copied_columns(columns: u32) -> MidProgram {
@@ -36,10 +36,11 @@ fn copied_columns(columns: u32) -> MidProgram {
             source: None,
             inputs: vec![MidValueId::from_index(0)],
             results: vec![MidValueId::from_index(1)],
-            kind: MidOperationKind::Primitive(Primitive::Copy {
+            kind: MidOperationKind::Copy {
+                policy: crate::CopyPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
-            }),
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         }],
@@ -171,11 +172,11 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
             source: None,
             inputs: vec![mid.values[1].id],
             results: vec![value.id],
-            kind: MidOperationKind::Convert(ConversionPlan {
-                input: OperandRequirement::new(mid.values[1].tensor_type.format.clone()),
-                output: OperandRequirement::new(value.tensor_type.format.clone()),
-                strategy: ConversionStrategy::DirectRetile,
-            }),
+            kind: MidOperationKind::Copy {
+                mapping: CoordinateMapping::default(),
+                reuse_local: false,
+                policy: CopyPolicy::DirectRetile,
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         });
@@ -229,8 +230,7 @@ fn shifted_halfword_crops_pack_before_physical_exchange() {
         value.tensor_type.format.precision = Precision::F16;
     }
     mid.values[1].tensor_type.format.layout = Layout::row_sharded(2);
-    let MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) = &mut mid.operations[0].kind
-    else {
+    let MidOperationKind::Copy { mapping, .. } = &mut mid.operations[0].kind else {
         unreachable!()
     };
     mapping.offsets = vec![0, 1];
@@ -266,7 +266,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         source: None,
         inputs: vec![mid.values[0].id, mid.values[1].id],
         results: vec![result.id],
-        kind: MidOperationKind::Primitive(Primitive::Compute {
+        kind: MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
             operands: vec![OperandWindow::default(); 2],
             product: None,
@@ -319,19 +319,19 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             source: None,
             inputs: vec![mid.values[1].id],
             results: vec![result.id],
-            kind: MidOperationKind::Primitive(if sum {
-                Primitive::Sum {
+            kind: if sum {
+                MidOperationKind::Compute(Compute::Sum {
                     axis: 0,
                     staging: crate::ReductionStaging::Complete,
-                }
+                })
             } else {
-                Primitive::Compute {
+                MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gelu,
                     operands: vec![OperandWindow::default()],
                     product: None,
                     output_aliases: vec![(0, 0)],
-                }
-            }),
+                })
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         });

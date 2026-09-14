@@ -1,6 +1,6 @@
 //! Opt-in explanations of the planner's existing memory estimate.
 use super::*;
-use crate::{ComputeGraph, MidOperationKind, PipelineConfig, Primitive};
+use crate::{Compute, ComputeGraph, MidOperationKind, PipelineConfig};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -97,9 +97,9 @@ impl mid::MemoryObserver for Timeline {
         tile_scratch: &[MemoryUsage],
     ) {
         let description = match &operation.kind {
-            MidOperationKind::Primitive(Primitive::Compute { kernel, .. }) => format!("{kernel:?}"),
-            MidOperationKind::Primitive(primitive) => format!("{primitive:?}"),
-            MidOperationKind::Convert(plan) => format!("Convert {:?}", plan.strategy),
+            MidOperationKind::Compute(Compute::Kernel { kernel, .. }) => format!("{kernel:?}"),
+            MidOperationKind::Copy { policy, .. } => format!("Copy {policy:?}"),
+            MidOperationKind::Compute(compute) => format!("{compute:?}"),
             MidOperationKind::Repeat(repeat) => format!("Repeat {} boundary", repeat.count),
         };
         let mut roots = BTreeMap::new();

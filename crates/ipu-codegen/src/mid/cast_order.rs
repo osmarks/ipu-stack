@@ -146,7 +146,7 @@ fn reorder_region(
                 source: cast.source,
                 inputs: vec![input],
                 results: vec![id],
-                kind: MidOperationKind::Primitive(Primitive::Compute {
+                kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Cast {
                         from: Precision::F16,
                         to: values[id.index() as usize].tensor_type.format.precision,
@@ -164,10 +164,11 @@ fn reorder_region(
         });
         let mut copy = cast.clone();
         copy.inputs = vec![id];
-        copy.kind = MidOperationKind::Primitive(Primitive::Copy {
+        copy.kind = MidOperationKind::Copy {
+            policy: crate::CopyPolicy::Automatic,
             mapping: CoordinateMapping::default(),
             reuse_local: false,
-        });
+        };
         copy.estimated_cycles = 0;
         copy.estimated_exchange_cycles = 0;
         before.entry(index).or_default().push(copy);
@@ -179,7 +180,7 @@ fn reorder_region(
 
 fn may_write_existing_storage(op: &MidOperation) -> bool {
     match &op.kind {
-        MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) => {
+        MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
             !output_aliases.is_empty()
         }
         MidOperationKind::Repeat(_) => true,
@@ -243,7 +244,7 @@ mod tests {
                 source: None,
                 inputs: vec![source],
                 results: vec![alias.id],
-                kind: MidOperationKind::Primitive(Primitive::Compute {
+                kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gelu,
                     operands: vec![OperandWindow::default()],
                     product: None,
@@ -309,10 +310,11 @@ mod tests {
                 source: None,
                 inputs: vec![original.id],
                 results: vec![source],
-                kind: MidOperationKind::Primitive(Primitive::Copy {
+                kind: MidOperationKind::Copy {
+                    policy: crate::CopyPolicy::Automatic,
                     mapping: CoordinateMapping::default(),
                     reuse_local: false,
-                }),
+                },
                 estimated_cycles: 0,
                 estimated_exchange_cycles: 0,
             },

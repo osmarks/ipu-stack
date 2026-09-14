@@ -1,6 +1,147 @@
-//! Compose consecutive materializations before tile expansion.
+//! Coordinate-copy semantics and composition before tile expansion.
 
 use super::*;
+
+/// Map output coordinates back to the source: first add the window offsets,
+/// then apply the optional factor-axis view. Layout/storage order is separate.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoordinateMapping {
+    pub offsets: Vec<u32>,
+    pub view: Option<AxisFactorView>,
+}
+
+impl From<AxisFactorView> for CoordinateMapping {
+    fn from(view: AxisFactorView) -> Self {
+        Self {
+            offsets: Vec::new(),
+            view: Some(view),
+        }
+    }
+}
+
+impl CoordinateMapping {
+    /// Omitted offsets and explicit zero offsets preserve the same coordinates.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.view.is_none() && self.offsets.iter().all(|&offset| offset == 0)
+    }
+
+    /// Compose output -> intermediate -> source without materializing the
+    /// intermediate. Return None when the result needs more than one factor
+    /// view, or when an intermediate supplies logical zero padding.
+    pub(crate) fn compose(
+        &self,
+        next: &Self,
+        source: &TensorShape,
+        intermediate: &TensorShape,
+        output: &TensorShape,
+    ) -> Option<Self> {
+        fn fits(
+            mapping: &CoordinateMapping,
+            source: &TensorShape,
+            output: &TensorShape,
+        ) -> Option<()> {
+            let shape = mapping
+                .view
+                .map_or_else(|| Some(source.clone()), |v| v.output_shape(source))?;
+            if shape.0.len() != output.0.len() || mapping.offsets.len() > shape.0.len() {
+                return None;
+            }
+            output
+                .0
+                .iter()
+                .zip(&shape.0)
+                .enumerate()
+                .all(|(axis, (&size, &bound))| {
+                    mapping
+                        .offsets
+                        .get(axis)
+                        .copied()
+                        .unwrap_or(0)
+                        .checked_add(size)
+                        .is_some_and(|end| end <= bound)
+                })
+                .then_some(())
+        }
+        // Inverse factor moves can still absorb a following window. Combining
+        // them with another view needs digit-order-aware composition.
+        if next.view.is_some_and(|v| v.reversed)
+            || (self.view.is_some_and(|v| v.reversed) && next.view.is_some())
+        {
+            return None;
+        }
+        fits(self, source, intermediate)?;
+        let next_shape = next.view.map_or_else(
+            || Some(intermediate.clone()),
+            |v| v.output_shape(intermediate),
+        )?;
+        if output.0.len() != next_shape.0.len()
+            || next.offsets.len() > output.0.len()
+            || output.0.iter().enumerate().any(|(axis, &size)| {
+                next.offsets
+                    .get(axis)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(size)
+                    .is_none()
+            })
+        {
+            return None;
+        }
+        if fits(next, intermediate, output).is_none() {
+            // The last copy may add padding if the removed copy did not crop
+            // the source. Otherwise bypassing it could expose cropped values.
+            let full = self
+                .view
+                .map_or_else(|| Some(source.clone()), |v| v.output_shape(source))?;
+            if intermediate != &full
+                || self.offsets.iter().any(|&offset| offset != 0)
+                || output.0.len() != intermediate.0.len()
+                || next.offsets.len() > output.0.len()
+            {
+                return None;
+            }
+        }
+        let mut offsets = vec![0u32; output.0.len()];
+        for (axis, offset) in offsets.iter_mut().enumerate() {
+            *offset = self.offsets.get(axis).copied().unwrap_or(0);
+        }
+        let view = match (self.view, next.view) {
+            (view, None) => view,
+            (None, Some(view)) => {
+                // A window before a view must retain the view's factor width.
+                if source.0[view.split_axis] != intermediate.0[view.split_axis] {
+                    return None;
+                }
+                offsets[view.merge_axis] = offsets[view.merge_axis].checked_mul(view.factor)?;
+                Some(view)
+            }
+            (Some(first), Some(second)) => {
+                if first.split_axis != second.split_axis
+                    || first.merge_axis != second.merge_axis
+                    || offsets[first.split_axis] != 0
+                    || offsets[first.merge_axis] != 0
+                    || first.output_shape(source)?.0[first.split_axis]
+                        != intermediate.0[first.split_axis]
+                {
+                    return None;
+                }
+                Some(AxisFactorView::new(
+                    first.split_axis,
+                    first.merge_axis,
+                    first.factor.checked_mul(second.factor)?,
+                ))
+            }
+        };
+        for (axis, offset) in offsets.iter_mut().enumerate() {
+            *offset = offset.checked_add(next.offsets.get(axis).copied().unwrap_or(0))?;
+        }
+        while offsets.last() == Some(&0) {
+            offsets.pop();
+        }
+        let result = Self { offsets, view };
+        Some(result)
+    }
+}
 
 impl MidProgram {
     pub(crate) fn compose_copies(&mut self) {
@@ -16,7 +157,7 @@ pub(crate) fn independent_copy_prefix(
     storage_groups: &[MidValueId],
 ) -> usize {
     independent_prefix(operations, checkpoints, storage_groups, |kind| {
-        matches!(kind, MidOperationKind::Primitive(Primitive::Copy { .. }))
+        matches!(kind, MidOperationKind::Copy { .. })
     })
 }
 
@@ -26,7 +167,7 @@ pub(crate) fn independent_sum_prefix(
     storage_groups: &[MidValueId],
 ) -> usize {
     independent_prefix(operations, checkpoints, storage_groups, |kind| {
-        matches!(kind, MidOperationKind::Primitive(Primitive::Sum { .. }))
+        matches!(kind, MidOperationKind::Compute(Compute::Sum { .. }))
     })
 }
 
@@ -63,13 +204,13 @@ fn independent_prefix(
         .count()
 }
 
-fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool)> {
+fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool, CopyPolicy)> {
     match &operation.kind {
-        MidOperationKind::Primitive(Primitive::Copy {
+        MidOperationKind::Copy {
             mapping,
             reuse_local,
-        }) => Some((mapping.clone(), *reuse_local)),
-        MidOperationKind::Convert(_) => Some((CoordinateMapping::default(), false)),
+            policy,
+        } if *policy != CopyPolicy::LocalKernel => Some((mapping.clone(), *reuse_local, *policy)),
         _ => None,
     }
 }
@@ -103,7 +244,7 @@ pub(super) fn compose(
     let mut producers = BTreeMap::<MidValueId, usize>::new();
     let mut removed = BTreeSet::new();
     for index in 0..operations.len() {
-        let Some((mut next, mut reuse_local)) = mapping(&operations[index]) else {
+        let Some((mut next, mut reuse_local, mut policy)) = mapping(&operations[index]) else {
             // In-place compute and loop-carried storage can overwrite an
             // earlier source. Do not move a materialization across them.
             producers.clear();
@@ -121,12 +262,12 @@ pub(super) fn compose(
             let Some(&producer) = producers.get(&input) else {
                 break;
             };
-            let (previous, previous_reuse) = mapping(&operations[producer]).unwrap();
+            let (previous, previous_reuse, previous_policy) =
+                mapping(&operations[producer]).unwrap();
             let source = operations[producer].inputs[0];
             let intermediate = &values[input.index() as usize].tensor_type;
             let destination = &values[output.index() as usize].tensor_type;
-            // Byte movement cannot itself convert element widths. Round trips
-            // may disappear, but a remaining precision change needs its Convert.
+            // Copy composition never crosses arithmetic, including casts.
             if values[source.index() as usize].tensor_type.format.precision
                 != destination.format.precision
             {
@@ -153,6 +294,27 @@ pub(super) fn compose(
             ) else {
                 break;
             };
+            // Retiling before/after a logical transformation can use the final
+            // owners directly: it does not require a distinct staging tensor.
+            // Keep the logical traversal request on the composed copy. A direct
+            // physical traversal is provable here only with unchanged element
+            // order and no factor-axis mapping; otherwise keep the boundary.
+            let merged_policy = match (previous_policy, policy) {
+                (CopyPolicy::StageLogicalThenTransform, _)
+                | (_, CopyPolicy::StageLogicalThenTransform) => {
+                    CopyPolicy::StageLogicalThenTransform
+                }
+                (CopyPolicy::Automatic, p) | (p, CopyPolicy::Automatic) => p,
+                (a, b) if a == b => a,
+                _ => break,
+            };
+            if merged_policy == CopyPolicy::DirectRetile
+                && (composed.view.is_some()
+                    || source_format.layout.order != destination.format.layout.order)
+            {
+                break;
+            }
+            policy = merged_policy;
             next = composed;
             reuse_local &= previous_reuse;
             input = source;
@@ -160,10 +322,11 @@ pub(super) fn compose(
         }
         if input != operations[index].inputs[0] {
             operations[index].inputs[0] = input;
-            operations[index].kind = MidOperationKind::Primitive(Primitive::Copy {
+            operations[index].kind = MidOperationKind::Copy {
+                policy,
                 mapping: next,
                 reuse_local,
-            });
+            };
             operations[index].estimated_cycles = 0;
             operations[index].estimated_exchange_cycles = 0;
         }
@@ -286,10 +449,11 @@ mod tests {
                 source: None,
                 inputs: vec![MidValueId(index - 1)],
                 results: vec![MidValueId(index)],
-                kind: MidOperationKind::Primitive(Primitive::Copy {
+                kind: MidOperationKind::Copy {
+                    policy: crate::CopyPolicy::Automatic,
                     mapping: CoordinateMapping::default(),
                     reuse_local: true,
-                }),
+                },
                 estimated_cycles: 0,
                 estimated_exchange_cycles: 0,
             })
@@ -298,12 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn copy_chains_drop_temporaries_and_intermediate_rounding() {
+    fn copy_chains_drop_temporaries_idempotently() {
         let (mut operations, mut values) = chain();
         for value in &mut values {
             value.tensor_type.format.precision = Precision::F32;
         }
-        values[1].tensor_type.format.precision = Precision::F16;
         compose(&mut operations, &values, &[MidValueId(3)]);
         assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].inputs, [MidValueId(0)]);
@@ -314,13 +477,61 @@ mod tests {
     }
 
     #[test]
-    fn composition_keeps_required_precision_changes_and_cropped_zeros() {
+    fn copy_composition_stops_at_numeric_casts() {
         let (mut operations, mut values) = chain();
         values[0].tensor_type.format.precision = Precision::F32;
+        operations[0].kind =
+            MidOperationKind::Compute(Compute::cast(Precision::F32, Precision::F16));
+        let cast = operations[0].clone();
         compose(&mut operations, &values, &[MidValueId(3)]);
         assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0], cast);
         assert_eq!(operations[1].inputs, [MidValueId(1)]);
+    }
 
+    #[test]
+    fn copy_composition_preserves_requested_realizations() {
+        for first in [
+            CopyPolicy::Automatic,
+            CopyPolicy::LocalKernel,
+            CopyPolicy::DirectRetile,
+            CopyPolicy::StageLogicalThenTransform,
+        ] {
+            for second in [
+                CopyPolicy::Automatic,
+                CopyPolicy::LocalKernel,
+                CopyPolicy::DirectRetile,
+                CopyPolicy::StageLogicalThenTransform,
+            ] {
+                let (mut operations, values) = chain();
+                operations.truncate(2);
+                for (op, choice) in operations.iter_mut().zip([first, second]) {
+                    if let MidOperationKind::Copy { policy, .. } = &mut op.kind {
+                        *policy = choice;
+                    }
+                }
+                compose(&mut operations, &values, &[MidValueId(2)]);
+                let compatible =
+                    first != CopyPolicy::LocalKernel && second != CopyPolicy::LocalKernel;
+                assert_eq!(operations.len(), if compatible { 1 } else { 2 });
+                if compatible {
+                    let expected =
+                        if [first, second].contains(&CopyPolicy::StageLogicalThenTransform) {
+                            CopyPolicy::StageLogicalThenTransform
+                        } else if second == CopyPolicy::Automatic {
+                            first
+                        } else {
+                            second
+                        };
+                    assert!(matches!(operations[0].kind,
+                        MidOperationKind::Copy { policy, .. } if policy == expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composition_preserves_cropped_zeros() {
         let identity = CoordinateMapping::default();
         let view = CoordinateMapping::from(AxisFactorView::new(2, 0, 3));
         let source = TensorShape(vec![1, 2, 12]);

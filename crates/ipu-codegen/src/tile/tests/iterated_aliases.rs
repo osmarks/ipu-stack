@@ -1,4 +1,5 @@
 use super::*;
+use crate::mid::Compute;
 use crate::*;
 
 fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
@@ -64,7 +65,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
                         results: vec![id(5)],
                         estimated_cycles: 0,
                         estimated_exchange_cycles: 0,
-                        kind: MidOperationKind::Primitive(Primitive::Sum {
+                        kind: MidOperationKind::Compute(Compute::Sum {
                             axis: 0,
                             staging: ReductionStaging::Complete,
                         }),

@@ -19,9 +19,12 @@ fragments: `Operator`, nested implementations, deferred offers/claims and the
 resolution pass are removed. Parameter-home changes insert their own required
 copies, and a binding validator checks constructed/rewritten mid programs.
 The family-fragment cache is also separate from costing: selection and insertion
-share it explicitly, and `CostModel::implementation` is removed. `Convert`, the
-primitive wrapper, planner module ownership and the other boundaries below
-remain to be refactored. The diagnoses below describe the
+share it explicitly, and `CostModel::implementation` is removed. Mid now has
+only Copy, Compute and Repeat: numerical casts and sums are Compute, the
+primitive wrapper and `ConversionPlan` are removed, and identity and mapped
+copies enter one low movement owner with an explicit copy policy. Composition
+retains incompatible policy boundaries. Explicit Product/indexing, planner
+module ownership and the other boundaries below remain to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.
 

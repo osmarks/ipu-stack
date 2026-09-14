@@ -136,10 +136,10 @@ impl Builder {
                 Some(self.emit(
                     vec![products],
                     output.clone(),
-                    Primitive::Sum {
+                    MidOperationKind::Compute(Compute::Sum {
                         axis: 0,
                         staging: reduction_staging,
-                    },
+                    }),
                 ))
             }
             GemmDistribution::OutputStationary => {
@@ -376,10 +376,10 @@ impl Builder {
             let sum = self.emit(
                 vec![result],
                 reduced,
-                Primitive::Sum {
+                MidOperationKind::Compute(Compute::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
-                },
+                }),
             );
             Some(self.copy(sum, output.clone(), vec![]))
         } else {

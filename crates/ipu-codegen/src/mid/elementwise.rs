@@ -39,7 +39,7 @@ fn fuse_region(
     let mut removed = BTreeSet::new();
     for index in 0..operations.len() {
         let current = &operations[index];
-        let MidOperationKind::Primitive(Primitive::Compute {
+        let MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands,
             product: None,
@@ -66,7 +66,7 @@ fn fuse_region(
             continue;
         }
         let add = &operations[previous];
-        let MidOperationKind::Primitive(Primitive::Compute {
+        let MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
             operands: add_operands,
             product: None,
@@ -108,12 +108,7 @@ fn fuse_region(
             values[input.index() as usize].storage_group,
         ];
         if operations[previous + 1..index].iter().any(|step| {
-            !(matches!(
-                step.kind,
-                MidOperationKind::Primitive(Primitive::Copy { .. })
-            ) || step
-                .conversion_plan()
-                .is_some_and(|plan| plan.input.format.precision == plan.output.format.precision))
+            !matches!(step.kind, MidOperationKind::Copy { .. })
                 || step
                     .results
                     .iter()
@@ -152,7 +147,7 @@ fn fuse_region(
         let arity = inputs.len();
         let mut replacement = current.clone();
         replacement.inputs = inputs;
-        replacement.kind = MidOperationKind::Primitive(Primitive::Compute {
+        replacement.kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: fused.clone(),
             operands: vec![OperandWindow::default(); arity],
             product: None,
@@ -255,7 +250,7 @@ mod tests {
                 operation(
                     0,
                     1,
-                    MidOperationKind::Primitive(Primitive::Compute {
+                    MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Gelu,
                         operands: vec![OperandWindow::default()],
                         product: None,
@@ -265,20 +260,19 @@ mod tests {
                 operation(
                     1,
                     2,
-                    MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(source.format),
-                        output: OperandRequirement::new(retiled.format.clone()),
-                        strategy: ConversionStrategy::DirectRetile,
-                    }),
+                    MidOperationKind::Copy {
+                        mapping: CoordinateMapping::default(),
+                        reuse_local: false,
+                        policy: CopyPolicy::DirectRetile,
+                    },
                 ),
                 operation(
                     2,
                     3,
-                    MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(retiled.format),
-                        output: OperandRequirement::new(packed.format),
-                        strategy: ConversionStrategy::LocalKernel,
-                    }),
+                    MidOperationKind::Compute(Compute::cast(
+                        retiled.format.precision,
+                        packed.format.precision,
+                    )),
                 ),
             ],
             outputs: vec![MidValueId(3)],
@@ -292,7 +286,7 @@ mod tests {
         assert_eq!(fused.operations[1].inputs, [MidValueId(2)]);
         assert!(matches!(
             fused.operations[1].kind,
-            MidOperationKind::Primitive(Primitive::Compute {
+            MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::Gelu,
                 ..
             })
@@ -344,7 +338,7 @@ mod tests {
             });
             norm.operations[0].inputs.push(id);
         }
-        norm.operations[0].kind = MidOperationKind::Primitive(Primitive::Compute {
+        norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::LayerNorm,
             operands: vec![OperandWindow::default(); 3],
             product: None,
@@ -358,7 +352,7 @@ mod tests {
         assert_eq!(last.inputs.len(), 3);
         assert!(matches!(
             last.kind,
-            MidOperationKind::Primitive(Primitive::Compute {
+            MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::LayerNorm,
                 ..
             })
@@ -369,7 +363,7 @@ mod tests {
         }
         let mut bias = norm.clone();
         bias.operations[0].inputs.truncate(2);
-        bias.operations[0].kind = MidOperationKind::Primitive(Primitive::Compute {
+        bias.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::BiasGelu,
             operands: vec![OperandWindow::default(); 2],
             product: None,
@@ -427,7 +421,7 @@ mod tests {
                 let producer = MidOperation {
                     source: None,
                     results: vec![MidValueId(3)],
-                    kind: MidOperationKind::Primitive(Primitive::Compute {
+                    kind: MidOperationKind::Compute(Compute::Kernel {
                         kernel: if norm {
                             TileKernelSpec::LayerNorm
                         } else {
@@ -455,43 +449,30 @@ mod tests {
                         4,
                         Padding::Reject,
                     ));
-                let identity_format = identity.tensor_type.format.clone();
                 values.push(identity);
                 let copy = MidOperation {
                     source: None,
                     inputs: vec![MidValueId(3)],
                     results: vec![MidValueId(5)],
-                    kind: MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(source.format.clone()),
-                        output: OperandRequirement::new(identity_format.clone()),
-                        strategy: ConversionStrategy::DirectRetile,
-                    }),
+                    kind: MidOperationKind::Copy {
+                        mapping: CoordinateMapping::default(),
+                        reuse_local: false,
+                        policy: CopyPolicy::DirectRetile,
+                    },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
-                let mut cast = MidOperation {
+                let cast = MidOperation {
                     source: None,
                     inputs: vec![MidValueId(5)],
                     results: vec![MidValueId(4)],
-                    kind: MidOperationKind::Convert(ConversionPlan {
-                        input: OperandRequirement::new(identity_format),
-                        output: OperandRequirement::new(output.format),
-                        strategy: ConversionStrategy::LocalKernel,
-                    }),
+                    kind: MidOperationKind::Compute(Compute::cast(
+                        Precision::F16,
+                        output.format.precision,
+                    )),
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
-                if rows > 1 {
-                    cast.kind = MidOperationKind::Primitive(Primitive::Compute {
-                        kernel: TileKernelSpec::Cast {
-                            from: Precision::F16,
-                            to: Precision::F8F143 { scale_exponent: -4 },
-                        },
-                        operands: vec![OperandWindow::default()],
-                        product: None,
-                        output_aliases: Vec::new(),
-                    });
-                }
                 let mut program = MidProgram {
                     tile_count: 1,
                     inputs: (0..if norm { 3 } else { 1 })
@@ -603,7 +584,7 @@ mod tests {
                         // delaying the bias read can then increase the live peak.
                         let mut fresh = mid.clone();
                         for op in &mut fresh.operations {
-                            if let MidOperationKind::Primitive(Primitive::Compute {
+                            if let MidOperationKind::Compute(Compute::Kernel {
                                 kernel: TileKernelSpec::Gelu,
                                 output_aliases,
                                 ..

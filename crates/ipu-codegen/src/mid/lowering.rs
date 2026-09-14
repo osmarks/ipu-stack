@@ -221,11 +221,9 @@ pub(super) fn plan_fits_operator_memory(
 
 fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValueId> {
     (operation.inputs.as_slice() == [input]
-        && operation.conversion_plan().is_some_and(|plan| {
-            plan.strategy == ConversionStrategy::LocalKernel
-                && plan.input.format.precision != plan.output.format.precision
-                && plan.output.materialization == OperandMaterialization::Complete
-        }))
+        && matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel {
+            kernel: TileKernelSpec::Cast { .. }, operands, output_aliases, ..
+        }) if operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty()))
     .then(|| operation.results[0])
 }
 
@@ -283,7 +281,7 @@ pub(super) fn ensure_format(
                     .rearrangement_cost(
                         &input.shape,
                         from,
-                        layout_conversion_strategy(&input.format.layout, layout),
+                        default_copy_policy(&input.format.layout, layout),
                         &input.format.layout,
                         layout,
                     )
@@ -345,11 +343,7 @@ pub(super) fn ensure_format(
             continue;
         }
         let cast = input.format.precision != output.format.precision;
-        let strategy = if cast {
-            ConversionStrategy::LocalKernel
-        } else {
-            layout_conversion_strategy(&input.format.layout, &output.format.layout)
-        };
+        let policy = default_copy_policy(&input.format.layout, &output.format.layout);
         let cost = if cast {
             crate::estimate::RearrangementCost {
                 cycles: costs.cast_format_cycles(&input, &output.format),
@@ -359,7 +353,7 @@ pub(super) fn ensure_format(
             costs.rearrangement_cost(
                 &output.shape,
                 output.format.precision,
-                strategy,
+                policy,
                 &input.format.layout,
                 &output.format.layout,
             )
@@ -369,11 +363,18 @@ pub(super) fn ensure_format(
             source: Some(source),
             inputs: vec![value],
             results: vec![result],
-            kind: MidOperationKind::Convert(ConversionPlan {
-                input: OperandRequirement::new(input.format),
-                output: OperandRequirement::new(output.format),
-                strategy,
-            }),
+            kind: if cast {
+                MidOperationKind::Compute(Compute::cast(
+                    input.format.precision,
+                    output.format.precision,
+                ))
+            } else {
+                MidOperationKind::Copy {
+                    mapping: CoordinateMapping::default(),
+                    reuse_local: false,
+                    policy,
+                }
+            },
             estimated_cycles: cost.cycles,
             estimated_exchange_cycles: cost.exchange_cycles,
         });

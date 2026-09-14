@@ -187,7 +187,7 @@ fn known_fusion_cost(
     let op = MidOperation {
         source: None,
         results: vec![MidValueId::from_index(outputs[0] as u32)],
-        kind: MidOperationKind::Primitive(Primitive::Compute {
+        kind: MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands: vec![OperandWindow::default(); inputs.len()],
             product: None,

@@ -3,8 +3,8 @@
 
 use super::{
     LoweringError, LoweringResult, MidOperation, MidOperationKind, MidProgram, MidValueId,
-    OperandMaterialization, Primitive,
 };
+use crate::Compute;
 use std::collections::BTreeSet;
 
 impl MidProgram {
@@ -69,7 +69,7 @@ impl MidProgram {
             }
             let arity = (operation.inputs.len(), operation.results.len());
             let valid = match &operation.kind {
-                MidOperationKind::Primitive(Primitive::Copy { .. }) => {
+                MidOperationKind::Copy { .. } => {
                     arity == (1, 1)
                         && self.values[operation.inputs[0].index() as usize]
                             .tensor_type
@@ -80,7 +80,7 @@ impl MidProgram {
                                 .format
                                 .precision
                 }
-                MidOperationKind::Primitive(Primitive::Compute {
+                MidOperationKind::Compute(Compute::Kernel {
                     operands,
                     output_aliases,
                     ..
@@ -91,7 +91,7 @@ impl MidProgram {
                             .iter()
                             .all(|&(output, input)| output < arity.1 && input < arity.0)
                 }
-                MidOperationKind::Primitive(Primitive::Sum { axis, .. }) => {
+                MidOperationKind::Compute(Compute::Sum { axis, .. }) => {
                     arity == (1, 1)
                         && usize::from(*axis)
                             < self.values[operation.inputs[0].index() as usize]
@@ -99,18 +99,6 @@ impl MidProgram {
                                 .shape
                                 .0
                                 .len()
-                }
-                MidOperationKind::Convert(plan) => {
-                    arity == (1, 1)
-                        && plan.output.materialization == OperandMaterialization::Complete
-                        && plan.input.format
-                            == self.values[operation.inputs[0].index() as usize]
-                                .tensor_type
-                                .format
-                        && plan.output.format
-                            == self.values[operation.results[0].index() as usize]
-                                .tensor_type
-                                .format
                 }
                 MidOperationKind::Repeat(repeat) => {
                     self.validate_region(
@@ -192,7 +180,7 @@ mod tests {
             .operations
             .iter_mut()
             .find_map(|op| match &mut op.kind {
-                MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) => {
+                MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
                     Some(output_aliases)
                 }
                 _ => None,

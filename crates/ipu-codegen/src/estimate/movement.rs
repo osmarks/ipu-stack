@@ -280,7 +280,7 @@ mod tests {
         let cost = Ipu21CostModel.rearrangement_cost(
             &input.shape,
             input.format.precision,
-            crate::ConversionStrategy::DirectRetile,
+            crate::CopyPolicy::DirectRetile,
             &input.format.layout,
             &output.format.layout,
         );
@@ -304,7 +304,7 @@ mod tests {
         let local = Ipu21CostModel.rearrangement_cost(
             &input.shape,
             input.format.precision,
-            crate::ConversionStrategy::DirectRetile,
+            crate::CopyPolicy::DirectRetile,
             &input.format.layout,
             &input.format.layout,
         );

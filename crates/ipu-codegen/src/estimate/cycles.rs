@@ -3,7 +3,7 @@
 use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic, maximum_shard_bytes};
 use crate::graph::TensorShape;
 use crate::{
-    AmpOrder, BlockMajorOrder, ConversionStrategy, ElementOrder, Layout, OperatorPlan, Precision,
+    AmpOrder, BlockMajorOrder, CopyPolicy, ElementOrder, Layout, OperatorPlan, Precision,
     TensorFormat, TensorType,
 };
 use foldhash::fast::FixedState;
@@ -29,7 +29,7 @@ pub trait CostModel: Sync {
         &self,
         shape: &TensorShape,
         precision: Precision,
-        strategy: ConversionStrategy,
+        strategy: CopyPolicy,
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost;
@@ -71,7 +71,7 @@ pub(crate) struct MemoizedCostModel<'a, C> {
     rearrangements: Mutex<RearrangementCache>,
 }
 
-type RearrangementKey = (TensorShape, Precision, ConversionStrategy, Layout, Layout);
+type RearrangementKey = (TensorShape, Precision, CopyPolicy, Layout, Layout);
 type RearrangementCache = HashMap<RearrangementKey, Arc<OnceLock<RearrangementCost>>, FixedState>;
 
 impl<'a, C> MemoizedCostModel<'a, C> {
@@ -103,7 +103,7 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         &self,
         shape: &TensorShape,
         precision: Precision,
-        strategy: ConversionStrategy,
+        strategy: CopyPolicy,
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost {
@@ -277,11 +277,16 @@ impl CostModel for Ipu21CostModel {
         &self,
         shape: &TensorShape,
         precision: Precision,
-        strategy: ConversionStrategy,
+        strategy: CopyPolicy,
         from: &Layout,
         to: &Layout,
     ) -> RearrangementCost {
-        if strategy == ConversionStrategy::StageLogicalThenTransform
+        let strategy = if strategy == CopyPolicy::Automatic {
+            crate::default_copy_policy(from, to)
+        } else {
+            strategy
+        };
+        if strategy == CopyPolicy::StageLogicalThenTransform
             && from.order != ElementOrder::RowMajor
             && to.order != ElementOrder::RowMajor
         {
@@ -300,7 +305,7 @@ impl CostModel for Ipu21CostModel {
                 exchange_cycles: u64::MAX / 8,
             };
         };
-        let direct_retile = strategy == ConversionStrategy::DirectRetile;
+        let direct_retile = strategy == CopyPolicy::DirectRetile;
         let endpoint_traffic = &traffic.exchange;
         let mut exchange_cycles = exchange_endpoint_cycles(endpoint_traffic, 1);
         if direct_retile && !endpoint_traffic.is_empty() {
@@ -364,7 +369,7 @@ mod tests {
                 costs.rearrangement_cost(
                     &TensorShape::new(shape),
                     Precision::F16,
-                    ConversionStrategy::DirectRetile,
+                    CopyPolicy::DirectRetile,
                     &source,
                     &target,
                 ),
@@ -383,8 +388,8 @@ mod tests {
                     target_tiles,
                 ));
                 for strategy in [
-                    ConversionStrategy::DirectRetile,
-                    ConversionStrategy::StageLogicalThenTransform,
+                    CopyPolicy::DirectRetile,
+                    CopyPolicy::StageLogicalThenTransform,
                 ] {
                     let expected = Ipu21CostModel.rearrangement_cost(
                         &shape,

@@ -2,26 +2,22 @@
 //! tensor storage have already been chosen in mid.
 
 use super::*;
-use crate::{OperandWindow, Primitive, ProductAxes};
+use crate::{Compute, OperandWindow, ProductAxes};
 
 impl TileGraphBuilder {
-    pub(super) fn build_primitive(
+    pub(super) fn build_compute(
         &mut self,
         operation: &MidOperation,
-        primitive: &Primitive,
+        compute: &Compute,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        match primitive {
-            Primitive::Copy {
-                mapping,
-                reuse_local,
-            } => self.copy_tensor(operation, mapping, *reuse_local, body),
-            Primitive::Sum { axis, staging } => {
+        match compute {
+            Compute::Sum { axis, staging } => {
                 let mut batch = reduce::SumBatch::default();
                 self.prepare_sum(operation, usize::from(*axis), *staging, &mut batch)?;
                 self.append_sum_batch(batch, operation_provenance(operation), body)
             }
-            Primitive::Compute {
+            Compute::Kernel {
                 kernel,
                 operands,
                 product,

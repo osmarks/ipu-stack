@@ -1,5 +1,6 @@
 use super::*;
-use crate::{GraphInputKind, MidInput, MidValue, OperandWindow, Primitive, ValueId};
+use crate::mid::Compute;
+use crate::{GraphInputKind, MidInput, MidValue, OperandWindow, ValueId};
 
 #[test]
 fn primitive_casts_pair_corresponding_linear_fragments() {
@@ -38,7 +39,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     source: None,
                     inputs: vec![input],
                     results: vec![output],
-                    kind: MidOperationKind::Primitive(Primitive::Compute {
+                    kind: MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Cast {
                             from: Precision::F32,
                             to: Precision::F16,
@@ -84,7 +85,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     });
                     norm.operations[0].inputs.push(id);
                 }
-                norm.operations[0].kind = MidOperationKind::Primitive(Primitive::Compute {
+                norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::LayerNorm,
                     operands: vec![OperandWindow::default(); 3],
                     product: None,

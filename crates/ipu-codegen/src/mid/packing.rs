@@ -84,7 +84,7 @@ fn distribute_region(
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
             changed |= distribute_region(&mut repeat.body.operations, values, capacity, rows);
         }
-        if let MidOperationKind::Primitive(Primitive::Copy { .. }) = &operation.kind
+        if let MidOperationKind::Copy { .. } = &operation.kind
             && let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
             && values[input.index() as usize].tensor_type.format.precision == Precision::F16
             && values[input.index() as usize]
@@ -116,7 +116,7 @@ fn distribute_region(
                     inputs: vec![logical],
                     results: vec![packed],
                     source: operation.source,
-                    kind: MidOperationKind::Primitive(Primitive::Compute {
+                    kind: MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Rearrange {
                             from: row_major.format.layout,
                             to: layout,
@@ -132,10 +132,11 @@ fn distribute_region(
                     inputs: vec![packed],
                     results: vec![*output],
                     source: operation.source,
-                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                    kind: MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
-                    }),
+                    },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 };
@@ -216,13 +217,14 @@ mod tests {
                     source: None,
                     inputs: vec![MidValueId(0)],
                     results: vec![MidValueId(1)],
-                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                    kind: MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
                         mapping: CoordinateMapping {
                             offsets: vec![],
                             view: view.then_some(AxisFactorView::new(2, 0, 2)),
                         },
                         reuse_local: true,
-                    }),
+                    },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 }],

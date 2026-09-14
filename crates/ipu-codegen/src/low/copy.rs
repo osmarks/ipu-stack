@@ -2,6 +2,40 @@
 
 use crate::storage::{ByteSpan, StorageError, StorageResult};
 
+/// Requested realization of a whole-device coordinate copy. Explicit requests
+/// are checked by movement lowering; Automatic selects from the actual geometry.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum CopyPolicy {
+    #[default]
+    Automatic,
+    /// Run a rearrangement kernel on corresponding resident shards.
+    LocalKernel,
+    /// Transfer compatible physical spans directly to their destination.
+    DirectRetile,
+    /// Transfer logical values through row-major staging, then pack locally.
+    StageLogicalThenTransform,
+}
+
+pub fn default_copy_policy(from: &crate::Layout, to: &crate::Layout) -> CopyPolicy {
+    if from.order == to.order {
+        CopyPolicy::DirectRetile
+    } else {
+        CopyPolicy::StageLogicalThenTransform
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CopyOrder {
     /// Preserve tensor coordinates, converting between physical layouts.

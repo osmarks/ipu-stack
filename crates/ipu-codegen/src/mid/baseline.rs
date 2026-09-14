@@ -629,10 +629,11 @@ impl<C: CostModel> Builder<'_, C> {
                     source: Some(operation.id),
                     inputs: vec![*input],
                     results: vec![result],
-                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                    kind: MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
-                    }),
+                    },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 });

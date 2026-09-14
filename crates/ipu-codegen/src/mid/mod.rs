@@ -15,8 +15,9 @@ mod validate;
 pub(crate) use copy::{independent_copy_prefix, independent_sum_prefix};
 pub(crate) mod implementation;
 use implementation::FragmentCache;
-mod primitive;
-pub use primitive::*;
+mod compute;
+pub use compute::*;
+pub use copy::CoordinateMapping;
 mod candidates;
 mod catalogue;
 mod layout;
@@ -26,6 +27,7 @@ mod ownership;
 mod resolved;
 pub use crate::graph::AxisFactorView;
 
+use crate::{CopyPolicy, default_copy_policy};
 use candidates::*;
 use catalogue::*;
 pub use catalogue::{ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy};
@@ -327,8 +329,13 @@ pub struct MidValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
-    Primitive(Primitive),
-    Convert(ConversionPlan),
+    /// Populate a distributed value through an explicit coordinate mapping.
+    Copy {
+        mapping: CoordinateMapping,
+        reuse_local: bool,
+        policy: crate::CopyPolicy,
+    },
+    Compute(Compute),
     Repeat(MidRepeat),
 }
 
@@ -350,13 +357,6 @@ impl MidOperation {
             _ => &[],
         };
         self.inputs.iter().chain(sequences.iter().flatten())
-    }
-
-    pub fn conversion_plan(&self) -> Option<&ConversionPlan> {
-        match &self.kind {
-            MidOperationKind::Convert(plan) => Some(plan),
-            _ => None,
-        }
     }
 }
 

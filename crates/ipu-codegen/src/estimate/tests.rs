@@ -295,7 +295,7 @@ fn parallel_gemm_partial_capacity_uses_selected_ownership_grain() {
 fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     use crate::{
         CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidOperationKind, MidProgram,
-        MidValue, Primitive, ValueId,
+        MidValue, ValueId,
     };
     let id = MidValueId::from_index;
     let mut program = MidProgram {
@@ -322,10 +322,11 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
             source: None,
             inputs: vec![id(0)],
             results: vec![id(2)],
-            kind: MidOperationKind::Primitive(Primitive::Copy {
+            kind: MidOperationKind::Copy {
+                policy: crate::CopyPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: false,
-            }),
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         }],
@@ -394,17 +395,18 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
 fn memory_retains_repeat_yields_until_the_backedge() {
     use crate::{
         CoordinateMapping, GraphInputKind, MidInput, MidOperation, MidOperationKind, MidProgram,
-        MidRegion, MidRepeat, MidValue, Primitive, ValueId,
+        MidRegion, MidRepeat, MidValue, ValueId,
     };
     let id = MidValueId::from_index;
     let copy = |input, output| MidOperation {
         source: None,
         inputs: vec![id(input)],
         results: vec![id(output)],
-        kind: MidOperationKind::Primitive(Primitive::Copy {
+        kind: MidOperationKind::Copy {
+            policy: crate::CopyPolicy::Automatic,
             mapping: CoordinateMapping::default(),
             reuse_local: false,
-        }),
+        },
         estimated_cycles: 0,
         estimated_exchange_cycles: 0,
     };
@@ -472,8 +474,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
 #[test]
 fn explicit_zero_copy_offsets_have_identity_cost() {
     use crate::{
-        CoordinateMapping, MidOperation, MidOperationKind, MidValue, Primitive, TensorTiling,
-        ValueId,
+        CoordinateMapping, MidOperation, MidOperationKind, MidValue, TensorTiling, ValueId,
     };
     let values = [
         Layout::row_major(TensorTiling::replicated(1)),
@@ -494,13 +495,14 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
             source: None,
             inputs: vec![values[0].id],
             results: vec![values[1].id],
-            kind: MidOperationKind::Primitive(Primitive::Copy {
+            kind: MidOperationKind::Copy {
+                policy: crate::CopyPolicy::Automatic,
                 mapping: CoordinateMapping {
                     offsets,
                     view: None,
                 },
                 reuse_local: false,
-            }),
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         };

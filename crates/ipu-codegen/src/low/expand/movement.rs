@@ -1,6 +1,18 @@
-//! Materialize coordinate mappings through shared local-copy and exchange machinery.
+//! Lower a whole-device Copy through coordinate mappings, physical realization
+//! and one batch of pre-exchange work, recipients and post-exchange work.
+//! Geometry helpers describe coverage; explicit policies constrain realization.
 
 use super::*;
+
+/// Work needed to populate ordinary destination blocks at one exchange boundary.
+#[derive(Default)]
+pub(super) struct MaterializationBatch {
+    transfers: BTreeMap<CopyOrder, BTreeMap<ShardView, Vec<ShardView>>>,
+    before: Vec<(u16, LocalCopy)>,
+    pub(super) after: Vec<(u16, LocalCopy)>,
+    kernels: Vec<(u16, KernelRun)>,
+    loopback_candidates: Vec<(ShardView, ShardView, CopyOrder)>,
+}
 
 impl TileGraphBuilder {
     pub(super) fn copy_tensor(
@@ -8,10 +20,11 @@ impl TileGraphBuilder {
         operation: &MidOperation,
         mapping: &crate::CoordinateMapping,
         reuse_local: bool,
+        policy: CopyPolicy,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
-        let mut batch = conversion::MaterializationBatch::default();
-        self.prepare_copy_tensor(operation, mapping, reuse_local, &mut batch, body)?;
+        let mut batch = MaterializationBatch::default();
+        self.prepare_copy_tensor(operation, mapping, reuse_local, policy, &mut batch, body)?;
         self.append_materialization(batch, operation_provenance(operation), body)
     }
 
@@ -20,7 +33,8 @@ impl TileGraphBuilder {
         operation: &MidOperation,
         mapping: &crate::CoordinateMapping,
         reuse_local: bool,
-        batch: &mut conversion::MaterializationBatch,
+        policy: CopyPolicy,
+        batch: &mut MaterializationBatch,
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
@@ -31,7 +45,7 @@ impl TileGraphBuilder {
         let outputs = self.value_shards(*output)?.to_vec();
         // Whole-buffer bindings require canonical storage with its own strides.
         let reuse_local = reuse_local && !self.required_storage.contains(output);
-        let source_order = self.shards[inputs
+        let output_order = self.shards[outputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
             .index() as usize]
@@ -39,7 +53,21 @@ impl TileGraphBuilder {
             .format
             .layout
             .order;
-        let output_order = self.shards[outputs
+        if policy == CopyPolicy::LocalKernel {
+            if !mapping.is_identity() {
+                return Err(ExpansionError::InvalidCopyPlan);
+            }
+            return self.local_rearrangement(operation, &inputs, &outputs, body);
+        }
+        let inputs = if policy == CopyPolicy::StageLogicalThenTransform
+            && output_order == ElementOrder::RowMajor
+        {
+            self.unpack_amp_to_row_major(*input, operation_provenance(operation), body)?
+                .unwrap_or(inputs)
+        } else {
+            inputs
+        };
+        let source_order = self.shards[inputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
             .index() as usize]
@@ -51,6 +79,8 @@ impl TileGraphBuilder {
             let mappings = self.window_view_mappings(&inputs, &outputs, view, &mapping.offsets)?;
             if let Some(physical) = self.micro_panel_mappings(mappings.clone())? {
                 physical
+            } else if policy == CopyPolicy::DirectRetile {
+                return Err(ExpansionError::InvalidCopyPlan);
             } else if matches!(
                 source_order,
                 ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedLeft)
@@ -78,10 +108,12 @@ impl TileGraphBuilder {
             )?;
             (
                 mappings,
-                if source_order == output_order {
-                    CopyOrder::Physical
-                } else {
-                    CopyOrder::Semantic
+                match policy {
+                    CopyPolicy::DirectRetile => CopyOrder::Physical,
+                    CopyPolicy::StageLogicalThenTransform => CopyOrder::Semantic,
+                    CopyPolicy::Automatic if source_order == output_order => CopyOrder::Physical,
+                    CopyPolicy::Automatic => CopyOrder::Semantic,
+                    CopyPolicy::LocalKernel => unreachable!(),
                 },
             )
         };
@@ -107,6 +139,115 @@ impl TileGraphBuilder {
             batch,
             body,
         )
+    }
+
+    pub(super) fn unpack_amp_to_row_major(
+        &mut self,
+        source: MidValueId,
+        provenance: WorkProvenance,
+        tiles: &mut BlockRegion,
+    ) -> ExpansionResult<Option<Vec<BlockValueId>>> {
+        let sources = self.value_shards(source)?.to_vec();
+        for &source_shard in &sources {
+            let source = &self.shards[source_shard.index() as usize];
+            let compatible = source.extents.len() >= 2
+                && source.tensor_type.format.precision == Precision::F16
+                && match source.tensor_type.format.layout.order {
+                    ElementOrder::Amp(AmpOrder::Output) => {
+                        let columns = source.extents[source.extents.len() - 1];
+                        (columns.physical_end - columns.start).is_multiple_of(AMP_COLUMN_MICRO)
+                    }
+                    ElementOrder::Amp(AmpOrder::TransposedLeft) => {
+                        let rows = source.extents[source.extents.len() - 2];
+                        (rows.physical_end - rows.start).is_multiple_of(AMP_COLUMN_MICRO)
+                    }
+                    ElementOrder::BlockMajor(_) => true,
+                    _ => false,
+                };
+            if !compatible {
+                tracing::debug!(
+                    shard = source_shard.index(),
+                    rank = source.extents.len(),
+                    precision = ?source.tensor_type.format.precision,
+                    order = ?source.tensor_type.format.layout.order,
+                    extents = ?source.extents,
+                    "cannot unpack source storage into row-major order"
+                );
+                return Ok(None);
+            }
+        }
+
+        let mut staging_shards = Vec::with_capacity(sources.len());
+        for source_shard in sources {
+            let source = &self.shards[source_shard.index() as usize];
+            let tile = source.tile;
+            let mut staging_type = source.tensor_type.clone();
+            let to = Layout::row_major(TensorTiling::replicated(1));
+            let from = std::mem::replace(&mut staging_type.format.layout, to.clone());
+            let staging = self.push_shard(BlockValue {
+                id: BlockValueId(0),
+                tile,
+                tensor_type: staging_type,
+                extents: source.extents.clone(),
+                definition: ShardDefinition::Staging,
+            })?;
+            let run = self.kernel_run(
+                provenance,
+                TileKernelSpec::Rearrange { from, to },
+                vec![KernelOperand {
+                    views: vec![self.full_view(source_shard)],
+                }],
+                self.full_view(staging),
+            )?;
+            self.append_kernel(tiles, tile, run)?;
+            staging_shards.push(staging);
+        }
+        Ok(Some(staging_shards))
+    }
+
+    pub(super) fn local_rearrangement(
+        &mut self,
+        operation: &MidOperation,
+        inputs: &[BlockValueId],
+        outputs: &[BlockValueId],
+        tiles: &mut BlockRegion,
+    ) -> ExpansionResult<()> {
+        if inputs.len() != outputs.len() {
+            return Err(ExpansionError::InvalidCopyPlan);
+        }
+        let shards = inputs
+            .iter()
+            .copied()
+            .zip(outputs.iter().copied())
+            .collect::<Vec<_>>();
+        for (input, output) in shards {
+            let source = &self.shards[input.index() as usize];
+            let destination = &self.shards[output.index() as usize];
+            if source.tile != destination.tile
+                || source.extents.len() != destination.extents.len()
+                || source
+                    .extents
+                    .iter()
+                    .zip(&destination.extents)
+                    .any(|(a, b)| a.start != b.start || a.logical_end != b.logical_end)
+            {
+                return Err(ExpansionError::InvalidCopyPlan);
+            }
+            let tile = destination.tile;
+            let run = self.kernel_run(
+                operation_provenance(operation),
+                TileKernelSpec::Rearrange {
+                    from: source.tensor_type.format.layout.clone(),
+                    to: destination.tensor_type.format.layout.clone(),
+                },
+                vec![KernelOperand {
+                    views: vec![self.full_view(input)],
+                }],
+                self.full_view(output),
+            )?;
+            self.append_kernel(tiles, tile, run)?;
+        }
+        Ok(())
     }
 
     fn offset_copy_mappings(
@@ -420,4 +561,271 @@ fn offset_extents(
         }
     }
     Ok(())
+}
+
+impl TileGraphBuilder {
+    pub(super) fn prepare_mapped_views(
+        &mut self,
+        mappings: Vec<(ShardView, ShardView)>,
+        copy_order: CopyOrder,
+        exchange_order: CopyOrder,
+        provenance: WorkProvenance,
+        batch: &mut MaterializationBatch,
+        tiles: &mut BlockRegion,
+    ) -> ExpansionResult<()> {
+        let mut grouped = BTreeMap::<BlockValueId, Vec<(ShardView, ShardView)>>::new();
+        for mut mapping in mappings {
+            self.resolve_read_view(&mut mapping.0)?;
+            grouped.entry(mapping.1.shard).or_default().push(mapping);
+        }
+        let mut packed_sources = BTreeMap::new();
+        for (destination_shard, mappings) in grouped {
+            // A clipped boundary on one destination must not expand complete
+            // panel grids on every other destination into tiny rectangles.
+            let physical = if copy_order == CopyOrder::Semantic {
+                self.micro_panel_mappings(mappings.clone())?
+            } else {
+                None
+            };
+            let (mappings, copy_order, exchange_order) = physical.map_or(
+                (mappings, copy_order, exchange_order),
+                |(mappings, order)| (mappings, order, order),
+            );
+            let transfers = batch.transfers.entry(exchange_order).or_default();
+            let plan = self.copy_plan(&mappings, destination_shard, copy_order)?;
+            self.append_copy_clears(tiles, destination_shard, &plan.clear_ranges, provenance)?;
+            let staging = if let Some(staging) = &plan.staging {
+                Some(self.push_shard(BlockValue {
+                    id: BlockValueId(0),
+                    tile: self.shards[destination_shard.index() as usize].tile,
+                    tensor_type: staging.tensor_type.clone(),
+                    extents: staging.extents.clone(),
+                    definition: ShardDefinition::Staging,
+                })?)
+            } else {
+                None
+            };
+            if let Some(staging) = staging {
+                let block = &self.shards[staging.index() as usize];
+                let coverage = mappings
+                    .iter()
+                    .map(|(source, destination)| crate::CopyMapping {
+                        source: self.shards[source.shard.index() as usize].storage(),
+                        source_extents: &source.extents,
+                        destination_extents: &destination.extents,
+                    })
+                    .collect::<Vec<_>>();
+                let ranges = crate::low::copy::uncovered_copy_bytes(
+                    block.storage(),
+                    &coverage,
+                    CopyOrder::Semantic,
+                )?;
+                self.append_copy_clears(tiles, staging, &ranges, provenance)?;
+            }
+            for (mut source, mut destination) in mappings {
+                if let Some(staging) = staging {
+                    destination.shard = staging;
+                    for extent in source.extents.iter_mut().chain(&mut destination.extents) {
+                        extent.physical_end = extent.logical_end;
+                    }
+                }
+                let source_tile = self.shards[source.shard.index() as usize].tile;
+                let destination_tile = self.shards[destination.shard.index() as usize].tile;
+                if source_tile == destination_tile {
+                    if staging.is_none()
+                        && copy_order == exchange_order
+                        && self.shards[source.shard.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .memory_class
+                            == MemoryClass::Ipu21Standard
+                    {
+                        batch
+                            .loopback_candidates
+                            .push((source, destination, copy_order));
+                        continue;
+                    }
+                    let copies = if staging.is_some() {
+                        &mut batch.before
+                    } else {
+                        &mut batch.after
+                    };
+                    append_span_copies(
+                        &self.cache,
+                        &self.shards,
+                        &source,
+                        &destination,
+                        destination_tile,
+                        copies,
+                        copy_order,
+                    )?;
+                } else {
+                    if exchange_order != CopyOrder::Panels
+                        && !view_byte_traversal(
+                            &self.shards[source.shard.index() as usize],
+                            &source,
+                            exchange_order,
+                        )?
+                        .word_aligned()
+                    {
+                        source = self.pack_exchange_source(
+                            source,
+                            exchange_order,
+                            &mut packed_sources,
+                            &mut batch.before,
+                        )?;
+                    }
+                    transfers.entry(source).or_default().push(destination);
+                }
+            }
+            if let Some(staging) = staging {
+                let staging = self.full_view(staging);
+                let tile = self.shards[destination_shard.index() as usize].tile;
+                if let Some(kernel) = plan
+                    .staging
+                    .as_ref()
+                    .and_then(|staging| staging.kernel.as_ref())
+                {
+                    batch.kernels.push((
+                        tile,
+                        self.kernel_run(
+                            provenance,
+                            kernel.clone(),
+                            vec![KernelOperand {
+                                views: vec![staging],
+                            }],
+                            self.full_view(destination_shard),
+                        )?,
+                    ));
+                } else {
+                    append_span_copies(
+                        &self.cache,
+                        &self.shards,
+                        &staging,
+                        &self.logical_view(destination_shard),
+                        tile,
+                        &mut batch.after,
+                        CopyOrder::Semantic,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Destination packing cannot repair halfword reads from a source panel.
+    // Gather that logical slice locally before sending it as whole words.
+    fn pack_exchange_source(
+        &mut self,
+        source: ShardView,
+        order: CopyOrder,
+        packed: &mut BTreeMap<(CopyOrder, ShardView), ShardView>,
+        copies: &mut Vec<(u16, LocalCopy)>,
+    ) -> ExpansionResult<ShardView> {
+        let key = (order, source.clone());
+        if let Some(view) = packed.get(&key) {
+            return Ok(view.clone());
+        }
+        let shard = &self.shards[source.shard.index() as usize];
+        let tile = shard.tile;
+        let bytes = view_byte_traversal(shard, &source, order)?.byte_len();
+        if bytes == 0 || !bytes.is_multiple_of(4) {
+            return Err(ExpansionError::InvalidCopyPlan);
+        }
+        let precision = shard.tensor_type.format.precision;
+        let staging = self.push_packed_buffer(
+            tile,
+            u32::try_from(bytes / precision.bytes()).map_err(|_| ExpansionError::IdOverflow)?,
+            precision,
+            ShardDefinition::Staging,
+        )?;
+        let view = self.full_view(staging);
+        append_span_copies(
+            &self.cache,
+            &self.shards,
+            &source,
+            &view,
+            tile,
+            copies,
+            order,
+        )?;
+        packed.insert(key, view.clone());
+        Ok(view)
+    }
+
+    pub(super) fn append_materialization(
+        &mut self,
+        mut batch: MaterializationBatch,
+        provenance: WorkProvenance,
+        tiles: &mut BlockRegion,
+    ) -> ExpansionResult<()> {
+        for (source, destination, order) in batch.loopback_candidates {
+            let transfers = batch.transfers.entry(order).or_default();
+            // Keep the existing multicast send; only add its local receiver.
+            // Placement separates same-class source/receiver SRAM elements.
+            let spans = |shard, view| view_byte_traversal(shard, view, order);
+            let source_spans = spans(&self.shards[source.shard.index() as usize], &source)?;
+            let destination_spans = spans(
+                &self.shards[destination.shard.index() as usize],
+                &destination,
+            )?;
+            let aligned = source_spans.word_aligned() && destination_spans.word_aligned();
+            if let Some(destinations) = transfers.get_mut(&source)
+                && destinations.len() >= 2
+                && aligned
+                // The local receiver must not split existing messages further.
+                && destinations.iter().any(|view| {
+                    spans(&self.shards[view.shard.index() as usize], view).is_ok_and(|remote|
+                        remote.spans().map(|span| span.bytes)
+                            .eq(destination_spans.spans().map(|span| span.bytes)))
+                })
+                && destinations.iter().all(|view| {
+                    self.shards[view.shard.index() as usize].tile
+                        != self.shards[source.shard.index() as usize].tile
+                })
+            {
+                destinations.push(destination);
+            } else {
+                append_span_copies(
+                    &self.cache,
+                    &self.shards,
+                    &source,
+                    &destination,
+                    self.shards[source.shard.index() as usize].tile,
+                    &mut batch.after,
+                    order,
+                )?;
+            }
+        }
+        for (tile, copy) in batch.before {
+            self.append_local_copy(tiles, tile, copy)?;
+        }
+        self.append_mixed_phase(batch.transfers, provenance, tiles)?;
+        for (tile, copy) in batch.after {
+            self.append_local_copy(tiles, tile, copy)?;
+        }
+        for (tile, run) in batch.kernels {
+            self.append_kernel(tiles, tile, run)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn logical_view(&self, shard: BlockValueId) -> ShardView {
+        let mut view = self.full_view(shard);
+        for extent in &mut view.extents {
+            extent.physical_end = extent.logical_end;
+        }
+        view
+    }
+
+    pub(super) fn copy_plan(
+        &self,
+        mappings: &[(ShardView, ShardView)],
+        destination: BlockValueId,
+        copy_order: CopyOrder,
+    ) -> ExpansionResult<Arc<crate::CopyPlan>> {
+        self.cache
+            .plan(&self.shards, mappings, destination, copy_order)
+    }
 }

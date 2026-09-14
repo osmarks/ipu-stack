@@ -180,7 +180,7 @@ fn edge(a: &TensorType, b: &TensorType, alias: bool) -> Option<Transform> {
         let estimate = Ipu21CostModel.rearrangement_cost(
             &a.shape,
             a.format.precision,
-            layout_conversion_strategy(&a.format.layout, &b.format.layout),
+            default_copy_policy(&a.format.layout, &b.format.layout),
             &a.format.layout,
             &b.format.layout,
         );
@@ -230,7 +230,7 @@ fn edge(a: &TensorType, b: &TensorType, alias: bool) -> Option<Transform> {
                 .rearrangement_cost(
                     &a.shape,
                     a.format.precision,
-                    layout_conversion_strategy(&a.format.layout, &b.format.layout),
+                    default_copy_policy(&a.format.layout, &b.format.layout),
                     &a.format.layout,
                     &b.format.layout,
                 )

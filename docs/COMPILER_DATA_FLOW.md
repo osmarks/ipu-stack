@@ -18,7 +18,7 @@ are less clean than their names suggest:
 | Representation | What it contains | What remains undecided |
 | --- | --- | --- |
 | `ComputeGraph` | Shaped semantic operations, parameters, outputs and structured Repeat | Precision, distribution, kernels, movement, storage |
-| `MidProgram` | Executable whole-device `Compute`, mapped `Copy`, `Sum`, remaining `Convert`, and Repeat | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
+| `MidProgram` | Executable whole-device `Copy`, `Compute` (including casts, products and sums), and `Repeat` | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
 | `TileGraph` | Shards, relative views, local copies, multicast source/recipient groups, kernel runs, structured control | Physical addresses, exact exchange instructions, linked symbols |
 | `LowProgram` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
 | `ScheduledPlan` | Low program, provisional placement, encoded exchange phases, reusable scheduling choices | Support-memory reservations and their final placement effects |
@@ -28,8 +28,9 @@ Selection emits executable family fragments directly into the program. There
 is no `Operator` variant, nested implementation, deferred-input state, or
 resolution pass. `Recipe` retains the selected family parameters separately.
 Binding validation checks definitions, region scope, arity and alias indices at
-construction and rewrite boundaries. The remaining `Convert` and outer
-`Primitive` wrapper are still scheduled for unification with Copy/Compute.
+construction and rewrite boundaries. Numerical casts have one compute form;
+coordinate/layout movement has one Copy form with a selected movement policy.
+There is no `Convert` or outer `Primitive` wrapper.
 
 `TileGraph` owns the live operation list and finite-scratch requirement.
 `LowProgram` shares its arenas and derives per-tile indexes without changing
@@ -44,7 +45,7 @@ flowchart TD
   R[Recipe: selections and rewrite choices] --> P
   P --> I[emit_selected: construct and bind executable family fragment]
   I --> W[Cast ordering, copy composition, fusions, ownership and storage rewrites]
-  W --> M[Executable MidProgram: Primitive / Convert / Repeat]
+  W --> M[Executable MidProgram: Copy / Compute / Repeat]
   M --> E[low::expand: shard enumeration and physical realization]
   E --> O[Low simplification, relay selection and padding removal]
   O --> T[TileGraph]
@@ -117,7 +118,7 @@ flowchart LR
    selecting or rebuilding an implementation. The later parameter-home
    transformation updates bindings and inserts any input-owner copies as part
    of that same transformation; there is no resolver repairing it afterward.
-4. [low/expand/primitive.rs](../crates/ipu-codegen/src/low/expand/primitive.rs)
+4. [low/expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs)
    finds resident operand shards. `product_calls` enumerates local K/column
    blocks, chooses initialize/accumulate for those calls, clips logical work
    accounting, and selects the weight-load variant from the actual memory class.
@@ -129,11 +130,10 @@ flowchart LR
    bounded contributor buffers, and emits transfer/reduction stages. It bypasses
    seed or output copies when a compatible physical slice is usable directly.
 
-The current `Sum` carries a distributed reduction axis and staging policy; the
-local `ReduceSum` kernel implements individual stages. That distinction must
-survive, but it does not justify placing sum outside `Compute`: the other mid
-arithmetic also describes distributed work. The proposal puts sum under compute
-while retaining the axis, result ownership and staging parameters.
+The current `Compute::Sum` carries a distributed reduction axis and staging
+policy; the local `ReduceSum` kernel implements individual stages. Products still
+use the kernel compute variant with optional `ProductAxes`; making that family
+explicit and giving operands declared indexing relations remains in progress.
 
 However, its current implementation is narrower than the name: singleton partial
 axis outside the final matrix axes, FP16 contributors/results, matching element
@@ -151,7 +151,7 @@ The semantic relation is `Y[b,r,c] = X[b,r,c] + B[0,r,c]`.
 | Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph.rs), `infer_shape`/`broadcast` | Define valid logical computation |
 | Select output layout and compatible kernel | [mid/candidates.rs](../crates/ipu-codegen/src/mid/candidates.rs) | Choose distributed implementation |
 | Project output ownership onto non-broadcast input axes | [implementation/mod.rs](../crates/ipu-codegen/src/mid/implementation/mod.rs), `pointwise_input_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
-| Select resident shard and crop a broadcast view | [expand/primitive.rs](../crates/ipu-codegen/src/low/expand/primitive.rs), [pointwise.rs](../crates/ipu-codegen/src/low/expand/pointwise.rs) | Supply the local kernel with the needed coordinates |
+| Select resident shard and crop a broadcast view | [expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs), [pointwise.rs](../crates/ipu-codegen/src/low/expand/pointwise.rs) | Supply the local kernel with the needed coordinates |
 | Validate supported broadcast shape and encode strides/counts | [kernel/abi.rs](../crates/ipu-codegen/src/kernel/abi.rs) | Match the actual kernel's address arithmetic |
 
 These steps do different jobs; their existence is not automatically duplication.
@@ -173,42 +173,33 @@ not by itself specify which bytes move or whether storage can be reused.
 
 ```mermaid
 flowchart TD
-  V[View/slice or implementation-created copy] --> C[Primitive::Copy with CoordinateMapping]
-  F[Boundary format requirement] --> CV[Convert with ConversionStrategy]
-  C --> MP[materialize: map output regions back to source owners]
-  CV --> CP[conversion: resident kernel or identity intersections]
-  MP --> U[Optional AMP unpack or physical panel mapping]
-  U --> B[prepare_mapped_views]
-  CP --> B
-  B --> P[CopyPlan: coverage, direct exchange vs staging/packing]
+  V[View/slice or layout requirement] --> C[Copy: CoordinateMapping and CopyPolicy]
+  C --> M[movement: map output regions to source owners]
+  M --> U[Reuse, direct panels or source unpacking]
+  U --> P[CopyPlan: coverage, direct exchange vs staging/packing]
   P --> Q[MaterializationBatch: before / exchange / after / kernels]
-  Q --> X[Local copies, logical multicast groups and kernel runs]
+  Q --> X[Local copies, multicast groups and kernel runs]
 ```
 
-[materialize.rs](../crates/ipu-codegen/src/low/expand/materialize.rs) bridges
-**logical coordinate mapping to shard-to-shard movement**. It maps output windows
-back to sources, asks [CopyRegions](../crates/ipu-codegen/src/low/expand/ownership.rs)
-for intersecting owners, recognizes reusable local storage, and tries physical
-micro-panel movement. If the packed source cannot be handled that way, it can
-insert an AMP-to-row-major unpack before mapping again.
+[movement.rs](../crates/ipu-codegen/src/low/expand/movement.rs) owns the connected
+construction. Identity mappings, windows and factor-axis views enter the same
+routine. It queries [CopyRegions](../crates/ipu-codegen/src/low/expand/ownership.rs)
+for intersecting owners, proves local storage reuse, and inspects physical panel
+compatibility. An explicit LocalKernel request uses corresponding resident shards;
+other requests constrain physical versus logical traversal. Incompatible requests
+are rejected. Unpacking, local packing, shared transfers and compatible loopback
+receivers are recorded as ordinary low work before placement.
 
-[conversion.rs](../crates/ipu-codegen/src/low/expand/conversion.rs) contains both
-a second entry path for `Convert` and the shared assembly used by mapped copies.
-It constructs local kernels, stages unaligned transfers, groups multicast
-recipients, and conditionally turns compatible local copies into receivers of an
-existing multicast.
+Numerical conversion is a Compute with a Cast kernel. Copy composition cannot
+cross it. It also retains boundaries between incompatible explicit copy policies;
+it does not silently replace every selected policy with Automatic.
 
-[CopyPlan::for_destination](../crates/ipu-codegen/src/low/copy.rs) computes
+[CopyPlan::for_destination](../crates/ipu-codegen/src/low/copy.rs) still computes
 uncovered padding and chooses direct word transfers versus staging/packing using
-estimated costs. This is **policy as well as geometry**. Meanwhile that same file
-also implements relative copy descriptors and span coalescing.
-[storage](../crates/ipu-codegen/src/storage.rs) owns layout-to-byte traversal.
-The files are not organized along these responsibility boundaries.
-
-The two entry paths do converge; they are not wholly duplicated engines. But
-requiring them both means rewrites and costs must recognize both `Copy` and
-`Convert`, and the selected conversion strategy does not fully describe the
-physical route later chosen by `CopyPlan`.
+estimated costs. Separating its pure geometry from this physical selection is
+still part of the refactor. [Storage](../crates/ipu-codegen/src/storage.rs) owns
+layout-to-byte traversal; relative local-copy descriptors and span coalescing are
+currently in low/copy.rs.
 
 There is additional control flow inside
 [expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs): `append_kernel`

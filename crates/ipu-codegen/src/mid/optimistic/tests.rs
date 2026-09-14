@@ -212,10 +212,11 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
             source: None,
             inputs: vec![MidValueId(0)],
             results: vec![MidValueId(1)],
-            kind: MidOperationKind::Primitive(Primitive::Copy {
+            kind: MidOperationKind::Copy {
+                policy: crate::CopyPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
-            }),
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         }],

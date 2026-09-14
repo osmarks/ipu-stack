@@ -50,8 +50,7 @@ pub(super) fn is_single_use(
 /// Recognize an unfused, whole-value FP16-to-FP8 local conversion.
 pub(super) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidValueId, MidValueId)> {
     let local = match &op.kind {
-        MidOperationKind::Convert(plan) => plan.strategy == ConversionStrategy::LocalKernel,
-        MidOperationKind::Primitive(Primitive::Compute {
+        MidOperationKind::Compute(Compute::Kernel {
             kernel:
                 TileKernelSpec::Cast {
                     from: Precision::F16,
@@ -118,10 +117,9 @@ pub(super) fn coordinate_copy_source(op: &MidOperation) -> Option<MidValueId> {
         return None;
     };
     match &op.kind {
-        MidOperationKind::Convert(_) => Some(*input),
-        MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) if mapping.is_identity() => {
-            Some(*input)
-        }
+        MidOperationKind::Copy {
+            mapping, policy, ..
+        } if mapping.is_identity() && *policy != CopyPolicy::LocalKernel => Some(*input),
         _ => None,
     }
 }

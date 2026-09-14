@@ -75,15 +75,10 @@ fn donate(
             continue;
         }
         match &op.kind {
-            MidOperationKind::Primitive(Primitive::Copy {
+            MidOperationKind::Copy {
                 reuse_local: true, ..
-            }) => bound.extend(op.inputs.iter().copied()),
-            MidOperationKind::Convert(plan)
-                if plan.input.format.precision == plan.output.format.precision =>
-            {
-                bound.extend(op.inputs.iter().copied())
-            }
-            MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) => {
+            } => bound.extend(op.inputs.iter().copied()),
+            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
                 for &(output, input) in output_aliases {
                     if bound.contains(&op.results[output]) {
                         bound.insert(op.inputs[input]);
@@ -131,12 +126,9 @@ fn donate(
             continue;
         }
         let fresh = match &operations[producer].kind {
-            MidOperationKind::Primitive(Primitive::Copy { .. }) => true,
-            MidOperationKind::Primitive(Primitive::Compute { output_aliases, .. }) => {
+            MidOperationKind::Copy { .. } => true,
+            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
                 output_aliases.is_empty()
-            }
-            MidOperationKind::Convert(plan) => {
-                plan.input.format.precision == plan.output.format.precision
             }
             _ => false,
         };
@@ -167,18 +159,10 @@ fn donate(
         }
         // A coordinate copy may otherwise alias an external parameter or an
         // earlier activation in low. Donation requires its own materialization.
-        if matches!(operations[producer].kind, MidOperationKind::Convert(_)) {
-            operations[producer].kind = MidOperationKind::Primitive(Primitive::Copy {
-                mapping: CoordinateMapping::default(),
-                reuse_local: false,
-            });
-        }
-        if let MidOperationKind::Primitive(Primitive::Copy { reuse_local, .. }) =
-            &mut operations[producer].kind
-        {
+        if let MidOperationKind::Copy { reuse_local, .. } = &mut operations[producer].kind {
             *reuse_local = false;
         }
-        operations[index].kind = MidOperationKind::Primitive(Primitive::Compute {
+        operations[index].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Cast {
                 from: Precision::F16,
                 to: target.tensor_type.format.precision,
@@ -231,10 +215,11 @@ mod tests {
                     source: None,
                     inputs: vec![MidValueId(0)],
                     results: vec![MidValueId(1)],
-                    kind: MidOperationKind::Primitive(Primitive::Copy {
+                    kind: MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
-                    }),
+                    },
                     estimated_cycles: 0,
                     estimated_exchange_cycles: 0,
                 },
@@ -242,7 +227,7 @@ mod tests {
                     source: None,
                     inputs: vec![MidValueId(1)],
                     results: vec![MidValueId(2)],
-                    kind: MidOperationKind::Primitive(Primitive::Compute {
+                    kind: MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Cast {
                             from: Precision::F16,
                             to: Precision::F8F143 { scale_exponent: 0 },
@@ -397,10 +382,11 @@ mod tests {
             source: None,
             inputs: vec![MidValueId(2)],
             results: vec![MidValueId(3)],
-            kind: MidOperationKind::Primitive(Primitive::Copy {
+            kind: MidOperationKind::Copy {
+                policy: crate::CopyPolicy::Automatic,
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
-            }),
+            },
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         });
@@ -410,34 +396,28 @@ mod tests {
     }
 
     #[test]
-    fn legacy_conversions_and_multiple_shards_use_the_corresponding_donor() {
+    fn local_rearrangements_and_multiple_shards_use_the_corresponding_donor() {
         let mut mid = fixture(ElementOrder::Amp(AmpOrder::Left), &[2, 49152]);
         for value in &mut mid.values {
             value.tensor_type.format.layout.tiling = TensorTiling::linear(1, 32);
         }
-        for op in &mut mid.operations {
-            op.kind = MidOperationKind::Convert(ConversionPlan {
-                input: OperandRequirement::new(
-                    mid.values[op.inputs[0].index() as usize]
-                        .tensor_type
-                        .format
-                        .clone(),
-                ),
-                output: OperandRequirement::new(
-                    mid.values[op.results[0].index() as usize]
-                        .tensor_type
-                        .format
-                        .clone(),
-                ),
-                strategy: ConversionStrategy::LocalKernel,
-            });
-        }
+        mid.operations[0].kind = MidOperationKind::Copy {
+            mapping: CoordinateMapping::default(),
+            reuse_local: false,
+            policy: CopyPolicy::LocalKernel,
+        };
         mid.reuse_cast_inputs();
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
         assert_eq!(low.value_shards(low.outputs[0]).len(), 2);
         let placement = crate::place::place(&low).unwrap();
-        for run in &low.kernel_runs {
+        let casts = low
+            .kernel_runs
+            .iter()
+            .filter(|run| matches!(run.kernel, TileKernelSpec::Cast { .. }))
+            .collect::<Vec<_>>();
+        assert!(casts.len() >= 2);
+        for run in casts {
             let crate::ShardDefinition::ShiftedAlias {
                 source: donor,
                 offset: -32768,

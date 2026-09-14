@@ -17,7 +17,7 @@ pub(super) fn fuse(
     let mut preparation = BTreeMap::new();
     for index in 0..operations.len() {
         let current = &operations[index];
-        let MidOperationKind::Primitive(Primitive::Compute {
+        let MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands,
             product: None,
@@ -44,7 +44,7 @@ pub(super) fn fuse(
             continue;
         }
         let add = &operations[previous];
-        let MidOperationKind::Primitive(Primitive::Compute {
+        let MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
             operands,
             product: None,
@@ -111,7 +111,7 @@ pub(super) fn fuse(
         let fused = MidOperation {
             inputs: add.inputs.clone(),
             results: vec![stats, sum],
-            kind: MidOperationKind::Primitive(Primitive::Compute {
+            kind: MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::AddLayerNormMoments,
                 operands: vec![OperandWindow::default(); 2],
                 product: None,
@@ -127,7 +127,7 @@ pub(super) fn fuse(
             apply.inputs[0] = if redistributed { input } else { sum };
             apply.inputs.truncate(3);
             apply.inputs.push(stats);
-            apply.kind = MidOperationKind::Primitive(Primitive::Compute {
+            apply.kind = MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::LayerNormApply {
                     parts: statistic_parts,
                 },
@@ -160,13 +160,11 @@ pub(super) fn fuse(
                 source: current.source,
                 inputs: vec![stats],
                 results: vec![id],
-                kind: MidOperationKind::Convert(ConversionPlan {
-                    input: OperandRequirement::new(
-                        values[stats.index() as usize].tensor_type.format.clone(),
-                    ),
-                    output: OperandRequirement::new(tensor_type.format.clone()),
-                    strategy: ConversionStrategy::DirectRetile,
-                }),
+                kind: MidOperationKind::Copy {
+                    mapping: CoordinateMapping::default(),
+                    reuse_local: false,
+                    policy: CopyPolicy::DirectRetile,
+                },
                 estimated_cycles: 0,
                 estimated_exchange_cycles: 0,
             };
@@ -357,7 +355,7 @@ mod tests {
             program.operations.push(MidOperation {
                 source: None,
                 results: vec![result],
-                kind: MidOperationKind::Primitive(Primitive::Compute {
+                kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel,
                     operands: vec![OperandWindow::default(); inputs.len()],
                     product: None,
@@ -421,11 +419,11 @@ mod tests {
                 source: None,
                 inputs: vec![source],
                 results: vec![value.id],
-                kind: MidOperationKind::Convert(ConversionPlan {
-                    input: OperandRequirement::new(tensor.format.clone()),
-                    output: OperandRequirement::new(value.tensor_type.format.clone()),
-                    strategy: ConversionStrategy::DirectRetile,
-                }),
+                kind: MidOperationKind::Copy {
+                    mapping: CoordinateMapping::default(),
+                    reuse_local: false,
+                    policy: CopyPolicy::DirectRetile,
+                },
                 estimated_cycles: 0,
                 estimated_exchange_cycles: 0,
             });
@@ -467,14 +465,6 @@ mod tests {
         );
         for id in [0, 1, 4] {
             program.values[id].tensor_type.format.layout = feature_layout.clone();
-        }
-        for op in &mut program.operations {
-            if let MidOperationKind::Convert(plan) = &mut op.kind {
-                plan.input.format = program.values[op.inputs[0].index() as usize]
-                    .tensor_type
-                    .format
-                    .clone();
-            }
         }
         let fused = program
             .with_elementwise_fusions(&PipelineConfig::new(program.tile_count))

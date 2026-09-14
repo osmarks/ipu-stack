@@ -55,7 +55,8 @@ pub(crate) fn implement(
             b.emit(
                 vec![MidValueId(0)],
                 output.clone(),
-                Primitive::Copy {
+                MidOperationKind::Copy {
+                    policy: crate::CopyPolicy::Automatic,
                     mapping,
                     reuse_local: false,
                 },
@@ -163,14 +164,14 @@ impl Builder {
         &mut self,
         inputs: Vec<MidValueId>,
         output: TensorType,
-        primitive: Primitive,
+        kind: MidOperationKind,
     ) -> MidValueId {
         let result = self.value(output);
         self.program.operations.push(MidOperation {
             source: None,
             inputs,
             results: vec![result],
-            kind: MidOperationKind::Primitive(primitive),
+            kind,
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         });
@@ -221,7 +222,8 @@ impl Builder {
         self.emit(
             vec![input],
             output,
-            Primitive::Copy {
+            MidOperationKind::Copy {
+                policy: crate::CopyPolicy::Automatic,
                 mapping: CoordinateMapping {
                     offsets,
                     view: None,
@@ -251,12 +253,12 @@ impl Builder {
         self.emit(
             inputs,
             output,
-            Primitive::Compute {
+            MidOperationKind::Compute(Compute::Kernel {
                 kernel,
                 operands,
                 product,
                 output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
-            },
+            }),
         )
     }
 }

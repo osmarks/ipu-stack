@@ -1,5 +1,6 @@
 //! Compiler timings which stop before placement and exchange scheduling.
 use super::*;
+use crate::Compute;
 use std::sync::Arc;
 
 #[derive(serde::Serialize)]
@@ -130,9 +131,9 @@ pub fn benchmark_mid_expansion(
                 continue;
             }
             let category = match &op.kind {
-                crate::MidOperationKind::Primitive(crate::Primitive::Compute { .. }) => "compute",
-                crate::MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => "copy",
-                crate::MidOperationKind::Primitive(crate::Primitive::Sum { .. }) => "sum",
+                crate::MidOperationKind::Compute(Compute::Kernel { .. }) => "compute",
+                crate::MidOperationKind::Copy { .. } => "copy",
+                crate::MidOperationKind::Compute(Compute::Sum { .. }) => "sum",
                 _ => "other",
             };
             let mut groups = Vec::new();

@@ -4,16 +4,14 @@ mod cache;
 mod emit;
 mod exchange_grouping;
 pub(crate) use cache::ExpansionCache;
-mod primitive;
-
-mod materialize;
+mod compute;
 
 mod buffers;
 mod cast;
-mod conversion;
 mod copies;
 mod gemm;
 mod mapping;
+mod movement;
 mod ownership;
 mod pointwise;
 mod reduce;
@@ -23,7 +21,7 @@ use crate::graph::OperationId;
 use crate::low::*;
 use crate::storage::{ByteSpan, StorageError};
 use crate::{
-    AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, ConversionStrategy, CopyOrder, ElementOrder,
+    AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder,
     KernelRequirements, Layout, LayoutError, MemoryClass, MidOperation, MidOperationKind,
     MidProgram, MidRepeat, MidValueId, Precision, ShardExtent, TensorTiling, TensorType,
     TileKernelSpec,
@@ -50,8 +48,8 @@ pub enum ExpansionError {
     ResultArity,
     #[error("operator plan is incompatible with its values or block dimensions")]
     InvalidOperatorPlan,
-    #[error("conversion plan is incompatible with its input or output")]
-    InvalidConversionPlan,
+    #[error("copy policy is incompatible with its mapping or bindings")]
+    InvalidCopyPlan,
     #[error("repeat structure is inconsistent with its inputs, arguments, yields, or results")]
     InvalidRepeat,
     #[error("repeat carried value {0} cannot alias its body argument")]
@@ -210,10 +208,7 @@ impl TileGraphBuilder {
                 // These ABIs bind or reshape an entire canonical allocation;
                 // a borrowed view with different backing strides is insufficient.
                 match &operation.kind {
-                    MidOperationKind::Primitive(crate::Primitive::Compute {
-                        output_aliases,
-                        ..
-                    }) => {
+                    MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
                         bindings.extend(
                             output_aliases
                                 .iter()
@@ -221,7 +216,7 @@ impl TileGraphBuilder {
                                 .copied(),
                         );
                     }
-                    MidOperationKind::Primitive(crate::Primitive::Sum { .. }) => {
+                    MidOperationKind::Compute(Compute::Sum { .. }) => {
                         bindings.extend(operation.inputs.iter().copied());
                     }
                     _ => {}
@@ -297,8 +292,7 @@ impl TileGraphBuilder {
             let lowered = if sums > 1 {
                 let mut batch = reduce::SumBatch::default();
                 for operation in &operations[index..index + sums] {
-                    let MidOperationKind::Primitive(crate::Primitive::Sum { axis, staging }) =
-                        operation.kind
+                    let MidOperationKind::Compute(Compute::Sum { axis, staging }) = operation.kind
                     else {
                         unreachable!()
                     };
@@ -314,12 +308,13 @@ impl TileGraphBuilder {
                     &mut tiles,
                 )
             } else if copies > 1 {
-                let mut batch = conversion::MaterializationBatch::default();
+                let mut batch = movement::MaterializationBatch::default();
                 for operation in &operations[index..index + group] {
-                    let MidOperationKind::Primitive(crate::Primitive::Copy {
+                    let MidOperationKind::Copy {
+                        policy,
                         mapping,
                         reuse_local,
-                    }) = &operation.kind
+                    } = &operation.kind
                     else {
                         unreachable!()
                     };
@@ -327,6 +322,7 @@ impl TileGraphBuilder {
                         operation,
                         mapping,
                         *reuse_local,
+                        *policy,
                         &mut batch,
                         &mut tiles,
                     )?;
@@ -342,14 +338,16 @@ impl TileGraphBuilder {
                 self.append_materialization(batch, provenance, &mut tiles)
             } else {
                 match &operation.kind {
-                    MidOperationKind::Primitive(primitive) => {
-                        self.build_primitive(operation, primitive, &mut tiles)
+                    MidOperationKind::Compute(compute) => {
+                        self.build_compute(operation, compute, &mut tiles)
                     }
+                    MidOperationKind::Copy {
+                        policy,
+                        mapping,
+                        reuse_local,
+                    } => self.copy_tensor(operation, mapping, *reuse_local, *policy, &mut tiles),
                     MidOperationKind::Repeat(repeat) => {
                         self.build_repeat(operation, repeat, &mut tiles)
-                    }
-                    MidOperationKind::Convert(plan) => {
-                        self.build_conversion(operation, plan, &mut tiles)
                     }
                 }
             };
@@ -358,7 +356,6 @@ impl TileGraphBuilder {
                     operation = index,
                     source = ?operation.source.map(OperationId::index),
                     kind = ?operation.kind,
-                    conversion = ?operation.conversion_plan(),
                     inputs = ?operation.inputs,
                     results = ?operation.results,
                     ?error,
@@ -470,16 +467,16 @@ fn operation_provenance(operation: &MidOperation) -> WorkProvenance {
         operation: operation.source,
         value: operation.results.first().copied(),
         reason: match &operation.kind {
-            MidOperationKind::Convert(plan)
-                if plan.input.format.precision != plan.output.format.precision =>
-            {
-                WorkReason::PrecisionCast
-            }
-            MidOperationKind::Convert(_) => WorkReason::LayoutRearrangement,
-            MidOperationKind::Primitive(crate::Primitive::Copy { .. }) => {
-                WorkReason::OperatorInputs
-            }
-            MidOperationKind::Primitive(_) => WorkReason::OperatorKernel,
+            MidOperationKind::Compute(Compute::Kernel {
+                kernel: TileKernelSpec::Cast { .. },
+                ..
+            }) => WorkReason::PrecisionCast,
+            MidOperationKind::Copy {
+                policy: CopyPolicy::Automatic,
+                ..
+            } => WorkReason::OperatorInputs,
+            MidOperationKind::Copy { .. } => WorkReason::LayoutRearrangement,
+            MidOperationKind::Compute(_) => WorkReason::OperatorKernel,
             MidOperationKind::Repeat(_) => WorkReason::Repeat,
         },
     }

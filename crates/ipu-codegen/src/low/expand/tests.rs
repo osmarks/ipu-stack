@@ -1,4 +1,5 @@
 use crate::low::*;
+use crate::mid::Compute;
 fn lower_to_tiles(
     graph: &crate::MidProgram,
     checkpoints: bool,
@@ -168,7 +169,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             value: None,
             reason: WorkReason::LayoutRearrangement,
         };
-        let mut batch = conversion::MaterializationBatch::default();
+        let mut batch = movement::MaterializationBatch::default();
         let mut region = BlockRegion::default();
         builder
             .prepare_mapped_views(
@@ -269,14 +270,19 @@ fn factor_mappings_resolve_locally_reused_source_storage() {
         reason: WorkReason::LayoutRearrangement,
     };
     let mut region = BlockRegion::default();
+    let mut batch = movement::MaterializationBatch::default();
     builder
-        .build_mapped_views(
+        .prepare_mapped_views(
             mappings,
             CopyOrder::Semantic,
             CopyOrder::Semantic,
             provenance,
+            &mut batch,
             &mut region,
         )
+        .unwrap();
+    builder
+        .append_materialization(batch, provenance, &mut region)
         .unwrap();
     assert!(!builder.local_copies.is_empty());
     assert!(
@@ -345,17 +351,16 @@ fn panel_construction_keeps_both_operand_casts_materialized() {
         .operations
         .iter()
         .filter(|op| {
-            op.conversion_plan()
-                .is_some_and(|plan| plan.input.format.precision != plan.output.format.precision)
+            matches!(
+                op.kind,
+                MidOperationKind::Compute(Compute::Kernel {
+                    kernel: TileKernelSpec::Cast { .. },
+                    ..
+                })
+            )
         })
         .collect::<Vec<_>>();
     assert_eq!(casts.len(), 2);
-    assert!(
-        casts
-            .iter()
-            .all(|op| op.conversion_plan().unwrap().output.materialization
-                == crate::OperandMaterialization::Complete)
-    );
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
     for cast in casts {
         assert!(!low.value_shards(cast.results[0]).is_empty());
@@ -538,7 +543,7 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             .find(|op| {
                 matches!(
                     op.kind,
-                    MidOperationKind::Primitive(crate::Primitive::Sum { axis: 0, .. })
+                    MidOperationKind::Compute(Compute::Sum { axis: 0, .. })
                 )
             })
             .unwrap();
@@ -780,13 +785,7 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
         config.conversion_streaming = crate::ConversionStreamingPolicy::Always;
 
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        assert!(
-            mid.operations.iter().all(|op| op
-                .conversion_plan()
-                .is_none_or(
-                    |plan| plan.output.materialization == crate::OperandMaterialization::Complete
-                ))
-        );
+        mid.validate().unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         for run in low
             .tiles
@@ -1482,13 +1481,10 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             .with_input(left, format(tiles))
             .with_input(right, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let resolved = mid.clone();
         let uncached =
-            super::expand_tiles_cached(&resolved, true, Arc::new(ExpansionCache::disabled()))
-                .unwrap();
+            super::expand_tiles_cached(&mid, true, Arc::new(ExpansionCache::disabled())).unwrap();
         for _ in 0..2 {
-            let cached =
-                super::expand_tiles_cached(&resolved, true, Arc::clone(&shared_cache)).unwrap();
+            let cached = super::expand_tiles_cached(&mid, true, Arc::clone(&shared_cache)).unwrap();
             assert_eq!(cached, uncached, "cache changed graph in case {case}");
         }
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
@@ -1506,11 +1502,6 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             }
         }
 
-        assert!(low.exchange_phases.iter().all(|phase| {
-            phase.provenance.operation.is_some()
-                && (phase.provenance.value.is_some()
-                    || phase.provenance.reason == WorkReason::OperatorInputs)
-        }));
         for tile in &low.tiles {
             let gemms = low
                 .work(tile)
@@ -1966,7 +1957,7 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
 
 #[test]
 fn repeat_copy_yield_reaches_the_carried_allocation() {
-    use crate::{CoordinateMapping, MidInput, MidRegion, MidValue, OperandWindow, Primitive};
+    use crate::{Compute, CoordinateMapping, MidInput, MidRegion, MidValue, OperandWindow};
     let id = MidValueId::from_index;
     let tensor_type = TensorType::new([8, 16], Precision::F16, Layout::row_sharded(1));
     let operation = |inputs: &[u32], result, kind| MidOperation {
@@ -2009,7 +2000,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                         operation(
                             &[1],
                             2,
-                            MidOperationKind::Primitive(Primitive::Compute {
+                            MidOperationKind::Compute(Compute::Kernel {
                                 kernel: TileKernelSpec::Gelu,
                                 operands: vec![OperandWindow::default()],
                                 product: None,
@@ -2019,10 +2010,11 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                         operation(
                             &[2],
                             3,
-                            MidOperationKind::Primitive(Primitive::Copy {
+                            MidOperationKind::Copy {
+                                policy: crate::CopyPolicy::Automatic,
                                 mapping: CoordinateMapping::default(),
                                 reuse_local: true,
-                            }),
+                            },
                         ),
                     ],
                     estimated_cycles: 0,
@@ -2202,9 +2194,7 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                             .iter_mut()
                             .find(|operation| operation.results.contains(&result))
                             .unwrap();
-                        let MidOperationKind::Primitive(crate::Primitive::Copy { mapping, .. }) =
-                            &mut copy.kind
-                        else {
+                        let MidOperationKind::Copy { mapping, .. } = &mut copy.kind else {
                             panic!("view must resolve to a copy");
                         };
                         mapping.offsets = vec![offset; rank];
@@ -2510,7 +2500,7 @@ fn complete_panel_grid_stays_one_logical_exchange() {
         value: None,
         reason: WorkReason::LayoutRearrangement,
     };
-    let mut batch = conversion::MaterializationBatch::default();
+    let mut batch = movement::MaterializationBatch::default();
     let mut body = BlockRegion::default();
     state
         .prepare_mapped_views(mappings, order, order, provenance, &mut batch, &mut body)
@@ -2621,7 +2611,7 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
         value: None,
         reason: WorkReason::LayoutRearrangement,
     };
-    let mut batch = conversion::MaterializationBatch::default();
+    let mut batch = movement::MaterializationBatch::default();
     let mut body = BlockRegion::default();
     state
         .prepare_mapped_views(

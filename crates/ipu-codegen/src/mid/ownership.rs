@@ -69,7 +69,7 @@ fn disjoint_sources(
         }
         if matches!(
             operation.kind,
-            MidOperationKind::Primitive(Primitive::Sum { .. })
+            MidOperationKind::Compute(Compute::Sum { .. })
         ) {
             sums.extend(operation.results.iter().copied());
         }
@@ -81,8 +81,7 @@ fn disjoint_sources(
         let sources = operations[index..index + count]
             .iter()
             .filter_map(|operation| {
-                let MidOperationKind::Primitive(Primitive::Copy { mapping, .. }) = &operation.kind
-                else {
+                let MidOperationKind::Copy { mapping, .. } = &operation.kind else {
                     return None;
                 };
                 let input = *operation.inputs.first()?;
@@ -137,7 +136,7 @@ fn overlap_reductions(
         .map(|id| groups[id.index() as usize])
         .collect::<BTreeSet<_>>();
     for op in operations.iter() {
-        if matches!(op.kind, MidOperationKind::Primitive(Primitive::Sum { .. }))
+        if matches!(op.kind, MidOperationKind::Compute(Compute::Sum { .. }))
             && op.results.len() == 1
         {
             eligible.insert(groups[op.results[0].index() as usize]);
@@ -145,7 +144,7 @@ fn overlap_reductions(
         for input in op.read_values() {
             let group = groups[input.index() as usize];
             used.insert(group);
-            if !matches!(op.kind, MidOperationKind::Primitive(Primitive::Copy { .. })) {
+            if !matches!(op.kind, MidOperationKind::Copy { .. }) {
                 forbidden.insert(group);
             }
         }
@@ -153,7 +152,7 @@ fn overlap_reductions(
     eligible.retain(|group| used.contains(group) && !forbidden.contains(group));
     let eligible = |op: &MidOperation| {
         op.results.len() == 1
-            && matches!(op.kind, MidOperationKind::Primitive(Primitive::Sum { .. }))
+            && matches!(op.kind, MidOperationKind::Compute(Compute::Sum { .. }))
             && eligible.contains(&groups[op.results[0].index() as usize])
     };
     let mut changed = false;
@@ -171,8 +170,8 @@ fn overlap_reductions(
             if selected.len() >= limit
                 || !(matches!(
                     operation.kind,
-                    MidOperationKind::Primitive(Primitive::Copy { .. } | Primitive::Sum { .. })
-                ) || matches!(&operation.kind, MidOperationKind::Primitive(Primitive::Compute { output_aliases, product: Some(_), .. }) if output_aliases.is_empty()))
+                    MidOperationKind::Copy { .. } | MidOperationKind::Compute(Compute::Sum { .. })
+                ) || matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel { output_aliases, product: Some(_), .. }) if output_aliases.is_empty()))
                 || selected
                     .iter()
                     .any(|&index| conflicts(&operations[index], operation))
@@ -437,7 +436,7 @@ fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidV
             MidOperationKind::Repeat(repeat) => {
                 bind_compute_owners(&mut repeat.body.operations, values);
             }
-            MidOperationKind::Primitive(Primitive::Compute { operands, .. }) => {
+            MidOperationKind::Compute(Compute::Kernel { operands, .. }) => {
                 let offset = values[operation.results[0].index() as usize].tile_offset;
                 for input in operation.inputs.iter_mut().take(operands.len()) {
                     if values[input.index() as usize].tile_offset != offset {
@@ -451,10 +450,11 @@ fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidV
                             source: operation.source,
                             inputs: vec![*input],
                             results: vec![id],
-                            kind: MidOperationKind::Primitive(Primitive::Copy {
+                            kind: MidOperationKind::Copy {
+                                policy: crate::CopyPolicy::Automatic,
                                 mapping: CoordinateMapping::default(),
                                 reuse_local: true,
-                            }),
+                            },
                             estimated_cycles: 0,
                             estimated_exchange_cycles: 0,
                         });
@@ -540,14 +540,14 @@ mod tests {
                         source: None,
                         inputs: vec![MidValueId(0)],
                         results: vec![MidValueId(1)],
-                        kind: MidOperationKind::Convert(ConversionPlan {
-                            strategy: layout_conversion_strategy(
+                        kind: MidOperationKind::Copy {
+                            mapping: CoordinateMapping::default(),
+                            reuse_local: false,
+                            policy: default_copy_policy(
                                 &source.format.layout,
                                 &output.format.layout,
                             ),
-                            input: OperandRequirement::new(source.format),
-                            output: OperandRequirement::new(output.format),
-                        }),
+                        },
                         estimated_cycles: 0,
                         estimated_exchange_cycles: 0,
                     }],
@@ -609,7 +609,7 @@ mod tests {
             source: None,
             inputs: vec![MidValueId(input)],
             results: vec![MidValueId(output)],
-            kind: MidOperationKind::Primitive(primitive),
+            kind: primitive,
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         };
@@ -617,7 +617,8 @@ mod tests {
             operation(
                 input,
                 output,
-                Primitive::Copy {
+                MidOperationKind::Copy {
+                    policy: crate::CopyPolicy::Automatic,
                     mapping: CoordinateMapping {
                         offsets: vec![],
                         view: Some(AxisFactorView {
@@ -635,18 +636,18 @@ mod tests {
             operation(
                 4,
                 0,
-                Primitive::Sum {
+                MidOperationKind::Compute(Compute::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
-                },
+                }),
             ),
             operation(
                 5,
                 1,
-                Primitive::Sum {
+                MidOperationKind::Compute(Compute::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
-                },
+                }),
             ),
             copy(0, 2),
             copy(1, 3),
@@ -722,7 +723,7 @@ mod tests {
         );
 
         assert!(delayed.with_overlapped_reductions(1).is_none());
-        delayed.operations[1].kind = MidOperationKind::Primitive(Primitive::Compute {
+        delayed.operations[1].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Gelu,
             operands: Vec::new(),
             product: None,
