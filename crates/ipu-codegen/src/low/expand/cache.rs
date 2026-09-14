@@ -2,8 +2,8 @@
 //! Packing selection and low graph mutation remain in movement construction.
 use super::{ExpansionResult, view_byte_traversal};
 use crate::low::{BlockValue, BlockValueId, CopyOperation, LocalCopy, ShardView};
-use crate::mid::{ElementOrder, Precision, ShardExtent};
 use crate::storage::{CopyGeometry, CopyMapping, CopyOrder, ViewGeometry};
+use crate::tensor::{ElementOrder, Precision, ShardExtent};
 use hashbrown::HashTable;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
@@ -283,7 +283,7 @@ impl ExpansionCache {
 mod tests {
     use super::*;
     use crate::low::ShardDefinition;
-    use crate::mid::{Layout, TensorType};
+    use crate::tensor::{Layout, TensorType};
 
     #[test]
     fn memo_checks_full_keys_and_bounds_entries_even_on_hash_collisions() {

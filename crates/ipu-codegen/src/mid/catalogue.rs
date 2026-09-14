@@ -547,11 +547,7 @@ impl AmpWeightPlacement {
 
 pub(super) fn amp_output_column_blocks(precision: Precision) -> &'static [u32] {
     match precision {
-        Precision::F16 => &[
-            AMP_OUTPUT_COLUMN_BLOCK,
-            AMP_WIDE_OUTPUT_COLUMN_BLOCK,
-            AMP_NARROW_OUTPUT_COLUMN_BLOCK,
-        ],
+        Precision::F16 => &[AMP_OUTPUT_COLUMN_BLOCK, 128, 32],
         Precision::F32 | Precision::F8F143 { .. } => &[AMP_OUTPUT_COLUMN_BLOCK],
     }
 }

@@ -268,7 +268,7 @@ pub(super) fn ensure_format(
                 layout: row_layout.clone(),
             },
         };
-        if row_type.fp8_producer_layout(&target).is_some() {
+        if cast_order::producer_layout(&row_type, &target).is_some() {
             let price = |layout: &Layout| {
                 let staging = TensorType {
                     shape: input.shape.clone(),

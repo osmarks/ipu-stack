@@ -2,7 +2,7 @@
 //! specialization and costing. Distributed contraction axes live in mid Product.
 
 use crate::graph::AttentionOptions;
-use crate::mid::{Layout, Precision};
+use crate::tensor::{Layout, Precision};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

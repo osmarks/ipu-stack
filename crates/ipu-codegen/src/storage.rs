@@ -679,7 +679,7 @@ fn amp_micro_dimension(precision: Precision) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mid::ShardExtent;
+    use crate::tensor::ShardExtent;
     use crate::{
         AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AmpOrder, BlockMajorOrder, ElementOrder, Layout,
         MemoryClass, Precision, TensorTiling, TensorType,

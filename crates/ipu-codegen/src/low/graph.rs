@@ -1,9 +1,12 @@
 //! Expanded tile storage, calls and movement, before physical placement.
 //! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
-use super::*;
+use super::call::{KernelRequirements, MemoryOperand};
+use crate::graph::OperationId;
 use crate::kernel::TileKernelSpec;
+use crate::mid::{MidInput, MidValue, MidValueId};
 use crate::storage::CopyOrder;
+use crate::tensor::{ShardExtent, TensorType};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

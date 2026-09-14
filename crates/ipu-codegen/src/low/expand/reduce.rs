@@ -636,7 +636,7 @@ mod tests {
             .prepare_sum_partials(
                 [first, second],
                 &[output],
-                ReductionStaging::Complete,
+                crate::ReductionStaging::Complete,
                 WorkProvenance {
                     operation: None,
                     value: None,

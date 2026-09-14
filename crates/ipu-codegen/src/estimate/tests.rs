@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 fn output_stationary_dispatch() -> OperatorDispatch {
     OperatorDispatch::BlockedGemm {
         inner_block: AMP_INNER_BLOCK,
-        output_column_block: crate::mid::AMP_OUTPUT_COLUMN_BLOCK,
+        output_column_block: crate::tensor::AMP_OUTPUT_COLUMN_BLOCK,
         orientation: crate::GemmOrientation::Normal,
         distribution: GemmDistribution::OutputStationary,
     }
@@ -48,7 +48,7 @@ fn randomized_average_shard_storage_covers_spatial_work() {
                 tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::tensor::GridOrder::ColumnsFast,
             ),
         );
         let total = physical_elements(&tensor.shape, &tensor.format.layout)
@@ -135,14 +135,14 @@ fn randomized_conversion_traffic_counts_fragmented_multicasts() {
             tiles,
             row_partitions,
             column_partitions,
-            crate::mid::GridOrder::ColumnsFast,
+            crate::tensor::GridOrder::ColumnsFast,
         );
         let aligned_source = Layout::amp_output_grid(
             64,
             tiles,
             column_partitions,
             row_partitions,
-            crate::mid::GridOrder::ColumnsFast,
+            crate::tensor::GridOrder::ColumnsFast,
         );
         let destination =
             Layout::amp_output_replicated_grid(tiles, column_partitions, row_partitions);

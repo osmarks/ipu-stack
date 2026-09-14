@@ -1,6 +1,10 @@
-//! Logical tensor geometry shared by graph semantics, distributed construction
-//! and local binding. These relations do not choose kernels or physical storage.
+//! Tensor shapes, coordinate relations, layouts and resolved ownership.
+//! Shared by graph semantics, planning, storage traversal and kernel binding;
+//! this module describes geometry without choosing an algorithm or assigning addresses.
 
+mod layout;
+mod resolved;
+pub use layout::*;
 mod view;
 pub use view::AxisFactorView;
 

@@ -1,5 +1,7 @@
 use crate::low::*;
 use crate::mid::Compute;
+use crate::mid::ConcreteOperatorCandidate;
+use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
 fn lower_to_tiles(
     graph: &crate::MidProgram,
     checkpoints: bool,
@@ -517,14 +519,14 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             precision: Precision::F16,
             layout: Layout::amp_left_result_grid(
                 if result_column_partitions > 1 {
-                    crate::mid::AMP_COLUMN_MICRO
+                    crate::tensor::AMP_COLUMN_MICRO
                 } else {
                     output_columns
                 },
                 storage_rows * storage_columns,
                 storage_rows,
                 storage_columns,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::tensor::GridOrder::ColumnsFast,
             ),
         };
         let candidate = ConcreteOperatorCandidate::new(
@@ -873,7 +875,7 @@ fn randomized_tile_local_gelu_reorders_without_exchange() {
                 tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::tensor::GridOrder::ColumnsFast,
             ),
         };
         let mut graph = ComputeGraph::new();
@@ -1664,7 +1666,7 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
                     requirement.format.layout.order
                         == crate::ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
                             row_block: 64,
-                            column_block: crate::mid::AMP_COLUMN_MICRO as u16,
+                            column_block: crate::tensor::AMP_COLUMN_MICRO as u16,
                         })
                         && requirement.format.layout.tiling.tile_count == tiles
                         && requirement.format.layout.memory_class == MemoryClass::Ipu21Interleaved
@@ -1734,7 +1736,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
                 tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::tensor::GridOrder::ColumnsFast,
             ),
         };
         let right_format = TensorFormat {
@@ -1755,7 +1757,7 @@ fn randomized_partially_sharded_weight_grids_preserve_storage() {
                 tiles,
                 row_partitions,
                 column_partitions,
-                crate::mid::GridOrder::ColumnsFast,
+                crate::tensor::GridOrder::ColumnsFast,
             ),
         };
         let mut config = PipelineConfig::new(tiles)

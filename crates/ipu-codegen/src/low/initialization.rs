@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::kernel::TileKernelSpec;
+use crate::tensor::{AmpOrder, ElementOrder, Precision};
 use std::collections::BTreeSet;
 
 // These readers have no kernel-specific proof that padding can be ignored.
@@ -274,6 +275,8 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
 mod tests {
     use super::*;
     use crate::kernel::{GemmKernelMode, GemmWeightLoad};
+    use crate::mid::{MidInput, MidValueId};
+    use crate::tensor::{Layout, ShardExtent, TensorTiling};
     use crate::{AccumulationPrecision, KernelAccess, KernelRequirements, TensorType};
 
     fn fixture() -> TileGraph {

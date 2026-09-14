@@ -32,6 +32,14 @@ construction and rewrite boundaries. Numerical casts have one compute form;
 coordinate/layout movement has one Copy form with a selected movement policy.
 There is no `Convert` or outer `Primitive` wrapper.
 
+[tensor](../crates/ipu-codegen/src/tensor.rs) owns shapes, coordinate relations,
+formats, layouts and resolved ownership geometry. Graph construction, mid,
+storage traversal and kernel binding import these descriptions from that owner.
+Cast-motion layout preferences remain in [mid/cast_order.rs](../crates/ipu-codegen/src/mid/cast_order.rs),
+separate from the represented layouts; rearrangement availability comes from
+the kernel family's supported destination table. Low's root no longer imports
+and implicitly exposes every mid definition to its children.
+
 `TileGraph` owns the live operation list and finite-scratch requirement.
 `LowProgram` shares its arenas and derives per-tile indexes without changing
 execution. Padding removal runs on the graph before this projection; costing,

@@ -2121,7 +2121,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         precision: Precision::F8F143 { scale_exponent: -4 },
         layout: Layout::amp_left(1, 32),
     };
-    assert!(narrow.fp8_producer_layout(&target).is_some());
+    assert!(cast_order::producer_layout(&narrow, &target).is_some());
 }
 
 #[test]

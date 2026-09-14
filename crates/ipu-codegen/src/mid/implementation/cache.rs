@@ -3,7 +3,8 @@
 //! the actual boundary types, including layout and precision.
 
 use super::implement;
-use crate::mid::{MidProgram, OperatorPlan, TensorType};
+use crate::mid::{MidProgram, OperatorPlan};
+use crate::tensor::TensorType;
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

@@ -15,7 +15,6 @@ pub use expand::{ExpansionError, ExpansionResult, logical_view_byte_spans, shard
 pub use graph::*;
 
 use crate::graph::OperationId;
-use crate::mid::*;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

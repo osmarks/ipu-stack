@@ -17,6 +17,7 @@ mod relay;
 mod repeat;
 use crate::graph::OperationId;
 use crate::low::*;
+use crate::mid::Compute;
 use crate::storage::{ByteSpan, StorageError};
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder,

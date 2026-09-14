@@ -3,8 +3,8 @@
 //! Axis partitions are resolved once, independently of element encoding and
 //! physical addresses. Replicas select the same bounds without duplicating them.
 
+use super::TensorShape;
 use super::{AxisTiling, Layout, LayoutError, Padding, ShardExtent, TensorTiling};
-use crate::graph::TensorShape;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedAxis {
@@ -313,7 +313,7 @@ impl AxisTiling {
 }
 
 impl TensorTiling {
-    pub(super) fn axis_strides(&self) -> Result<Vec<u32>, LayoutError> {
+    pub(crate) fn axis_strides(&self) -> Result<Vec<u32>, LayoutError> {
         let mut packed_stride = u32::from(self.replicas);
         self.axes
             .iter()

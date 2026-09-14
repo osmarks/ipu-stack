@@ -143,13 +143,11 @@ impl<'a> CandidateSearch<'a> {
                                 && input
                                     .format
                                     .supports_micro_panel_exchange(&requirement.format))
-                            || !requirement.format.layout.order.requires_direct_population()
+                            || !requires_direct_population(requirement.format.layout.order)
                             || (current.order == ElementOrder::RowMajor
-                                && requirement
-                                    .format
-                                    .layout
-                                    .order
-                                    .supports_row_major_population())
+                                && crate::kernel::rearrange::supports_row_major_population(
+                                    requirement.format.layout.order,
+                                ))
                     })
             })
             .collect::<Vec<_>>();
@@ -177,7 +175,7 @@ impl<'a> CandidateSearch<'a> {
                 let panel_population = input_types.iter().zip(&plan.requirements.inputs).any(
                     |(input, requirement)| {
                         input.format.layout.order != requirement.format.layout.order
-                            && requirement.format.layout.order.requires_direct_population()
+                            && requires_direct_population(requirement.format.layout.order)
                             && input
                                 .format
                                 .supports_micro_panel_exchange(&requirement.format)
@@ -200,4 +198,15 @@ impl<'a> CandidateSearch<'a> {
             .collect::<Vec<_>>();
         Ok(candidate_plans)
     }
+}
+
+// Candidate construction reserves these K-major formats for direct panel
+// population or the family's supported whole-value packing path. This is a
+// planner restriction, not a property of tensor-coordinate geometry.
+fn requires_direct_population(order: ElementOrder) -> bool {
+    matches!(
+        order,
+        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
+            | ElementOrder::Amp(AmpOrder::TransposedRight)
+    )
 }

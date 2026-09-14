@@ -2,6 +2,10 @@
 
 use super::*;
 
+pub(crate) fn supports_row_major_population(order: ElementOrder) -> bool {
+    order == ElementOrder::RowMajor || RearrangeTarget::from_order(order).is_some()
+}
+
 impl KernelBuildPlan {
     pub(super) fn add_unpack(&mut self, shape: (UnpackSource, u32, u32, u32, u32)) {
         let (order, logical_rows, physical_rows, logical_columns, physical_columns) = shape;

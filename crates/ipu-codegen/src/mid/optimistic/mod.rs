@@ -16,7 +16,8 @@ pub use search::{plan_graph, plan_region};
 use std::ops::Range;
 use std::sync::Arc;
 // Expose the existing mid vocabulary, rather than a second layout/algorithm IR.
-pub use super::{ElementOrder, MidProgram, OperatorPlan};
+pub use super::{MidProgram, OperatorPlan};
+pub use crate::tensor::ElementOrder;
 
 /// Region boundary formats are fixed for one invocation. Internal formats are not.
 #[derive(Clone, Debug)]

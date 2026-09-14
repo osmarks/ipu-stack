@@ -106,7 +106,7 @@ pub fn enumerate_conversions(
             && matches!(to.format.precision, Precision::F8F143 { .. })
             && from.format.layout.tiling != to.format.layout.tiling
         {
-            let ordinary_eligible = from.fp8_producer_layout(&to.format).is_some();
+            let ordinary_eligible = cast_order::producer_layout(from, &to.format).is_some();
             if !ordinary_eligible {
                 path.steps[cast_index]
                     .assumptions
@@ -266,7 +266,7 @@ fn local_supported(a: &TensorType, b: &TensorType, kind: &TransformKind) -> bool
                 && matches!(b.format.precision, Precision::F8F143 { .. })
                 && a.format.layout.order == ElementOrder::RowMajor
                 && b.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
-                && a.fp8_producer_layout(&b.format).as_ref() == Some(&b.format.layout) =>
+                && cast_order::producer_layout(a, &b.format).as_ref() == Some(&b.format.layout) =>
         {
             TileKernelSpec::Cast {
                 from: a.format.precision,
@@ -280,7 +280,7 @@ fn local_supported(a: &TensorType, b: &TensorType, kind: &TransformKind) -> bool
                 && a.format.layout.order != ElementOrder::RowMajor
                 && !(a.format.precision == Precision::F16
                     && matches!(b.format.precision, Precision::F8F143 { .. })
-                    && a.fp8_cast_layout().as_ref() == Some(&b.format.layout))
+                    && cast_order::cast_layout(a).as_ref() == Some(&b.format.layout))
             {
                 return false;
             }

@@ -2,7 +2,7 @@
 //! prefix and chunk boundaries keep stores out of the input's memory elements.
 //! Whether the extra prefix saves storage belongs to the mid donation rewrite.
 
-use crate::mid::{AmpOrder, ElementOrder};
+use crate::tensor::{AmpOrder, ElementOrder};
 
 /// Keep the output in earlier memory elements than each input chunk.
 pub(crate) const CAST_PREFIX_BYTES: u32 = 32768;

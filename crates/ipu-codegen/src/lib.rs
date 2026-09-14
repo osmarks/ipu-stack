@@ -29,7 +29,6 @@ pub use exchange::{
     PhysicalExchangePhase, inactive_exchange_program, schedule_exchange_problem,
     schedule_exchange_problem_with_priority, select_exchange_schedule, validate_exchange_schedule,
 };
-pub(crate) use graph::*;
 pub use graph::{
     AttentionOptions, AttentionScale, AxisFactorView, AxisSlice, ComputeGraph, GemmOptions,
     GraphError, GraphInput, GraphInputKind, Operation, OperationId, OperationKind, Region, Repeat,
@@ -44,10 +43,9 @@ pub use low::{
 pub(crate) use memory::*;
 pub(crate) use mid::*;
 pub use mid::{
-    AMP_COLUMN_MICRO, AmpOrder, AttentionProducts, AttentionStrategy, BlockMajorOrder,
-    ConversionStreamingPolicy, GemmOrientation, GemmOutputPacking, GemmPlanConstraint, GridOrder,
-    Layout, LocalOperandStaging, MemoryClass, MidOperator, OperatorCandidate, PipelineConfig,
-    Precision, ReductionStaging, ShardExtent, TensorFormat, TensorType,
+    AttentionProducts, AttentionStrategy, ConversionStreamingPolicy, GemmOrientation,
+    GemmOutputPacking, GemmPlanConstraint, LocalOperandStaging, MidOperator, OperatorCandidate,
+    PipelineConfig, ReductionStaging,
 };
 pub use package::{
     CompiledPackage, DiagnosticShard, DiagnosticTensor, ExpansionBenchmark, ExpansionTiming,
@@ -58,6 +56,11 @@ pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
 pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
+pub(crate) use tensor::*;
+pub use tensor::{
+    AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, GridOrder, Layout, MemoryClass, Precision,
+    ShardExtent, TensorFormat, TensorType,
+};
 pub(crate) use tile::*;
 
 const INCOMING_BASE: u8 = 0xa4;

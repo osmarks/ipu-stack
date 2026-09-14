@@ -3,6 +3,7 @@
 //! Geometry helpers describe coverage; explicit policies constrain realization.
 
 use super::*;
+use crate::tensor::{BlockMajorOrder, TensorFormat};
 
 /// Work needed to populate ordinary destination blocks at one exchange boundary.
 #[derive(Default)]

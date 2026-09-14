@@ -39,6 +39,10 @@ access requirements; element-separation constraints can name every result.
 Mid operands now declare elementwise/result indexing or local windows. Graph
 validation, ownership projection, low binding and product batch selection share
 the logical broadcast relation; generic low kernel-name broadcasting is removed.
+Tensor shapes, layout definitions and resolved ownership geometry now have a
+neutral tensor owner. Cast-motion preferences and candidate population policy
+are outside those geometry types, and row-major packing availability comes from
+the rearrangement family rather than a duplicate format list.
 Complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks

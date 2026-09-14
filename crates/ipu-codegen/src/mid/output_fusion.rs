@@ -110,9 +110,7 @@ fn fuse_fp8_outputs_at(
             if !at_source && output.tensor_type.format.layout.order == ElementOrder::RowMajor {
                 Some(input.tensor_type.format.layout.clone())
             } else {
-                input
-                    .tensor_type
-                    .fp8_producer_layout(&output.tensor_type.format)
+                cast_order::producer_layout(&input.tensor_type, &output.tensor_type.format)
             };
         let Some(layout) = layout else { continue };
         if input.tensor_type.format.layout.order != capability.input_order

@@ -21,19 +21,17 @@ pub use compute::*;
 pub use copy::CoordinateMapping;
 mod candidates;
 mod catalogue;
-mod layout;
 mod lowering;
 mod operator;
 mod ownership;
-mod resolved;
 pub use crate::graph::AxisFactorView;
 
 use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
+use crate::tensor::*;
 use crate::{CopyPolicy, default_copy_policy};
 use candidates::*;
 use catalogue::*;
 pub use catalogue::{ConcreteOperatorCandidate, OperatorCandidate, OperatorFormatPolicy};
-pub use layout::*;
 #[cfg(test)]
 pub(crate) use lowering::lower;
 pub use operator::*;

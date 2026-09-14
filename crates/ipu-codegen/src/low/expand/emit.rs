@@ -1,6 +1,7 @@
 //! Append tile movement and compute operations with bound contracts.
 
 use super::*;
+use crate::tensor::TensorFormat;
 
 impl TileGraphBuilder {
     pub(super) fn kernel_run(

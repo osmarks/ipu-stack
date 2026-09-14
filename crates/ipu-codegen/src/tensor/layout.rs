@@ -1,6 +1,6 @@
 //! Tensor formats, ownership, padding, and logical shard geometry.
 
-use super::*;
+use super::TensorShape;
 use serde::{Deserialize, Serialize};
 
 /// In-memory representation of one tensor element.
@@ -66,9 +66,7 @@ pub enum BlockMajorOrder {
 }
 
 pub const AMP_INNER_BLOCK: u32 = 64;
-pub(super) const AMP_NARROW_OUTPUT_COLUMN_BLOCK: u32 = 32;
 pub const AMP_OUTPUT_COLUMN_BLOCK: u32 = 64;
-pub(super) const AMP_WIDE_OUTPUT_COLUMN_BLOCK: u32 = 128;
 pub const AMP_COLUMN_MICRO: u32 = 16;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -128,29 +126,6 @@ impl ElementOrder {
         )
     }
 
-    /// This packing is consumed as contiguous K-major panels, while a generic
-    /// intersection rearrangement produces rectangular tensor-coordinate
-    /// views. It must therefore be selected for an automatic input or produced
-    /// by a specialized operator/local staging path.
-    pub(super) fn requires_direct_population(&self) -> bool {
-        matches!(
-            self,
-            Self::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
-                | Self::Amp(AmpOrder::TransposedRight)
-        )
-    }
-
-    /// Whether a row-major logical staging shard can be transformed locally
-    /// into this order by the generated conversion kernels.
-    pub(super) fn supports_row_major_population(self) -> bool {
-        matches!(
-            self,
-            Self::RowMajor
-                | Self::BlockMajor(BlockMajorOrder::Matrix { .. })
-                | Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
-        )
-    }
-
     pub(crate) const fn micro_panel_order(self) -> Option<MicroPanelOrder> {
         match self {
             Self::Amp(AmpOrder::Left | AmpOrder::TransposedRight)
@@ -187,9 +162,7 @@ pub enum MemoryClass {
     Ipu21Interleaved,
 }
 
-/// Maximum per-tile bytes attributed to each address/load class. The classes
-/// share physical tile SRAM, so feasibility must check both the individual
-/// interleaved-region limit and their combined size.
+/// A semantic tensor axis, or canonical flattened ownership across all axes.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TensorAxis {
     FromStart(u16),
@@ -396,7 +369,7 @@ impl Layout {
         Self::row_major(TensorTiling::sharded(TensorAxis::FromEnd(3), tile_count))
     }
 
-    pub(super) fn attention_tiling(heads: u16, query_partitions: u16) -> TensorTiling {
+    pub(crate) fn attention_tiling(heads: u16, query_partitions: u16) -> TensorTiling {
         TensorTiling {
             tile_count: heads.saturating_mul(query_partitions),
             replicas: 1,
@@ -895,94 +868,6 @@ pub struct TensorType {
 }
 
 impl TensorType {
-    /// Keep producer ownership while completing FP8's 32-element panels.
-    /// Producer-local FP8 panels available without an intermediate F16 pack.
-    pub(crate) fn fp8_producer_layout(&self, target: &TensorFormat) -> Option<Layout> {
-        let mut layout = self.fp8_cast_layout()?;
-        if layout.order == ElementOrder::RowMajor && target.layout.order != ElementOrder::RowMajor {
-            let resolved = layout.resolve(&self.shape).ok()?;
-            let axes = resolved.axes()?;
-            if axes.len() < 2 || !axes.last()?.extents_are_multiple_of(4) {
-                return None;
-            }
-            if !axes.last()?.extents_are_multiple_of(32) {
-                let rank = self.shape.0.len();
-                if let Some(axis) = layout
-                    .tiling
-                    .axes
-                    .iter_mut()
-                    .find(|axis| axis.axis.resolve(rank) == Ok(rank - 1))
-                {
-                    axis.shard_padding_multiple = axis.shard_padding_multiple.max(32);
-                    axis.padding = Padding::Zero;
-                } else {
-                    layout.tiling.axes.push(
-                        AxisTiling::new(TensorAxis::FromEnd(1), 1, 1, Padding::Zero)
-                            .with_shard_padding_multiple(32),
-                    );
-                }
-            }
-            layout.order = ElementOrder::Amp(AmpOrder::Left);
-        }
-        let quantized = TensorFormat {
-            precision: target.precision,
-            layout: layout.clone(),
-        };
-        layout.resolve(&self.shape).ok()?;
-        (layout.order == target.layout.order || quantized.supports_micro_panel_exchange(target))
-            .then_some(layout)
-    }
-
-    pub(crate) fn fp8_cast_layout(&self) -> Option<Layout> {
-        let mut layout = self.format.layout.clone();
-        let axis_from_end = match layout.order {
-            ElementOrder::Amp(AmpOrder::Left) => {
-                if layout.resolve(&self.shape).ok().is_some_and(|resolved| {
-                    resolved
-                        .axes()
-                        .and_then(|axes| axes.last())
-                        .is_some_and(|axis| axis.extents_are_multiple_of(32))
-                }) {
-                    return Some(layout);
-                }
-                // A narrow final tail is harmless, but padding every producer
-                // panel would turn a bulk exchange into strided short packets.
-                if !layout.resolve(&self.shape).ok().is_some_and(|resolved| {
-                    resolved
-                        .axes()
-                        .and_then(|axes| axes.last())
-                        .is_some_and(|axis| axis.complete_panels_except_tail(32))
-                }) {
-                    return None;
-                }
-                let axis = layout.tiling.axes.iter_mut().find(|axis| {
-                    matches!(axis.axis, TensorAxis::FromEnd(1))
-                        || axis.axis == TensorAxis::FromStart((self.shape.0.len() - 1) as u16)
-                })?;
-                axis.shard_padding_multiple = axis.shard_padding_multiple.max(32);
-                return Some(layout);
-            }
-            ElementOrder::RowMajor
-            | ElementOrder::Amp(AmpOrder::Output | AmpOrder::TransposedOutput) => {
-                return Some(layout);
-            }
-            ElementOrder::Amp(AmpOrder::TransposedRight) => 1,
-            ElementOrder::Amp(AmpOrder::TransposedLeft) => 2,
-            ElementOrder::BlockMajor(
-                BlockMajorOrder::Matrix { row_block, .. }
-                | BlockMajorOrder::TransposedMatrix { row_block, .. },
-            ) => return row_block.is_multiple_of(32).then_some(layout),
-        };
-        let valid = layout.resolve(&self.shape).ok().is_some_and(|resolved| {
-            resolved.axes().is_some_and(|axes| {
-                axes.len()
-                    .checked_sub(axis_from_end)
-                    .is_some_and(|axis| axes[axis].extents_are_multiple_of(32))
-            })
-        });
-        valid.then_some(layout)
-    }
-
     pub fn new(shape: impl IntoIterator<Item = u32>, precision: Precision, layout: Layout) -> Self {
         Self {
             shape: TensorShape::new(shape),

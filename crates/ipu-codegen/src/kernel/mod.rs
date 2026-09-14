@@ -7,7 +7,7 @@ pub(crate) mod cast;
 pub(crate) mod cost;
 mod gemm;
 mod output;
-mod rearrange;
+pub(crate) mod rearrange;
 mod spec;
 mod specialization;
 pub use spec::*;

@@ -5,7 +5,7 @@ use super::{
     ByteSpan, ByteTraversal, StorageError, StorageResult, TensorStorage, byte_traversal,
     storage_bytes,
 };
-use crate::mid::ShardExtent;
+use crate::tensor::ShardExtent;
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -196,7 +196,7 @@ pub(crate) fn for_each_copy_span(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mid::{Layout, Precision, TensorTiling, TensorType};
+    use crate::tensor::{Layout, Precision, TensorTiling, TensorType};
 
     #[test]
     fn copies_initialize_uncovered_padding_and_view_tails() {

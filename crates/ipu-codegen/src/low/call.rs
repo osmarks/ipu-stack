@@ -1,7 +1,8 @@
 //! Address-independent kernel access contracts and call geometry.
 
-use super::*;
+use super::graph::{KernelRun, ShardView};
 use crate::kernel::TileKernelSpec;
+use crate::tensor::TensorFormat;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryOperand {
