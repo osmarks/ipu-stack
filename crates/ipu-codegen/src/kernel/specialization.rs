@@ -240,7 +240,7 @@ impl KernelInventory {
 
 pub(super) fn rearrangement_specialization(
     order: RearrangeTarget,
-    logical_rows: u32,
+    mut logical_rows: u32,
     physical_rows: u32,
     logical_columns: u32,
     physical_columns: u32,
@@ -254,14 +254,13 @@ pub(super) fn rearrangement_specialization(
     {
         // Row tails share one worker, but column alignment selects wide loads.
         // Erasing it could incorrectly admit a two-halfword tail to ld64.
-        (order, 0, physical_rows, logical_columns, physical_columns)
-    } else {
-        (
-            order,
-            logical_rows,
-            physical_rows,
-            logical_columns,
-            physical_columns,
-        )
+        logical_rows = 0;
     }
+    (
+        order,
+        logical_rows,
+        physical_rows,
+        logical_columns,
+        physical_columns,
+    )
 }
