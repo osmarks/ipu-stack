@@ -248,6 +248,7 @@ impl Application {
                     tile.physical_tile
                 )));
             }
+            let mut ranges = Vec::with_capacity(tile.segments.len());
             for segment in &tile.segments {
                 let end = segment
                     .address
@@ -266,13 +267,10 @@ impl Application {
                         segment.data.len(),
                     )));
                 }
+                if segment.memory_size != 0 {
+                    ranges.push((segment.address, end));
+                }
             }
-            let mut ranges: Vec<_> = tile
-                .segments
-                .iter()
-                .filter(|segment| segment.memory_size != 0)
-                .map(|segment| (segment.address, segment.address + segment.memory_size))
-                .collect();
             ranges.sort_unstable();
             if let Some(pair) = ranges.windows(2).find(|pair| pair[0].1 > pair[1].0) {
                 return Err(PackageError::Invalid(format!(
