@@ -73,15 +73,7 @@ impl Checkpoint {
             && self.lookahead.is_none_or(|previous| {
                 let next = next_event
                     .filter(|event| event.cycles < sender_start)
-                    .map_or(sender_start, |event| {
-                        event.cycles.saturating_sub(
-                            if event.kind == ReceiveEventKind::OutgoingBase {
-                                EXCHANGE_BASE_WRITE_CYCLES
-                            } else {
-                                1
-                            },
-                        )
-                    });
+                    .map_or(sender_start, ReceiveEvent::issue_start);
                 next == previous
             })
     }
