@@ -750,6 +750,18 @@ impl PendingTransfer {
         self.width.item_count(self.words)
     }
 
+    /// Payload eligibility only; topology and route encoding are checked separately.
+    fn supports_paired_width(&self) -> bool {
+        self.words >= 2
+            && self.words.is_multiple_of(2)
+            && self
+                .source_addresses
+                .iter()
+                .copied()
+                .chain(self.destinations.iter().map(|&(_, address)| address))
+                .all(|address| address.is_multiple_of(8))
+    }
+
     fn refresh_source_elements(&mut self) {
         self.source_elements = self
             .source_addresses
@@ -861,14 +873,7 @@ fn paired_transfer_alternatives(
 ) -> Result<Vec<Option<PendingTransfer>>, ExchangeLoweringError> {
     let mut alternatives = Vec::with_capacity(pending.len());
     for transfer in pending {
-        if transfer.width != ExchangeItemWidth::Word32
-            || transfer.words < 2
-            || transfer.words & 1 != 0
-            || transfer
-                .source_addresses
-                .iter()
-                .any(|address| address & 0b111 != 0)
-        {
+        if transfer.width != ExchangeItemWidth::Word32 || !transfer.supports_paired_width() {
             alternatives.push(None);
             continue;
         }
@@ -887,14 +892,12 @@ fn paired_transfer_alternatives(
         }
         let mut paired_destinations = Vec::with_capacity(transfer.destinations.len());
         let all_destinations_pairable = by_pair.into_values().all(|destinations| {
-            let complete_pair = destinations.len() == 2
+            // Each receiver independently programs its SRAM pointer; only
+            // membership in a complete receive pair is required here.
+            let pairable = destinations.len() == 2
                 && topology
                     .paired_logical(destinations[0].0)
                     .is_ok_and(|paired| paired == destinations[1].0);
-            // Pairing shares the receive stream, not its SRAM pointer. Each
-            // receiver row independently programs its destination address.
-            let pairable =
-                complete_pair && destinations.iter().all(|(_, address)| address & 0b111 == 0);
             if pairable {
                 paired_destinations.extend(destinations);
             }

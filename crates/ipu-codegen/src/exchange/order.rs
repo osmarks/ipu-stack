@@ -654,18 +654,7 @@ fn balance_stream_chunks(
     }
     // Even slots are sending endpoints, odd slots receiving endpoints. A tile
     // can send and receive together; its paired sender occupies a second TX.
-    let endpoints = |index: usize| {
-        let transfer = &problem.transfers[index];
-        std::iter::once(transfer.source)
-            .chain(transfer.reserved_source)
-            .map(|tile| 2 * usize::from(tile))
-            .chain(
-                transfer
-                    .destinations
-                    .iter()
-                    .map(|&(tile, _)| 2 * usize::from(tile) + 1),
-            )
-    };
+    let endpoints = |index: usize| problem.transfers[index].pressure_resources(true);
     let mut loads = vec![(0u64, 0u64); 2 * usize::from(problem.tile_count)];
     for (index, transfer) in problem.transfers.iter().enumerate() {
         let work = u64::from(transfer.item_count().unwrap_or(transfer.words));

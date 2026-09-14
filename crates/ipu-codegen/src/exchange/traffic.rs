@@ -121,17 +121,7 @@ impl MappingPhase {
             for &resource in &resources {
                 loads[resource] += u64::from(transfer.words);
             }
-            if transfer.words >= 2
-                && transfer.words.is_multiple_of(2)
-                && transfer
-                    .source_addresses
-                    .iter()
-                    .all(|address| address.is_multiple_of(8))
-                && transfer
-                    .destinations
-                    .iter()
-                    .all(|&(_, address)| address.is_multiple_of(8))
-            {
+            if transfer.supports_paired_width() {
                 pairable.push(MappingTransfer {
                     source: transfer.source,
                     destinations: transfer.destinations,

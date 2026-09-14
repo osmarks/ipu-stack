@@ -666,17 +666,23 @@ fn randomized_eligible_physical_pairs_use_double_width_transfers() {
         assert_eq!(paired_destinations, expected_destinations);
         assert_eq!(paired.source_addresses, original.source_addresses);
 
-        let mut inexact = original.clone();
-        if random.bool() {
-            inexact.words -= 1;
-        } else {
-            inexact.destinations.pop();
+        for failure in 0..4 {
+            let mut inexact = original.clone();
+            match failure {
+                0 => inexact.words -= 1,
+                1 => {
+                    inexact.destinations.pop();
+                }
+                // Every Repeat source must support the selected width.
+                2 => inexact.source_addresses.push(source_address + 4),
+                _ => inexact.destinations[0].1 += 4,
+            }
+            assert!(
+                paired_transfer_alternatives(std::slice::from_ref(&inexact), &topology, tile_count)
+                    .unwrap()[0]
+                    .is_none()
+            );
         }
-        assert!(
-            paired_transfer_alternatives(std::slice::from_ref(&inexact), &topology, tile_count)
-                .unwrap()[0]
-                .is_none()
-        );
     }
 }
 
