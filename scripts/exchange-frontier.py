@@ -39,8 +39,7 @@ def render(rows, output):
             group = phases[start:start+12]
             directory = output / f'phases-{group[0]}-{group[-1]}'
             directory.mkdir(exist_ok=True)
-            render([r for r in rows if r['phase'] in group], directory)
-            chosen.extend(json.loads((directory/'frontier.json').read_text()))
+            chosen.extend(render([r for r in rows if r['phase'] in group], directory))
             links.append(f'<li><a href="{directory.name}/index.html">Phases {group[0]}–{group[-1]}</a></li>')
         write_tables(rows, chosen, output)
         (output/'index.html').write_text('''<!doctype html><meta charset="utf-8">
@@ -50,7 +49,7 @@ def render(rows, output):
 <p><a href="results.csv">All measurements</a> ·
 <a href="frontier.csv">Frontier points</a> · <a href="manifest.json">Commands</a></p><ul>'''
             + '\n'.join(links) + '</ul>')
-        return
+        return chosen
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -141,6 +140,7 @@ Suffixes u/p mark ordinary/paired alternatives, and (+N) counts equivalent confi
 <img src="maximum_row_bytes.svg" alt="Cycles versus maximum row storage per tile">
 <img src="total_row_bytes.svg" alt="Cycles versus total row storage">
 ''')
+    return chosen
 
 
 def write_tables(rows, chosen, output):
