@@ -33,26 +33,10 @@
 //! ```
 
 mod builder;
-mod view;
-pub use view::AxisFactorView;
+pub use crate::tensor::{AxisFactorView, TensorShape};
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-
-/// Logical tensor dimensions. Shapes are semantic graph information; storage
-/// precision and physical layout are selected during mid-level lowering.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TensorShape(pub Vec<u32>);
-
-impl TensorShape {
-    pub fn new(dimensions: impl IntoIterator<Item = u32>) -> Self {
-        Self(dimensions.into_iter().collect())
-    }
-
-    pub fn elements(&self) -> u64 {
-        self.0.iter().copied().map(u64::from).product()
-    }
-}
 
 /// Stable identity of an operation, used for diagnostics and transformations.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -562,7 +546,10 @@ fn infer_shape(
                     "GEMM inner dimensions do not match".into(),
                 ));
             }
-            let mut output = broadcast(&left.0[..left.0.len() - 2], &right.0[..right.0.len() - 2])?;
+            let mut output = crate::tensor::broadcast_shape(
+                &left.0[..left.0.len() - 2],
+                &right.0[..right.0.len() - 2],
+            )?;
             output.push(left_rows);
             output.push(right_columns);
             Ok(TensorShape(output))
@@ -583,7 +570,10 @@ fn infer_shape(
             Ok(x.clone())
         }
         OperationKind::Gelu => Ok(input(0)?.clone()),
-        OperationKind::Add => Ok(TensorShape(broadcast(&input(0)?.0, &input(1)?.0)?)),
+        OperationKind::Add => Ok(TensorShape(crate::tensor::broadcast_shape(
+            &input(0)?.0,
+            &input(1)?.0,
+        )?)),
         OperationKind::View(view) => view.output_shape(input(0)?).ok_or_else(|| {
             GraphError::InvalidShape("view axes, factor, or output dimensions are invalid".into())
         }),
@@ -612,8 +602,11 @@ fn infer_shape(
                 ));
             }
             let q_batch = &query.0[..query.0.len() - 2];
-            let kv_batch = broadcast(&key.0[..key.0.len() - 2], &value.0[..value.0.len() - 2])?;
-            let mut output = broadcast(q_batch, &kv_batch)?;
+            let kv_batch = crate::tensor::broadcast_shape(
+                &key.0[..key.0.len() - 2],
+                &value.0[..value.0.len() - 2],
+            )?;
+            let mut output = crate::tensor::broadcast_shape(q_batch, &kv_batch)?;
             output.push(query.0[query.0.len() - 2]);
             output.push(value.0[value.0.len() - 1]);
             Ok(TensorShape(output))
@@ -624,28 +617,10 @@ fn infer_shape(
     }
 }
 
-fn broadcast(left: &[u32], right: &[u32]) -> GraphResult<Vec<u32>> {
-    let rank = left.len().max(right.len());
-    let mut output = Vec::with_capacity(rank);
-    for index in 0..rank {
-        let left = if index + left.len() >= rank {
-            left[index + left.len() - rank]
-        } else {
-            1
-        };
-        let right = if index + right.len() >= rank {
-            right[index + right.len() - rank]
-        } else {
-            1
-        };
-        if left != right && left != 1 && right != 1 {
-            return Err(GraphError::InvalidShape(format!(
-                "dimensions {left} and {right} cannot be broadcast"
-            )));
-        }
-        output.push(left.max(right));
+impl From<crate::tensor::BroadcastError> for GraphError {
+    fn from(error: crate::tensor::BroadcastError) -> Self {
+        Self::InvalidShape(error.to_string())
     }
-    Ok(output)
 }
 
 fn allocate_values(next_value: &mut u32, count: usize) -> Vec<ValueId> {

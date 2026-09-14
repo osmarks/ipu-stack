@@ -223,7 +223,7 @@ fn reusable_cast(operation: &MidOperation, input: MidValueId) -> Option<MidValue
     (operation.inputs.as_slice() == [input]
         && matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Cast { .. }, operands, output_aliases, ..
-        }) if operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty()))
+        }) if operands.len() == 1 && operands[0] == (OperandIndexing::Elementwise { result: 0 }) && output_aliases.is_empty()))
     .then(|| operation.results[0])
 }
 

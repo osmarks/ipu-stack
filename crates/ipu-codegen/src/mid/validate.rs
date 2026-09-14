@@ -4,7 +4,7 @@
 use super::{
     LoweringError, LoweringResult, MidOperation, MidOperationKind, MidProgram, MidValueId,
 };
-use crate::{Compute, TileKernelSpec};
+use crate::{Compute, OperandIndexing, TileKernelSpec};
 use std::collections::BTreeSet;
 
 impl MidProgram {
@@ -124,6 +124,32 @@ impl MidProgram {
                 }) => {
                     arity.1 != 0
                         && operands.len() <= arity.0
+                        && operation
+                            .inputs
+                            .iter()
+                            .zip(operands)
+                            .all(|(&input, indexing)| {
+                                let input = &self.values[input.index() as usize].tensor_type;
+                                match indexing {
+                                    OperandIndexing::Elementwise { result } => {
+                                        operation.results.get(*result).is_some_and(|result| {
+                                            crate::tensor::Broadcast::new(
+                                                &input.shape.0,
+                                                &self.values[result.index() as usize]
+                                                    .tensor_type
+                                                    .shape
+                                                    .0,
+                                            )
+                                            .is_some()
+                                        })
+                                    }
+                                    OperandIndexing::Local(window) => {
+                                        window.0.iter().all(|&(axis, start, end)| {
+                                            usize::from(axis) < input.shape.0.len() && start < end
+                                        })
+                                    }
+                                }
+                            })
                         && match kernel {
                             TileKernelSpec::Gemm { .. } => false, // Distributed products have explicit axes and blocking.
                             TileKernelSpec::Cast { from, to } => {

@@ -73,7 +73,9 @@ fn fuse_fp8_outputs_at(
             continue;
         };
         if producer.inputs.len() != capability.operands
-            || operands.iter().any(|window| !window.0.is_empty())
+            || operands
+                .iter()
+                .any(|indexing| *indexing != (OperandIndexing::Elementwise { result: 0 }))
         {
             continue;
         }

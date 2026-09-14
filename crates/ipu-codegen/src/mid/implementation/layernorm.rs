@@ -31,7 +31,7 @@ impl Builder {
             moments.clone(),
             TileKernelSpec::LayerNormMoments,
             None,
-            vec![],
+            vec![OperandIndexing::local()],
         );
         // Replicate only the small (mean, variance) vectors;
         // features and affine parameters remain partitioned.
@@ -49,7 +49,12 @@ impl Builder {
             output.clone(),
             TileKernelSpec::LayerNormApply { parts },
             None,
-            vec![],
+            vec![
+                OperandIndexing::Elementwise { result: 0 },
+                OperandIndexing::Elementwise { result: 0 },
+                OperandIndexing::Elementwise { result: 0 },
+                OperandIndexing::local(),
+            ],
         ))
     }
 }

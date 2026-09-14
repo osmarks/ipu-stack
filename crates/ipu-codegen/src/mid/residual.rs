@@ -25,7 +25,14 @@ pub(super) fn fuse(
         };
         let ordinary = *kernel == TileKernelSpec::LayerNorm;
         if (!ordinary && *kernel != TileKernelSpec::LayerNormMoments)
-            || operands.iter().any(|window| !window.0.is_empty())
+            || operands.iter().any(|indexing| {
+                *indexing
+                    != if ordinary {
+                        OperandIndexing::Elementwise { result: 0 }
+                    } else {
+                        OperandIndexing::local()
+                    }
+            })
         {
             continue;
         }
@@ -49,7 +56,11 @@ pub(super) fn fuse(
         else {
             continue;
         };
-        if operands.len() != 2 || operands.iter().any(|window| !window.0.is_empty()) {
+        if operands.len() != 2
+            || operands
+                .iter()
+                .any(|indexing| *indexing != (OperandIndexing::Elementwise { result: 0 }))
+        {
             continue;
         }
         let value = &values[sum.index() as usize];
@@ -109,7 +120,7 @@ pub(super) fn fuse(
             results: vec![stats, sum],
             kind: MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::AddLayerNormMoments,
-                operands: vec![OperandWindow::default(); 2],
+                operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
                 output_aliases: output_aliases
                     .iter()
                     .map(|&(_, input)| (1, input))
@@ -126,7 +137,12 @@ pub(super) fn fuse(
                 kernel: TileKernelSpec::LayerNormApply {
                     parts: statistic_parts,
                 },
-                operands: vec![OperandWindow::default(); 4],
+                operands: vec![
+                    OperandIndexing::Elementwise { result: 0 },
+                    OperandIndexing::Elementwise { result: 0 },
+                    OperandIndexing::Elementwise { result: 0 },
+                    OperandIndexing::local(),
+                ],
                 output_aliases: Vec::new(),
             });
         }
@@ -352,7 +368,7 @@ mod tests {
                 results: vec![result],
                 kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel,
-                    operands: vec![OperandWindow::default(); inputs.len()],
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
                     output_aliases: Vec::new(),
                 }),
                 inputs,

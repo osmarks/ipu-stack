@@ -20,6 +20,7 @@ pub use mid::optimistic;
 mod package;
 mod place;
 mod storage;
+mod tensor;
 mod tile;
 pub(crate) use exchange::*;
 pub use exchange::{

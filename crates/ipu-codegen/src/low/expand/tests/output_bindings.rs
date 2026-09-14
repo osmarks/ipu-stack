@@ -1,7 +1,7 @@
 use super::*;
 use crate::mid::Compute;
 use crate::{
-    CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandWindow, TensorAxis, ValueId,
+    CoordinateMapping, GraphInputKind, MidInput, MidValue, OperandIndexing, TensorAxis, ValueId,
 };
 
 fn copied_columns(columns: u32) -> MidProgram {
@@ -270,7 +270,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         results: vec![result.id],
         kind: MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
-            operands: vec![OperandWindow::default(); 2],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
             output_aliases: vec![],
         }),
         estimated_cycles: 0,
@@ -293,6 +293,106 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
             .iter()
             .all(|extent| extent.start == 0 && extent.logical_end == 1)
     );
+}
+
+#[test]
+fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
+    for (rows, columns, tiles) in [(7, 16, 2), (11, 24, 3), (17, 32, 4)] {
+        let data = TensorType::new(
+            [rows, columns],
+            Precision::F16,
+            Layout::logical_linear(tiles, columns),
+        );
+        let stats = TensorType::new(
+            [rows, 1, 2],
+            Precision::F32,
+            Layout::logical_linear(tiles, 2),
+        );
+        let values = [data.clone(), data.clone(), stats, data]
+            .into_iter()
+            .enumerate()
+            .map(|(index, tensor_type)| {
+                let id = MidValueId::from_index(index as u32);
+                MidValue {
+                    id,
+                    tensor_type,
+                    tile_offset: 0,
+                    origin: ValueId::from_index(index as u32),
+                    storage_group: id,
+                }
+            })
+            .collect();
+        let mid = MidProgram {
+            values,
+            tile_count: tiles,
+            inputs: (0..2)
+                .map(|index| MidInput {
+                    name: index.to_string(),
+                    kind: GraphInputKind::Host,
+                    value: MidValueId::from_index(index),
+                })
+                .collect(),
+            operations: vec![MidOperation {
+                source: None,
+                inputs: vec![MidValueId::from_index(0), MidValueId::from_index(1)],
+                results: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
+                kind: MidOperationKind::Compute(Compute::Kernel {
+                    kernel: TileKernelSpec::AddLayerNormMoments,
+                    operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
+                    output_aliases: vec![(1, 0)],
+                }),
+                estimated_cycles: 0,
+                estimated_exchange_cycles: 0,
+            }],
+            outputs: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
+            ..MidProgram::default()
+        };
+        mid.validate().unwrap();
+        let graph = expand_tiles(&mid, false).unwrap();
+        let low = crate::low::lower_to_tiles(&graph, false);
+        let placement = crate::place(&low).unwrap();
+        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
+        let mut covered = std::collections::BTreeSet::new();
+        for run in low.kernel_calls() {
+            if run.kernel != TileKernelSpec::AddLayerNormMoments {
+                continue;
+            }
+            crate::materialize_kernel_run(
+                run,
+                &low.shards,
+                &placement.shard_addresses,
+                &kernels,
+                &Default::default(),
+            )
+            .unwrap();
+            let residual = &run.outputs[1];
+            assert!(
+                covered.insert(residual.extents[0].start),
+                "row computed twice"
+            );
+            assert_eq!(run.outputs[0].extents[0], residual.extents[0]);
+            for operand in &run.inputs {
+                assert_eq!(operand.views[0].extents, residual.extents);
+            }
+            assert_eq!(
+                placement.shard_addresses[&residual.shard],
+                placement.shard_addresses[&run.inputs[0].views[0].shard]
+            );
+        }
+        assert_eq!(covered, (0..rows).collect());
+
+        let mut wrong_domain = mid;
+        let MidOperationKind::Compute(Compute::Kernel { operands, .. }) =
+            &mut wrong_domain.operations[0].kind
+        else {
+            unreachable!()
+        };
+        operands[0] = OperandIndexing::Elementwise { result: 0 };
+        assert!(
+            wrong_domain.validate().is_err(),
+            "feature data cannot broadcast into statistics"
+        );
+    }
 }
 
 #[test]
@@ -328,7 +428,7 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             } else {
                 MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gelu,
-                    operands: vec![OperandWindow::default()],
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![(0, 0)],
                 })
             },

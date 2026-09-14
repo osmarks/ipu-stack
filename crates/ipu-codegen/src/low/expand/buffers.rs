@@ -23,24 +23,6 @@ impl TileGraphBuilder {
             .ok_or(ExpansionError::UnknownValue(value))
     }
 
-    pub(super) fn local_shard(
-        &self,
-        value: MidValueId,
-        tile: u16,
-    ) -> ExpansionResult<BlockValueId> {
-        let shards = self.value_shards(value)?;
-        if let Some(&shard) = shards.get(usize::from(tile))
-            && self.shards[shard.index() as usize].tile == tile
-        {
-            return Ok(shard);
-        }
-        shards
-            .iter()
-            .copied()
-            .find(|shard| self.shards[shard.index() as usize].tile == tile)
-            .ok_or(ExpansionError::UnknownValue(value))
-    }
-
     pub(super) fn full_view(&self, shard: BlockValueId) -> ShardView {
         if let Some(view) = self.borrowed_views.get(&shard) {
             return view.clone();

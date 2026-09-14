@@ -58,7 +58,11 @@ pub(super) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidVal
                 },
             operands,
             output_aliases,
-        }) => operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty(),
+        }) => {
+            operands.len() == 1
+                && operands[0] == (OperandIndexing::Elementwise { result: 0 })
+                && output_aliases.is_empty()
+        }
         _ => false,
     };
     let ([input], [output]) = (op.inputs.as_slice(), op.results.as_slice()) else {

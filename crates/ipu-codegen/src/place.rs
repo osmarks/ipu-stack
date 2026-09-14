@@ -6,10 +6,10 @@ pub(crate) mod profile;
 mod search;
 pub(crate) use exchange::ExchangeConflicts;
 
+use crate::MemoryClass;
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::{BlockValueId, ShardDefinition};
-use crate::MemoryClass;
 use crate::{StorageError, shard_storage_bytes};
 use ipu_package::{
     IPU21_APPLICATION_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,

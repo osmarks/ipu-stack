@@ -52,7 +52,10 @@ fn fuse_region(
             TileKernelSpec::LayerNorm => TileKernelSpec::AddLayerNorm,
             _ => continue,
         };
-        if operands.iter().any(|window| !window.0.is_empty()) {
+        if operands
+            .iter()
+            .any(|indexing| *indexing != (OperandIndexing::Elementwise { result: 0 }))
+        {
             continue;
         }
         let Some(&input) = current.inputs.first() else {
@@ -73,7 +76,11 @@ fn fuse_region(
         else {
             continue;
         };
-        if add_operands.len() != 2 || add_operands.iter().any(|window| !window.0.is_empty()) {
+        if add_operands.len() != 2
+            || add_operands
+                .iter()
+                .any(|indexing| *indexing != (OperandIndexing::Elementwise { result: 0 }))
+        {
             continue;
         }
         let [output] = current.results.as_slice() else {
@@ -147,7 +154,7 @@ fn fuse_region(
         replacement.inputs = inputs;
         replacement.kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: fused.clone(),
-            operands: vec![OperandWindow::default(); arity],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }; arity],
             output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
         });
         if !super::rewrite::fusion_pays(
@@ -249,7 +256,7 @@ mod tests {
                     1,
                     MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Gelu,
-                        operands: vec![OperandWindow::default()],
+                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
                         output_aliases: vec![],
                     }),
                 ),
@@ -337,7 +344,7 @@ mod tests {
         }
         norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::LayerNorm,
-            operands: vec![OperandWindow::default(); 3],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }; 3],
             output_aliases: vec![],
         });
         let fused_norm = norm
@@ -361,7 +368,7 @@ mod tests {
         bias.operations[0].inputs.truncate(2);
         bias.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::BiasGelu,
-            operands: vec![OperandWindow::default(); 2],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
             output_aliases: vec![],
         });
         let fused_bias = bias
@@ -422,7 +429,7 @@ mod tests {
                         } else {
                             TileKernelSpec::Gelu
                         },
-                        operands: vec![OperandWindow::default(); inputs.len()],
+                        operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
                         output_aliases: Vec::new(),
                     }),
                     inputs,

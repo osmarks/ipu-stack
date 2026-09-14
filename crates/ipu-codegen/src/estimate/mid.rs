@@ -396,15 +396,20 @@ fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
 fn operand_tensors(
     operation: &MidOperation,
     values: &[MidValue],
-    windows: &[crate::OperandWindow],
+    compute: &Compute,
 ) -> Option<Vec<TensorType>> {
     operation
         .inputs
         .iter()
-        .zip(windows)
-        .map(|(&id, window)| {
+        .take(compute.input_count())
+        .enumerate()
+        .map(|(index, &id)| {
             let mut local = local_tensor(&values[id.index() as usize].tensor_type)?;
-            for &(axis, start, end) in &window.0 {
+            for &(axis, start, end) in compute
+                .operand_window(index)
+                .into_iter()
+                .flat_map(|window| &window.0)
+            {
                 local.shape.0[usize::from(axis)] =
                     local.shape.0[usize::from(axis)].min(end.checked_sub(start)?);
             }
@@ -427,12 +432,14 @@ pub(crate) fn operation_cost(
     let mut rows = 0;
     let mut price = ProgramCycles::default();
     match &operation.kind {
-        MidOperationKind::Compute(Compute::Kernel {
-            kernel,
-            operands,
-            output_aliases,
-        }) => {
-            let mut inputs = operand_tensors(operation, values, operands)?;
+        MidOperationKind::Compute(
+            compute @ Compute::Kernel {
+                kernel,
+                output_aliases,
+                ..
+            },
+        ) => {
+            let mut inputs = operand_tensors(operation, values, compute)?;
             price.total = super::primitive::kernel_cycles(
                 kernel,
                 |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
@@ -460,8 +467,8 @@ pub(crate) fn operation_cost(
                 }
             }
         }
-        MidOperationKind::Compute(Compute::Product(product)) => {
-            let mut inputs = operand_tensors(operation, values, &product.operands)?;
+        MidOperationKind::Compute(compute @ Compute::Product(product)) => {
+            let mut inputs = operand_tensors(operation, values, compute)?;
             let axes = product.axes;
             let left_axis = axes.left_inner.resolve(inputs[0].shape.0.len()).ok()?;
             let right_axis = axes.right_inner.resolve(inputs[1].shape.0.len()).ok()?;

@@ -437,9 +437,9 @@ fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidV
                 bind_compute_owners(&mut repeat.body.operations, values);
             }
             MidOperationKind::Compute(compute) => {
-                let operands = compute.operand_windows();
+                let count = compute.input_count();
                 let offset = values[operation.results[0].index() as usize].tile_offset;
-                for input in operation.inputs.iter_mut().take(operands.len()) {
+                for input in operation.inputs.iter_mut().take(count) {
                     if values[input.index() as usize].tile_offset != offset {
                         let mut value = values[input.index() as usize].clone();
                         value.id = MidValueId(values.len() as u32);

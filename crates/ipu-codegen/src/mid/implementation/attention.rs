@@ -200,7 +200,7 @@ impl Builder {
                     padded_key_columns: key_block,
                 },
                 weights,
-                vec![],
+                vec![OperandIndexing::local()],
             ));
             let weights_id = weights?;
             let v = if probability_value_grid.is_some() {
@@ -258,6 +258,7 @@ impl Builder {
                 // The initial-block path does not read this operand.
                 inputs.push(result.unwrap_or(product));
             }
+            let indexing = vec![OperandIndexing::local(); inputs.len()];
             result = Some(self.kernel(
                 inputs,
                 if direct_f16 {
@@ -273,7 +274,7 @@ impl Builder {
                     final_block,
                 },
                 if direct_f16 { None } else { result },
-                vec![],
+                indexing,
             ));
         }
         let result = self.cast(result?, final_output.format.precision);

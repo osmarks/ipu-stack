@@ -14,7 +14,7 @@ impl TileGraphBuilder {
             return Err(ExpansionError::ResultArity);
         };
         let outputs = self.value_shards(*result)?.to_vec();
-        let inputs_by_tile = self.inputs_by_tile(&operation.inputs)?;
+        let inputs_by_tile = self.shards_by_tile(&operation.inputs)?;
         for output in outputs {
             let block = &self.shards[output.index() as usize];
             if block
@@ -25,13 +25,7 @@ impl TileGraphBuilder {
                 continue;
             }
             let tile = block.tile;
-            self.bind_compute_aliases(
-                operation,
-                output,
-                &product.output_aliases,
-                &inputs_by_tile,
-                0,
-            )?;
+            self.bind_compute_aliases(&[output], &product.output_aliases, &inputs_by_tile, 0)?;
             let inputs = inputs_by_tile
                 .iter()
                 .zip(&product.operands)
@@ -176,6 +170,11 @@ impl TileGraphBuilder {
                     run.requirements.outputs[0].format.layout.order,
                     ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
                 );
+                let mut matrices = Vec::new();
+                if run.outputs[0].extents.len() > 2 && !flattens_outer_rows {
+                    let mut coordinates = vec![0; run.outputs[0].extents.len() - 2];
+                    split_gemm_matrices(&run, &self.shards, 0, &mut coordinates, &mut matrices)?;
+                }
                 // Count after batch splitting: each local call owns only its
                 // selected matrix, including its own logical padding bounds.
                 let mut append = |mut run: KernelRun| -> ExpansionResult<()> {
@@ -212,18 +211,13 @@ impl TileGraphBuilder {
                         Some([2 * rows * cols * inner, 2 * physical * u64::from(width)]);
                     self.append_kernel(body, tile, run)
                 };
-                if run.outputs[0].extents.len() > 2 && !flattens_outer_rows {
-                    let mut coordinates = vec![0; run.outputs[0].extents.len() - 2];
-                    let mut matrices = Vec::new();
-                    split_gemm_matrices(&run, 0, &mut coordinates, &mut matrices)?;
-                    if matrices.len() > 1 {
-                        for matrix in matrices {
-                            append(matrix)?;
-                        }
-                        continue;
+                if !matrices.is_empty() {
+                    for matrix in matrices {
+                        append(matrix)?;
                     }
+                } else {
+                    append(run)?;
                 }
-                append(run)?;
             }
         }
         Ok(())
@@ -232,6 +226,7 @@ impl TileGraphBuilder {
 
 fn split_gemm_matrices(
     run: &KernelRun,
+    shards: &[BlockValue],
     axis: usize,
     coordinates: &mut [u32],
     runs: &mut Vec<KernelRun>,
@@ -246,16 +241,26 @@ fn split_gemm_matrices(
         }
         for coordinate in extent.start..extent.physical_end {
             coordinates[axis] = coordinate;
-            split_gemm_matrices(run, axis + 1, coordinates, runs)?;
+            split_gemm_matrices(run, shards, axis + 1, coordinates, runs)?;
         }
         return Ok(());
     }
 
     let mut matrix = run.clone();
-    narrow_gemm_matrix_view(&mut matrix.outputs[0], coordinates)?;
+    let output_shape = &shards[run.outputs[0].shard.index() as usize]
+        .tensor_type
+        .shape
+        .0;
+    narrow_gemm_matrix_view(
+        &mut matrix.outputs[0],
+        output_shape,
+        output_shape,
+        coordinates,
+    )?;
     for operand in &mut matrix.inputs {
         for view in &mut operand.views {
-            narrow_gemm_matrix_view(view, coordinates)?;
+            let shape = &shards[view.shard.index() as usize].tensor_type.shape.0;
+            narrow_gemm_matrix_view(view, shape, output_shape, coordinates)?;
         }
     }
     runs.push(matrix);
@@ -264,18 +269,27 @@ fn split_gemm_matrices(
 
 fn narrow_gemm_matrix_view(
     view: &mut ShardView,
+    input_shape: &[u32],
+    output_shape: &[u32],
     output_coordinates: &[u32],
 ) -> ExpansionResult<()> {
-    let input_axes = view.extents.len().saturating_sub(2);
-    if input_axes > output_coordinates.len() {
-        return Err(ExpansionError::InvalidOperatorPlan);
-    }
-    let output_axis_offset = output_coordinates.len() - input_axes;
+    let input_axes = input_shape
+        .len()
+        .checked_sub(2)
+        .ok_or(ExpansionError::InvalidOperatorPlan)?;
+    let output_axes = output_shape
+        .len()
+        .checked_sub(2)
+        .ok_or(ExpansionError::InvalidOperatorPlan)?;
+    let indexing =
+        crate::tensor::Broadcast::new(&input_shape[..input_axes], &output_shape[..output_axes])
+            .ok_or(ExpansionError::InvalidOperatorPlan)?;
     for (axis, extent) in view.extents[..input_axes].iter_mut().enumerate() {
-        if extent.physical_end - extent.start == 1 {
-            continue;
-        }
-        let coordinate = output_coordinates[output_axis_offset + axis];
+        let coordinate = if indexing.is_broadcast(axis) {
+            0
+        } else {
+            output_coordinates[indexing.output_axis(axis)]
+        };
         if coordinate < extent.start || coordinate >= extent.physical_end {
             return Err(ExpansionError::InvalidOperatorPlan);
         }
@@ -293,6 +307,46 @@ mod tests {
         AccumulationPrecision, Compute, GraphInputKind, MidInput, MidValue, Product, ProductAxes,
         TensorAxis, ValueId,
     };
+
+    #[test]
+    fn singleton_batch_shards_do_not_broadcast_non_singleton_dimensions() {
+        let mut view = ShardView {
+            shard: BlockValueId::from_index(0),
+            extents: [
+                ShardExtent {
+                    axis: 0,
+                    start: 3,
+                    logical_end: 4,
+                    physical_end: 4,
+                },
+                ShardExtent {
+                    axis: 1,
+                    start: 0,
+                    logical_end: 16,
+                    physical_end: 16,
+                },
+                ShardExtent {
+                    axis: 2,
+                    start: 0,
+                    logical_end: 16,
+                    physical_end: 16,
+                },
+            ]
+            .to_vec(),
+        };
+        let shape = [8, 16, 16];
+        assert!(narrow_gemm_matrix_view(&mut view, &shape, &shape, &[2]).is_err());
+        narrow_gemm_matrix_view(&mut view, &shape, &shape, &[3]).unwrap();
+        assert_eq!(view.extents[0].start, 3);
+        view.extents[0] = ShardExtent {
+            axis: 0,
+            start: 0,
+            logical_end: 1,
+            physical_end: 1,
+        };
+        narrow_gemm_matrix_view(&mut view, &[1, 16, 16], &shape, &[7]).unwrap();
+        assert_eq!(view.extents[0].start, 0);
+    }
 
     #[test]
     fn batched_product_calls_count_only_their_own_arithmetic() {

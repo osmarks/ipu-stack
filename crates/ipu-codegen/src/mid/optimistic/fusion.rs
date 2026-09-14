@@ -189,7 +189,7 @@ fn known_fusion_cost(
         results: vec![MidValueId::from_index(outputs[0] as u32)],
         kind: MidOperationKind::Compute(Compute::Kernel {
             kernel,
-            operands: vec![OperandWindow::default(); inputs.len()],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }; inputs.len()],
             output_aliases: Vec::new(),
         }),
         inputs: inputs

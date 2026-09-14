@@ -1977,7 +1977,7 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
 
 #[test]
 fn repeat_copy_yield_reaches_the_carried_allocation() {
-    use crate::{Compute, CoordinateMapping, MidInput, MidRegion, MidValue, OperandWindow};
+    use crate::{Compute, CoordinateMapping, MidInput, MidRegion, MidValue, OperandIndexing};
     let id = MidValueId::from_index;
     let tensor_type = TensorType::new([8, 16], Precision::F16, Layout::row_sharded(1));
     let operation = |inputs: &[u32], result, kind| MidOperation {
@@ -2022,7 +2022,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                             2,
                             MidOperationKind::Compute(Compute::Kernel {
                                 kernel: TileKernelSpec::Gelu,
-                                operands: vec![OperandWindow::default()],
+                                operands: vec![OperandIndexing::Elementwise { result: 0 }],
                                 output_aliases: vec![],
                             }),
                         ),

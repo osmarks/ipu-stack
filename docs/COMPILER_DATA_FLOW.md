@@ -133,8 +133,8 @@ flowchart LR
 The current `Compute::Sum` carries a distributed reduction axis and staging
 policy; the local `ReductionSum` kernel implements individual stages. Products
 have their own compute variant; ordinary kernel compute no longer has optional
-product axes. Both retain declared output aliases. Explicit operand indexing and
-complete family binding remain in progress.
+product axes. Both retain declared output aliases. Complete family binding
+remains in progress.
 
 However, its current implementation is narrower than the name: singleton partial
 axis outside the final matrix axes, FP16 contributors/results, matching element
@@ -149,23 +149,29 @@ The semantic relation is `Y[b,r,c] = X[b,r,c] + B[0,r,c]`.
 
 | Step | Current owner | Purpose |
 | --- | --- | --- |
-| Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph.rs), `infer_shape`/`broadcast` | Define valid logical computation |
+| Validate broadcasting and infer `[8,4,32]` | [graph.rs](../crates/ipu-codegen/src/graph.rs), `infer_shape`, using [tensor.rs](../crates/ipu-codegen/src/tensor.rs) | Define valid logical computation |
 | Select output layout and compatible kernel | [mid/candidates.rs](../crates/ipu-codegen/src/mid/candidates.rs) | Choose distributed implementation |
 | Project output ownership onto non-broadcast input axes | [implementation/mod.rs](../crates/ipu-codegen/src/mid/implementation/mod.rs), `pointwise_input_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
-| Select resident shard and crop a broadcast view | [expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs), [pointwise.rs](../crates/ipu-codegen/src/low/expand/pointwise.rs) | Supply the local kernel with the needed coordinates |
+| Bind the declared operand relation to a resident fragment | [expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs), `elementwise_view` | Supply the local kernel with the needed coordinates |
 | Validate supported broadcast shape and encode strides/counts | [kernel/abi.rs](../crates/ipu-codegen/src/kernel/abi.rs) | Match the actual kernel's address arithmetic |
 
-These steps do different jobs; their existence is not automatically duplication.
-The missing connection is a shared operand-indexing contract. Mid records mostly
-empty `OperandWindow`s; low recognizes Add/BiasGeLU/AddLayerNorm by kernel name
-and infers the relationship again. A new fused kernel can need another exception
-in that dispatch. Broadcasting is also inferred for GEMM batch dimensions in a
-separate helper.
+Mid records `OperandIndexing`: an elementwise relation to a specified result, or
+a whole local fragment with an optional window. Graph validation, ownership
+projection and low binding share the broadcast relation in `tensor.rs`; low
+does not recognize Add/BiasGeLU/AddLayerNorm names. Local fragment indexing is
+explicit for attention panels and feature statistics whose domains differ from
+their output. Multiple results share the invocation distribution and are paired
+by their fragment order on each owner. Residual/statistics fusion indexes its
+inputs against the residual result, not the differently shaped statistics.
+GEMM batch binding also uses the shared logical relation: a singleton shard of a
+non-singleton batch dimension is not a broadcast dimension.
 
 Physical padding adds a second concern: equal-layout pointwise calls consume the
 complete physical panel, whereas broadcasting a singleton axis must use the
 logical shape even if storage is borrowed from a larger allocation.
-`pointwise.rs` handles both. A logical broadcast map must not erase this distinction.
+The declared elementwise binding retains complete source panels when the logical
+fragment is unchanged; a proper subregion retains its backing strides. Kernel
+family validation still decides which such views its address arithmetic supports.
 
 ## Trace 3: mapped copy, unpacking and exchange
 

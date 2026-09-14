@@ -19,10 +19,19 @@ pub(crate) fn implement(
     let result = match &plan.dispatch {
         OperatorDispatch::LayerNorm { parts } => b.layernorm(output, *parts)?,
         OperatorDispatch::Pointwise { kernel, .. } => {
+            // The fused attention callable consumes already-selected local
+            // Q/K/V panels. Its row domains differ from the result's domain.
+            let indexing = if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
+                OperandIndexing::local()
+            } else {
+                OperandIndexing::Elementwise { result: 0 }
+            };
             let mut operands = Vec::new();
             for (index, input) in inputs.iter().enumerate() {
                 let mut resident = input.clone();
-                resident.format.layout.tiling = pointwise_input_tiling(input, output)?;
+                if matches!(indexing, OperandIndexing::Elementwise { .. }) {
+                    resident.format.layout.tiling = pointwise_input_tiling(input, output)?;
+                }
                 operands.push(b.copy(MidValueId(index as u32), resident, vec![]));
             }
             let reuse = match &plan.requirements.output_aliasing {
@@ -36,7 +45,8 @@ pub(crate) fn implement(
             if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                 kernel_output.format.precision = Precision::F32;
             }
-            let result = b.kernel(operands, kernel_output, kernel.clone(), reuse, vec![]);
+            let indexing = vec![indexing; operands.len()];
+            let result = b.kernel(operands, kernel_output, kernel.clone(), reuse, indexing);
             b.cast(result, output.format.precision)
         }
         OperatorDispatch::View => {
@@ -113,16 +123,11 @@ pub(super) fn pointwise_input_tiling(
     input: &TensorType,
     output: &TensorType,
 ) -> Option<TensorTiling> {
-    let tiling = &output.format.layout.tiling;
+    let indexing = crate::tensor::Broadcast::new(&input.shape.0, &output.shape.0)?;
     if input.shape == output.shape {
-        return Some(tiling.clone());
+        return Some(output.format.layout.tiling.clone());
     }
-    let offset = output.shape.0.len().checked_sub(input.shape.0.len())?;
-    project_tiling(output, |index| {
-        index
-            .checked_sub(offset)
-            .filter(|&axis| input.shape.0[axis] != 1)
-    })
+    project_tiling(output, |axis| indexing.input_axis(axis))
 }
 
 struct Builder {
@@ -194,7 +199,7 @@ impl Builder {
                 to: precision,
             },
             None,
-            vec![],
+            vec![OperandIndexing::Elementwise { result: 0 }],
         )
     }
 
@@ -240,11 +245,8 @@ impl Builder {
         output: TensorType,
         kernel: TileKernelSpec,
         reuse: Option<MidValueId>,
-        mut operands: Vec<OperandWindow>,
+        operands: Vec<OperandIndexing>,
     ) -> MidValueId {
-        if operands.is_empty() {
-            operands.resize(inputs.len(), OperandWindow::default());
-        }
         self.compute(
             inputs,
             output,

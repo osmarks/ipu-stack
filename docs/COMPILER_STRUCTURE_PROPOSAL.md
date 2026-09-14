@@ -36,7 +36,10 @@ policy. The cache retains geometry instead of selected staging, uses foldhash an
 a hash table instead of custom buckets, and excludes ownership from geometry keys.
 Low kernel calls now bind all results together in one indexed list, with matching
 access requirements; element-separation constraints can name every result.
-Operand indexing, complete family binding, planner module ownership and the other boundaries below remain
+Mid operands now declare elementwise/result indexing or local windows. Graph
+validation, ownership projection, low binding and product batch selection share
+the logical broadcast relation; generic low kernel-name broadcasting is removed.
+Complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

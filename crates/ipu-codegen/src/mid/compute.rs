@@ -8,6 +8,26 @@ use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OperandWindow(pub Vec<(u16, u32, u32)>);
 
+/// Logical operand selection for a distributed local kernel. The constructor
+/// declares the relation; generic low binding never infers it from a kernel name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperandIndexing {
+    /// Right-aligned identity/broadcast indexing relative to this result.
+    /// Identity consumes complete physical panels when the selected logical
+    /// fragment is unchanged. Broadcast singleton axes select one logical value.
+    Elementwise { result: usize },
+    /// The resident fragment corresponding to this invocation, optionally
+    /// restricted by a global window. One resident fragment can serve every
+    /// invocation on its owner; multiple fragments follow the result's order.
+    Local(OperandWindow),
+}
+
+impl OperandIndexing {
+    pub fn local() -> Self {
+        Self::Local(OperandWindow::default())
+    }
+}
+
 /// Matrix axes used by a local product after the distributed operands have
 /// been materialized. Product records the selected local blocking separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +62,7 @@ pub enum Compute {
     /// Invoke the selected kernel over the output distribution.
     Kernel {
         kernel: TileKernelSpec,
-        operands: Vec<OperandWindow>,
+        operands: Vec<OperandIndexing>,
         /// (Result index, input index) pairs sharing an allocation. Inputs may
         /// include lifetime dependencies beyond the kernel's explicit operands.
         /// Shrinking casts donate storage with a displacement chosen in low;
@@ -59,11 +79,22 @@ pub enum Compute {
 }
 
 impl Compute {
-    pub(crate) fn operand_windows(&self) -> &[OperandWindow] {
+    pub(crate) fn operand_window(&self, index: usize) -> Option<&OperandWindow> {
         match self {
-            Self::Product(product) => &product.operands,
-            Self::Kernel { operands, .. } => operands,
-            Self::Sum { .. } => &[],
+            Self::Product(product) => product.operands.get(index),
+            Self::Kernel { operands, .. } => match operands.get(index)? {
+                OperandIndexing::Local(window) => Some(window),
+                OperandIndexing::Elementwise { .. } => None,
+            },
+            Self::Sum { .. } => None,
+        }
+    }
+
+    pub(crate) fn input_count(&self) -> usize {
+        match self {
+            Self::Product(product) => product.operands.len(),
+            Self::Kernel { operands, .. } => operands.len(),
+            Self::Sum { .. } => 0,
         }
     }
 
@@ -79,7 +110,7 @@ impl Compute {
     pub fn cast(from: Precision, to: Precision) -> Self {
         Self::Kernel {
             kernel: TileKernelSpec::Cast { from, to },
-            operands: vec![OperandWindow::default()],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }],
             output_aliases: Vec::new(),
         }
     }

@@ -12,7 +12,6 @@ mod gemm;
 mod mapping;
 mod movement;
 mod ownership;
-mod pointwise;
 mod reduce;
 mod relay;
 mod repeat;

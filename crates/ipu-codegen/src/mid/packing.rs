@@ -121,7 +121,7 @@ fn distribute_region(
                             from: row_major.format.layout,
                             to: layout,
                         },
-                        operands: vec![OperandWindow::default()],
+                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
                         output_aliases: Vec::new(),
                     }),
                     estimated_cycles: 0,

@@ -164,7 +164,7 @@ fn repeat_yield_can_alias(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Compute, CoordinateMapping, OperandWindow};
+    use crate::{Compute, CoordinateMapping, OperandIndexing};
 
     #[test]
     fn carried_storage_remains_live_through_reused_copy_inputs() {
@@ -180,7 +180,7 @@ mod tests {
         let gelu = || {
             MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::Gelu,
-                operands: vec![OperandWindow::default()],
+                operands: vec![OperandIndexing::Elementwise { result: 0 }],
                 output_aliases: vec![],
             })
         };

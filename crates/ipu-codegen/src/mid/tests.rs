@@ -654,7 +654,7 @@ fn assert_operator_signature(
     let MidOperationKind::Compute(compute) = &operation.kind else {
         panic!("expected compute")
     };
-    assert_eq!(compute.operand_windows().len(), inputs.len());
+    assert_eq!(compute.input_count(), inputs.len());
     for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
         assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
     }

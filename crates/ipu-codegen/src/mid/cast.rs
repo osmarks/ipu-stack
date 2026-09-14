@@ -126,7 +126,7 @@ fn donate(
                 from: Precision::F16,
                 to: target.tensor_type.format.precision,
             },
-            operands: vec![OperandWindow::default()],
+            operands: vec![OperandIndexing::Elementwise { result: 0 }],
             output_aliases: vec![(0, 0)],
         });
         tracing::debug!(?input, ?output, "donated cast input storage");
@@ -191,7 +191,7 @@ mod tests {
                             from: Precision::F16,
                             to: Precision::F8F143 { scale_exponent: 0 },
                         },
-                        operands: vec![OperandWindow::default()],
+                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
                         output_aliases: vec![],
                     }),
                     estimated_cycles: 0,

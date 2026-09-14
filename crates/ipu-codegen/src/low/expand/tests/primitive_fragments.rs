@@ -1,6 +1,6 @@
 use super::*;
 use crate::mid::Compute;
-use crate::{GraphInputKind, MidInput, MidValue, OperandWindow, ValueId};
+use crate::{GraphInputKind, MidInput, MidValue, OperandIndexing, ValueId};
 
 #[test]
 fn primitive_casts_pair_corresponding_linear_fragments() {
@@ -44,7 +44,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                             from: Precision::F32,
                             to: Precision::F16,
                         },
-                        operands: vec![OperandWindow::default()],
+                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
                         output_aliases: vec![],
                     }),
                     estimated_cycles: 0,
@@ -86,7 +86,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 }
                 norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::LayerNorm,
-                    operands: vec![OperandWindow::default(); 3],
+                    operands: vec![OperandIndexing::local(); 3],
                     output_aliases: vec![],
                 });
                 let expanded = expand_tiles(&norm, false).unwrap();

@@ -151,7 +151,7 @@ fn reorder_region(
                         from: Precision::F16,
                         to: values[id.index() as usize].tensor_type.format.precision,
                     },
-                    operands: vec![OperandWindow::default()],
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![],
                 }),
                 estimated_cycles: 0,
@@ -247,7 +247,7 @@ mod tests {
                 results: vec![alias.id],
                 kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gelu,
-                    operands: vec![OperandWindow::default()],
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![(0, 0)],
                 }),
                 estimated_cycles: 0,
