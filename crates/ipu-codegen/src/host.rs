@@ -3,7 +3,7 @@ use ipu_package::{
     Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice, SEGMENT_EXECUTE,
     SEGMENT_READ, Segment,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use super::package::{PackageBuildResult, invalid};
 
@@ -68,17 +68,15 @@ pub(crate) fn plan(
     let pending_weights = collect(weights, Direction::ToTile)?;
     let pending_inputs = collect(inputs, Direction::ToTile)?;
     let pending_outputs = collect(outputs, Direction::ToHost)?;
-    let participating = pending_weights
+    let mut slots = pending_weights
         .iter()
         .chain(&pending_inputs)
         .chain(&pending_outputs)
-        .map(|pending| pending.transfer.physical_tile)
-        .collect::<BTreeSet<_>>();
-    let slots = participating
-        .into_iter()
-        .enumerate()
-        .map(|(slot, tile)| Ok((tile, u32::try_from(slot)?)))
-        .collect::<PackageBuildResult<BTreeMap<_, _>>>()?;
+        .map(|pending| (pending.transfer.physical_tile, 0))
+        .collect::<BTreeMap<_, _>>();
+    for (slot, value) in slots.values_mut().enumerate() {
+        *value = u32::try_from(slot)?;
+    }
     let (mut weight_phases, weight_slices, weight_ends) = batch(pending_weights, &slots)?;
     let (mut input_phases, input_slices, input_ends) = batch(pending_inputs, &slots)?;
     let (output_phases, output_slices, output_ends) = batch(pending_outputs, &slots)?;
