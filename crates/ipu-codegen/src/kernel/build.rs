@@ -67,7 +67,7 @@ impl KernelBuildPlan {
                 }
                 let flags: Vec<_> = extra.into_iter().map(str::to_owned).collect();
                 let mut codelet_flags = vec!["-O2".into(), format!("-DVERTEX_{vertex}")];
-                codelet_flags.extend(flags.clone());
+                codelet_flags.extend(flags.iter().cloned());
                 plan.compilations.extend([
                     KernelCompilation {
                         source,

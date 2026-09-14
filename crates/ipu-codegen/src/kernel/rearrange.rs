@@ -76,12 +76,10 @@ impl KernelBuildPlan {
         let suffix = format!(
             "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
         );
-        let suffix = match order {
-            RearrangeTarget::BlockMajor {
-                row_block,
-                column_block,
-            } => format!("{suffix}_b{row_block}x{column_block}"),
-            _ => suffix,
+        let suffix = if matches!(order, RearrangeTarget::BlockMajor { .. }) {
+            format!("{suffix}_b{row_block}x{column_block}")
+        } else {
+            suffix
         };
         let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
         let call = format!("rearrange_row_major_to_amp_f16_{suffix}");

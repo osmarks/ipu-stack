@@ -141,7 +141,7 @@ impl KernelBuildPlan {
             if matches!(precision, Precision::F8F143 { .. }) {
                 flags.push("-DGEMM_NATIVE_FP8=1".into());
             }
-            flags.extend(worker_flags.clone());
+            flags.extend(worker_flags.iter().cloned());
             if single_rows {
                 flags.push("-DGEMM_SINGLE_ROWS=1".into());
             }
