@@ -332,7 +332,6 @@ dependencies = [
  "ipu-runtime",
  "serde_json",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

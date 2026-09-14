@@ -15,18 +15,27 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
         exchange_event_cycles: u32,
     }
 
+    fn intern<T: Clone + Eq + std::hash::Hash>(
+        values: &mut Vec<T>,
+        indices: &mut HashMap<T, u32>,
+        value: T,
+    ) -> u32 {
+        *indices.entry(value).or_insert_with_key(|value| {
+            let index = values.len() as u32;
+            values.push(value.clone());
+            index
+        })
+    }
+
     fn intern_string(
         values: &mut Vec<String>,
         indices: &mut HashMap<String, u32>,
         value: &str,
     ) -> u32 {
-        if let Some(index) = indices.get(value) {
-            return *index;
-        }
-        let index = values.len() as u32;
-        values.push(value.into());
-        indices.insert(value.into(), index);
-        index
+        indices
+            .get(value)
+            .copied()
+            .unwrap_or_else(|| intern(values, indices, value.to_owned()))
     }
 
     let mut strings = Vec::new();
@@ -57,11 +66,7 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
                             ]
                         })
                         .collect::<Vec<_>>();
-                    let metadata = *metadata_indices.entry(metadata.clone()).or_insert_with(|| {
-                        let index = metadata_sets.len() as u32;
-                        metadata_sets.push(metadata);
-                        index
-                    });
+                    let metadata = intern(&mut metadata_sets, &mut metadata_indices, metadata);
                     let step = StepKey {
                         phase: sample.step.phase,
                         epoch: sample.step.epoch,
@@ -84,11 +89,7 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
                         },
                         exchange_event_cycles: sample.step.exchange_event_cycles,
                     };
-                    let step = *step_indices.entry(step).or_insert_with(|| {
-                        let index = steps.len() as u32;
-                        steps.push(step);
-                        index
-                    });
+                    let step = intern(&mut steps, &mut step_indices, step);
                     let activities = sample
                         .step
                         .exchange_activities
@@ -107,14 +108,7 @@ fn payload(report: &ProfileReport) -> serde_json::Value {
                             ]
                         })
                         .collect::<Vec<_>>();
-                    let activities =
-                        *activity_indices
-                            .entry(activities.clone())
-                            .or_insert_with(|| {
-                                let index = activity_sets.len() as u32;
-                                activity_sets.push(activities);
-                                index
-                            });
+                    let activities = intern(&mut activity_sets, &mut activity_indices, activities);
                     serde_json::json!([
                         step,
                         sample.start_cycle.wrapping_sub(base_cycle),
@@ -340,7 +334,7 @@ mod tests {
     #[test]
     fn external_chunks_reconstruct_the_lossless_streams() {
         use ipu_package::{CycleSample, ProfileExchangeActivity, ProfileStep, TileProfile};
-        let report = ProfileReport {
+        let mut report = ProfileReport {
             clock_hz: 1_500_000_000,
             tiles: vec![TileProfile {
                 physical_tile: 3,
@@ -356,7 +350,10 @@ mod tests {
                             operation: "test </script> & unicode λ".into(),
                             kernel: String::new(),
                             kind: ProfileStepKind::Exchange,
-                            metadata: vec![],
+                            metadata: vec![ipu_package::ProfileMetadata {
+                                name: "source".into(),
+                                value: "shared projection".into(),
+                            }],
                             exchange_event_cycles: 100000,
                             exchange_activities: (0..10001)
                                 .map(|i| ProfileExchangeActivity {
@@ -372,6 +369,24 @@ mod tests {
                     .collect(),
             }],
         };
+        let before = payload(&report);
+        let mut duplicate = report.tiles[0].clone();
+        duplicate.physical_tile = 7;
+        report.tiles.push(duplicate);
+        let after = payload(&report);
+        for table in [
+            "strings",
+            "metadata",
+            "metadataSets",
+            "steps",
+            "activitySets",
+        ] {
+            assert_eq!(
+                before[table], after[table],
+                "duplicate tile enlarged {table}"
+            );
+        }
+        assert_eq!(after["tiles"][0]["samples"], after["tiles"][1]["samples"]);
         let directory =
             std::env::temp_dir().join(format!("ipu-profile-report-{}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();

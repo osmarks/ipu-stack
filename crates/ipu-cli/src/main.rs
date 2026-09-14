@@ -13,7 +13,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(version, about = "Low-level Graphcore IPU tools")]
@@ -218,7 +217,7 @@ enum ProfileKind {
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    init_tracing();
+    ipu_runtime::init_tracing();
     match Arguments::parse().command {
         Command::KernelBuildId { source_directory } => {
             println!("{}", source_tree_digest(source_directory)?);
@@ -740,22 +739,4 @@ fn parse_named_path(value: &str) -> Result<(String, PathBuf), String> {
         return Err("expected non-empty NAME=PATH".into());
     }
     Ok((name.into(), path.into()))
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if std::env::var("IPU_LOG_FORMAT").as_deref() == Ok("json") {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .json()
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
-    }
 }

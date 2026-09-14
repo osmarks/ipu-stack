@@ -21,4 +21,3 @@ ipu-profile = { path = "../ipu-profile" }
 ipu-runtime = { path = "../ipu-runtime" }
 serde_json.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
