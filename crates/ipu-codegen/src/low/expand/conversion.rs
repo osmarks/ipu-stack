@@ -51,32 +51,27 @@ impl TileGraphBuilder {
 
         let mut staging_shards = Vec::with_capacity(sources.len());
         for source_shard in sources {
-            let source = self.shards[source_shard.index() as usize].clone();
+            let source = &self.shards[source_shard.index() as usize];
+            let tile = source.tile;
             let mut staging_type = source.tensor_type.clone();
-            staging_type.format.layout = Layout::row_major(TensorTiling::replicated(1));
+            let to = Layout::row_major(TensorTiling::replicated(1));
+            let from = std::mem::replace(&mut staging_type.format.layout, to.clone());
             let staging = self.push_shard(BlockValue {
                 id: BlockValueId(0),
-                tile: source.tile,
+                tile,
                 tensor_type: staging_type,
                 extents: source.extents.clone(),
                 definition: ShardDefinition::Staging,
             })?;
             let run = self.kernel_run(
                 provenance,
-                TileKernelSpec::Rearrange {
-                    from: source.tensor_type.format.layout.clone(),
-                    to: self.shards[staging.index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .clone(),
-                },
+                TileKernelSpec::Rearrange { from, to },
                 vec![KernelOperand {
                     views: vec![self.full_view(source_shard)],
                 }],
                 self.full_view(staging),
             )?;
-            self.append_kernel(tiles, source.tile, run)?;
+            self.append_kernel(tiles, tile, run)?;
             staging_shards.push(staging);
         }
         Ok(Some(staging_shards))

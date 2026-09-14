@@ -8,8 +8,7 @@ impl TileGraphBuilder {
         tile: u16,
         run: KernelRun,
     ) -> ExpansionResult<()> {
-        let input = run.inputs[0].views[0].clone();
-        let dimensions = input
+        let dimensions = run.inputs[0].views[0]
             .extents
             .iter()
             .map(|e| e.physical_end - e.start)
