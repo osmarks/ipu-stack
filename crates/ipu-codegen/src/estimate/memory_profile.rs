@@ -289,20 +289,28 @@ fn profile(
 /// Called only for exhausted memory shortlists and selected planner finalists.
 /// Diagnostics never force every candidate to retain a detailed timeline.
 pub(crate) fn write(
-    scope: &str,
     graph: &ComputeGraph,
     config: &PipelineConfig,
-    initial: &[MidValueId],
-    operations: &[MidOperation],
-    outputs: &[MidValueId],
-    values: &[MidValue],
-    copies: &BTreeMap<MidValueId, u32>,
+    program: &crate::MidProgram,
+    scope: &str,
 ) -> crate::LoweringResult<()> {
     let Some(directory) = &config.memory_profile_directory else {
         return Ok(());
     };
+    let initial = program
+        .inputs
+        .iter()
+        .map(|input| input.value)
+        .collect::<Vec<_>>();
     let profile = profile(
-        scope, graph, config, initial, operations, outputs, values, copies,
+        scope,
+        graph,
+        config,
+        &initial,
+        &program.operations,
+        &program.outputs,
+        &program.values,
+        &Default::default(),
     )
     .ok_or(crate::LoweringError::InvalidImplementation)?;
     let result = (|| -> Result<_, Box<dyn std::error::Error>> {
@@ -494,17 +502,7 @@ mod tests {
                 .as_nanos()
         ));
         config.memory_profile_directory = Some(directory.clone());
-        write(
-            "test",
-            &graph,
-            &config,
-            &initial,
-            &program.operations,
-            &program.outputs,
-            &program.values,
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        write(&graph, &config, &program, "test").unwrap();
         for file in std::fs::read_dir(&directory).unwrap() {
             let path = file.unwrap().path();
             let text = std::fs::read_to_string(&path).unwrap();

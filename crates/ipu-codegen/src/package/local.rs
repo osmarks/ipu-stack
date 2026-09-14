@@ -2,6 +2,7 @@
 pub(super) mod checkpoint;
 
 use super::*;
+use crate::estimate::memory_profile::write as memory_profile;
 use crate::mid::baseline::{self, Baseline, Recipe};
 use std::sync::Arc;
 
@@ -283,28 +284,6 @@ fn remember<'a>(visited: &mut Vec<Recipe>, candidates: impl IntoIterator<Item = 
             visited.push(recipe.clone());
         }
     }
-}
-
-fn memory_profile(
-    graph: &ComputeGraph,
-    config: &PipelineConfig,
-    mid: &crate::MidProgram,
-    scope: &str,
-) -> PackageBuildResult<()> {
-    crate::estimate::memory_profile::write(
-        scope,
-        graph,
-        config,
-        &mid.inputs
-            .iter()
-            .map(|input| input.value)
-            .collect::<Vec<_>>(),
-        &mid.operations,
-        &mid.outputs,
-        &mid.values,
-        &Default::default(),
-    )?;
-    Ok(())
 }
 
 fn validate<T>(
