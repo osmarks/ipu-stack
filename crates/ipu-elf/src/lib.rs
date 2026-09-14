@@ -518,9 +518,7 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
 
     for (object_index, file) in parsed.iter().enumerate() {
         for section in file.sections() {
-            let Some(place) = placements.iter().find(|placed| {
-                placed.object_index == object_index && placed.section_index == section.index()
-            }) else {
+            let Ok(place) = placement(&placements, object_index, section.index()) else {
                 continue;
             };
             for (offset, relocation) in section.relocations() {
@@ -566,14 +564,18 @@ pub fn link(objects: &[Vec<u8>], options: &LinkOptions) -> Result<LinkedImage, E
                 if value < 0 {
                     return Err(ElfError::Link("negative relocation value".into()));
                 }
-                let location = place
-                    .offset
-                    .checked_add(offset as usize)
-                    .ok_or_else(|| ElfError::Link("relocation offset overflow".into()))?;
+                let location = usize::try_from(offset)
+                    .map_err(|_| ElfError::Link("relocation offset overflow".into()))?;
                 let object::RelocationFlags::Elf { r_type } = relocation.flags() else {
                     return Err(ElfError::Link("non-ELF relocation".into()));
                 };
-                apply_relocation(&mut image, location, r_type, value as u64, image_base)?;
+                apply_relocation(
+                    &mut image[place.offset..place.offset + place.size],
+                    location,
+                    r_type,
+                    value as u64,
+                    image_base,
+                )?;
             }
         }
     }
@@ -749,29 +751,17 @@ pub fn apply_relocation(
             write(image, offset, &(value as u32).to_le_bytes())?;
         }
         R_COLOSSUS_64 => write(image, offset, &value.to_le_bytes())?,
-        R_COLOSSUS_18_S2 | R_COLOSSUS_19_S2 => {
-            if value & 3 != 0 {
-                return Err(invalid(value));
-            }
-            value >>= 2;
-            let bits = if relocation == R_COLOSSUS_18_S2 {
-                18
-            } else {
-                19
+        R_COLOSSUS_18_S2 | R_COLOSSUS_19_S2 | R_COLOSSUS_20 | R_COLOSSUS_21 => {
+            let (bits, shift) = match relocation {
+                R_COLOSSUS_18_S2 => (18, 2),
+                R_COLOSSUS_19_S2 => (19, 2),
+                R_COLOSSUS_20 => (20, 0),
+                _ => (21, 0),
             };
-            if value >= (1 << bits) {
+            if value & ((1u64 << shift) - 1) != 0 {
                 return Err(invalid(value));
             }
-            let current = read_u32(image, offset)?;
-            let mask = (1u32 << bits) - 1;
-            write(
-                image,
-                offset,
-                &((current & !mask) | value as u32).to_le_bytes(),
-            )?;
-        }
-        R_COLOSSUS_20 | R_COLOSSUS_21 => {
-            let bits = if relocation == R_COLOSSUS_20 { 20 } else { 21 };
+            value >>= shift;
             if value >= (1 << bits) {
                 return Err(invalid(value));
             }
@@ -813,7 +803,8 @@ pub fn apply_relocation(
 
 fn read_u32(image: &[u8], offset: usize) -> Result<u32, ElfError> {
     let bytes: [u8; 4] = image
-        .get(offset..offset + 4)
+        .get(offset..)
+        .and_then(|tail| tail.get(..4))
         .ok_or_else(|| ElfError::Link("relocation outside section".into()))?
         .try_into()
         .unwrap();
@@ -822,7 +813,8 @@ fn read_u32(image: &[u8], offset: usize) -> Result<u32, ElfError> {
 
 fn write(image: &mut [u8], offset: usize, bytes: &[u8]) -> Result<(), ElfError> {
     let output = image
-        .get_mut(offset..offset + bytes.len())
+        .get_mut(offset..)
+        .and_then(|tail| tail.get_mut(..bytes.len()))
         .ok_or_else(|| ElfError::Link("relocation outside section".into()))?;
     output.copy_from_slice(bytes);
     Ok(())
@@ -866,6 +858,53 @@ mod tests {
             u32::from_le_bytes(bytes.try_into().unwrap()) & 0x7ffff,
             0x14048
         );
+    }
+
+    #[test]
+    fn instruction_fields_preserve_opcodes_and_reject_invalid_relocations() {
+        for (relocation, bits, shift) in [
+            (R_COLOSSUS_18_S2, 18, 2),
+            (R_COLOSSUS_19_S2, 19, 2),
+            (R_COLOSSUS_20, 20, 0),
+            (R_COLOSSUS_21, 21, 0),
+        ] {
+            let mask = (1u32 << bits) - 1;
+            for opcode in [0, u32::MAX, 0xa55a_963c] {
+                for value in [0, 1, mask / 2, mask] {
+                    let mut bytes = opcode.to_le_bytes();
+                    apply_relocation(&mut bytes, 0, relocation, u64::from(value) << shift, 0)
+                        .unwrap();
+                    assert_eq!(u32::from_le_bytes(bytes), (opcode & !mask) | value);
+                }
+                let mut bytes = opcode.to_le_bytes();
+                assert!(
+                    apply_relocation(&mut bytes, 0, relocation, (u64::from(mask) + 1) << shift, 0)
+                        .is_err()
+                );
+                assert_eq!(u32::from_le_bytes(bytes), opcode);
+                if shift != 0 {
+                    assert!(apply_relocation(&mut bytes, 0, relocation, 3, 0).is_err());
+                    assert_eq!(u32::from_le_bytes(bytes), opcode);
+                }
+            }
+        }
+        for relocation in [
+            R_COLOSSUS_8,
+            R_COLOSSUS_16,
+            R_COLOSSUS_32,
+            R_COLOSSUS_64,
+            R_COLOSSUS_18_S2,
+            R_COLOSSUS_19_S2,
+            R_COLOSSUS_20,
+            R_COLOSSUS_21,
+            R_COLOSSUS_RUN,
+        ] {
+            for offset in [4, usize::MAX] {
+                let mut bytes = [0xa5; 4];
+                assert!(apply_relocation(&mut bytes, offset, relocation, 0, 0).is_err());
+                assert_eq!(bytes, [0xa5; 4]);
+            }
+        }
     }
 
     #[test]
