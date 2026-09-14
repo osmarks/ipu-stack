@@ -1,12 +1,8 @@
-use ipu_driver::{Device, DriverError, HostSession, Loader, block_device_interrupt_signals};
+use ipu_driver::{Device, HostSession, Loader, block_device_interrupt_signals};
 use ipu_package::Application;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, thiserror::Error)]
-pub enum RuntimeError {
-    #[error("driver error: {0}")]
-    Driver(#[from] DriverError),
-}
+pub use ipu_driver::DriverError as RuntimeError;
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
@@ -42,10 +38,7 @@ impl Runtime {
     }
 
     pub fn host_session(&self, application: &Application) -> Result<HostSession<'_>> {
-        Ok(HostSession::new(
-            &self.device,
-            application.host_exchange.clone(),
-        )?)
+        HostSession::new(&self.device, application.host_exchange.clone())
     }
 
     pub fn device(&self) -> &Device {

@@ -64,3 +64,7 @@ softmax hardware cases passed after extraction; all diagnostic targets compile.
 View adapter cleanup: logical-range to shard-extent translation now belongs
 to low expansion and is shared by forward and reversed views; mid/view.rs
 is removed. The low expansion suite passed (see /tmp/ipu-view-cleanup-tests.log).
+
+Runtime cleanup: removed the single-variant wrapper around DriverError and
+its thiserror dependency; RuntimeError remains a public alias. Workspace
+compilation passes. No callers pattern-matched the old wrapper in this tree.
