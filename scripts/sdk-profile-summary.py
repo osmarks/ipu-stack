@@ -46,16 +46,13 @@ def summarize(path, output):
                          if p is not None and p.type == pva.Program.Type.DoExchange else 0,
                          vertices='; '.join(v.type.name for v in cs.vertices) if cs else ''))
     output.mkdir(parents=True, exist_ok=True)
-    with (output / 'steps.csv').open('w') as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
     qkv = [r for r in rows if r['name'].endswith('/Convolve') and '/attn/qkv/' in r['name']]
     first = [r for r in rows if qkv[0]['step'] <= r['step'] < qkv[1]['step']]
-    with (output / 'first-body.csv').open('w') as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(first)
+    for name, selected in [('steps.csv', rows), ('first-body.csv', first)]:
+        with (output / name).open('w') as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(selected)
     kernels = [r for r in first if r['name'].endswith('/Convolve')]
     exchanges = [dict(name=p.name, maximum=max(p.codeBytesByTile),
                       mean=sum(p.codeBytesByTile) / len(p.codeBytesByTile))
