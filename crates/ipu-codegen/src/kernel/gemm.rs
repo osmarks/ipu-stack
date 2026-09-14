@@ -2,6 +2,54 @@
 
 use super::*;
 
+pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
+    run.check_arity(2, 1)?;
+    let TileKernelSpec::Gemm {
+        multiply,
+        accumulate,
+        weights,
+        inner_block,
+        output_columns,
+        mode,
+    } = run.kernel
+    else {
+        return Err(KernelAbiError::RequirementMismatch);
+    };
+    let output = run.requirements.outputs[0].format.precision;
+    if (weights == GemmWeightLoad::Interleaved && multiply == Precision::F32)
+        || (matches!(multiply, Precision::F8F143 { .. })
+            && (accumulate != crate::AccumulationPrecision::F16 || output != Precision::F16))
+    {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    // Scales change the call argument, not the compiled AMP instruction stream.
+    let (precision, arguments) = if let Precision::F8F143 { scale_exponent } = multiply {
+        (
+            Precision::F8F143 { scale_exponent: 0 },
+            vec![fp8_scale_argument(2 * i32::from(scale_exponent))?],
+        )
+    } else {
+        (multiply, Vec::new())
+    };
+    Ok(KernelCall {
+        implementation: KernelImplementation::Gemm(
+            precision,
+            weights,
+            inner_block,
+            output_columns,
+            mode,
+            gemm_rows(run)?,
+            run.requirements.outputs[0]
+                .format
+                .layout
+                .order
+                .gemm_output_group()
+                .unwrap_or(0),
+        ),
+        arguments,
+    })
+}
+
 /// Packed stores use the leading address of one column group, with the row
 /// permutation encoded by the GEMM. Other outputs require a contiguous view.
 pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool, KernelAbiError> {
@@ -222,7 +270,7 @@ impl KernelBuildPlan {
                         return None;
                     }
                     self.symbols.insert(
-                        KernelSpecialization::Gemm(
+                        KernelImplementation::Gemm(
                             precision,
                             weights,
                             inner_block,

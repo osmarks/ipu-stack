@@ -403,7 +403,7 @@ mod tests {
         let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut sums = 0;
         for run in &low.kernel_runs {
-            crate::validate_kernel_run(run).unwrap();
+            run.call().unwrap();
             let call = crate::materialize_kernel_run(
                 run,
                 &low.shards,
@@ -428,13 +428,13 @@ mod tests {
                 }
                 let mut invalid = run.clone();
                 invalid.outputs.pop();
-                assert!(crate::validate_kernel_run(&invalid).is_err());
+                assert!(invalid.call().is_err());
                 let mut invalid = run.clone();
                 std::sync::Arc::make_mut(&mut invalid.metadata)
                     .requirements
                     .distinct_elements
                     .push(vec![crate::MemoryOperand::Output(2)]);
-                assert!(crate::validate_kernel_run(&invalid).is_err());
+                assert!(invalid.call().is_err());
                 assert_eq!(call.input_addresses.len(), 3);
                 assert_ne!(call.output_address, call.input_addresses[2]);
                 assert_eq!(call.arguments, vec![1, 9216]);
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(fused.outputs, program.outputs);
         let graph = crate::expand_tiles(&fused).unwrap();
         for run in &graph.kernel_runs {
-            crate::validate_kernel_run(run).unwrap();
+            run.call().unwrap();
         }
         assert!(
             graph
@@ -517,7 +517,7 @@ mod tests {
         let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut applied = 0;
         for run in &low.kernel_runs {
-            crate::validate_kernel_run(run).unwrap();
+            run.call().unwrap();
             let call = crate::materialize_kernel_run(
                 run,
                 &low.shards,

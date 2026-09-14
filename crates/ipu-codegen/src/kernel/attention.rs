@@ -4,6 +4,83 @@
 use super::*;
 use crate::ShardView;
 
+pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
+    if run.outputs.len() != 1 {
+        return Err(KernelAbiError::RequirementMismatch);
+    }
+    let output = run.requirements.outputs[0].format.precision;
+    let (implementation, arguments) = match run.kernel {
+        TileKernelSpec::FlashAttention { .. } => {
+            run.check_arity(3, 1)?;
+            if output != Precision::F32
+                || run
+                    .requirements
+                    .inputs
+                    .iter()
+                    .any(|input| input.format.precision != Precision::F16)
+            {
+                return Err(KernelAbiError::Unavailable(run.kernel.clone()));
+            }
+            (
+                KernelImplementation::Attention(attention_shape(run)?),
+                Vec::new(),
+            )
+        }
+        TileKernelSpec::AttentionSoftmax {
+            head_dimension,
+            key_columns,
+            padded_key_columns,
+        } => {
+            run.check_arity(1, 1)?;
+            let rows = gemm_rows(run)?;
+            (
+                KernelImplementation::Softmax(
+                    head_dimension,
+                    key_columns,
+                    padded_key_columns,
+                    output,
+                ),
+                vec![
+                    rows,
+                    key_columns,
+                    u32::from(cost::f16_softmax_split_rows(
+                        u64::from(rows),
+                        u64::from(key_columns),
+                        u64::from(padded_key_columns),
+                    )),
+                ],
+            )
+        }
+        TileKernelSpec::AttentionMerge {
+            value_dimension,
+            padded_value_dimension,
+            key_block_columns,
+            initial,
+            final_block,
+        } => {
+            if output != Precision::F32 && !(output == Precision::F16 && final_block) {
+                return Err(KernelAbiError::Unavailable(run.kernel.clone()));
+            }
+            run.check_arity(if output == Precision::F16 { 3 } else { 2 }, 1)?;
+            (
+                KernelImplementation::Merge(
+                    value_dimension,
+                    padded_value_dimension,
+                    key_block_columns,
+                    output,
+                    run.requirements.inputs[1].format.precision,
+                ),
+                vec![u32::from(initial), u32::from(final_block), gemm_rows(run)?],
+            )
+        }
+        _ => return Err(KernelAbiError::RequirementMismatch),
+    };
+    Ok(KernelCall {
+        implementation,
+        arguments,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AttentionKernelShape {
     pub(crate) matrices: u32,
@@ -96,17 +173,17 @@ impl KernelBuildPlan {
             &[3, 4, 5, 2],
         );
         self.symbols
-            .insert(KernelSpecialization::Attention(shape), call_symbol);
+            .insert(KernelImplementation::Attention(shape), call_symbol);
     }
 
     pub(super) fn add_attention_stages(
         &mut self,
-        stages: BTreeSet<KernelSpecialization>,
+        stages: BTreeSet<KernelImplementation>,
     ) -> Result<(), KernelAbiError> {
         let mut compiled = BTreeSet::new();
         for key in stages {
             let (name, symbol, source, flags) = match key {
-                KernelSpecialization::Softmax(head, keys, padded, precision) => {
+                KernelImplementation::Softmax(head, keys, padded, precision) => {
                     let full = keys == padded;
                     let name = format!(
                         "attention_softmax_d{head}_p{padded}_{}",
@@ -140,7 +217,7 @@ impl KernelBuildPlan {
                     }
                     (name, symbol, "attention_softmax_f16.S", flags)
                 }
-                KernelSpecialization::Merge(values, padded, keys, output, weights) => {
+                KernelImplementation::Merge(values, padded, keys, output, weights) => {
                     let suffix = match output {
                         Precision::F16 => "out16",
                         Precision::F32 => "out32",

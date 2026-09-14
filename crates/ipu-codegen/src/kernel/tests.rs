@@ -124,8 +124,8 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                         run.requirements.outputs[0].format.layout.order,
                         ElementOrder::RowMajor
                     );
-                    let abi = validate_kernel_run(run).unwrap();
-                    assert!(scalar_values(run, &abi).unwrap()[3] > 0);
+                    let abi = run.call().unwrap();
+                    assert!(abi.arguments[3] > 0);
                 }
                 TileKernelSpec::Gemm {
                     multiply,
@@ -136,10 +136,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     assert_eq!(multiply, fp8);
                     assert_eq!(accumulate, AccumulationPrecision::F16);
                     assert_eq!(run.requirements.outputs[0].format.precision, Precision::F16);
-                    assert_eq!(
-                        scalar_values(run, &validate_kernel_run(run).unwrap()).unwrap(),
-                        vec![(-8i32) as u32]
-                    );
+                    assert_eq!(run.call().unwrap().arguments, vec![(-8i32) as u32]);
                     let mut rescaled = run.clone();
                     let metadata = std::sync::Arc::make_mut(&mut rescaled.metadata);
                     if let TileKernelSpec::Gemm { multiply, .. } = &mut metadata.kernel {
@@ -149,13 +146,10 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                         input.format.precision = Precision::F8F143 { scale_exponent: 1 };
                     }
                     assert_eq!(
-                        KernelSpecialization::from_run(run).unwrap(),
-                        KernelSpecialization::from_run(&rescaled).unwrap()
+                        run.call().unwrap().implementation,
+                        rescaled.call().unwrap().implementation
                     );
-                    assert_eq!(
-                        scalar_values(&rescaled, &validate_kernel_run(&rescaled).unwrap()).unwrap(),
-                        vec![2]
-                    );
+                    assert_eq!(rescaled.call().unwrap().arguments, vec![2]);
                 }
                 _ => {}
             }
@@ -231,56 +225,6 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
 }
 
 #[test]
-fn randomized_gemm_abis_resolve_to_retained_symbols() {
-    let mut random = fastrand::Rng::with_seed(0x6162_6921);
-    for _ in 0..64 {
-        let precision = if random.bool() {
-            Precision::F16
-        } else {
-            Precision::F32
-        };
-        let mode = if random.bool() {
-            GemmKernelMode::Initialize
-        } else {
-            GemmKernelMode::Accumulate
-        };
-        let weights = if precision == Precision::F16 && random.bool() {
-            GemmWeightLoad::Interleaved
-        } else {
-            GemmWeightLoad::Standard
-        };
-        let format = TensorFormat {
-            precision,
-            layout: Layout {
-                order: crate::ElementOrder::RowMajor,
-                tiling: TensorTiling::replicated(1),
-                memory_class: MemoryClass::Ipu21Standard,
-            },
-        };
-        let operand = KernelAccess::new(format, 8);
-        let requirements = KernelRequirements {
-            inputs: vec![operand.clone(), operand.clone()],
-            outputs: vec![operand],
-            distinct_elements: Vec::new(),
-        };
-        let abi = tile_kernel_abi(
-            &TileKernelSpec::Gemm {
-                multiply: precision,
-                accumulate: AccumulationPrecision::F32,
-                mode,
-                weights,
-                inner_block: 64,
-                output_columns: [32, 64, 128][random.usize(0..3)],
-            },
-            &requirements,
-        )
-        .unwrap();
-        assert!(matches!(abi.symbols, KernelSymbols::Specialized));
-        assert_eq!(abi.inputs, 2);
-    }
-}
-
-#[test]
 fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
     let mut random = fastrand::Rng::with_seed(0x7370_6563);
     for _ in 0..32 {
@@ -346,7 +290,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             .symbols
             .keys()
             .filter_map(|key| match key {
-                KernelSpecialization::Gemm(_, _, _, _, _, rows, _) => Some(*rows),
+                KernelImplementation::Gemm(_, _, _, _, _, rows, _) => Some(*rows),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -379,49 +323,20 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 }
             })
         {
-            let call = plan.call(run).unwrap();
-            assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
+            let call = run.call().unwrap();
+            assert!(
+                plan.retained_symbols()
+                    .any(|symbol| symbol == plan.symbol(&call.implementation).unwrap())
+            );
             assert!(call.arguments.is_empty());
             let compute =
                 materialize_kernel_run(run, &low.shards, &addresses, &plan, &BTreeMap::new())
                     .unwrap_or_else(|error| {
                         panic!("batch={batch} tiles={tiles} run={run:?}: {error}")
                     });
-            assert_eq!(compute.symbol, call.symbol);
+            assert_eq!(compute.symbol, plan.symbol(&call.implementation).unwrap());
             assert_eq!(compute.input_addresses.len(), 2);
         }
-    }
-}
-
-#[test]
-fn randomized_gelu_abis_select_supported_layout_paths() {
-    let mut random = fastrand::Rng::with_seed(0x6765_6c75);
-    for _ in 0..64 {
-        let tiles = 1_u16 << random.u32(0..=5);
-        let input_layout = if random.bool() {
-            Layout::amp_left_result(tiles)
-        } else {
-            Layout::row_sharded(tiles)
-        };
-        let output_layout = input_layout.clone();
-        let requirement = |layout| {
-            KernelAccess::new(
-                TensorFormat {
-                    precision: Precision::F16,
-                    layout,
-                },
-                8,
-            )
-        };
-        let requirements = KernelRequirements {
-            inputs: vec![requirement(input_layout)],
-            outputs: vec![requirement(output_layout)],
-            distinct_elements: Vec::new(),
-        };
-        let abi = tile_kernel_abi(&TileKernelSpec::Gelu, &requirements).unwrap();
-        assert_eq!(abi.inputs, 1);
-        assert_eq!(abi.scalar_arguments, &[ScalarValue::ElementCount]);
-        assert_eq!(abi.symbols, KernelSymbols::Exact("gelu_tanh_approx_f16"));
     }
 }
 
@@ -458,28 +373,7 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             ));
         }
     }
-    let mut plan = KernelBuildPlan::default();
-    plan.add_attention_stages(
-        stages
-            .iter()
-            .map(|(kernel, _)| {
-                KernelSpecialization::stage(
-                    kernel,
-                    if matches!(kernel, TileKernelSpec::AttentionSoftmax { .. }) {
-                        Precision::F16
-                    } else {
-                        Precision::F32
-                    },
-                    Precision::F16,
-                )
-                .unwrap()
-            })
-            .collect(),
-    )
-    .unwrap();
-    // Four dimension pairs each have full/masked softmax, plus two merges.
-    // Query-row counts share assembly instead of producing more codelets.
-    assert_eq!(plan.compilations.len(), 10);
+    let mut calls = Vec::new();
     for (kernel, rows) in stages {
         let (inputs, expected) = match kernel {
             TileKernelSpec::AttentionSoftmax { key_columns, .. } => (1, vec![rows, key_columns, 0]),
@@ -531,9 +425,26 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 distinct_elements: Vec::new(),
             },
         );
-        let call = plan.call(&run).unwrap();
+        let call = run.call().unwrap();
         assert_eq!(call.arguments, expected);
-        assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
+        calls.push(call);
+    }
+    let mut plan = KernelBuildPlan::default();
+    plan.add_attention_stages(
+        calls
+            .iter()
+            .map(|call| call.implementation.clone())
+            .collect(),
+    )
+    .unwrap();
+    // Four dimension pairs each have full/masked softmax, plus two merges.
+    // Query-row counts share assembly instead of producing more codelets.
+    assert_eq!(plan.compilations.len(), 10);
+    for call in calls {
+        assert!(
+            plan.retained_symbols()
+                .any(|symbol| symbol == plan.symbol(&call.implementation).unwrap())
+        );
     }
 }
 
@@ -565,7 +476,7 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
     let symbols = plan.retained_symbols().collect::<BTreeSet<_>>();
     assert_eq!(symbols.len(), targets.len());
     for (row_block, column_block) in targets {
-        let symbol = &plan.symbols[&KernelSpecialization::Rearrange((
+        let symbol = &plan.symbols[&KernelImplementation::Rearrange((
             RearrangeTarget::BlockMajor {
                 row_block,
                 column_block,
@@ -658,7 +569,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
         compute.output_address,
         TileAddress::Absolute(0x60000 + 32 + 16)
     );
-    assert_eq!(plan.call(&run).unwrap().arguments, vec![1, 1]);
+    assert_eq!(run.call().unwrap().arguments, vec![1, 1]);
     for (offset, bytes) in [(48, 56), (1, 8), (0, 7), (u32::MAX - 7, 16)] {
         let run = KernelRun::new(
             run.provenance,
@@ -774,9 +685,12 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
                 distinct_elements: Vec::new(),
             },
         );
-        let call = plan.call(&run).unwrap();
+        let call = run.call().unwrap();
         assert_eq!(call.arguments, [count]);
-        assert!(plan.retained_symbols().any(|symbol| symbol == call.symbol));
+        assert!(
+            plan.retained_symbols()
+                .any(|symbol| symbol == plan.symbol(&call.implementation).unwrap())
+        );
     }
 }
 
@@ -785,7 +699,7 @@ fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
     // 14 columns have a two-halfword tail: a 64-bit load would cross the row.
     // Sharing kernels across row tails must not erase this distinction.
     for columns in [14, 16] {
-        let shape = rearrangement_specialization(
+        let shape = rearrange::rearrangement_specialization(
             RearrangeTarget::BlockMajor {
                 row_block: 64,
                 column_block: 16,
@@ -841,7 +755,7 @@ fn worker_stack_support_follows_cpp_recipes() {
     }
     // The hand-written softmax worker does not use a compiler-managed stack.
     let plan = KernelBuildPlan::from_inventory(KernelInventory {
-        attention_stages: BTreeSet::from([KernelSpecialization::Softmax(
+        attention_stages: BTreeSet::from([KernelImplementation::Softmax(
             64,
             32,
             32,
@@ -855,29 +769,56 @@ fn worker_stack_support_follows_cpp_recipes() {
 }
 
 #[test]
-fn unsupported_kernel_abis_fail_at_lookup() {
+fn unsupported_kernel_formats_fail_at_call_construction() {
     let format = TensorFormat {
         precision: Precision::F32,
         layout: Layout::row_sharded(1),
     };
-    for kernel in [
-        TileKernelSpec::Add,
-        TileKernelSpec::LayerNorm,
-        TileKernelSpec::Gelu,
-        TileKernelSpec::Cast {
-            from: Precision::F16,
-            to: Precision::F32,
-        },
-        TileKernelSpec::Rearrange {
-            from: format.layout.clone(),
-            to: format.layout.clone(),
-        },
+    for (kernel, inputs) in [
+        (TileKernelSpec::Add, 2),
+        (TileKernelSpec::LayerNorm, 3),
+        (TileKernelSpec::Gelu, 1),
+        (
+            TileKernelSpec::Cast {
+                from: Precision::F16,
+                to: Precision::F32,
+            },
+            1,
+        ),
+        (
+            TileKernelSpec::Rearrange {
+                from: format.layout.clone(),
+                to: format.layout.clone(),
+            },
+            1,
+        ),
     ] {
-        let requirements = KernelRequirements::new(&kernel, [format.clone()], vec![format.clone()]);
-        assert_eq!(
-            tile_kernel_abi(&kernel, &requirements),
-            Err(KernelAbiError::Unavailable(kernel))
+        let requirements = KernelRequirements::new(
+            &kernel,
+            (0..inputs).map(|_| format.clone()),
+            vec![format.clone()],
         );
+        let view = ShardView {
+            shard: BlockValueId(0),
+            extents: vec![ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: 16,
+                physical_end: 16,
+            }],
+        };
+        let run = KernelRun::new(
+            WorkProvenance {
+                operation: None,
+                value: None,
+                reason: WorkReason::OperatorKernel,
+            },
+            kernel.clone(),
+            vec![view.clone(); inputs],
+            vec![view],
+            requirements,
+        );
+        assert_eq!(run.call(), Err(KernelAbiError::Unavailable(kernel)));
     }
 }
 
@@ -912,13 +853,10 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
         vec![view(2, [1, 2])],
         KernelRequirements::new(&kernel, [format.clone(), format.clone()], vec![format]),
     );
-    validate_kernel_run(&run).unwrap();
+    run.call().unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.
     run.inputs[1] = view(1, [2, (1 << 31) + 1]);
-    assert_eq!(
-        validate_kernel_run(&run),
-        Err(KernelAbiError::ElementCountOverflow)
-    );
+    assert_eq!(run.call(), Err(KernelAbiError::ElementCountOverflow));
 }
 
 #[test]

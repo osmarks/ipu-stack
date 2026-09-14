@@ -2,6 +2,126 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum RearrangeTarget {
+    AmpLeft,
+    AmpTransposedRight,
+    BlockMajor { row_block: u16, column_block: u16 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum UnpackSource {
+    AmpOutput,
+    AmpTransposedLeft,
+    Blocked(BlockMajorOrder),
+}
+
+impl UnpackSource {
+    pub(super) fn from_order(order: ElementOrder) -> Option<Self> {
+        match order {
+            ElementOrder::Amp(AmpOrder::Output) => Some(Self::AmpOutput),
+            ElementOrder::Amp(AmpOrder::TransposedLeft) => Some(Self::AmpTransposedLeft),
+            ElementOrder::BlockMajor(order) => Some(Self::Blocked(order)),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn codelet_index(self) -> u32 {
+        match self {
+            Self::AmpOutput => 0,
+            Self::AmpTransposedLeft => 1,
+            Self::Blocked(BlockMajorOrder::Matrix { .. }) => 2,
+            Self::Blocked(BlockMajorOrder::TransposedMatrix { .. }) => 3,
+        }
+    }
+}
+
+impl RearrangeTarget {
+    pub(super) fn from_order(order: ElementOrder) -> Option<Self> {
+        match order {
+            ElementOrder::Amp(AmpOrder::Left) => Some(Self::AmpLeft),
+            ElementOrder::Amp(AmpOrder::TransposedRight) => Some(Self::AmpTransposedRight),
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block,
+                column_block,
+            }) => Some(Self::BlockMajor {
+                row_block,
+                column_block,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn codelet_index(self) -> u32 {
+        match self {
+            Self::AmpLeft => 0,
+            Self::AmpTransposedRight => 1,
+            Self::BlockMajor { .. } => 2,
+        }
+    }
+}
+
+pub(crate) fn supported(from: ElementOrder, to: ElementOrder, precision: Precision) -> bool {
+    precision == Precision::F16
+        && ((UnpackSource::from_order(from).is_some() && to == ElementOrder::RowMajor)
+            || (from == ElementOrder::RowMajor && RearrangeTarget::from_order(to).is_some()))
+}
+
+pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
+    run.check_arity(1, 1)?;
+    let TileKernelSpec::Rearrange { from, to } = &run.kernel else {
+        return Err(KernelAbiError::RequirementMismatch);
+    };
+    if !supported(
+        from.order,
+        to.order,
+        run.requirements.outputs[0].format.precision,
+    ) {
+        return Err(KernelAbiError::Unavailable(run.kernel.clone()));
+    }
+    let rows = matrix_extent(&run.outputs[0], true, false)?;
+    let physical_rows = matrix_extent(&run.outputs[0], false, false)?;
+    let columns = matrix_extent(&run.outputs[0], true, true)?;
+    let physical_columns = matrix_extent(&run.outputs[0], false, true)?;
+    let matrices = matrix_count(run)?;
+    let (implementation, arguments) = if from.order == ElementOrder::RowMajor {
+        let target =
+            RearrangeTarget::from_order(to.order).ok_or(KernelAbiError::RequirementMismatch)?;
+        (
+            KernelImplementation::Rearrange(rearrangement_specialization(
+                target,
+                rows,
+                physical_rows,
+                columns,
+                physical_columns,
+            )),
+            vec![
+                rows,
+                physical_rows,
+                target.codelet_index(),
+                columns,
+                physical_columns,
+                matrices,
+            ],
+        )
+    } else {
+        (
+            KernelImplementation::Unpack((
+                UnpackSource::from_order(from.order).ok_or(KernelAbiError::RequirementMismatch)?,
+                input_matrix_extent(run, true, false)?,
+                input_matrix_extent(run, false, false)?,
+                input_matrix_extent(run, true, true)?,
+                input_matrix_extent(run, false, true)?,
+            )),
+            vec![matrices, rows, physical_rows, columns, physical_columns],
+        )
+    };
+    Ok(KernelCall {
+        implementation,
+        arguments,
+    })
+}
+
 pub(crate) fn supports_row_major_population(order: ElementOrder) -> bool {
     order == ElementOrder::RowMajor || RearrangeTarget::from_order(order).is_some()
 }
@@ -34,7 +154,7 @@ impl KernelBuildPlan {
         let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
         let call = format!("unpack_amp_to_row_major_f16_{suffix}");
         self.symbols
-            .insert(KernelSpecialization::Unpack(shape), call.clone());
+            .insert(KernelImplementation::Unpack(shape), call.clone());
         let mut flags = vec![
             format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
             format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
@@ -88,7 +208,7 @@ impl KernelBuildPlan {
         let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
         let call = format!("rearrange_row_major_to_amp_f16_{suffix}");
         self.symbols
-            .insert(KernelSpecialization::Rearrange(shape), call.clone());
+            .insert(KernelImplementation::Rearrange(shape), call.clone());
         let assembly = if order == RearrangeTarget::AmpLeft
             && logical_columns.is_multiple_of(2)
             && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
@@ -144,4 +264,31 @@ impl KernelBuildPlan {
             );
         }
     }
+}
+
+pub(super) fn rearrangement_specialization(
+    order: RearrangeTarget,
+    mut logical_rows: u32,
+    physical_rows: u32,
+    logical_columns: u32,
+    physical_columns: u32,
+) -> (RearrangeTarget, u32, u32, u32, u32) {
+    if physical_rows == AMP_INNER_BLOCK
+        && logical_rows < physical_rows
+        && matches!(
+            order,
+            RearrangeTarget::AmpTransposedRight | RearrangeTarget::BlockMajor { .. }
+        )
+    {
+        // Row tails share one worker, but column alignment selects wide loads.
+        // Erasing it could incorrectly admit a two-halfword tail to ld64.
+        logical_rows = 0;
+    }
+    (
+        order,
+        logical_rows,
+        physical_rows,
+        logical_columns,
+        physical_columns,
+    )
 }

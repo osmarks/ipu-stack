@@ -50,11 +50,11 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
     for run in &low.kernel_runs {
         if matches!(run.kernel, TileKernelSpec::LayerNormMoments) {
             assert_eq!(run.requirements.outputs[0].format.precision, Precision::F32);
-            crate::validate_kernel_run(run).unwrap();
+            run.call().unwrap();
             moments += 1;
         }
         if matches!(run.kernel, TileKernelSpec::LayerNormApply { .. }) {
-            crate::validate_kernel_run(run).unwrap();
+            run.call().unwrap();
             applies += 1;
         }
     }
@@ -2105,14 +2105,14 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         );
         assert_eq!(packed.format.layout.tiling.tile_count, 1);
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-        let build = crate::KernelBuildPlan::from_program(&low).unwrap();
+        crate::KernelBuildPlan::from_program(&low).unwrap();
         let calls: Vec<_> = low
             .kernel_runs
             .iter()
             .filter(|run| matches!(run.kernel, TileKernelSpec::Cast { .. }))
             .collect();
         assert_eq!(calls.len(), 1);
-        let arguments = build.call(calls[0]).unwrap().arguments;
+        let arguments = calls[0].call().unwrap().arguments;
         assert_eq!(arguments[3], if rows == 1 { 0 } else { rows });
         assert_eq!(arguments[5], 128);
     }

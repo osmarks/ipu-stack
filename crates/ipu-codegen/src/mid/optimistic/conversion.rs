@@ -295,9 +295,13 @@ fn local_supported(a: &TensorType, b: &TensorType, kind: &TransformKind) -> bool
         },
         _ => return false,
     };
-    let requirements =
-        crate::KernelRequirements::new(&kernel, [a.format.clone()], vec![b.format.clone()]);
-    crate::tile_kernel_abi(&kernel, &requirements).is_ok()
+    match kernel {
+        TileKernelSpec::Cast { from, to } => crate::kernel::cast::symbol(from, to).is_some(),
+        TileKernelSpec::Rearrange { from, to } => {
+            crate::kernel::rearrange::supported(from.order, to.order, b.format.precision)
+        }
+        _ => unreachable!(),
+    }
 }
 
 // AMP-left consists of contiguous row fragments, unlike AMP output's lane

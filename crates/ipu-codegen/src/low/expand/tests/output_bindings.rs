@@ -284,7 +284,7 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         .iter()
         .find(|run| run.kernel == TileKernelSpec::Add)
         .unwrap();
-    crate::validate_kernel_run(run).unwrap();
+    run.call().unwrap();
     let scalar = &run.inputs[1];
     assert_eq!(scalar.shard, graph.value_shards(graph.inputs[0].value)[0]);
     assert!(
@@ -446,7 +446,7 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             );
         }
         for run in &low.kernel_runs {
-            crate::validate_kernel_run(run).unwrap();
+            run.call().unwrap();
         }
         let placement = crate::place(&low).unwrap();
         for &shard in copied {

@@ -59,7 +59,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                     run.inputs[0].extents, run.outputs[0].extents,
                     "shape {shape:?}, tiles {tiles}"
                 );
-                crate::validate_kernel_run(run).unwrap();
+                run.call().unwrap();
             }
             if shape == [8, 16] && tiles != 3 {
                 let mut norm = mid;
@@ -92,7 +92,7 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 let expanded = expand_tiles(&norm, false).unwrap();
                 for run in &expanded.kernel_runs {
                     assert_eq!(run.inputs[0].extents, run.outputs[0].extents);
-                    crate::validate_kernel_run(run).unwrap();
+                    run.call().unwrap();
                 }
             }
         }

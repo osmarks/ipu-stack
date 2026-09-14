@@ -226,7 +226,7 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
     let tiles = crate::low::expand::expand_tiles(&program, false).unwrap();
     let low = crate::low::lower_to_tiles(&tiles, false);
     for run in &low.kernel_runs {
-        crate::validate_kernel_run(run).unwrap();
+        run.call().unwrap();
     }
 }
 

@@ -1394,7 +1394,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
         for tile in &low.tiles {
             for work in low.work(tile) {
                 if let TileWorkRef::Kernel(run) = work {
-                    crate::validate_kernel_run(run).unwrap();
+                    run.call().unwrap();
                     assert_eq!(
                         low.shards[run.outputs[0].shard.index() as usize].tile,
                         tile.tile

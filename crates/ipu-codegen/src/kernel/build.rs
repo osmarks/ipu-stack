@@ -13,7 +13,7 @@ pub struct KernelCompilation {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
-    pub(super) symbols: BTreeMap<KernelSpecialization, String>,
+    pub(super) symbols: BTreeMap<KernelImplementation, String>,
 }
 
 impl KernelBuildPlan {
@@ -143,7 +143,7 @@ impl KernelBuildPlan {
             (Precision::F16, f8),
             (Precision::F32, f8),
         ] {
-            let symbol = cast_symbol(from, to).expect("FP8 cast implementation");
+            let symbol = cast::symbol(from, to).expect("FP8 cast implementation");
             if !exact_symbols.contains(symbol) {
                 continue;
             }
@@ -228,20 +228,18 @@ impl KernelBuildPlan {
         self.compilations.last_mut().unwrap()
     }
 
-    pub fn call(&self, run: &KernelRun) -> Result<PlannedKernelCall, KernelAbiError> {
-        let abi = validate_kernel_run(run)?;
-        let symbol = match abi.symbols {
-            KernelSymbols::Exact(symbol) => symbol.to_owned(),
+    pub(super) fn symbol<'a>(
+        &'a self,
+        implementation: &KernelImplementation,
+    ) -> Result<&'a str, KernelAbiError> {
+        match implementation {
+            KernelImplementation::Exact(symbol) => Ok(symbol),
             _ => self
                 .symbols
-                .get(&KernelSpecialization::from_run(run)?)
-                .cloned()
-                .ok_or(KernelAbiError::RequirementMismatch)?,
-        };
-        Ok(PlannedKernelCall {
-            symbol,
-            arguments: scalar_values(run, &abi)?,
-        })
+                .get(implementation)
+                .map(String::as_str)
+                .ok_or(KernelAbiError::RequirementMismatch),
+        }
     }
 
     pub fn retained_symbols(&self) -> impl Iterator<Item = &str> {

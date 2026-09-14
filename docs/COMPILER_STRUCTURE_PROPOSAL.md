@@ -53,6 +53,11 @@ low no longer derives kernel requirements, `low/call.rs` is removed, and final
 materialization shares relative-view addressing with construction. This exposed
 two test fixtures that requested nonexistent GeLU/rearrangement implementations;
 they now construct supported conversions and exercise the early failure boundary.
+Family call construction now replaces the separate ABI, scalar-getter and
+specialization-reconstruction tables. Each family produces a complete build
+identity and encoded arguments; inventory and final emission use that same
+description. Shared FP8 output validation lives beside the fusion capabilities,
+and optimistic conversion checks query the cast/rearrangement families directly.
 Complete family binding, planner module ownership and the other boundaries below remain
 to be refactored. The diagnoses below describe the
 reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks

@@ -161,7 +161,7 @@ The semantic relation is `Y[b,r,c] = X[b,r,c] + B[0,r,c]`.
 | Select output layout and compatible kernel | [mid/candidates.rs](../crates/ipu-codegen/src/mid/candidates.rs) | Choose distributed implementation |
 | Project output ownership onto non-broadcast input axes | [implementation/mod.rs](../crates/ipu-codegen/src/mid/implementation/mod.rs), `pointwise_input_tiling` | Give each owner its corresponding `[1,4,8]` bias slice instead of a whole replicated parameter |
 | Bind the declared operand relation to a resident fragment | [expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs), `elementwise_view` | Supply the local kernel with the needed coordinates |
-| Validate supported broadcast shape and encode strides/counts | [kernel/abi.rs](../crates/ipu-codegen/src/kernel/abi.rs) | Match the actual kernel's address arithmetic |
+| Validate supported broadcast shape and encode strides/counts | [kernel/pointwise.rs](../crates/ipu-codegen/src/kernel/pointwise.rs), `call` | Match the actual kernel's address arithmetic |
 
 Mid records `OperandIndexing`: an elementwise relation to a specified result, or
 a whole local fragment with an optional window. Graph validation, ownership
@@ -225,12 +225,19 @@ launch coalescing remain in low/copy.rs.
 Kernel construction resolves read views in
 [buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs), then calls
 `KernelRun::bind` in [kernel/binding.rs](../crates/ipu-codegen/src/kernel/binding.rs).
-That owner interns access requirements and checks the ABI, scalar arguments,
-specialization and relative physical views before the call enters low. GEMM
+That owner interns access requirements and checks the family call and relative
+physical views before the call enters low. GEMM
 batch selection and shifted cast chunking select the final views first; neither
 mutates an already bound call. Both kernel and exchange append only record work.
-The remaining family refactor consolidates the ABI's family-specific decisions
-and shares their capabilities with planning and costing.
+`KernelRun::call` dispatches to the family once. The family checks its formats and
+shape and returns a complete `KernelImplementation` key plus encoded arguments.
+Build inventory and final emission consume that same description. The former
+ABI lookup, symbolic scalar-getter list and specialization reconstruction are
+removed. Fixed entry points and parameterized implementations use one identity
+enum; there is no unspecified specialization for another pass to discover.
+FP8 output epilogues share their contract with mid fusion, and optimistic cast
+and packing queries use their families' capabilities. Mixed-state/local-copy
+contracts and wider sharing of cost geometry remain to be refactored.
 After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
 groups exchanges across commuting local copies, then merges adjacent copies.
 It checks read/write hazards against completed storage bindings and respects
@@ -247,8 +254,8 @@ alongside movement and kernel binding.
 ## What each later representation is for
 
 - `KernelRun` retains checked relative views, kernel specification and shared
-  access requirements. Binding validates the current implementation's ABI,
-  specialization, scalars and physical view interpretation before placement.
+  access requirements. Binding validates the implementation identity, scalar
+  values and physical view interpretation before placement.
   Those cheap derived fields are not copied into every call. Final emission
   uses the same derivation and adds placed or Repeat-relative base addresses.
 - `LogicalExchange` stores one source with multiple recipient views. Physical

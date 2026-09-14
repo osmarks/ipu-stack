@@ -244,7 +244,7 @@ mod tests {
             );
             let mut written = 0;
             for run in &low.kernel_runs {
-                crate::validate_kernel_run(run).unwrap();
+                run.call().unwrap();
                 let src = &run.inputs[0];
                 let dst = &run.outputs[0];
                 let spans = |v: &crate::ShardView| {

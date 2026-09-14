@@ -7,19 +7,23 @@ mod build;
 pub(crate) mod cast;
 pub(crate) mod cost;
 mod gemm;
+mod inventory;
+mod normalization;
 mod output;
+mod pointwise;
 pub(crate) mod rearrange;
+mod reduce;
 mod spec;
-mod specialization;
 pub use spec::*;
 #[cfg(test)]
 mod tests;
 pub(crate) use abi::*;
-pub(crate) use attention::{AttentionKernelShape, attention_shape};
+use attention::AttentionKernelShape;
 pub(crate) use binding::*;
 pub(crate) use build::*;
 pub(crate) use gemm::gemm_rows;
-use specialization::*;
+use inventory::*;
+use rearrange::{RearrangeTarget, UnpackSource};
 
 use crate::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 use crate::{
@@ -28,12 +32,6 @@ use crate::{
     view_byte_traversal,
 };
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlannedKernelCall {
-    pub symbol: String,
-    pub arguments: Vec<u32>,
-}
 
 /// Resolves one scheduled call after placement has assigned each shard base.
 /// Layout conversion supplies the byte offset; the build plan supplies the
@@ -45,7 +43,8 @@ pub fn materialize_kernel_run(
     plan: &KernelBuildPlan,
     overrides: &BTreeMap<BlockValueId, TileAddress>,
 ) -> Result<ComputeStep, KernelError> {
-    let call = plan.call(run)?;
+    let call = run.call()?;
+    let symbol = plan.symbol(&call.implementation)?.to_owned();
     let resolve = |operand: MemoryOperand| {
         let view = run
             .operand_view(operand)
@@ -63,7 +62,7 @@ pub fn materialize_kernel_run(
         .map(resolve)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ComputeStep {
-        symbol: call.symbol,
+        symbol,
         output_address,
         input_addresses,
         arguments: call.arguments,

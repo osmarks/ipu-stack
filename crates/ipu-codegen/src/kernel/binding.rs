@@ -212,11 +212,7 @@ impl KernelRun {
             inputs,
             outputs,
         };
-        let abi = validate_kernel_run(&run)?;
-        scalar_values(&run, &abi)?;
-        if abi.symbols == KernelSymbols::Specialized {
-            KernelSpecialization::from_run(&run)?;
-        }
+        run.call()?;
         for operand in (0..run.inputs.len())
             .map(|i| MemoryOperand::Input(i as u16))
             .chain((0..run.outputs.len()).map(|i| MemoryOperand::Output(i as u16)))
@@ -264,4 +260,132 @@ pub(super) fn view_offset(
             .ok_or(KernelError::AddressOverflow);
     }
     Ok(span.offset)
+}
+
+pub(super) fn element_count(extents: &[crate::ShardExtent]) -> Result<u32, KernelAbiError> {
+    extents.iter().try_fold(1u32, |product, extent| {
+        product
+            .checked_mul(extent.physical_end - extent.start)
+            .ok_or(KernelAbiError::ElementCountOverflow)
+    })
+}
+
+pub(super) fn output_byte_count(run: &KernelRun) -> Result<u32, KernelAbiError> {
+    if let TileKernelSpec::FillZero { bytes, .. } = run.kernel {
+        return Ok(bytes);
+    }
+    let precision = run.requirements.outputs[0].format.precision;
+    element_count(&run.outputs[0].extents)?
+        .checked_mul(
+            u32::try_from(precision.bytes()).map_err(|_| KernelAbiError::ElementCountOverflow)?,
+        )
+        .ok_or(KernelAbiError::ElementCountOverflow)
+}
+
+pub(super) fn fp8_scale_argument(scale: i32) -> Result<u32, KernelAbiError> {
+    if (-32..=31).contains(&scale) {
+        Ok(u32::from_ne_bytes(scale.to_ne_bytes()))
+    } else {
+        Err(KernelAbiError::Fp8Scale(scale))
+    }
+}
+
+/// The same key selects a build recipe and resolves its eventual call.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum KernelImplementation {
+    Exact(&'static str),
+    Gemm(
+        Precision,
+        GemmWeightLoad,
+        u32,
+        u32,
+        GemmKernelMode,
+        u32,
+        u32,
+    ),
+    Attention(AttentionKernelShape),
+    Softmax(u32, u32, u32, Precision),
+    Merge(u32, u32, u32, Precision, Precision),
+    Rearrange((RearrangeTarget, u32, u32, u32, u32)),
+    Unpack((UnpackSource, u32, u32, u32, u32)),
+}
+
+/// Derived facts for one bound invocation. The implementation key is complete
+/// before build collection; only its linked symbol and operand addresses remain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KernelCall {
+    pub(super) implementation: KernelImplementation,
+    pub arguments: Vec<u32>,
+}
+
+impl KernelCall {
+    pub(super) fn exact(symbol: &'static str, arguments: Vec<u32>) -> Self {
+        Self {
+            implementation: KernelImplementation::Exact(symbol),
+            arguments,
+        }
+    }
+}
+
+impl KernelRun {
+    pub(crate) fn call(&self) -> Result<KernelCall, KernelAbiError> {
+        if self.inputs.len() != self.requirements.inputs.len()
+            || self.outputs.len() != self.requirements.outputs.len()
+            || self
+                .requirements
+                .distinct_elements
+                .iter()
+                .flatten()
+                .any(|&operand| self.operand_view(operand).is_none())
+        {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+        match self.kernel {
+            TileKernelSpec::Gemm { .. } => gemm::call(self),
+            TileKernelSpec::FlashAttention { .. }
+            | TileKernelSpec::AttentionSoftmax { .. }
+            | TileKernelSpec::AttentionMerge { .. } => attention::call(self),
+            TileKernelSpec::Cast { .. } => cast::call(self),
+            TileKernelSpec::Rearrange { .. } => rearrange::call(self),
+            TileKernelSpec::Gelu | TileKernelSpec::BiasGelu | TileKernelSpec::Add => {
+                pointwise::call(self)
+            }
+            TileKernelSpec::LayerNorm
+            | TileKernelSpec::AddLayerNorm
+            | TileKernelSpec::LayerNormMoments
+            | TileKernelSpec::AddLayerNormMoments
+            | TileKernelSpec::LayerNormApply { .. } => normalization::call(self),
+            TileKernelSpec::ReductionSum { .. } => reduce::call(self),
+            TileKernelSpec::FillZero { .. } => fill_call(self),
+        }
+    }
+
+    pub(super) fn check_arity(&self, inputs: usize, outputs: usize) -> Result<(), KernelAbiError> {
+        if self.inputs.len() != inputs {
+            return Err(KernelAbiError::PointerArity {
+                expected: inputs,
+                actual: self.inputs.len(),
+            });
+        }
+        if self.outputs.len() != outputs {
+            return Err(KernelAbiError::RequirementMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn fill_call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
+    run.check_arity(0, 1)?;
+    let bytes = output_byte_count(run)?;
+    if !bytes.is_multiple_of(8) {
+        return Err(KernelAbiError::UnsupportedElementCount {
+            symbol: crate::FILL_ZERO_U64_SYMBOL,
+            count: bytes,
+            divisor: 8,
+        });
+    }
+    Ok(KernelCall::exact(
+        crate::FILL_ZERO_U64_SYMBOL,
+        vec![bytes / 8 / 6, bytes / 8 % 6],
+    ))
 }

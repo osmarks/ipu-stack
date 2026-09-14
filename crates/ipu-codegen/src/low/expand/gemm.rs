@@ -405,7 +405,7 @@ mod tests {
             let low = expand_tiles(&mid, false).unwrap();
             let mut flops = [0; 2];
             for run in low.kernel_calls() {
-                crate::validate_kernel_run(run).unwrap();
+                run.call().unwrap();
                 let counted = run.product_flops.unwrap();
                 flops[0] += counted[0];
                 flops[1] += counted[1];

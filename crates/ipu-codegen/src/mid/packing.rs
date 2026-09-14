@@ -252,7 +252,7 @@ mod tests {
                                 ..
                             })
                         ));
-                        crate::validate_kernel_run(run).unwrap();
+                        run.call().unwrap();
                         packs += 1;
                     }
                 }
