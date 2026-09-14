@@ -111,12 +111,6 @@ fn main() -> Result<()> {
             steps,
         });
     }
-    for tile in programs.len() as u16..1472 {
-        programs.push(TileProgram {
-            tile,
-            steps: vec![],
-        });
-    }
     let outputs = [
         Binding {
             name: "result".into(),

@@ -99,12 +99,7 @@ exitz $mzero
     }
     let wrapper = args.output.join("kernel_equivalence.S");
     fs::write(&wrapper, source)?;
-    let mut programs = (0..1472)
-        .map(|tile| TileProgram {
-            tile,
-            steps: vec![],
-        })
-        .collect::<Vec<_>>();
+    let mut programs = Vec::new();
     let mut data = Vec::new();
     let finite = (0..=u16::MAX)
         .filter(|bits| bits & 0x7c00 != 0x7c00)
@@ -181,7 +176,7 @@ exitz $mzero
         } else {
             "reduce_sum_f16"
         };
-        let steps = &mut programs[index].steps;
+        let mut steps = Vec::new();
         // Extreme finite GELU inputs overflow the existing polynomial. Compare
         // their outputs with benign exceptions, preserving other FP controls.
         if *partials == 1 {
@@ -236,6 +231,7 @@ exitz $mzero
                 &[4],
             ));
         }
+        programs.push(TileProgram { tile, steps });
         data.push(TileProgramData {
             tile,
             address: 0xe7000,

@@ -7,6 +7,7 @@ use super::*;
 /// no tensor bindings: callers supply initialized tile data and inspect it
 /// through driver diagnostics. A zero-payload `run` rendezvous starts execution
 /// after loading, so breakpoints in the program cannot race the loader.
+/// Programs cover an ordered prefix of logical tiles; remaining tiles are idle.
 /// Initial values in the host aperture are staged and copied in after this
 /// rendezvous, before the supplied device steps execute.
 pub fn build_tile_program_package(
@@ -18,14 +19,14 @@ pub fn build_tile_program_package(
 ) -> PackageBuildResult<Application> {
     let topology = Topology::c600();
     let execution_tiles = u16::try_from(topology.tile_count())?;
-    if programs.len() != usize::from(execution_tiles)
+    if programs.len() > usize::from(execution_tiles)
         || programs
             .iter()
             .enumerate()
             .any(|(tile, program)| usize::from(program.tile) != tile)
     {
         return Err(invalid(
-            "finalized tile programs must cover every C600 logical tile in order",
+            "finalized tile programs must be an ordered prefix of C600 logical tiles",
         ));
     }
     if data
@@ -38,6 +39,12 @@ pub fn build_tile_program_package(
     }
 
     let mut programs = programs.to_vec();
+    programs.extend(
+        (programs.len() as u16..execution_tiles).map(|tile| TileProgram {
+            tile,
+            steps: Vec::new(),
+        }),
+    );
     let (mut data, aperture) = split_aperture_data(data)?;
     let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
     let objects = vec![fs::read(runtime_artifact.object)?];

@@ -72,12 +72,7 @@ fn main() -> Result<()> {
         "#include \"{}\"\n",
         device.join("static_runtime.S").display()
     );
-    let mut programs = (0..1472)
-        .map(|tile| TileProgram {
-            tile,
-            steps: vec![],
-        })
-        .collect::<Vec<_>>();
+    let mut programs = Vec::new();
     let mut data = vec![];
     let mut slices = vec![];
     let mut cases = vec![];
@@ -156,20 +151,20 @@ fn main() -> Result<()> {
                 address: 0x5c000,
                 data: vec![0x55; 0x10000],
             });
+            let mut steps = Vec::new();
             for (index, (tag, address)) in [("old", old), ("new", new)].into_iter().enumerate() {
-                programs[tile as usize]
-                    .steps
-                    .push(TileStep::Compute(ComputeStep {
-                        symbol: format!("softmax_{tag}_{keys}"),
-                        output_address: TileAddress::Absolute(address),
-                        input_addresses: vec![TileAddress::Absolute(0x88000)],
-                        arguments: vec![rows, keys, u32::from(args.split_rows && keys >= 128)],
-                        profile: StepProfile {
-                            before: Some(0x7f000 + index as u32 * 8),
-                            after: Some(0x7f004 + index as u32 * 8),
-                        },
-                    }));
+                steps.push(TileStep::Compute(ComputeStep {
+                    symbol: format!("softmax_{tag}_{keys}"),
+                    output_address: TileAddress::Absolute(address),
+                    input_addresses: vec![TileAddress::Absolute(0x88000)],
+                    arguments: vec![rows, keys, u32::from(args.split_rows && keys >= 128)],
+                    profile: StepProfile {
+                        before: Some(0x7f000 + index as u32 * 8),
+                        after: Some(0x7f004 + index as u32 * 8),
+                    },
+                }));
             }
+            programs.push(TileProgram { tile, steps });
             data.push(TileProgramData {
                 tile,
                 address: 0x7c000,

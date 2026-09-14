@@ -455,12 +455,6 @@ fn main() -> Result<()> {
     let bytes: usize = cases.iter().map(|case| case.5).sum();
     let wrapper = args.output.join("elementwise_check.S");
     fs::write(&wrapper, source)?;
-    for tile in programs.len() as u16..1472 {
-        programs.push(TileProgram {
-            tile,
-            steps: vec![],
-        });
-    }
     let outputs = [
         Binding {
             name: "result".into(),

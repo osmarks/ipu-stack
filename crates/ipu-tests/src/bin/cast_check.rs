@@ -383,12 +383,6 @@ fn main() -> Result<()> {
         }
     }
     let wrapper = args.output.join("cast_check.S");
-    for tile in programs.len() as u16..1472 {
-        programs.push(TileProgram {
-            tile,
-            steps: vec![],
-        });
-    }
     fs::write(&wrapper, source)?;
     let outputs = [
         Binding {
