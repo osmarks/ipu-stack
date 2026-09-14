@@ -28,11 +28,6 @@ struct Transfer {
     copy_destination: Option<u32>,
 }
 
-#[derive(Clone)]
-struct Phase {
-    transfers: Vec<Transfer>,
-}
-
 struct PendingTransfer {
     transfer: Transfer,
     file_offset: u64,
@@ -97,11 +92,7 @@ pub(crate) fn plan(
     let (mut weight_phases, weight_slices, weight_ends) = batch(pending_weights, &slots)?;
     let (mut input_phases, input_slices, input_ends) = batch(pending_inputs, &slots)?;
     let (output_phases, output_slices, output_ends) = batch(pending_outputs, &slots)?;
-    for transfer in weight_phases
-        .iter_mut()
-        .chain(&mut input_phases)
-        .flat_map(|phase| &mut phase.transfers)
-    {
+    for transfer in weight_phases.iter_mut().chain(&mut input_phases).flatten() {
         transfer.copy_destination = Some(transfer.tile_address);
         transfer.tile_address = HOST_STAGING_ADDRESS;
         ipu_exchange::plan_host_to_tile(
@@ -111,7 +102,7 @@ pub(crate) fn plan(
             transfer.bytes,
         )?;
     }
-    for transfer in output_phases.iter().flat_map(|phase| &phase.transfers) {
+    for transfer in output_phases.iter().flatten() {
         ipu_exchange::plan_tile_to_host(
             transfer.physical_tile,
             transfer.tile_address,
@@ -120,11 +111,13 @@ pub(crate) fn plan(
         )?;
     }
 
+    let weight_end = weight_phases.len();
+    let input_end = weight_end + input_phases.len();
+    let graph_batches = input_phases.len() + output_phases.len();
     let phases = weight_phases
-        .iter()
-        .chain(&input_phases)
-        .chain(&output_phases)
-        .cloned()
+        .into_iter()
+        .chain(input_phases)
+        .chain(output_phases)
         .collect::<Vec<_>>();
     let mut programs = Vec::with_capacity(usize::from(execution_tiles));
     let mut all_segments = Vec::with_capacity(usize::from(execution_tiles));
@@ -139,8 +132,6 @@ pub(crate) fn plan(
         )?;
         maximum_end = maximum_end.max(planned.end);
         descriptor_bytes = descriptor_bytes.max(planned.data_bytes);
-        let weight_end = weight_phases.len();
-        let input_end = weight_end + input_phases.len();
         programs.push(HostProgram {
             initialize: planned.calls[..weight_end].to_vec(),
             inputs: planned.calls[weight_end..input_end].to_vec(),
@@ -150,11 +141,11 @@ pub(crate) fn plan(
     }
 
     let mut calls = Vec::new();
-    if !weight_phases.is_empty() {
+    if weight_end != 0 {
         calls.push(HostCall {
             name: "initialize".into(),
             command: 0,
-            phases: u32::try_from(weight_phases.len() * 2)?,
+            phases: u32::try_from(weight_end * 2)?,
             inputs: weight_slices,
             outputs: Vec::new(),
             invocations: 1,
@@ -162,7 +153,6 @@ pub(crate) fn plan(
             output_batch_ends: Vec::new(),
         });
     }
-    let graph_batches = input_phases.len() + output_phases.len();
     calls.push(HostCall {
         name: "run".into(),
         command: 0,
@@ -262,7 +252,7 @@ fn append_slice(
 fn batch(
     pending: Vec<PendingTransfer>,
     slots: &BTreeMap<u16, u32>,
-) -> PackageBuildResult<(Vec<Phase>, Vec<HostSlice>, Vec<u32>)> {
+) -> PackageBuildResult<(Vec<Vec<Transfer>>, Vec<HostSlice>, Vec<u32>)> {
     let mut queues = BTreeMap::<u16, VecDeque<_>>::new();
     for transfer in pending {
         queues
@@ -293,7 +283,7 @@ fn batch(
             });
             transfers.push(pending.transfer);
         }
-        phases.push(Phase { transfers });
+        phases.push(transfers);
         ends.push(u32::try_from(slices.len())?);
     }
     Ok((phases, slices, ends))
@@ -308,7 +298,7 @@ struct PlannedTile {
 
 fn plan_tile(
     physical_tile: u16,
-    phases: &[Phase],
+    phases: &[Vec<Transfer>],
     base: u32,
     data_ranges: &[(u32, u32)],
 ) -> PackageBuildResult<PlannedTile> {
@@ -423,7 +413,7 @@ impl DataArena {
 
 fn phase_instructions(
     physical_tile: u16,
-    phase: &Phase,
+    phase: &[Transfer],
 ) -> PackageBuildResult<(Vec<u32>, Vec<u32>)> {
     let target = target(physical_tile, phase)
         .map(|transfer| target_program(transfer, HOST_PACKET_ADDRESS + 8))
@@ -484,7 +474,7 @@ fn target_program(
 
 fn descriptor_words(
     physical_tile: u16,
-    phase: &Phase,
+    phase: &[Transfer],
     packet: PacketCopy,
 ) -> PackageBuildResult<Vec<u32>> {
     let target = target(physical_tile, phase);
@@ -508,17 +498,15 @@ fn descriptor_words(
     ])
 }
 
-fn target(physical_tile: u16, phase: &Phase) -> Option<Transfer> {
+fn target(physical_tile: u16, phase: &[Transfer]) -> Option<Transfer> {
     phase
-        .transfers
         .iter()
         .copied()
         .find(|transfer| transfer.physical_tile == physical_tile)
 }
 
-fn xreq_targets(physical_tile: u16, phase: &Phase) -> PackageBuildResult<Vec<u16>> {
+fn xreq_targets(physical_tile: u16, phase: &[Transfer]) -> PackageBuildResult<Vec<u16>> {
     phase
-        .transfers
         .iter()
         .filter_map(
             |transfer| match ipu_exchange::host_hierarchy(transfer.physical_tile) {
@@ -532,7 +520,7 @@ fn xreq_targets(physical_tile: u16, phase: &Phase) -> PackageBuildResult<Vec<u16
         .collect()
 }
 
-fn active(physical_tile: u16, phase: &Phase) -> bool {
+fn active(physical_tile: u16, phase: &[Transfer]) -> bool {
     target(physical_tile, phase).is_some()
         || xreq_targets(physical_tile, phase).is_ok_and(|targets| !targets.is_empty())
 }
@@ -582,15 +570,15 @@ mod tests {
     #[test]
     fn descriptor_reservation_survives_relocation_and_packet_deduplication() {
         let mut phases = (0..8)
-            .map(|_| Phase {
-                transfers: vec![Transfer {
+            .map(|_| {
+                vec![Transfer {
                     direction: Direction::ToHost,
                     physical_tile: 0,
                     tile_address: 0x80000,
                     host_offset: HOST_DATA_START,
                     bytes: 256,
                     copy_destination: None,
-                }],
+                }]
             })
             .collect::<Vec<_>>();
         let initial = plan_tile(0, &phases, 0x60000, &[(0x70000, 0x80000)]).unwrap();
@@ -606,7 +594,7 @@ mod tests {
             "identical packets should share storage"
         );
         for (index, phase) in phases.iter_mut().enumerate() {
-            phase.transfers[0].tile_address += index as u32 * 1024;
+            phase[0].tile_address += index as u32 * 1024;
         }
         for base in [0x70000, 0x90000] {
             let relocated = plan_tile(0, &phases, 0x60000, &[(base, base + reservation)]).unwrap();
