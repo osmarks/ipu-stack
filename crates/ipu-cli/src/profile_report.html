@@ -709,8 +709,18 @@ function hideTip() { tooltip.style.display = "none"; }
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+function prepareCanvas(canvas, width, height) {
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, width, height);
+  return ctx;
+}
 function drawFlame() {
-  const ctx = flame.getContext("2d");
   const width = Math.max(960, Math.round(flame.parentElement.clientWidth - 2));
   const rowH = 24, top = 18;
   const root = { name: focusLabel(state.focus), value: 0, depth: 0, children: new Map() };
@@ -742,14 +752,7 @@ function drawFlame() {
   layout([...root.children.values()].sort(byValue), 0, width, 1, nodes);
   const maxDepth = nodes.reduce((depth, node) => Math.max(depth, node.depth), 0);
   const height = top + (maxDepth + 1) * rowH + 8;
-  flame.style.width = `${width}px`;
-  flame.style.height = `${height}px`;
-  flame.width = width;
-  flame.height = height;
-  ctx.imageSmoothingEnabled = false;
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, width, height);
+  const ctx = prepareCanvas(flame, width, height);
   ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
   ctx.textBaseline = "middle";
   ctx.fillStyle = "#303030";
@@ -794,18 +797,10 @@ function tooltipLines(node) {
   return [node.name, `${formatCount(node.value)} total`, pct, node.kind || ""].filter(Boolean);
 }
 function drawOverview() {
-  const ctx = overview.getContext("2d");
   const width = Math.max(1024, Math.round(overview.parentElement.clientWidth - 2));
   const height = 96;
   const maxEnd = fullEnd();
-  overview.style.width = `${width}px`;
-  overview.style.height = `${height}px`;
-  overview.width = width;
-  overview.height = height;
-  ctx.imageSmoothingEnabled = false;
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, width, height);
+  const ctx = prepareCanvas(overview, width, height);
   const kinds = ["compute", "send", "receive", "sendReceive", "partnerBusy", "exchangeIdle", "exchange", "synchronization", "idle"];
   const deltas = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width + 1)]));
   const edges = Object.fromEntries(kinds.map(kind => [kind, new Float64Array(width)]));
@@ -861,8 +856,6 @@ function drawOverview() {
 }
 function drawTimeline() {
   const textures = document.getElementById("transferTexture").checked;
-  const ctx = timeline.getContext("2d");
-  const ratio = 1;
   const left = 0, top = 0, right = 0, rowH = state.timelineRowHeight;
   const maxEnd = fullEnd();
   const viewStart = Math.max(0, Math.min(state.viewStart, maxEnd));
@@ -871,15 +864,7 @@ function drawTimeline() {
   const plotW = width - left - right;
   const height = top + Math.max(1, tiles.length) * rowH;
   timelineGeom = { left, top, right, rowH, width, height, plotW, maxEnd, viewStart, viewEnd };
-  timeline.style.width = `${width}px`;
-  timeline.style.height = `${height}px`;
-  timeline.width = Math.ceil(width * ratio);
-  timeline.height = Math.ceil(height * ratio);
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  ctx.imageSmoothingEnabled = false;
-  ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#ffffff";
-  ctx.fillRect(0, 0, width, height);
+  const ctx = prepareCanvas(timeline, width, height);
   ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
   ctx.textBaseline = "alphabetic";
   ctx.strokeStyle = "#777777";
@@ -1075,11 +1060,7 @@ function render() {
   requestVisibleDetails();
 }
 function timelineHit(event) {
-  const rect = timeline.getBoundingClientRect();
-  const scaleX = timeline.width / rect.width;
-  const scaleY = timeline.height / rect.height;
-  const x = (event.clientX - rect.left) * scaleX;
-  const y = (event.clientY - rect.top) * scaleY;
+  const { x, y } = canvasPoint(event, timeline);
   if (!timelineGeom || y < timelineGeom.top || y >= timelineGeom.height) return null;
   const tile = tiles[Math.floor((y - timelineGeom.top) / timelineGeom.rowH)];
   if (!tile) return null;
@@ -1092,9 +1073,7 @@ function timelineHit(event) {
   return null;
 }
 function flameHit(event) {
-  const rect = flame.getBoundingClientRect();
-  const x = (event.clientX - rect.left) * flame.width / rect.width;
-  const y = (event.clientY - rect.top) * flame.height / rect.height;
+  const { x, y } = canvasPoint(event, flame);
   for (let index = flameHits.length - 1; index >= 0; index--) {
     const hit = flameHits[index];
     if (x >= hit.x && x <= hit.x + hit.w && y >= hit.y && y <= hit.y + hit.h) return hit.node;
@@ -1121,11 +1100,7 @@ function canvasGeom(canvas) {
 function canvasTime(event, canvas = event.currentTarget) {
   const geom = canvasGeom(canvas);
   if (!geom) return null;
-  const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  const x = (event.clientX - rect.left) * scaleX;
-  const y = (event.clientY - rect.top) * scaleY;
+  const { x, y } = canvasPoint(event, canvas);
   if (x < geom.left || x >= geom.width - geom.right || y < geom.top || y >= geom.height) return null;
   return Math.round(geom.viewStart + (x - geom.left) * (geom.viewEnd - geom.viewStart) / geom.plotW);
 }

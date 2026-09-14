@@ -8,10 +8,10 @@ not sources to rewrite.
 | Component | Current coverage | Remaining examination |
 | --- | --- | --- |
 | Compiler/planner, storage, exchange | Shared fusion contracts, span geometry, endpoint accounting and package assembly reviewed; forward/reverse view adapters consolidated in low; identity-copy predicates unified | Broader candidate generation and lowering control flow |
-| Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed; redundant runtime error wrapper removed | Remaining loader/protocol and command dispatch paths |
+| Package/driver/runtime/CLI | Shared binding extents, host capture, logging and profile interning reviewed; redundant runtime error wrapper removed | Loader, host invocation and CLI dispatch inspected; no further extraction selected |
 | ELF toolchain | Hashing/cache and linker paths inspected; instruction field relocations consolidated; relocation bounds constrained to their section | No additional duplication selected from this inspection |
 | Device kernels/runtime | Dense packing supervisor loops, GEMM weight loads and runtime word copies consolidated; cast and normalization families inspected | Remaining kernel/runtime families; preserve independent numerical references |
-| Profile viewers | HTML entry points located | Interaction, data loading and rendering logic across viewers |
+| Profile viewers | All three viewers inspected; runtime canvas setup and coordinate conversion consolidated | No additional cross-viewer extraction selected: placement uses virtual rows/DPR scaling; runtime uses event-count-bounded chunks and accounting segments |
 | Calibration tools | Shared Torch-only F143 module; shared Hessian accumulation and scale selection; shared calibration loop with exception-safe hook removal; offline placement tool inspected (independent constraints intentionally retained) | No additional duplication selected in the pretrained exporter |
 | Experiment scripts | Gather/packing affine detection consolidated; frontier, batch/MLP sweep orchestration and SDK summary inspected | Deeper sweep provenance/error handling |
 | Diagnostic harnesses | Shared bindings/logical packing reviewed; six standalone kernel binaries share locked runtime loading and use HostSession::finish for deferred output completion; four share timestamp bindings | Remaining fixture assembly; terminal-state polling now shares the model diagnostic checker |
@@ -73,3 +73,14 @@ Identity mapping validation: an omitted-offset versus explicit-zero-offset
 copy regression failed before consolidation (exchange row estimate 18,436
 versus 4,612 bytes) and passes afterward. Cast motion, producer tracing and
 costing now use the same predicate. Full codegen suite: 296 passed, 5 ignored.
+
+Viewer validation: headless Chromium rendered the same incremental profile
+with old and new templates. Initial and zoomed canvases matched pixel-for-pixel;
+scaled pointer coordinates, hit tests, time conversion and timeline clicks also
+matched. Sidecar loading remained enabled. Evidence: /tmp/ipu-viewer-cleanup/.
+
+CLI/loader review: the CLI enum adapters keep clap out of the profiling
+library; package-load and host-run commands have distinct completion policies.
+The driver already shares phase handshakes and output capture. Additional
+wrappers for its short attachment checks were not selected. Both Rust profile
+report tests pass after the viewer change.
