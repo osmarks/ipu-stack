@@ -1544,22 +1544,20 @@ impl<'a> HostSession<'a> {
         self.streamed_output = Some((vec![0; host_data_size(&call.outputs)], 0));
         self.write_command(&call)?;
 
-        let input_batches = host_batch_ranges(&call.input_batch_ends);
-        let output_batches = host_batch_ranges(&call.output_batch_ends);
         self.drive_handshake(&call, &mut poll, |session, phase| {
             if phase & 1 == 0 {
                 let batch = usize::try_from(phase / 2).unwrap();
-                if let Some(range) = input_batches.get(batch) {
-                    for slice in &call.inputs[range.clone()] {
+                if batch < call.input_batch_ends.len() {
+                    for slice in &call.inputs[host_batch_range(&call.input_batch_ends, batch)] {
                         copy_input_slice(&mut session.storage, &session.pages, slice, input)?;
                     }
                 } else {
-                    let output = batch - input_batches.len();
+                    let output = batch - call.input_batch_ends.len();
                     if output != 0 {
                         capture_output(
                             &session.storage,
                             &session.pages,
-                            &call.outputs[output_batches[output - 1].clone()],
+                            &call.outputs[host_batch_range(&call.output_batch_ends, output - 1)],
                             session.streamed_output.as_mut().unwrap(),
                         )?;
                     }
@@ -1706,16 +1704,9 @@ fn host_call_reuses_storage(call: &HostCall) -> bool {
     })
 }
 
-fn host_batch_ranges(ends: &[u32]) -> Vec<std::ops::Range<usize>> {
-    let mut start = 0usize;
-    ends.iter()
-        .map(|&end| {
-            let end = end as usize;
-            let range = start..end;
-            start = end;
-            range
-        })
-        .collect()
+fn host_batch_range(ends: &[u32], index: usize) -> std::ops::Range<usize> {
+    let start = index.checked_sub(1).map_or(0, |previous| ends[previous]);
+    start as usize..ends[index] as usize
 }
 
 fn host_slice_range(
@@ -1967,10 +1958,22 @@ mod tests {
         let slices = [first, second];
         let mut output = (vec![0; host_data_size(&slices)], 0);
         storage.bytes_mut()[40..44].copy_from_slice(&[1, 2, 3, 4]);
-        capture_output(&storage, &pages, &slices[..1], &mut output).unwrap();
+        capture_output(
+            &storage,
+            &pages,
+            &slices[host_batch_range(&[1, 2], 0)],
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(output, (vec![0, 0, 0, 0, 1, 2, 3, 4], 1));
         storage.bytes_mut()[40..44].copy_from_slice(&[5, 6, 7, 8]);
-        capture_output(&storage, &pages, &slices[1..], &mut output).unwrap();
+        capture_output(
+            &storage,
+            &pages,
+            &slices[host_batch_range(&[1, 2], 1)],
+            &mut output,
+        )
+        .unwrap();
         assert_eq!(output, (vec![5, 6, 7, 8, 1, 2, 3, 4], 2));
 
         // A completed non-streaming call uses the same batch path.
