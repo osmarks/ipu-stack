@@ -53,9 +53,7 @@ pub(crate) struct ViewGeometry {
 }
 impl ViewGeometry {
     pub(crate) fn new(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<Self> {
-        if shard.extents.len() != view.len() {
-            return Err(StorageError::InvalidView);
-        }
+        validate_view(shard, view)?;
         let mut allocation = shard.extents.to_vec();
         let mut view = view.to_vec();
         for (a, v) in allocation.iter_mut().zip(&mut view) {
@@ -63,18 +61,9 @@ impl ViewGeometry {
             a.start = 0;
             a.logical_end -= start;
             a.physical_end -= start;
-            v.start = v
-                .start
-                .checked_sub(start)
-                .ok_or(StorageError::InvalidView)?;
-            v.logical_end = v
-                .logical_end
-                .checked_sub(start)
-                .ok_or(StorageError::InvalidView)?;
-            v.physical_end = v
-                .physical_end
-                .checked_sub(start)
-                .ok_or(StorageError::InvalidView)?;
+            v.start -= start;
+            v.logical_end -= start;
+            v.physical_end -= start;
         }
         Ok(Self {
             precision: shard.format.precision,
@@ -442,7 +431,9 @@ fn block_major_matrix_index(
 fn validate_view(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<()> {
     if view.len() != shard.extents.len()
         || view.iter().zip(shard.extents).any(|(view, shard)| {
-            view.axis != shard.axis
+            shard.start > shard.logical_end
+                || shard.logical_end > shard.physical_end
+                || view.axis != shard.axis
                 || view.start < shard.start
                 || view.start > view.logical_end
                 || view.logical_end > view.physical_end
@@ -710,6 +701,27 @@ mod tests {
                 })
                 .collect(),
             definition: ShardDefinition::Value(crate::MidValueId::from_index(0)),
+        }
+    }
+
+    #[test]
+    fn malformed_allocations_are_rejected_before_cache_normalization() {
+        for (start, logical_end, physical_end) in [(8, 4, 16), (0, 20, 16)] {
+            let mut source = shard(Layout::row_sharded(1), &[16]);
+            source.extents[0] = ShardExtent {
+                axis: 0,
+                start,
+                logical_end,
+                physical_end,
+            };
+            assert!(matches!(
+                ViewGeometry::new(source.storage(), &source.extents),
+                Err(StorageError::InvalidView)
+            ));
+            assert!(matches!(
+                byte_traversal(source.storage(), &source.extents, true),
+                Err(StorageError::InvalidView)
+            ));
         }
     }
 
