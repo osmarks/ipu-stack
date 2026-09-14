@@ -651,10 +651,10 @@ fn assert_operator_signature(
     inputs: &[TensorFormat],
     output: TensorFormat,
 ) {
-    let MidOperationKind::Compute(Compute::Kernel { operands, .. }) = &operation.kind else {
+    let MidOperationKind::Compute(compute) = &operation.kind else {
         panic!("expected compute")
     };
-    assert_eq!(operands.len(), inputs.len());
+    assert_eq!(compute.operand_windows().len(), inputs.len());
     for (&value_id, expected) in operation.inputs.iter().zip(inputs) {
         assert_eq!(&value(lowered, value_id).tensor_type.format, expected);
     }
@@ -827,22 +827,15 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
             .find(|operation| {
                 matches!(
                     operation.kind,
-                    MidOperationKind::Compute(Compute::Kernel {
-                        kernel: TileKernelSpec::Gemm { .. },
-                        ..
-                    })
+                    MidOperationKind::Compute(Compute::Product(Product { .. }))
                 )
             })
             .unwrap();
-        let MidOperationKind::Compute(Compute::Kernel {
-            kernel:
-                TileKernelSpec::Gemm {
-                    multiply: selected_multiply,
-                    accumulate: selected_accumulate,
-                    ..
-                },
+        let MidOperationKind::Compute(Compute::Product(Product {
+            multiply: selected_multiply,
+            accumulate: selected_accumulate,
             ..
-        }) = operator.kind
+        })) = operator.kind
         else {
             panic!("random case {case}: expected GEMM");
         };
@@ -929,10 +922,9 @@ fn randomized_gemms_choose_precision_independently_within_one_graph() {
             .operations
             .iter()
             .filter_map(|operation| match operation.kind {
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Gemm { multiply, .. },
-                    ..
-                }) => Some(multiply),
+                MidOperationKind::Compute(Compute::Product(Product { multiply, .. })) => {
+                    Some(multiply)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1245,10 +1237,13 @@ fn randomized_single_use_views_compose_into_panel_copies() {
         for op in &compact.operations {
             if matches!(
                 op.kind,
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Gemm { .. } | TileKernelSpec::AttentionSoftmax { .. },
-                    ..
-                })
+                MidOperationKind::Compute(
+                    Compute::Product(_)
+                        | Compute::Kernel {
+                            kernel: TileKernelSpec::AttentionSoftmax { .. },
+                            ..
+                        }
+                )
             ) {
                 assert_eq!(
                     compact.values[op.results[0].index() as usize]
@@ -1518,17 +1513,14 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .find(|op| {
             matches!(
                 op.kind,
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Gemm {
-                        inner_block: 128,
-                        ..
-                    },
-                    product: Some(ProductAxes {
+                MidOperationKind::Compute(Compute::Product(Product {
+                    inner_block: 128,
+                    axes: ProductAxes {
                         right_inner: TensorAxis::FromEnd(2),
                         ..
-                    }),
+                    },
                     ..
-                })
+                }))
             )
         })
         .unwrap();
@@ -2410,10 +2402,7 @@ fn fixed_gemm_precisions_apply_inside_repeat_without_changing_other_gemms() {
     fn collect(ops: &[MidOperation], values: &[MidValue], found: &mut BTreeSet<Precision>) {
         for op in ops {
             match &op.kind {
-                MidOperationKind::Compute(Compute::Kernel {
-                    kernel: TileKernelSpec::Gemm { multiply, .. },
-                    ..
-                }) => {
+                MidOperationKind::Compute(Compute::Product(Product { multiply, .. })) => {
                     assert!(op.inputs.iter().take(2).all(|id| {
                         values[id.index() as usize].tensor_type.format.precision == *multiply
                     }));

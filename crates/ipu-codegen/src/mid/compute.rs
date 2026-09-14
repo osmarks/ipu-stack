@@ -1,6 +1,7 @@
 //! Distributed arithmetic and its operand windows. Tile calls are enumerated in low.
 
-use super::*;
+use super::{Precision, ReductionStaging, TensorAxis};
+use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
 
 /// A rectangular operand window in global tensor coordinates. Omitted axes
 /// retain their full extent. Windows do not allocate temporary tensors.
@@ -8,7 +9,7 @@ use super::*;
 pub struct OperandWindow(pub Vec<(u16, u32, u32)>);
 
 /// Matrix axes used by a local product after the distributed operands have
-/// been materialized. Blocking is in the selected GEMM kernel specification.
+/// been materialized. Product records the selected local blocking separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProductAxes {
     pub left_inner: TensorAxis,
@@ -20,14 +21,28 @@ pub struct ProductAxes {
     pub valid_columns: Option<u32>,
 }
 
+/// A selected contraction over resident distributed operands. The block sizes
+/// bound local calls; low clips them to each shard and binds the callable GEMM.
+/// Weight load instructions depend on that binding, not this mathematical work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Product {
+    pub multiply: Precision,
+    pub accumulate: AccumulationPrecision,
+    pub mode: GemmKernelMode,
+    pub inner_block: u32,
+    pub output_columns: u32,
+    pub axes: ProductAxes,
+    pub operands: [OperandWindow; 2],
+    pub output_aliases: Vec<(usize, usize)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Compute {
-    /// Invoke the selected kernel over the output distribution. GEMM blocking
-    /// enumerates local calls later; it does not choose distribution or staging.
+    Product(Product),
+    /// Invoke the selected kernel over the output distribution.
     Kernel {
         kernel: TileKernelSpec,
         operands: Vec<OperandWindow>,
-        product: Option<ProductAxes>,
         /// (Result index, input index) pairs sharing an allocation. Inputs may
         /// include lifetime dependencies beyond the kernel's explicit operands.
         /// Shrinking casts donate storage with a displacement chosen in low;
@@ -44,12 +59,27 @@ pub enum Compute {
 }
 
 impl Compute {
+    pub(crate) fn operand_windows(&self) -> &[OperandWindow] {
+        match self {
+            Self::Product(product) => &product.operands,
+            Self::Kernel { operands, .. } => operands,
+            Self::Sum { .. } => &[],
+        }
+    }
+
+    pub(crate) fn output_aliases(&self) -> &[(usize, usize)] {
+        match self {
+            Self::Product(product) => &product.output_aliases,
+            Self::Kernel { output_aliases, .. } => output_aliases,
+            Self::Sum { .. } => &[],
+        }
+    }
+
     /// Whole-value numerical conversion; ownership is unchanged by this call.
     pub fn cast(from: Precision, to: Precision) -> Self {
         Self::Kernel {
             kernel: TileKernelSpec::Cast { from, to },
             operands: vec![OperandWindow::default()],
-            product: None,
             output_aliases: Vec::new(),
         }
     }

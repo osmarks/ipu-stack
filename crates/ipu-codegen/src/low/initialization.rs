@@ -7,6 +7,7 @@
 //! mixed-precision arenas: finite FP32 bits need not encode finite FP16 values.
 
 use super::*;
+use crate::kernel::TileKernelSpec;
 use std::collections::BTreeSet;
 
 // These readers have no kernel-specific proof that padding can be ignored.
@@ -270,6 +271,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kernel::{GemmKernelMode, GemmWeightLoad};
     use crate::{AccumulationPrecision, KernelAccess, KernelRequirements, TensorType};
 
     fn fixture() -> TileGraph {

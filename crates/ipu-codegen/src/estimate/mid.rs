@@ -105,7 +105,8 @@ fn analyze_storage<const PER_TILE: bool>(
     };
     for (operation, _) in &steps {
         match &operation.kind {
-            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
+            MidOperationKind::Compute(compute) => {
+                let output_aliases = compute.output_aliases();
                 for &(output, input) in output_aliases {
                     alias(operation.results[output], operation.inputs[input]);
                 }
@@ -137,14 +138,10 @@ fn analyze_storage<const PER_TILE: bool>(
     let mut element = vec![false; roots.len()];
     let mut tail = vec![0; roots.len()];
     for (operation, _) in &steps {
-        if let MidOperationKind::Compute(Compute::Kernel {
-            kernel: TileKernelSpec::Gemm { multiply, .. },
-            ..
-        }) = &operation.kind
-        {
+        if let MidOperationKind::Compute(Compute::Product(product)) = &operation.kind {
             element[roots[operation.inputs[0].index() as usize]] = true;
             element[roots[operation.results[0].index() as usize]] = true;
-            tail[roots[operation.inputs[0].index() as usize]] = 8 * multiply.bytes();
+            tail[roots[operation.inputs[0].index() as usize]] = 8 * product.multiply.bytes();
         }
     }
     let tiles = if PER_TILE {
@@ -396,6 +393,26 @@ fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
     })
 }
 
+fn operand_tensors(
+    operation: &MidOperation,
+    values: &[MidValue],
+    windows: &[crate::OperandWindow],
+) -> Option<Vec<TensorType>> {
+    operation
+        .inputs
+        .iter()
+        .zip(windows)
+        .map(|(&id, window)| {
+            let mut local = local_tensor(&values[id.index() as usize].tensor_type)?;
+            for &(axis, start, end) in &window.0 {
+                local.shape.0[usize::from(axis)] =
+                    local.shape.0[usize::from(axis)].min(end.checked_sub(start)?);
+            }
+            Some(local)
+        })
+        .collect()
+}
+
 pub(crate) fn operation_cost(
     operation: &MidOperation,
     values: &[MidValue],
@@ -413,57 +430,14 @@ pub(crate) fn operation_cost(
         MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands,
-            product,
             output_aliases,
         }) => {
-            let mut inputs = operation
-                .inputs
-                .iter()
-                .zip(operands)
-                .map(|(&id, window)| {
-                    let mut local = local_tensor(tensor(id))?;
-                    for &(axis, start, end) in &window.0 {
-                        local.shape.0[usize::from(axis)] =
-                            local.shape.0[usize::from(axis)].min(end.checked_sub(start)?);
-                    }
-                    Some(local)
-                })
-                .collect::<Option<Vec<_>>>()?;
-            let mut kernel = kernel.clone();
-            let mut calls = 1u64;
-            if let Some(axes) = product {
-                let left_axis = axes.left_inner.resolve(inputs[0].shape.0.len()).ok()?;
-                let right_axis = axes.right_inner.resolve(inputs[1].shape.0.len()).ok()?;
-                let column_axis = axes.output_column.resolve(out.shape.0.len()).ok()?;
-                if let TileKernelSpec::Gemm {
-                    inner_block,
-                    output_columns,
-                    ..
-                } = &mut kernel
-                {
-                    if *inner_block == 0 || *output_columns == 0 {
-                        return None;
-                    }
-                    if let Some(group) = out.format.layout.order.gemm_output_group() {
-                        *output_columns = (*output_columns).min(group);
-                    }
-                    calls = u64::from(inputs[0].shape.0[left_axis].div_ceil(*inner_block))
-                        .checked_mul(u64::from(
-                            out.shape.0[column_axis].div_ceil(*output_columns),
-                        ))?;
-                    *inner_block = (*inner_block).min(inputs[0].shape.0[left_axis]);
-                    *output_columns = (*output_columns).min(out.shape.0[column_axis]);
-                    inputs[0].shape.0[left_axis] = *inner_block;
-                    inputs[1].shape.0[right_axis] = *inner_block;
-                    out.shape.0[column_axis] = *output_columns;
-                }
-            }
+            let mut inputs = operand_tensors(operation, values, operands)?;
             price.total = super::primitive::kernel_cycles(
-                &kernel,
+                kernel,
                 |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
                 super::primitive::Geometry::Tensor(&out),
-            )
-            .saturating_mul(calls);
+            );
             if matches!(
                 kernel,
                 TileKernelSpec::Cast {
@@ -479,12 +453,46 @@ pub(crate) fn operation_cost(
                     out.shape.0[chunks.axis] = end - start;
                     inputs[0].shape.0[chunks.axis] = end - start;
                     price.total += super::primitive::kernel_cycles(
-                        &kernel,
+                        kernel,
                         |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
                         super::primitive::Geometry::Tensor(&out),
                     );
                 }
             }
+        }
+        MidOperationKind::Compute(Compute::Product(product)) => {
+            let mut inputs = operand_tensors(operation, values, &product.operands)?;
+            let axes = product.axes;
+            let left_axis = axes.left_inner.resolve(inputs[0].shape.0.len()).ok()?;
+            let right_axis = axes.right_inner.resolve(inputs[1].shape.0.len()).ok()?;
+            let column_axis = axes.output_column.resolve(out.shape.0.len()).ok()?;
+            let mut columns = product.output_columns;
+            if product.inner_block == 0 || columns == 0 {
+                return None;
+            }
+            if let Some(group) = out.format.layout.order.gemm_output_group() {
+                columns = columns.min(group);
+            }
+            let calls = u64::from(inputs[0].shape.0[left_axis].div_ceil(product.inner_block))
+                .checked_mul(u64::from(out.shape.0[column_axis].div_ceil(columns)))?;
+            let inner = product.inner_block.min(inputs[0].shape.0[left_axis]);
+            columns = columns.min(out.shape.0[column_axis]);
+            inputs[0].shape.0[left_axis] = inner;
+            inputs[1].shape.0[right_axis] = inner;
+            out.shape.0[column_axis] = columns;
+            price.total = super::primitive::kernel_cycles(
+                &TileKernelSpec::Gemm {
+                    multiply: product.multiply,
+                    accumulate: product.accumulate,
+                    mode: product.mode,
+                    weights: crate::GemmWeightLoad::Standard,
+                    inner_block: inner,
+                    output_columns: columns,
+                },
+                |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
+                super::primitive::Geometry::Tensor(&out),
+            )
+            .saturating_mul(calls);
         }
         MidOperationKind::Compute(Compute::Sum { axis, staging }) => {
             let contributors = u64::from(tensor(operation.inputs[0]).shape.0[usize::from(*axis)]);

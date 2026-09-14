@@ -110,7 +110,8 @@ flowchart LR
    layout movement to the family's copies, without inventing a converted value.
 2. [implementation/gemm.rs](../crates/ipu-codegen/src/mid/implementation/gemm.rs)
    builds a compact mid fragment. Parallel GEMM emits ordinary copies, a
-   `Compute` with `ProductAxes`, a leading partials dimension, and `Sum`.
+   `Compute::Product` with axes/blocking, a leading partials dimension, and
+   `Compute::Sum`.
    Output-stationary GEMM instead exposes successive K-panel values and
    accumulating result versions. This is the owner of the distributed algorithm.
 3. [emit_selected](../crates/ipu-codegen/src/mid/lowering.rs) binds the fragment
@@ -118,12 +119,11 @@ flowchart LR
    selecting or rebuilding an implementation. The later parameter-home
    transformation updates bindings and inserts any input-owner copies as part
    of that same transformation; there is no resolver repairing it afterward.
-4. [low/expand/compute.rs](../crates/ipu-codegen/src/low/expand/compute.rs)
-   finds resident operand shards. `product_calls` enumerates local K/column
-   blocks, chooses initialize/accumulate for those calls, clips logical work
-   accounting, and selects the weight-load variant from the actual memory class.
-   [expand/gemm.rs](../crates/ipu-codegen/src/low/expand/gemm.rs) further splits
-   batch matrices for local execution. These loops do not search a new GEMM grid.
+4. [low/expand/gemm.rs](../crates/ipu-codegen/src/low/expand/gemm.rs)
+   binds resident operand windows, enumerates local K/column blocks and batch
+   matrices, and chooses the weight-load variant from actual storage. Product
+   work accounting uses the final call's extents. Generic kernel append records
+   that call without splitting it. These loops do not choose another GEMM grid.
 5. `prepare_sum` removes the independent-partials axis from alias views and
    groups matching coordinates. [expand/reduce.rs](../crates/ipu-codegen/src/low/expand/reduce.rs)
    intersects these groups with output ownership, chooses a seed, allocates
@@ -131,9 +131,10 @@ flowchart LR
    seed or output copies when a compatible physical slice is usable directly.
 
 The current `Compute::Sum` carries a distributed reduction axis and staging
-policy; the local `ReduceSum` kernel implements individual stages. Products still
-use the kernel compute variant with optional `ProductAxes`; making that family
-explicit and giving operands declared indexing relations remains in progress.
+policy; the local `ReductionSum` kernel implements individual stages. Products
+have their own compute variant; ordinary kernel compute no longer has optional
+product axes. Both retain declared output aliases. Explicit operand indexing and
+complete family binding remain in progress.
 
 However, its current implementation is narrower than the name: singleton partial
 axis outside the final matrix axes, FP16 contributors/results, matching element
@@ -201,10 +202,10 @@ still part of the refactor. [Storage](../crates/ipu-codegen/src/storage.rs) owns
 layout-to-byte traversal; relative local-copy descriptors and span coalescing are
 currently in low/copy.rs.
 
-There is additional control flow inside
-[expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs): `append_kernel`
-can split a GEMM into batch-matrix calls, while `append_exchange_phase` can move
-intervening local copies and merge an earlier exchange through
+Kernel construction still assembles parts of a call in
+[expand/emit.rs](../crates/ipu-codegen/src/low/expand/emit.rs); full binding through
+families remains to be done. `append_exchange_phase` can still move intervening
+local copies and merge an earlier exchange through
 [exchange_grouping.rs](../crates/ipu-codegen/src/low/expand/exchange_grouping.rs).
 The latter checks read/write hazards and respects compute, Repeat and checkpoint
 boundaries. These transformations currently happen during insertion, before the

@@ -31,7 +31,6 @@ pub use copies::view_byte_spans;
 pub(crate) use copies::view_byte_traversal;
 use copies::*;
 pub use copies::{logical_view_byte_spans, shard_storage_bytes};
-use gemm::*;
 use mapping::*;
 use ownership::CopyRegions;
 use std::collections::{BTreeMap, BTreeSet};
@@ -208,16 +207,17 @@ impl TileGraphBuilder {
                 // These ABIs bind or reshape an entire canonical allocation;
                 // a borrowed view with different backing strides is insufficient.
                 match &operation.kind {
-                    MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
+                    MidOperationKind::Compute(Compute::Sum { .. }) => {
+                        bindings.extend(operation.inputs.iter().copied());
+                    }
+                    MidOperationKind::Compute(compute) => {
+                        let output_aliases = compute.output_aliases();
                         bindings.extend(
                             output_aliases
                                 .iter()
                                 .filter_map(|&(_, input)| operation.inputs.get(input))
                                 .copied(),
                         );
-                    }
-                    MidOperationKind::Compute(Compute::Sum { .. }) => {
-                        bindings.extend(operation.inputs.iter().copied());
                     }
                     _ => {}
                 }

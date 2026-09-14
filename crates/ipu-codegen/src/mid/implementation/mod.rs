@@ -36,7 +36,7 @@ pub(crate) fn implement(
             if matches!(kernel, TileKernelSpec::FlashAttention { .. }) {
                 kernel_output.format.precision = Precision::F32;
             }
-            let result = b.compute(operands, kernel_output, kernel.clone(), None, reuse, vec![]);
+            let result = b.kernel(operands, kernel_output, kernel.clone(), reuse, vec![]);
             b.cast(result, output.format.precision)
         }
         OperatorDispatch::View => {
@@ -185,14 +185,13 @@ impl Builder {
             return input;
         }
         output.format.precision = precision;
-        self.compute(
+        self.kernel(
             vec![input],
             output,
             TileKernelSpec::Cast {
                 from,
                 to: precision,
             },
-            None,
             None,
             vec![],
         )
@@ -233,33 +232,46 @@ impl Builder {
         )
     }
 
-    fn compute(
+    fn kernel(
         &mut self,
-        mut inputs: Vec<MidValueId>,
+        inputs: Vec<MidValueId>,
         output: TensorType,
         kernel: TileKernelSpec,
-        product: Option<ProductAxes>,
         reuse: Option<MidValueId>,
         mut operands: Vec<OperandWindow>,
     ) -> MidValueId {
         if operands.is_empty() {
             operands.resize(inputs.len(), OperandWindow::default());
         }
-        let reuse_input = reuse.map(|value| {
-            let index = inputs.len();
-            inputs.push(value);
-            index
-        });
-        self.emit(
+        self.compute(
             inputs,
             output,
-            MidOperationKind::Compute(Compute::Kernel {
+            Compute::Kernel {
                 kernel,
                 operands,
-                product,
-                output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
-            }),
+                output_aliases: Vec::new(),
+            },
+            reuse,
         )
+    }
+
+    fn compute(
+        &mut self,
+        mut inputs: Vec<MidValueId>,
+        output: TensorType,
+        mut compute: Compute,
+        reuse: Option<MidValueId>,
+    ) -> MidValueId {
+        if let Some(value) = reuse {
+            let aliases = match &mut compute {
+                Compute::Product(product) => &mut product.output_aliases,
+                Compute::Kernel { output_aliases, .. } => output_aliases,
+                Compute::Sum { .. } => unreachable!("sum output ownership is independent"),
+            };
+            aliases.push((0, inputs.len()));
+            inputs.push(value);
+        }
+        self.emit(inputs, output, MidOperationKind::Compute(compute))
     }
 }
 

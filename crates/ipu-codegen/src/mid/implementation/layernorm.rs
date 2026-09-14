@@ -26,11 +26,10 @@ impl Builder {
                 dim.block_size = 1;
             }
         }
-        let partials = self.compute(
+        let partials = self.kernel(
             vec![inputs[0]],
             moments.clone(),
             TileKernelSpec::LayerNormMoments,
-            None,
             None,
             vec![],
         );
@@ -45,11 +44,10 @@ impl Builder {
         moments.format.layout.tiling.replicas *= parts;
         let complete = self.copy(partials, moments, vec![]);
         inputs.push(complete);
-        Some(self.compute(
+        Some(self.kernel(
             inputs,
             output.clone(),
             TileKernelSpec::LayerNormApply { parts },
-            None,
             None,
             vec![],
         ))

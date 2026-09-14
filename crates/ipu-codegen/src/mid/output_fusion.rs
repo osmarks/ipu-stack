@@ -59,10 +59,7 @@ fn fuse_fp8_outputs_at(
         }
         let producer = &operations[previous];
         let MidOperationKind::Compute(Compute::Kernel {
-            kernel,
-            operands,
-            product: None,
-            ..
+            kernel, operands, ..
         }) = &producer.kind
         else {
             continue;
@@ -177,7 +174,6 @@ fn fuse_fp8_outputs_at(
             fused.kind = MidOperationKind::Compute(Compute::Kernel {
                 kernel: kernel.clone(),
                 operands: operands.clone(),
-                product: None,
                 output_aliases: vec![],
             });
             let copy = MidOperation {
@@ -217,7 +213,6 @@ fn fuse_fp8_outputs_at(
         replacement.kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: kernel.clone(),
             operands: operands.clone(),
-            product: None,
             output_aliases: Vec::new(),
         });
         let original_value_count = values.len();

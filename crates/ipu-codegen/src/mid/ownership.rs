@@ -171,7 +171,7 @@ fn overlap_reductions(
                 || !(matches!(
                     operation.kind,
                     MidOperationKind::Copy { .. } | MidOperationKind::Compute(Compute::Sum { .. })
-                ) || matches!(&operation.kind, MidOperationKind::Compute(Compute::Kernel { output_aliases, product: Some(_), .. }) if output_aliases.is_empty()))
+                ) || matches!(&operation.kind, MidOperationKind::Compute(Compute::Product(product)) if product.output_aliases.is_empty()))
                 || selected
                     .iter()
                     .any(|&index| conflicts(&operations[index], operation))
@@ -436,7 +436,8 @@ fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidV
             MidOperationKind::Repeat(repeat) => {
                 bind_compute_owners(&mut repeat.body.operations, values);
             }
-            MidOperationKind::Compute(Compute::Kernel { operands, .. }) => {
+            MidOperationKind::Compute(compute) => {
+                let operands = compute.operand_windows();
                 let offset = values[operation.results[0].index() as usize].tile_offset;
                 for input in operation.inputs.iter_mut().take(operands.len()) {
                     if values[input.index() as usize].tile_offset != offset {
@@ -726,7 +727,6 @@ mod tests {
         delayed.operations[1].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Gelu,
             operands: Vec::new(),
-            product: None,
             output_aliases: vec![(0, 0)],
         });
         assert!(delayed.with_overlapped_reductions(2).is_none());

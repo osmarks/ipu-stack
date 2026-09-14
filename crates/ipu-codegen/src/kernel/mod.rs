@@ -7,7 +7,9 @@ pub(crate) mod cost;
 mod gemm;
 mod output;
 mod rearrange;
+mod spec;
 mod specialization;
+pub use spec::*;
 #[cfg(test)]
 mod tests;
 pub(crate) use abi::*;
@@ -19,9 +21,9 @@ use crate::{
     gemm_rows, input_matrix_extent, matrix_count, matrix_extent,
 };
 use crate::{
-    AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, GemmKernelMode,
-    GemmWeightLoad, KernelRequirements, KernelRun, LowProgram, Precision, StepProfile,
-    StorageError, TileAddress, TileKernelSpec, TileWorkList, TileWorkRef, view_byte_traversal,
+    AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder,
+    KernelRequirements, KernelRun, LowProgram, Precision, StepProfile, StorageError, TileAddress,
+    TileWorkList, TileWorkRef, view_byte_traversal,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

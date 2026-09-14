@@ -269,7 +269,6 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
         kind: MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
             operands: vec![OperandWindow::default(); 2],
-            product: None,
             output_aliases: vec![],
         }),
         estimated_cycles: 0,
@@ -328,7 +327,6 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
                 MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gelu,
                     operands: vec![OperandWindow::default()],
-                    product: None,
                     output_aliases: vec![(0, 0)],
                 })
             },

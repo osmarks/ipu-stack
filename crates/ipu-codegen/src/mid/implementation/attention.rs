@@ -26,16 +26,16 @@ impl Builder {
         // each value row. These are real storage, not disposable AMP padding.
         accumulator.shape.0[2] += 2;
         let output = &accumulator;
-        let product = |inner_block, output_columns| TileKernelSpec::Gemm {
+        let product = |inner_block, output_columns, axes| Product {
             multiply: Precision::F16,
             accumulate: AccumulationPrecision::F32,
             mode: GemmKernelMode::Initialize,
-            weights: GemmWeightLoad::Standard,
             inner_block,
             output_columns,
+            axes,
+            operands: Default::default(),
+            output_aliases: Vec::new(),
         };
-        let query_key = product(query_width, key_block);
-        let probability_value = product(key_block, value_width);
         let query = self.tensor(MidValueId(0)).clone();
         let key = self.tensor(MidValueId(1)).clone();
         let value = self.tensor(MidValueId(2)).clone();
@@ -180,16 +180,18 @@ impl Builder {
                 self.compute(
                     vec![query_buffer, k],
                     scores_type.clone(),
-                    query_key.clone(),
-                    Some(ProductAxes {
-                        valid_columns: Some(valid),
-                        ..qk_axes
-                    }),
+                    Compute::Product(product(
+                        query_width,
+                        key_block,
+                        ProductAxes {
+                            valid_columns: Some(valid),
+                            ..qk_axes
+                        },
+                    )),
                     None,
-                    vec![],
                 )
             };
-            weights = Some(self.compute(
+            weights = Some(self.kernel(
                 vec![scores],
                 weights_type.clone(),
                 TileKernelSpec::AttentionSoftmax {
@@ -197,7 +199,6 @@ impl Builder {
                     key_columns: valid,
                     padded_key_columns: key_block,
                 },
-                None,
                 weights,
                 vec![],
             ));
@@ -231,16 +232,21 @@ impl Builder {
                 self.compute(
                     vec![weights_id, v],
                     product_type.clone(),
-                    probability_value.clone(),
-                    Some(ProductAxes {
-                        valid_inner: Some(valid),
-                        ..pv_axes
+                    Compute::Product(Product {
+                        operands: [
+                            OperandWindow(vec![(2, 0, key_block)]),
+                            OperandWindow::default(),
+                        ],
+                        ..product(
+                            key_block,
+                            value_width,
+                            ProductAxes {
+                                valid_inner: Some(valid),
+                                ..pv_axes
+                            },
+                        )
                     }),
                     None,
-                    vec![
-                        OperandWindow(vec![(2, 0, key_block)]),
-                        OperandWindow::default(),
-                    ],
                 )
             };
             let final_block = materialized || start + key_block >= key_rows;
@@ -252,7 +258,7 @@ impl Builder {
                 // The initial-block path does not read this operand.
                 inputs.push(result.unwrap_or(product));
             }
-            result = Some(self.compute(
+            result = Some(self.kernel(
                 inputs,
                 if direct_f16 {
                     final_output.clone()
@@ -266,7 +272,6 @@ impl Builder {
                     initial: start == 0,
                     final_block,
                 },
-                None,
                 if direct_f16 { None } else { result },
                 vec![],
             ));

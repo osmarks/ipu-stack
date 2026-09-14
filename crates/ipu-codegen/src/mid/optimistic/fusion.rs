@@ -190,7 +190,6 @@ fn known_fusion_cost(
         kind: MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands: vec![OperandWindow::default(); inputs.len()],
-            product: None,
             output_aliases: Vec::new(),
         }),
         inputs: inputs

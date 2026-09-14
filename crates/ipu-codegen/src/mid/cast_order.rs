@@ -152,7 +152,6 @@ fn reorder_region(
                         to: values[id.index() as usize].tensor_type.format.precision,
                     },
                     operands: vec![OperandWindow::default()],
-                    product: None,
                     output_aliases: vec![],
                 }),
                 estimated_cycles: 0,
@@ -180,7 +179,8 @@ fn reorder_region(
 
 fn may_write_existing_storage(op: &MidOperation) -> bool {
     match &op.kind {
-        MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
+        MidOperationKind::Compute(compute) => {
+            let output_aliases = compute.output_aliases();
             !output_aliases.is_empty()
         }
         MidOperationKind::Repeat(_) => true,
@@ -247,7 +247,6 @@ mod tests {
                 kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::Gelu,
                     operands: vec![OperandWindow::default()],
-                    product: None,
                     output_aliases: vec![(0, 0)],
                 }),
                 estimated_cycles: 0,

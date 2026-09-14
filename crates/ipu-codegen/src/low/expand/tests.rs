@@ -2003,7 +2003,6 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                             MidOperationKind::Compute(Compute::Kernel {
                                 kernel: TileKernelSpec::Gelu,
                                 operands: vec![OperandWindow::default()],
-                                product: None,
                                 output_aliases: vec![],
                             }),
                         ),

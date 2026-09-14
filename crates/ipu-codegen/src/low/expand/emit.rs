@@ -156,34 +156,6 @@ impl TileGraphBuilder {
         tile: u16,
         run: KernelRun,
     ) -> ExpansionResult<()> {
-        let output_flattens_outer_rows = matches!(
-            run.requirements.output.format.layout.order,
-            ElementOrder::Amp(AmpOrder::Left | AmpOrder::Output)
-        );
-        if matches!(run.kernel, TileKernelSpec::Gemm { .. })
-            && run.output.extents.len() > 2
-            && !output_flattens_outer_rows
-        {
-            let matrix_axes = run.output.extents.len() - 2;
-            let mut coordinates = vec![0; matrix_axes];
-            let mut matrix_runs = Vec::new();
-            split_gemm_matrices(&run, 0, &mut coordinates, &mut matrix_runs)?;
-            if matrix_runs.len() > 1 {
-                for matrix_run in matrix_runs {
-                    self.append_single_kernel(tiles, tile, matrix_run)?;
-                }
-                return Ok(());
-            }
-        }
-        self.append_single_kernel(tiles, tile, run)
-    }
-
-    pub(super) fn append_single_kernel(
-        &mut self,
-        tiles: &mut BlockRegion,
-        tile: u16,
-        run: KernelRun,
-    ) -> ExpansionResult<()> {
         let id = KernelRunId(
             u32::try_from(self.kernel_runs.len()).map_err(|_| ExpansionError::IdOverflow)?,
         );

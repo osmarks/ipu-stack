@@ -4,7 +4,7 @@
 use super::{
     LoweringError, LoweringResult, MidOperation, MidOperationKind, MidProgram, MidValueId,
 };
-use crate::Compute;
+use crate::{Compute, TileKernelSpec};
 use std::collections::BTreeSet;
 
 impl MidProgram {
@@ -80,25 +80,94 @@ impl MidProgram {
                                 .format
                                 .precision
                 }
+                MidOperationKind::Compute(Compute::Product(product)) => {
+                    arity.0 >= 2
+                        && arity.1 == 1
+                        && product.inner_block > 0
+                        && product.output_columns > 0
+                        && product
+                            .axes
+                            .left_inner
+                            .resolve(
+                                self.values[operation.inputs[0].index() as usize]
+                                    .tensor_type
+                                    .shape
+                                    .0
+                                    .len(),
+                            )
+                            .is_ok()
+                        && product
+                            .axes
+                            .right_inner
+                            .resolve(
+                                self.values[operation.inputs[1].index() as usize]
+                                    .tensor_type
+                                    .shape
+                                    .0
+                                    .len(),
+                            )
+                            .is_ok()
+                        && product
+                            .axes
+                            .output_column
+                            .resolve(
+                                self.values[operation.results[0].index() as usize]
+                                    .tensor_type
+                                    .shape
+                                    .0
+                                    .len(),
+                            )
+                            .is_ok()
+                }
                 MidOperationKind::Compute(Compute::Kernel {
-                    operands,
-                    output_aliases,
-                    ..
+                    kernel, operands, ..
                 }) => {
                     arity.1 != 0
                         && operands.len() <= arity.0
-                        && output_aliases
-                            .iter()
-                            .all(|&(output, input)| output < arity.1 && input < arity.0)
+                        && match kernel {
+                            TileKernelSpec::Gemm { .. } => false, // Distributed products have explicit axes and blocking.
+                            TileKernelSpec::Cast { from, to } => {
+                                arity.0 >= 1
+                                    && arity.1 == 1
+                                    && operands.len() == 1
+                                    && self.values[operation.inputs[0].index() as usize]
+                                        .tensor_type
+                                        .format
+                                        .precision
+                                        == *from
+                                    && self.values[operation.results[0].index() as usize]
+                                        .tensor_type
+                                        .format
+                                        .precision
+                                        == *to
+                                    && self.values[operation.inputs[0].index() as usize]
+                                        .tensor_type
+                                        .shape
+                                        == self.values[operation.results[0].index() as usize]
+                                            .tensor_type
+                                            .shape
+                            }
+                            _ => true,
+                        }
                 }
                 MidOperationKind::Compute(Compute::Sum { axis, .. }) => {
-                    arity == (1, 1)
-                        && usize::from(*axis)
-                            < self.values[operation.inputs[0].index() as usize]
-                                .tensor_type
+                    if arity != (1, 1) {
+                        false
+                    } else {
+                        let input = &self.values[operation.inputs[0].index() as usize].tensor_type;
+                        let output =
+                            &self.values[operation.results[0].index() as usize].tensor_type;
+                        let axis = usize::from(*axis);
+                        axis < input.shape.0.len()
+                            && input.format.precision == output.format.precision
+                            && input
                                 .shape
                                 .0
-                                .len()
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, d)| (i != axis).then_some(d))
+                                .eq(&output.shape.0)
+                    }
                 }
                 MidOperationKind::Repeat(repeat) => {
                     self.validate_region(
@@ -118,7 +187,14 @@ impl MidProgram {
                             .all(|sequence| sequence.len() == repeat.count as usize)
                 }
             };
-            if !valid {
+            let aliases_valid = match &operation.kind {
+                MidOperationKind::Compute(compute) => compute
+                    .output_aliases()
+                    .iter()
+                    .all(|&(output, input)| output < arity.1 && input < arity.0),
+                _ => true,
+            };
+            if !valid || !aliases_valid {
                 return Err(invalid(format!(
                     "invalid executable operation {:?}",
                     operation.source

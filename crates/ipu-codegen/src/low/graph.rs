@@ -2,6 +2,7 @@
 //! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
 use super::*;
+use crate::kernel::TileKernelSpec;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

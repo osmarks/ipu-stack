@@ -122,7 +122,6 @@ fn distribute_region(
                             to: layout,
                         },
                         operands: vec![OperandWindow::default()],
-                        product: None,
                         output_aliases: Vec::new(),
                     }),
                     estimated_cycles: 0,

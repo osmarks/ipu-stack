@@ -18,10 +18,7 @@ pub(super) fn fuse(
     for index in 0..operations.len() {
         let current = &operations[index];
         let MidOperationKind::Compute(Compute::Kernel {
-            kernel,
-            operands,
-            product: None,
-            ..
+            kernel, operands, ..
         }) = &current.kind
         else {
             continue;
@@ -47,7 +44,6 @@ pub(super) fn fuse(
         let MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
             operands,
-            product: None,
             output_aliases,
         }) = &add.kind
         else {
@@ -114,7 +110,6 @@ pub(super) fn fuse(
             kind: MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::AddLayerNormMoments,
                 operands: vec![OperandWindow::default(); 2],
-                product: None,
                 output_aliases: output_aliases
                     .iter()
                     .map(|&(_, input)| (1, input))
@@ -132,7 +127,6 @@ pub(super) fn fuse(
                     parts: statistic_parts,
                 },
                 operands: vec![OperandWindow::default(); 4],
-                product: None,
                 output_aliases: Vec::new(),
             });
         }
@@ -358,7 +352,6 @@ mod tests {
                 kind: MidOperationKind::Compute(Compute::Kernel {
                     kernel,
                     operands: vec![OperandWindow::default(); inputs.len()],
-                    product: None,
                     output_aliases: Vec::new(),
                 }),
                 inputs,

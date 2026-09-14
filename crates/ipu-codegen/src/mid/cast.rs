@@ -78,7 +78,8 @@ fn donate(
             MidOperationKind::Copy {
                 reuse_local: true, ..
             } => bound.extend(op.inputs.iter().copied()),
-            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
+            MidOperationKind::Compute(compute) => {
+                let output_aliases = compute.output_aliases();
                 for &(output, input) in output_aliases {
                     if bound.contains(&op.results[output]) {
                         bound.insert(op.inputs[input]);
@@ -127,7 +128,9 @@ fn donate(
         }
         let fresh = match &operations[producer].kind {
             MidOperationKind::Copy { .. } => true,
-            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
+            MidOperationKind::Compute(Compute::Sum { .. }) => false,
+            MidOperationKind::Compute(compute) => {
+                let output_aliases = compute.output_aliases();
                 output_aliases.is_empty()
             }
             _ => false,
@@ -168,7 +171,6 @@ fn donate(
                 to: target.tensor_type.format.precision,
             },
             operands: vec![OperandWindow::default()],
-            product: None,
             output_aliases: vec![(0, 0)],
         });
         tracing::debug!(?input, ?output, "donated cast input storage");
@@ -233,7 +235,6 @@ mod tests {
                             to: Precision::F8F143 { scale_exponent: 0 },
                         },
                         operands: vec![OperandWindow::default()],
-                        product: None,
                         output_aliases: vec![],
                     }),
                     estimated_cycles: 0,

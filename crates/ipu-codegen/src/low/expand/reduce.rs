@@ -18,6 +18,50 @@ struct SumStage {
 }
 
 impl TileGraphBuilder {
+    pub(super) fn prepare_sum(
+        &mut self,
+        operation: &MidOperation,
+        axis: usize,
+        staging: crate::ReductionStaging,
+        batch: &mut SumBatch,
+    ) -> ExpansionResult<()> {
+        let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
+        else {
+            return Err(ExpansionError::ResultArity);
+        };
+        let sources = self.value_shards(*input)?.to_vec();
+        let outputs = self.value_shards(*output)?.to_vec();
+        let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<ShardView>>::new();
+        for source in sources {
+            let mut block = self.shards[source.index() as usize].clone();
+            if axis + 2 >= block.extents.len()
+                || block.extents[axis].physical_end - block.extents[axis].start != 1
+            {
+                return Err(ExpansionError::InvalidOperatorPlan);
+            }
+            block.extents.remove(axis);
+            for (axis, extent) in block.extents.iter_mut().enumerate() {
+                extent.axis = axis as u16;
+            }
+            block.tensor_type.shape.0.remove(axis);
+            block.tensor_type.format.layout.tiling = TensorTiling::replicated(1);
+            block.definition = ShardDefinition::Alias(source);
+            let extents = block.extents.clone();
+            let alias = self.push_shard(block)?;
+            groups
+                .entry(extents)
+                .or_default()
+                .push(self.full_view(alias));
+        }
+        self.prepare_sum_partials(
+            groups.into_values(),
+            &outputs,
+            staging,
+            operation_provenance(operation),
+            batch,
+        )
+    }
+
     pub(super) fn prepare_sum_partials(
         &mut self,
         groups: impl IntoIterator<Item = Vec<ShardView>>,

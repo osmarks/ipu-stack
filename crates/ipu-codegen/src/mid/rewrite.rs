@@ -57,7 +57,6 @@ pub(super) fn fp8_cast(op: &MidOperation, values: &[MidValue]) -> Option<(MidVal
                     to: Precision::F8F143 { .. },
                 },
             operands,
-            product: None,
             output_aliases,
         }) => operands.len() == 1 && operands[0].0.is_empty() && output_aliases.is_empty(),
         _ => false,

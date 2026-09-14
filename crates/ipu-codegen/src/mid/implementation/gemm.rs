@@ -47,13 +47,15 @@ impl Builder {
                 2
             }),
         };
-        let kernel = |mode| TileKernelSpec::Gemm {
+        let product = |mode| Product {
             multiply,
             accumulate,
             mode,
-            weights: GemmWeightLoad::Standard,
             inner_block,
             output_columns: column_block,
+            axes,
+            operands: Default::default(),
+            output_aliases: Vec::new(),
         };
         match distribution {
             GemmDistribution::ParallelReduction {
@@ -128,10 +130,8 @@ impl Builder {
                 let products = self.compute(
                     vec![left, weights],
                     partials,
-                    kernel(GemmKernelMode::Initialize),
-                    Some(axes),
+                    Compute::Product(product(GemmKernelMode::Initialize)),
                     None,
-                    vec![],
                 );
                 Some(self.emit(
                     vec![products],
@@ -170,10 +170,8 @@ impl Builder {
                     return Some(self.compute(
                         vec![left, right],
                         output.clone(),
-                        kernel(GemmKernelMode::Initialize),
-                        Some(axes),
+                        Compute::Product(product(GemmKernelMode::Initialize)),
                         None,
-                        vec![],
                     ));
                 }
                 for (tensor, axis) in [
@@ -213,14 +211,12 @@ impl Builder {
                     result = Some(self.compute(
                         vec![l, r],
                         output.clone(),
-                        kernel(if result.is_none() {
+                        Compute::Product(product(if result.is_none() {
                             GemmKernelMode::Initialize
                         } else {
                             GemmKernelMode::Accumulate
-                        }),
-                        Some(axes),
+                        })),
                         result,
-                        vec![],
                     ));
                 }
                 result
@@ -354,7 +350,7 @@ impl Builder {
         let result = self.compute(
             vec![l, r],
             product,
-            TileKernelSpec::Gemm {
+            Compute::Product(Product {
                 multiply,
                 accumulate: if fp8_scale.is_some() {
                     AccumulationPrecision::F16
@@ -362,13 +358,14 @@ impl Builder {
                     AccumulationPrecision::F32
                 },
                 mode: GemmKernelMode::Initialize,
-                weights: GemmWeightLoad::Interleaved,
+
                 inner_block: inner_width,
                 output_columns: column_width,
-            },
-            Some(axes),
+                axes,
+                operands: Default::default(),
+                output_aliases: Vec::new(),
+            }),
             None,
-            vec![],
         );
         if grid.inner > 1 {
             let mut reduced = output.clone();

@@ -45,7 +45,6 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                             to: Precision::F16,
                         },
                         operands: vec![OperandWindow::default()],
-                        product: None,
                         output_aliases: vec![],
                     }),
                     estimated_cycles: 0,
@@ -88,7 +87,6 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
                     kernel: TileKernelSpec::LayerNorm,
                     operands: vec![OperandWindow::default(); 3],
-                    product: None,
                     output_aliases: vec![],
                 });
                 let expanded = expand_tiles(&norm, false).unwrap();

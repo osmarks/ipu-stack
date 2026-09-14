@@ -1,5 +1,6 @@
-//! Whole-device implementation selection, tensor primitives, and layouts.
-//! Tile enumeration occurs only after selection, in low expansion.
+//! Executable whole-device copies, arithmetic and structured repetition.
+//! Selection/builders still live here during migration to the planner owner;
+//! mid values themselves contain no unresolved operator or conversion state.
 
 pub(crate) mod baseline;
 pub(crate) mod cast;
@@ -27,6 +28,7 @@ mod ownership;
 mod resolved;
 pub use crate::graph::AxisFactorView;
 
+use crate::kernel::{AccumulationPrecision, GemmKernelMode, TileKernelSpec};
 use crate::{CopyPolicy, default_copy_policy};
 use candidates::*;
 use catalogue::*;

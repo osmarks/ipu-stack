@@ -42,7 +42,6 @@ fn fuse_region(
         let MidOperationKind::Compute(Compute::Kernel {
             kernel,
             operands,
-            product: None,
             output_aliases: consumer_aliases,
         }) = &current.kind
         else {
@@ -69,7 +68,6 @@ fn fuse_region(
         let MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::Add,
             operands: add_operands,
-            product: None,
             output_aliases: add_aliases,
         }) = &add.kind
         else {
@@ -150,7 +148,6 @@ fn fuse_region(
         replacement.kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: fused.clone(),
             operands: vec![OperandWindow::default(); arity],
-            product: None,
             output_aliases: reuse_input.map(|input| (0, input)).into_iter().collect(),
         });
         if !super::rewrite::fusion_pays(
@@ -253,7 +250,6 @@ mod tests {
                     MidOperationKind::Compute(Compute::Kernel {
                         kernel: TileKernelSpec::Gelu,
                         operands: vec![OperandWindow::default()],
-                        product: None,
                         output_aliases: vec![],
                     }),
                 ),
@@ -341,7 +337,6 @@ mod tests {
         norm.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::LayerNorm,
             operands: vec![OperandWindow::default(); 3],
-            product: None,
             output_aliases: vec![],
         });
         let fused_norm = norm
@@ -366,7 +361,6 @@ mod tests {
         bias.operations[0].kind = MidOperationKind::Compute(Compute::Kernel {
             kernel: TileKernelSpec::BiasGelu,
             operands: vec![OperandWindow::default(); 2],
-            product: None,
             output_aliases: vec![],
         });
         let fused_bias = bias
@@ -428,7 +422,6 @@ mod tests {
                             TileKernelSpec::Gelu
                         },
                         operands: vec![OperandWindow::default(); inputs.len()],
-                        product: None,
                         output_aliases: Vec::new(),
                     }),
                     inputs,

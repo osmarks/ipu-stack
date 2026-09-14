@@ -1,6 +1,7 @@
 //! Address-independent kernel access contracts and call geometry.
 
 use super::*;
+use crate::kernel::TileKernelSpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MemoryOperand {

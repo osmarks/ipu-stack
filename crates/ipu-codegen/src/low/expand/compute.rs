@@ -1,8 +1,8 @@
-//! Realize selected whole-device primitives. Distribution and intermediate
-//! tensor storage have already been chosen in mid.
+//! Dispatch distributed compute to its family. Elementwise/local kernels bind
+//! resident operands here; products and sums own their local construction.
 
 use super::*;
-use crate::{Compute, OperandWindow, ProductAxes};
+use crate::{Compute, OperandWindow};
 
 impl TileGraphBuilder {
     pub(super) fn build_compute(
@@ -12,6 +12,7 @@ impl TileGraphBuilder {
         body: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         match compute {
+            Compute::Product(product) => self.build_product(operation, product, body),
             Compute::Sum { axis, staging } => {
                 let mut batch = reduce::SumBatch::default();
                 self.prepare_sum(operation, usize::from(*axis), *staging, &mut batch)?;
@@ -20,7 +21,6 @@ impl TileGraphBuilder {
             Compute::Kernel {
                 kernel,
                 operands,
-                product,
                 output_aliases,
             } => {
                 let donate_cast = matches!(
@@ -35,20 +35,7 @@ impl TileGraphBuilder {
                     .first()
                     .ok_or(ExpansionError::ResultArity)?;
                 let outputs = self.value_shards(output)?.to_vec();
-                // Preserve shard order within each tile, but avoid searching all tiles
-                // again for every output shard (quadratic for whole-device operations).
-                let inputs_by_tile = operation
-                    .inputs
-                    .iter()
-                    .map(|&value| {
-                        let mut tiles = vec![Vec::new(); usize::from(self.tile_count)];
-                        for &source in self.value_shards(value)? {
-                            tiles[usize::from(self.shards[source.index() as usize].tile)]
-                                .push(source);
-                        }
-                        Ok(tiles)
-                    })
-                    .collect::<ExpansionResult<Vec<_>>>()?;
+                let inputs_by_tile = self.inputs_by_tile(&operation.inputs)?;
                 for output in outputs {
                     let block = &self.shards[output.index() as usize];
                     if block
@@ -59,29 +46,17 @@ impl TileGraphBuilder {
                         continue;
                     }
                     let tile = block.tile;
-                    for &(result, input) in output_aliases {
-                        let target = if result == 0 {
-                            output
+                    self.bind_compute_aliases(
+                        operation,
+                        output,
+                        output_aliases,
+                        &inputs_by_tile,
+                        if donate_cast {
+                            -(crate::mid::cast::CAST_PREFIX_BYTES as i32)
                         } else {
-                            self.local_shard(operation.results[result], tile)?
-                        };
-                        let previous = inputs_by_tile[input][usize::from(tile)]
-                            .iter()
-                            .copied()
-                            .find(|&source| {
-                                self.shards[source.index() as usize].extents
-                                    == self.shards[target.index() as usize].extents
-                            })
-                            .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                        self.shards[target.index() as usize].definition = if donate_cast {
-                            ShardDefinition::ShiftedAlias {
-                                source: previous,
-                                offset: -(crate::mid::cast::CAST_PREFIX_BYTES as i32),
-                            }
-                        } else {
-                            ShardDefinition::WritableAlias(previous)
-                        };
-                    }
+                            0
+                        },
+                    )?;
                     let inputs = inputs_by_tile
                         .iter()
                         .zip(operands)
@@ -95,13 +70,11 @@ impl TileGraphBuilder {
                                             == self.shards[output.index() as usize].extents;
                                     }
                                     // A tile can own several row fragments. Equal-shape
-                                    // pointwise operands must match this output's coordinates;
-                                    // product axes need not match even when shapes coincide.
-                                    let same_shape = product.is_none()
-                                        && self.shards[source.index() as usize].tensor_type.shape
-                                            == self.shards[output.index() as usize]
-                                                .tensor_type
-                                                .shape;
+                                    // pointwise operands must match this output's coordinates.
+                                    let same_shape = self.shards[source.index() as usize]
+                                        .tensor_type
+                                        .shape
+                                        == self.shards[output.index() as usize].tensor_type.shape;
                                     !(same_shape
                                         || matches!(
                                             kernel,
@@ -127,44 +100,32 @@ impl TileGraphBuilder {
                             }
                         })
                         .collect::<ExpansionResult<Vec<_>>>()?;
-                    if let Some(axes) = product {
-                        self.product_calls(
-                            operation_provenance(operation),
-                            tile,
-                            kernel,
-                            &inputs,
-                            output,
-                            *axes,
-                            body,
-                        )?;
+                    let mut run = self.kernel_run(
+                        operation_provenance(operation),
+                        kernel.clone(),
+                        inputs
+                            .into_iter()
+                            .map(|view| KernelOperand { views: vec![view] })
+                            .collect(),
+                        self.full_view(output),
+                    )?;
+                    for &value in operation.results.iter().skip(1) {
+                        let shard = self.local_shard(value, tile)?;
+                        let view = self.full_view(shard);
+                        let format = self.shards[shard.index() as usize]
+                            .tensor_type
+                            .format
+                            .clone();
+                        Arc::make_mut(&mut run.metadata)
+                            .requirements
+                            .additional_outputs
+                            .push(crate::KernelAccess::new(format, 8));
+                        run.additional_outputs.push(view);
+                    }
+                    if donate_cast {
+                        self.append_in_place_cast(body, tile, run)?;
                     } else {
-                        let mut run = self.kernel_run(
-                            operation_provenance(operation),
-                            kernel.clone(),
-                            inputs
-                                .into_iter()
-                                .map(|view| KernelOperand { views: vec![view] })
-                                .collect(),
-                            self.full_view(output),
-                        )?;
-                        for &value in operation.results.iter().skip(1) {
-                            let shard = self.local_shard(value, tile)?;
-                            let view = self.full_view(shard);
-                            let format = self.shards[shard.index() as usize]
-                                .tensor_type
-                                .format
-                                .clone();
-                            Arc::make_mut(&mut run.metadata)
-                                .requirements
-                                .additional_outputs
-                                .push(crate::KernelAccess::new(format, 8));
-                            run.additional_outputs.push(view);
-                        }
-                        if donate_cast {
-                            self.append_in_place_cast(body, tile, run)?;
-                        } else {
-                            self.append_kernel(body, tile, run)?;
-                        }
+                        self.append_kernel(body, tile, run)?;
                     }
                 }
                 Ok(())
@@ -172,7 +133,11 @@ impl TileGraphBuilder {
         }
     }
 
-    fn window(&self, source: BlockValueId, window: &OperandWindow) -> ExpansionResult<ShardView> {
+    pub(super) fn window(
+        &self,
+        source: BlockValueId,
+        window: &OperandWindow,
+    ) -> ExpansionResult<ShardView> {
         let ranges = window
             .0
             .iter()
@@ -181,213 +146,56 @@ impl TileGraphBuilder {
         self.narrow_view(source, &ranges)
     }
 
-    fn product_calls(
-        &mut self,
-        provenance: WorkProvenance,
-        tile: u16,
-        kernel: &TileKernelSpec,
-        inputs: &[ShardView],
-        output: BlockValueId,
-        axes: ProductAxes,
-        body: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        let [left, right] = inputs else {
-            return Err(ExpansionError::InvalidOperatorPlan);
-        };
-        let TileKernelSpec::Gemm {
-            inner_block,
-            output_columns,
-            mode,
-            ..
-        } = kernel
-        else {
-            return Err(ExpansionError::InvalidOperatorPlan);
-        };
-        let left_inner = axes.left_inner.resolve(left.extents.len())?;
-        let right_inner = axes.right_inner.resolve(right.extents.len())?;
-        let output_column = axes
-            .output_column
-            .resolve(self.shards[output.index() as usize].extents.len())?;
-        let right_column = if right_inner == right.extents.len() - 1 {
-            right_inner - 1
-        } else {
-            right_inner + 1
-        };
-        let left_row = if left_inner == left.extents.len() - 1 {
-            left_inner - 1
-        } else {
-            left_inner + 1
-        };
-        let output_row = if output_column == self.shards[output.index() as usize].extents.len() - 1
-        {
-            output_column - 1
-        } else {
-            output_column + 1
-        };
-        let bounds = |extent: ShardExtent| (extent.start, extent.physical_end);
-        if bounds(left.extents[left_row])
-            != bounds(self.shards[output.index() as usize].extents[output_row])
-            || bounds(right.extents[right_column])
-                != bounds(self.shards[output.index() as usize].extents[output_column])
-        {
-            return Err(ExpansionError::InvalidOperatorPlan);
-        }
-        let inner = left.extents[left_inner].physical_end - left.extents[left_inner].start;
-        if inner != right.extents[right_inner].physical_end - right.extents[right_inner].start
-            || *inner_block == 0
-            || *output_columns == 0
-        {
-            return Err(ExpansionError::InvalidOperatorPlan);
-        }
-        let columns = self.shards[output.index() as usize].extents[output_column];
-        let group = self.shards[output.index() as usize]
-            .tensor_type
-            .format
-            .layout
-            .order
-            .gemm_output_group();
-        let column_step = group.map_or(*output_columns, |group| (*output_columns).min(group));
-        for column in (columns.start..columns.physical_end).step_by(column_step as usize) {
-            let column_end = (column + column_step).min(columns.physical_end);
-            for k in (0..inner).step_by(*inner_block as usize) {
-                let width = (inner - k).min(*inner_block);
-                let l = self.narrow_view(
-                    left.shard,
-                    &[(
-                        left_inner,
-                        left.extents[left_inner].start + k,
-                        left.extents[left_inner].start + k + width,
-                    )],
-                )?;
-                let r = self.narrow_view(
-                    right.shard,
-                    &[
-                        (
-                            right_inner,
-                            right.extents[right_inner].start + k,
-                            right.extents[right_inner].start + k + width,
-                        ),
-                        (right_column, column, column_end),
-                    ],
-                )?;
-                let destination =
-                    self.narrow_view(output, &[(output_column, column, column_end)])?;
-                let mut kernel = kernel.clone();
-                if let TileKernelSpec::Gemm {
-                    mode: call_mode,
-                    inner_block,
-                    output_columns,
-                    weights,
-                    ..
-                } = &mut kernel
-                {
-                    *call_mode = if k == 0 {
-                        *mode
-                    } else {
-                        crate::GemmKernelMode::Accumulate
-                    };
-                    *inner_block = width;
-                    *output_columns = column_end - column;
-                    *weights = if self.shards[right.shard.index() as usize]
-                        .tensor_type
-                        .format
-                        .layout
-                        .memory_class
-                        == MemoryClass::Ipu21Interleaved
-                    {
-                        crate::GemmWeightLoad::Interleaved
-                    } else {
-                        crate::GemmWeightLoad::Standard
-                    };
+    /// Preserve per-tile fragment order without rescanning all shards for each
+    /// output. Lifetime-only dependencies follow the explicit operands.
+    pub(super) fn inputs_by_tile(
+        &self,
+        inputs: &[MidValueId],
+    ) -> ExpansionResult<Vec<Vec<Vec<BlockValueId>>>> {
+        inputs
+            .iter()
+            .map(|&value| {
+                let mut tiles = vec![Vec::new(); usize::from(self.tile_count)];
+                for &source in self.value_shards(value)? {
+                    tiles[usize::from(self.shards[source.index() as usize].tile)].push(source);
                 }
-                let mut run = self.kernel_run(
-                    provenance,
-                    kernel,
-                    vec![
-                        KernelOperand { views: vec![l] },
-                        KernelOperand { views: vec![r] },
-                    ],
-                    destination,
-                )?;
-                let size = |e: ShardExtent, bound: Option<u32>| {
-                    u64::from(
-                        e.logical_end
-                            .min(bound.unwrap_or(u32::MAX))
-                            .saturating_sub(e.start),
-                    )
-                };
-                let rows: u64 = run
-                    .output
-                    .extents
-                    .iter()
-                    .enumerate()
-                    .filter(|(axis, _)| *axis != output_column)
-                    .map(|(_, &e)| size(e, None))
-                    .product();
-                let cols = size(run.output.extents[output_column], axes.valid_columns).min(size(
-                    run.inputs[1].views[0].extents[right_column],
-                    axes.valid_columns,
-                ));
-                let inner =
-                    size(run.inputs[0].views[0].extents[left_inner], axes.valid_inner).min(size(
-                        run.inputs[1].views[0].extents[right_inner],
-                        axes.valid_inner,
-                    ));
-                let physical: u64 = run
-                    .output
-                    .extents
-                    .iter()
-                    .map(|e| u64::from(e.physical_end - e.start))
-                    .product();
-                run.product_flops =
-                    Some([2 * rows * cols * inner, 2 * physical * u64::from(width)]);
-                self.append_kernel(body, tile, run)?;
-            }
-        }
-        Ok(())
+                Ok(tiles)
+            })
+            .collect()
     }
 
-    pub(super) fn prepare_sum(
+    pub(super) fn bind_compute_aliases(
         &mut self,
         operation: &MidOperation,
-        axis: usize,
-        staging: crate::ReductionStaging,
-        batch: &mut reduce::SumBatch,
+        output: BlockValueId,
+        aliases: &[(usize, usize)],
+        inputs_by_tile: &[Vec<Vec<BlockValueId>>],
+        offset: i32,
     ) -> ExpansionResult<()> {
-        let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
-        else {
-            return Err(ExpansionError::ResultArity);
-        };
-        let sources = self.value_shards(*input)?.to_vec();
-        let outputs = self.value_shards(*output)?.to_vec();
-        let mut groups = BTreeMap::<Vec<ShardExtent>, Vec<ShardView>>::new();
-        for source in sources {
-            let mut block = self.shards[source.index() as usize].clone();
-            if axis + 2 >= block.extents.len()
-                || block.extents[axis].physical_end - block.extents[axis].start != 1
-            {
-                return Err(ExpansionError::InvalidOperatorPlan);
-            }
-            block.extents.remove(axis);
-            for (axis, extent) in block.extents.iter_mut().enumerate() {
-                extent.axis = axis as u16;
-            }
-            block.tensor_type.shape.0.remove(axis);
-            block.tensor_type.format.layout.tiling = TensorTiling::replicated(1);
-            block.definition = ShardDefinition::Alias(source);
-            let extents = block.extents.clone();
-            let alias = self.push_shard(block)?;
-            groups
-                .entry(extents)
-                .or_default()
-                .push(self.full_view(alias));
+        let tile = self.shards[output.index() as usize].tile;
+        for &(result, input) in aliases {
+            let target = if result == 0 {
+                output
+            } else {
+                self.local_shard(operation.results[result], tile)?
+            };
+            let previous = inputs_by_tile[input][usize::from(tile)]
+                .iter()
+                .copied()
+                .find(|&source| {
+                    self.shards[source.index() as usize].extents
+                        == self.shards[target.index() as usize].extents
+                })
+                .ok_or(ExpansionError::InvalidOperatorPlan)?;
+            self.shards[target.index() as usize].definition = if offset == 0 {
+                ShardDefinition::WritableAlias(previous)
+            } else {
+                ShardDefinition::ShiftedAlias {
+                    source: previous,
+                    offset,
+                }
+            };
         }
-        self.prepare_sum_partials(
-            groups.into_values(),
-            &outputs,
-            staging,
-            operation_provenance(operation),
-            batch,
-        )
+        Ok(())
     }
 }

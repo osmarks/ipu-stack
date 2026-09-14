@@ -109,8 +109,8 @@ fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOpera
     else {
         return false;
     };
-    if let MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) = &operation.kind {
-        return output_aliases.iter().any(|&(output, input)| {
+    if let MidOperationKind::Compute(compute) = &operation.kind {
+        return compute.output_aliases().iter().any(|&(output, input)| {
             operation.results[output] == value
                 && value_can_alias(operation.inputs[input], target, operations)
         });
@@ -147,7 +147,8 @@ fn repeat_yield_can_alias(
                 // Internal copies may become local views during expansion.
                 aliases.extend(operation.results.iter().copied());
             }
-            MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) => {
+            MidOperationKind::Compute(compute) => {
+                let output_aliases = compute.output_aliases();
                 for &(output, input) in output_aliases {
                     if aliases.contains(&operation.inputs[input]) {
                         aliases.insert(operation.results[output]);
@@ -180,7 +181,6 @@ mod tests {
             MidOperationKind::Compute(Compute::Kernel {
                 kernel: TileKernelSpec::Gelu,
                 operands: vec![OperandWindow::default()],
-                product: None,
                 output_aliases: vec![],
             })
         };

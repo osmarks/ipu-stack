@@ -131,7 +131,9 @@ pub fn benchmark_mid_expansion(
                 continue;
             }
             let category = match &op.kind {
-                crate::MidOperationKind::Compute(Compute::Kernel { .. }) => "compute",
+                crate::MidOperationKind::Compute(Compute::Kernel { .. } | Compute::Product(_)) => {
+                    "compute"
+                }
                 crate::MidOperationKind::Copy { .. } => "copy",
                 crate::MidOperationKind::Compute(Compute::Sum { .. }) => "sum",
                 _ => "other",
