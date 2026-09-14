@@ -210,44 +210,17 @@ fn main() -> Result<()> {
     let runtime = device.runtime();
     let mut session = runtime.host_session(&application)?;
     session.start()?;
-    let executed = match session.invoke_streaming_deferred("run", &[0; 4]) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "completion={:?}",
-                application
-                    .debug_symbols
+    let executed = session
+        .invoke_streaming_deferred("run", &[0; 4])
+        .inspect_err(|_| {
+            ipu_tests::completion::report_kernel_faults(
+                runtime,
+                &application,
+                cases
                     .iter()
-                    .filter(|s| s.name == ipu_codegen::COMPLETED_SYMBOL)
-                    .collect::<Vec<_>>()
+                    .map(|(rows, keys, _, _)| format!("rows={rows} keys={keys}")),
             );
-            for (logical, (rows, keys, _, _)) in cases.iter().enumerate() {
-                let tile = ipu_exchange::c600_logical_to_physical(logical as u16);
-                for context in 0..=6 {
-                    let state = runtime.device().tile_context_state(tile, context)?;
-                    if state == 3 {
-                        let pc = runtime.device().read_tile_program_counter(tile, context)?;
-                        eprintln!(
-                            "rows={rows} keys={keys} tile={tile} context={context} status={:x} pc={pc:x} {:?}",
-                            runtime.device().read_tile_context_status(tile, context)?,
-                            application.symbolize_pc(u32::from(tile), pc)
-                        );
-                        if context == 0 {
-                            eprintln!(
-                                "regs={:?}",
-                                (0..12)
-                                    .map(|r| runtime
-                                        .device()
-                                        .read_tile_m_register(tile, context, r))
-                                    .collect::<Vec<_>>()
-                            );
-                        }
-                    }
-                }
-            }
-            return Err(e.into());
-        }
-    };
+        })?;
     let output = session.finish(&executed)?;
     ipu_tests::completion::diagnose_completion(
         runtime,

@@ -93,3 +93,46 @@ pub fn summarize_states(states: &[(u16, u32)]) -> String {
     }
     format!("counts={counts:?} firstUnexpected={unexpected:?}")
 }
+
+/// Best-effort fault detail; diagnostic reads must not replace the execution error.
+pub fn report_kernel_faults(
+    runtime: &Runtime,
+    application: &Application,
+    cases: impl IntoIterator<Item = String>,
+) {
+    let device = runtime.device();
+    eprintln!(
+        "completion={:?}",
+        application
+            .debug_symbols
+            .iter()
+            .filter(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
+            .collect::<Vec<_>>()
+    );
+    for (logical, case) in cases.into_iter().enumerate() {
+        let tile = ipu_exchange::c600_logical_to_physical(logical as u16);
+        for context in 0..=6 {
+            if device.tile_context_state(tile, context).ok() != Some(3) {
+                continue;
+            }
+            let pc = device.read_tile_program_counter(tile, context);
+            eprintln!(
+                "{case} logicalTile={logical} tile={tile} context={context} pc={pc:x?} symbol={:?} exception={:?}",
+                pc.as_ref()
+                    .ok()
+                    .map(|&pc| application.symbolize_pc(u32::from(tile), pc)),
+                device
+                    .read_tile_context_status(tile, context)
+                    .map(ipu_driver::TileException::from_status),
+            );
+            if context == 0 {
+                eprintln!(
+                    "regs={:?}",
+                    (0..12)
+                        .map(|r| device.read_tile_m_register(tile, context, r))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
