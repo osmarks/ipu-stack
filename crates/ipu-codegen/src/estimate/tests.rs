@@ -68,8 +68,8 @@ fn conversion_traffic_reference(
     from: &Layout,
     to: &Layout,
 ) -> ConversionTraffic {
-    let sources = layout_extents(shape, from).unwrap();
-    let destinations = layout_extents(shape, to).unwrap();
+    let sources = layout_extents(shape, from).unwrap().collect::<Vec<_>>();
+    let destinations = layout_extents(shape, to).unwrap().collect::<Vec<_>>();
     let mut remote = BTreeSet::<(u16, Vec<(u32, u32)>)>::new();
     let mut traffic = ConversionTraffic::default();
     for (destination_tile, destination) in &destinations {

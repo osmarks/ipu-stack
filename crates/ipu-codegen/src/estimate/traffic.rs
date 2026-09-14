@@ -126,17 +126,16 @@ pub(crate) fn conversion_traffic(
     from: &Layout,
     to: &Layout,
 ) -> Option<ConversionTraffic> {
-    let sources = layout_extents(shape, from)?;
-    let destinations = layout_extents(shape, to)?;
+    let groups = |layout: &Layout| {
+        let mut groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
+        for (tile, extents) in layout_extents(shape, layout)? {
+            groups.entry(extents).or_default().push(tile);
+        }
+        Some(groups)
+    };
+    let source_groups = groups(from)?;
+    let destination_groups = groups(to)?;
     let element_bytes = precision.bytes();
-    let mut source_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
-    for (tile, extents) in sources {
-        source_groups.entry(extents).or_default().push(tile);
-    }
-    let mut destination_groups = HashMap::<Vec<(u32, u32)>, Vec<u16>>::new();
-    for (tile, extents) in destinations {
-        destination_groups.entry(extents).or_default().push(tile);
-    }
     let mut remote = HashSet::<(u16, Vec<(u32, u32)>)>::new();
     let mut traffic = ConversionTraffic::default();
     for (destination, destination_tiles) in &destination_groups {
@@ -194,7 +193,7 @@ pub(crate) fn conversion_traffic(
 pub(super) fn layout_extents(
     shape: &TensorShape,
     layout: &Layout,
-) -> Option<Vec<(u16, Vec<(u32, u32)>)>> {
+) -> Option<impl Iterator<Item = (u16, Vec<(u32, u32)>)>> {
     Some(
         layout
             .shard_extents(shape)
@@ -208,8 +207,7 @@ pub(super) fn layout_extents(
                         .map(|extent| (extent.start, extent.logical_end))
                         .collect(),
                 )
-            })
-            .collect(),
+            }),
     )
 }
 
