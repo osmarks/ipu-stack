@@ -6,10 +6,15 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct SumBatch {
-    transfers: Vec<BTreeMap<ShardView, Vec<ShardView>>>,
+    stages: Vec<SumStage>,
     seeds: Vec<(u16, LocalCopy)>,
-    runs: Vec<Vec<(u16, KernelRun)>>,
     results: Vec<(u16, LocalCopy)>,
+}
+
+#[derive(Default)]
+struct SumStage {
+    transfers: BTreeMap<ShardView, Vec<ShardView>>,
+    runs: Vec<(u16, KernelRun)>,
 }
 
 impl TileGraphBuilder {
@@ -22,9 +27,8 @@ impl TileGraphBuilder {
         batch: &mut SumBatch,
     ) -> ExpansionResult<()> {
         let SumBatch {
-            transfers: reduction_transfers,
+            stages,
             seeds: seed_copies,
-            runs: reduction_runs,
             results: result_copies,
         } = batch;
         let mut reduction_roots = 0usize;
@@ -36,11 +40,7 @@ impl TileGraphBuilder {
             let remote_partials_per_stage =
                 staging.remote_partials_per_stage(remote_count as u64) as usize;
             let reduction_stages = remote_count.div_ceil(remote_partials_per_stage);
-            reduction_transfers.resize_with(
-                reduction_stages.max(reduction_transfers.len()),
-                BTreeMap::new,
-            );
-            reduction_runs.resize_with(reduction_stages.max(reduction_runs.len()), Vec::new);
+            stages.resize_with(reduction_stages.max(stages.len()), SumStage::default);
             let source_order = self.shards[complete.shard.index() as usize]
                 .tensor_type
                 .format
@@ -107,11 +107,11 @@ impl TileGraphBuilder {
                             CopyOrder::Physical,
                         )?;
                     } else {
-                        if reduction_transfers.is_empty() {
-                            reduction_transfers.push(BTreeMap::new());
-                            reduction_runs.push(Vec::new());
+                        if stages.is_empty() {
+                            stages.push(SumStage::default());
                         }
-                        reduction_transfers[0]
+                        stages[0]
+                            .transfers
                             .entry(source)
                             .or_default()
                             .push(destination);
@@ -204,7 +204,8 @@ impl TileGraphBuilder {
                         CopyOrder::Physical,
                     )?;
                 } else {
-                    reduction_transfers[0]
+                    stages[0]
+                        .transfers
                         .entry(seed_source.clone())
                         .or_default()
                         .push(self.full_view(initial));
@@ -228,7 +229,8 @@ impl TileGraphBuilder {
                         let end = start
                             .checked_add(elements)
                             .ok_or(ExpansionError::IdOverflow)?;
-                        reduction_transfers[stage]
+                        stages[stage]
+                            .transfers
                             .entry(source_view(partial))
                             .or_default()
                             .push(ShardView {
@@ -246,7 +248,7 @@ impl TileGraphBuilder {
                     } else {
                         (result, initial)
                     };
-                    reduction_runs[stage].push((
+                    stages[stage].runs.push((
                         owner.tile,
                         self.kernel_run(
                             provenance,
@@ -307,16 +309,11 @@ impl TileGraphBuilder {
         tiles: &mut BlockRegion,
     ) -> ExpansionResult<()> {
         let SumBatch {
-            transfers: reduction_transfers,
+            stages,
             seeds: mut seed_copies,
-            runs: reduction_runs,
             results: result_copies,
         } = batch;
-        for (stage, (transfers, runs)) in reduction_transfers
-            .into_iter()
-            .zip(reduction_runs)
-            .enumerate()
-        {
+        for (stage, SumStage { transfers, runs }) in stages.into_iter().enumerate() {
             self.append_physical_phase(
                 transfers,
                 WorkProvenance {
