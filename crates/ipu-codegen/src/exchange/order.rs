@@ -611,33 +611,17 @@ pub(super) fn stream_wave_order(
             .max()
             .unwrap_or(0);
     }
-    let mut indegrees = problem.indegrees();
-    let mut ready = BinaryHeap::new();
-    for (index, &degree) in indegrees.iter().enumerate() {
-        if degree == 0 {
-            ready.push(Reverse((
-                depth[index],
-                !problem.transfers[index].moving_source(),
-                rank[index],
-                index,
-            )));
-        }
-    }
-    let mut order = Vec::with_capacity(rank.len());
-    while let Some(Reverse((_, _, _, index))) = ready.pop() {
-        order.push(index);
-        for &next in &problem.dependents[index] {
-            indegrees[next] -= 1;
-            if indegrees[next] == 0 {
-                ready.push(Reverse((
-                    depth[next],
-                    !problem.transfers[next].moving_source(),
-                    rank[next],
-                    next,
-                )));
-            }
-        }
-    }
+    // Depth strictly increases along every dependency edge, so this total
+    // order is already topological; no separate ready queue is needed.
+    let mut order = (0..rank.len()).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&index| {
+        (
+            depth[index],
+            !problem.transfers[index].moving_source(),
+            rank[index],
+            index,
+        )
+    });
     order
 }
 
