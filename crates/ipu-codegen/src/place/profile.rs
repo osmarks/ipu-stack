@@ -106,18 +106,11 @@ fn collect(
                     .assignments
                     .get(i + 1)
                     .map_or(end, |&(root, _)| address(root));
-                let bytes = allocation_bytes(
-                    program,
-                    group,
-                    &analysis.member_offsets,
-                    analysis.root_requirements[&root],
-                )?;
-                let payload = allocation_bytes(
-                    program,
-                    group,
-                    &analysis.member_offsets,
-                    Requirement::default(),
-                )?;
+                let requirement = analysis.root_requirements[&root];
+                let bytes =
+                    allocation_bytes(program, group, &analysis.member_offsets, requirement)?;
+                // Every member includes the same access tail in the allocation size.
+                let payload = bytes - requirement.access_tail;
                 let input = group
                     .iter()
                     .find_map(|&member| names.get(&program.shards[member].id));
