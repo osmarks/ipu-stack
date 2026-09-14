@@ -143,10 +143,8 @@ impl ResolvedLayout {
     }
 
     pub(crate) fn maximum_tile_elements(&self) -> u64 {
-        if let Some(grain) = self.linear_grain {
-            return (self.shape.elements() / u64::from(grain))
-                .div_ceil(u64::from(self.tile_count))
-                .saturating_mul(u64::from(grain));
+        if self.linear_grain.is_some() {
+            return self.tile_elements(0);
         }
         self.axes
             .iter()
@@ -175,20 +173,16 @@ impl ResolvedLayout {
     }
 
     pub(crate) fn shard_extents(&self) -> Result<Vec<(u16, Vec<ShardExtent>)>, LayoutError> {
-        if let Some(grain) = self.linear_grain {
+        if self.linear_grain.is_some() {
             let shape = &self.shape;
             let rank = shape.0.len();
-            let elements = shape.elements();
-            let grains = elements / u64::from(grain);
-            let tiles = u64::from(self.tile_count);
             let width = u64::from(*shape.0.last().ok_or(LayoutError::EmptyAxisTiling)?);
             let mut all = Vec::new();
+            let mut cursor = 0;
             for tile in 0..self.tile_count {
-                let start_grain =
-                    u64::from(tile) * (grains / tiles) + u64::from(tile).min(grains % tiles);
-                let tile_grains = grains / tiles + u64::from(u64::from(tile) < grains % tiles);
-                let start = start_grain * u64::from(grain);
-                let end = start + tile_grains * u64::from(grain);
+                let start = cursor;
+                let end = start + self.tile_elements(tile);
+                cursor = end;
                 let first_row = start / width;
                 let last_row = end.div_ceil(width);
                 for row in first_row..last_row {
