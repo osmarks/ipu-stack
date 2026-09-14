@@ -265,20 +265,6 @@ fn geometry_traffic(
         for destination in &transfer.destinations {
             let target = &program.shards[destination.shard.index() as usize];
             let copy = geometry.copy(program, source_geometry, destination, order)?;
-            if let Some(storage) = storage.as_deref_mut() {
-                for row in &copy.receives {
-                    storage.connection_rows(
-                        source.tile,
-                        target.tile,
-                        (u64::from(destination.shard.index()) << 32) + u64::from(row.offset),
-                        row.bytes,
-                        row.rows,
-                        row.stride,
-                        transfer.destinations.len(),
-                        ipu_exchange::MAX_TRANSFER_WORDS * 4,
-                    );
-                }
-            }
             outgoing_fragments = outgoing_fragments.max(copy.fragments);
             outgoing_long_fragments = outgoing_long_fragments.max(copy.long_fragments);
             // Relative allocation/offset identities expose pointer continuation
@@ -287,6 +273,18 @@ fn geometry_traffic(
             let mut resets = 0;
             for row in &copy.receives {
                 let address = (u64::from(destination.shard.index()) << 32) + u64::from(row.offset);
+                if let Some(storage) = storage.as_deref_mut() {
+                    storage.connection_rows(
+                        source.tile,
+                        target.tile,
+                        address,
+                        row.bytes,
+                        row.rows,
+                        row.stride,
+                        transfer.destinations.len(),
+                        ipu_exchange::MAX_TRANSFER_WORDS * 4,
+                    );
+                }
                 let end = &mut receive_end[usize::from(target.tile)];
                 resets += u64::from(*end != Some(address))
                     + u64::from(row.rows.saturating_sub(1)) * u64::from(row.stride != row.bytes);
