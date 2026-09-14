@@ -95,6 +95,39 @@ fn region_search_preserves_live_residual_and_fixed_boundaries() {
 }
 
 #[test]
+fn region_escape_analysis_only_counts_consumed_repeat_entries() {
+    for count in [1, 2] {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [2, 128]).unwrap();
+        let a = graph.gelu(x).unwrap();
+        let b = graph.gelu(x).unwrap();
+        let sequence = graph.value_sequence("sequence", [a, b]).unwrap();
+        let result = graph
+            .repeat(count, [x], [], [sequence], |body, args| {
+                Ok(vec![body.add(args.carried[0], args.iterated[0])?])
+            })
+            .unwrap();
+        graph.set_outputs(result).unwrap();
+        let tensor = format(Precision::F16, Layout::row_sharded(2));
+        let config = PipelineConfig::new(2).with_input(x, tensor.clone());
+        let request = RegionRequest {
+            operations: 0..2,
+            inputs: config.inputs.clone(),
+            outputs: BTreeMap::from([(a, tensor)]),
+        };
+        let result = plan_region(&graph, &request, &config, &SearchOptions::default());
+        if count == 1 {
+            assert!(!result.unwrap().candidates.is_empty());
+        } else {
+            assert!(
+                result.is_err(),
+                "the second iteration consumes b, which must escape"
+            );
+        }
+    }
+}
+
+#[test]
 fn materializations_are_shared_and_search_limits_are_explicit() {
     use super::search::plan_region;
     let mut graph = ComputeGraph::new();

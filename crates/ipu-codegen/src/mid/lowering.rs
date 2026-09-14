@@ -159,21 +159,6 @@ pub(super) fn restore_unclaimed_deferred_costs(operations: &mut [MidOperation]) 
     changed
 }
 
-pub(super) fn operation_graph_inputs(operation: &Operation, graph: &ComputeGraph) -> Vec<ValueId> {
-    let mut inputs = operation.inputs.clone();
-    if let OperationKind::Repeat(repeat) = &operation.kind {
-        for sequence in &repeat.iterated_inputs {
-            inputs.extend(
-                graph.sequences()[sequence.index() as usize]
-                    .values
-                    .iter()
-                    .take(repeat.count as usize),
-            );
-        }
-    }
-    inputs
-}
-
 pub(super) fn apply_selected_plan(
     operation: &Operation,
     output_shape: TensorShape,

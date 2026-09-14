@@ -298,7 +298,7 @@ impl<C: CostModel> Builder<'_, C> {
         let mut uses = BTreeMap::new();
         for input in source
             .iter()
-            .flat_map(|op| operation_graph_inputs(op, self.graph))
+            .flat_map(|op| self.graph.operation_inputs(op))
             .chain(required.iter().copied())
         {
             *uses.entry(input).or_insert(0) += 1;

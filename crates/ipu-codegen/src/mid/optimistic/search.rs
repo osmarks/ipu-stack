@@ -155,28 +155,12 @@ pub fn plan_region(
             "boundary inputs must exactly cover region free values",
         ));
     }
-    let mut escaped = graph.operations()[request.operations.end..]
+    let escaped = graph.operations()[request.operations.end..]
         .iter()
-        .flat_map(|op| op.inputs.iter())
-        .chain(graph.outputs())
+        .flat_map(|op| graph.operation_inputs(op))
+        .chain(graph.outputs().iter().copied())
         .filter(|v| defined.contains(v))
-        .copied()
         .collect::<BTreeSet<_>>();
-    for op in &graph.operations()[request.operations.end..] {
-        if let OperationKind::Repeat(repeat) = &op.kind {
-            for sequence in &repeat.iterated_inputs {
-                if let Some(sequence) = graph.sequences().iter().find(|s| s.id == *sequence) {
-                    escaped.extend(
-                        sequence
-                            .values
-                            .iter()
-                            .filter(|v| defined.contains(v))
-                            .copied(),
-                    );
-                }
-            }
-        }
-    }
     if !escaped.is_subset(&request.outputs.keys().copied().collect())
         || request.outputs.is_empty()
         || request.outputs.keys().any(|v| !defined.contains(v))

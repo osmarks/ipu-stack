@@ -278,6 +278,29 @@ impl ComputeGraph {
         &self.operations
     }
 
+    /// Inputs consumed in the enclosing region, including the used prefix of
+    /// each Repeat sequence. Preserve multiplicity for use-count accounting.
+    pub(crate) fn operation_inputs<'a>(
+        &'a self,
+        operation: &'a Operation,
+    ) -> impl Iterator<Item = ValueId> + 'a {
+        let (sequences, count) = match &operation.kind {
+            OperationKind::Repeat(repeat) => (repeat.iterated_inputs.as_slice(), repeat.count),
+            _ => (&[][..], 0),
+        };
+        operation
+            .inputs
+            .iter()
+            .copied()
+            .chain(sequences.iter().flat_map(move |sequence| {
+                self.sequences[sequence.index() as usize]
+                    .values
+                    .iter()
+                    .take(count as usize)
+                    .copied()
+            }))
+    }
+
     pub fn outputs(&self) -> &[ValueId] {
         &self.outputs
     }
