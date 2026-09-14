@@ -98,7 +98,7 @@ impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
                 Ok(())
             },
         )?;
-        let original = coalesce_copies(copies.clone());
+        let original = coalesce_copies(&copies);
         if !can_reorder || original.len() < 2 {
             return Ok(original);
         }
@@ -114,7 +114,7 @@ impl<Buffer: Clone + PartialEq> CopyOperation<Buffer> {
         }) {
             return Ok(original);
         }
-        let reordered = coalesce_copies(copies);
+        let reordered = coalesce_copies(&copies);
         Ok(if reordered.len() < original.len() {
             reordered
         } else {
@@ -208,9 +208,7 @@ fn row_copy_pattern(
     )
 }
 
-fn coalesce_copies<Buffer: Clone>(
-    copies: Vec<CopyOperation<Buffer>>,
-) -> Vec<CopyOperation<Buffer>> {
+fn coalesce_copies<Buffer: Clone>(copies: &[CopyOperation<Buffer>]) -> Vec<CopyOperation<Buffer>> {
     let mut coalesced = Vec::new();
     let mut index = 0;
     while index < copies.len() {
