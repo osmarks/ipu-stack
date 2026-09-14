@@ -4,7 +4,9 @@
 `1501698`; revised after discussion of reduction, the two mid states, and source
 comprehensibility. Read [current data flow](COMPILER_DATA_FLOW.md) for the concrete
 paths behind this proposal. Proposed function names below specify responsibilities
-and call direction; they are not existing APIs.
+and call direction; they are not existing APIs. The follow-up review separates
+explicit choices from search coverage and traces additional low/backend ownership
+problems, including a reproduced disagreement about which work executes.
 
 ## Diagnosis
 
@@ -60,10 +62,11 @@ flowchart TD
 ```
 
 The solid edges describe consumed information, not a requirement to split every
-box into a crate. Search owns decisions. Analyses consume descriptions. Backend
-optimization may change physical realization, but must publish its resulting
-scratch, dependencies and work before placement. A lowered program must not
-contain unresolved requests for the planner to interpret.
+box into a crate. Recipes and explicit policies describe the available decisions;
+search explores a selected subset of them. Analyses consume descriptions. Backend
+optimization may change physical realization within its supplied policy, but
+must publish its resulting scratch, dependencies and work before placement. A
+lowered program must not contain unresolved requests for the planner to interpret.
 
 ### 1. Make mid an executable language
 
@@ -91,8 +94,8 @@ Pointwise operations, layernorm, attention and structured control have their own
 constructors. Sharing the executable language does not require sharing a GEMM
 decomposition, one universal constructor, or one implementation per operation.
 
-`Recipe` is a map from semantic operation IDs to choice parameters, plus boundary
-and rewrite choices. It has no executable edges, invented values or nested
+`Recipe` records family parameters, boundary/rewrite choices and requested
+backend policies. It has no executable edges, invented values or nested
 implementations. The semantic graph supplies dependency order; the mid graph
 supplies execution. Moving today's selected-operator graph to a private planner
 type would retain the second layer and is explicitly not the proposed change.
@@ -138,6 +141,29 @@ operator-resolution pass to repair compute placement.
 
 ### Scope choices to the work they affect
 
+Representing a decision does not require searching it. Separate three things:
+
+1. The choice or policy recorded by a recipe, scoped to the work it affects.
+2. The default rule that fills in an unspecified choice or realizes an automatic
+   policy from actual geometry.
+3. The search neighborhood that currently proposes changes to those settings.
+
+The refactor can preserve today's defaults and search effort. A plausibly useful
+alternative must be expressible without editing an unrelated implementation
+module; it need not receive another search dimension now. A recorded automatic
+policy is legitimate when the answer depends on shard geometry or final
+placement. Its selection routine must be visible, take that policy explicitly,
+and expose the resulting choice in the normal low graph or schedule diagnostics.
+An explicit request that cannot apply must be reported as such, rather than
+silently treated as another implementation.
+
+Low and exchange modules receive the relevant typed policy, not the entire
+planner `Recipe`. The policy type belongs to the subsystem that implements it;
+the recipe/configuration refers to it. This keeps dependency direction clear.
+There is no need for a global option registry, an enum for each implementation
+constant, or a second record of every generated instruction. Hardware legality,
+alias safety and numerical contracts remain requirements, not tunable choices.
+
 The current one-off tile-mapping search is too global to be the intended design.
 `package/placement::model_mapping` scores block-transpose permutations of all
 active tiles. `map_tiles` applies the winning permutation to every shard, local
@@ -166,14 +192,15 @@ consistent homes; required alias and Repeat-sequence relationships must remain
 consistent too. Persistent parameters can keep one home while individual users
 choose different temporary compute distributions.
 
-Mapping proposals therefore join the ordinary recipe neighborhood, where their
-boundary movement is visible in mid and costed with the computation. Reuse the
-existing fabric-load model to screen promising embeddings; it must score the
-source and destination assignments relevant to each transfer. Its current
-whole-graph tile permutation argument is insufficient for that. There is no
-second mapping optimizer invoked once beside the main search loop. A uniform
-whole-graph remapping can still be represented as a joint choice or an explicit
-diagnostic override, rather than being the only available choice.
+Owner maps therefore belong to the recipe and the produced mid values, where
+their boundary movement is visible and costed with the computation. Their
+defaults can initially reproduce current mappings. The existing whole-graph
+proposal can become an ordinary joint recipe change; searching independent
+embeddings is not a prerequisite for this ownership change. When adding those
+proposals, reuse the existing fabric-load model with the source and destination
+assignments relevant to each transfer. Its current whole-graph permutation
+argument cannot evaluate independent embeddings. The endpoint has no separate
+one-off mapping optimizer beside the main search loop.
 
 Other current global switches should be scoped similarly:
 
@@ -184,6 +211,16 @@ Other current global switches should be scoped similarly:
 | `parallel_reductions` and `disjoint_copy_sources` rewrites across all regions | Particular independent reduction/preparation groups and their owner choices |
 | One `exchange_stream_words` setting | A default scheduling policy, with phase-specific choices where worth evaluating; this belongs to low scheduling, since phases can contain work from several semantic operations |
 | One address-placement offset used as a global alternative | An allocator heuristic, not an operator's layout; useful address/bank preferences concern allocation conflict groups under joint placement constraints |
+| `CopyPlan`'s implicit direct-versus-staging selection | An explicit movement policy for the copy/preparation site; automatic selection may retain the current heuristic |
+| `relay::select`'s gather/pack/multicast acceptance rule | An explicit low routing policy, with added work and scratch recorded in the graph |
+
+The exchange scheduler is a concrete instance of misplaced policy today:
+`ExchangeScheduleCache::with_stream_words` selects an algorithm setting, and
+the cache's `select` method invokes scheduling with it. Scheduling should receive
+policy and a cache as separate inputs. A cache owns reusable results, not the
+authority to choose the algorithm. Replay must account for the effective policy
+as well as transfer structure and address-dependent legality. This change does
+not require scheduling multiple alternatives for each candidate.
 
 Global defaults and effort caps remain useful. They should initialize or bound
 local choices, not force unrelated sites to change together. Retain device-wide
@@ -193,10 +230,13 @@ and phase grouping. Local scope does not imply independent feasibility.
 Use source-operation provenance and stable family-local sites for replayable
 mid choices, validating their applicability when rebuilding a changed recipe.
 Final phase numbers or incidental low arena indexes are unsuitable identities.
-Start with the existing small alternative sets and targeted joint proposals;
-do not enumerate the Cartesian product of all local settings or schedule every
-exchange variant. Search checkpoints retain these choices in the same search
-state, with explicit compatibility handling for old global settings.
+Keep the current alternative sets initially. Later additions to search can target
+individual sites or coupled groups without changing the representation again.
+Do not enumerate their Cartesian product or schedule every exchange variant.
+Search checkpoints retain requested choices and effective defaults in the same
+state, with explicit compatibility handling for old global settings. Addresses,
+per-transfer instruction choices and cache contents are compilation results,
+not additional executable structure inside `Recipe`.
 
 ### 2. Give movement one path and separate geometry from policy
 
@@ -608,6 +648,83 @@ the selected local work, append it, then perform named low transformations.
 This is a substantive change to the lower-level code's contracts and mutation
 boundaries. Moving files or writing a clearer outer driver alone does not meet it.
 
+### Give executable low work one authority
+
+`TileGraph.body` and the per-tile work lists in `LowProgram` reference shared
+arenas, but they can disagree about which entries execute. `lower_to_tiles`
+projects the graph and then calls the initialization-removal passes. Those
+passes remove calls from `tiles[*].work` and `repeat_runs[*].body.work`, leaving
+the graph's `BlockRegion` operations unchanged. Final package costing walks that
+original region; kernel inventory, placement and emission walk the filtered work.
+
+A temporary diagnostic using the existing initialization fixture reproduced the
+disagreement: two graph calls became one emitted call, but final costing reported
+1,402 cycles versus 1,390 for the retained work. This is a small synthetic example,
+not a measured model slowdown. It demonstrates that the final estimator can
+charge for work that will not run. The probe was removed after running it.
+
+Make work-changing low passes transform `TileGraph` before deriving per-tile
+indexes. Record any resulting finite-scratch requirement with that graph.
+Projection should be read-only and should not make another optimization decision.
+Cost, inventory, lifetimes, profiles and emission then observe the same live
+operations. Arena entries can remain interned without being live operations;
+analyses must distinguish those concepts. Rebuild derived indexes after a graph
+change instead of mutating two execution descriptions independently. Teaching
+the estimator one padding-specific exception would leave this defect in place.
+
+This also gives low transformations a clear sequence: construction, explicit
+graph rewrites, validation, then projection and placement. A backend limitation
+such as unsupported nested Repeat should be checked before expensive scheduling,
+not first discovered in `tile::lower_work`; the general graph representation
+need not lose the ability to express it.
+
+### Finish the storage and call contracts, including special paths
+
+The earlier kernel-family proposal must cover these concrete cases:
+
+| Current path and consequence | Ownership change and code removed |
+| --- | --- |
+| `expand/repeat::body_storage_requirement` scans mid for GEMMs to infer 32-byte alignment and the left-input tail. `KernelRequirements::new` defines the same facts. Placement later recomputes sequence stride from complete low access requirements, and `tile::lower_repeat` recovers it again from placed addresses. | Low Repeat declares sequence relationships. Checked calls supply access requirements once; placement establishes and returns the sequence base/stride. Remove the preliminary GEMM-only scan and emission's stride reconstruction, retaining validation of the placed sequence. Current placement already repairs provisional requirements; this is duplicated authority, not a demonstrated Repeat corruption. |
+| `KernelRun` and its requirements split `output` from `additional_outputs`; `MemoryOperand::Output` cannot refer to a second result in an element-separation constraint. Low appends additional results after creating the call, and ABI code recognizes their special arity. | Use indexed results and operand references in a complete family binding. Each family retains its ABI ordering and which result determines compute geometry. Remove primary/additional traversal and mutation paths; do not create another adapter for multi-output compute. |
+| Attention probabilities and FP32 maximum/denominator state occupy one buffer described with an F16/FP8 tensor type. Attention construction must hide those trailing words from ordinary copies; finite-padding analysis exempts attention kernels by name. | Describe numerical data and mixed-type state as typed regions/bindings of the selected storage. Preserve the existing packed placement when required by the kernel. Copies select the probability region; padding analysis consumes the actual write/read contract. A new mixed-state kernel should not need an unrelated name-based padding exception. |
+| `tile::local_copy_call` chooses the u16/u32/u64 or strided helper and ABI. Placement applies a separate fixed alignment rule; low costing independently prices copies, including a fixed 64-bit strided-loop formula. Local copies also bypass kernel useful-work accounting. | Retain the useful `LocalCopy` byte/stride descriptor for coalescing and motion. A copy family binds its helper, access requirements, cost inputs and retained symbol. Placement, costing and emission consume that binding. Do not invent a homogeneous tensor type just to route byte copies through arithmetic-kernel interfaces. |
+
+These are related extensions of the same contract, not reasons to introduce a
+generic constraint language or a new workspace IR. Record the access facts the
+existing implementations actually require, at the family that establishes them.
+In particular, describing mixed-type state must not force separate allocations
+or extra exchanges: its logical components and its physical packing are
+different facts. The existing guards against treating FP32 statistics as F16
+padding remain necessary until the replacement contract proves the same safety.
+
+### Preserve relocation information through encoding
+
+The backend repeatedly recovers information that its encoder just knew:
+
+- `sender_address_instruction_groups` scans encoded words to identify outgoing
+  messages and paired-send restarts, reconstructing their source offsets.
+  Repeat relocation matches these groups back to scheduled send activities.
+- `normalized_exchange_address_words` separately recognizes address fields for
+  schedule replay and row sharing. `tile::layout_exchange_rows` normalizes rows
+  and compares them with the originals to recover changed word positions.
+- Repeat's fallback from base relocation uses the diagnostic decoder to find
+  the base-register writes it needs to replace.
+
+Have exchange encoding return words with compact relocation metadata: address
+field locations/kinds, outgoing-message identity and source-relative offset,
+and relevant base-write locations. Produce it at the point each instruction is
+encoded. Row sharing, Repeat relocation and schedule replay consume those sites
+instead of rediscovering them through separate opcode walks. Account for inline
+paired control words and both send and receive address fields. Keep this metadata
+with the encoded result so that any instruction rewriting updates it together
+with the words.
+
+This replaces data already being reconstructed, not the scheduler or its timing
+model. Do not introduce a large symbolic instruction graph. Keep the independent
+decoder for imported SDK rows, diagnostics and validation against emitted words;
+independent validation is useful and should not reuse the encoder's conclusions.
+No performance gain from this change has been measured in this review.
+
 ### What must be apparent from the source
 
 | Reader's question | Where the answer must be visible |
@@ -619,6 +736,9 @@ boundaries. Moving files or writing a clearer outer driver alone does not meet i
 | Why does this kernel require a tail, alignment or separate element? | Its family binding contract, reused by placement and call emission |
 | Which storage and strides does this borrowed or shifted view use? | The common storage/view binding and geometry interface |
 | Which pass may alter ownership, aliasing or phase grouping? | Named mid rewrite or low transformation called by the relevant entry routine |
+| Which work actually executes? | The transformed low graph; per-tile indexes are derived from it without further work removal |
+| Where did this default or optimization choice come from? | Recipe/default policy, then the named selector receiving it; search coverage is separate |
+| Which words need address relocation? | Relocation metadata emitted with the exchange instructions |
 
 Module introductions should describe their inputs, guarantees and decisions in
 those terms. Comments beside an algorithm should explain constraints such as
@@ -731,20 +851,24 @@ kernels.
 The driver extraction can first preserve current behavior as a contained step.
 The main refactor spans direct executable mid construction, scoped choices,
 storage/view binding, movement realization and complete family call construction.
-It includes all supported operation families and Repeat. The scoped mapping
-neighborhood replaces the one-off global mapping search when owner maps are
-represented in mid; the latter is not the intended endpoint. Moving constants
-can be a separate contained commit.
+It includes all supported operation families and Repeat. Existing global mapping
+proposals become joint recipe choices when owner maps are represented in mid;
+additional per-site search can wait. The live-low-graph, storage-contract and
+relocation changes do not depend on expanding the search and should not be
+deferred behind it. Moving constants can be a separate contained commit.
 
 | Slice | Required endpoint | Code that should disappear or lose responsibility |
 | --- | --- | --- |
 | Compiler driver | One visible search loop and one visible candidate evaluation; package code consumes final placements/schedules | `local::optimize` finalization callback, `validate<T>` indirection, nested scheduling in package placement improvement, duplicated provisional/final result ownership |
 | Target/ABI ownership | One definition per hardware fact or shared protocol constant; compiler no longer imports driver for constants | Duplicate SRAM/register constants; generic instruction encoders and tile mapping misplaced in exchange; runtime policy mixed into architectural definitions |
 | Direct mid construction | Graph plus recipe emits only Copy, Compute and Repeat; both candidate costing and insertion use the same emitter | `Operator`, `Convert`, `Primitive` wrapper, `resolve_region`, `CostModel::implementation`, deferred offers/claims/cost restoration, dual cast/copy recognition |
-| Scoped choices | Owner embeddings and preparation/donation choices are attached to the values/sites/groups affected; complete candidates remain jointly validated | One-off global mapping search and `mapping_checked`, program-wide all-or-nothing rewrite choices as the only representation |
+| Scoped choices and explicit defaults | Recipe/policies describe owner maps, preparation/donation, movement and scheduling choices; search may retain its current coverage | One-off global mapping search and `mapping_checked`, program-wide rewrites as the only representation, algorithm policy hidden in geometry or caches |
 | Movement/geometry consolidation | One mapping-to-movement path, pure reusable facts, explicit physical selection | Independent identity-intersection path and repeated geometry-key/traversal construction; custom cache policy where no longer justified |
-| Compute and kernel binding | Sum is a compute family; existing indexing patterns reused without generic kernel-name exceptions; static call legality checked before placement | Separate top-level Sum, product/reduction-specific orchestration in generic expansion, scattered broadcast inference and overlapping call/specialization/argument derivation |
+| Compute and kernel binding | Sum is a compute family; complete indexed operands/results and access contracts cover arithmetic, mixed state and local-copy helpers | Separate top-level Sum, product/reduction-specific generic orchestration, scattered broadcast/ABI derivation, primary/additional-output paths, name-based mixed-state exceptions |
 | Low construction and access | Appenders record work; storage binding resolves access geometry; explicit transformations own copy motion/routing/phase changes | Hidden GEMM splitting and exchange/copy motion in appenders, caller-by-caller borrowed-view repair, cast chunk implementation owned by mid |
+| Authoritative low work | All transformations change the graph; pure projection derives the work observed by cost, inventory, placement and emission | Padding removal that edits only projected work; independent mutable descriptions of live calls |
+| Repeat storage | Checked access requirements feed sequence placement; placement returns the binding used by emission | Mid GEMM-specific requirement scan and emitter reconstruction of placed sequence strides |
+| Exchange relocation | Encoder retains compact address/base sites for Repeat and row sharing; independent decoding remains a validator | Repeated production opcode walks and recovery of send identity/relative offsets from encoded words |
 | Source comprehensibility | The named entry routines show sequence and decisions; family/movement procedures own their construction end to end | Implicit cross-module builder mutations, single-use step scattering, broad internal re-exports that mask ownership, stale module explanations |
 
 Perform each slice as runnable commits and remove its old path before declaring
@@ -758,6 +882,12 @@ and alias safety, Repeat residency and sequence behavior, and successful package
 construction for representative saved SigLIP/PE plans. Compare expansion/search
 time, peak host memory, per-tile memory and on-device cycles where the path
 changes. One deterministic hardware run per distinct package is enough.
+
+Add invariant checks that the source and projected low work agree after removal,
+that every Repeat iteration satisfies its call access contracts, and that
+relocation produces the intended addresses when independently decoded. These
+test the responsibilities being consolidated, rather than pinning helper names,
+instruction counts or internal call sequences merely because they are current.
 
 Track non-test source size and the number of places a new operation/indexing
 pattern must modify. A refactor that only moves files or adds adapters without

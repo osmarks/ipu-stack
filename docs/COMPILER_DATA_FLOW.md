@@ -28,9 +28,11 @@ The two mid rows are **states of the same Rust type**, not separate checked
 interfaces. `resolve` removes `Operator` but can leave `Convert`. Low rejects
 an unresolved `Operator` at runtime. This is a significant source of ambiguity.
 
-`TileGraph` and `LowProgram` are different views of the same arenas, not two
-independently owned copies of all calls and transfers. `lower_to_tiles` also
-performs finite-value initialization elimination; it is not only projection.
+`TileGraph` and `LowProgram` share arenas, but their live operation lists can
+diverge. `lower_to_tiles` projects the graph and then performs initialization
+elimination on per-tile work only. The original graph still contains removed
+calls. This matters because different downstream consumers use different lists;
+see the low-work trace below.
 
 ## Production control flow
 
@@ -68,8 +70,9 @@ one permutation over the entire active tile set. `map_tiles` changes every
 shard and local work item together. This preserves their existing ownership
 relationships; it cannot choose a different embedding for one operator's
 outputs while leaving unrelated values alone. Mid's `tile_offset` and ownership
-groups separately provide local rotations. The proposal replaces the one-off
-global search with scoped owner-map choices in the ordinary neighborhood.
+groups separately provide local rotations. The proposal records scoped owner-map
+choices and makes the existing global proposal a joint recipe change; it does
+not require searching independent maps immediately.
 
 [validation::expand_and_screen](../crates/ipu-codegen/src/package/validation.rs)
 expands each retained candidate and checks transfer geometry before scheduling.
@@ -79,7 +82,9 @@ provisional/final cycle is real. Cached ordering and widths are replayed and
 validated; cached physical addresses are not assumed valid.
 
 The reported final cycles still combine modelled kernel work with scheduled
-exchange horizons. They are not hardware measurements.
+exchange horizons. They are not hardware measurements. In addition to modelling
+error, the low-work trace identifies an actual mismatch between their input and
+emitted work.
 
 ## Trace 1: GEMM and its reduction
 
@@ -244,6 +249,64 @@ alongside movement and kernel binding.
   [codegen/lib.rs](../crates/ipu-codegen/src/lib.rs) emits supervisor instructions.
   The package builder assembles executable images and host-visible metadata.
 
+## Trace 4: live low work and storage contracts
+
+[lower_to_tiles](../crates/ipu-codegen/src/low/mod.rs) first projects `BlockRegion`
+operations into tile work and Repeat instances.
+[initialization.rs](../crates/ipu-codegen/src/low/initialization.rs) then removes
+padding clears from the projected lists. The shared `TileGraph.body` is unchanged.
+
+| Consumer | Execution description used |
+| --- | --- |
+| Final `scheduled_program_cycles` in [estimate/program.rs](../crates/ipu-codegen/src/estimate/program.rs), called by package construction | Original `BlockRegion` operations |
+| [KernelBuildPlan](../crates/ipu-codegen/src/kernel/build.rs), runtime-symbol retention and tile emission | Filtered per-tile work, including Repeat bodies |
+| Placement lifetimes and kernel access collection | Filtered `TileWorkRef` traversal |
+
+A temporary test populated the graph body corresponding to the existing
+initialization fixture and ran `lower_to_tiles`: two graph calls became one tile
+call. Scheduled costing reported 1,402 cycles; removing the same dead call from
+the graph before costing gave 1,390. The test was removed after this diagnostic.
+It establishes disagreement about live work, not a large performance regression
+or an inaccurate kernel inventory.
+
+Several physical access contracts also have multiple owners:
+
+- [expand/repeat.rs](../crates/ipu-codegen/src/low/expand/repeat.rs) preliminarily
+  infers GEMM alignment and input tails to size iterated sequences.
+  [low/call.rs](../crates/ipu-codegen/src/low/call.rs) declares those facts again.
+  Placement recomputes stride from complete requirements; tile emission recovers
+  it from consecutive addresses. The late placement calculation is necessary
+  today and prevents treating the preliminary scan as authoritative.
+- `KernelRun` and `KernelRequirements` distinguish a primary output from
+  `additional_outputs`. `MemoryOperand::Output` refers only to the primary one,
+  so the element-separation contract cannot name another result.
+- [attention construction](../crates/ipu-codegen/src/mid/implementation/attention.rs)
+  places FP32 statistics after probabilities inside a nominal F16/FP8 tensor.
+  It crops probability copies to exclude the statistics; finite-padding reuse
+  separately rejects attention kernels because their writes are not all F16.
+- `tile::local_copy_call` selects copy helpers and arguments. Runtime inventory
+  reuses that selection, but placement alignment and local-copy costing use
+  separate rules instead of a common checked helper binding.
+
+## Trace 5: exchange words back to relocation sites
+
+The exchange builder emits instruction words. Later,
+[exchange/relocation.rs](../crates/ipu-codegen/src/exchange/relocation.rs) invokes
+`sender_address_instruction_groups` to scan those words for SEND and paired-send
+restarts and recover offsets relative to each outgoing message. It matches the
+groups back to scheduled send activities for Repeat relocation. Its base fallback
+also invokes the diagnostic decoder to locate OUTGOING_BASE writes.
+
+[ipu-exchange](../crates/ipu-exchange/src/lib.rs) separately implements
+`normalized_exchange_address_words`, recognizing send and receive address fields
+for cache replay and row sharing. `tile::layout_exchange_rows` normalizes each
+row in both its counting and placement passes, then compares normalized and
+original words to collect address-patch positions. These are production uses of
+instruction interpretation, beyond the independent validation/diagnostic decoder.
+The proposal retains relocation sites during encoding instead of discarding and
+recovering them. The independent decoder remains useful for verification and SDK
+captures.
+
 ## Costs and caches
 
 Compact costing reads layouts and mid primitives; detailed costing reads tile
@@ -262,7 +325,7 @@ reduction lowering.
 | `CopyRegions.targets` | Requested logical region to clipped source regions/replica owners | One source set during a copy or conversion; avoids repeating intersection work for replicas |
 | `TileGraphBuilder.kernel_metadata` | Shared provenance/kernel/format access contracts, found by linear lookup | One expansion; operand views remain per call |
 | Timeline `KernelCosts` | Interned call metadata plus physical widths to cycles | One timeline evaluation |
-| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order and normalized encoded rows | Incumbent plus speculative candidate snapshots; physical replay is validated |
+| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order and normalized encoded rows; also owns the `stream_words` scheduling setting | Incumbent plus speculative candidate snapshots; physical replay is validated |
 | ELF artifact cache | Source/includes, effective flags, target and tool identity to immutable compiled objects | On disk across builds |
 
 [ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses custom
@@ -274,6 +337,11 @@ standard hash maps. These are not all caches of the same computation.
 `borrowed_views` is different: it records storage substitutions made during
 expansion. It is mutable lowering state, not a memoization cache, and cannot be
 shared between candidates.
+
+The exchange cache also invokes production algorithm selection using its stored
+stream setting. This is policy ownership as well as caching. Separating policy
+from cached results does not require evaluating more schedules; it makes the
+caller-selected default explicit and requires replay compatibility with it.
 
 The overlapping work is constructing, normalizing and matching byte geometry in
 copy realization and geometry costing. The cached `CopyPlan` additionally
