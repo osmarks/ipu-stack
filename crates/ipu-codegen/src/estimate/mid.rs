@@ -213,7 +213,11 @@ fn analyze_storage<const PER_TILE: bool>(
             if shard == 0 {
                 continue;
             }
-            let tile = (usize::from(owner) + usize::from(value.tile_offset)) % tiles;
+            let tile = if PER_TILE {
+                usize::from(value.owners.tile(owner, program.tile_count)?)
+            } else {
+                0
+            };
             let prefix = if PER_TILE {
                 prefixes[usize::from(owner)]
             } else {
@@ -350,7 +354,7 @@ fn analyze_storage<const PER_TILE: bool>(
             let maximum = resolved.maximum_tile_elements();
             for owner in 0..layout.tiling.tile_count {
                 let elements = resolved.tile_elements(owner);
-                let tile = (usize::from(owner) + usize::from(output.tile_offset)) % tiles;
+                let tile = usize::from(output.owners.tile(owner, program.tile_count)?);
                 tile_scratch[tile] = MemoryUsage {
                     standard: scratch.standard.checked_mul(elements)?.div_ceil(maximum),
                     interleaved: scratch.interleaved.checked_mul(elements)?.div_ceil(maximum),
@@ -540,8 +544,8 @@ pub(crate) fn operation_cost(
             let local_conversion = *policy == crate::CopyPolicy::LocalKernel;
             let same_ownership = local_conversion
                 || (crate::tensor::same_distribution(input, output)
-                    && values[operation.inputs[0].index() as usize].tile_offset
-                        == values[operation.results[0].index() as usize].tile_offset);
+                    && values[operation.inputs[0].index() as usize].owners
+                        == values[operation.results[0].index() as usize].owners);
             if !same_ownership
                 || matches!(
                     operation.kind,

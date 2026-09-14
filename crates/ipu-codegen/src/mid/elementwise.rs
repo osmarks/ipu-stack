@@ -99,17 +99,16 @@ fn fuse_region(
         let left = &values[add.inputs[0].index() as usize];
         let right = &values[add.inputs[1].index() as usize];
         if &left.tensor_type != output_type
-            || left.tile_offset != output_value.tile_offset
+            || left.owners != output_value.owners
             || output_type.format.precision != Precision::F16
             || output_type.format.layout.order != ElementOrder::RowMajor
             || values[input.index() as usize].tensor_type != *output_type
-            || values[input.index() as usize].tile_offset != output_value.tile_offset
+            || values[input.index() as usize].owners != output_value.owners
         {
             continue;
         }
         if !compatible_fusion(&fused, &left.tensor_type, &right.tensor_type, output_type)
-            || (fused == TileKernelSpec::AddLayerNorm
-                && right.tile_offset != output_value.tile_offset)
+            || (fused == TileKernelSpec::AddLayerNorm && right.owners != output_value.owners)
         {
             continue;
         }
@@ -150,7 +149,7 @@ fn fuse_region(
                             let value = &values[add.inputs[input].index() as usize];
                             (result == 0
                                 && value.tensor_type == *output_type
-                                && value.tile_offset == output_value.tile_offset)
+                                && value.owners == output_value.owners)
                                 .then(|| inputs.iter().position(|id| *id == add.inputs[input]))
                                 .flatten()
                         })
@@ -247,7 +246,7 @@ mod tests {
             let id = MidValueId(index as u32);
             MidValue {
                 id,
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type,
                 origin: ValueId::from_index(0),
                 storage_group: id,
@@ -356,7 +355,7 @@ mod tests {
             norm.values.push(MidValue {
                 id,
                 storage_group: id,
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 origin: ValueId::from_index(0),
                 tensor_type: TensorType::new(
                     [1152],
@@ -447,7 +446,7 @@ mod tests {
                     let id = MidValueId(values.len() as u32);
                     values.push(MidValue {
                         id,
-                        tile_offset: 0,
+                        owners: crate::tensor::OwnerMap::default(),
                         tensor_type: tensor,
                         origin: ValueId::from_index(0),
                         storage_group: id,

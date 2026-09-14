@@ -3,7 +3,7 @@
 //! composition and explicit transformations of already selected work.
 use crate::estimate::MemoryPeaks;
 use crate::graph::{GraphInputKind, OperationId, ValueId};
-use crate::tensor::TensorType;
+use crate::tensor::{OwnerMap, TensorType};
 use std::collections::BTreeMap;
 pub(crate) mod cast;
 pub(crate) mod cast_order;
@@ -13,6 +13,7 @@ pub(crate) mod elementwise;
 mod fragment;
 mod output_fusion;
 mod ownership;
+pub(crate) use ownership::bind_compute_owners;
 mod packing;
 mod residual;
 pub(crate) mod rewrite;
@@ -45,8 +46,9 @@ impl MidValueId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidValue {
     pub id: MidValueId,
-    /// Selected rotation of layout ownership within the graph's tile group.
-    pub tile_offset: u16,
+    /// Selected embedding of layout owners onto device tiles. Distribution and
+    /// storage order remain in tensor_type; values can share this map cheaply.
+    pub owners: OwnerMap,
     pub tensor_type: TensorType,
     /// Semantic value represented by this value; conversions retain the same
     /// origin. Region arguments also refer to their high-level argument ID.

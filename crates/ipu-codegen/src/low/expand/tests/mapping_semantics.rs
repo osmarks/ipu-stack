@@ -276,16 +276,22 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
             .enumerate()
             .map(|(index, shape)| {
                 let id = MidValueId::from_index(index as u32);
+                let layout = layout(&mut random, shape);
+                let owners = if case % 2 == 0 {
+                    let mut tiles = vec![0, 1, 2, 3];
+                    random.shuffle(&mut tiles);
+                    tiles.truncate(usize::from(layout.tiling.tile_count));
+                    crate::tensor::OwnerMap::embedded(tiles)
+                        .with_rotation(random.u16(0..layout.tiling.tile_count))
+                } else {
+                    crate::tensor::OwnerMap::rotated(random.u16(0..4))
+                };
                 MidValue {
                     id,
-                    tensor_type: TensorType::new(
-                        shape.0.clone(),
-                        Precision::F32,
-                        layout(&mut random, shape),
-                    ),
+                    tensor_type: TensorType::new(shape.0.clone(), Precision::F32, layout),
                     origin: ValueId::from_index(index as u32),
                     storage_group: id,
-                    tile_offset: random.u16(0..4),
+                    owners,
                 }
             })
             .collect();
@@ -359,7 +365,7 @@ fn forced_destination_packing_and_direct_transfers_preserve_the_same_values() {
                         ),
                         origin: ValueId::from_index(index),
                         storage_group: id,
-                        tile_offset: index as u16,
+                        owners: crate::tensor::OwnerMap::rotated(index as u16),
                     }
                 })
                 .collect();

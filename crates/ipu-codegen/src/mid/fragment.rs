@@ -5,8 +5,9 @@ use crate::low::{CopyPolicy, PackingPolicy};
 use std::collections::BTreeMap;
 
 /// Substitute complete boundary bindings, preserving the fragment's operations
-/// and ownership groups. Unbound groups rotate with the first result (or input);
-/// groups shared with a boundary retain that boundary's mapping instead.
+/// and ownership groups. Unbound groups inherit the first result's (or input's)
+/// embedding unless the fragment declares one, preserving relative rotations.
+/// Groups shared with a boundary retain that boundary's mapping instead.
 /// New temporaries belong to the caller's semantic result for diagnostics.
 /// A returned input is connected to a distinct caller result by an explicit
 /// identity copy, which ordinary copy lowering can reuse locally.
@@ -57,11 +58,17 @@ pub(crate) fn append_fragment(
         let actual = values.get(to.index() as usize)?;
         if actual.id != to
             || actual.tensor_type != template.tensor_type
-            || actual.tile_offset >= tile_count
             || actual.storage_group.index() as usize >= values.len()
         {
             return None;
         }
+        actual
+            .owners
+            .validate(
+                actual.tensor_type.format.layout.tiling.tile_count,
+                tile_count,
+            )
+            .ok()?;
         if let Some(existing) = ids[from.index() as usize] {
             if existing != to {
                 if input || inputs.contains(&to) {
@@ -79,10 +86,11 @@ pub(crate) fn append_fragment(
         let group = &mut groups[template.storage_group.index() as usize];
         let binding = (
             actual.storage_group,
-            (i32::from(actual.tile_offset) - i32::from(template.tile_offset))
-                .rem_euclid(i32::from(tile_count)),
+            actual
+                .owners
+                .shifted(-i32::from(template.owners.rotation()), tile_count)?,
         );
-        if group.is_some_and(|old| old != binding) {
+        if group.as_ref().is_some_and(|old| old != &binding) {
             return None; // Bound members of one ownership group must agree.
         }
         *group = Some(binding);
@@ -100,14 +108,18 @@ pub(crate) fn append_fragment(
                 .map(|v| v.value)
                 .zip(inputs.first().copied())
         });
-    let (origin, rotation) = anchor.map_or((None, 0), |(from, to)| {
+    let (origin, relative_owners) = if let Some((from, to)) = anchor {
         let actual = &values[to.index() as usize];
         (
             Some(actual.origin),
-            i32::from(actual.tile_offset)
-                - i32::from(fragment.values[from.index() as usize].tile_offset),
+            actual.owners.shifted(
+                -i32::from(fragment.values[from.index() as usize].owners.rotation()),
+                tile_count,
+            )?,
         )
-    });
+    } else {
+        (None, crate::tensor::OwnerMap::default())
+    };
     let mut next = values.len();
     for value in &fragment.values {
         let binding = &mut ids[value.id.index() as usize];
@@ -115,19 +127,31 @@ pub(crate) fn append_fragment(
             let id = MidValueId::from_index(u32::try_from(next).ok()?);
             next = next.checked_add(1)?;
             *binding = Some(id);
-            groups[value.storage_group.index() as usize].get_or_insert((id, rotation));
+            let owners = if value.owners.has_embedding() {
+                value.owners.with_rotation(relative_owners.rotation())
+            } else {
+                relative_owners.clone()
+            };
+            groups[value.storage_group.index() as usize].get_or_insert((id, owners));
         }
     }
     let mut added = Vec::with_capacity(next - values.len());
     for template in &fragment.values {
         let id = ids[template.id.index() as usize]?;
         if id.index() as usize >= values.len() {
-            let (storage_group, rotation) = groups[template.storage_group.index() as usize]?;
+            let (storage_group, owners) =
+                groups[template.storage_group.index() as usize].as_ref()?;
+            let owners = owners.shifted(i32::from(template.owners.rotation()), tile_count)?;
+            owners
+                .validate(
+                    template.tensor_type.format.layout.tiling.tile_count,
+                    tile_count,
+                )
+                .ok()?;
             added.push(MidValue {
                 id,
-                storage_group,
-                tile_offset: (i32::from(template.tile_offset) + rotation)
-                    .rem_euclid(i32::from(tile_count)) as u16,
+                storage_group: *storage_group,
+                owners,
                 tensor_type: template.tensor_type.clone(),
                 origin: origin.unwrap_or(template.origin),
             });
@@ -197,7 +221,7 @@ mod tests {
     fn value(i: u32) -> MidValue {
         MidValue {
             id: id(i),
-            tile_offset: 0,
+            owners: crate::tensor::OwnerMap::default(),
             tensor_type: TensorType::new([1, 16], Precision::F16, Layout::row_sharded(1)),
             origin: ValueId::from_index(i),
             storage_group: id(i),
@@ -214,7 +238,7 @@ mod tests {
         let mut values = (0..7).map(value).collect::<Vec<_>>();
         for i in [0, 3, 4, 6] {
             values[i].storage_group = id(0);
-            values[i].tile_offset = 1;
+            values[i].owners = crate::tensor::OwnerMap::rotated(1);
         }
         for i in [1, 2, 5] {
             values[i].storage_group = id(1);
@@ -231,7 +255,7 @@ mod tests {
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         };
-        MidProgram {
+        let mut program = MidProgram {
             tile_count: 4,
             values,
             inputs: (0..3).map(input).collect(),
@@ -257,17 +281,19 @@ mod tests {
                 estimated_exchange_cycles: 0,
             }],
             ..MidProgram::default()
-        }
+        };
+        crate::mid::bind_compute_owners(&mut program.operations, &mut program.values).unwrap();
+        program
     }
     fn caller() -> MidProgram {
         let mut values = (0..6).map(value).collect::<Vec<_>>();
         for i in [2, 5] {
             values[i].storage_group = id(2);
-            values[i].tile_offset = 7;
+            values[i].owners = crate::tensor::OwnerMap::rotated(7);
         }
         for i in [3, 4] {
             values[i].storage_group = id(3);
-            values[i].tile_offset = 9;
+            values[i].owners = crate::tensor::OwnerMap::rotated(9);
         }
         MidProgram {
             tile_count: 16,
@@ -325,44 +351,60 @@ mod tests {
 
     #[test]
     fn binding_preserves_repeat_execution_ownership_and_aliases() {
-        let fragment = repeated_add();
-        let mut bound = caller();
-        fragment.validate().unwrap();
-        append_fragment(
-            &fragment,
-            &[id(2), id(3), id(4)],
-            &[id(5)],
-            None,
-            bound.tile_count,
-            &mut bound.values,
-            &mut bound.operations,
-        )
-        .unwrap();
-        bound.validate().unwrap();
-        let mut before = vec![0; fragment.values.len()];
-        before[..3].copy_from_slice(&[3, 5, 7]);
-        let mut after = vec![0; bound.values.len()];
-        after[2..5].copy_from_slice(&[3, 5, 7]);
-        execute(&fragment.operations, &mut before);
-        execute(&bound.operations, &mut after);
-        assert_eq!(after[5], before[3]);
-        assert_eq!(after[5], 15);
-        let MidOperationKind::Repeat(repeat) = &bound.operations[0].kind else {
-            panic!()
-        };
-        for &i in [&repeat.body.arguments[..1], &repeat.body.yields]
-            .concat()
-            .iter()
-        {
-            let value = &bound.values[i.index() as usize];
-            assert_eq!((value.storage_group, value.tile_offset), (id(2), 7));
+        for embedded in [false, true] {
+            let fragment = repeated_add();
+            let mut bound = caller();
+            if embedded {
+                for i in [2, 5] {
+                    bound.values[i].owners =
+                        crate::tensor::OwnerMap::embedded(vec![2, 7, 10, 3]).with_rotation(1);
+                }
+                for i in [3, 4] {
+                    bound.values[i].owners =
+                        crate::tensor::OwnerMap::embedded(vec![11, 5, 9]).with_rotation(2);
+                }
+            }
+            fragment.validate().unwrap();
+            append_fragment(
+                &fragment,
+                &[id(2), id(3), id(4)],
+                &[id(5)],
+                None,
+                bound.tile_count,
+                &mut bound.values,
+                &mut bound.operations,
+            )
+            .unwrap();
+            bound.validate().unwrap();
+            crate::low::expand::expand_tiles(&bound, false).unwrap();
+            let mut before = vec![0; fragment.values.len()];
+            before[..3].copy_from_slice(&[3, 5, 7]);
+            let mut after = vec![0; bound.values.len()];
+            after[2..5].copy_from_slice(&[3, 5, 7]);
+            execute(&fragment.operations, &mut before);
+            execute(&bound.operations, &mut after);
+            assert_eq!(after[5], before[3]);
+            assert_eq!(after[5], 15);
+            let MidOperationKind::Repeat(repeat) = &bound.operations[0].kind else {
+                panic!()
+            };
+            for &i in [&repeat.body.arguments[..1], &repeat.body.yields]
+                .concat()
+                .iter()
+            {
+                let value = &bound.values[i.index() as usize];
+                assert_eq!(value.storage_group, id(2));
+                assert_eq!(value.owners, bound.values[2].owners);
+            }
+            let weight = &bound.values[repeat.body.arguments[1].index() as usize];
+            assert_eq!(weight.storage_group, id(3));
+            assert_eq!(weight.owners, bound.values[3].owners);
+            let MidOperationKind::Compute(compute) = &repeat.body.operations.last().unwrap().kind
+            else {
+                panic!()
+            };
+            assert_eq!(compute.output_aliases(), &[(0, 0)]);
         }
-        let weight = &bound.values[repeat.body.arguments[1].index() as usize];
-        assert_eq!((weight.storage_group, weight.tile_offset), (id(3), 9));
-        let MidOperationKind::Compute(compute) = &repeat.body.operations[0].kind else {
-            panic!()
-        };
-        assert_eq!(compute.output_aliases(), &[(0, 0)]);
     }
 
     #[test]

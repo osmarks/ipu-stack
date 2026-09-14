@@ -213,7 +213,7 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
                 tensor_type,
                 origin: ValueId::from_index(i as u32),
                 storage_group: id,
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
             }
         })
         .collect();

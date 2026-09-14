@@ -1895,7 +1895,7 @@ fn repeat_binds_every_linear_fragment_including_rotated_owners() {
     let mut mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     for offset in 0..2 {
         for value in &mut mid.values {
-            value.tile_offset = offset;
+            value.owners = crate::tensor::OwnerMap::rotated(offset);
         }
         let low = lower_to_tiles(&mid, false).unwrap();
         let placement = crate::place(&low).unwrap();
@@ -1993,7 +1993,7 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
         values: (0..5)
             .map(|index| MidValue {
                 id: id(index),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 origin: crate::ValueId::from_index(index),
                 storage_group: id(index),
                 tensor_type: tensor_type.clone(),

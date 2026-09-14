@@ -75,9 +75,15 @@ preserves ownership groups and relative offsets, remaps Repeat recursively, and
 connects returned inputs to requested result values with explicit identity copies.
 Invalid bindings cannot leave partially appended values or operations. Program
 validation has its own error type, independent of planning failures.
-Scoped ownership decisions and the remaining family storage, relocation, target
-and cache boundaries below still require work. The diagnoses below describe the
-reviewed starting point; [current data flow](COMPILER_DATA_FLOW.md) tracks
+Mid values now use shared `OwnerMap` embeddings instead of scalar tile offsets.
+Maps may select arbitrary subsets; expansion, memory accounting and ownership
+comparisons observe the same assignment. Existing rotation behavior remains.
+Ownership-copy insertion belongs to mid and covers allocation aliases as well
+as callable operands. This representation work does not yet move the global
+mapping proposal into Recipe. Scoped ownership decisions and the remaining
+family storage, relocation, target and cache boundaries below still require work.
+The diagnoses below describe the reviewed starting point;
+[current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.
 
 ## Diagnosis

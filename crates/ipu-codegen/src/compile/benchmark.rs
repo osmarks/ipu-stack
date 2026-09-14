@@ -157,7 +157,7 @@ pub fn benchmark_mid_expansion(
                             groups.push(value.storage_group);
                             groups.len() - 1
                         });
-                    (&value.tensor_type, value.tile_offset, group)
+                    (&value.tensor_type, &value.owners, group)
                 })
                 .collect::<Vec<_>>();
             let entry = selections.entry(category).or_default();

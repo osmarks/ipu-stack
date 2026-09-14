@@ -363,11 +363,11 @@ mod tests {
         values[1].tensor_type.shape.0[0] += 1;
         assert!(!super::super::rewrite::same_storage(&values[0], &values[1]));
         values[1].tensor_type = values[0].tensor_type.clone();
-        values[1].tile_offset = 1;
+        values[1].owners = crate::tensor::OwnerMap::rotated(1);
         assert!(!super::super::rewrite::same_storage(&values[0], &values[1]));
 
         for value in &mut values {
-            value.tile_offset = 0;
+            value.owners = crate::tensor::OwnerMap::default();
             value.tensor_type.format.layout = Layout::row_sharded(1);
         }
         values[1].tensor_type.format.layout.tiling.axes[0].shard_padding_multiple = 8;
@@ -443,7 +443,7 @@ mod tests {
         let values = (0..4)
             .map(|index| MidValue {
                 id: MidValueId(index),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type: TensorType {
                     shape: TensorShape(vec![4, 16]),
                     format: TensorFormat {

@@ -304,7 +304,7 @@ mod tests {
                 let id = MidValueId(i as u32);
                 MidValue {
                     id,
-                    tile_offset: 0,
+                    owners: crate::tensor::OwnerMap::default(),
                     tensor_type,
                     origin: ValueId::from_index(0),
                     storage_group: MidValueId(0),

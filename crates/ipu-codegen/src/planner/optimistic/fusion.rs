@@ -188,7 +188,7 @@ fn known_fusion_cost(
                 tensor_type: value.tensor.clone(),
                 origin: value.origin,
                 storage_group: id,
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
             }
         })
         .collect::<Vec<_>>();

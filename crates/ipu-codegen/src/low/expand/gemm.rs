@@ -360,7 +360,7 @@ mod tests {
                     id,
                     origin: ValueId::from_index(i as u32),
                     tensor_type,
-                    tile_offset: 0,
+                    owners: crate::tensor::OwnerMap::default(),
                     storage_group: id,
                 }
             })

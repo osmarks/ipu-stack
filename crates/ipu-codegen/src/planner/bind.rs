@@ -31,7 +31,7 @@ impl ValueBuilder {
         let id = MidValueId::from_index(self.values.len() as u32);
         self.values.push(MidValue {
             id,
-            tile_offset: 0,
+            owners: crate::tensor::OwnerMap::default(),
             tensor_type,
             origin,
             storage_group: id,
@@ -61,9 +61,9 @@ impl ValueBuilder {
     ) -> MidValueId {
         let origin = self.get(source).origin;
         let storage_group = self.get(source).storage_group;
-        let offset = self.get(source).tile_offset;
+        let owners = self.get(source).owners.clone();
         let result = self.value_in_storage_group(origin, tensor_type, storage_group);
-        self.values[result.index() as usize].tile_offset = offset;
+        self.values[result.index() as usize].owners = owners;
         if self.parameter_values.contains(&source) {
             self.parameter_values.insert(result);
         }

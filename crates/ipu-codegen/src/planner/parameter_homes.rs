@@ -1,7 +1,7 @@
 //! Choose persistent parameter homes and insert the copies those choices require.
 
 use crate::compile::PipelineConfig;
-use crate::mid::{CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId};
+use crate::mid::{MidOperation, MidValue, MidValueId};
 use crate::planner::error::LoweringResult;
 #[cfg(test)]
 use crate::tensor::AmpOrder;
@@ -181,59 +181,15 @@ pub(super) fn assign_parameter_tiles(
     let mut changed = false;
     for value in values.iter_mut() {
         if let Some(&offset) = offsets.get(&value.storage_group) {
-            changed |= value.tile_offset != offset;
-            value.tile_offset = offset;
+            let owners = value.owners.with_rotation(offset);
+            changed |= value.owners != owners;
+            value.owners = owners;
         }
     }
     if changed {
-        bind_compute_owners(operations, values);
+        crate::mid::bind_compute_owners(operations, values)?;
     }
     Ok(changed)
-}
-
-/// Changing persistent homes is a mid transformation: every direct compute
-/// reader keeps its selected owners through an explicit copy. Copy consumers
-/// already express this ownership change in their result binding.
-fn bind_compute_owners(operations: &mut Vec<MidOperation>, values: &mut Vec<MidValue>) {
-    let mut result = Vec::with_capacity(operations.len());
-    for mut operation in std::mem::take(operations) {
-        match &mut operation.kind {
-            MidOperationKind::Repeat(repeat) => {
-                bind_compute_owners(&mut repeat.body.operations, values);
-            }
-            MidOperationKind::Compute(compute) => {
-                let count = compute.input_count();
-                let offset = values[operation.results[0].index() as usize].tile_offset;
-                for input in operation.inputs.iter_mut().take(count) {
-                    if values[input.index() as usize].tile_offset != offset {
-                        let mut value = values[input.index() as usize].clone();
-                        value.id = MidValueId::from_index(values.len() as u32);
-                        value.tile_offset = offset;
-                        value.storage_group = value.id;
-                        let id = value.id;
-                        values.push(value);
-                        result.push(MidOperation {
-                            source: operation.source,
-                            inputs: vec![*input],
-                            results: vec![id],
-                            kind: MidOperationKind::Copy {
-                                policy: crate::CopyPolicy::Automatic,
-                                packing: crate::PackingPolicy::Automatic,
-                                mapping: CoordinateMapping::default(),
-                                reuse_local: true,
-                            },
-                            estimated_cycles: 0,
-                            estimated_exchange_cycles: 0,
-                        });
-                        *input = id;
-                    }
-                }
-            }
-            _ => {}
-        }
-        result.push(operation);
-    }
-    *operations = result;
 }
 
 fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
@@ -261,7 +217,7 @@ fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
 mod tests {
     use crate::graph::{GraphInputKind, ValueId};
     use crate::low::default_copy_policy;
-    use crate::mid::{MidInput, MidProgram};
+    use crate::mid::{CoordinateMapping, MidInput, MidOperationKind, MidProgram};
     use crate::tensor::{MemoryClass, Precision, TensorShape};
 
     use super::*;
@@ -302,7 +258,7 @@ mod tests {
                         .enumerate()
                         .map(|(id, tensor_type)| MidValue {
                             id: MidValueId::from_index(id as u32),
-                            tile_offset: 0,
+                            owners: crate::tensor::OwnerMap::default(),
                             tensor_type,
                             origin: ValueId::from_index(0),
                             storage_group: MidValueId::from_index(id as u32),
@@ -368,7 +324,7 @@ mod tests {
                 id: MidValueId::from_index(i),
                 origin: ValueId::from_index(i),
                 storage_group: MidValueId::from_index(if i == 1 { 0 } else { i }),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type: TensorType::new([64], Precision::F16, Layout::logical_linear(2, 4)),
             })
             .collect::<Vec<_>>();
@@ -389,10 +345,13 @@ mod tests {
             8,
         )
         .unwrap();
-        assert_eq!(values[0].tile_offset, values[1].tile_offset);
-        assert_eq!(values[2].tile_offset, values[4].tile_offset);
-        assert_ne!(values[0].tile_offset, values[2].tile_offset);
-        let offsets = values.iter().map(|v| v.tile_offset).collect::<Vec<_>>();
+        assert_eq!(values[0].owners, values[1].owners);
+        assert_eq!(values[2].owners, values[4].owners);
+        assert_ne!(values[0].owners, values[2].owners);
+        let offsets = values
+            .iter()
+            .map(|v| v.owners.rotation())
+            .collect::<Vec<_>>();
         values[4].tensor_type.shape = TensorShape(vec![16384]);
         assign_parameter_tiles(
             &mut values,
@@ -404,7 +363,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             offsets,
-            values.iter().map(|v| v.tile_offset).collect::<Vec<_>>()
+            values
+                .iter()
+                .map(|v| v.owners.rotation())
+                .collect::<Vec<_>>()
         );
     }
 

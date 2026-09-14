@@ -249,13 +249,20 @@ impl TileGraphBuilder {
             }
             let layout = &value.tensor_type.format.layout;
             layout.validate_tile_count(tile_count)?;
+            value
+                .owners
+                .validate(layout.tiling.tile_count, tile_count)?;
             let extents = layout.shard_extents(&value.tensor_type.shape)?;
             let mut value_shards = Vec::with_capacity(extents.len());
             for (owner, extents) in extents {
                 let id = state.push_shard(BlockValue {
                     id: BlockValueId(0),
-                    tile: ((usize::from(owner) + usize::from(value.tile_offset))
-                        % usize::from(tile_count)) as u16,
+                    tile: value.owners.tile(owner, tile_count).ok_or(
+                        crate::tensor::LayoutError::InvalidOwnerMap {
+                            owners: layout.tiling.tile_count,
+                            tiles: tile_count,
+                        },
+                    )?,
                     tensor_type: value.tensor_type.clone(),
                     extents,
                     definition: ShardDefinition::Value(value.id),

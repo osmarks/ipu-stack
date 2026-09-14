@@ -532,7 +532,7 @@ impl<C: CostModel> Builder<'_, C> {
             for value in &mut self.state.values[previous_values..] {
                 if parameter_origins.contains(&value.origin) {
                     value.storage_group = value.id;
-                    value.tile_offset = 0;
+                    value.owners = crate::tensor::OwnerMap::default();
                 }
             }
             let output = operation.results[0];
@@ -583,7 +583,7 @@ impl<C: CostModel> Builder<'_, C> {
             {
                 let source = self.state.get(*input).clone();
                 let result = self.state.value(source.origin, source.tensor_type);
-                self.state.values[result.index() as usize].tile_offset = source.tile_offset;
+                self.state.values[result.index() as usize].owners = source.owners.clone();
                 operations.push(MidOperation {
                     source: Some(operation.id),
                     inputs: vec![*input],
@@ -792,7 +792,7 @@ mod tests {
         let home = &baseline.program.values[op.inputs[1].index() as usize];
         let argument = &baseline.program.values[repeat.body.arguments[1].index() as usize];
         assert_eq!(home.tensor_type, argument.tensor_type);
-        assert_eq!(home.tile_offset, argument.tile_offset);
+        assert_eq!(home.owners, argument.owners);
         let low = crate::low::expand::expand_tiles(&baseline.program, false).unwrap();
         crate::place(&crate::lower_to_tiles(&low, false)).unwrap();
     }

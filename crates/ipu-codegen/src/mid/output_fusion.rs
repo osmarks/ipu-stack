@@ -260,7 +260,7 @@ fn fuse_fp8_outputs_at(
                 };
                 let mut value = old.clone();
                 value.tensor_type.format.layout.tiling = tiling;
-                value.tile_offset = input.tile_offset;
+                value.owners = input.owners.clone();
                 if same_storage(old, &value) {
                     replacement.inputs.push(parameter);
                     continue;

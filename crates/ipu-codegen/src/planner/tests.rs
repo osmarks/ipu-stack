@@ -2251,7 +2251,7 @@ fn repeated_normalization_can_keep_parameters_compact() {
         assert_eq!(first.tensor_type.format.layout.tiling.replicas, 1);
         for id in sequence {
             let value = &mid.values[id.index() as usize];
-            assert_eq!(value.tile_offset, first.tile_offset);
+            assert_eq!(value.owners, first.owners);
         }
     }
     let resolved = mid;

@@ -309,7 +309,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
                 id: id(i as u32),
                 origin: ValueId::from_index(i as u32),
                 storage_group: id(i as u32),
-                tile_offset,
+                owners: crate::tensor::OwnerMap::rotated(tile_offset),
                 tensor_type: TensorType::new([256], Precision::F16, Layout::logical_linear(2, 4)),
             })
             .collect(),
@@ -343,6 +343,12 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     // Each allocation has 256 bytes on two owners. {7,0}, {1,2}, {3,4}
     // are disjoint even though no layout individually uses all eight tiles.
     assert_eq!(peak(&program), 256);
+    let mut explicit = program.clone();
+    for (value, tiles) in explicit.values.iter_mut().zip([[0, 7], [2, 1], [4, 3]]) {
+        value.owners = crate::tensor::OwnerMap::embedded(Vec::from(tiles)).with_rotation(1);
+    }
+    explicit.validate().unwrap();
+    assert_eq!(peak(&explicit), peak(&program));
     let mut config = crate::PipelineConfig::new(8);
     config.standard_memory_reservation_bytes = 0;
     let mut screened_peak = |budget| {
@@ -374,9 +380,9 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     assert_eq!(separate_classes.interleaved, 256);
     assert_eq!(peak(&program), 256);
     program.values[1].tensor_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
-    program.values[1].tile_offset = 7;
+    program.values[1].owners = crate::tensor::OwnerMap::rotated(7);
     assert_eq!(peak(&program), 512);
-    program.values[2].tile_offset = 7;
+    program.values[2].owners = crate::tensor::OwnerMap::rotated(7);
     assert_eq!(peak(&program), 768);
 
     // The first parameter's later sequence members remain resident when a
@@ -421,7 +427,7 @@ fn memory_retains_repeat_yields_until_the_backedge() {
                 id: id(i),
                 origin: ValueId::from_index(i),
                 storage_group: id(i),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type: TensorType::new([256], Precision::F16, Layout::logical_linear(1, 4)),
             })
             .collect(),
@@ -490,7 +496,7 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
         id: MidValueId::from_index(index as u32),
         origin: ValueId::from_index(index as u32),
         storage_group: MidValueId::from_index(index as u32),
-        tile_offset: 0,
+        owners: crate::tensor::OwnerMap::default(),
         tensor_type: TensorType::new([128, 128], Precision::F16, layout),
     })
     .collect::<Vec<_>>();

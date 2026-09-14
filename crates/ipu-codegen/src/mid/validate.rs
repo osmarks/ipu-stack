@@ -21,7 +21,6 @@ impl MidProgram {
         for (index, value) in self.values.iter().enumerate() {
             if value.id.index() as usize != index
                 || value.storage_group.index() as usize >= self.values.len()
-                || value.tile_offset >= self.tile_count
             {
                 return Err(invalid(format!("invalid value binding {:?}", value.id)));
             }
@@ -30,6 +29,10 @@ impl MidProgram {
                 .format
                 .layout
                 .validate_tile_count(self.tile_count)?;
+            value.owners.validate(
+                value.tensor_type.format.layout.tiling.tile_count,
+                self.tile_count,
+            )?;
         }
         let mut defined = BTreeSet::new();
         self.validate_region(
@@ -296,6 +299,23 @@ mod tests {
             .unwrap();
         operation.push((usize::MAX, 0));
         assert!(matches!(alias.validate(), Err(ProgramError::Invalid(_))));
+    }
+
+    #[test]
+    fn invalid_owner_embeddings_fail_before_tile_expansion() {
+        let original = program(false);
+        let input = original.inputs[0].value;
+        for tiles in [vec![], vec![0, 0, 1, 2], vec![0, 1, 2, 4]] {
+            let mut bad = original.clone();
+            bad.values[input.index() as usize].owners = crate::tensor::OwnerMap::embedded(tiles);
+            assert!(matches!(
+                bad.validate(),
+                Err(ProgramError::Layout(
+                    crate::tensor::LayoutError::InvalidOwnerMap { .. }
+                ))
+            ));
+            assert!(crate::low::expand::expand_tiles(&bad, false).is_err());
+        }
     }
 
     #[test]

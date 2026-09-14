@@ -116,6 +116,7 @@ pub(super) fn fuse(
                 id,
                 tensor_type: stats_type,
                 storage_group: id,
+                owners: value.owners.clone(),
                 ..*value
             });
             id
@@ -190,6 +191,7 @@ pub(super) fn fuse(
                 id,
                 storage_group: id,
                 tensor_type,
+                owners: target.owners.clone(),
                 ..*target
             });
             *apply.inputs.last_mut().unwrap() = id;
@@ -355,7 +357,7 @@ mod tests {
             let id = MidValueId(index);
             program.values.push(MidValue {
                 id,
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type: tensor.clone(),
                 origin: ValueId::from_index(index),
                 storage_group: id,

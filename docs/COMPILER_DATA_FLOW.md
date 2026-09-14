@@ -97,10 +97,17 @@ The optional mapping search in
 one permutation over the entire active tile set. `map_tiles` changes every
 shard and local work item together. This preserves their existing ownership
 relationships; it cannot choose a different embedding for one operator's
-outputs while leaving unrelated values alone. Mid's `tile_offset` and ownership
-groups separately provide local rotations. The proposal records scoped owner-map
-choices and makes the existing global proposal a joint recipe change; it does
-not require searching independent maps immediately.
+outputs while leaving unrelated values alone. Mid values now carry an
+[OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs): a reusable embedding onto
+any subset of device tiles, applied after the selected owner-ordinal rotation.
+Explicit maps share their array through `Arc`; distribution stays in the tensor layout.
+Expansion and memory accounting resolve owners through this same map. Mid
+[ownership binding](../crates/ipu-codegen/src/mid/ownership.rs) inserts explicit
+copies when a local compute operand or allocation alias needs another result's
+owners; distributed Sum retains its own contributor traffic. Repeat and fragment
+binding preserve the maps. The existing search still proposes only its old
+global permutations. Moving those proposals into scoped Recipe choices remains
+unfinished; representation support does not imply that search already uses it.
 
 [screen::expand_and_screen](../crates/ipu-codegen/src/compile/screen.rs)
 expands each retained candidate and checks transfer geometry before scheduling.

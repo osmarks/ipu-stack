@@ -1,8 +1,8 @@
-//! Select ownership rotations before expanding the low schedule.
+//! Change value ownership and make the resulting operand movement explicit.
 
 use crate::mid::{
-    Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    independent_copy_prefix,
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
+    OperandIndexing, ProgramError, independent_copy_prefix,
 };
 use crate::tensor::{AmpOrder, ElementOrder};
 use std::collections::BTreeSet;
@@ -108,7 +108,7 @@ fn disjoint_sources(
             .map(|&id| owner_count(values, id))
             .sum::<u32>();
         if sources.len() > 1 && total <= u32::from(tile_count) {
-            let offset = values[sources[0].index() as usize].tile_offset;
+            let offset = values[sources[0].index() as usize].owners.rotation();
             changed |= rotate_owners(values, tile_count, sources, offset);
         }
         index += count.max(1);
@@ -202,7 +202,9 @@ fn overlap_reductions(
             sums.push(operations.remove(index));
         }
         sums.reverse();
-        let offset = values[sums[0].results[0].index() as usize].tile_offset;
+        let offset = values[sums[0].results[0].index() as usize]
+            .owners
+            .rotation();
         rotate_owners(
             values,
             tile_count,
@@ -241,12 +243,93 @@ fn rotate_owners(
             .iter_mut()
             .filter(|alias| alias.storage_group == group)
         {
-            changed |= alias.tile_offset != offset;
-            alias.tile_offset = offset;
+            let owners = alias.owners.with_rotation(offset);
+            changed |= alias.owners != owners;
+            alias.owners = owners;
         }
         offset = ((u32::from(offset) + owner_count(values, source)) % u32::from(tile_count)) as u16;
     }
     changed
+}
+
+/// Preserve each compute operand's declared result ownership with explicit
+/// copies after homes change. Aliased inputs include accumulation/donation
+/// bindings beyond the callable operands. Distributed sums select their own
+/// contributor traffic; ordinary copies already declare both endpoints.
+pub(crate) fn bind_compute_owners(
+    operations: &mut Vec<MidOperation>,
+    values: &mut Vec<MidValue>,
+) -> Result<(), ProgramError> {
+    let mut rewritten = Vec::with_capacity(operations.len());
+    for mut operation in std::mem::take(operations) {
+        match &mut operation.kind {
+            MidOperationKind::Repeat(repeat) => {
+                bind_compute_owners(&mut repeat.body.operations, values)?;
+            }
+            MidOperationKind::Compute(compute) => {
+                for (index, input) in operation.inputs.iter_mut().enumerate() {
+                    let result = match compute {
+                        Compute::Kernel { operands, .. } => {
+                            operands.get(index).map(|operand| match operand {
+                                OperandIndexing::Elementwise { result } => *result,
+                                OperandIndexing::Local(_) => 0,
+                            })
+                        }
+                        Compute::Product(product) => (index < product.operands.len()).then_some(0),
+                        Compute::Sum { .. } => None,
+                    };
+                    let mut result = result;
+                    for &(output, alias_input) in compute.output_aliases() {
+                        if alias_input != index {
+                            continue;
+                        }
+                        if result.is_some_and(|result| {
+                            values[operation.results[result].index() as usize].owners
+                                != values[operation.results[output].index() as usize].owners
+                        }) {
+                            return Err(ProgramError::Invalid(format!(
+                                "operation {:?} requires incompatible homes for input {index}",
+                                operation.source
+                            )));
+                        }
+                        result = Some(output);
+                    }
+                    let Some(result) = result else {
+                        continue;
+                    };
+                    let owners = values[operation.results[result].index() as usize]
+                        .owners
+                        .clone();
+                    if values[input.index() as usize].owners != owners {
+                        let mut value = values[input.index() as usize].clone();
+                        value.id = MidValueId::from_index(values.len() as u32);
+                        value.owners = owners.clone();
+                        value.storage_group = value.id;
+                        let id = value.id;
+                        values.push(value);
+                        rewritten.push(MidOperation {
+                            source: operation.source,
+                            inputs: vec![*input],
+                            results: vec![id],
+                            kind: MidOperationKind::Copy {
+                                policy: crate::CopyPolicy::Automatic,
+                                packing: crate::PackingPolicy::Automatic,
+                                mapping: CoordinateMapping::default(),
+                                reuse_local: true,
+                            },
+                            estimated_cycles: 0,
+                            estimated_exchange_cycles: 0,
+                        });
+                        *input = id;
+                    }
+                }
+            }
+            _ => {}
+        }
+        rewritten.push(operation);
+    }
+    *operations = rewritten;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -255,8 +338,70 @@ mod tests {
     use crate::estimate::MemoryPeaks;
     use crate::graph::{ComputeGraph, ValueId};
     use crate::kernel::TileKernelSpec;
-    use crate::mid::{CoordinateMapping, MidRegion, MidRepeat, ReductionStaging};
+    use crate::mid::{MidRegion, MidRepeat, ReductionStaging};
     use crate::tensor::{AxisFactorView, Layout, Precision, TensorType};
+
+    #[test]
+    fn moving_a_compute_relocates_its_separate_donation_buffer() {
+        use crate::GraphInputKind;
+        use crate::mid::MidInput;
+        use crate::tensor::OwnerMap;
+
+        let id = MidValueId::from_index;
+        let mut program = MidProgram {
+            tile_count: 8,
+            values: [5, 1, 5]
+                .into_iter()
+                .enumerate()
+                .map(|(index, tile)| MidValue {
+                    id: id(index as u32),
+                    origin: ValueId::from_index(index as u32),
+                    storage_group: id(index as u32),
+                    owners: OwnerMap::embedded(vec![tile]),
+                    tensor_type: TensorType::new([4, 16], Precision::F16, Layout::row_sharded(1)),
+                })
+                .collect(),
+            inputs: (0..2)
+                .map(|index| MidInput {
+                    name: format!("input{index}"),
+                    kind: GraphInputKind::Host,
+                    value: id(index),
+                })
+                .collect(),
+            outputs: vec![id(2)],
+            operations: vec![MidOperation {
+                source: None,
+                inputs: vec![id(0), id(1)],
+                results: vec![id(2)],
+                kind: MidOperationKind::Compute(Compute::Kernel {
+                    kernel: TileKernelSpec::Gelu,
+                    operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                    output_aliases: vec![(0, 1)],
+                }),
+                estimated_cycles: 0,
+                estimated_exchange_cycles: 0,
+            }],
+            ..MidProgram::default()
+        };
+        bind_compute_owners(&mut program.operations, &mut program.values).unwrap();
+        program.validate().unwrap();
+        let graph = crate::low::expand::expand_tiles(&program, false).unwrap();
+        let low = crate::low::lower_to_tiles(&graph, false);
+        let placement = crate::place(&low).unwrap();
+        let donation = program.operations.last().unwrap().inputs[1];
+        let donation = low.value_shards(donation)[0];
+        let output = low.value_shards(id(2))[0];
+        assert_eq!(
+            low.shards[low.value_shards(id(1))[0].index() as usize].tile,
+            1
+        );
+        assert_eq!(low.shards[donation.index() as usize].tile, 5);
+        assert_eq!(low.shards[output.index() as usize].tile, 5);
+        assert_eq!(
+            placement.shard_addresses[&donation],
+            placement.shard_addresses[&output]
+        );
+    }
 
     #[test]
     fn independent_copy_roots_rotate_without_moving_partials_or_shared_results() {
@@ -269,7 +414,7 @@ mod tests {
         for id in 0..6 {
             program.values.push(MidValue {
                 id: MidValueId::from_index(id),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type: TensorType::new([1, 16, 16], Precision::F16, layout.clone()),
                 origin: ValueId::from_index(id),
                 storage_group: MidValueId::from_index(id),
@@ -333,11 +478,16 @@ mod tests {
             rotated
                 .values
                 .iter()
-                .map(|v| v.tile_offset)
+                .map(|v| v.owners.rotation())
                 .collect::<Vec<_>>(),
             [0, 4, 0, 0, 0, 0]
         );
-        assert!(program.values.iter().all(|v| v.tile_offset == 0));
+        assert!(
+            program
+                .values
+                .iter()
+                .all(|v| v.owners == crate::tensor::OwnerMap::default())
+        );
         let mut delayed = program.clone();
         delayed.operations.insert(1, copy(4, 5));
         let overlapped = delayed.with_overlapped_reductions(2).unwrap();
@@ -353,7 +503,7 @@ mod tests {
             overlapped.operations[2].results,
             [MidValueId::from_index(1)]
         );
-        assert_eq!(overlapped.values[1].tile_offset, 4);
+        assert_eq!(overlapped.values[1].owners.rotation(), 4);
         // The same transformations must work in the repeated encoder, while
         // treating its yields as externally live values.
         let wrap = |mut body: MidProgram, yields: Vec<MidValueId>| {

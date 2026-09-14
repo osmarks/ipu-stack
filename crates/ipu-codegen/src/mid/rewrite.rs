@@ -112,7 +112,7 @@ pub(super) fn apply_edits(
 }
 
 pub(super) fn same_storage(a: &MidValue, b: &MidValue) -> bool {
-    a.tile_offset == b.tile_offset
+    a.owners == b.owners
         && a.tensor_type.format.precision == b.tensor_type.format.precision
         && a.tensor_type.format.layout.order == b.tensor_type.format.layout.order
         && a.tensor_type.format.layout.memory_class == b.tensor_type.format.layout.memory_class

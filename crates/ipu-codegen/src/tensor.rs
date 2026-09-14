@@ -3,6 +3,8 @@
 //! this module describes geometry without choosing an algorithm or assigning addresses.
 
 mod layout;
+mod owners;
+pub use owners::OwnerMap;
 mod resolved;
 pub use layout::*;
 mod view;

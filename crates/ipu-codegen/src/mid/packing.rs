@@ -118,6 +118,7 @@ fn distribute_region(
                         id,
                         tensor_type,
                         storage_group: id,
+                        owners: target.owners.clone(),
                         ..target
                     });
                 }
@@ -214,7 +215,7 @@ mod tests {
                         tensor_type,
                         origin: ValueId::from_index(index as u32),
                         storage_group: id,
-                        tile_offset: 0,
+                        owners: crate::tensor::OwnerMap::default(),
                     }
                 })
                 .collect();

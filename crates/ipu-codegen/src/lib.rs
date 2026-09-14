@@ -65,8 +65,8 @@ pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
 pub(crate) use tensor::*;
 pub use tensor::{
-    AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, GridOrder, Layout, MemoryClass, Precision,
-    ShardExtent, TensorFormat, TensorType,
+    AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, GridOrder, Layout, MemoryClass, OwnerMap,
+    Precision, ShardExtent, TensorFormat, TensorType,
 };
 pub(crate) use tile::*;
 

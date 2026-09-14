@@ -27,8 +27,8 @@ impl Precision {
 /// Linearization of a GEMM's logical tile grid.
 ///
 /// The order is part of the operand and output layouts because it determines
-/// which tensor coordinates occupy adjacent logical (and therefore paired
-/// physical) tiles.
+/// which tensor coordinates occupy adjacent logical owners. The owner embedding
+/// independently determines whether those owners occupy paired physical tiles.
 #[derive(
     Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
@@ -795,6 +795,8 @@ impl Layout {
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LayoutError {
+    #[error("invalid owner embedding for {owners} logical owners on {tiles} device tiles")]
+    InvalidOwnerMap { owners: u16, tiles: u16 },
     #[error("layout requires {declared} tiles but the graph has {available}")]
     TileCapacity { declared: u16, available: u16 },
     #[error("layout has an empty tile group")]

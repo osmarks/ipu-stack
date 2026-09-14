@@ -11,7 +11,7 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
                 id: id(i),
                 origin: ValueId::from_index(i),
                 storage_group: id(i),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 tensor_type: TensorType::new(
                     if parameter {
                         vec![u32::from(partials), 8, 16]

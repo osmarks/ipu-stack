@@ -144,7 +144,7 @@ impl FragmentBuilder {
         let id = MidValueId::from_index(self.program.values.len() as u32);
         self.program.values.push(MidValue {
             id,
-            tile_offset: 0,
+            owners: crate::tensor::OwnerMap::default(),
             tensor_type,
             origin: ValueId::from_index(0),
             storage_group: id,

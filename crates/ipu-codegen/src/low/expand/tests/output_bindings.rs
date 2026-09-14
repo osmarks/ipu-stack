@@ -19,7 +19,7 @@ fn copied_columns(columns: u32) -> MidProgram {
                 ),
                 origin: ValueId::from_index(index as u32),
                 storage_group: id,
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
             }
         })
         .collect();
@@ -316,7 +316,7 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 MidValue {
                     id,
                     tensor_type,
-                    tile_offset: 0,
+                    owners: crate::tensor::OwnerMap::default(),
                     origin: ValueId::from_index(index as u32),
                     storage_group: id,
                 }

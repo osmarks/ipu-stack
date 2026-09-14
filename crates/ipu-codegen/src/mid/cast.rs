@@ -72,7 +72,7 @@ fn donate(
         let target = &values[output.index() as usize];
         tracing::debug!(?input, ?output, input_layout = ?source.tensor_type.format.layout,
             output_layout = ?target.tensor_type.format.layout, "considering cast storage donation");
-        if source.tile_offset != target.tile_offset
+        if source.owners != target.owners
             || source.tensor_type.shape != target.tensor_type.shape
             || source.tensor_type.format.layout != target.tensor_type.format.layout
             || values
@@ -157,7 +157,7 @@ mod tests {
         let values = (0..3)
             .map(|index| MidValue {
                 id: MidValueId(index),
-                tile_offset: 0,
+                owners: crate::tensor::OwnerMap::default(),
                 origin: ValueId::from_index(0),
                 storage_group: MidValueId(index),
                 tensor_type: TensorType::new(
