@@ -142,15 +142,13 @@ pub(crate) fn select(
         && config.operator_candidates == default_operator_candidates(config.tile_count))
     .then(|| {
         let mut expanded = config.clone();
-        for tiles in
+        let existing_counts = candidate_active_tile_counts(config.tile_count);
+        expanded.operator_candidates.extend(
             shape_aware_active_tile_counts(config.tile_count, graph.value_shapes().values())
-        {
-            for candidate in operator_candidates_for_tile_count(tiles) {
-                if !expanded.operator_candidates.contains(&candidate) {
-                    expanded.operator_candidates.push(candidate);
-                }
-            }
-        }
+                .into_iter()
+                .filter(|tiles| !existing_counts.contains(tiles))
+                .flat_map(operator_candidates_for_tile_count),
+        );
         expanded
     });
     let config = expanded_config.as_ref().unwrap_or(config);

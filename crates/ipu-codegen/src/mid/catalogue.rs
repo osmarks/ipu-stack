@@ -124,17 +124,12 @@ impl ConcreteOperatorCandidate {
 }
 
 pub(super) fn default_operator_candidates(tile_count: u16) -> Vec<OperatorCandidate> {
-    let mut candidates = Vec::new();
-    for active_tiles in candidate_active_tile_counts(tile_count) {
-        candidates.extend(operator_candidates_for_tile_count(active_tiles));
-    }
-    let mut unique = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        if !unique.contains(&candidate) {
-            unique.push(candidate);
-        }
-    }
-    unique
+    // Each group is unique, and candidates from different groups retain
+    // different tile counts in their layouts or family parameters.
+    candidate_active_tile_counts(tile_count)
+        .into_iter()
+        .flat_map(operator_candidates_for_tile_count)
+        .collect()
 }
 
 pub(super) fn candidate_active_tile_counts(capacity: u16) -> Vec<u16> {
@@ -257,22 +252,21 @@ pub(super) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                     {
                         continue;
                     }
-                    let candidate = amp_grid_gemm_operator_candidate(
+                    let mut candidate = amp_grid_gemm_operator_candidate(
                         precision,
                         64,
                         output_columns,
                         grid_shape,
                         weights,
                     );
-                    grid.push(candidate.clone());
                     if precision == Precision::F16
                         && weights.memory_class == MemoryClass::Ipu21Standard
                     {
-                        let mut staged = candidate;
-                        staged.plan.requirements.inputs[1].local_staging =
+                        grid.push(candidate.clone());
+                        candidate.plan.requirements.inputs[1].local_staging =
                             LocalOperandStaging::MatchRemote;
-                        grid.push(staged);
                     }
+                    grid.push(candidate);
                 }
             }
             grid

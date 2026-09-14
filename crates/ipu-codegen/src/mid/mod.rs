@@ -269,15 +269,12 @@ impl PipelineConfig {
     /// This is useful when evaluating a fixed occupancy rather than allowing
     /// the planner to trade occupancy against communication and memory use.
     pub fn with_active_tile_counts(mut self, counts: impl IntoIterator<Item = u16>) -> Self {
-        let mut candidates = Vec::new();
-        for count in counts {
-            if count == 0 || count > self.tile_count {
-                continue;
-            }
-            candidates.extend(operator_candidates_for_tile_count(count));
-        }
-        candidates.dedup();
-        self.operator_candidates = candidates;
+        let mut seen = BTreeSet::new();
+        self.operator_candidates = counts
+            .into_iter()
+            .filter(|&count| count > 0 && count <= self.tile_count && seen.insert(count))
+            .flat_map(operator_candidates_for_tile_count)
+            .collect();
         self.shape_aware_active_tile_counts = false;
         self
     }

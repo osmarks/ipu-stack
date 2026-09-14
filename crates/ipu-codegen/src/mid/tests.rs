@@ -348,6 +348,27 @@ fn random_format(random: &mut fastrand::Rng, tiles: u16) -> TensorFormat {
 }
 
 #[test]
+fn default_catalogue_candidates_are_unique_across_tile_counts() {
+    for capacity in [0, 1, 2, 3, 8, 64, 729, 1458, 1472] {
+        let candidates = default_operator_candidates(capacity);
+        for (index, candidate) in candidates.iter().enumerate() {
+            assert!(
+                !candidates[..index].contains(candidate),
+                "duplicate candidate at capacity {capacity}: {candidate:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_active_tile_counts_ignore_duplicates_and_invalid_counts() {
+    let expected = PipelineConfig::new(8).with_active_tile_counts([4, 8, 1]);
+    let actual = PipelineConfig::new(8).with_active_tile_counts([0, 4, 4, 9, 8, 4, 1, 8]);
+    assert_eq!(actual.operator_candidates, expected.operator_candidates);
+    assert!(!actual.shape_aware_active_tile_counts);
+}
+
+#[test]
 fn randomized_active_tile_candidates_bound_idle_capacity() {
     let mut random = fastrand::Rng::with_seed(0x7469_6c65);
     for _ in 0..RANDOM_CASES {
