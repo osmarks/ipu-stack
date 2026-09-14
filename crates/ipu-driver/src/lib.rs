@@ -1217,26 +1217,31 @@ pub struct Loader<'a> {
     bootloader: Vec<u8>,
 }
 
-struct BufferAttachment<'a> {
+struct BufferAttachments<'a> {
     device: &'a Device,
-    index: u32,
+    indices: Vec<u32>,
 }
 
-impl<'a> BufferAttachment<'a> {
-    fn new(
-        device: &'a Device,
-        index: u32,
-        address: *mut u8,
-        size: usize,
-    ) -> Result<Self, DriverError> {
-        device.attach_buffer(index, address, size)?;
-        Ok(Self { device, index })
+impl<'a> BufferAttachments<'a> {
+    fn new(device: &'a Device) -> Self {
+        Self {
+            device,
+            indices: Vec::new(),
+        }
+    }
+
+    fn attach(&mut self, index: u32, address: *mut u8, size: usize) -> Result<(), DriverError> {
+        self.device.attach_buffer(index, address, size)?;
+        self.indices.push(index);
+        Ok(())
     }
 }
 
-impl Drop for BufferAttachment<'_> {
+impl Drop for BufferAttachments<'_> {
     fn drop(&mut self) {
-        self.device.detach_buffer(self.index);
+        for index in self.indices.drain(..).rev() {
+            self.device.detach_buffer(index);
+        }
     }
 }
 
@@ -1282,7 +1287,8 @@ impl<'a> Loader<'a> {
         self.device
             .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
         let mut transport = HostBuffer::new(TRANSPORT_SIZE)?;
-        let _attachment = BufferAttachment::new(self.device, 0, transport.data, transport.size)?;
+        let mut attachments = BufferAttachments::new(self.device);
+        attachments.attach(0, transport.data, transport.size)?;
         let guard = ExchangeBufferGuard::new(self.device)?;
         guard.restore_primary()?;
 
@@ -1366,9 +1372,10 @@ impl<'a> Loader<'a> {
 pub struct HostSession<'a> {
     device: &'a Device,
     protocol: HostExchange,
+    // Declared before storage so attachments are dropped before memory is unmapped.
+    attached_pages: BufferAttachments<'a>,
     storage: HostBuffer,
     pages: HashMap<u32, HostPageRange>,
-    attached_pages: Vec<u32>,
     poll_interval: Duration,
     write_jitter: Option<HostWriteJitter>,
     streamed_output: Option<(Vec<u8>, usize)>,
@@ -1417,7 +1424,7 @@ impl<'a> HostSession<'a> {
             // uses the common rendezvous implementation.
             storage: HostBuffer::new(storage_size.max(1))?,
             pages,
-            attached_pages: Vec::new(),
+            attached_pages: BufferAttachments::new(device),
             poll_interval: Duration::from_micros(100),
             write_jitter: None,
             streamed_output: None,
@@ -1456,7 +1463,9 @@ impl<'a> HostSession<'a> {
             pages = self.protocol.attach_order.len(),
             "attaching host exchange pages"
         );
+        self.attached_pages = BufferAttachments::new(self.device);
         self.device.detach_all_buffers()?;
+        let mut attachments = BufferAttachments::new(self.device);
         for index in &self.protocol.attach_order {
             let page = self
                 .pages
@@ -1465,14 +1474,9 @@ impl<'a> HostSession<'a> {
             self.device
                 .write_config(pci::EXCHANGE_WINDOW_BASE, pci::EXCHANGE_WINDOW_HEXOPT)?;
             let address = unsafe { self.storage.data.add(page.offset) };
-            if let Err(error) = self.device.attach_buffer(*index, address, page.size) {
-                for attached in self.attached_pages.drain(..).rev() {
-                    self.device.detach_buffer(attached);
-                }
-                return Err(error);
-            }
-            self.attached_pages.push(*index);
+            attachments.attach(*index, address, page.size)?;
         }
+        self.attached_pages = attachments;
         Ok(())
     }
 
@@ -1496,7 +1500,7 @@ impl<'a> HostSession<'a> {
     }
 
     pub fn invoke(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, DriverError> {
-        if self.attached_pages.len() != self.protocol.attach_order.len() {
+        if self.attached_pages.indices.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
         if self
@@ -1516,7 +1520,7 @@ impl<'a> HostSession<'a> {
     /// Drive the prepared protocol, leaving the final output transfer deferred.
     /// Call [`Self::finish`] before reading the result.
     pub fn invoke_deferred(&mut self, name: &str, input: &[u8]) -> Result<HostCall, DriverError> {
-        if self.attached_pages.len() != self.protocol.attach_order.len() {
+        if self.attached_pages.indices.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
         let call = self.prepare(name, input)?;
@@ -1542,7 +1546,7 @@ impl<'a> HostSession<'a> {
         input: &[u8],
         mut poll: impl FnMut(&Device) -> Result<(), DriverError>,
     ) -> Result<HostCall, DriverError> {
-        if self.attached_pages.len() != self.protocol.attach_order.len() {
+        if self.attached_pages.indices.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
         let call = self.resolve_call(name)?;
@@ -1639,7 +1643,7 @@ impl<'a> HostSession<'a> {
     }
 
     pub fn invoke_prepared(&mut self, name: &str) -> Result<Vec<u8>, DriverError> {
-        if self.attached_pages.len() != self.protocol.attach_order.len() {
+        if self.attached_pages.indices.len() != self.protocol.attach_order.len() {
             return Err(DriverError::Invalid("host session not attached".into()));
         }
         let call = self.resolve_call(name)?;
@@ -1722,14 +1726,6 @@ fn host_batch_ranges(ends: &[u32]) -> Vec<std::ops::Range<usize>> {
             range
         })
         .collect()
-}
-
-impl Drop for HostSession<'_> {
-    fn drop(&mut self) {
-        for index in self.attached_pages.drain(..).rev() {
-            self.device.detach_buffer(index);
-        }
-    }
 }
 
 fn poison_output(
