@@ -200,6 +200,27 @@ pub struct ExchangeStep {
     pub profile: StepProfile,
 }
 
+impl ExchangeStep {
+    /// Ordinary timed exchange; specialized receive controls and patches are opt-in.
+    pub fn new(active: bool, incoming_base: u32, program: PlacedExchangeRow) -> Self {
+        Self {
+            active,
+            incoming_base,
+            program,
+            outgoing_base: None,
+            preserve_base_registers: false,
+            incoming_mux: None,
+            incoming_format: 0,
+            incoming_mux_pair: None,
+            incoming_dcount: None,
+            sync_in_program: false,
+            setup_patch: None,
+            repeat_patches: Vec::new(),
+            profile: StepProfile::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExchangeSetupPatch {
     /// Byte offsets into the shared executable row, reused by its structural shape.

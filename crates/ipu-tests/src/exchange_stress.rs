@@ -176,22 +176,15 @@ pub(crate) fn build_wide(
         programs[usize::from(tile)]
             .steps
             .push(TileStep::Exchange(ExchangeStep {
-                active: true,
-                incoming_base: 0,
-                outgoing_base: None,
-                preserve_base_registers: false,
-                incoming_mux: None,
-                incoming_format: 0,
-                incoming_mux_pair: None,
-                incoming_dcount: None,
                 sync_in_program: true,
-                program: PlacedExchangeRow {
-                    address: row_address,
-                    words: setup_row.clone(),
-                },
-                setup_patch: None,
-                repeat_patches: Vec::new(),
-                profile: StepProfile::default(),
+                ..ExchangeStep::new(
+                    true,
+                    0,
+                    PlacedExchangeRow {
+                        address: row_address,
+                        words: setup_row.clone(),
+                    },
+                )
             }));
     }
     row_address = (setup_end + 7) & !7;
@@ -324,11 +317,7 @@ pub(crate) fn build_wide(
             programs[usize::from(tile)]
                 .steps
                 .push(TileStep::Exchange(ExchangeStep {
-                    active,
-                    incoming_base: 0,
-                    outgoing_base: None,
                     preserve_base_registers: true,
-                    incoming_mux: None,
                     incoming_format: if receiving && explicit_config {
                         if topology.paired_receiver_is_early(tile, source)? {
                             1
@@ -340,15 +329,15 @@ pub(crate) fn build_wide(
                     },
                     incoming_mux_pair: (receiving && explicit_config)
                         .then_some(topology.paired_source_mux(source)?),
-                    incoming_dcount: None,
                     sync_in_program: active,
-                    program: PlacedExchangeRow {
-                        address: row_address,
-                        words: row,
-                    },
-                    setup_patch: None,
-                    repeat_patches: Vec::new(),
-                    profile: StepProfile::default(),
+                    ..ExchangeStep::new(
+                        active,
+                        0,
+                        PlacedExchangeRow {
+                            address: row_address,
+                            words: row,
+                        },
+                    )
                 }));
         }
         if initialized.insert((source, source_address)) {
@@ -759,24 +748,14 @@ pub(crate) fn build(
             let active = rows[usize::from(tile)].is_some();
             programs[usize::from(tile)]
                 .steps
-                .push(TileStep::Exchange(ExchangeStep {
+                .push(TileStep::Exchange(ExchangeStep::new(
                     active,
-                    incoming_base: 0,
-                    outgoing_base: None,
-                    preserve_base_registers: false,
-                    incoming_mux: None,
-                    incoming_format: 0,
-                    incoming_mux_pair: None,
-                    incoming_dcount: None,
-                    sync_in_program: false,
-                    program: PlacedExchangeRow {
+                    0,
+                    PlacedExchangeRow {
                         address,
                         words: row,
                     },
-                    setup_patch: None,
-                    repeat_patches: Vec::new(),
-                    profile: StepProfile::default(),
-                }));
+                )));
             for &(actual, expected, words) in validators.get(&tile).into_iter().flatten() {
                 programs[usize::from(tile)]
                     .steps
@@ -914,28 +893,18 @@ fn build_physical_phase_replay(
             Ok(TileProgram {
                 tile,
                 steps: vec![
-                    TileStep::Exchange(ExchangeStep {
-                        active: scheduled && phase.active[usize::from(tile)],
-                        incoming_base: if scheduled {
+                    TileStep::Exchange(ExchangeStep::new(
+                        scheduled && phase.active[usize::from(tile)],
+                        if scheduled {
                             phase.incoming_bases[usize::from(tile)]
                         } else {
                             0
                         },
-                        outgoing_base: None,
-                        preserve_base_registers: false,
-                        incoming_mux: None,
-                        incoming_format: 0,
-                        incoming_mux_pair: None,
-                        incoming_dcount: None,
-                        sync_in_program: false,
-                        program: PlacedExchangeRow {
+                        PlacedExchangeRow {
                             address: row_address,
                             words,
                         },
-                        setup_patch: None,
-                        repeat_patches: Vec::new(),
-                        profile: StepProfile::default(),
-                    }),
+                    )),
                     // A patched breakpoint immediately following the final
                     // internal-exchange dispatch is not durable on IPU21.
                     // Cross one ordinary worker-call boundary before trapping;

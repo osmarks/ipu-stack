@@ -227,25 +227,18 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             row_address = row_address.max(grouped_address + row.len() as u32 * 4);
             grouped_rows.push((tile, row.clone()));
             let mut body = vec![TileStep::Exchange(ExchangeStep {
-                active: true,
-                incoming_base: 0,
                 outgoing_base: (tile == 0).then_some(TileAddress::RepeatPointer {
                     index: 0,
                     offset: 0,
                 }),
-                preserve_base_registers: false,
-                incoming_mux: None,
-                incoming_format: 0,
-                incoming_mux_pair: None,
-                incoming_dcount: None,
-                sync_in_program: false,
-                program: PlacedExchangeRow {
-                    address: grouped_address,
-                    words: row,
-                },
-                setup_patch: None,
-                repeat_patches: vec![],
-                profile: StepProfile::default(),
+                ..ExchangeStep::new(
+                    true,
+                    0,
+                    PlacedExchangeRow {
+                        address: grouped_address,
+                        words: row,
+                    },
+                )
             })];
             if destinations.contains(&tile) {
                 for section in 0..3u32 {
@@ -291,27 +284,20 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         for tile in 0..tiles {
             for (relative, (address, phase)) in [true, false].into_iter().zip(&exchanges) {
                 let mut body = vec![TileStep::Exchange(ExchangeStep {
-                    active: phase.programs[usize::from(tile)].is_some(),
-                    incoming_base: 0,
                     outgoing_base: (relative && tile == 0).then_some(TileAddress::RepeatPointer {
                         index: 0,
                         offset: 0,
                     }),
-                    preserve_base_registers: false,
-                    incoming_mux: None,
-                    incoming_format: 0,
-                    incoming_mux_pair: None,
-                    incoming_dcount: None,
-                    sync_in_program: false,
-                    program: PlacedExchangeRow {
-                        address: *address,
-                        words: phase.programs[usize::from(tile)]
-                            .clone()
-                            .unwrap_or_else(inactive_exchange_program),
-                    },
-                    setup_patch: None,
-                    repeat_patches: vec![],
-                    profile: StepProfile::default(),
+                    ..ExchangeStep::new(
+                        phase.programs[usize::from(tile)].is_some(),
+                        0,
+                        PlacedExchangeRow {
+                            address: *address,
+                            words: phase.programs[usize::from(tile)]
+                                .clone()
+                                .unwrap_or_else(inactive_exchange_program),
+                        },
+                    )
                 })];
                 if destinations.contains(&tile) {
                     body.push(TileStep::Compute(ComputeStep {

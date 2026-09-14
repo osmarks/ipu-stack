@@ -52,22 +52,15 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
         programs.push(TileProgram {
             tile,
             steps: vec![TileStep::Exchange(ExchangeStep {
-                active: true,
-                incoming_base: 0,
-                outgoing_base: None,
-                preserve_base_registers: false,
-                incoming_mux: None,
-                incoming_format: 0,
-                incoming_mux_pair: None,
-                incoming_dcount: None,
                 sync_in_program: true,
-                program: PlacedExchangeRow {
-                    address: ROW_BASE,
-                    words: row,
-                },
-                setup_patch: None,
-                repeat_patches: Vec::new(),
-                profile: StepProfile::default(),
+                ..ExchangeStep::new(
+                    true,
+                    0,
+                    PlacedExchangeRow {
+                        address: ROW_BASE,
+                        words: row,
+                    },
+                )
             })],
         });
         if tile < 3 {

@@ -198,8 +198,6 @@ fn lower_work(
                     .get(&id)
                     .ok_or(TileLoweringError::UnknownExchange)?;
                 TileStep::Exchange(ExchangeStep {
-                    active: placed.active,
-                    incoming_base: placed.incoming_base,
                     outgoing_base: phase
                         .outgoing_bases
                         .get(usize::from(tile.tile))
@@ -218,20 +216,13 @@ fn lower_work(
                             Ok(crate::kernel::add_address_offset(base, offset)?)
                         })
                         .transpose()?,
-                    preserve_base_registers: false,
-                    incoming_mux: None,
-                    incoming_format: 0,
-                    incoming_mux_pair: None,
-                    incoming_dcount: None,
-                    sync_in_program: false,
-                    program: placed.program.clone(),
                     setup_patch: placed.setup_patch.clone(),
                     repeat_patches: if inside_repeat {
                         placed.repeat_patches.clone()
                     } else {
                         Default::default()
                     },
-                    profile: StepProfile::default(),
+                    ..ExchangeStep::new(placed.active, placed.incoming_base, placed.program.clone())
                 })
             }
             TileWorkRef::LocalCopy(copy) => {
@@ -430,19 +421,12 @@ fn lower_inactive_work(
     for work in program.work(work) {
         match work {
             TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
-                active: exchange_rows[&id].active,
-                incoming_base: exchange_rows[&id].incoming_base,
-                outgoing_base: None,
-                preserve_base_registers: false,
-                incoming_mux: None,
-                incoming_format: 0,
-                incoming_mux_pair: None,
-                incoming_dcount: None,
-                sync_in_program: false,
-                program: exchange_rows[&id].program.clone(),
                 setup_patch: exchange_rows[&id].setup_patch.clone(),
-                repeat_patches: Vec::new(),
-                profile: StepProfile::default(),
+                ..ExchangeStep::new(
+                    exchange_rows[&id].active,
+                    exchange_rows[&id].incoming_base,
+                    exchange_rows[&id].program.clone(),
+                )
             })),
             TileWorkRef::Repeat(repeat) => steps.push(TileStep::Repeat(RepeatStep {
                 count: repeat.count,
