@@ -86,8 +86,7 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
             &placement,
             &ipu_target::ipu21::fabric::Topology::c600(),
         )
-        .unwrap()
-        .phases;
+        .unwrap();
         let lowering =
             TileProgramLowering::new(&low, &placement, &phases, &kernels, 0x100, partials, false)
                 .unwrap();
@@ -195,8 +194,7 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
                 &placement,
                 &ipu_target::ipu21::fabric::Topology::c600(),
             )
-            .unwrap()
-            .phases;
+            .unwrap();
             let lowering =
                 TileProgramLowering::new(&low, &placement, &phases, &kernels, 0x100, 2, false)
                     .unwrap();

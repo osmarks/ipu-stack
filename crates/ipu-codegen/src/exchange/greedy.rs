@@ -3,8 +3,8 @@
 //! live endpoint availability and reports each transfer's actual completion.
 //! Row encoding and SRAM legality remain in MaterializedSchedule::append.
 use super::{
-    ExchangeLoweringError, ExchangeSchedulingPriority, MaterializedSchedule, PendingTransfer,
-    SchedulingProblem, TileAvailability, TilePredecessor, schedule_encoding_is_valid,
+    ExchangeLoweringError, MaterializedSchedule, PendingTransfer, SchedulingProblem,
+    TileAvailability, TilePredecessor, schedule_encoding_is_valid,
 };
 use ipu_target::ipu21::fabric::Topology;
 use std::cmp::Reverse;
@@ -575,4 +575,19 @@ mod tests {
             }
         }
     }
+}
+
+/// Endpoint-pressure policy for dependency-ready list scheduling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ExchangeSchedulingPriority {
+    #[default]
+    Automatic,
+    Combined,
+    Directional,
+    RemainingCombined,
+    RemainingDirectional,
+    #[cfg(test)]
+    Streams(u32),
+    #[cfg(test)]
+    BalancedStreams(u32),
 }

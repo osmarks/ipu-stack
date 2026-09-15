@@ -92,8 +92,7 @@ mod tests {
     use crate::exchange::patch_sender_instruction;
     use crate::exchange::{
         ExchangeActivityKind, ExchangeItemWidth, SchedulingProblem,
-        materialize_valid_schedule_order, receive_configuration, schedule_problem,
-        validate_exchange_schedule,
+        materialize_valid_schedule_order, receive_configuration, validate_exchange_schedule,
     };
 
     use crate::low::ExchangePhaseId;
@@ -147,7 +146,7 @@ mod tests {
             let mut physical = schedule
                 .into_phase(ExchangePhaseId::from_index(0), bases)
                 .unwrap();
-            validate_exchange_schedule(4, &schedule_problem(0, &pending), &physical).unwrap();
+            validate_exchange_schedule(4, &pending.clone(), &physical).unwrap();
             // Crossing source sequences have no common nonnegative base.
             // Keep their word patches and never read an uninitialized m6.
             let mut fallback = physical.clone();

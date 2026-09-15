@@ -257,13 +257,11 @@ mod tests {
             tile_count: 4,
             multiplicities: vec![1],
         };
-        let scheduled = schedule_exchange_problem(
-            4,
-            &schedule_problem(0, &[transfer(0, &[2], 100), transfer(1, &[3], 100)]),
-        )
-        .unwrap();
+        let scheduled =
+            schedule_exchange_problem(4, &[transfer(0, &[2], 100), transfer(1, &[3], 100)])
+                .unwrap();
         let send = |tile: usize| {
-            scheduled.phase.activities[tile]
+            scheduled.activities[tile]
                 .iter()
                 .find(|activity| activity.kind == ExchangeActivityKind::Send)
                 .unwrap()

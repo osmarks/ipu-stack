@@ -90,17 +90,6 @@ struct Arguments {
     /// physical exchange phase and verify sampled words after execution.
     #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
     exchange_replay_phase: Option<usize>,
-    /// Replay a phase from an exported address-resolved schedule without
-    /// recompiling the model.
-    #[arg(
-        long,
-        requires = "exchange_replay_phase",
-        conflicts_with = "export_exchange_schedule"
-    )]
-    replay_exchange_schedule: Option<PathBuf>,
-    /// Balance compact stream chunks when replaying an exported schedule.
-    #[arg(long, requires_all = ["replay_exchange_schedule", "exchange_stream_words"])]
-    exchange_replay_balance_streams: bool,
     /// Maximum number of systematically distributed words read back by an
     /// exact exchange-phase replay.
     #[arg(long, default_value_t = 8192)]
@@ -120,9 +109,6 @@ struct Arguments {
     /// Write memory estimates and an exact per-tile placement map as JSON/HTML.
     #[arg(long, conflicts_with = "reuse_package")]
     memory_profile_directory: Option<PathBuf>,
-    /// Write the address-resolved exchange input, then exit unless a phase replay is requested.
-    #[arg(long, conflicts_with_all = ["reuse_package", "diagnostic_run"])]
-    export_exchange_schedule: Option<PathBuf>,
     /// Include complete decoded rows for one physical tile in the inspection.
     #[arg(long, requires = "inspect_exchanges")]
     inspect_exchange_tile: Option<u32>,
@@ -681,39 +667,7 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
-    if let Some(path) = &arguments.replay_exchange_schedule {
-        let phase = arguments
-            .exchange_replay_phase
-            .expect("clap requires a replay phase");
-        let input = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        let snapshot: ipu_codegen::ExchangeScheduleSnapshot =
-            serde_json::from_reader(std::io::BufReader::new(input))
-                .with_context(|| format!("read {}", path.display()))?;
-        if snapshot.schema_version != ipu_codegen::EXCHANGE_SCHEDULE_SNAPSHOT_VERSION {
-            bail!(
-                "exchange schedule schema {} does not match supported schema {}",
-                snapshot.schema_version,
-                ipu_codegen::EXCHANGE_SCHEDULE_SNAPSHOT_VERSION
-            );
-        }
-        let replay = exchange_stress::build_schedule_phase_replay(
-            &snapshot,
-            phase,
-            arguments.exchange_replay_first_transfer,
-            arguments.exchange_replay_transfer_limit,
-            match arguments.exchange_stream_words {
-                Some(words) if arguments.exchange_replay_balance_streams => {
-                    ipu_codegen::ExchangeSchedulingPriority::BalancedStreams(words.get())
-                }
-                Some(words) => ipu_codegen::ExchangeSchedulingPriority::Streams(words.get()),
-                None => ipu_codegen::ExchangeSchedulingPriority::Automatic,
-            },
-            &Toolchain::from_sdk(&arguments.sdk),
-            &runtime_source,
-        )?;
-        execute_exchange_replay(&arguments, &replay, &bootloader)?;
-        return Ok(());
-    }
+
     let mut graph = ComputeGraph::default();
     let mut pipeline = PipelineConfig::new(active_tiles);
     if let Some(width) = arguments.operator_candidate_limit {
@@ -1105,31 +1059,7 @@ fn main() -> Result<()> {
         }
         None
     };
-    if let Some(path) = &arguments.export_exchange_schedule {
-        let compiled = compiled_package
-            .as_ref()
-            .context("--export-exchange-schedule requires a newly compiled package")?;
-        let output =
-            fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
-        serde_json::to_writer(std::io::BufWriter::new(output), &compiled.exchange_schedule)
-            .with_context(|| format!("write {}", path.display()))?;
-        let transfers = compiled
-            .exchange_schedule
-            .phases
-            .iter()
-            .map(|phase| phase.transfers.len())
-            .sum::<usize>();
-        println!(
-            "exchangeSchedule={} tiles={} phases={} transfers={}",
-            path.display(),
-            compiled.exchange_schedule.tile_count,
-            compiled.exchange_schedule.phases.len(),
-            transfers
-        );
-        if arguments.exchange_replay_phase.is_none() {
-            return Ok(());
-        }
-    }
+
     if let Some(phase) = arguments.exchange_replay_phase {
         let compiled = compiled_package
             .as_ref()

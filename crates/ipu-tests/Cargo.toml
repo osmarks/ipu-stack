@@ -9,10 +9,6 @@ name = "ipu-trivial-test"
 path = "src/main.rs"
 
 [[bin]]
-name = "ipu-exchange-schedule-bench"
-path = "src/bin/exchange_schedule_bench.rs"
-
-[[bin]]
 name = "ipu-exchange-live-state"
 path = "src/bin/exchange_live_state.rs"
 

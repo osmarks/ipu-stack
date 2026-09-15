@@ -1932,10 +1932,12 @@ mod tests {
                                         let definition = &low.shards[shard.index() as usize];
                                         let address = placement.shard_addresses[&shard];
                                         let bytes = shard_storage_bytes(definition).unwrap();
-                                        ranges.push(crate::exchange::effective_memory_elements(
-                                            address,
-                                            bytes.div_ceil(4),
-                                        ));
+                                        ranges.push(
+                                            ipu_target::ipu21::memory::effective_memory_elements(
+                                                address,
+                                                bytes.div_ceil(4),
+                                            ),
+                                        );
                                     }
                                 }
                                 for (index, left) in ranges.iter().enumerate() {

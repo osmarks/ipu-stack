@@ -760,9 +760,7 @@ mod tests {
             );
             let placement = place(&low).unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
-            let exchanges = lower_exchanges(&low, &placement, &Topology::c600())
-                .unwrap()
-                .phases;
+            let exchanges = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
             let filler_tiles = random.u16(1..=4);
             let lowering = TileProgramLowering::new(
                 &low,

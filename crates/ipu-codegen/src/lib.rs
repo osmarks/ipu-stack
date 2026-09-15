@@ -31,7 +31,7 @@ pub struct PackageConfig {
 struct EvaluatedCandidate {
     program: LowProgram,
     placement: crate::Placement,
-    exchanges: crate::exchange::LoweredExchanges,
+    exchanges: Vec<crate::exchange::PhysicalExchangePhase>,
     application: ipu_package::Application,
     support_memory: TileMemoryMap,
     exchange_code_base: u32,
@@ -129,8 +129,7 @@ fn build_package_with_checkpoints(
         checkpoints,
         precisions: package_precisions(low),
         multiply_precisions: package_multiply_precisions(low),
-        exchange_phases: built.exchanges.phases,
-        exchange_schedule: built.exchanges.schedule_snapshot,
+        exchange_phases: built.exchanges,
         exchange_code_base: built.exchange_code_base,
     })
 }
@@ -465,7 +464,7 @@ fn evaluate_candidate(
     let support = package::size_support(
         &program,
         &provisional_placement,
-        &provisional_exchanges.phases,
+        &provisional_exchanges,
         config,
         objects,
         kernel_plan,
@@ -492,8 +491,7 @@ fn evaluate_candidate(
                 &mut cache,
             )?)
         })?;
-    let final_cost =
-        crate::estimate::scheduled_program_cycles(&program.program, &exchanges.phases)?;
+    let final_cost = crate::estimate::scheduled_program_cycles(&program.program, &exchanges)?;
     tracing::info!(
         final_cycles = final_cost.total,
         final_exchange = final_cost.exchange,
@@ -502,7 +500,7 @@ fn evaluate_candidate(
     let application = package::emit_package(
         &program,
         &placement,
-        &exchanges.phases,
+        &exchanges,
         &support,
         config,
         package.invocations,
@@ -523,7 +521,6 @@ pub mod f143;
 pub mod runtime_layout;
 
 mod estimate;
-pub use estimate::{ExchangeStorageEstimator, estimate_exchange_phase_storage};
 pub mod exchange;
 pub mod graph;
 mod host;
@@ -540,10 +537,8 @@ mod tile;
 pub use config::*;
 pub(crate) use exchange::*;
 pub use exchange::{
-    EXCHANGE_SCHEDULE_SNAPSHOT_VERSION, ExchangeActivity, ExchangeActivityKind,
-    ExchangeScheduleCache, ExchangeScheduleSnapshot, ExchangeSchedulingPriority,
-    PhysicalExchangePhase, inactive_exchange_program, schedule_exchange_problem,
-    schedule_exchange_problem_with_priority, select_exchange_schedule, validate_exchange_schedule,
+    ExchangeActivity, ExchangeActivityKind, ExchangeScheduleCache, PhysicalExchangePhase,
+    inactive_exchange_program,
 };
 pub use graph::{
     AttentionOptions, AttentionScale, AxisFactorView, AxisSlice, ComputeGraph, GemmOptions,

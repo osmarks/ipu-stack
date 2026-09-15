@@ -35,27 +35,16 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                     // lengths; production width selection retains ordinary TX.
                     continue;
                 }
-                let problem = ExchangeScheduleProblem {
-                    phase: 0,
-                    transfers: vec![ExchangeScheduleTransfer {
-                        source,
-                        source_addresses: vec![0x65000, 0x75000],
-                        destinations: destinations
-                            .iter()
-                            .map(|&tile| ExchangeScheduleDestination {
-                                tile,
-                                address: 0x98000,
-                            })
-                            .collect(),
-                        words: count * width.item_words(),
-                        width,
-                    }],
-                };
-                let packets = packet::split_self_receive_conflicts(
-                    &Topology::c600(),
-                    pending_from_problem(1472, &problem).unwrap(),
-                )
-                .unwrap();
+                let problem: Vec<PendingTransfer> = vec![transfer(
+                    source,
+                    vec![0x65000, 0x75000],
+                    destinations.iter().map(|&tile| (tile, 0x98000)).collect(),
+                    count * width.item_words(),
+                    width,
+                )];
+                let packets =
+                    packet::split_self_receive_conflicts(&Topology::c600(), problem.clone())
+                        .unwrap();
                 let mut offset = 0;
                 if source == 745 && width == ExchangeItemWidth::Word32 && count == 28 {
                     assert_eq!(
@@ -71,9 +60,9 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                         &mut cache,
                     )
                     .unwrap();
-                    validate_exchange_schedule(1472, &selected, &run.phase).unwrap();
+                    validate_exchange_schedule(1472, &selected, &run).unwrap();
                     let mut relocated = problem.clone();
-                    for address in &mut relocated.transfers[0].source_addresses {
+                    for address in &mut relocated[0].source_addresses {
                         *address += 0x100;
                     }
                     let (selected, run) = select_exchange_schedule(
@@ -83,8 +72,8 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                         &mut cache,
                     )
                     .unwrap();
-                    assert!(run.reused);
-                    validate_exchange_schedule(1472, &selected, &run.phase).unwrap();
+
+                    validate_exchange_schedule(1472, &selected, &run).unwrap();
                 }
                 for p in &packets {
                     assert_eq!(p.source_addresses, vec![0x65000 + offset, 0x75000 + offset]);
@@ -96,14 +85,14 @@ fn loopback_packet_boundaries_preserve_repeat_sources() {
                     );
                     offset += p.words * 4;
                 }
-                assert_eq!(offset, problem.transfers[0].words * 4);
+                assert_eq!(offset, problem[0].words * 4);
                 let run = schedule_exchange_problem_with_priority(
                     1472,
                     &problem,
                     ExchangeSchedulingPriority::BalancedStreams(1024),
                 )
                 .unwrap();
-                validate_exchange_schedule(1472, &problem, &run.phase).unwrap();
+                validate_exchange_schedule(1472, &problem, &run).unwrap();
             }
         }
     }
@@ -119,39 +108,34 @@ fn multicast_loopback_schedules_both_roles_and_rejects_bank_aliases() {
         (128, ExchangeItemWidth::Paired64),
         (512, ExchangeItemWidth::Paired64),
     ] {
-        let mut problem = ExchangeScheduleProblem {
-            phase: 0,
-            transfers: vec![ExchangeScheduleTransfer {
-                source: 0,
-                source_addresses: vec![0x65000],
-                destinations: [0, 1, 2, 3]
-                    .into_iter()
-                    .map(|tile| ExchangeScheduleDestination {
-                        tile,
-                        address: 0x98000,
-                    })
-                    .collect(),
-                words,
-                width,
-            }],
-        };
+        let mut problem: Vec<PendingTransfer> = vec![transfer(
+            0,
+            vec![0x65000],
+            [0, 1, 2, 3]
+                .into_iter()
+                .map(|tile| (tile, 0x98000))
+                .collect(),
+            words,
+            width,
+        )];
         let run = schedule_exchange_problem(4, &problem).unwrap();
-        validate_exchange_schedule(4, &problem, &run.phase).unwrap();
+        validate_exchange_schedule(4, &problem, &run).unwrap();
         assert!(
-            run.phase.activities[0]
+            run.activities[0]
                 .iter()
                 .any(|a| a.kind == ExchangeActivityKind::Send)
         );
         assert!(
-            run.phase.activities[0]
+            run.activities[0]
                 .iter()
                 .any(|a| a.kind == ExchangeActivityKind::Receive)
         );
-        problem.transfers[0].destinations[0].address = 0x65004;
+        problem[0].destinations[0].1 = 0x65004;
         assert!(schedule_exchange_problem(4, &problem).is_err());
         // Every alternative source address in a repeated phase must be safe.
-        problem.transfers[0].destinations[0].address = 0x98000;
-        problem.transfers[0].source_addresses.push(0x98004);
+        problem[0].destinations[0].1 = 0x98000;
+        problem[0].source_addresses.push(0x98004);
+        problem[0].refresh_source_elements();
         assert!(schedule_exchange_problem(4, &problem).is_err());
     }
 }
@@ -169,24 +153,18 @@ fn randomized_ready_matchings_have_maximum_cardinality() {
                     continue;
                 }
                 let index = transfers.len();
-                transfers.push(ExchangeScheduleTransfer {
-                    source: source as u16,
-                    source_addresses: vec![0x1_0000],
-                    destinations: vec![ExchangeScheduleDestination {
-                        tile: destination as u16,
-                        address: 0x4_0000,
-                    }],
-                    words: 1,
-                    width: ExchangeItemWidth::Word32,
-                });
+                transfers.push(transfer(
+                    source as u16,
+                    vec![0x1_0000],
+                    vec![(destination as u16, 0x4_0000)],
+                    1,
+                    ExchangeItemWidth::Word32,
+                ));
                 edges.push(index);
             }
         }
-        let problem = ExchangeScheduleProblem {
-            phase: 0,
-            transfers,
-        };
-        let pending = pending_from_problem(tile_count as u16, &problem).unwrap();
+        let problem: Vec<PendingTransfer> = transfers;
+        let pending = problem.clone();
         let source_order = (0..tile_count).collect::<Vec<_>>();
         let matching = maximum_ready_matching(&pending, &adjacency, &source_order, tile_count);
         let mut matched_sources = BTreeSet::new();
@@ -234,23 +212,20 @@ fn randomized_matching_wave_orders_preserve_memory_dependencies() {
         for wave in 0..waves {
             let shift = random.u16(1..tile_count);
             for source in 0..tile_count {
-                transfers.push(ExchangeScheduleTransfer {
+                transfers.push(transfer(
                     source,
-                    source_addresses: vec![0x1_0000 + u32::from(random.u16(0..=wave)) * 0x100],
-                    destinations: vec![ExchangeScheduleDestination {
-                        tile: (source + shift) % tile_count,
-                        address: 0x4_0000 + u32::from(random.u16(0..=wave)) * 0x100,
-                    }],
-                    words: random.u32(1..=64),
-                    width: ExchangeItemWidth::Word32,
-                });
+                    vec![0x1_0000 + u32::from(random.u16(0..=wave)) * 0x100],
+                    vec![(
+                        (source + shift) % tile_count,
+                        0x4_0000 + u32::from(random.u16(0..=wave)) * 0x100,
+                    )],
+                    random.u32(1..=64),
+                    ExchangeItemWidth::Word32,
+                ));
             }
         }
-        let problem = ExchangeScheduleProblem {
-            phase: 0,
-            transfers,
-        };
-        let pending = pending_from_problem(tile_count, &problem).unwrap();
+        let problem: Vec<PendingTransfer> = transfers;
+        let pending = problem.clone();
         let incumbent = (0..pending.len()).collect::<Vec<_>>();
         let order = matching::order(&SchedulingProblem::new(&pending, tile_count), &incumbent)
             .expect("balanced point-to-point phases have a matching-wave candidate");
@@ -275,33 +250,28 @@ fn randomized_matching_wave_orders_preserve_memory_dependencies() {
 
 #[test]
 fn independent_sends_pipeline_before_previous_payload_arrives() {
-    let problem = ExchangeScheduleProblem {
-        phase: 0,
-        transfers: [0, 4]
-            .into_iter()
-            .enumerate()
-            .map(|(index, source)| ExchangeScheduleTransfer {
+    let problem: Vec<PendingTransfer> = [0, 4]
+        .into_iter()
+        .enumerate()
+        .map(|(index, source)| {
+            transfer(
                 source,
-                source_addresses: vec![0x1_0000],
-                destinations: vec![ExchangeScheduleDestination {
-                    tile: 2,
-                    address: 0x4_0000 + index as u32 * 0x100,
-                }],
-                words: 16,
-                width: ExchangeItemWidth::Word32,
-            })
-            .collect(),
-    };
+                vec![0x1_0000],
+                vec![(2, 0x4_0000 + index as u32 * 0x100)],
+                16,
+                ExchangeItemWidth::Word32,
+            )
+        })
+        .collect();
     let run = schedule_exchange_problem(8, &problem).unwrap();
-    validate_exchange_schedule(8, &problem, &run.phase).unwrap();
-    let mut receives = run.phase.activities[2]
+    validate_exchange_schedule(8, &problem, &run).unwrap();
+    let mut receives = run.activities[2]
         .iter()
         .filter(|a| a.kind == ExchangeActivityKind::Receive)
         .collect::<Vec<_>>();
     receives.sort_by_key(|a| a.start_cycle);
     assert_eq!(receives.len(), 2);
     let second_send = run
-        .phase
         .activities
         .iter()
         .flatten()
@@ -315,7 +285,7 @@ fn independent_sends_pipeline_before_previous_payload_arrives() {
 }
 
 #[test]
-fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
+fn randomized_schedules_are_deterministic_and_valid() {
     let mut random = fastrand::Rng::with_seed(0x736e_6170_7368_6f74);
     for phase in 0..32 {
         let tile_count = random.u16(2..=16);
@@ -335,22 +305,19 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
                 if random.bool() {
                     source_addresses.push(0x4_2000 + random.u32(0..2) * 0x4000);
                 }
-                ExchangeScheduleTransfer {
+                transfer(
                     source,
                     source_addresses,
-                    destinations: tiles
+                    tiles
                         .into_iter()
-                        .map(|tile| ExchangeScheduleDestination {
-                            tile,
-                            address: 0x4_0000 + random.u32(0..2) * 0x4000,
-                        })
+                        .map(|tile| (tile, 0x4_0000 + random.u32(0..2) * 0x4000))
                         .collect(),
-                    words: random.u32(1..=64),
-                    width: ExchangeItemWidth::Word32,
-                }
+                    random.u32(1..=64),
+                    ExchangeItemWidth::Word32,
+                )
             })
             .collect();
-        let problem = ExchangeScheduleProblem { phase, transfers };
+        let problem: Vec<PendingTransfer> = transfers;
         for priority in [
             ExchangeSchedulingPriority::Automatic,
             ExchangeSchedulingPriority::RemainingDirectional,
@@ -361,17 +328,11 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
         ] {
             let first =
                 schedule_exchange_problem_with_priority(tile_count, &problem, priority).unwrap();
-            validate_exchange_schedule(tile_count, &problem, &first.phase).unwrap();
+            validate_exchange_schedule(tile_count, &problem, &first).unwrap();
             let second =
                 schedule_exchange_problem_with_priority(tile_count, &problem, priority).unwrap();
-            validate_exchange_schedule(tile_count, &problem, &second.phase).unwrap();
-            assert_eq!(first.phase, second.phase);
-            assert_eq!(first.initial_horizon, second.initial_horizon);
-            assert_eq!(first.endpoint_lower_bound, second.endpoint_lower_bound);
-            assert_eq!(
-                first.neighborhood_improvements,
-                second.neighborhood_improvements
-            );
+            validate_exchange_schedule(tile_count, &problem, &second).unwrap();
+            assert_eq!(first, second);
         }
         let topology = Topology::new(
             (0..tile_count)
@@ -379,7 +340,7 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
                 .collect(),
         )
         .unwrap();
-        let pending = pending_from_problem(tile_count, &problem).unwrap();
+        let pending = problem.clone();
         let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count).unwrap();
         let scheduling = SchedulingProblem::new(&pending, tile_count);
         let baseline = streams::schedule(
@@ -404,38 +365,37 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
         let (new_maximum, new_total) = encoded_row_storage(&optimized.schedule).unwrap();
         assert_eq!((new_maximum, new_total), (maximum, total));
         assert_eq!(optimized.schedule.horizon, baseline.horizon);
-        let run = finish_exchange_run(phase, incoming_bases, optimized).unwrap();
-        validate_exchange_schedule(tile_count, &problem, &run.phase).unwrap();
+        let run = optimized
+            .schedule
+            .into_phase(ExchangePhaseId::from_index(phase), incoming_bases)
+            .unwrap();
+        validate_exchange_schedule(tile_count, &problem, &run).unwrap();
     }
 }
 
 #[test]
 fn width_selection_pairs_receivers_with_independent_addresses() {
     let topology = Topology::c600();
-    let problem = ExchangeScheduleProblem {
-        phase: 0,
-        transfers: [0, 4]
-            .into_iter()
-            .map(|source| ExchangeScheduleTransfer {
+    let problem: Vec<PendingTransfer> = [0, 4]
+        .into_iter()
+        .map(|source| {
+            transfer(
                 source,
-                source_addresses: vec![0x8_0000],
-                destinations: (if source == 0 {
+                vec![0x8_0000],
+                (if source == 0 {
                     [0, 1]
                 } else {
                     [source + 2, source + 3]
                 })
                 .into_iter()
-                .map(|tile| ExchangeScheduleDestination {
-                    tile,
-                    address: 0x8_8000 + u32::from(tile & 1) * 0x4000,
-                })
+                .map(|tile| (tile, 0x8_8000 + u32::from(tile & 1) * 0x4000))
                 .collect(),
-                words: 64,
-                width: ExchangeItemWidth::Word32,
-            })
-            .collect(),
-    };
-    let pending = pending_from_problem(8, &problem).unwrap();
+                64,
+                ExchangeItemWidth::Word32,
+            )
+        })
+        .collect();
+    let pending = problem.clone();
     let ordinary = optimize_owned_pending(&topology, pending.clone(), 8, None).unwrap();
     let selected = select_transfer_widths(0, &topology, pending, 8, None).unwrap();
     assert!(
@@ -445,9 +405,9 @@ fn width_selection_pairs_receivers_with_independent_addresses() {
             .all(|transfer| transfer.width == ExchangeItemWidth::Paired64)
     );
     assert!(selected.optimized.schedule.horizon < ordinary.optimized.schedule.horizon);
-    let paired = schedule_problem(0, &selected.pending);
+    let paired = selected.pending.clone();
     let run = schedule_exchange_problem(8, &paired).unwrap();
-    validate_exchange_schedule(8, &paired, &run.phase).unwrap();
+    validate_exchange_schedule(8, &paired, &run).unwrap();
 }
 
 #[test]
@@ -456,28 +416,21 @@ fn borrowed_transmit_lane_allows_receive_but_excludes_local_send() {
         Topology::new((0..64).map(ipu_target::c600::logical_to_physical).collect()).unwrap();
     for source in [0, 1] {
         let partner = source ^ 1;
-        let transfer = |source, destinations: &[u16], words, width| ExchangeScheduleTransfer {
-            source,
-            source_addresses: vec![0x8_0000],
-            destinations: destinations
-                .iter()
-                .map(|&tile| ExchangeScheduleDestination {
-                    tile,
-                    address: 0x8_8000,
-                })
-                .collect(),
-            words,
-            width,
+        let transfer = |source, destinations: &[u16], words, width| {
+            transfer(
+                source,
+                vec![0x8_0000],
+                destinations.iter().map(|&tile| (tile, 0x8_8000)).collect(),
+                words,
+                width,
+            )
         };
-        let problem = ExchangeScheduleProblem {
-            phase: 0,
-            transfers: vec![
-                transfer(source, &[2, 3], 4096, ExchangeItemWidth::Paired64),
-                transfer(4, &[partner], 2048, ExchangeItemWidth::Word32),
-                transfer(partner, &[5], 256, ExchangeItemWidth::Word32),
-            ],
-        };
-        let pending = pending_from_problem(64, &problem).unwrap();
+        let problem: Vec<PendingTransfer> = vec![
+            transfer(source, &[2, 3], 4096, ExchangeItemWidth::Paired64),
+            transfer(4, &[partner], 2048, ExchangeItemWidth::Word32),
+            transfer(partner, &[5], 256, ExchangeItemWidth::Word32),
+        ];
+        let pending = problem.clone();
         let (counts, bases) = receive_configuration(&pending, 64).unwrap();
         for order in [[0, 1, 2], [1, 0, 2]] {
             let schedule = materialize_schedule_order(
@@ -502,7 +455,7 @@ fn borrowed_transmit_lane_allows_receive_but_excludes_local_send() {
             assert!(endpoint_work_lower_bound(&pending, 64) <= schedule.horizon);
         }
         let run = schedule_exchange_problem(64, &problem).unwrap();
-        validate_exchange_schedule(64, &problem, &run.phase).unwrap();
+        validate_exchange_schedule(64, &problem, &run).unwrap();
     }
 }
 
@@ -633,7 +586,7 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();
     let phases = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
-    assert!(!phases.phases.is_empty());
+    assert!(!phases.is_empty());
 }
 
 #[test]
@@ -669,9 +622,7 @@ fn randomized_gemm_exchanges_produce_one_executable_row_per_tile() {
             config.diagnostic_checkpoints,
         );
         let placement = place(&low).unwrap();
-        let phases = lower_exchanges(&low, &placement, &Topology::c600())
-            .unwrap()
-            .phases;
+        let phases = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
         assert_eq!(phases.len(), low.exchange_phases.len());
         for phase in phases {
             assert_eq!(phase.programs.len(), usize::from(tiles));
@@ -745,12 +696,11 @@ fn dense_repeated_parameter_broadcasts_have_relocatable_exchange_rows() {
     let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
     assert!(
         exchanges
-            .phases
             .iter()
             .flat_map(|p| &p.outgoing_bases)
             .any(Option::is_some)
     );
-    for phase in &exchanges.phases {
+    for phase in &exchanges {
         for (tile, base) in phase.outgoing_bases.iter().enumerate() {
             let Some((shard, offset)) = base else {
                 continue;
@@ -983,73 +933,25 @@ fn coalescing_preserves_loopback_dependencies_in_every_repeat_iteration() {
 
 #[test]
 fn compact_streams_order_inputs_before_ready_forwarders() {
-    let transfer = |source, address, destination, words| ExchangeScheduleTransfer {
-        source,
-        source_addresses: vec![address],
-        destinations: vec![ExchangeScheduleDestination {
-            tile: destination,
-            address: 0x64000,
-        }],
-        words,
-        width: ExchangeItemWidth::Word32,
+    let transfer = |source, address, destination, words| {
+        transfer(
+            source,
+            vec![address],
+            vec![(destination, 0x64000)],
+            words,
+            ExchangeItemWidth::Word32,
+        )
     };
-    let phase = ExchangeScheduleProblem {
-        phase: 0,
-        transfers: vec![
-            transfer(0, 0x60000, 1, 16),
-            transfer(2, 0x60000, 3, 16),
-            transfer(1, 0x64000, 2, 1024),
-        ],
-    };
-    let pending = pending_from_problem(4, &phase).unwrap();
+    let phase = vec![
+        transfer(0, 0x60000, 1, 16),
+        transfer(2, 0x60000, 3, 16),
+        transfer(1, 0x64000, 2, 1024),
+    ];
+    let pending = phase.clone();
     let problem = SchedulingProblem::new(&pending, 4);
     for balanced in [false, true] {
         let order = streams::order(&problem, 1024, balanced);
         assert_eq!(order.last(), Some(&2));
-    }
-}
-
-#[test]
-fn snapshot_rejects_inactive_paired_sender_lane() {
-    let problem = ExchangeScheduleProblem {
-        phase: 0,
-        transfers: vec![ExchangeScheduleTransfer {
-            source: 2,
-            source_addresses: vec![0x50000],
-            destinations: vec![
-                ExchangeScheduleDestination {
-                    tile: 0,
-                    address: 0x58000,
-                },
-                ExchangeScheduleDestination {
-                    tile: 1,
-                    address: 0x58000,
-                },
-            ],
-            words: 128,
-            width: ExchangeItemWidth::Paired64,
-        }],
-    };
-    for tiles in [3, 4] {
-        let snapshot = ExchangeScheduleSnapshot {
-            schema_version: EXCHANGE_SCHEDULE_SNAPSHOT_VERSION,
-            tile_count: tiles,
-            phases: vec![problem.clone()],
-        };
-        if tiles == 3 {
-            assert!(matches!(
-                snapshot.validate(),
-                Err(ExchangeLoweringError::InvalidSnapshot(_))
-            ));
-            assert!(matches!(
-                schedule_exchange_problem(tiles, &problem),
-                Err(ExchangeLoweringError::InvalidSnapshot(_))
-            ));
-        } else {
-            snapshot.validate().unwrap();
-            let run = schedule_exchange_problem(tiles, &problem).unwrap();
-            validate_exchange_schedule(tiles, &problem, &run.phase).unwrap();
-        }
     }
 }
 
@@ -1061,4 +963,322 @@ fn phase_finalization_rejects_a_stale_schedule_horizon() {
         schedule.into_phase(ExchangePhaseId::from_index(0), vec![0; 4]),
         Err(ExchangeLoweringError::Invariant(_))
     ));
+}
+
+pub(super) fn transfer(
+    source: u16,
+    source_addresses: Vec<u32>,
+    destinations: Vec<(u16, u32)>,
+    words: u32,
+    width: ExchangeItemWidth,
+) -> PendingTransfer {
+    let mut transfer = PendingTransfer {
+        source,
+        source_shard: BlockValueId::from_index(u32::from(source)),
+        source_offset: 0,
+        source_addresses,
+        destinations,
+        words,
+        width,
+        source_elements: Vec::new(),
+        reserved_source: (width == ExchangeItemWidth::Paired64)
+            .then(|| Topology::c600().paired_logical(source).unwrap()),
+    };
+    transfer.refresh_source_elements();
+    transfer
+}
+pub(super) fn select_exchange_schedule(
+    tile_count: u16,
+    transfers: &[PendingTransfer],
+    stream_words: Option<std::num::NonZeroU32>,
+    cache: &mut ExchangeScheduleCache,
+) -> Result<(Vec<PendingTransfer>, PhysicalExchangePhase), ExchangeLoweringError> {
+    let selected = select_phase(
+        ExchangePhaseId::from_index(0),
+        &Topology::c600(),
+        transfers.to_vec(),
+        tile_count,
+        stream_words,
+        cache,
+    )?;
+    Ok((
+        selected.pending,
+        selected
+            .optimized
+            .schedule
+            .into_phase(ExchangePhaseId::from_index(0), selected.incoming_bases)?,
+    ))
+}
+pub(super) fn schedule_exchange_problem(
+    tile_count: u16,
+    transfers: &[PendingTransfer],
+) -> Result<PhysicalExchangePhase, ExchangeLoweringError> {
+    schedule_exchange_problem_with_priority(
+        tile_count,
+        transfers,
+        ExchangeSchedulingPriority::Automatic,
+    )
+}
+pub(super) fn schedule_exchange_problem_with_priority(
+    tile_count: u16,
+    transfers: &[PendingTransfer],
+    priority: ExchangeSchedulingPriority,
+) -> Result<PhysicalExchangePhase, ExchangeLoweringError> {
+    let topology = Topology::c600();
+    let pending = packet::split_self_receive_conflicts(&topology, transfers.to_vec())?;
+    let (counts, bases) = receive_configuration(&pending, tile_count)?;
+    let problem = SchedulingProblem::new(&pending, tile_count);
+    let schedule = match priority {
+        ExchangeSchedulingPriority::Streams(words)
+        | ExchangeSchedulingPriority::BalancedStreams(words) => streams::schedule(
+            &topology,
+            &problem,
+            &bases,
+            &counts,
+            words,
+            matches!(priority, ExchangeSchedulingPriority::BalancedStreams(_)),
+        )?,
+        _ => {
+            let initial = greedy::schedule(&topology, &problem, &bases, &counts, priority)?;
+            improve_pending_schedule(&topology, &problem, &bases, &counts, initial, "test")?
+                .schedule
+        }
+    };
+    schedule.into_phase(ExchangePhaseId::from_index(0), bases)
+}
+/// Checks that scheduled activities and encoded rows preserve the input
+/// transfer set and obey per-tile bus and SRAM-element hazards.
+pub(super) fn validate_exchange_schedule(
+    tile_count: u16,
+    transfers: &[PendingTransfer],
+    phase: &PhysicalExchangePhase,
+) -> Result<(), ExchangeLoweringError> {
+    let packets = packet::split_self_receive_conflicts(&Topology::c600(), transfers.to_vec())?;
+    let transfers = &packets;
+    let fail = |message| ExchangeLoweringError::Invariant(message);
+    let size = usize::from(tile_count);
+    for (name, length) in [
+        ("active", phase.active.len()),
+        ("programs", phase.programs.len()),
+        ("incoming bases", phase.incoming_bases.len()),
+        ("tile horizons", phase.tile_event_cycles.len()),
+        ("activities", phase.activities.len()),
+        ("repeat patches", phase.repeat_patches.len()),
+        ("outgoing bases", phase.outgoing_bases.len()),
+    ] {
+        if length != size {
+            return Err(fail(format!(
+                "phase {} has {length} {name} entries for {tile_count} tiles",
+                phase.id.index()
+            )));
+        }
+    }
+    if phase
+        .repeat_patches
+        .iter()
+        .any(|patches| !patches.is_empty())
+        || phase.outgoing_bases.iter().any(Option::is_some)
+    {
+        return Err(fail(format!(
+            "standalone phase {} unexpectedly contains repeat relocation",
+            phase.id.index()
+        )));
+    }
+    let maximum_horizon = phase.tile_event_cycles.iter().copied().max().unwrap_or(0);
+    if phase.event_cycles != maximum_horizon {
+        return Err(fail(format!(
+            "phase {} horizon {} differs from maximum tile horizon {maximum_horizon}",
+            phase.id.index(),
+            phase.event_cycles
+        )));
+    }
+
+    let mut send_counts = vec![0usize; transfers.len()];
+    let mut partner_busy_counts = vec![0usize; transfers.len()];
+    let mut receive_counts = transfers
+        .iter()
+        .map(|transfer| vec![0usize; transfer.destinations.len()])
+        .collect::<Vec<_>>();
+    let reserved_paired_sources = transfers
+        .iter()
+        .filter(|transfer| transfer.width == ExchangeItemWidth::Paired64)
+        .map(|transfer| Topology::c600().paired_logical(transfer.source))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    for tile in 0..size {
+        let decoded =
+            crate::exchange::diagnostic::diagnose_plan_program(phase.programs[tile].words(), None)?;
+        if decoded.event_cycles != phase.tile_event_cycles[tile] {
+            return Err(fail(format!(
+                "phase {} tile {tile} decoded horizon {} differs from {}",
+                phase.id.index(),
+                decoded.event_cycles,
+                phase.tile_event_cycles[tile]
+            )));
+        }
+        let tile_u16 = u16::try_from(tile).map_err(|_| ExchangeLoweringError::Overflow)?;
+        let expected_active =
+            !phase.activities[tile].is_empty() || reserved_paired_sources.contains(&tile_u16);
+        if phase.active[tile] != expected_active
+            || phase.active[tile] != (phase.tile_event_cycles[tile] != 0)
+        {
+            return Err(fail(format!(
+                "phase {} tile {tile} has inconsistent active state",
+                phase.id.index()
+            )));
+        }
+        for activity in &phase.activities[tile] {
+            if activity.start_cycle > activity.end_cycle
+                || activity.end_cycle > activity.memory_end_cycle
+                || activity.memory_end_cycle > phase.tile_event_cycles[tile]
+            {
+                return Err(fail(format!(
+                    "phase {} tile {tile} transfer {} has invalid cycle interval",
+                    phase.id.index(),
+                    activity.transfer
+                )));
+            }
+            let transfer_index =
+                usize::try_from(activity.transfer).map_err(|_| ExchangeLoweringError::Overflow)?;
+            let transfer = transfers.get(transfer_index).ok_or_else(|| {
+                fail(format!(
+                    "phase {} tile {tile} references missing transfer {}",
+                    phase.id.index(),
+                    activity.transfer
+                ))
+            })?;
+            if activity.words != transfer.words {
+                return Err(fail(format!(
+                    "phase {} tile {tile} transfer {transfer_index} has wrong word count",
+                    phase.id.index()
+                )));
+            }
+            match activity.kind {
+                ExchangeActivityKind::Send => {
+                    if usize::from(transfer.source) != tile
+                        || activity.address != transfer.source_addresses[0]
+                    {
+                        return Err(fail(format!(
+                            "phase {} transfer {transfer_index} has a mismatched send activity",
+                            phase.id.index()
+                        )));
+                    }
+                    send_counts[transfer_index] += 1;
+                }
+                ExchangeActivityKind::Receive => {
+                    let destination = transfer
+                        .destinations
+                        .iter()
+                        .position(|destination| {
+                            usize::from(destination.0) == tile
+                                && destination.1 == activity.address
+                        })
+                        .ok_or_else(|| {
+                            fail(format!(
+                                "phase {} transfer {transfer_index} has an unexpected receive activity on tile {tile}",
+                                phase.id.index()
+                            ))
+                        })?;
+                    receive_counts[transfer_index][destination] += 1;
+                }
+                ExchangeActivityKind::PartnerBusy => {
+                    let expected = (transfer.width == ExchangeItemWidth::Paired64)
+                        .then(|| Topology::c600().paired_logical(transfer.source))
+                        .transpose()?;
+                    if expected != Some(tile_u16)
+                        || activity.address != transfer.source_addresses[0]
+                    {
+                        return Err(fail(format!(
+                            "phase {} transfer {transfer_index} has a mismatched partner-busy activity",
+                            phase.id.index()
+                        )));
+                    }
+                    partner_busy_counts[transfer_index] += 1;
+                }
+            }
+        }
+        for kind in [ExchangeActivityKind::Send, ExchangeActivityKind::Receive] {
+            let mut intervals = phase.activities[tile]
+                .iter()
+                .filter(|activity| activity.kind == kind)
+                .map(|activity| (activity.start_cycle, activity.end_cycle))
+                .collect::<Vec<_>>();
+            intervals.sort_unstable();
+            if intervals.windows(2).any(|pair| pair[1].0 < pair[0].1) {
+                return Err(fail(format!(
+                    "phase {} tile {tile} has overlapping {kind:?} bus intervals",
+                    phase.id.index()
+                )));
+            }
+        }
+        let sends = phase.activities[tile]
+            .iter()
+            .filter(|activity| activity.kind == ExchangeActivityKind::Send);
+        for send in sends {
+            let transfer = &transfers[send.transfer as usize];
+            for receive in phase.activities[tile]
+                .iter()
+                .filter(|activity| activity.kind == ExchangeActivityKind::Receive)
+            {
+                let overlaps = send.start_cycle < receive.memory_end_cycle
+                    && receive.start_cycle < send.memory_end_cycle;
+                if overlaps
+                    && transfer.source_addresses.iter().any(|&address| {
+                        spans_share_effective_memory_element(
+                            address,
+                            send.words,
+                            receive.address,
+                            receive.words,
+                        )
+                    })
+                {
+                    return Err(fail(format!(
+                        "phase {} tile {tile} overlaps send/receive access to one SRAM element",
+                        phase.id.index()
+                    )));
+                }
+            }
+        }
+        for partner_busy in phase.activities[tile]
+            .iter()
+            .filter(|activity| activity.kind == ExchangeActivityKind::PartnerBusy)
+        {
+            if phase.activities[tile].iter().any(|activity| {
+                activity.transfer != partner_busy.transfer
+                    && activity.kind != ExchangeActivityKind::Receive
+                    && activity.start_cycle < partner_busy.end_cycle
+                    && partner_busy.start_cycle < activity.end_cycle
+            }) {
+                return Err(fail(format!(
+                    "phase {} tile {tile} overlaps borrowed and local transmit intervals",
+                    phase.id.index()
+                )));
+            }
+        }
+    }
+    for (index, count) in send_counts.into_iter().enumerate() {
+        if count != 1 {
+            return Err(fail(format!(
+                "phase {} transfer {index} has {count} send activities",
+                phase.id.index()
+            )));
+        }
+    }
+    for (index, count) in partner_busy_counts.into_iter().enumerate() {
+        let expected = usize::from(transfers[index].width == ExchangeItemWidth::Paired64);
+        if count != expected {
+            return Err(fail(format!(
+                "phase {} transfer {index} has {count} partner-busy activities, expected {expected}",
+                phase.id.index()
+            )));
+        }
+    }
+    for (transfer, counts) in receive_counts.into_iter().enumerate() {
+        if counts.into_iter().any(|count| count != 1) {
+            return Err(fail(format!(
+                "phase {} transfer {transfer} does not have exactly one activity per destination",
+                phase.id.index()
+            )));
+        }
+    }
+    Ok(())
 }

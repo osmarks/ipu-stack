@@ -12,3 +12,27 @@ pub const IPU21_EXECUTABLE_MEMORY_LIMIT: u32 = 0x80000;
 pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = IPU21_EXECUTABLE_MEMORY_LIMIT;
 pub const IPU21_INTERLEAVED_REGION_LIMIT: u32 = TILE_MEMORY_BASE + TILE_MEMORY_SIZE;
 pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
+
+/// Base addresses of SRAM contention regions touched by a word range.
+/// Interleaved accesses occupy pairs of physical elements.
+pub fn effective_memory_elements(address: u32, words: u32) -> Vec<u32> {
+    let end = address.saturating_add(words.saturating_mul(4));
+    let mut elements = Vec::new();
+    let mut cursor = address;
+    while cursor < end {
+        let interleaved = cursor >= IPU21_INTERLEAVED_MEMORY_BASE;
+        let (base, size) = if interleaved {
+            (
+                IPU21_INTERLEAVED_MEMORY_BASE,
+                IPU21_INTERLEAVED_ELEMENT_SIZE,
+            )
+        } else {
+            (0, TILE_MEMORY_ELEMENT_SIZE)
+        };
+        let index = (cursor - base) / size;
+        elements.push(base + index * size);
+        let boundary = base.saturating_add((index + 1).saturating_mul(size));
+        cursor = boundary.min(end);
+    }
+    elements
+}

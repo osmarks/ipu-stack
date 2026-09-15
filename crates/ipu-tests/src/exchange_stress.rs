@@ -832,38 +832,6 @@ pub(crate) fn build_phase_replay(
     build_physical_phase_replay(phase, phase_index, toolchain, runtime_source)
 }
 
-pub(crate) fn build_schedule_phase_replay(
-    snapshot: &ipu_codegen::ExchangeScheduleSnapshot,
-    phase_index: usize,
-    first_transfer: usize,
-    transfer_limit: Option<usize>,
-    priority: ipu_codegen::ExchangeSchedulingPriority,
-    toolchain: &Toolchain,
-    runtime_source: &Path,
-) -> Result<PhaseReplayPackage> {
-    let mut problem = snapshot
-        .phases
-        .get(phase_index)
-        .with_context(|| format!("exchange phase {phase_index} is out of range"))?
-        .clone();
-    if first_transfer > problem.transfers.len() {
-        bail!("--exchange-replay-first-transfer is beyond the selected phase");
-    }
-    problem.transfers.drain(..first_transfer);
-    if let Some(limit) = transfer_limit {
-        if limit == 0 {
-            bail!("--exchange-replay-transfer-limit must be nonzero");
-        }
-        problem.transfers.truncate(limit);
-    }
-    let scheduled = ipu_codegen::schedule_exchange_problem_with_priority(
-        snapshot.tile_count,
-        &problem,
-        priority,
-    )?;
-    build_physical_phase_replay(&scheduled.phase, phase_index, toolchain, runtime_source)
-}
-
 fn build_physical_phase_replay(
     phase: &ipu_codegen::PhysicalExchangePhase,
     phase_index: usize,

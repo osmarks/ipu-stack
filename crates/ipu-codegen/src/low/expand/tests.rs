@@ -244,12 +244,13 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             .unwrap();
             for transfer in low.exchange_phases.iter().flat_map(|p| &p.transfers) {
                 let source = placement.shard_addresses[&transfer.source.shard];
-                let source_elements = crate::exchange::effective_memory_elements(source, 128);
+                let source_elements =
+                    ipu_target::ipu21::memory::effective_memory_elements(source, 128);
                 for destination in &transfer.destinations {
                     if low.shards[destination.shard.index() as usize].tile == 0 {
                         let address = placement.shard_addresses[&destination.shard];
                         assert!(
-                            crate::exchange::effective_memory_elements(address, 128)
+                            ipu_target::ipu21::memory::effective_memory_elements(address, 128)
                                 .iter()
                                 .all(|e| !source_elements.contains(e))
                         );

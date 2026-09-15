@@ -594,9 +594,7 @@ mod tests {
             assert_eq!(binding.slices.len(), 3);
             let placement = crate::place(&low).unwrap();
             let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
-            let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600())
-                .unwrap()
-                .phases;
+            let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
             let lowering = crate::TileProgramLowering::new(
                 &low, &placement, &exchanges, &kernels, 0x60000, 2, false,
             )
@@ -657,9 +655,7 @@ mod tests {
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
         let placement = crate::place(&low).unwrap();
         let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
-        let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600())
-            .unwrap()
-            .phases;
+        let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
         let lowering = crate::TileProgramLowering::new(
             &low, &placement, &exchanges, &kernels, 0x60000, 1, false,
         )

@@ -202,14 +202,6 @@ impl ExchangeStorageEstimator {
         self.bytes.iter().copied().max().unwrap_or(0)
     }
 
-    /// Add a phase from a validated snapshot and return its unshared row sizes.
-    pub fn add_phase(&mut self, problem: &crate::exchange::ExchangeScheduleProblem) -> Vec<u64> {
-        let phase = captured_phase(self.bytes.len() as u16, problem);
-        let sizes = phase.row_bytes().collect();
-        self.add(phase);
-        sizes
-    }
-
     pub(crate) fn add(&mut self, phase: ExchangeStoragePhase) {
         assert_eq!(phase.bytes.len(), self.bytes.len());
         for (tile, bytes) in phase.row_bytes().enumerate() {
@@ -235,40 +227,6 @@ impl ExchangeStorageEstimator {
             self.bytes[tile] += extra;
         }
     }
-}
-
-/// Estimate each tile's row bytes for a captured, unscheduled phase. Uses the
-/// same model as the planner; timings and encoded instructions are not inputs.
-pub fn estimate_exchange_phase_storage(
-    tile_count: u16,
-    problem: &crate::exchange::ExchangeScheduleProblem,
-) -> Vec<u64> {
-    captured_phase(tile_count, problem).row_bytes().collect()
-}
-
-fn captured_phase(
-    tile_count: u16,
-    problem: &crate::exchange::ExchangeScheduleProblem,
-) -> ExchangeStoragePhase {
-    let mut phase = ExchangeStoragePhase::new(tile_count);
-    for transfer in &problem.transfers {
-        let bytes = u64::from(transfer.words) * 4;
-        phase.send(transfer.source, 1, u64::from(transfer.words > 64));
-        if transfer.source_addresses.len() > 1 {
-            phase.disable_sharing(transfer.source);
-        }
-        for destination in &transfer.destinations {
-            phase.connection(
-                transfer.source,
-                destination.tile,
-                bytes,
-                transfer.width == crate::exchange::ExchangeItemWidth::Paired64,
-                transfer.destinations.len(),
-            );
-            phase.receive(destination.tile, u64::from(destination.address), bytes);
-        }
-    }
-    phase
 }
 
 #[cfg(test)]

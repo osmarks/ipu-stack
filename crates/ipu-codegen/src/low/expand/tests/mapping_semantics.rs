@@ -190,29 +190,36 @@ fn check_bytes(
             }
             BlockOperation::Exchange(phase) => {
                 let phase = exchange
-                    .schedule_snapshot
-                    .phases
                     .iter()
-                    .find(|candidate| candidate.phase == phase.index())
+                    .find(|candidate| candidate.id == *phase)
                     .unwrap();
                 let messages = phase
-                    .transfers
+                    .activities
                     .iter()
-                    .map(|transfer| {
-                        let start = transfer.source_addresses[0] as usize / 4;
+                    .enumerate()
+                    .flat_map(|(tile, activities)| {
+                        activities.iter().filter_map(move |activity| {
+                            (activity.kind == crate::ExchangeActivityKind::Send)
+                                .then_some((tile, activity))
+                        })
+                    })
+                    .map(|(tile, transfer)| {
+                        let start = transfer.address as usize / 4;
                         (
-                            transfer,
-                            memory[usize::from(transfer.source)]
-                                [start..start + transfer.words as usize]
-                                .to_vec(),
+                            transfer.transfer,
+                            memory[tile][start..start + transfer.words as usize].to_vec(),
                         )
                     })
                     .collect::<Vec<_>>();
                 for (transfer, payload) in messages {
-                    for destination in &transfer.destinations {
-                        let start = destination.address as usize / 4;
-                        memory[usize::from(destination.tile)][start..start + payload.len()]
-                            .copy_from_slice(&payload);
+                    for (tile, activities) in phase.activities.iter().enumerate() {
+                        for destination in activities.iter().filter(|activity| {
+                            activity.transfer == transfer
+                                && activity.kind == crate::ExchangeActivityKind::Receive
+                        }) {
+                            let start = destination.address as usize / 4;
+                            memory[tile][start..start + payload.len()].copy_from_slice(&payload);
+                        }
                     }
                 }
             }

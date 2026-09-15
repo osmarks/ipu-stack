@@ -134,10 +134,8 @@ fn packed_halfword_sources_are_gathered_before_word_exchange() {
     .unwrap();
     assert!(
         snapshot
-            .schedule_snapshot
-            .phases
             .iter()
-            .any(|phase| !phase.transfers.is_empty())
+            .any(|phase| phase.activities.iter().any(|tile| !tile.is_empty()))
     );
     let source = low.value_views(low.inputs[0].value)[0].shard;
     assert!(
@@ -252,10 +250,8 @@ fn shifted_halfword_crops_pack_before_physical_exchange() {
     .unwrap();
     assert!(
         snapshot
-            .schedule_snapshot
-            .phases
             .iter()
-            .any(|phase| !phase.transfers.is_empty())
+            .any(|phase| phase.activities.iter().any(|tile| !tile.is_empty()))
     );
     assert!(
         low.local_copies

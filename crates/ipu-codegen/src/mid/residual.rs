@@ -436,7 +436,7 @@ mod tests {
                 let mut occupied = BTreeSet::new();
                 for view in &run.outputs {
                     let shard = &low.shards[view.shard.index() as usize];
-                    let elements = crate::exchange::effective_memory_elements(
+                    let elements = ipu_target::ipu21::memory::effective_memory_elements(
                         placement.shard_addresses[&view.shard],
                         crate::shard_storage_bytes(shard).unwrap().div_ceil(4),
                     );

@@ -1,10 +1,9 @@
 //! Per-memory-element interval queries for simultaneous send/receive hazards.
-use super::ExchangeMemoryElement;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct MemoryHistory {
-    elements: BTreeMap<ExchangeMemoryElement, Vec<Interval>>,
+    elements: BTreeMap<u32, Vec<Interval>>,
 }
 
 #[derive(Clone, Debug)]
@@ -15,7 +14,7 @@ struct Interval {
 }
 
 impl MemoryHistory {
-    pub(super) fn record(&mut self, elements: &[ExchangeMemoryElement], start: u32, end: u32) {
+    pub(super) fn record(&mut self, elements: &[u32], start: u32, end: u32) {
         for element in elements {
             let intervals = self.elements.entry(*element).or_default();
             let index = intervals.partition_point(|interval| interval.start <= start);
@@ -39,12 +38,7 @@ impl MemoryHistory {
         }
     }
 
-    pub(super) fn conflict_end(
-        &self,
-        elements: &[ExchangeMemoryElement],
-        start: u32,
-        end: u32,
-    ) -> Option<u32> {
+    pub(super) fn conflict_end(&self, elements: &[u32], start: u32, end: u32) -> Option<u32> {
         elements
             .iter()
             .filter_map(|element| {
@@ -64,12 +58,7 @@ mod tests {
     #[test]
     fn indexed_hazards_match_exhaustive_queries_after_arbitrary_insertions() {
         let mut random = fastrand::Rng::with_seed(0x6861_7a61_7264);
-        let elements = (0..8)
-            .map(|index| ExchangeMemoryElement {
-                interleaved: index % 2 == 0,
-                index,
-            })
-            .collect::<Vec<_>>();
+        let elements = (0..8).collect::<Vec<_>>();
         let mut history = MemoryHistory::default();
         let mut reference = Vec::new();
         for _ in 0..2048 {

@@ -535,9 +535,8 @@ program state, not a memoization cache, and cannot be shared between candidates.
 
 Exchange selection receives `stream_words` explicitly from the pipeline policy,
 separately from the cache. The cache records which policy produced each entry;
-a policy change cannot reuse an earlier selection. The public
-`select_exchange_schedule` entry point applies this same production selection to
-captured transfers.
+a policy change cannot reuse an earlier selection. `lower_exchanges_cached`
+returns the physical phases directly; there is no captured-transfer replay API.
 
 Destination facts retain no cost-dependent staging decisions. Changing packing
 policy reuses the facts. Exchange fragment size remains an explicit analysis input.

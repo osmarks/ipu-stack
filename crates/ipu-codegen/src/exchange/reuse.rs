@@ -131,25 +131,17 @@ mod tests {
     use super::*;
 
     fn transfers() -> Vec<PendingTransfer> {
-        pending_from_problem(
-            4,
-            &ExchangeScheduleProblem {
-                phase: 0,
-                transfers: (0..2)
-                    .map(|source| ExchangeScheduleTransfer {
-                        source,
-                        source_addresses: vec![0x60000],
-                        destinations: vec![ExchangeScheduleDestination {
-                            tile: source + 2,
-                            address: 0x64000,
-                        }],
-                        words: 64,
-                        width: ExchangeItemWidth::Word32,
-                    })
-                    .collect(),
-            },
-        )
-        .unwrap()
+        (0..2)
+            .map(|source| {
+                transfer(
+                    source,
+                    vec![0x60000],
+                    vec![(source + 2, 0x64000)],
+                    64,
+                    ExchangeItemWidth::Word32,
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -275,28 +267,22 @@ mod tests {
             (1, 17, &[6], 18),
             (2, 18, &[5, 6, 7], 2),
         ];
-        let problem = ExchangeScheduleProblem {
-            phase: 0,
-            transfers: transfers
-                .into_iter()
-                .map(
-                    |(source, offset, destinations, words)| ExchangeScheduleTransfer {
-                        source,
-                        source_addresses: vec![0x10000 + offset * 128],
-                        destinations: destinations
-                            .iter()
-                            .map(|&tile| ExchangeScheduleDestination {
-                                tile,
-                                address: 0x40000 + offset * 128,
-                            })
-                            .collect(),
-                        words,
-                        width: ExchangeItemWidth::Word32,
-                    },
+        let problem: Vec<PendingTransfer> = transfers
+            .into_iter()
+            .map(|(source, offset, destinations, words)| {
+                transfer(
+                    source,
+                    vec![0x10000 + offset * 128],
+                    destinations
+                        .iter()
+                        .map(|&tile| (tile, 0x40000 + offset * 128))
+                        .collect(),
+                    words,
+                    ExchangeItemWidth::Word32,
                 )
-                .collect(),
-        };
-        let pending = pending_from_problem(8, &problem).unwrap();
+            })
+            .collect();
+        let pending = problem.clone();
         let (counts, bases) = receive_configuration(&pending, 8).unwrap();
         let aligned = greedy::schedule(
             &topology,

@@ -5,7 +5,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExchangeActivityDiagnostic {
     pub activity: ExchangeActivity,
-    pub memory_elements: Vec<ExchangeMemoryElement>,
+    pub memory_elements: Vec<u32>,
     pub conflicts_with_row: bool,
 }
 
@@ -14,7 +14,7 @@ pub struct ExchangeTileDiagnostic {
     pub phase: ExchangePhaseId,
     pub tile: u16,
     pub row_address: u32,
-    pub row_elements: Vec<ExchangeMemoryElement>,
+    pub row_elements: Vec<u32>,
     pub program: crate::exchange::diagnostic::PlanProgramDiagnostic,
     pub activities: Vec<ExchangeActivityDiagnostic>,
 }

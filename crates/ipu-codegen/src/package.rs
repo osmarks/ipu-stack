@@ -128,7 +128,6 @@ pub struct CompiledPackage {
     /// This is build metadata and is not serialized into the application.
     pub exchange_phases: Vec<crate::PhysicalExchangePhase>,
     /// Address-resolved inputs to physical exchange scheduling and row codegen.
-    pub exchange_schedule: crate::ExchangeScheduleSnapshot,
     /// Base address used when laying out the compact per-tile exchange table.
     pub exchange_code_base: u32,
 }
