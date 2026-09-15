@@ -12,41 +12,38 @@ use crate::mid::MidOperationKind;
 use crate::tensor::{AmpOrder, ElementOrder, Precision};
 use std::collections::BTreeSet;
 
-// These readers have no kernel-specific proof that padding can be ignored.
-// Repeat bindings can expose bytes to readers under another shard ID; scratch
-// local to the body has no such additional readers.
 fn non_kernel_read_storage(program: &TileGraph) -> BTreeSet<BlockValueId> {
-    let mut readers = program
+    let root = |id| storage_root(&program.shards, id);
+    let mut forbidden = program
         .outputs
         .iter()
-        .flat_map(|&output| program.value_views(output).iter().map(|view| view.shard))
+        .flat_map(|&output| {
+            program
+                .value_views(output)
+                .iter()
+                .map(|view| root(view.shard))
+        })
         .collect::<BTreeSet<_>>();
+    // Kernels have a padding-specific proof below. Other reads and storage
+    // exposed across Repeat boundaries conservatively prevent clear removal.
     for operation in program.body.walk() {
         match operation {
-            BlockOperation::Exchange(id) => readers.extend(
-                program.exchange_phases[id.index() as usize]
-                    .transfers
+            BlockOperation::Compute { .. } => {}
+            BlockOperation::Repeat(repeat) => forbidden.extend(
+                repeat
+                    .bindings
                     .iter()
-                    .map(|transfer| transfer.source.shard),
+                    .flat_map(BlockRepeatBinding::bound_shards)
+                    .map(root),
             ),
-            BlockOperation::Copy { copy, .. } => {
-                readers.insert(program.local_copies[copy.0 as usize].movement().source);
-            }
-            BlockOperation::Repeat(repeat) => {
-                readers.extend(
-                    repeat
-                        .bindings
-                        .iter()
-                        .flat_map(BlockRepeatBinding::bound_shards),
-                );
-            }
-            _ => {}
+            _ => forbidden.extend(
+                program
+                    .accesses(operation)
+                    .filter_map(|(id, write)| (!write).then(|| root(id))),
+            ),
         }
     }
-    readers
-        .into_iter()
-        .map(|id| storage_root(&program.shards, id))
-        .collect()
+    forbidden
 }
 
 /// Row-major FP8 packing reads only logical columns/rows and writes its own

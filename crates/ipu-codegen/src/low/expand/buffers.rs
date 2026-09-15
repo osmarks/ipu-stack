@@ -61,10 +61,6 @@ impl TileGraphBuilder {
             .collect()
     }
 
-    pub(super) fn alias_shard(&mut self, shard: BlockValueId, target: BlockValueId) {
-        self.shards[shard.index() as usize].definition = ShardDefinition::Alias(target);
-    }
-
     pub(super) fn corresponding_shard(
         &self,
         value: MidValueId,

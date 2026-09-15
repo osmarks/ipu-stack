@@ -26,11 +26,13 @@ pub(in crate::low) fn eliminate_copies(program: &mut crate::low::TileGraph) -> S
     let mut boundary = vec![false; roots.len()];
     let mut distinct = vec![std::collections::BTreeSet::new(); roots.len()];
     for (index, op) in program.body.walk().enumerate() {
-        let mut write = |id: BlockValueId| {
-            let root = roots[id.index() as usize].index() as usize;
-            writes[root] += 1;
-            last_write[root] = Some(index);
-        };
+        for (id, write) in program.accesses(op) {
+            if write {
+                let root = roots[id.index() as usize].index() as usize;
+                writes[root] += 1;
+                last_write[root] = Some(index);
+            }
+        }
         match op {
             BlockOperation::Compute { run, .. } => {
                 let run = &program.kernel_runs[run.0 as usize];
@@ -46,9 +48,6 @@ pub(in crate::low) fn eliminate_copies(program: &mut crate::low::TileGraph) -> S
                         }
                     }
                 }
-                for view in &run.outputs {
-                    write(view.shard);
-                }
                 for (view, requirement) in run
                     .inputs
                     .iter()
@@ -61,19 +60,12 @@ pub(in crate::low) fn eliminate_copies(program: &mut crate::low::TileGraph) -> S
             }
             BlockOperation::Copy { copy, .. } => {
                 let copy = &program.local_copies[copy.0 as usize];
-                write(copy.movement().destination);
                 for (id, access) in copy.accesses() {
                     let root = roots[id.index() as usize].index() as usize;
                     alignment[root] = alignment[root].max(access.alignment);
                 }
             }
-            BlockOperation::Exchange(id) => {
-                for transfer in &program.exchange_phases[id.index() as usize].transfers {
-                    for view in &transfer.destinations {
-                        write(view.shard);
-                    }
-                }
-            }
+            BlockOperation::Exchange(_) => {}
             BlockOperation::Repeat(repeat) => {
                 for id in repeat.bindings.iter().flat_map(|b| b.bound_shards()) {
                     boundary[roots[id.index() as usize].index() as usize] = true;

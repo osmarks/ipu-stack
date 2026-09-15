@@ -1371,8 +1371,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
             for transfer in &phase.transfers {
                 assert!(transfer.destinations.iter().all(|destination| matches!(
                     low.shards[destination.shard.index() as usize].definition,
-                    ShardDefinition::Value(_)
-                        | ShardDefinition::Staging
+                    ShardDefinition::Value(_) | ShardDefinition::Staging
                 )));
             }
         }

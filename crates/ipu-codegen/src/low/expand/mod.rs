@@ -275,22 +275,6 @@ impl TileGraphBuilder {
         Ok(tiles)
     }
 
-    fn append_fill_zero(
-        &mut self,
-        tiles: &mut BlockRegion,
-        shard: BlockValueId,
-        provenance: WorkProvenance,
-    ) -> ExpansionResult<()> {
-        let bytes = crate::shard_storage_bytes(&self.shards[shard.index() as usize])?;
-        self.append_zero_range(
-            tiles,
-            shard,
-            crate::ByteSpan { offset: 0, bytes },
-            false,
-            provenance,
-        )
-    }
-
     /// All these clears precede the copies. Overwriting a covered gap is safe
     /// and cheaper than another launch when the gap is sufficiently small.
     fn append_copy_clears(

@@ -158,7 +158,14 @@ impl TileGraphBuilder {
                     ShardDefinition::Value(_)
                 )
             {
-                self.append_fill_zero(body, output, operation_provenance(operation))?;
+                let bytes = shard_storage_bytes(&self.shards[output.index() as usize])?;
+                self.append_zero_range(
+                    body,
+                    output,
+                    crate::ByteSpan { offset: 0, bytes },
+                    false,
+                    operation_provenance(operation),
+                )?;
             }
         }
         self.prepare_mapped_views(

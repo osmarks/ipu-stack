@@ -48,12 +48,12 @@ impl TileGraphBuilder {
                 let initial = self.corresponding_shard(operation.inputs[index], argument)?;
                 let yielded = self.corresponding_shard(repeat.body.yields[index], argument)?;
                 let result = self.corresponding_shard(operation.results[index], argument)?;
-                self.alias_shard(argument, initial);
+                self.shards[argument.index() as usize].definition = ShardDefinition::Alias(initial);
                 if yielded != argument {
                     self.shards[yielded.index() as usize].definition =
                         ShardDefinition::WritableAlias(argument);
                 }
-                self.alias_shard(result, initial);
+                self.shards[result.index() as usize].definition = ShardDefinition::Alias(initial);
                 let tile = self.shards[argument.index() as usize].tile;
                 bindings[usize::from(tile)].carried.push(RepeatCarried {
                     initial,

@@ -33,20 +33,14 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
     let mut writes = vec![0; roots.len()];
     let mut candidates = Vec::new();
     for (index, operation) in program.body.walk().enumerate() {
-        let mut touch = |id: BlockValueId, write: bool| {
+        for (id, write) in program.accesses(operation) {
             let root = roots[id.index() as usize];
             last[root] = index + 1;
             writes[root] += usize::from(write);
-        };
+        }
         match operation {
             BlockOperation::Compute { run, .. } => {
                 let call = &program.kernel_runs[run.0 as usize];
-                for input in &call.inputs {
-                    touch(input.shard, false);
-                }
-                for output in &call.outputs {
-                    touch(output.shard, true);
-                }
                 if matches!(
                     call.kernel,
                     MidOperationKind::Cast {
@@ -57,19 +51,7 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
                     candidates.push((*run, index + 1));
                 }
             }
-            BlockOperation::Copy { copy, .. } => {
-                let copy = program.local_copies[copy.0 as usize].movement();
-                touch(copy.source, false);
-                touch(copy.destination, true);
-            }
-            BlockOperation::Exchange(phase) => {
-                for transfer in &program.exchange_phases[phase.index() as usize].transfers {
-                    touch(transfer.source.shard, false);
-                    for target in &transfer.destinations {
-                        touch(target.shard, true);
-                    }
-                }
-            }
+            BlockOperation::Copy { .. } | BlockOperation::Exchange(_) => {}
             BlockOperation::Repeat(repeat) => {
                 for id in repeat
                     .bindings
