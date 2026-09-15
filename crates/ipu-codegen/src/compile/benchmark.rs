@@ -16,9 +16,8 @@ pub struct ExpansionBenchmark {
     /// Whole-process Linux RSS, including caches and allocator-retained pages.
     pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
     pub baseline: ExpansionTiming,
-    /// Cache entries, hits and misses, respectively.
-    pub fragment_cache: (usize, u64, u64),
-    pub copy_geometry_cache: (usize, u64, u64),
+    /// A second candidate expansion with the same search cache and fresh costing state.
+    pub warm: Option<ExpansionTiming>,
     /// Matching selections are opportunities, not validated reusable graph fragments.
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
 }
@@ -55,6 +54,13 @@ pub struct SelectionReuse {
 
 #[derive(serde::Serialize)]
 pub struct ExpansionTiming {
+    pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
+    /// Cache entries, hits and misses, respectively; counters are cumulative.
+    pub fragment_cache: (usize, u64, u64),
+    pub copy_geometry_cache: (usize, u64, u64),
+    /// Capacity-based payload estimates: copy recipes, destination facts, costing geometry.
+    /// Shared traversal bodies can be counted more than once; allocator overhead is excluded.
+    pub retained_cache_bytes: (usize, usize, usize),
     pub mid_operations: usize,
     pub mid_values: usize,
     pub expand_ms: f64,
@@ -168,6 +174,40 @@ pub fn benchmark_mid_expansion(
         }
     }
     selections_in(&mid, &mid.operations, &mut selections);
+    let baseline = measure_expansion(&mid, config, &cache)?;
+    let warm = cache_enabled
+        .then(|| measure_expansion(&mid, config, &cache))
+        .transpose()?;
+    drop(mid);
+    memory.insert("after_mid_drop", process_memory());
+    Ok(ExpansionBenchmark {
+        planning_ms,
+        mid_cost_ms,
+        mid_cycles: mid_cost.total,
+        process_memory: memory,
+        baseline,
+        warm,
+        selection_reuse: selections
+            .into_iter()
+            .map(|(kind, (occurrences, keys))| {
+                (
+                    kind,
+                    SelectionReuse {
+                        occurrences,
+                        distinct: keys.len(),
+                    },
+                )
+            })
+            .collect(),
+    })
+}
+
+fn measure_expansion(
+    mid: &crate::MidProgram,
+    config: &PipelineConfig,
+    cache: &Arc<crate::low::expand::ExpansionCache>,
+) -> PackageBuildResult<ExpansionTiming> {
+    let mut memory = BTreeMap::from([("start", process_memory())]);
     let mut analysis = crate::estimate::GeometryAnalysis::default();
     let start = Instant::now();
     let expanded = crate::low::expand::expand_tiles_analyzed(
@@ -197,7 +237,12 @@ pub fn benchmark_mid_expansion(
     let cloned = std::hint::black_box(expanded.kernel_runs.clone());
     let clone_kernel_runs_ms = start.elapsed().as_secs_f64() * 1000.0;
     drop(cloned);
-    let timing = ExpansionTiming {
+    let retained = cache.retained_bytes();
+    let mut timing = ExpansionTiming {
+        process_memory: BTreeMap::new(),
+        fragment_cache: cache.stats(),
+        copy_geometry_cache: cache.geometry_stats(),
+        retained_cache_bytes: (retained.0, retained.1, analysis.retained_bytes()),
         mid_operations: mid.operations.len(),
         mid_values: mid.values.len(),
         expand_ms,
@@ -228,28 +273,9 @@ pub fn benchmark_mid_expansion(
             .map(|t| t.destinations.len())
             .sum(),
     };
-    drop((low, expanded, analysis, mid));
+    drop((low, expanded, analysis));
     memory.insert("after_plan_drop", process_memory());
+    timing.process_memory = memory;
     tracing::info!(expand_ms, tile_lists_ms, "benchmarked mid-to-low expansion");
-    Ok(ExpansionBenchmark {
-        planning_ms,
-        mid_cost_ms,
-        mid_cycles: mid_cost.total,
-        process_memory: memory,
-        baseline: timing,
-        fragment_cache: cache.stats(),
-        copy_geometry_cache: cache.geometry_stats(),
-        selection_reuse: selections
-            .into_iter()
-            .map(|(kind, (occurrences, keys))| {
-                (
-                    kind,
-                    SelectionReuse {
-                        occurrences,
-                        distinct: keys.len(),
-                    },
-                )
-            })
-            .collect(),
-    })
+    Ok(timing)
 }

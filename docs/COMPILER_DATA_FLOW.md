@@ -581,5 +581,17 @@ The fragment width is fixed by the IPU21 exchange target for this cache's lifeti
 
 [Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) found a useful
 MLP B2 improvement, marginal attention changes, and rejected broader fragment
-caches. Those measurements have not been rerun for this review. Deleting caches
-because their names overlap would discard evidence, not simplify the data flow.
+caches. The current `--benchmark-expansion` records a cold expansion and a second
+expansion with the same search cache and fresh per-candidate costing state. Each
+timing contains cache counters, capacity-based retained-payload estimates and
+process RSS samples; the latter also includes allocator-retained pages. The
+`--benchmark-expansion-uncached` variant disables the two expansion caches while
+retaining the existing per-candidate costing cache.
+
+Current MLP B2 Repeat3 measurements show 1.42 s cold / 0.95 s warm expansion,
+about 0.30 s recosting and 0.35 s footprint analysis. Expansion retains about
+35 MB of estimated payload and costing another 36 MB. The local-copy recipes
+account for only 67 KB of that expansion cache; they still include the row-launch
+heuristic in `low/copy.rs`. That selection must belong to the copy family before
+the geometry caches are consolidated. Measurements do not justify merging
+search state, low graph state and compiled kernel artifacts into one cache.

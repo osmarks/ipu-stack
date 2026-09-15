@@ -61,6 +61,31 @@ pub(crate) struct GeometryAnalysis {
     pairs: HashMap<(usize, usize), Arc<CopyGeometry>>,
 }
 impl GeometryAnalysis {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.views.capacity() * (size_of::<((CopyOrder, ViewGeometry), usize)>() + 1)
+            + self
+                .views
+                .keys()
+                .map(|(_, view)| view.heap_bytes())
+                .sum::<usize>()
+            + self.traversals.capacity() * size_of::<ByteTraversal>()
+            + self
+                .traversals
+                .iter()
+                .map(ByteTraversal::heap_bytes)
+                .sum::<usize>()
+            + self.pairs.capacity() * (size_of::<((usize, usize), Arc<CopyGeometry>)>() + 1)
+            + self
+                .pairs
+                .values()
+                .map(|pair| {
+                    size_of::<CopyGeometry>()
+                        + 2 * size_of::<usize>()
+                        + pair.receives.capacity() * size_of::<StridedSpan>()
+                })
+                .sum::<usize>()
+    }
+
     pub(crate) fn stats(&self) -> (usize, usize, usize) {
         (
             self.traversals.len(),

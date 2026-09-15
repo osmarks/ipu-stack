@@ -68,6 +68,16 @@ impl<K: Eq, V> Memo<K, V> {
         let state = self.entries.lock().unwrap();
         (state.table.len(), state.hits, state.misses)
     }
+
+    fn retained_bytes(&self, heap: impl Fn(&K, &V) -> usize) -> usize {
+        let state = self.entries.lock().unwrap();
+        state.table.capacity() * (size_of::<(u64, K, Arc<V>)>() + 1)
+            + state
+                .table
+                .iter()
+                .map(|(_, key, value)| 2 * size_of::<usize>() + size_of::<V>() + heap(key, value))
+                .sum::<usize>()
+    }
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -129,6 +139,33 @@ impl ExpansionCache {
     }
     pub(crate) fn geometry_stats(&self) -> (usize, u64, u64) {
         self.geometry.stats()
+    }
+
+    /// Capacity-based retained payload, excluding allocator bookkeeping. Shared
+    /// traversal bodies can be counted more than once; this is an upper estimate.
+    pub(crate) fn retained_bytes(&self) -> (usize, usize) {
+        (
+            self.copies.retained_bytes(|key, copies| {
+                key.source.heap_bytes()
+                    + key.destination.heap_bytes()
+                    + copies.capacity() * size_of::<CopyOperation<()>>()
+            }),
+            self.geometry.retained_bytes(|key, geometry| {
+                key.allocation.capacity() * size_of::<ShardExtent>()
+                    + key.mappings.capacity() * size_of::<GeometrySource>()
+                    + key
+                        .mappings
+                        .iter()
+                        .map(|source| {
+                            (source.allocation.capacity()
+                                + source.source.capacity()
+                                + source.destination.capacity())
+                                * size_of::<ShardExtent>()
+                        })
+                        .sum::<usize>()
+                    + geometry.heap_bytes()
+            }),
+        )
     }
 
     pub(super) fn geometry(

@@ -40,6 +40,15 @@ pub(crate) struct CopyGeometry {
 }
 
 impl CopyGeometry {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.coverage.heap_bytes()
+            + self
+                .uncovered
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .map_or(0, |spans| spans.capacity() * size_of::<ByteSpan>())
+    }
+
     pub(crate) fn analyze(
         destination: TensorStorage<'_>,
         mappings: &[CopyMapping<'_>],

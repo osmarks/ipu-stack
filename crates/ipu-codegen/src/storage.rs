@@ -54,6 +54,10 @@ pub(crate) struct ViewGeometry {
     extents: Vec<[ShardExtent; 2]>,
 }
 impl ViewGeometry {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.extents.capacity() * std::mem::size_of::<[ShardExtent; 2]>()
+    }
+
     pub(crate) fn new(shard: TensorStorage<'_>, view: &[ShardExtent]) -> StorageResult<Self> {
         validate_view(shard, view)?;
         let extents = shard
