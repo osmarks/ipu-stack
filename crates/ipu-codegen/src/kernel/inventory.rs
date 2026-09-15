@@ -54,9 +54,10 @@ impl KernelInventory {
                     }
                 },
                 TileWorkRef::Repeat(repeat) => self.collect(program, &repeat.body)?,
-                TileWorkRef::Exchange(_)
-                | TileWorkRef::LocalCopy(_)
-                | TileWorkRef::Checkpoint(..) => {}
+                TileWorkRef::LocalCopy(copy) => {
+                    self.exact_symbols.insert(copy.symbol());
+                }
+                TileWorkRef::Exchange(_) | TileWorkRef::Checkpoint(..) => {}
             }
         }
         Ok(())

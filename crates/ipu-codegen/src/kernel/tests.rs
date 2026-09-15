@@ -278,7 +278,11 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
         let specialization = plan
             .compilations
             .iter()
-            .find(|unit| !unit.retained_symbols.is_empty())
+            .find(|unit| {
+                unit.flags
+                    .iter()
+                    .any(|flag| flag.starts_with("-DGEMM_SMALL_ROWS="))
+            })
             .unwrap();
         assert_eq!(plan.compilations.len(), 3);
         assert_eq!(
@@ -308,7 +312,6 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 .iter()
                 .any(|flag| flag == "-DGEMM_SINGLE_ROWS=1")
         );
-        assert_eq!(specialization.retained_symbols.len(), 1);
         assert!(
             plan.retained_symbols()
                 .all(|symbol| !symbol.contains("accumulate"))

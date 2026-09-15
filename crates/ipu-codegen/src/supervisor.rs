@@ -1,6 +1,12 @@
 //! Emit supervisor machine code from an address-resolved tile program.
 //! Program validation is completed before instruction emission starts.
-use crate::kernel::{FIRST_INPUT_REGISTER, OUTPUT_REGISTER, RETURN_REGISTER};
+use crate::kernel::abi::{
+    FIRST_INPUT_REGISTER, LAST_VALUE_REGISTER, OUTPUT_REGISTER, RETURN_REGISTER,
+};
+use crate::runtime_layout::{
+    COMPLETE_SYMBOL, HOST_RUN_SYMBOL, PATCH_REPEAT_ARITHMETIC_SYMBOL, PATCH_REPEAT_TABLES_SYMBOL,
+    PATCH_ROW_SYMBOL, REPEAT_CALL_SYMBOL, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL,
+};
 use ipu_target::ipu21::instruction::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
     encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
@@ -17,30 +23,7 @@ mod validate;
 // encoded in the timed instructions rather than this external-stream counter.
 // Consolidated phases currently preserve that primitive-plan setting.
 const INTERNAL_EXCHANGE_DCOUNT: u32 = 1;
-const LAST_VALUE_REGISTER: u8 = 9;
 
-pub const WORKER_BARRIER_SYMBOL: &str = "ipu_stack_static_worker_barrier";
-pub const COMPLETE_SYMBOL: &str = "ipu_stack_static_complete";
-pub const COMPLETED_SYMBOL: &str = "ipu_stack_static_completed";
-pub const HOST_RUN_SYMBOL: &str = "ipu_stack_static_host_run";
-pub const REPEAT_CALL_SYMBOL: &str = "ipu_stack_static_repeat_call";
-pub const SAMPLE_CYCLE_SYMBOL: &str = "ipu_stack_static_sample_cycle";
-pub const COPY_U16_SYMBOL: &str = "static_copy_u16";
-pub const COPY_U32_SYMBOL: &str = "static_copy_u32";
-pub const COPY_U64_SYMBOL: &str = "copy_u64";
-pub const COPY_STRIDED_U32_SYMBOL: &str = "copy_strided_u32";
-pub const COPY_STRIDED_U64_SYMBOL: &str = "copy_strided_u64";
-pub const FILL_ZERO_U64_SYMBOL: &str = "fill_zero_u64";
-pub const PATCH_REPEAT_TABLES_SYMBOL: &str = "static_patch_repeat_tables";
-pub const PATCH_REPEAT_ARITHMETIC_SYMBOL: &str = "static_patch_repeat_arithmetic";
-pub const PATCH_ROW_SYMBOL: &str = "ipu_stack_static_patch_row";
-pub const RUNTIME_ENTRY_SYMBOL: &str = "ipu_stack_static_start";
-pub const PROGRAM_ADDRESS_SYMBOL: &str = "ipu_stack_static_program";
-pub const WORKER_SYNC_CONTEXT_SYMBOL: &str = "ipu_stack_static_worker_sync_context";
-pub const WORKER_STACK_BASE_SYMBOL: &str = "ipu_stack_static_worker_stack_base";
-pub const PRNG_SEED_SYMBOL: &str = "ipu_stack_static_prng_seed";
-pub const HOST_STAGING_SYMBOL: &str = "ipu_stack_static_host_staging";
-pub const COMPLETION_ADDRESS_SYMBOL: &str = "ipu_stack_static_completion";
 const PATCHED_BREAKPOINT_TRAP_BASE: u32 = 0x4180_1000;
 
 #[derive(Debug, thiserror::Error)]

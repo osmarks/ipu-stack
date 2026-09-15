@@ -530,7 +530,7 @@ pub use estimate::{ExchangeStorageEstimator, estimate_exchange_phase_storage};
 pub mod exchange;
 pub mod graph;
 mod host;
-mod kernel;
+pub mod kernel;
 mod low;
 mod memory;
 mod mid;

@@ -390,7 +390,6 @@ impl KernelBuildPlan {
                     source,
                     name,
                     flags,
-                    retained_symbols: vec![symbol],
                 });
             }
         }

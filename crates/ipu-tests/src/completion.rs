@@ -12,7 +12,7 @@ pub fn diagnose_completion(
     let completion_pc = application
         .debug_symbols
         .iter()
-        .find(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
+        .find(|symbol| symbol.name == ipu_codegen::runtime_layout::COMPLETED_SYMBOL)
         .map(|symbol| symbol.address);
     let deadline = Instant::now() + timeout;
     let mut completed = std::collections::BTreeSet::new();
@@ -106,7 +106,7 @@ pub fn report_kernel_faults(
         application
             .debug_symbols
             .iter()
-            .filter(|symbol| symbol.name == ipu_codegen::COMPLETED_SYMBOL)
+            .filter(|symbol| symbol.name == ipu_codegen::runtime_layout::COMPLETED_SYMBOL)
             .collect::<Vec<_>>()
     );
     for (logical, case) in cases.into_iter().enumerate() {

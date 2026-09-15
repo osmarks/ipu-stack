@@ -8,6 +8,7 @@ use crate::low::storage::{StorageAccess, bind_storage};
 use crate::storage::ByteSpan;
 use crate::storage::{CopyPair, StorageResult};
 use crate::{BlockValue, BlockValueId, CopyOperation, CopyPattern, LocalCopy};
+
 use ipu_target::ipu21::WORKER_CONTEXTS;
 
 /// Coarse launch allowance when mid has not selected a local helper yet.
@@ -31,11 +32,11 @@ impl CopyKernel {
     }
     fn symbol(self) -> &'static str {
         match self {
-            Self::U16 => crate::COPY_U16_SYMBOL,
-            Self::U32 => crate::COPY_U32_SYMBOL,
-            Self::U64 => crate::COPY_U64_SYMBOL,
-            Self::StridedU32 => crate::COPY_STRIDED_U32_SYMBOL,
-            Self::StridedU64 => crate::COPY_STRIDED_U64_SYMBOL,
+            Self::U16 => crate::kernel::abi::COPY_U16_SYMBOL,
+            Self::U32 => crate::kernel::abi::COPY_U32_SYMBOL,
+            Self::U64 => crate::kernel::abi::COPY_U64_SYMBOL,
+            Self::StridedU32 => crate::kernel::abi::COPY_STRIDED_U32_SYMBOL,
+            Self::StridedU64 => crate::kernel::abi::COPY_STRIDED_U64_SYMBOL,
         }
     }
 }
@@ -705,18 +706,18 @@ mod tests {
             let run = CopyRun::bind(copy.clone(), &shards).unwrap();
             let symbol = run.symbol();
             let arguments = run.call().arguments;
-            if symbol == crate::COPY_U64_SYMBOL {
+            if symbol == crate::kernel::abi::COPY_U64_SYMBOL {
                 assert!(copy.source_offset.is_multiple_of(8));
                 assert!(copy.destination_offset.is_multiple_of(8));
                 assert!(arguments[0] != 0);
                 assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
                 assert!(arguments[1] < 6);
-            } else if symbol == crate::COPY_U32_SYMBOL {
+            } else if symbol == crate::kernel::abi::COPY_U32_SYMBOL {
                 assert!(copy.source_offset.is_multiple_of(4));
                 assert!(copy.destination_offset.is_multiple_of(4));
                 assert_eq!(arguments, [words]);
             } else {
-                assert_eq!(symbol, crate::COPY_U16_SYMBOL);
+                assert_eq!(symbol, crate::kernel::abi::COPY_U16_SYMBOL);
                 assert_eq!(arguments, [bytes / 2]);
             }
         }
@@ -749,7 +750,7 @@ mod tests {
                 let run = CopyRun::bind(copies[0].clone(), &shards).unwrap();
                 let symbol = run.symbol();
                 let args = run.call().arguments;
-                assert_eq!(symbol, crate::COPY_STRIDED_U32_SYMBOL);
+                assert_eq!(symbol, crate::kernel::abi::COPY_STRIDED_U32_SYMBOL);
                 assert_eq!(args, [width / 4, rows, source_stride, destination_stride]);
                 let source = (0..offset + rows * source_stride)
                     .map(|i| (i % 251) as u8)

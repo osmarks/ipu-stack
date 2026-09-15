@@ -367,13 +367,13 @@ fn fill_call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     let bytes = output_byte_count(run)?;
     if !bytes.is_multiple_of(8) {
         return Err(KernelAbiError::UnsupportedElementCount {
-            symbol: crate::FILL_ZERO_U64_SYMBOL,
+            symbol: crate::kernel::abi::FILL_ZERO_U64_SYMBOL,
             count: bytes,
             divisor: 8,
         });
     }
     Ok(KernelCall::exact(
-        crate::FILL_ZERO_U64_SYMBOL,
+        crate::kernel::abi::FILL_ZERO_U64_SYMBOL,
         vec![bytes / 8 / 6, bytes / 8 % 6],
     ))
 }

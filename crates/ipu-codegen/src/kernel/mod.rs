@@ -1,6 +1,6 @@
 //! Kernel ABI, specialization recipes, and placed call materialization.
 
-mod abi;
+pub mod abi;
 pub(crate) mod copy;
 pub(crate) use copy::CopyRun;
 mod attention;
@@ -19,7 +19,6 @@ mod spec;
 pub use spec::*;
 #[cfg(test)]
 mod tests;
-pub(crate) use abi::*;
 use attention::AttentionKernelShape;
 pub(crate) use attention::softmax_workspaces;
 pub(crate) use binding::*;
@@ -29,10 +28,12 @@ use inventory::*;
 use rearrange::{RearrangeTarget, UnpackSource};
 
 use crate::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
+
 use crate::{
     AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, KernelRun,
     LowProgram, Precision, StepProfile, StorageError, TileAddress, TileWorkList, TileWorkRef,
 };
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Resolves one scheduled call after placement has assigned each shard base.

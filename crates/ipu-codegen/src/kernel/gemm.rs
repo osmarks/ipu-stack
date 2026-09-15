@@ -176,7 +176,6 @@ impl KernelBuildPlan {
                 source,
                 name: dispatch.clone(),
                 flags,
-                retained_symbols: vec![],
             });
         }
         let weight_suffix = if output_group == 0 {
@@ -210,7 +209,6 @@ impl KernelBuildPlan {
                 source,
                 name: worker,
                 flags,
-                retained_symbols: vec![],
             });
         }
         for pair in values.chunks(2) {
@@ -261,14 +259,9 @@ impl KernelBuildPlan {
             if weights == GemmWeightLoad::Interleaved {
                 flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
             }
-            let retained_symbols = symbols
-                .into_iter()
-                .zip(variants)
-                .enumerate()
-                .filter_map(|(index, (symbol, (mode, _, rows)))| {
-                    if !used.contains(&(rows, mode)) || (index % 2 != 0 && single_rows) {
-                        return None;
-                    }
+            for (index, (symbol, (mode, _, rows))) in symbols.into_iter().zip(variants).enumerate()
+            {
+                if used.contains(&(rows, mode)) && (index % 2 == 0 || !single_rows) {
                     self.symbols.insert(
                         KernelImplementation::Gemm(
                             precision,
@@ -279,18 +272,16 @@ impl KernelBuildPlan {
                             rows,
                             output_group,
                         ),
-                        symbol.clone(),
+                        symbol,
                     );
-                    Some(symbol)
-                })
-                .collect();
+                }
+            }
             self.compilations.push(KernelCompilation {
                 source,
                 name: format!(
                     "gemm_{prefix}{weight_suffix}_k{inner_block}_c{output_columns}_r{small}_r{large}"
                 ),
                 flags,
-                retained_symbols,
             });
         }
     }

@@ -21,13 +21,16 @@ use crate::memory::{
     MemoryAllocation, MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE,
     RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
 };
+use crate::runtime_layout::{
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, HOST_RUN_SYMBOL, PRNG_SEED_SYMBOL,
+    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
+    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL,
+};
 use crate::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, CodegenOptions, HOST_RUN_SYMBOL, KernelBuildPlan,
-    PRNG_SEED_SYMBOL, PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL,
-    SAMPLE_CYCLE_SYMBOL, TileProgram, TileProgramLowering, WORKER_BARRIER_SYMBOL,
-    WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL, emit, shard_storage_bytes,
+    CodegenOptions, KernelBuildPlan, TileProgram, TileProgramLowering, emit, shard_storage_bytes,
 };
 use crate::{PipelineConfig, Precision, TileGraph};
+
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
 use ipu_package::loader_abi::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_package::{
@@ -37,7 +40,7 @@ use ipu_package::{
     SEGMENT_WRITE, Segment, TileImage, TileProfilePlan,
 };
 use rayon::prelude::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::num::TryFromIntError;
 
@@ -706,44 +709,19 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
-        symbols.push(crate::PATCH_ROW_SYMBOL.into());
+        symbols.push(crate::runtime_layout::PATCH_ROW_SYMBOL.into());
         if !program.repeat_runs.is_empty() {
-            symbols.push(crate::PATCH_REPEAT_TABLES_SYMBOL.into());
-            symbols.push(crate::PATCH_REPEAT_ARITHMETIC_SYMBOL.into());
+            symbols.push(crate::runtime_layout::PATCH_REPEAT_TABLES_SYMBOL.into());
+            symbols.push(crate::runtime_layout::PATCH_REPEAT_ARITHMETIC_SYMBOL.into());
         }
     }
     if config.profiling {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {
-        symbols.push(crate::HOST_RUN_SYMBOL.into());
-        symbols.push(crate::REPEAT_CALL_SYMBOL.into());
+        symbols.push(crate::runtime_layout::HOST_RUN_SYMBOL.into());
+        symbols.push(crate::runtime_layout::REPEAT_CALL_SYMBOL.into());
     }
-    fn collect(
-        program: &LowProgram,
-        tile: &crate::TileWorkList,
-        symbols: &mut BTreeSet<&'static str>,
-    ) {
-        for work in program.work(tile) {
-            match work {
-                crate::TileWorkRef::LocalCopy(copy) => {
-                    symbols.insert(copy.symbol());
-                }
-                crate::TileWorkRef::Kernel(run)
-                    if matches!(run.kernel, crate::TileKernelSpec::FillZero { .. }) =>
-                {
-                    symbols.insert(crate::FILL_ZERO_U64_SYMBOL);
-                }
-                crate::TileWorkRef::Repeat(repeat) => collect(program, &repeat.body, symbols),
-                _ => {}
-            }
-        }
-    }
-    let mut copies = BTreeSet::new();
-    for tile in &program.tiles {
-        collect(program, tile, &mut copies);
-    }
-    symbols.extend(copies.into_iter().map(String::from));
     symbols
 }
 
@@ -768,7 +746,10 @@ fn runtime_symbols(
         (PRNG_SEED_SYMBOL.into(), prng_seed),
         (PROGRAM_ADDRESS_SYMBOL.into(), program_address),
         (COMPLETION_ADDRESS_SYMBOL.into(), COMPLETION_ADDRESS),
-        (crate::HOST_STAGING_SYMBOL.into(), host_staging_address),
+        (
+            crate::runtime_layout::HOST_STAGING_SYMBOL.into(),
+            host_staging_address,
+        ),
     ]))
 }
 

@@ -7,12 +7,12 @@ pub struct KernelCompilation {
     pub source: &'static str,
     pub name: String,
     pub flags: Vec<String>,
-    pub retained_symbols: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct KernelBuildPlan {
     pub compilations: Vec<KernelCompilation>,
+    /// All callable entry points, including kernels supplied by the runtime object.
     pub(super) symbols: BTreeMap<KernelImplementation, String>,
 }
 
@@ -36,7 +36,13 @@ impl KernelBuildPlan {
             attention,
             attention_stages,
         } = inventory;
-        let mut plan = Self::default();
+        let mut plan = Self {
+            compilations: Vec::new(),
+            symbols: exact_symbols
+                .iter()
+                .map(|&symbol| (KernelImplementation::Exact(symbol), symbol.to_owned()))
+                .collect(),
+        };
         for (configuration, rows) in rows {
             plan.add_gemm(configuration, rows);
         }
@@ -73,13 +79,11 @@ impl KernelBuildPlan {
                         source,
                         name: format!("{symbol}_codelet"),
                         flags: codelet_flags,
-                        retained_symbols: vec![],
                     },
                     KernelCompilation {
                         source: wrapper,
                         name: format!("{symbol}_wrapper"),
                         flags,
-                        retained_symbols: vec![symbol.into()],
                     },
                 ]);
             }
@@ -104,7 +108,6 @@ impl KernelBuildPlan {
                     source,
                     name: symbol.into(),
                     flags: extra.into_iter().map(str::to_owned).collect(),
-                    retained_symbols: vec![symbol.into()],
                 });
             }
         }
@@ -113,7 +116,6 @@ impl KernelBuildPlan {
                 source: "reduce_add_f16.S",
                 name: "reduce_add_f16".into(),
                 flags: Vec::new(),
-                retained_symbols: vec!["reduce_sum_f16".into()],
             });
         }
         if exact_symbols.contains("cast_f32_f16") {
@@ -186,7 +188,6 @@ impl KernelBuildPlan {
                 source: "worker_support.S",
                 name: "worker_support".into(),
                 flags: Vec::new(),
-                retained_symbols: Vec::new(),
             });
         }
         Ok(plan)
@@ -206,7 +207,6 @@ impl KernelBuildPlan {
             source,
             name: format!("{symbol}_codelet"),
             flags,
-            retained_symbols: Vec::new(),
         });
         let arguments = registers
             .iter()
@@ -223,7 +223,6 @@ impl KernelBuildPlan {
                 format!("-DWORKER_ARGUMENTS={arguments}"),
                 format!("-DWORKER_FRAME_BYTES={frame_bytes}"),
             ],
-            retained_symbols: vec![symbol.to_owned()],
         });
         self.compilations.last_mut().unwrap()
     }
@@ -243,8 +242,6 @@ impl KernelBuildPlan {
     }
 
     pub fn retained_symbols(&self) -> impl Iterator<Item = &str> {
-        self.compilations
-            .iter()
-            .flat_map(|compilation| compilation.retained_symbols.iter().map(String::as_str))
+        self.symbols.values().map(String::as_str)
     }
 }

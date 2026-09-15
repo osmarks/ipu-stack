@@ -79,6 +79,13 @@ the configured window base; it does not select a runtime address. Rust and
 register IDs, supervisor opcodes and runtime layout. [build/abi.rs](../build/abi.rs)
 generates the Rust declarations; assembly includes the inputs through `.set`.
 
+Worker register assignments and resident copy/fill entry points belong to
+[kernel/abi.rs](../crates/ipu-codegen/src/kernel/abi.rs). Runtime function and data
+symbols belong to `runtime_layout`; supervisor emission imports both contracts.
+Kernel inventory collects ordinary kernels and local copies together. Its symbol
+map supplies linker retention, so package assembly does not scan copies/fills
+again and compilation recipes do not carry a second list of entry points.
+
 
 ## Production control flow
 

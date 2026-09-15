@@ -59,7 +59,7 @@ pub fn build_tile_program_package(
         collect_compute_symbols(&mut retained_runtime, &program.steps);
     }
     if !aperture.is_empty() {
-        retained_runtime.push(crate::COPY_U32_SYMBOL.into());
+        retained_runtime.push(crate::kernel::abi::COPY_U32_SYMBOL.into());
     }
     retained_runtime.sort_unstable();
     retained_runtime.dedup();
@@ -136,7 +136,7 @@ pub fn build_tile_program_package(
         programs[tile].steps.insert(
             0,
             crate::TileStep::Compute(crate::ComputeStep {
-                symbol: crate::COPY_U32_SYMBOL.into(),
+                symbol: crate::kernel::abi::COPY_U32_SYMBOL.into(),
                 output_address: crate::TileAddress::Absolute(segment.address),
                 input_addresses: vec![crate::TileAddress::Absolute(staging.start)],
                 arguments: vec![bytes / 4],

@@ -548,6 +548,7 @@ fn profile_address(base: u32, index: usize) -> PackageBuildResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn active_tiles_with_empty_repeat_bodies_have_complete_samples() {

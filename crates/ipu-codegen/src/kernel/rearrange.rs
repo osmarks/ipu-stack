@@ -167,7 +167,6 @@ impl KernelBuildPlan {
                 source: "unpack_transposed_amp_f16.S",
                 name: format!("unpack_transposed_amp_f16_{suffix}"),
                 flags,
-                retained_symbols: vec![call],
             });
         } else {
             flags.extend([
@@ -244,7 +243,6 @@ impl KernelBuildPlan {
                 source,
                 name: format!("rearrange_f16_codelet_{suffix}"),
                 flags,
-                retained_symbols: vec![call],
             });
         } else {
             flags.extend([
