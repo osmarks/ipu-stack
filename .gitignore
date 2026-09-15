@@ -8,6 +8,8 @@ __pycache__/
 *.o
 *.capnp
 *.html
+!docs/module-map.html
+!scripts/module-map/template.html
 !crates/ipu-cli/src/profile_viewer.html
 perf.data
 bugs.md

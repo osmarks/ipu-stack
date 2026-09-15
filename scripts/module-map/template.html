@@ -1,0 +1,22 @@
+<!doctype html><meta charset="utf-8"><title>Module dependencies and production LOC</title>
+<style>
+body{font:16px Georgia,serif;color:#111;background:#fff;max-width:1600px;margin:30px auto;padding:0 25px}h1{font-size:28px}a{color:#111}button,input,select{font:14px monospace;background:white;color:#111;border:1px solid #777;padding:7px}button{cursor:pointer}section{border:1px solid #555;margin:20px 0;padding:15px}table{border-collapse:collapse;font:13px monospace}td,th{text-align:left;padding:6px 12px;border-bottom:1px solid #ddd}td.num{text-align:right}pre{white-space:pre-wrap;font-size:12px}#matrix{overflow:auto;max-height:850px}#matrix th.vertical{writing-mode:vertical-rl;vertical-align:bottom;height:160px;padding:6px 3px}#matrix td.cell{padding:0;width:25px;min-width:25px;height:25px;text-align:center;cursor:pointer;border:1px solid #eee}#matrix td.hit{background:#333;color:white}#matrix td.cell:hover{outline:2px solid #bb5500;outline-offset:-2px}#matrix th.row{white-space:nowrap}#matrix td.self{background:#ddd}summary{cursor:pointer}#evidence{max-height:350px;overflow:auto}#loc{max-height:650px;overflow:auto}.muted{color:#555}
+</style>
+<h1>Module dependencies and production LOC</h1>
+<p id="summary"></p>
+<section><label>Dependency scope <select id="scope"><option value="overview">Overview</option><option value="all">All Rust modules</option></select></label>
+<div id="matrix"></div><pre id="evidence"></pre></section>
+<section><label>Module LOC <input id="filter" placeholder="Filter modules…"></label> <button id="sort">Sort by subtree LOC</button><div id="loc"></div></section>
+<script>
+const D=DATA_JSON;
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('"','&quot;');
+const group=m=>m.startsWith('ipu_codegen::')?m.split('::').slice(0,2).join('::'):m.split('::')[0];
+document.querySelector('#summary').textContent=D.files.reduce((n,r)=>n+r.lines,0).toLocaleString()+' production LOC · '+D.edges.length.toLocaleString()+' dependencies';
+const scope=document.querySelector('#scope');Object.keys(D.groups).filter(x=>x.startsWith('ipu_codegen')).sort().forEach(m=>scope.add(new Option(m,m)));
+let E=[],N=[];
+function matrix(){const s=scope.value;let aggregate=s==='overview';E=D.edges.map(e=>({...e,source:aggregate?group(e.source):e.source,target:aggregate?group(e.target):e.target})).filter(e=>e.source!==e.target);N=aggregate?Object.keys(D.groups).filter(x=>x!=='device').sort():D.modules.filter(m=>D.files.some(f=>f.module===m.module&&f.path.endsWith('.rs')&&f.lines)&&(s==='all'||m.module===s||m.module.startsWith(s+'::'))).map(m=>m.module).sort();let pairs=new Set(E.map(e=>e.source+'|'+e.target));document.querySelector('#matrix').innerHTML='<table><thead><tr><th>↓ source / target →</th>'+N.map(n=>'<th class="vertical">'+esc(n)+'</th>').join('')+'</tr></thead><tbody>'+N.map((a,i)=>'<tr><th class="row" data-row="'+i+'">'+esc(a)+'</th>'+N.map((b,j)=>'<td class="cell '+(a===b?'self':pairs.has(a+'|'+b)?'hit':'')+'" data-a="'+i+'" data-b="'+j+'">'+(pairs.has(a+'|'+b)?'●':'')+'</td>').join('')+'</tr>').join('')+'</tbody></table>';}
+document.querySelector('#matrix').onclick=e=>{let t=e.target;if(t.dataset.row!==undefined){let n=N[+t.dataset.row],out=E.filter(x=>x.source===n),inc=E.filter(x=>x.target===n);document.querySelector('#evidence').textContent=n+'\n\nDepends on:\n'+[...new Set(out.map(e=>e.target))].sort().join('\n')+'\n\nUsed by:\n'+[...new Set(inc.map(e=>e.source))].sort().join('\n');}else if(t.dataset.a!==undefined){let a=N[+t.dataset.a],b=N[+t.dataset.b];document.querySelector('#evidence').textContent=a+' → '+b+'\n\n'+E.filter(e=>e.source===a&&e.target===b).flatMap(e=>e.evidence).join('\n');}};
+scope.onchange=matrix;matrix();let bySize=true;
+function loc(){let q=document.querySelector('#filter').value.toLowerCase(),rows=D.modules.filter(m=>m.module.toLowerCase().includes(q)).sort((a,b)=>bySize?b.subtree_loc-a.subtree_loc:a.module.localeCompare(b.module));document.querySelector('#loc').innerHTML='<table><tr><th>Module</th><th>Own LOC</th><th>Subtree LOC</th></tr>'+rows.map(r=>'<tr><td>'+esc(r.module)+'</td><td class="num">'+r.own_loc.toLocaleString()+'</td><td class="num">'+r.subtree_loc.toLocaleString()+'</td></tr>').join('')+'</table>';}
+document.querySelector('#filter').oninput=loc;document.querySelector('#sort').onclick=()=>{bySize=!bySize;document.querySelector('#sort').textContent=bySize?'Sort by subtree LOC':'Sort by name';loc();};loc();
+</script>
