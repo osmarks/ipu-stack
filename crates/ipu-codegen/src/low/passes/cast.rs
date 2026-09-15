@@ -2,81 +2,34 @@
 //! This pass owns the storage decision; kernel::cast owns the chunk geometry.
 
 use crate::kernel::cast::{CAST_PREFIX_BYTES, CastChunks};
-use crate::low::storage::{shard_storage_bytes, storage_root};
+use crate::low::storage::shard_storage_bytes;
 use crate::low::*;
 use crate::{MidOperationKind, Precision};
 use std::collections::BTreeMap;
 
 pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
-    let roots = program
-        .shards
-        .iter()
-        .map(|s| storage_root(&program.shards, s.id).index() as usize)
-        .collect::<Vec<_>>();
-    let mut aliases = vec![0; roots.len()];
-    for &root in &roots {
-        aliases[root] += 1;
-    }
-    let mut protected = vec![false; roots.len()];
-    let mut bound = vec![false; roots.len()];
-    for value in program
-        .inputs
-        .iter()
-        .map(|i| i.value)
-        .chain(program.outputs.iter().copied())
-    {
-        for view in program.value_views(value) {
-            protected[roots[view.shard.index() as usize]] = true;
-        }
-    }
-    let mut last = vec![0; roots.len()];
-    let mut writes = vec![0; roots.len()];
-    let mut candidates = Vec::new();
-    for (index, operation) in program.body.walk().enumerate() {
-        for (id, write) in program.accesses(operation) {
-            let root = roots[id.index() as usize];
-            last[root] = index + 1;
-            writes[root] += usize::from(write);
-        }
-        match operation {
-            BlockOperation::Compute { run, .. } => {
-                let call = &program.kernel_runs[run.0 as usize];
-                if matches!(
-                    call.kernel,
+    let mut uses = crate::low::uses::StorageUses::analyze(program);
+    let roots = &uses.roots;
+    let candidates = program
+        .body
+        .walk()
+        .enumerate()
+        .filter_map(|(index, operation)| {
+            if let BlockOperation::Compute { run, .. } = operation
+                && matches!(
+                    program.kernel_runs[run.0 as usize].kernel,
                     MidOperationKind::Cast {
                         from: Precision::F16,
                         to: Precision::F8F143 { .. }
                     }
-                ) {
-                    candidates.push((*run, index + 1));
-                }
+                )
+            {
+                Some((*run, index + 1))
+            } else {
+                None
             }
-            BlockOperation::Copy { .. } | BlockOperation::Exchange(_) => {}
-            BlockOperation::Repeat(repeat) => {
-                for id in repeat
-                    .bindings
-                    .iter()
-                    .flat_map(BlockRepeatBinding::bound_shards)
-                {
-                    protected[roots[id.index() as usize]] = true;
-                    bound[roots[id.index() as usize]] = true;
-                }
-            }
-            BlockOperation::Checkpoint(id, _) => {
-                for (_, values) in program
-                    .checkpoints
-                    .iter()
-                    .filter(|(source, _)| source == id)
-                {
-                    for &value in values {
-                        for view in program.value_views(value) {
-                            protected[roots[view.shard.index() as usize]] = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
     let mut replacements = BTreeMap::new();
     let mut metadata = Vec::new();
     for (id, index) in candidates {
@@ -91,13 +44,14 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
         // Read-only alias elimination may have exposed a shared or persistent
         // donor. Require independent, fully selected scratch on both sides.
         if from == to
-            || aliases[from] != 1
-            || aliases[to] != 1
-            || protected[from]
-            || bound[to]
-            || writes[from] == 0
-            || writes[to] != 1
-            || last[from] != index
+            || uses.allocations[from].aliases != 1
+            || uses.allocations[to].aliases != 1
+            || uses.allocations[from].external
+            || uses.allocations[from].boundary
+            || uses.allocations[to].boundary
+            || uses.allocations[from].writes == 0
+            || uses.allocations[to].writes != 1
+            || uses.allocations[from].last != index
             || input.extents != source.extents
             || output.extents != target.extents
             || input.extents != output.extents
@@ -121,8 +75,8 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
             source: input.shard,
             offset: -(CAST_PREFIX_BYTES as i32),
         };
-        aliases[from] += 1;
-        aliases[to] += 1;
+        uses.allocations[from].aliases += 1;
+        uses.allocations[to].aliases += 1;
         let mut calls = Vec::new();
         for (start, end) in chunks.ranges {
             let (mut input, mut output) = (input.clone(), output.clone());
@@ -249,6 +203,147 @@ mod tests {
     fn expand(mid: &MidProgram, enabled: bool) -> std::sync::Arc<TileGraph> {
         crate::low::expand::expand_tiles_cached(mid, false, enabled, std::sync::Arc::default())
             .unwrap()
+    }
+
+    #[test]
+    fn checkpoint_reads_extend_donor_lifetimes() {
+        for after_cast in [false, true] {
+            let mid = fixture(ElementOrder::RowMajor, &[65536]);
+            let mut graph = (*expand(&mid, false)).clone();
+            let checkpoint = serde_json::from_str("0").unwrap();
+            graph.checkpoints = vec![(checkpoint, vec![MidValueId::from_index(1)])];
+            let cast = graph.body.operations.iter().position(|op| matches!(op,
+                BlockOperation::Compute { run, .. }
+                    if matches!(graph.kernel_runs[run.0 as usize].kernel, MidOperationKind::Cast { .. })
+            )).unwrap();
+            graph.body.operations.insert(
+                cast + usize::from(after_cast),
+                BlockOperation::Checkpoint(checkpoint, 0),
+            );
+            donate(&mut graph).unwrap();
+            assert_eq!(
+                graph
+                    .shards
+                    .iter()
+                    .any(|shard| matches!(shard.definition, ShardDefinition::ShiftedAlias { .. })),
+                !after_cast
+            );
+            crate::place(&crate::low::lower_to_tiles(
+                &std::sync::Arc::new(graph),
+                false,
+            ))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn repeat_reentry_keeps_outer_donors_live() {
+        for producer_inside in [false, true] {
+            let mid = fixture(ElementOrder::RowMajor, &[65536]);
+            let mut graph = (*expand(&mid, false)).clone();
+            let body = graph
+                .body
+                .operations
+                .split_off(usize::from(!producer_inside));
+            graph
+                .body
+                .operations
+                .push(BlockOperation::Repeat(Box::new(BlockRepeat {
+                    provenance: graph.kernel_runs[0].provenance,
+                    count: 2,
+                    // A direct capture still needs protection across iterations.
+                    bindings: vec![],
+                    body: BlockRegion { operations: body },
+                })));
+            donate(&mut graph).unwrap();
+            assert_eq!(
+                graph
+                    .shards
+                    .iter()
+                    .any(|shard| matches!(shard.definition, ShardDefinition::ShiftedAlias { .. })),
+                producer_inside
+            );
+            crate::place(&crate::low::lower_to_tiles(
+                &std::sync::Arc::new(graph),
+                false,
+            ))
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn nested_repeat_bindings_propagate_mutability() {
+        let mid = fixture(ElementOrder::RowMajor, &[65536]);
+        let mut graph = (*expand(&mid, false)).clone();
+        let source = graph.value_views(MidValueId::from_index(0))[0].shard;
+        let mut arguments = Vec::new();
+        for _ in 0..2 {
+            let mut shard = graph.shards[source.index() as usize].clone();
+            shard.id = BlockValueId::from_index(graph.shards.len() as u32);
+            shard.definition = ShardDefinition::Staging;
+            arguments.push(shard.id);
+            graph.shards.push(shard);
+        }
+        let copy = crate::kernel::CopyRun::bind(
+            LocalCopy {
+                source,
+                destination: arguments[1],
+                source_offset: 0,
+                destination_offset: 0,
+                bytes: 32,
+                pattern: CopyPattern::Contiguous,
+            },
+            &graph.shards,
+        )
+        .unwrap();
+        let id = LocalCopyId(graph.local_copies.len() as u32);
+        graph.local_copies.push(copy);
+        let mut body = BlockRegion {
+            operations: vec![BlockOperation::Copy { tile: 0, copy: id }],
+        };
+        for (input, argument, iterated) in [
+            (arguments[0], arguments[1], true),
+            (source, arguments[0], false),
+        ] {
+            body = BlockRegion {
+                operations: vec![BlockOperation::Repeat(Box::new(BlockRepeat {
+                    provenance: graph.kernel_runs[0].provenance,
+                    count: 2,
+                    bindings: vec![BlockRepeatBinding {
+                        tile: 0,
+                        carried: vec![],
+                        invariants: if iterated {
+                            vec![]
+                        } else {
+                            vec![RepeatInvariant { input, argument }]
+                        },
+                        iterated: if iterated {
+                            vec![RepeatIterated {
+                                inputs: vec![input; 2],
+                                argument,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    }],
+                    body,
+                }))],
+            };
+        }
+        graph.body = body;
+        let uses = crate::low::uses::StorageUses::analyze(&graph);
+        for id in [source, arguments[0], arguments[1]] {
+            let allocation = &uses.allocations[uses.roots[id.index() as usize]];
+            assert!(
+                !allocation.read_only,
+                "a nested argument write can modify {id:?}"
+            );
+            assert!(allocation.boundary);
+        }
+        assert_eq!(
+            uses.allocations[uses.roots[source.index() as usize]].last,
+            usize::MAX
+        );
     }
 
     #[test]

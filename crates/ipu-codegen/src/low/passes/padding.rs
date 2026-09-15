@@ -12,40 +12,6 @@ use crate::mid::MidOperationKind;
 use crate::tensor::{AmpOrder, ElementOrder, Precision};
 use std::collections::BTreeSet;
 
-fn non_kernel_read_storage(program: &TileGraph) -> BTreeSet<BlockValueId> {
-    let root = |id| storage_root(&program.shards, id);
-    let mut forbidden = program
-        .outputs
-        .iter()
-        .flat_map(|&output| {
-            program
-                .value_views(output)
-                .iter()
-                .map(|view| root(view.shard))
-        })
-        .collect::<BTreeSet<_>>();
-    // Kernels have a padding-specific proof below. Other reads and storage
-    // exposed across Repeat boundaries conservatively prevent clear removal.
-    for operation in program.body.walk() {
-        match operation {
-            BlockOperation::Compute { .. } => {}
-            BlockOperation::Repeat(repeat) => forbidden.extend(
-                repeat
-                    .bindings
-                    .iter()
-                    .flat_map(BlockRepeatBinding::bound_shards)
-                    .map(root),
-            ),
-            _ => forbidden.extend(
-                program
-                    .accesses(operation)
-                    .filter_map(|(id, write)| (!write).then(|| root(id))),
-            ),
-        }
-    }
-    forbidden
-}
-
 /// Row-major FP8 packing reads only logical columns/rows and writes its own
 /// output padding. Drop input padding clears when that is the sole reader.
 #[tracing::instrument(skip_all)]
@@ -54,7 +20,14 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
     let kernels = &program.kernel_runs;
     let root = |id| storage_root(shards, id);
     let mut candidates = BTreeSet::new();
-    let mut forbidden = non_kernel_read_storage(program);
+    let uses = crate::low::uses::StorageUses::analyze(program);
+    let mut forbidden = uses
+        .allocations
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| use_.non_kernel_read)
+        .map(|(id, _)| BlockValueId::from_index(id as u32))
+        .collect::<BTreeSet<_>>();
     for run in program.kernel_calls() {
         for view in &run.inputs {
             let block = &shards[view.shard.index() as usize];
@@ -184,7 +157,14 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
         }
     }
     let mut candidates = BTreeSet::new();
-    let mut forbidden = non_kernel_read_storage(program);
+    let uses = crate::low::uses::StorageUses::analyze(program);
+    let mut forbidden = uses
+        .allocations
+        .iter()
+        .enumerate()
+        .filter(|(_, use_)| use_.non_kernel_read)
+        .map(|(id, _)| BlockValueId::from_index(id as u32))
+        .collect::<BTreeSet<_>>();
     for run in program.kernel_calls() {
         // Parameter packing supplies exact zero coefficients beyond logical K.
         // Only the activation operand can therefore tolerate arbitrary finite K

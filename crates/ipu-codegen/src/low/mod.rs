@@ -4,6 +4,7 @@ mod copy;
 pub(crate) mod expand;
 mod graph;
 mod passes;
+pub(crate) mod uses;
 pub(crate) mod storage;
 pub use copy::*;
 pub use expand::{ExpansionError, ExpansionResult};

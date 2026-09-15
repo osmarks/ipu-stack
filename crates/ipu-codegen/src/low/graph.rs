@@ -319,49 +319,6 @@ pub struct TileGraph {
 }
 
 impl TileGraph {
-    /// Direct accesses of one operation, retaining selected shard identities.
-    /// Repeat bindings are boundary storage, not accesses; walk the body and
-    /// handle bound_shards separately. Checkpoints likewise need caller policy.
-    pub(crate) fn accesses<'a>(
-        &'a self,
-        operation: &'a BlockOperation,
-    ) -> impl Iterator<Item = (BlockValueId, bool)> + 'a {
-        let (kernel, copy, transfers) = match operation {
-            BlockOperation::Compute { run, .. } => {
-                (Some(&self.kernel_runs[run.0 as usize]), None, &[][..])
-            }
-            BlockOperation::Copy { copy, .. } => (
-                None,
-                Some(self.local_copies[copy.0 as usize].movement()),
-                &[][..],
-            ),
-            BlockOperation::Exchange(id) => (
-                None,
-                None,
-                self.exchange_phases[id.index() as usize]
-                    .transfers
-                    .as_slice(),
-            ),
-            BlockOperation::Repeat(_) | BlockOperation::Checkpoint(..) => (None, None, &[][..]),
-        };
-        kernel
-            .into_iter()
-            .flat_map(|run| {
-                run.inputs
-                    .iter()
-                    .map(|view| (view.shard, false))
-                    .chain(run.outputs.iter().map(|view| (view.shard, true)))
-            })
-            .chain(
-                copy.into_iter()
-                    .flat_map(|copy| [(copy.source, false), (copy.destination, true)]),
-            )
-            .chain(transfers.iter().flat_map(|transfer| {
-                std::iter::once((transfer.source.shard, false))
-                    .chain(transfer.destinations.iter().map(|view| (view.shard, true)))
-            }))
-    }
-
     pub fn value_views(&self, value: MidValueId) -> &[ShardView] {
         &self.value_views[value.index() as usize]
     }
