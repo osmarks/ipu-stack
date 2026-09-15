@@ -2,7 +2,7 @@
 //! Distributed algorithms and intermediate tensor layouts were selected in mid.
 
 use crate::graph::OperationId;
-use crate::kernel::TileKernelSpec;
+use crate::kernel::{CopyRun, TileKernelSpec};
 use crate::kernel::{KernelRequirements, MemoryOperand};
 use crate::mid::{MidInput, MidValue, MidValueId};
 use crate::storage::CopyOrder;
@@ -311,7 +311,7 @@ pub struct TileGraph {
     pub inputs: Vec<MidInput>,
     pub body: BlockRegion,
     pub kernel_runs: Vec<KernelRun>,
-    pub local_copies: Vec<LocalCopy>,
+    pub local_copies: Vec<CopyRun>,
     /// Concrete reads indexed by MidValueId, including borrowed selections.
     /// Logical shapes remain in logical_values; backing strides belong to shards.
     pub value_views: Vec<Vec<ShardView>>,

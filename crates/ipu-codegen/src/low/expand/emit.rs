@@ -91,7 +91,7 @@ impl TileGraphBuilder {
         &mut self,
         tiles: &mut BlockRegion,
         tile: u16,
-        copy: LocalCopy,
+        copy: crate::kernel::CopyRun,
     ) -> ExpansionResult<()> {
         let id = LocalCopyId(
             u32::try_from(self.local_copies.len()).map_err(|_| ExpansionError::IdOverflow)?,

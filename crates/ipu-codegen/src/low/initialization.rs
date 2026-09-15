@@ -30,7 +30,7 @@ fn non_kernel_read_storage(program: &TileGraph) -> BTreeSet<BlockValueId> {
                     .map(|transfer| transfer.source.shard),
             ),
             BlockOperation::Copy { copy, .. } => {
-                readers.insert(program.local_copies[copy.0 as usize].source);
+                readers.insert(program.local_copies[copy.0 as usize].movement().source);
             }
             BlockOperation::Repeat(repeat) => {
                 readers.extend(
@@ -136,7 +136,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
     for operation in program.body.walk() {
         match operation {
             BlockOperation::Copy { copy, .. } => {
-                let copy = &program.local_copies[copy.0 as usize];
+                let copy = program.local_copies[copy.0 as usize].movement();
                 incoming
                     .entry(root(copy.destination))
                     .or_default()
@@ -433,14 +433,20 @@ mod tests {
 
     fn append_copy(program: &mut TileGraph, source: u32, destination: u32, bytes: u32) {
         let copy = LocalCopyId(program.local_copies.len() as u32);
-        program.local_copies.push(LocalCopy {
-            source: BlockValueId(source),
-            source_offset: 0,
-            destination: BlockValueId(destination),
-            destination_offset: 0,
-            bytes,
-            pattern: CopyPattern::Contiguous,
-        });
+        program.local_copies.push(
+            crate::kernel::CopyRun::bind(
+                LocalCopy {
+                    source: BlockValueId(source),
+                    source_offset: 0,
+                    destination: BlockValueId(destination),
+                    destination_offset: 0,
+                    bytes,
+                    pattern: CopyPattern::Contiguous,
+                },
+                &program.shards,
+            )
+            .unwrap(),
+        );
         program
             .body
             .operations
@@ -577,7 +583,10 @@ mod tests {
         let mut mixed = program.clone();
         append_copy(&mut mixed, 2, 3, 8);
         let mut overwritten = mixed.clone();
-        overwritten.local_copies.last_mut().unwrap().destination = BlockValueId(1);
+        let last = overwritten.local_copies.last_mut().unwrap();
+        let mut movement = last.movement().clone();
+        movement.destination = BlockValueId(1);
+        *last = crate::kernel::CopyRun::bind(movement, &overwritten.shards).unwrap();
         reuse_finite_padding(&mut program);
         reuse_finite_padding(&mut mixed);
         reuse_finite_padding(&mut overwritten);

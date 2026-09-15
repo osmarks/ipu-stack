@@ -368,7 +368,11 @@ impl TileGraphBuilder {
             )?;
             if stage == 0 {
                 for (tile, copy) in seed_copies.drain(..) {
-                    self.append_local_copy(tiles, tile, copy)?;
+                    self.append_local_copy(
+                        tiles,
+                        tile,
+                        crate::kernel::CopyRun::bind(copy, &self.shards)?,
+                    )?;
                 }
             }
             for (tile, run) in runs {
@@ -376,7 +380,11 @@ impl TileGraphBuilder {
             }
         }
         for (tile, copy) in result_copies {
-            self.append_local_copy(tiles, tile, copy)?;
+            self.append_local_copy(
+                tiles,
+                tile,
+                crate::kernel::CopyRun::bind(copy, &self.shards)?,
+            )?;
         }
         Ok(())
     }
@@ -503,7 +511,7 @@ mod tests {
             for operation in &region.operations {
                 match operation {
                     BlockOperation::Copy { copy: id, .. } => {
-                        copy(&mut memory, &builder.local_copies[id.0 as usize])
+                        copy(&mut memory, builder.local_copies[id.0 as usize].movement())
                     }
                     BlockOperation::Exchange(id) => {
                         for transfer in &builder.phases[id.index() as usize].transfers {
@@ -577,7 +585,7 @@ mod tests {
                         !builder
                             .local_copies
                             .iter()
-                            .any(|copy| copy.destination == output)
+                            .any(|copy| copy.movement().destination == output)
                     );
                 }
             }
@@ -666,7 +674,7 @@ mod tests {
             builder
                 .local_copies
                 .iter()
-                .any(|copy| copy.destination == output)
+                .any(|copy| copy.movement().destination == output)
         );
     }
 }

@@ -10,6 +10,7 @@ mod search;
 pub(crate) use exchange::ExchangeConflicts;
 
 use crate::MemoryClass;
+use crate::low::storage::StorageAccess;
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
 use crate::memory::IPU21_DATA_BASE;
 use crate::{BlockValueId, ShardDefinition};
@@ -67,12 +68,6 @@ pub enum PlacementError {
     },
     #[error("placement arithmetic overflowed")]
     Overflow,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Requirement {
-    alignment: u32,
-    access_tail: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -212,7 +207,7 @@ struct AllocationAnalysis {
     tiles: Vec<TileAllocations>,
     root_of_member: Vec<usize>,
     member_offsets: Vec<u32>,
-    root_requirements: BTreeMap<usize, Requirement>,
+    root_requirements: BTreeMap<usize, StorageAccess>,
     root_lifetimes: BTreeMap<usize, Lifetime>,
     conflicts: BTreeMap<usize, BTreeSet<usize>>,
 }
@@ -246,7 +241,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
     }
 
     let mut pairs = Vec::new();
-    let mut requirements = vec![Requirement::default(); program.shards.len()];
+    let mut requirements = vec![StorageAccess::default(); program.shards.len()];
     for tile in &program.tiles {
         collect_requirements(program, tile, &mut requirements, &mut pairs);
     }
@@ -265,7 +260,7 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
             }
         }
     }
-    let mut root_requirements = BTreeMap::<usize, Requirement>::new();
+    let mut root_requirements = BTreeMap::<usize, StorageAccess>::new();
     for (index, requirement) in requirements.iter().copied().enumerate() {
         let root = sets.find(index);
         let combined = root_requirements.entry(root).or_default();
@@ -276,7 +271,9 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         ) {
             combined.alignment = combined.alignment.max(32768);
         }
-        combined.access_tail = combined.access_tail.max(requirement.access_tail);
+        combined.access_tail_bytes = combined
+            .access_tail_bytes
+            .max(requirement.access_tail_bytes);
     }
 
     let mut members = BTreeMap::<usize, Vec<usize>>::new();
@@ -507,8 +504,9 @@ fn touch_work(
             }
         }
         TileWorkRef::LocalCopy(copy) => {
-            touch(copy.source);
-            touch(copy.destination);
+            for (shard, _) in copy.accesses() {
+                touch(shard);
+            }
         }
         TileWorkRef::Exchange(id) => {
             for &shard in &exchanges[id.index() as usize][usize::from(tile)] {
@@ -570,7 +568,7 @@ fn collect_repeat_constraints(
 fn collect_requirements(
     program: &LowProgram,
     tile: &TileWorkList,
-    requirements: &mut [Requirement],
+    requirements: &mut [StorageAccess],
     pairs: &mut Vec<(usize, usize)>,
 ) {
     for work in program.work(tile) {
@@ -598,16 +596,13 @@ fn collect_requirements(
                     .zip(&run.requirements.inputs)
                     .chain(run.outputs.iter().zip(&run.requirements.outputs))
                 {
-                    apply_requirement(&mut requirements[view.shard.index() as usize], requirement);
+                    requirements[view.shard.index() as usize].include(requirement.storage);
                 }
             }
             TileWorkRef::LocalCopy(copy) => {
-                requirements[copy.source.index() as usize].alignment =
-                    requirements[copy.source.index() as usize].alignment.max(8);
-                requirements[copy.destination.index() as usize].alignment = requirements
-                    [copy.destination.index() as usize]
-                    .alignment
-                    .max(8);
+                for (shard, access) in copy.accesses() {
+                    requirements[shard.index() as usize].include(access);
+                }
             }
             TileWorkRef::Repeat(repeat) => {
                 collect_requirements(program, &repeat.body, requirements, pairs)
@@ -615,11 +610,6 @@ fn collect_requirements(
             TileWorkRef::Exchange(_) | TileWorkRef::Checkpoint(..) => {}
         }
     }
-}
-
-fn apply_requirement(target: &mut Requirement, requirement: &crate::KernelAccess) {
-    target.alignment = target.alignment.max(requirement.alignment);
-    target.access_tail = target.access_tail.max(requirement.access_tail_bytes);
 }
 
 fn checked_union(
@@ -662,12 +652,12 @@ fn allocation_bytes(
     program: &LowProgram,
     members: &[usize],
     member_offsets: &[u32],
-    requirement: Requirement,
+    requirement: StorageAccess,
 ) -> Result<u32, PlacementError> {
     members.iter().try_fold(0, |maximum, &index| {
         member_offsets[index]
             .checked_add(shard_storage_bytes(&program.shards[index])?)
-            .and_then(|bytes| bytes.checked_add(requirement.access_tail))
+            .and_then(|bytes| bytes.checked_add(requirement.access_tail_bytes))
             .map(|bytes| maximum.max(bytes))
             .ok_or(PlacementError::Overflow)
     })

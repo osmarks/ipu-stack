@@ -164,8 +164,8 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
                 .requirements
                 .inputs
             {
-                input.alignment = 64;
-                input.access_tail_bytes = 96;
+                input.storage.alignment = 64;
+                input.storage.access_tail_bytes = 96;
             }
         }
         let BlockOperation::Repeat(repeat) = &mut graph.body.operations[0] else {

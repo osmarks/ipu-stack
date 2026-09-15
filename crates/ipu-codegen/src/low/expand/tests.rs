@@ -84,31 +84,37 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                     &mut region,
                 )
                 .unwrap();
-            builder.local_copies.push(LocalCopy {
-                source: if alias && source == 1 {
-                    alias_id
-                } else {
-                    ids[source]
-                },
-                destination: if alias && destination == 1 {
-                    alias_id
-                } else {
-                    ids[destination]
-                },
-                source_offset: 0,
-                destination_offset: offset,
-                bytes: 128,
-                pattern: if strided {
-                    CopyPattern::Strided {
-                        rows: 4,
-                        row_bytes: 32,
-                        source_stride: 32,
-                        destination_stride: 64,
-                    }
-                } else {
-                    CopyPattern::Contiguous
-                },
-            });
+            builder.local_copies.push(
+                crate::kernel::CopyRun::bind(
+                    LocalCopy {
+                        source: if alias && source == 1 {
+                            alias_id
+                        } else {
+                            ids[source]
+                        },
+                        destination: if alias && destination == 1 {
+                            alias_id
+                        } else {
+                            ids[destination]
+                        },
+                        source_offset: 0,
+                        destination_offset: offset,
+                        bytes: 128,
+                        pattern: if strided {
+                            CopyPattern::Strided {
+                                rows: 4,
+                                row_bytes: 32,
+                                source_stride: 32,
+                                destination_stride: 64,
+                            }
+                        } else {
+                            CopyPattern::Contiguous
+                        },
+                    },
+                    &builder.shards,
+                )
+                .unwrap(),
+            );
             region.operations.push(BlockOperation::Copy {
                 tile: 1,
                 copy: LocalCopyId(0),
@@ -318,7 +324,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
         builder
             .local_copies
             .iter()
-            .all(|copy| copy.source == source)
+            .all(|copy| copy.movement().source == source)
     );
 
     let run = builder
@@ -664,8 +670,8 @@ fn randomized_parallel_reduction_gemms_lower_to_packed_reductions() {
             let copied_outputs = low
                 .local_copies
                 .iter()
-                .filter(|copy| packed_results.contains(&copy.source))
-                .map(|copy| copy.destination)
+                .filter(|copy| packed_results.contains(&copy.movement().source))
+                .map(|copy| copy.movement().destination)
                 .collect::<BTreeSet<_>>();
             assert!(
                 output_shards.iter().all(
@@ -1006,8 +1012,8 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
             "case {case}"
         );
         assert!(low.local_copies.iter().all(|copy| {
-            low.shards[copy.source.index() as usize].tile
-                == low.shards[copy.destination.index() as usize].tile
+            low.shards[copy.movement().source.index() as usize].tile
+                == low.shards[copy.movement().destination.index() as usize].tile
         }));
     }
 }
@@ -2072,7 +2078,8 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
     assert!(
         low.work(&repeat.body).any(|work| match work {
             TileWorkRef::Kernel(run) => placement.shard_addresses[&run.outputs[0].shard] == target,
-            TileWorkRef::LocalCopy(copy) => placement.shard_addresses[&copy.destination] == target,
+            TileWorkRef::LocalCopy(copy) =>
+                placement.shard_addresses[&copy.movement().destination] == target,
             _ => false,
         }),
         "the body must write the allocation carried into its next iteration"
@@ -2256,7 +2263,7 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                         buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
                         for work in low.work(&low.tiles[0]) {
                             let copy = match work {
-                                TileWorkRef::LocalCopy(copy) => copy,
+                                TileWorkRef::LocalCopy(copy) => copy.movement(),
                                 TileWorkRef::Exchange(phase) => {
                                     assert!(
                                         low.exchange_phases[phase.index() as usize]

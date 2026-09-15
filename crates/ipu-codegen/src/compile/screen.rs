@@ -63,17 +63,6 @@ pub(super) fn expand_and_screen(
         });
     }
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
-    if let Some(copy) = low
-        .local_copies
-        .iter()
-        .find(|copy| crate::tile::local_copy_call(copy).is_none())
-    {
-        return Err(crate::TileLoweringError::InvalidLocalCopy {
-            tile: low.shards[copy.source.index() as usize].tile,
-            copy: copy.clone(),
-        }
-        .into());
-    }
     Ok((low, footprint))
 }
 

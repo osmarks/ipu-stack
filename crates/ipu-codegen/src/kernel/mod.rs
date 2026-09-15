@@ -1,6 +1,8 @@
 //! Kernel ABI, specialization recipes, and placed call materialization.
 
 mod abi;
+pub(crate) mod copy;
+pub(crate) use copy::CopyRun;
 mod attention;
 mod binding;
 mod build;

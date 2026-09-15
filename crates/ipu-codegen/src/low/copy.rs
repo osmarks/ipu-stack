@@ -406,59 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn four_byte_strided_copies_batch_rows_and_preserve_gaps() {
-        // Include the attention query's 960-byte local intersection, fewer
-        // rows than workers, and several rounds of the six-worker row loop.
-        for rows in [2, 5, 6, 8, 19] {
-            for (offset, width, source_stride, destination_stride) in
-                [(108, 120, 228, 160), (4, 12, 20, 28), (0, 4, 12, 8)]
-            {
-                let spans = |start, stride| {
-                    (0..rows)
-                        .map(|row| ByteSpan {
-                            offset: start + row * stride,
-                            bytes: width,
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let copies = CopyOperation::from_spans(
-                    crate::BlockValueId::from_index(0),
-                    crate::BlockValueId::from_index(1),
-                    spans(offset, source_stride),
-                    spans(0, destination_stride),
-                )
-                .unwrap();
-                assert_eq!(copies.len(), 1);
-                let (symbol, args) = crate::tile::local_copy_call(&copies[0]).unwrap();
-                assert_eq!(symbol, crate::COPY_STRIDED_U32_SYMBOL);
-                assert_eq!(args, [width / 4, rows, source_stride, destination_stride]);
-                let source = (0..offset + rows * source_stride)
-                    .map(|i| (i % 251) as u8)
-                    .collect::<Vec<_>>();
-                let mut actual = vec![255; (rows * destination_stride) as usize];
-                let mut expected = actual.clone();
-                for row in 0..rows {
-                    let src = (offset + row * source_stride) as usize;
-                    let dst = (row * destination_stride) as usize;
-                    expected[dst..dst + width as usize]
-                        .copy_from_slice(&source[src..src + width as usize]);
-                }
-                for worker in 0..6 {
-                    for row in (worker..args[1]).step_by(6) {
-                        for word in 0..args[0] {
-                            let src = (copies[0].source_offset + row * args[2] + word * 4) as usize;
-                            let dst =
-                                (copies[0].destination_offset + row * args[3] + word * 4) as usize;
-                            actual[dst..dst + 4].copy_from_slice(&source[src..src + 4]);
-                        }
-                    }
-                }
-                assert_eq!(actual, expected);
-            }
-        }
-    }
-
-    #[test]
     fn long_strided_copies_keep_all_rows_in_one_launch() {
         for rows in [2, 64, 65, 164] {
             let source = (0..rows)

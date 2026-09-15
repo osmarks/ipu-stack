@@ -16,16 +16,17 @@ pub enum MemoryOperand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelAccess {
     pub format: TensorFormat,
-    pub alignment: u32,
-    pub access_tail_bytes: u32,
+    pub storage: crate::low::storage::StorageAccess,
 }
 
 impl KernelAccess {
     pub fn new(format: TensorFormat, alignment: u32) -> Self {
         Self {
             format,
-            alignment,
-            access_tail_bytes: 0,
+            storage: crate::low::storage::StorageAccess {
+                alignment,
+                access_tail_bytes: 0,
+            },
         }
     }
 }
@@ -63,7 +64,7 @@ impl KernelRequirements {
         if let TileKernelSpec::Gemm { multiply, .. } = kernel
             && let Some(left) = requirements.inputs.first_mut()
         {
-            left.access_tail_bytes = 8 * multiply.bytes() as u32;
+            left.storage.access_tail_bytes = 8 * multiply.bytes() as u32;
             requirements
                 .distinct_elements
                 .push(vec![MemoryOperand::Output(0), MemoryOperand::Input(0)]);

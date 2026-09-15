@@ -179,33 +179,10 @@ pub(crate) fn program_cycles_analyzed(
                     usize::from(*tile),
                     cached_kernel_cycles(&program.kernel_runs[run.0 as usize], kernels),
                 ),
-                BlockOperation::Copy { tile, copy } => {
-                    let copy = &program.local_copies[copy.0 as usize];
-                    // The strided helper assigns complete rows to six workers.
-                    // Its inner loop has six instructions per 64-bit word and
-                    // five instructions between rows; short rows cannot attain
-                    // the contiguous-copy bandwidth.
-                    let work = match copy.pattern {
-                        crate::CopyPattern::Contiguous => {
-                            u64::from(copy.bytes).div_ceil(TARGET.local_copy_bytes_per_cycle)
-                        }
-                        crate::CopyPattern::Strided {
-                            rows, row_bytes, ..
-                        } => u64::from(rows)
-                            .div_ceil(6)
-                            .saturating_mul(6)
-                            .saturating_mul(
-                                u64::from(row_bytes)
-                                    .div_ceil(8)
-                                    .saturating_mul(6)
-                                    .saturating_add(5),
-                            ),
-                    };
-                    timeline.local(
-                        usize::from(*tile),
-                        work.saturating_add(TARGET.local_copy_call_cycles),
-                    );
-                }
+                BlockOperation::Copy { tile, copy } => timeline.local(
+                    usize::from(*tile),
+                    program.local_copies[copy.0 as usize].cycles(),
+                ),
                 BlockOperation::Exchange(phase) => {
                     let cycles = phases[phase.index() as usize];
                     timeline.barrier(cycles, cycles);

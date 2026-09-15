@@ -161,7 +161,7 @@ fn check_bytes(
     for operation in &graph.body.operations {
         match operation {
             BlockOperation::Copy { tile, copy } => {
-                let copy = &graph.local_copies[copy.0 as usize];
+                let copy = graph.local_copies[copy.0 as usize].movement();
                 let (rows, bytes, source_stride, destination_stride) = match copy.pattern {
                     CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
                     CopyPattern::Strided {

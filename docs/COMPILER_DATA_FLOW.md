@@ -360,8 +360,12 @@ ABI lookup, symbolic scalar-getter list and specialization reconstruction are
 removed. Fixed entry points and parameterized implementations use one identity
 enum; there is no unspecified specialization for another pass to discover.
 FP8 output epilogues share their contract with mid fusion, and optimistic cast
-and packing queries use their families' capabilities. Local-copy helper contracts
-remain to be brought under their family owner.
+and packing queries use their families' capabilities. Local byte copies bind
+through [kernel/copy.rs](../crates/ipu-codegen/src/kernel/copy.rs): movement
+construction supplies the byte geometry, and `CopyRun` checks its ranges and
+selects the helper before append. Placement, costing, runtime symbol retention
+and emission consume that binding. Coalescing explicitly rebinds the changed
+descriptor.
 After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
 groups exchanges across commuting local copies, then merges adjacent copies.
 It checks read/write hazards against completed storage bindings and respects
@@ -491,10 +495,13 @@ result aliases. Padding reuse therefore checks actual storage types, without
 recognizing attention kernel names. The initial merge has no previous-state
 operand; the family fills its unused ABI slot when emitting the call.
 
-Local-copy access still has multiple owners: `tile::local_copy_call` selects
-helpers and arguments. Runtime inventory reuses that selection, but placement
-alignment and local-copy costing use separate rules instead of a common checked
-helper binding.
+Local copies share raw `StorageAccess` requirements with numerical kernels,
+without fabricating tensor formats for their byte movement. Halfword copies
+reserve the possible two-byte read/modify/write tail of the runtime helper.
+Their family supplies the detailed cost for the selected scalar or worker loop;
+mid retains a coarser launch allowance before selection. The late tile helper
+selector and its separate screening pass are removed. Logical useful-work
+coverage for copies still needs to distinguish physical padding bytes.
 
 ## Trace 5: exchange encoding retains relocation sites
 

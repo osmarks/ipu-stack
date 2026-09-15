@@ -16,30 +16,53 @@ pub(crate) struct BoundView<'a> {
     pub backing: (BlockValueId, i64),
 }
 
+/// Physical requirements of a buffer access, independent of numerical format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageAccess {
+    pub alignment: u32,
+    pub access_tail_bytes: u32,
+}
+impl StorageAccess {
+    pub(crate) fn include(&mut self, other: Self) {
+        self.alignment = self.alignment.max(other.alignment);
+        self.access_tail_bytes = self.access_tail_bytes.max(other.access_tail_bytes);
+    }
+}
+
+/// Resolve a value's interpretation and backing origin before selecting either
+/// tensor coordinates or raw byte accesses.
+pub(crate) fn bind_storage(
+    shards: &[BlockValue],
+    id: BlockValueId,
+) -> StorageResult<(&BlockValue, (BlockValueId, i64))> {
+    let shard = shards
+        .get(id.index() as usize)
+        .ok_or(StorageError::WrongShard)?;
+    if shard.id != id {
+        return Err(StorageError::WrongShard);
+    }
+    let backing = storage_location(shards, id);
+    let root = shards
+        .get(backing.0.index() as usize)
+        .ok_or(StorageError::WrongShard)?;
+    if root.id != backing.0
+        || root.tile != shard.tile
+        || matches!(
+            root.definition,
+            ShardDefinition::Unmaterialized
+                | ShardDefinition::Alias(_)
+                | ShardDefinition::WritableAlias(_)
+                | ShardDefinition::ShiftedAlias { .. }
+        )
+    {
+        return Err(StorageError::InvalidView);
+    }
+    Ok((shard, backing))
+}
+
 impl ShardView {
     pub(crate) fn bind<'a>(&'a self, shards: &'a [BlockValue]) -> StorageResult<BoundView<'a>> {
-        let shard = shards
-            .get(self.shard.index() as usize)
-            .ok_or(StorageError::WrongShard)?;
-        if shard.id != self.shard {
-            return Err(StorageError::WrongShard);
-        }
-        let backing = storage_location(shards, self.shard);
-        let root = shards
-            .get(backing.0.index() as usize)
-            .ok_or(StorageError::WrongShard)?;
-        if root.id != backing.0
-            || root.tile != shard.tile
-            || matches!(
-                root.definition,
-                ShardDefinition::Unmaterialized
-                    | ShardDefinition::Alias(_)
-                    | ShardDefinition::WritableAlias(_)
-                    | ShardDefinition::ShiftedAlias { .. }
-            )
-        {
-            return Err(StorageError::InvalidView);
-        }
+        let (shard, backing) = bind_storage(shards, self.shard)?;
         crate::storage::validate_view(shard.storage(), &self.extents)?;
         Ok(BoundView {
             shard,

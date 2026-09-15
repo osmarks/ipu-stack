@@ -817,11 +817,19 @@ impl TileGraphBuilder {
             }
         }
         for (tile, copy) in batch.before {
-            self.append_local_copy(tiles, tile, copy)?;
+            self.append_local_copy(
+                tiles,
+                tile,
+                crate::kernel::CopyRun::bind(copy, &self.shards)?,
+            )?;
         }
         self.append_mixed_phase(batch.transfers, provenance, tiles)?;
         for (tile, copy) in batch.after {
-            self.append_local_copy(tiles, tile, copy)?;
+            self.append_local_copy(
+                tiles,
+                tile,
+                crate::kernel::CopyRun::bind(copy, &self.shards)?,
+            )?;
         }
         for (tile, run) in batch.kernels {
             self.append_kernel(tiles, tile, run)?;

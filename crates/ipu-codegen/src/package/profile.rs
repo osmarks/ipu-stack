@@ -294,7 +294,9 @@ fn profile_work_can_merge(
         (
             crate::TileWorkRef::LocalCopy(previous),
             crate::TileWorkRef::LocalCopy(current)
-        ) if previous.bytes == current.bytes && previous.pattern == current.pattern
+        ) if previous.symbol() == current.symbol()
+            && previous.movement().bytes == current.movement().bytes
+            && previous.movement().pattern == current.movement().pattern
     )
 }
 
@@ -378,6 +380,7 @@ fn profile_step(
             Ok(description)
         }
         (crate::TileWorkRef::LocalCopy(copy), crate::TileStep::Compute(compute)) => {
+            let copy = copy.movement();
             if let Some(provenance) = following {
                 let mut description = profile_description(
                     index,

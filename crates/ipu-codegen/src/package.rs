@@ -749,9 +749,7 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
         for work in program.work(tile) {
             match work {
                 crate::TileWorkRef::LocalCopy(copy) => {
-                    if let Some((symbol, _)) = crate::tile::local_copy_call(copy) {
-                        symbols.insert(symbol);
-                    }
+                    symbols.insert(copy.symbol());
                 }
                 crate::TileWorkRef::Kernel(run)
                     if matches!(run.kernel, crate::TileKernelSpec::FillZero { .. }) =>

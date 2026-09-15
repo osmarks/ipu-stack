@@ -67,8 +67,6 @@ pub enum TileLoweringError {
         kind: crate::ExchangeActivityKind,
         data_address: u32,
     },
-    #[error("tile {tile} has invalid local copy addresses or geometry: {copy:?}")]
-    InvalidLocalCopy { tile: u16, copy: crate::LocalCopy },
 }
 
 struct PlacedExchange {
@@ -223,12 +221,8 @@ fn lower_work(
                     ..ExchangeStep::new(placed.active, placed.incoming_base, placed.program.clone())
                 })
             }
-            TileWorkRef::LocalCopy(copy) => {
-                let invalid = || TileLoweringError::InvalidLocalCopy {
-                    tile: tile.tile,
-                    copy: copy.clone(),
-                };
-                let (symbol, arguments) = local_copy_call(copy).ok_or_else(invalid)?;
+            TileWorkRef::LocalCopy(run) => {
+                let copy = run.movement();
                 let resolve = |shard, offset| {
                     crate::low::storage::resolve_address(
                         &program.shards,
@@ -237,13 +231,12 @@ fn lower_work(
                         shard,
                         offset,
                     )
-                    .map_err(|_| invalid())
                 };
                 TileStep::Compute(crate::ComputeStep {
-                    symbol: symbol.into(),
+                    symbol: run.symbol().into(),
                     output_address: resolve(copy.destination, copy.destination_offset)?,
                     input_addresses: vec![resolve(copy.source, copy.source_offset)?],
-                    arguments,
+                    arguments: run.call().arguments,
                     profile: StepProfile::default(),
                 })
             }
@@ -278,51 +271,6 @@ fn lower_work(
         steps.push(step);
     }
     Ok(steps)
-}
-
-pub(crate) fn local_copy_call(copy: &crate::LocalCopy) -> Option<(&'static str, Vec<u32>)> {
-    let bytes = copy.bytes;
-    let aligned = |width| {
-        copy.source_offset.is_multiple_of(width) && copy.destination_offset.is_multiple_of(width)
-    };
-    if let crate::CopyPattern::Strided {
-        rows,
-        row_bytes,
-        source_stride,
-        destination_stride,
-    } = copy.pattern
-    {
-        if rows < 2 || row_bytes == 0 || row_bytes.checked_mul(rows) != Some(bytes) {
-            return None;
-        }
-        return [
-            (8, crate::COPY_STRIDED_U64_SYMBOL),
-            (4, crate::COPY_STRIDED_U32_SYMBOL),
-        ]
-        .into_iter()
-        .find(|&(width, _)| {
-            aligned(width)
-                && row_bytes.is_multiple_of(width)
-                && source_stride.is_multiple_of(width)
-                && destination_stride.is_multiple_of(width)
-        })
-        .map(|(width, symbol)| {
-            (
-                symbol,
-                vec![row_bytes / width, rows, source_stride, destination_stride],
-            )
-        });
-    }
-    if aligned(8) && bytes >= 6 * 8 && bytes.is_multiple_of(8) {
-        let words = bytes / 8;
-        Some((crate::COPY_U64_SYMBOL, vec![words / 6, words % 6]))
-    } else if aligned(4) && bytes != 0 && bytes.is_multiple_of(4) {
-        Some((crate::COPY_U32_SYMBOL, vec![bytes / 4]))
-    } else if aligned(2) && bytes != 0 && bytes.is_multiple_of(2) {
-        Some((crate::COPY_U16_SYMBOL, vec![bytes / 2]))
-    } else {
-        None
-    }
 }
 
 fn lower_repeat(
@@ -703,30 +651,38 @@ mod tests {
     #[test]
     fn local_copies_follow_iterated_pointers_inside_repeat() {
         let id = crate::BlockValueId::from_index;
+        let shards = (0..2)
+            .map(|index| crate::BlockValue {
+                id: id(index),
+                tile: 0,
+                tensor_type: crate::TensorType::new([128], Precision::F16, Layout::row_sharded(1)),
+                extents: vec![crate::ShardExtent {
+                    axis: 0,
+                    start: 0,
+                    logical_end: 128,
+                    physical_end: 128,
+                }],
+                definition: crate::ShardDefinition::Staging,
+            })
+            .collect::<Vec<_>>();
         let graph = crate::TileGraph {
             tile_count: 1,
             requires_finite_scratch: false,
-            shards: (0..2)
-                .map(|index| crate::BlockValue {
-                    id: id(index),
-                    tile: 0,
-                    tensor_type: crate::TensorType::new(
-                        [128],
-                        Precision::F16,
-                        Layout::row_sharded(1),
-                    ),
-                    extents: vec![],
-                    definition: crate::ShardDefinition::Staging,
-                })
-                .collect(),
-            local_copies: vec![crate::LocalCopy {
-                source: id(0),
-                source_offset: 8,
-                destination: id(1),
-                destination_offset: 16,
-                bytes: 64,
-                pattern: crate::CopyPattern::Contiguous,
-            }],
+            local_copies: vec![
+                crate::kernel::CopyRun::bind(
+                    crate::LocalCopy {
+                        source: id(0),
+                        source_offset: 8,
+                        destination: id(1),
+                        destination_offset: 16,
+                        bytes: 64,
+                        pattern: crate::CopyPattern::Contiguous,
+                    },
+                    &shards,
+                )
+                .unwrap(),
+            ],
+            shards,
             exchange_phases: vec![],
             inputs: vec![],
             body: Default::default(),
@@ -853,38 +809,6 @@ mod tests {
                     TileStep::Exchange(exchange)
                         if !exchange.active
                 )));
-            }
-        }
-    }
-
-    #[test]
-    fn randomized_local_copy_calls_respect_alignment_and_worker_counts() {
-        let mut random = fastrand::Rng::with_seed(0x636f_7079);
-        for _ in 0..1_000 {
-            let words = random.u32(1..=4_096);
-            let bytes = words * 4;
-            let copy = crate::LocalCopy {
-                source: crate::BlockValueId::from_index(0),
-                source_offset: 2 * random.u32(0..4),
-                destination: crate::BlockValueId::from_index(1),
-                destination_offset: 2 * random.u32(0..4),
-                bytes,
-                pattern: crate::CopyPattern::Contiguous,
-            };
-            let (symbol, arguments) = local_copy_call(&copy).unwrap();
-            if symbol == crate::COPY_U64_SYMBOL {
-                assert!(copy.source_offset.is_multiple_of(8));
-                assert!(copy.destination_offset.is_multiple_of(8));
-                assert!(arguments[0] != 0);
-                assert_eq!((arguments[0] * 6 + arguments[1]) * 8, bytes);
-                assert!(arguments[1] < 6);
-            } else if symbol == crate::COPY_U32_SYMBOL {
-                assert!(copy.source_offset.is_multiple_of(4));
-                assert!(copy.destination_offset.is_multiple_of(4));
-                assert_eq!(arguments, [words]);
-            } else {
-                assert_eq!(symbol, crate::COPY_U16_SYMBOL);
-                assert_eq!(arguments, [bytes / 2]);
             }
         }
     }

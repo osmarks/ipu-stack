@@ -141,7 +141,7 @@ pub const IPU21_TARGET_COSTS: Ipu21TargetCosts = Ipu21TargetCosts {
     local_copy_bytes_per_cycle: 8,
     // A finalized six-worker local-copy invocation, including supervisor and
     // worker rendezvous overhead, takes 288 tile cycles on IPU21.
-    local_copy_call_cycles: 288,
+    local_copy_call_cycles: crate::kernel::copy::WORKER_CALL_CYCLES,
     // Target::getGlobalSyncCycles.
     exchange_phase_cycles: 600,
     // popops::internal::basicOpSupervisorOverhead(false).

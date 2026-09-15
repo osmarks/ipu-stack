@@ -119,7 +119,7 @@ fn collect(
                     program,
                     group,
                     &analysis.member_offsets,
-                    Requirement::default(),
+                    StorageAccess::default(),
                 )?;
                 let input = group
                     .iter()

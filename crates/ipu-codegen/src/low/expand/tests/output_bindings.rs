@@ -79,6 +79,7 @@ fn exported_copies_have_complete_storage_and_preserve_identity_reuse() {
         } else {
             let mut actual = vec![u32::MAX; (4 * columns) as usize];
             for copy in &low.local_copies {
+                let copy = copy.movement();
                 assert_eq!(copy.source, input);
                 assert_eq!(copy.destination, output);
                 let (rows, bytes, source_stride, destination_stride) = match copy.pattern {
@@ -139,10 +140,12 @@ fn packed_halfword_sources_are_gathered_before_word_exchange() {
     assert!(
         low.local_copies
             .iter()
-            .any(|copy| copy.source == source && copy.bytes == 2)
+            .any(|copy| copy.movement().source == source && copy.movement().bytes == 2)
     );
     assert!(
-        low.local_copies.iter().all(|copy| copy.source == source),
+        low.local_copies
+            .iter()
+            .all(|copy| copy.movement().source == source),
         "aligned row-major receivers do not need a second staging copy"
     );
     for phase in &low.exchange_phases {
@@ -251,7 +254,7 @@ fn shifted_halfword_crops_pack_before_physical_exchange() {
     assert!(
         low.local_copies
             .iter()
-            .any(|copy| copy.source_offset % 4 == 2)
+            .any(|copy| copy.movement().source_offset % 4 == 2)
     );
 }
 

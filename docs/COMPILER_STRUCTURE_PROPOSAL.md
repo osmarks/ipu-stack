@@ -136,8 +136,12 @@ backing identity, and dependency checks compare translated byte ranges. Placed
 address binding also belongs to low storage, retaining intermediate Repeat
 overrides through alias chains. Halfword copies now use an ordinary callable
 ABI, removing the emitter's inline-address table exception and supporting both
-multi-element and Repeat-relative calls. Local-copy helper binding, remaining
-movement policies and cache consolidation are still unfinished.
+multi-element and Repeat-relative calls. Local copies now retain a checked
+helper binding before append; coalescing rebinds changed geometry. The helper
+owns raw access requirements, ABI and detailed cost, shared by placement,
+runtime retention and emission. Late helper selection and screening are removed.
+Copy useful-work coverage, remaining movement policies and cache consolidation
+are still unfinished.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

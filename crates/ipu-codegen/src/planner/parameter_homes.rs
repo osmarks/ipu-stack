@@ -278,14 +278,7 @@ mod tests {
                     outputs: vec![MidValueId::from_index(1)],
                     ..Default::default()
                 };
-                let expanded = crate::expand_tiles(&program).unwrap();
-                assert_eq!(
-                    expanded
-                        .local_copies
-                        .iter()
-                        .all(|copy| crate::tile::local_copy_call(copy).is_some()),
-                    encodable
-                );
+                assert_eq!(crate::expand_tiles(&program).is_ok(), encodable);
             }
         }
     }

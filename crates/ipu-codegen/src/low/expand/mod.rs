@@ -167,7 +167,7 @@ struct TileGraphBuilder {
     required_storage: BTreeSet<MidValueId>,
     phases: Vec<ExchangePhase>,
     kernel_runs: Vec<KernelRun>,
-    local_copies: Vec<LocalCopy>,
+    local_copies: Vec<crate::kernel::CopyRun>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
 }
 

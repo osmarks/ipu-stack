@@ -42,7 +42,7 @@ pub enum TileWork {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileWorkRef<'a> {
     Exchange(ExchangePhaseId),
-    LocalCopy(&'a LocalCopy),
+    LocalCopy(&'a crate::kernel::CopyRun),
     Kernel(&'a KernelRun),
     Repeat(&'a RepeatRun),
     Checkpoint(OperationId, u8),

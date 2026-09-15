@@ -2661,11 +2661,9 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
                 .iter()
                 .map(|view| crate::low::storage::storage_root(&low.shards, view.shard))
         })
-        .chain(
-            low.local_copies
-                .iter()
-                .map(|copy| crate::low::storage::storage_root(&low.shards, copy.destination)),
-        )
+        .chain(low.local_copies.iter().map(|copy| {
+            crate::low::storage::storage_root(&low.shards, copy.movement().destination)
+        }))
         .chain(
             low.inputs
                 .iter()
