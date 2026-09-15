@@ -140,13 +140,13 @@ pub(crate) fn program_cycles(
     program: &TileGraph,
     exchange: Option<&[u64]>,
 ) -> ExpansionResult<ProgramCycles> {
-    program_cycles_analyzed(program, exchange, &mut GeometryAnalysis::default())
+    program_cycles_analyzed(program, exchange, &GeometryCache::default())
 }
 
 pub(crate) fn program_cycles_analyzed(
     program: &TileGraph,
     exchange: Option<&[u64]>,
-    geometry: &mut GeometryAnalysis,
+    geometry: &GeometryCache,
 ) -> ExpansionResult<ProgramCycles> {
     let estimated;
     let phases = if let Some(costs) = exchange {
@@ -210,7 +210,7 @@ pub(crate) fn program_cycles_analyzed(
 pub(crate) fn exchange_phase_estimate(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
-    geometry: &mut GeometryAnalysis,
+    geometry: &GeometryCache,
 ) -> ExpansionResult<(u64, Vec<u64>)> {
     let mut storage = ExchangeStoragePhase::new(program.tile_count);
     let traffic = geometry_traffic(program, phase, Some(&mut storage), geometry)?;
@@ -224,7 +224,7 @@ fn geometry_traffic(
     program: &TileGraph,
     phase: &crate::ExchangePhase,
     mut storage: Option<&mut ExchangeStoragePhase>,
-    geometry: &mut GeometryAnalysis,
+    geometry: &GeometryCache,
 ) -> ExpansionResult<ExchangeEndpointTraffic> {
     #[cfg(test)]
     let mut expected_storage = storage.as_deref().cloned();
@@ -233,20 +233,31 @@ fn geometry_traffic(
     for transfer in &phase.transfers {
         let source = &program.shards[transfer.source.shard.index() as usize];
         let order = transfer.span_order(&program.shards);
-        let source_geometry = geometry.view(program, &transfer.source, order)?;
-        let bytes = geometry.bytes(source_geometry);
+        let source_geometry = transfer
+            .source
+            .bind(&program.shards)?
+            .geometry(geometry, order)?;
+        let bytes = source_geometry.traversal.byte_len();
         let mut outgoing_fragments = 0;
         let mut outgoing_long_fragments = 0;
         for destination in &transfer.destinations {
             let target = &program.shards[destination.shard.index() as usize];
-            let copy = geometry.copy(program, source_geometry, destination, order)?;
-            outgoing_fragments = outgoing_fragments.max(copy.fragments);
-            outgoing_long_fragments = outgoing_long_fragments.max(copy.long_fragments);
+            let target_geometry = destination
+                .bind(&program.shards)?
+                .geometry(geometry, order)?;
+            let copy = geometry.pair(&source_geometry, &target_geometry)?;
+            let mut fragments = 0;
+            let mut long_fragments = 0;
             // Relative allocation/offset identities expose pointer continuation
             // without placement. This follows the supplied transfer order;
             // scheduling can change that order, pairing and control overlap.
             let mut resets = 0;
-            for row in &copy.receives {
+            for [_, row] in &copy.rows {
+                let limit = ipu_exchange::MAX_TRANSFER_WORDS * 4;
+                fragments += u64::from(row.rows) * u64::from(row.bytes.div_ceil(limit));
+                long_fragments += u64::from(row.rows)
+                    * (u64::from(row.bytes / limit) * u64::from(limit > 256)
+                        + u64::from(row.bytes % limit > 256));
                 let address = (u64::from(destination.shard.index()) << 32) + u64::from(row.offset);
                 if let Some(storage) = storage.as_deref_mut() {
                     storage.connection_rows(
@@ -269,7 +280,9 @@ fn geometry_traffic(
                         + u64::from(row.bytes),
                 );
             }
-            traffic.add_receive(target.tile, bytes, copy.fragments, resets);
+            outgoing_fragments = outgoing_fragments.max(fragments);
+            outgoing_long_fragments = outgoing_long_fragments.max(long_fragments);
+            traffic.add_receive(target.tile, bytes, fragments, resets);
         }
         if let Some(storage) = storage.as_deref_mut() {
             storage.send(source.tile, outgoing_fragments, outgoing_long_fragments);
@@ -307,12 +320,12 @@ fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn program_footprint(program: &TileGraph) -> ExpansionResult<ExchangeFootprint> {
-    program_footprint_analyzed(program, &mut GeometryAnalysis::default())
+    program_footprint_analyzed(program, &GeometryCache::default())
 }
 
 pub(crate) fn program_footprint_analyzed(
     program: &TileGraph,
-    geometry: &mut GeometryAnalysis,
+    geometry: &GeometryCache,
 ) -> ExpansionResult<ExchangeFootprint> {
     // Storage belongs to a tile, not to a shared transmit lane. Count both
     // endpoint roles conservatively (bidi encoding may later combine them).

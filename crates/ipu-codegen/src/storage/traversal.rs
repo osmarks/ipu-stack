@@ -769,32 +769,6 @@ impl ByteTraversal {
     pub(crate) fn word_aligned(&self) -> bool {
         self.summary(u32::MAX).is_none_or(|s| s.bad[0] == 0)
     }
-    pub(crate) fn copy_fragments(&self, other: &Self, limit: u32) -> StorageResult<u64> {
-        if self.byte_len() != other.byte_len() {
-            return Err(StorageError::InvalidView);
-        }
-        if let Some((rows, _)) = self.regular_copy(other) {
-            return Ok(u64::from(rows.rows) * u64::from(rows.bytes.div_ceil(limit)));
-        }
-        let Some(left) = self.summary(limit) else {
-            return Ok(0);
-        };
-        let Some(right) = other.summary(limit) else {
-            return Ok(0);
-        };
-        if left.count == 1 {
-            return Ok(right.chunks);
-        }
-        if right.count == 1 {
-            return Ok(left.chunks);
-        }
-        let mut count = 0;
-        super::for_each_copy_span(self.spans(), other.spans(), |_, _, bytes| {
-            count += u64::from(bytes.div_ceil(limit));
-            Ok(())
-        })?;
-        Ok(count)
-    }
 }
 
 #[cfg(test)]
@@ -814,8 +788,18 @@ mod tests {
         let (source, target) = (traversal(64), traversal(96));
         let (_, rows) = source.regular_copy(&target).unwrap();
         assert_eq!(rows.rows, 1_000_000);
-        assert_eq!(source.copy_fragments(&target, 16).unwrap(), 2_000_000);
-        assert_eq!(source.copy_fragments(&target, 1024).unwrap(), 1_000_000);
+        assert_eq!(
+            crate::storage::CopyPair::new(&source, &target)
+                .unwrap()
+                .fragments(16),
+            2_000_000
+        );
+        assert_eq!(
+            crate::storage::CopyPair::new(&source, &target)
+                .unwrap()
+                .fragments(1024),
+            1_000_000
+        );
     }
 
     #[test]
@@ -1016,7 +1000,9 @@ mod tests {
                             )
                             .unwrap();
                             assert_eq!(
-                                semantic.copy_fragments(traversal, limit).unwrap(),
+                                crate::storage::CopyPair::new(&semantic, traversal)
+                                    .unwrap()
+                                    .fragments(limit),
                                 fragments
                             );
                         }

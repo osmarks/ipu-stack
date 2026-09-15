@@ -7,8 +7,8 @@ fn lower_to_tiles(
 ) -> super::ExpansionResult<crate::LowProgram> {
     let mut graph = graph.clone();
     graph.compose_copies();
-    let cache = Arc::new(ExpansionCache::default());
-    let expected = super::expand_tiles_cached(&graph, true, Arc::new(ExpansionCache::disabled()))?;
+    let cache = Arc::new(GeometryCache::default());
+    let expected = super::expand_tiles_cached(&graph, true, Arc::new(GeometryCache::disabled()))?;
     for _ in 0..2 {
         let cached = super::expand_tiles_cached(&graph, true, Arc::clone(&cache))?;
         assert_eq!(cached, expected, "cache changed the complete low graph");
@@ -50,7 +50,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                 &Ipu21CostModel,
             )
             .unwrap();
-            let mut builder = TileGraphBuilder::new(&mid).unwrap();
+            let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
             let mut ids = vec![builder.shards[0].id];
             for tile in [1, 2, 1] {
                 let mut shard = builder.shards[0].clone();
@@ -181,7 +181,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         graph.set_outputs([input]).unwrap();
         let config = PipelineConfig::new(3).with_input(input, format(1));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-        let mut builder = TileGraphBuilder::new(&mid).unwrap();
+        let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
         let source = builder.full_view(builder.shards[0].id);
         let mut mappings = Vec::new();
         for tile in 0..=remote_count {
@@ -272,7 +272,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
     graph.set_outputs([input]).unwrap();
     let config = PipelineConfig::new(1).with_input(input, format(1));
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
-    let mut builder = TileGraphBuilder::new(&mid).unwrap();
+    let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
     let source = builder.shards[0].id;
     let source_view = builder
         .narrow_view(&builder.full_view(source), &[(1, 0, 2)])
@@ -1507,7 +1507,7 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
 
 #[test]
 fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
-    let shared_cache = Arc::new(ExpansionCache::default());
+    let shared_cache = Arc::new(GeometryCache::default());
     let mut random = fastrand::Rng::with_seed(0x6765_6d6d);
     for case in 0..CASES {
         let tiles = 1_u16 << random.u32(0..=3);
@@ -1527,7 +1527,7 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
             .with_input(right, format(tiles));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let uncached =
-            super::expand_tiles_cached(&mid, true, Arc::new(ExpansionCache::disabled())).unwrap();
+            super::expand_tiles_cached(&mid, true, Arc::new(GeometryCache::disabled())).unwrap();
         for _ in 0..2 {
             let cached = super::expand_tiles_cached(&mid, true, Arc::clone(&shared_cache)).unwrap();
             assert_eq!(cached, uncached, "cache changed graph in case {case}");
@@ -2503,10 +2503,13 @@ fn local_casts_pair_corresponding_linear_fragments() {
 
 #[test]
 fn complete_panel_grid_stays_one_logical_exchange() {
-    let mut state = TileGraphBuilder::new(&MidProgram {
-        tile_count: 2,
-        ..MidProgram::default()
-    })
+    let mut state = TileGraphBuilder::new(
+        &MidProgram {
+            tile_count: 2,
+            ..MidProgram::default()
+        },
+        Arc::default(),
+    )
     .unwrap();
     for (tile, columns) in [(0, 128), (1, 64)] {
         let tensor_type = TensorType::new(
@@ -2593,10 +2596,13 @@ fn complete_panel_grid_stays_one_logical_exchange() {
 
 #[test]
 fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
-    let mut state = TileGraphBuilder::new(&MidProgram {
-        tile_count: 3,
-        ..MidProgram::default()
-    })
+    let mut state = TileGraphBuilder::new(
+        &MidProgram {
+            tile_count: 3,
+            ..MidProgram::default()
+        },
+        Arc::default(),
+    )
     .unwrap();
     for tile in 0..3 {
         let mut layout = Layout::row_sharded(1);
@@ -2699,4 +2705,143 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
         .collect::<Vec<_>>();
     assert_eq!(regular.len(), 1);
     assert_eq!(regular[0].order, CopyOrder::Panels);
+}
+
+#[test]
+fn copy_preparation_preserves_order_when_distinct_values_share_storage() {
+    fn mapping(copies: &[(u16, LocalCopy)]) -> Vec<(u32, u32)> {
+        copies
+            .iter()
+            .flat_map(|(_, copy)| {
+                let (rows, bytes, source_stride, destination_stride) = match copy.pattern {
+                    crate::CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
+                    crate::CopyPattern::Strided {
+                        rows,
+                        row_bytes,
+                        source_stride,
+                        destination_stride,
+                    } => (rows, row_bytes, source_stride, destination_stride),
+                };
+                (0..rows).flat_map(move |row| {
+                    (0..bytes).map(move |byte| {
+                        (
+                            copy.source_offset + row * source_stride + byte,
+                            copy.destination_offset + row * destination_stride + byte,
+                        )
+                    })
+                })
+            })
+            .collect()
+    }
+    let orders = [
+        ElementOrder::RowMajor,
+        ElementOrder::Amp(crate::AmpOrder::Left),
+        ElementOrder::Amp(crate::AmpOrder::Output),
+        ElementOrder::Amp(crate::AmpOrder::TransposedLeft),
+        ElementOrder::Amp(crate::AmpOrder::TransposedOutput),
+        ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+            row_block: 16,
+            column_block: 32,
+        }),
+    ];
+    let mut reordered = 0;
+    for precision in [Precision::F16, Precision::F32] {
+        for source_order in orders {
+            for destination_order in orders {
+                let mut shards = [source_order, destination_order]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, order)| {
+                        let mut layout = Layout::row_sharded(1);
+                        layout.order = order;
+                        BlockValue {
+                            id: BlockValueId(index as u32),
+                            tile: 0,
+                            tensor_type: TensorType::new([48, 96], precision, layout),
+                            extents: [48, 96]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(axis, end)| ShardExtent {
+                                    axis: axis as u16,
+                                    start: 0,
+                                    logical_end: end,
+                                    physical_end: end,
+                                })
+                                .collect(),
+                            definition: ShardDefinition::Staging,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let view = |id| ShardView {
+                    shard: BlockValueId(id),
+                    extents: vec![
+                        ShardExtent {
+                            axis: 0,
+                            start: 0,
+                            logical_end: 32,
+                            physical_end: 32,
+                        },
+                        ShardExtent {
+                            axis: 1,
+                            start: 0,
+                            logical_end: 64,
+                            physical_end: 64,
+                        },
+                    ],
+                };
+                let (source, destination) = (view(0), view(1));
+                let a = source
+                    .bind(&shards)
+                    .unwrap()
+                    .traversal(CopyOrder::Semantic)
+                    .unwrap();
+                let b = destination
+                    .bind(&shards)
+                    .unwrap()
+                    .traversal(CopyOrder::Semantic)
+                    .unwrap();
+                let mut expected = Vec::new();
+                crate::storage::for_each_copy_span(a.spans(), b.spans(), |a, b, bytes| {
+                    expected.extend((0..bytes).map(|byte| (a + byte, b + byte)));
+                    Ok(())
+                })
+                .unwrap();
+                let cache = GeometryCache::default();
+                let mut separate = Vec::new();
+                append_span_copies(
+                    &cache,
+                    &shards,
+                    &source,
+                    &destination,
+                    0,
+                    &mut separate,
+                    CopyOrder::Semantic,
+                )
+                .unwrap();
+                reordered += usize::from(mapping(&separate) != expected);
+                for offset in [0, 64] {
+                    shards[1].definition = ShardDefinition::ShiftedAlias {
+                        source: BlockValueId(0),
+                        offset,
+                    };
+                    let mut shared = Vec::new();
+                    append_span_copies(
+                        &cache,
+                        &shards,
+                        &source,
+                        &destination,
+                        0,
+                        &mut shared,
+                        CopyOrder::Semantic,
+                    )
+                    .unwrap();
+                    assert_eq!(mapping(&shared), expected);
+                }
+            }
+        }
+    }
+    assert!(
+        reordered > 0,
+        "fixture must expose unsafe reuse of a reordered disjoint copy"
+    );
 }

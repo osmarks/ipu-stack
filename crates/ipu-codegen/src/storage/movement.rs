@@ -6,7 +6,6 @@ use super::{
     storage_bytes,
 };
 use crate::tensor::ShardExtent;
-use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CopyOrder {
@@ -17,94 +16,6 @@ pub enum CopyOrder {
     Physical,
     /// Row-major grid of 16-by-16 panels, physical order within each panel.
     Panels,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct CopyMapping<'a> {
-    pub source: TensorStorage<'a>,
-    pub source_extents: &'a [ShardExtent],
-    pub destination_extents: &'a [ShardExtent],
-}
-
-/// Facts about populating one allocation. Alignment and fragment facts concern
-/// semantic traversal; physical/panel requests retain their selected traversal.
-pub(crate) struct CopyGeometry {
-    pub bytes: u32,
-    coverage: ByteTraversal,
-    uncovered: OnceLock<StorageResult<Vec<ByteSpan>>>,
-    pub fragments: Option<u64>,
-    pub semantic: bool,
-    pub destination_word_aligned: bool,
-    pub same_element_order: bool,
-    pub padding: bool,
-}
-
-impl CopyGeometry {
-    pub(crate) fn heap_bytes(&self) -> usize {
-        self.coverage.heap_bytes()
-            + self
-                .uncovered
-                .get()
-                .and_then(|result| result.as_ref().ok())
-                .map_or(0, |spans| spans.capacity() * size_of::<ByteSpan>())
-    }
-
-    pub(crate) fn analyze(
-        destination: TensorStorage<'_>,
-        mappings: &[CopyMapping<'_>],
-        order: CopyOrder,
-        max_fragment_bytes: u32,
-    ) -> StorageResult<Self> {
-        if max_fragment_bytes == 0 {
-            return Err(StorageError::InvalidView);
-        }
-        let mut fragments = (order == CopyOrder::Semantic).then_some(0u64);
-        let mut destination_unaligned = false;
-        if order == CopyOrder::Semantic {
-            for mapping in mappings {
-                let source = byte_traversal(mapping.source, mapping.source_extents, false)?;
-                let target = byte_traversal(destination, mapping.destination_extents, false)?;
-                destination_unaligned |= !target.word_aligned();
-                fragments = match fragments {
-                    Some(count) if source.word_aligned() && !destination_unaligned => source
-                        .copy_fragments(&target, max_fragment_bytes)
-                        .ok()
-                        .map(|n| count.saturating_add(n)),
-                    _ => None,
-                };
-            }
-        }
-        Ok(Self {
-            bytes: storage_bytes(destination)?,
-            coverage: copy_coverage(
-                destination,
-                mappings.iter().map(|m| m.destination_extents),
-                order,
-            )?,
-            uncovered: OnceLock::new(),
-            fragments,
-            semantic: order == CopyOrder::Semantic,
-            destination_word_aligned: !destination_unaligned,
-            same_element_order: mappings.iter().all(|mapping| {
-                mapping.source.format.layout.order == destination.format.layout.order
-            }),
-            padding: destination
-                .extents
-                .iter()
-                .any(|extent| extent.physical_end > extent.logical_end),
-        })
-    }
-
-    /// Keep coverage symbolic until a realization actually needs clearing.
-    /// A packing kernel writes its padding itself, so scanning its span union
-    /// would be wasted work. The cached fact is independent of that choice.
-    pub(crate) fn uncovered(&self) -> StorageResult<&[ByteSpan]> {
-        self.uncovered
-            .get_or_init(|| uncovered_ranges(self.bytes, &self.coverage))
-            .as_ref()
-            .map(Vec::as_slice)
-            .map_err(Clone::clone)
-    }
 }
 
 /// Exact byte coverage, not summed volume: overlapping mappings cannot hide holes.
@@ -140,7 +51,10 @@ fn copy_coverage<'a>(
     Ok(ByteTraversal::physical_union(covered))
 }
 
-fn uncovered_ranges(bytes: u32, covered: &ByteTraversal) -> StorageResult<Vec<ByteSpan>> {
+pub(super) fn uncovered_ranges(
+    bytes: u32,
+    covered: &ByteTraversal,
+) -> StorageResult<Vec<ByteSpan>> {
     let mut cursor = 0u32;
     let mut holes: Vec<ByteSpan> = Vec::new();
     for span in covered.spans().chain(std::iter::once(ByteSpan {
@@ -205,6 +119,7 @@ pub(crate) fn for_each_copy_span(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{CopyMapping, GeometryCache};
     use crate::tensor::{Layout, Precision, TensorTiling, TensorType};
 
     #[test]
@@ -241,16 +156,17 @@ mod tests {
                 destination_extents: &copied,
             };
             for order in [CopyOrder::Physical, CopyOrder::Semantic] {
-                let geometry = CopyGeometry::analyze(
-                    TensorStorage {
-                        format: &source.format,
-                        extents: &extents,
-                    },
-                    std::slice::from_ref(&mapping),
-                    order,
-                    256,
-                )
-                .unwrap();
+                let geometry = GeometryCache::default()
+                    .destination(
+                        TensorStorage {
+                            format: &source.format,
+                            extents: &extents,
+                        },
+                        std::slice::from_ref(&mapping),
+                        order,
+                        256,
+                    )
+                    .unwrap();
                 let expected = vec![
                     ByteSpan {
                         offset: 100,

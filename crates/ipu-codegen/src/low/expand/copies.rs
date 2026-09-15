@@ -1,9 +1,8 @@
-//! Bind relative copy descriptors to the selected low storage identities.
-
+//! Bind copy geometry to low storage identities, then select local launches.
 use super::*;
 
 pub(super) fn append_span_copies(
-    cache: &ExpansionCache,
+    cache: &crate::storage::GeometryCache,
     shards: &[BlockValue],
     source: &ShardView,
     destination: &ShardView,
@@ -11,23 +10,20 @@ pub(super) fn append_span_copies(
     copies: &mut Vec<(u16, LocalCopy)>,
     order: CopyOrder,
 ) -> ExpansionResult<()> {
+    let a = source.bind(shards)?;
+    let b = destination.bind(shards)?;
+    let source_geometry = a.geometry(cache, order)?;
+    let target_geometry = b.geometry(cache, order)?;
+    let pair = cache.pair(&source_geometry, &target_geometry)?;
     copies.extend(
-        cache
-            .copy(shards, source, destination, order)?
-            .iter()
-            .map(|c| {
-                (
-                    tile,
-                    LocalCopy {
-                        source: source.shard,
-                        destination: destination.shard,
-                        source_offset: c.source_offset,
-                        destination_offset: c.destination_offset,
-                        bytes: c.bytes,
-                        pattern: c.pattern,
-                    },
-                )
-            }),
+        LocalCopy::from_pair(
+            source.shard,
+            destination.shard,
+            a.backing.0 == b.backing.0,
+            &pair,
+        )?
+        .into_iter()
+        .map(|copy| (tile, copy)),
     );
     Ok(())
 }

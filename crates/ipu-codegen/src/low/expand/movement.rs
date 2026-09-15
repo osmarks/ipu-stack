@@ -605,10 +605,28 @@ impl TileGraphBuilder {
                 |(mappings, order)| (mappings, order, order),
             );
             let transfers = batch.transfers.entry(exchange_order).or_default();
-            let geometry =
-                self.cache
-                    .geometry(&self.shards, &mappings, destination_shard, copy_order)?;
             let destination = &self.shards[destination_shard.index() as usize];
+            let geometric_mappings = mappings
+                .iter()
+                .map(|(source, target)| {
+                    let source = source.bind(&self.shards)?;
+                    target.bind(&self.shards)?;
+                    if target.shard != destination_shard {
+                        return Err(ExpansionError::InvalidCopyPlan);
+                    }
+                    Ok(crate::storage::CopyMapping {
+                        source: source.shard.storage(),
+                        source_extents: source.extents,
+                        destination_extents: &target.extents,
+                    })
+                })
+                .collect::<ExpansionResult<Vec<_>>>()?;
+            let geometry = self.cache.destination(
+                destination.storage(),
+                &geometric_mappings,
+                copy_order,
+                ipu_exchange::MAX_TRANSFER_WORDS * 4,
+            )?;
             let preparation = select_destination_packing(
                 &destination.tensor_type,
                 &destination.extents,
@@ -857,7 +875,7 @@ struct CopyStaging {
 fn select_destination_packing(
     destination: &TensorType,
     extents: &[ShardExtent],
-    geometry: &crate::storage::CopyGeometry,
+    geometry: &crate::storage::DestinationGeometry,
     policy: PackingPolicy,
 ) -> ExpansionResult<Option<CopyStaging>> {
     let transform = geometry.semantic

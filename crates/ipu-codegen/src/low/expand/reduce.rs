@@ -401,10 +401,13 @@ mod tests {
             crate::ReductionStaging::Streamed,
             crate::ReductionStaging::Batched(std::num::NonZeroU16::new(2).unwrap()),
         ] {
-            let mut builder = TileGraphBuilder::new(&MidProgram {
-                tile_count: 4,
-                ..Default::default()
-            })
+            let mut builder = TileGraphBuilder::new(
+                &MidProgram {
+                    tile_count: 4,
+                    ..Default::default()
+                },
+                Arc::default(),
+            )
             .unwrap();
             let format = crate::TensorFormat {
                 precision: Precision::F16,
@@ -593,10 +596,13 @@ mod tests {
     }
     #[test]
     fn fragmented_sum_output_keeps_packed_result_copy() {
-        let mut builder = TileGraphBuilder::new(&MidProgram {
-            tile_count: 3,
-            ..Default::default()
-        })
+        let mut builder = TileGraphBuilder::new(
+            &MidProgram {
+                tile_count: 3,
+                ..Default::default()
+            },
+            Arc::default(),
+        )
         .unwrap();
         let mut block = |tile, columns| {
             builder

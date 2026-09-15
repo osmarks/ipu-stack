@@ -333,17 +333,15 @@ Numerical conversion is a Compute with a Cast kernel. Copy composition cannot
 cross it. It also retains boundaries between incompatible explicit copy policies;
 it does not silently replace every selected policy with Automatic.
 
-[storage/movement.rs](../crates/ipu-codegen/src/storage/movement.rs) computes
-exact destination coverage, traversal alignment and direct-word fragment counts.
-It also owns span-stream matching, shared by local copies and exchange analysis.
-Coverage remains symbolic; its cached hole list is only evaluated when a clear
-needs it. It does not choose scratch or kernels. `select_destination_packing` in movement
-lowering consumes these facts and the Copy's `PackingPolicy`. Automatic retains
-the existing cost heuristic; forced direct or staged requests are checked, and
-copy composition retains their source/destination boundary. Kernel binding still
-needs the broader family-contract refactor. Clear emission widens exact holes to
-the fill implementation's write granularity. Relative local-copy descriptors and
-launch coalescing remain in low/copy.rs.
+[storage/geometry.rs](../crates/ipu-codegen/src/storage/geometry.rs) shares normalized
+views, matched copy rows and exact destination coverage between movement and
+costing. [storage/movement.rs](../crates/ipu-codegen/src/storage/movement.rs) owns
+span-stream matching and coverage subtraction. Hole lists are evaluated only when
+a selected realization needs clearing. These facts do not choose scratch or kernels.
+`select_destination_packing` consumes them with the Copy's `PackingPolicy`.
+Clear emission widens exact holes to the fill implementation's write granularity.
+The [copy family](../crates/ipu-codegen/src/kernel/copy.rs) owns launch coalescing,
+helper selection and binding against actual backing storage.
 
 Kernel construction resolves read views in
 [buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs), then calls
@@ -546,20 +544,16 @@ reduction lowering.
 | --- | --- | --- |
 | `planner::cache::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | Owned by the search invocation, passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
 | `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
-| `ExpansionCache.geometry` | Byte interpretation, extents and ordered mappings to coverage/alignment/fragment facts; excludes ownership and packing policy | Same search in production; bounded at 32,768 entries |
-| `ExpansionCache.copies` | Normalized view geometry, copy order, same-buffer flag to relative local-copy descriptors | Same search; separately bounded at 32,768 entries |
-| `GeometryAnalysis` | Interned view traversals and source/recipient pair facts: bytes, fragments, receive spans | One candidate's expansion and footprint screen; also used to price tentative relays |
+| `storage::GeometryCache` | Normalized byte views, matched source/target rows and destination coverage; excludes ownership, selected kernels and placement | One search, shared by expansion and costing; bounded view/pair/destination tables using foldhash |
 | `CopyRegions.targets` | Requested logical region to clipped source regions/replica owners | One source set during a copy or conversion; avoids repeating intersection work for replicas |
 | `TileGraphBuilder.kernel_metadata` | Shared provenance/kernel/format access contracts, found by linear lookup | One expansion; operand views remain per call |
 | Timeline `KernelCosts` | Interned call metadata plus physical widths to cycles | One timeline evaluation |
 | `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order, normalized encoded rows and the policy under which they were selected | Incumbent plus speculative candidate snapshots; policy compatibility and physical replay are validated |
 | ELF artifact cache | Source/includes, effective flags, target and tool identity to immutable compiled objects | On disk across builds |
 
-[ExpansionCache](../crates/ipu-codegen/src/low/expand/cache.rs) uses foldhash and
-`hashbrown::HashTable`, with full key equality. Borrowed lookups avoid allocating
-owned mapping lists on hits. Generation stays outside the lock; entries remain
-bounded. [GeometryAnalysis](../crates/ipu-codegen/src/estimate/geometry.rs) still
-uses standard hash maps. These are not all caches of the same computation.
+Shared geometry entries are immutable; construction runs outside the cache lock.
+Matched rows preserve traversal order. The copy family chooses any legal local
+reordering from actual alias bindings; cached geometry never chooses that policy.
 Family fragments are built by the constructor and consumed by costing;
 `CostModel` no longer constructs or caches executable programs.
 
@@ -573,24 +567,13 @@ a policy change cannot reuse an earlier selection. The public
 captured transfers. Current defaults, search coverage and checkpoint configuration
 remain unchanged.
 
-The overlapping work is constructing, normalizing and matching byte geometry in
-copy realization and geometry costing. Destination geometry no longer retains
-cost-dependent staging decisions; changing the packing policy reuses those facts.
-The fragment width is fixed by the IPU21 exchange target for this cache's lifetime.
+Destination facts retain no cost-dependent staging decisions. Changing packing
+policy reuses the facts. Exchange fragment size remains an explicit analysis input.
 
-[Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) found a useful
-MLP B2 improvement, marginal attention changes, and rejected broader fragment
-caches. The current `--benchmark-expansion` records a cold expansion and a second
-expansion with the same search cache and fresh per-candidate costing state. Each
-timing contains cache counters, capacity-based retained-payload estimates and
-process RSS samples; the latter also includes allocator-retained pages. The
-`--benchmark-expansion-uncached` variant disables the two expansion caches while
-retaining the existing per-candidate costing cache.
-
-Current MLP B2 Repeat3 measurements show 1.42 s cold / 0.95 s warm expansion,
-about 0.30 s recosting and 0.35 s footprint analysis. Expansion retains about
-35 MB of estimated payload and costing another 36 MB. The local-copy recipes
-account for only 67 KB of that expansion cache; they still include the row-launch
-heuristic in `low/copy.rs`. That selection must belong to the copy family before
-the geometry caches are consolidated. Measurements do not justify merging
-search state, low graph state and compiled kernel artifacts into one cache.
+[Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) cover earlier
+implementations. `--benchmark-expansion` now records cold and warm expansions,
+recosting, footprint analysis, retained-payload estimates and process RSS. All use
+the same geometry cache; `--benchmark-expansion-uncached` disables it throughout.
+The retained-byte estimate includes table capacity and can count shared traversal
+nodes more than once. RSS also includes the rest of the compiler and freed pages
+retained by the allocator.

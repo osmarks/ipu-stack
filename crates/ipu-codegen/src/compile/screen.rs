@@ -25,7 +25,7 @@ pub(super) fn expand_and_place(
     let (low, footprint) = expand_and_screen(
         mid,
         planning,
-        Arc::new(crate::low::expand::ExpansionCache::default()),
+        Arc::new(crate::storage::GeometryCache::default()),
     )?;
     let placement = place(&low)?;
     Ok((low, placement, footprint))
@@ -34,18 +34,16 @@ pub(super) fn expand_and_place(
 pub(super) fn expand_and_screen(
     mid: &crate::MidProgram,
     planning: &PipelineConfig,
-    cache: Arc<crate::low::expand::ExpansionCache>,
+    cache: Arc<crate::storage::GeometryCache>,
 ) -> PackageBuildResult<(LowProgram, crate::estimate::ExchangeFootprint)> {
     let start = Instant::now();
-    let mut analysis = crate::estimate::GeometryAnalysis::default();
-    let expanded = crate::low::expand::expand_tiles_analyzed(
+    let expanded = crate::low::expand::expand_tiles_cached(
         mid,
         planning.diagnostic_checkpoints,
-        cache,
-        &mut analysis,
+        Arc::clone(&cache),
     )?;
     let expansion_ms = start.elapsed().as_millis();
-    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
+    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &cache)?;
     let fragments = footprint.maximum_transfer_chunks_per_tile;
     tracing::info!(
         expansion_ms,

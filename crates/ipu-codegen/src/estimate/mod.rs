@@ -1,8 +1,7 @@
 //! Estimates share one vocabulary: tensor geometry and traffic describe work;
 //! memory evaluates allocations/liveness, and cycles applies IPU21 prices.
 
-mod geometry;
-pub(crate) use geometry::GeometryAnalysis;
+use crate::storage::GeometryCache;
 mod cycles;
 use cycles::exchange_fragment_price;
 mod exchange_storage;

@@ -5,7 +5,7 @@ use crate::low::storage::storage_root;
 
 pub(super) fn select(
     program: &mut TileGraph,
-    analysis: &mut crate::estimate::GeometryAnalysis,
+    analysis: &crate::storage::GeometryCache,
 ) -> ExpansionResult<()> {
     for index in 0..program.exchange_phases.len() {
         if !program.exchange_phases[index]
@@ -406,11 +406,7 @@ mod tests {
     fn relays_preserve_native_bytes_and_enter_normal_costing() {
         let mut program = fixture();
         let expected = execute(&program);
-        select(
-            &mut program,
-            &mut crate::estimate::GeometryAnalysis::default(),
-        )
-        .unwrap();
+        select(&mut program, &crate::storage::GeometryCache::default()).unwrap();
         assert_eq!(program.shards.len(), 52);
         assert_eq!(program.exchange_phases.len(), 1);
         assert_eq!(execute(&program), expected);
@@ -438,11 +434,7 @@ mod tests {
                 }
             }
             let before = program.clone();
-            select(
-                &mut program,
-                &mut crate::estimate::GeometryAnalysis::default(),
-            )
-            .unwrap();
+            select(&mut program, &crate::storage::GeometryCache::default()).unwrap();
             assert_eq!(program, before);
         }
     }

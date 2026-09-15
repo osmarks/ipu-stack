@@ -1,8 +1,7 @@
 //! Expand selected whole-device primitives into tile-local calls and movement.
 
-mod cache;
 mod emit;
-pub(crate) use cache::ExpansionCache;
+use crate::storage::GeometryCache;
 mod compute;
 
 mod buffers;
@@ -69,35 +68,19 @@ pub(crate) fn expand_tiles(
     graph: &MidProgram,
     checkpoints: bool,
 ) -> ExpansionResult<Arc<TileGraph>> {
-    expand_tiles_cached(graph, checkpoints, Arc::new(ExpansionCache::default()))
+    expand_tiles_cached(graph, checkpoints, Arc::new(GeometryCache::default()))
 }
 
-#[cfg(test)]
 pub(crate) fn expand_tiles_cached(
     graph: &MidProgram,
     checkpoints: bool,
-    cache: Arc<ExpansionCache>,
-) -> ExpansionResult<Arc<TileGraph>> {
-    expand_tiles_analyzed(
-        graph,
-        checkpoints,
-        cache,
-        &mut crate::estimate::GeometryAnalysis::default(),
-    )
-}
-
-pub(crate) fn expand_tiles_analyzed(
-    graph: &MidProgram,
-    checkpoints: bool,
-    cache: Arc<ExpansionCache>,
-    analysis: &mut crate::estimate::GeometryAnalysis,
+    cache: Arc<GeometryCache>,
 ) -> ExpansionResult<Arc<TileGraph>> {
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
     let start = Instant::now();
-    let mut state = TileGraphBuilder::new(graph)?;
-    state.cache = cache;
+    let mut state = TileGraphBuilder::new(graph, Arc::clone(&cache))?;
     let body = state.build_region(&graph.operations, checkpoints)?;
     for value in graph
         .inputs
@@ -141,7 +124,7 @@ pub(crate) fn expand_tiles_analyzed(
     crate::low::passes::simplify(&mut program)?;
     let simplify_time = start.elapsed();
     let start = Instant::now();
-    relay::select(&mut program, analysis)?;
+    relay::select(&mut program, &cache)?;
     let relay_time = start.elapsed();
     crate::low::initialization::omit_unread_fp8_input_padding(&mut program);
     crate::low::initialization::reuse_finite_padding(&mut program);
@@ -157,7 +140,7 @@ pub(crate) fn expand_tiles_analyzed(
 }
 
 struct TileGraphBuilder {
-    cache: Arc<ExpansionCache>,
+    cache: Arc<GeometryCache>,
     tile_count: u16,
     storage_groups: Vec<MidValueId>,
     shards: Vec<BlockValue>,
@@ -172,10 +155,10 @@ struct TileGraphBuilder {
 }
 
 impl TileGraphBuilder {
-    fn new(graph: &MidProgram) -> ExpansionResult<Self> {
+    fn new(graph: &MidProgram, cache: Arc<GeometryCache>) -> ExpansionResult<Self> {
         let tile_count = graph.tile_count;
         let mut state = Self {
-            cache: Arc::new(ExpansionCache::default()),
+            cache,
             tile_count,
             storage_groups: graph
                 .values

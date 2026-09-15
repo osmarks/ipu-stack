@@ -136,7 +136,10 @@ multi-element and Repeat-relative calls. Local copies now retain a checked
 helper binding before append; coalescing rebinds changed geometry. The helper
 owns raw access requirements, ABI and detailed cost, shared by placement,
 runtime retention and emission. Late helper selection and screening are removed.
-Copy useful-work coverage, remaining movement policies and cache consolidation
+Movement and costing now share normalized geometry and matched rows. The separate
+expansion and costing caches, cached unit-buffer copy recipes, and repeated
+fragment-count implementation are removed. Local launch selection belongs to
+the copy family. Copy useful-work coverage and remaining movement policies
 are still unfinished.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.

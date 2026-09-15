@@ -73,6 +73,14 @@ impl ShardView {
 }
 
 impl BoundView<'_> {
+    pub(crate) fn geometry(
+        &self,
+        cache: &crate::storage::GeometryCache,
+        order: CopyOrder,
+    ) -> StorageResult<std::sync::Arc<crate::storage::GeometryView>> {
+        cache.view(self.shard.storage(), self.extents, order)
+    }
+
     pub(crate) fn traversal(&self, order: CopyOrder) -> StorageResult<ByteTraversal> {
         let storage = self.shard.storage();
         match order {

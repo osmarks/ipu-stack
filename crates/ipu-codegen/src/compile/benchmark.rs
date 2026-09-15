@@ -16,7 +16,7 @@ pub struct ExpansionBenchmark {
     /// Whole-process Linux RSS, including caches and allocator-retained pages.
     pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
     pub baseline: ExpansionTiming,
-    /// A second candidate expansion with the same search cache and fresh costing state.
+    /// A second candidate expansion with the same shared geometry cache.
     pub warm: Option<ExpansionTiming>,
     /// Matching selections are opportunities, not validated reusable graph fragments.
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
@@ -55,12 +55,8 @@ pub struct SelectionReuse {
 #[derive(serde::Serialize)]
 pub struct ExpansionTiming {
     pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
-    /// Cache entries, hits and misses, respectively; counters are cumulative.
-    pub fragment_cache: (usize, u64, u64),
-    pub copy_geometry_cache: (usize, u64, u64),
-    /// Capacity-based payload estimates: copy recipes, destination facts, costing geometry.
-    /// Shared traversal bodies can be counted more than once; allocator overhead is excluded.
-    pub retained_cache_bytes: (usize, usize, usize),
+    /// Shared geometry counters are cumulative across cold/warm expansion and costing.
+    pub geometry_cache: crate::storage::GeometryCacheStats,
     pub mid_operations: usize,
     pub mid_values: usize,
     pub expand_ms: f64,
@@ -71,8 +67,6 @@ pub struct ExpansionTiming {
     pub footprint_ms: f64,
     pub estimated_row_bytes: u64,
     pub maximum_transfer_chunks_per_tile: u64,
-    /// Distinct views, view pairs and stored receive-row descriptors.
-    pub geometry: (usize, usize, usize),
     /// Diagnostic copying costs, outside expansion/footprint timings.
     pub clone_shards_ms: f64,
     pub clone_kernel_runs_ms: f64,
@@ -118,9 +112,9 @@ pub fn benchmark_mid_expansion(
         .ok_or_else(|| invalid("cannot cost benchmark mid program"))?;
     let mid_cost_ms = start.elapsed().as_secs_f64() * 1000.0;
     let cache = Arc::new(if cache_enabled {
-        crate::low::expand::ExpansionCache::default()
+        crate::storage::GeometryCache::default()
     } else {
-        crate::low::expand::ExpansionCache::disabled()
+        crate::storage::GeometryCache::disabled()
     });
     let mut selections = std::collections::BTreeMap::<
         &'static str,
@@ -205,24 +199,22 @@ pub fn benchmark_mid_expansion(
 fn measure_expansion(
     mid: &crate::MidProgram,
     config: &PipelineConfig,
-    cache: &Arc<crate::low::expand::ExpansionCache>,
+    cache: &Arc<crate::storage::GeometryCache>,
 ) -> PackageBuildResult<ExpansionTiming> {
     let mut memory = BTreeMap::from([("start", process_memory())]);
-    let mut analysis = crate::estimate::GeometryAnalysis::default();
     let start = Instant::now();
-    let expanded = crate::low::expand::expand_tiles_analyzed(
+    let expanded = crate::low::expand::expand_tiles_cached(
         &mid,
         config.diagnostic_checkpoints,
         Arc::clone(&cache),
-        &mut analysis,
     )?;
     let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("expanded", process_memory());
     let start = Instant::now();
-    let low_cost = crate::estimate::program_cycles_analyzed(&expanded, None, &mut analysis)?;
+    let low_cost = crate::estimate::program_cycles_analyzed(&expanded, None, cache)?;
     let recost_ms = start.elapsed().as_secs_f64() * 1000.0;
     let start = Instant::now();
-    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &mut analysis)?;
+    let footprint = crate::estimate::program_footprint_analyzed(&expanded, cache)?;
     let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("footprint", process_memory());
     let start = Instant::now();
@@ -237,12 +229,9 @@ fn measure_expansion(
     let cloned = std::hint::black_box(expanded.kernel_runs.clone());
     let clone_kernel_runs_ms = start.elapsed().as_secs_f64() * 1000.0;
     drop(cloned);
-    let retained = cache.retained_bytes();
     let mut timing = ExpansionTiming {
         process_memory: BTreeMap::new(),
-        fragment_cache: cache.stats(),
-        copy_geometry_cache: cache.geometry_stats(),
-        retained_cache_bytes: (retained.0, retained.1, analysis.retained_bytes()),
+        geometry_cache: cache.stats(),
         mid_operations: mid.operations.len(),
         mid_values: mid.values.len(),
         expand_ms,
@@ -252,7 +241,6 @@ fn measure_expansion(
         footprint_ms,
         estimated_row_bytes: footprint.estimated_row_bytes(),
         maximum_transfer_chunks_per_tile: footprint.maximum_transfer_chunks_per_tile,
-        geometry: analysis.stats(),
         clone_shards_ms,
         clone_kernel_runs_ms,
         shards: low.shards.len(),
@@ -273,7 +261,7 @@ fn measure_expansion(
             .map(|t| t.destinations.len())
             .sum(),
     };
-    drop((low, expanded, analysis));
+    drop((low, expanded));
     memory.insert("after_plan_drop", process_memory());
     timing.process_memory = memory;
     tracing::info!(expand_ms, tile_lists_ms, "benchmarked mid-to-low expansion");

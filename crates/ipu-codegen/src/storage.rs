@@ -2,7 +2,12 @@
 
 mod movement;
 pub use movement::CopyOrder;
-pub(crate) use movement::{CopyGeometry, CopyMapping, for_each_copy_span, uncovered_bytes};
+pub(crate) use movement::{for_each_copy_span, uncovered_bytes};
+mod geometry;
+pub use geometry::GeometryCacheStats;
+pub(crate) use geometry::{
+    CopyMapping, CopyPair, DestinationGeometry, GeometryCache, GeometryView,
+};
 mod traversal;
 pub(crate) use traversal::{ByteTraversal, StridedSpan, byte_traversal, panel_byte_traversal};
 

@@ -162,7 +162,7 @@ fn compile_graph(
     let selected = build_phase("plan_package", || {
         let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
         let fragments = crate::planner::cache::FragmentCache::default();
-        let expansions = Arc::new(crate::low::expand::ExpansionCache::default());
+        let expansions = Arc::new(crate::storage::GeometryCache::default());
         let mut state = checkpoint::State::load(graph, config, tile_mapping)?;
         let mut fixed = config.clone();
         let resuming = config.load_search_state.is_some();
@@ -439,7 +439,7 @@ fn remember<'a>(
 fn evaluate_candidate(
     mid: &crate::MidProgram,
     package: &PackageConfig,
-    expansions: Arc<crate::low::expand::ExpansionCache>,
+    expansions: Arc<crate::storage::GeometryCache>,
     mut cache: crate::ExchangeScheduleCache,
     runtime: &[u8],
 ) -> PackageBuildResult<EvaluatedCandidate> {
