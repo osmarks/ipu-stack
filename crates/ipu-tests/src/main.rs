@@ -675,6 +675,7 @@ fn main() -> Result<()> {
     }
     pipeline.optimization_steps = arguments.optimization_steps;
     pipeline.capacity_baseline = arguments.capacity_baseline;
+    pipeline.reuse_cast_inputs = arguments.capacity_baseline;
     pipeline.exchange_stream_words = arguments.exchange_stream_words;
     pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {

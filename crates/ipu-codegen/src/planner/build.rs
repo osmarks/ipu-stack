@@ -31,9 +31,8 @@ pub(crate) fn build_candidate(
     recipe: &Recipe,
 ) -> LoweringResult<Candidate> {
     let mut selected = select(graph, config, costs, fragments, recipe)?;
-    let options = &selected.recipe.options;
     let mut program = selected.program;
-    if options.cast_before_copies {
+    if config.cast_before_copies {
         program.reorder_casts();
     }
     program.compose_copies();
@@ -44,21 +43,21 @@ pub(crate) fn build_candidate(
                 config.tile_memory_budget_bytes,
             )
             .unwrap_or(program);
-        if options.packing_rows != 0 {
+        if config.packing_rows != 0 {
             program = program
-                .with_distributed_packing(options.packing_rows)
+                .with_distributed_packing(config.packing_rows)
                 .unwrap_or(program);
         }
-        program.group_reductions(options.parallel_reductions)?;
-        if options.disjoint_copy_sources {
+        program.group_reductions(config.parallel_reductions)?;
+        if config.disjoint_copy_sources {
             program.distribute_preparation(config.diagnostic_checkpoints)?;
         }
-        if options.reuse_cast_inputs {
+        if config.reuse_cast_inputs {
             program.reuse_cast_inputs();
         }
     }
-    if !options.tile_mapping.is_empty() {
-        program.remap_tiles(&options.tile_mapping)?;
+    if let Some(mapping) = &config.tile_mapping {
+        program.remap_tiles(mapping)?;
     }
     selected.program = program;
     selected
@@ -75,6 +74,7 @@ pub(crate) fn select(
     fragments: &FragmentCache,
     recipe: &Recipe,
 ) -> LoweringResult<Candidate> {
+    let selected_config = config.clone();
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -170,6 +170,7 @@ pub(crate) fn select(
     program.validate()?;
     Ok(Candidate {
         program,
+        config: selected_config,
         recipe: builder.recipe,
         alternatives: builder.alternatives,
     })
@@ -364,7 +365,7 @@ impl<C: CostModel> Builder<'_, C> {
                             &state.values,
                         );
                         let mut fragment = fragment;
-                        if self.recipe.options.cast_before_copies {
+                        if self.config.cast_before_copies {
                             fragment.reorder_casts();
                         }
                         fragment.compose_copies();
@@ -592,7 +593,7 @@ mod tests {
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &Recipe::baseline(&config),
+            &Recipe::default(),
         )
         .unwrap();
         let op = baseline
@@ -662,7 +663,7 @@ mod tests {
                 &config,
                 &costs,
                 &crate::planner::cache::FragmentCache::default(),
-                &Recipe::baseline(&config),
+                &Recipe::default(),
             )
             .unwrap();
             let repeat = baseline

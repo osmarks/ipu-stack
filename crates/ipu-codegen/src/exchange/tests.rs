@@ -578,7 +578,7 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
         &config,
         &Ipu21CostModel,
         &crate::planner::cache::FragmentCache::default(),
-        &crate::planner::Recipe::baseline(&config),
+        &crate::planner::Recipe::default(),
     )
     .unwrap()
     .program;

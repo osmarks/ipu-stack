@@ -46,6 +46,14 @@ pub struct PipelineConfig {
     /// Prefer distributed boundaries and conversion-inclusive memory costs.
     /// Experimental: smaller tensor peaks can still require larger exchange rows.
     pub capacity_baseline: bool,
+    /// Initial rewrite settings; local search may propose alternatives.
+    pub cast_before_copies: bool,
+    pub reuse_cast_inputs: bool,
+    /// Rows per distributed packing task; zero retains the original ownership.
+    pub packing_rows: u16,
+    /// Maximum reductions grouped into one compute phase; zero disables grouping.
+    pub parallel_reductions: usize,
+    pub disjoint_copy_sources: bool,
     /// Compact endpoint-balanced exchange waves; None uses latency-oriented scheduling.
     pub exchange_stream_words: Option<std::num::NonZeroU32>,
     pub inputs: BTreeMap<ValueId, TensorFormat>,
@@ -149,6 +157,11 @@ impl PipelineConfig {
             shape_aware_active_tile_counts: true,
             optimization_steps: 8,
             capacity_baseline: false,
+            cast_before_copies: false,
+            reuse_cast_inputs: false,
+            packing_rows: 0,
+            parallel_reductions: 0,
+            disjoint_copy_sources: false,
             exchange_stream_words: None,
             operator_candidate_limit: 64,
             exchange_table_budget_bytes: 80 * 1024,

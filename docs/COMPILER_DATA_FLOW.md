@@ -92,9 +92,9 @@ again and compilation recipes do not carry a second list of entry points.
 ```mermaid
 flowchart TD
   G[ComputeGraph and PipelineConfig] --> P[planner::build::select: select families and construct boundaries]
-  R[Recipe: selections and rewrite choices] --> P
+  R[Recipe: selections and open boundaries] --> P
   P --> I[emit_selected: construct and bind executable family fragment]
-  I --> H[Choose persistent homes; apply Recipe ownership and bind movement]
+  I --> H[Choose persistent homes; apply configured ownership and bind movement]
   H --> W[Cast ordering, copy composition, fusions, grouping and storage rewrites]
   W --> M[Executable MidProgram: Copy / Compute / Repeat]
   M --> E[low::expand: shard enumeration and physical realization]
@@ -132,11 +132,14 @@ another representation. Persistent parameter-home selection belongs to
 `mid/ownership.rs`. Cross-module imports name their owners instead of inheriting
 planner/tensor/configuration names through the mid module.
 
-Whole-program settings live in `Recipe.options` in
-[planner/recipe.rs](../crates/ipu-codegen/src/planner/recipe.rs): early FP8 casts,
+Whole-program settings live in `PipelineConfig` in
+[config.rs](../crates/ipu-codegen/src/config.rs): early FP8 casts,
 cast-buffer reuse, packing row size, reduction-group limit, disjoint preparation,
 and a device tile permutation. Operator layout selections remain in `Recipe.plans`.
-`Candidate` holds the executable program, recipe, and alternative operator layouts.
+`Recipe.open_boundaries` records intermediate values whose layouts may change.
+`Candidate` holds the executable program, its configuration, recipe, and alternative
+operator layouts. Proposals carry the changed configuration; search tracks both
+configuration and recipe when recognizing previously evaluated candidates.
 There are no named work identities, override maps, or available-choice inventories.
 
 [planner/build.rs](../crates/ipu-codegen/src/planner/build.rs) constructs mid,

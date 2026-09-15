@@ -153,14 +153,10 @@ fn compile_graph(
         let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
         let fragments = crate::planner::cache::FragmentCache::default();
         let expansions = Arc::new(crate::storage::GeometryCache::default());
-        let recipe = match tile_mapping {
-            Some(mapping) => Recipe::baseline(config).remapped(mapping, config.tile_count)?,
-            None => Recipe::baseline(config),
-        };
-        let mut attempted_recipes = Vec::new();
+        let mut attempted_recipes: Vec<(Recipe, PipelineConfig)> = Vec::new();
         let mut attempts = 0;
-        let mut fixed = config.clone();
-        let mut incumbent = build::build_candidate(graph, &fixed, &costs, &fragments, &recipe)?;
+        let mut incumbent =
+            build::build_candidate(graph, config, &costs, &fragments, &Recipe::default())?;
         memory_profile(graph, config, &incumbent.program, "baseline")?;
         let mut selected = evaluate_candidate(
             &incumbent.program,
@@ -172,7 +168,7 @@ fn compile_graph(
         tracing::info!(cycles = selected.cycles, "validated search incumbent");
         // Fix logical homes for the remaining local search.
         for (input, planned) in graph.inputs().iter().zip(&incumbent.program.inputs) {
-            fixed.inputs.insert(
+            incumbent.config.inputs.insert(
                 input.value,
                 incumbent.program.values[planned.value.index() as usize]
                     .tensor_type
@@ -190,21 +186,27 @@ fn compile_graph(
             } else {
                 None
             };
-            let proposed = proposals(graph, config, &incumbent, traffic.as_ref());
+            let proposed = proposals(graph, &incumbent, traffic.as_ref());
             let proposed_count = proposed.len();
             let screened = proposed
                 .into_par_iter()
                 .enumerate()
-                .filter(|(_, proposal)| !attempted_recipes.contains(&proposal.recipe))
+                .filter(|(_, proposal)| {
+                    !attempted_recipes.iter().any(|(recipe, config)| {
+                        recipe == &proposal.recipe && config == &proposal.config
+                    })
+                })
                 .map(|(proposal, proposed)| {
-                    let recipe = proposed.recipe;
+                    let raw = (proposed.recipe, proposed.config);
                     let span = tracing::debug_span!("local_screen", round = attempts, proposal);
                     let _entered = span.enter();
                     let candidate =
-                        build::build_candidate(graph, &fixed, &costs, &fragments, &recipe);
+                        build::build_candidate(graph, &raw.1, &costs, &fragments, &raw.0);
                     let candidate = match candidate {
                         Ok(candidate) => {
-                            let visited = attempted_recipes.contains(&candidate.recipe);
+                            let visited = attempted_recipes.iter().any(|(recipe, config)| {
+                                recipe == &candidate.recipe && config == &candidate.config
+                            });
                             let estimate = proposed
                                 .estimated_cycles
                                 .unwrap_or(candidate.program.estimated_cycles);
@@ -228,7 +230,7 @@ fn compile_graph(
                             Err(Skipped::Invalid)
                         }
                     };
-                    (proposal, recipe, candidate)
+                    (proposal, raw, candidate)
                 })
                 .collect::<Vec<_>>();
             let mut visited = proposed_count - screened.len();
@@ -258,10 +260,11 @@ fn compile_graph(
                     .find(|old| old.baseline.program == candidate.program)
                 {
                     same.estimated_cycles = same.estimated_cycles.min(estimate);
-                    same.recipes.extend([raw, candidate.recipe]);
+                    same.recipes
+                        .extend([raw, (candidate.recipe, candidate.config)]);
                     deduplicated += 1;
                 } else {
-                    let recipes = vec![raw, candidate.recipe.clone()];
+                    let recipes = vec![raw, (candidate.recipe.clone(), candidate.config.clone())];
                     pending.push(ShortlistedCandidate {
                         proposal,
                         estimated_cycles: estimate,
@@ -291,9 +294,12 @@ fn compile_graph(
             }
             for (index, candidate) in pending.iter().enumerate() {
                 let scope = format!("local-{}-candidate-{index}", attempts);
-                if let Err(error) =
-                    memory_profile(graph, &fixed, &candidate.baseline.program, &scope)
-                {
+                if let Err(error) = memory_profile(
+                    graph,
+                    &candidate.baseline.config,
+                    &candidate.baseline.program,
+                    &scope,
+                ) {
                     tracing::warn!(%error, scope, "skipped candidate memory profile");
                 }
             }
@@ -391,11 +397,11 @@ struct ShortlistedCandidate {
     proposal: usize,
     estimated_cycles: u64,
     baseline: Candidate,
-    recipes: Vec<Recipe>,
+    recipes: Vec<(Recipe, PipelineConfig)>,
 }
 
 fn remember<'a>(
-    visited: &mut Vec<Recipe>,
+    visited: &mut Vec<(Recipe, PipelineConfig)>,
     candidates: impl IntoIterator<Item = &'a ShortlistedCandidate>,
 ) {
     for recipe in candidates

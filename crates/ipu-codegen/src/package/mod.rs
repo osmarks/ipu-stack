@@ -1005,7 +1005,7 @@ mod tests {
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::baseline(&config),
+            &crate::planner::Recipe::default(),
         )
         .unwrap()
         .program;

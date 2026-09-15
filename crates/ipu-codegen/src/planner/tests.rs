@@ -81,8 +81,8 @@ fn whole_program_reduction_grouping_replays_and_lowers() {
     };
     let baseline =
         build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &initial).unwrap();
-    let mut recipe = baseline.recipe.clone();
-    recipe.options.parallel_reductions = 2;
+    let recipe = baseline.recipe.clone();
+    config.parallel_reductions = 2;
     let grouped = build::build_candidate(
         &graph,
         &config,
@@ -1263,7 +1263,7 @@ fn materialized_attention_packs_values_for_the_full_product() {
         &config,
         &Ipu21CostModel,
         &crate::planner::cache::FragmentCache::default(),
-        &crate::planner::Recipe::baseline(&config),
+        &crate::planner::Recipe::default(),
     )
     .unwrap()
     .program;
@@ -1658,7 +1658,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::baseline(&config),
+            &crate::planner::Recipe::default(),
         )
         .unwrap()
         .program;
@@ -1727,7 +1727,7 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::baseline(&config),
+            &crate::planner::Recipe::default(),
         )
         .unwrap()
         .program;
@@ -2229,8 +2229,8 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
         .unwrap();
         for with_v in [false, true] {
             config.attention_fp8_scales[1] = with_v.then_some(-4);
-            let mut recipe = late.recipe.clone();
-            recipe.options.cast_before_copies = true;
+            let recipe = late.recipe.clone();
+            config.cast_before_copies = true;
             let early = build::build_candidate(
                 &graph,
                 &config,
@@ -2240,7 +2240,7 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             )
             .unwrap();
             assert_ne!(early.program.operations, late.program.operations);
-            assert_eq!(early.recipe.options, recipe.options);
+            assert_eq!(early.config, config);
             let tiles = crate::expand_tiles(&early.program).unwrap();
             let low = crate::lower_to_tiles(&tiles, false);
             crate::KernelBuildPlan::from_program(&low).unwrap();

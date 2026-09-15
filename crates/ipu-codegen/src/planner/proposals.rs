@@ -11,49 +11,51 @@ pub(super) const PACKING_ROWS: [u16; 4] = [32, 64, 128, 256];
 /// estimate. This estimate never changes the executable program's own costing.
 pub(crate) struct RecipeProposal {
     pub recipe: Recipe,
+    pub config: PipelineConfig,
     pub estimated_cycles: Option<u64>,
 }
 
 pub(crate) fn proposals(
     graph: &ComputeGraph,
-    config: &PipelineConfig,
     incumbent: &Candidate,
     traffic: Option<&crate::exchange::MappingTraffic>,
 ) -> Vec<RecipeProposal> {
+    let config = &incumbent.config;
     let operations = graph
         .walk_operations()
         .filter(|op| !matches!(op.kind, crate::OperationKind::Repeat(_)))
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
-    let mut propose = |recipe: Recipe| {
-        candidates.push(recipe.clone());
+    let mut propose = |recipe: Recipe, settings: PipelineConfig| {
+        candidates.push((recipe.clone(), settings.clone()));
         if !config.diagnostic_checkpoints {
-            let mut donated = recipe;
-            donated.options.reuse_cast_inputs = !donated.options.reuse_cast_inputs;
-            candidates.push(donated);
+            let mut donated = settings;
+            donated.reuse_cast_inputs = !donated.reuse_cast_inputs;
+            candidates.push((recipe, donated));
         }
     };
-    propose(incumbent.recipe.clone());
-    let mut early = incumbent.recipe.clone();
-    early.options.cast_before_copies = !early.options.cast_before_copies;
-    propose(early);
+    let settings = &incumbent.config;
+    propose(incumbent.recipe.clone(), settings.clone());
+    let mut early = settings.clone();
+    early.cast_before_copies = !early.cast_before_copies;
+    propose(incumbent.recipe.clone(), early);
     if !config.diagnostic_checkpoints {
         for rows in std::iter::once(0).chain(PACKING_ROWS) {
-            let mut recipe = incumbent.recipe.clone();
-            recipe.options.packing_rows = rows;
-            propose(recipe);
+            let mut config = settings.clone();
+            config.packing_rows = rows;
+            propose(incumbent.recipe.clone(), config);
         }
         for limit in 0..=config.max_parallel_reductions {
             if limit == 1 {
                 continue;
             }
-            let mut recipe = incumbent.recipe.clone();
-            recipe.options.parallel_reductions = limit;
-            propose(recipe);
+            let mut config = settings.clone();
+            config.parallel_reductions = limit;
+            propose(incumbent.recipe.clone(), config);
         }
-        let mut recipe = incumbent.recipe.clone();
-        recipe.options.disjoint_copy_sources = !recipe.options.disjoint_copy_sources;
-        propose(recipe);
+        let mut config = settings.clone();
+        config.disjoint_copy_sources = !config.disjoint_copy_sources;
+        propose(incumbent.recipe.clone(), config);
     }
     for operation in &operations {
         let alternatives = incumbent
@@ -66,7 +68,7 @@ pub(crate) fn proposals(
         for plan in alternatives.clone() {
             let mut recipe = incumbent.recipe.clone();
             recipe.plans.insert(operation.id, plan.clone());
-            propose(recipe);
+            propose(recipe, settings.clone());
         }
         for &output in &operation.results {
             if graph.outputs().contains(&output)
@@ -93,15 +95,16 @@ pub(crate) fn proposals(
             for plan in alternatives.clone() {
                 let mut joint = recipe.clone();
                 joint.plans.insert(operation.id, plan.clone());
-                propose(joint);
+                propose(joint, settings.clone());
             }
-            propose(recipe);
+            propose(recipe, settings.clone());
         }
     }
     let mut candidates = candidates
         .into_iter()
-        .map(|recipe| RecipeProposal {
+        .map(|(recipe, config)| RecipeProposal {
             recipe,
+            config,
             estimated_cycles: None,
         })
         .collect::<Vec<_>>();
@@ -171,8 +174,24 @@ fn owner_mapping(
         baseline_pressure=%baseline.1, candidate_pressure=%best_score.1,
         "screened ownership proposal by exchange resource load");
     best.map(|mapping| {
+        let mut config = incumbent.config.clone();
+        let mut owners = crate::tensor::OwnerMap::default();
+        if let Some(previous) = &config.tile_mapping {
+            crate::tensor::remap_owners(
+                std::iter::once(&mut owners),
+                previous,
+                program.tile_count,
+            )?;
+        }
+        crate::tensor::remap_owners(std::iter::once(&mut owners), &mapping, program.tile_count)?;
+        config.tile_mapping = Some(
+            (0..program.tile_count)
+                .map(|tile| owners.tile(tile, program.tile_count).unwrap())
+                .collect(),
+        );
         Ok(RecipeProposal {
-            recipe: incumbent.recipe.remapped(&mapping, program.tile_count)?,
+            recipe: incumbent.recipe.clone(),
+            config,
             estimated_cycles: Some(
                 program
                     .estimated_cycles
@@ -239,7 +258,7 @@ mod tests {
             &Recipe::default(),
         )
         .unwrap();
-        let choices = proposals(&graph, &config, &incumbent, None);
+        let choices = proposals(&graph, &incumbent, None);
         let changed = choices
             .iter()
             .find(|p| p.recipe.plans != incumbent.recipe.plans)
@@ -248,36 +267,28 @@ mod tests {
             choices
                 .iter()
                 .any(|p| p.recipe.plans == changed.recipe.plans
-                    && p.recipe.options.reuse_cast_inputs
-                        != changed.recipe.options.reuse_cast_inputs)
+                    && p.config.reuse_cast_inputs != changed.config.reuse_cast_inputs)
         );
     }
     #[test]
     fn global_mapping_replays_without_changing_logical_work() {
-        let (graph, config) = mlp();
+        let (graph, mut config) = mlp();
         let cache = crate::planner::cache::FragmentCache::default();
-        let baseline = build::build_candidate(
-            &graph,
-            &config,
-            &Ipu21CostModel,
-            &cache,
-            &Recipe::baseline(&config),
-        )
-        .unwrap();
+        let baseline =
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, &Recipe::default())
+                .unwrap();
         let mapping = (0..config.tile_count).rev().collect::<Vec<_>>();
-        let recipe = baseline
-            .recipe
-            .remapped(&mapping, config.tile_count)
-            .unwrap();
+        let recipe = &baseline.recipe;
+        config.tile_mapping = Some(mapping.clone());
         let mapped =
-            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, &recipe).unwrap();
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, recipe).unwrap();
         let mut expected = baseline.program.clone();
         expected.remap_tiles(&mapping).unwrap();
         expected.refresh_estimates().unwrap();
         assert_eq!(mapped.program, expected);
-        let inverse = recipe.remapped(&mapping, config.tile_count).unwrap();
+        config.tile_mapping = Some((0..config.tile_count).collect());
         let restored =
-            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, &inverse).unwrap();
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, recipe).unwrap();
         for (old, new) in baseline.program.values.iter().zip(&restored.program.values) {
             for tile in 0..old.tensor_type.format.layout.tiling.tile_count {
                 assert_eq!(
