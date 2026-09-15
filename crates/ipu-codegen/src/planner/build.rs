@@ -73,16 +73,6 @@ pub(crate) fn build_candidate(
             .unwrap_or(program);
     }
     let storage = selected.recipe.cast_storage.as_ref().unwrap();
-    if let Some(source) = storage.operators.keys().find(|&&source| {
-        !graph
-            .walk_operations()
-            .any(|operation| operation.id == source)
-    }) {
-        return Err(crate::mid::ProgramError::Invalid(format!(
-            "cast-storage policy names unknown operator {source:?}"
-        ))
-        .into());
-    }
     if config.diagnostic_checkpoints {
         if !storage.sites.is_empty() || !storage.operators.is_empty() {
             return Err(crate::mid::ProgramError::Invalid(
@@ -116,6 +106,33 @@ pub(crate) fn select(
 ) -> LoweringResult<Candidate> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
+    }
+    // Defaults may name an operator whose selected implementation emits no
+    // work. Validate provenance against the graph, not the surviving mid sites.
+    let sources = graph
+        .walk_operations()
+        .map(|op| op.id)
+        .collect::<BTreeSet<_>>();
+    let requests = recipe
+        .owners
+        .operators
+        .keys()
+        .map(|source| ("ownership", source))
+        .chain(
+            recipe
+                .cast_storage
+                .iter()
+                .flat_map(|policy| policy.operators.keys())
+                .map(|source| ("cast-storage", source)),
+        );
+    if let Some((policy, source)) = requests
+        .into_iter()
+        .find(|(_, source)| !sources.contains(source))
+    {
+        return Err(crate::mid::ProgramError::Invalid(format!(
+            "{policy} policy names unknown operator {source:?}"
+        ))
+        .into());
     }
     let expanded_config = (config.shape_aware_active_tile_counts
         && config.operator_candidates == default_operator_candidates(config.tile_count))
@@ -180,8 +197,7 @@ pub(crate) fn select(
             value: id,
         });
     }
-    let mut operations =
-        builder.region(graph.operations(), graph.outputs(), graph.value_shapes())?;
+    let operations = builder.region(graph.operations(), graph.outputs(), graph.value_shapes())?;
     let outputs = graph
         .outputs()
         .iter()
@@ -189,7 +205,6 @@ pub(crate) fn select(
         .collect::<LoweringResult<Vec<_>>>()?;
     parameter_homes::assign_parameter_tiles(
         &mut builder.state.values,
-        &mut operations,
         &inputs
             .iter()
             .filter(|input| input.kind == GraphInputKind::Parameter)
@@ -198,7 +213,7 @@ pub(crate) fn select(
         &BTreeMap::new(),
         config.tile_count,
     )?;
-    let program = MidProgram {
+    let mut program = MidProgram {
         tile_count: config.tile_count,
         inputs,
         operations,
@@ -208,6 +223,7 @@ pub(crate) fn select(
         estimated_exchange_cycles: 0,
         peak_memory: MemoryPeaks::default(),
     };
+    program.apply_ownership(&builder.recipe.owners)?;
     program.validate()?;
     Ok(Candidate {
         cast_sites: BTreeSet::new(),

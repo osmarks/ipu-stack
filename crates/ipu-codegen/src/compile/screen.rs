@@ -1,5 +1,4 @@
 //! Expand, screen, and place a concrete whole-device program.
-use super::placement;
 use crate::compile::PipelineConfig;
 #[cfg(test)]
 use crate::estimate::Ipu21CostModel;
@@ -18,7 +17,6 @@ use std::time::Instant;
 pub(super) fn expand_and_place(
     mid: &crate::MidProgram,
     planning: &PipelineConfig,
-    tile_mapping: Option<&[u16]>,
 ) -> PackageBuildResult<(
     LowProgram,
     crate::Placement,
@@ -27,7 +25,6 @@ pub(super) fn expand_and_place(
     let (low, footprint) = expand_and_screen(
         mid,
         planning,
-        tile_mapping,
         Arc::new(crate::low::expand::ExpansionCache::default()),
     )?;
     let placement = place(&low)?;
@@ -37,12 +34,11 @@ pub(super) fn expand_and_place(
 pub(super) fn expand_and_screen(
     mid: &crate::MidProgram,
     planning: &PipelineConfig,
-    tile_mapping: Option<&[u16]>,
     cache: Arc<crate::low::expand::ExpansionCache>,
 ) -> PackageBuildResult<(LowProgram, crate::estimate::ExchangeFootprint)> {
     let start = Instant::now();
     let mut analysis = crate::estimate::GeometryAnalysis::default();
-    let mut expanded = crate::low::expand::expand_tiles_analyzed(
+    let expanded = crate::low::expand::expand_tiles_analyzed(
         mid,
         planning.diagnostic_checkpoints,
         cache,
@@ -66,7 +62,6 @@ pub(super) fn expand_and_screen(
             limit: planning.exchange_transfer_limit_per_tile,
         });
     }
-    placement::map_tiles(&mut expanded, tile_mapping)?;
     let low = lower_to_tiles(&expanded, planning.diagnostic_checkpoints);
     if let Some(copy) = low
         .local_copies
@@ -108,20 +103,20 @@ mod tests {
         config.exchange_table_budget_bytes = 0;
         // Encoded storage is checked only once encoded; mid heuristics and
         // uncompressed row slots cannot veto this geometry-feasible plan.
-        assert!(expand_and_place(&baseline, &config, None).is_ok());
+        assert!(expand_and_place(&baseline, &config).is_ok());
         assert!(check_exchange_budget(1, &config).is_err());
         config.exchange_table_budget_bytes = 1;
         assert!(check_exchange_budget(1, &config).is_ok());
         config.exchange_transfer_limit_per_tile = fragments - 1;
-        let error = expand_and_place(&baseline, &config, None).err().unwrap();
+        let error = expand_and_place(&baseline, &config).err().unwrap();
         assert!(matches!(
             error,
             PackageBuildError::ExchangeTransferLimitExceeded { .. }
         ));
         config.exchange_transfer_limit_per_tile = 0;
         let still_planned = [build_baseline(&graph, &config, &Ipu21CostModel).unwrap()];
-        assert!(expand_and_place(&still_planned[0], &config, None).is_err());
+        assert!(expand_and_place(&still_planned[0], &config).is_err());
         config.exchange_transfer_limit_per_tile = u64::MAX;
-        assert!(expand_and_place(&still_planned[0], &config, None).is_ok());
+        assert!(expand_and_place(&still_planned[0], &config).is_ok());
     }
 }

@@ -34,7 +34,8 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
-    /// Optional bijection from planned tile indices to execution tile indices.
+    /// Initial bijection from planned tile indices to execution tile indices.
+    /// A supplied map disables automatic ownership-remapping proposals.
     pub tile_mapping: Option<Vec<u16>>,
 }
 
@@ -177,7 +178,6 @@ fn compile_graph(
         let mut selected = evaluate_candidate(
             &incumbent.program,
             package,
-            state.mapping.as_deref(),
             Arc::clone(&expansions),
             crate::ExchangeScheduleCache::default(),
             &runtime,
@@ -202,51 +202,24 @@ fn compile_graph(
             );
         }
         state.save(config, &incumbent, &fixed)?;
-        if config.optimization_steps != 0 && !state.mapping_checked && state.mapping.is_none() {
-            state.mapping_checked = true;
-            let challenger =
-                match placement::model_mapping(&selected.program, &selected.placement, true) {
-                    Ok((_, challenger)) => challenger,
-                    Err(error) => {
-                        tracing::info!(%error, "retained incumbent after mapping estimate failed");
-                        None
-                    }
-                };
-            if let Some(challenger) = challenger {
-                state.attempts += 1;
-                match evaluate_candidate(
-                    &incumbent.program,
-                    package,
-                    Some(&challenger),
-                    Arc::clone(&expansions),
-                    selected.cache.clone(),
-                    &runtime,
-                ) {
-                    Ok(plan) if plan.cycles < selected.cycles => {
-                        let improved = plan.cycles;
-                        tracing::info!(
-                            before = selected.cycles,
-                            after = improved,
-                            "accepted tile mapping improvement"
-                        );
-                        selected = plan;
-                        state.mapping = Some(challenger);
-                    }
-                    Ok(_) => tracing::info!("retained incumbent tile mapping"),
-                    Err(error) => tracing::info!(%error, "retained feasible tile mapping"),
-                }
-            }
-        }
-
-        state.save(config, &incumbent, &fixed)?;
         while state.attempts < budget_end {
-            let proposed = proposals(graph, config, &incumbent);
+            let traffic = if tile_mapping.is_none() {
+                crate::exchange::MappingTraffic::new(&selected.program, &selected.placement)
+                    .map_err(
+                        |error| tracing::info!(%error, "could not estimate ownership proposals"),
+                    )
+                    .ok()
+            } else {
+                None
+            };
+            let proposed = proposals(graph, config, &incumbent, traffic.as_ref());
             let proposed_count = proposed.len();
             let screened = proposed
                 .into_par_iter()
                 .enumerate()
-                .filter(|(_, recipe)| !state.visited.contains(recipe))
-                .map(|(proposal, recipe)| {
+                .filter(|(_, proposal)| !state.visited.contains(&proposal.recipe))
+                .map(|(proposal, proposed)| {
+                    let recipe = proposed.recipe;
                     let span =
                         tracing::debug_span!("local_screen", round = state.attempts, proposal);
                     let _entered = span.enter();
@@ -255,17 +228,18 @@ fn compile_graph(
                     let candidate = match candidate {
                         Ok(candidate) => {
                             let visited = state.visited.contains(&candidate.recipe);
-                            let keep = !visited
-                                && candidate.program.estimated_cycles
-                                    < incumbent.program.estimated_cycles;
+                            let estimate = proposed
+                                .estimated_cycles
+                                .unwrap_or(candidate.program.estimated_cycles);
+                            let keep = !visited && estimate < incumbent.program.estimated_cycles;
                             tracing::debug!(
                                 incumbent_estimate = incumbent.program.estimated_cycles,
-                                candidate_estimate = candidate.program.estimated_cycles,
+                                candidate_estimate = estimate,
                                 visited, keep, delta = ?candidate.recipe.changes(&incumbent.recipe),
                                 "screened local recipe"
                             );
                             if keep {
-                                Ok(candidate)
+                                Ok((candidate, estimate))
                             } else if visited {
                                 Err(Skipped::Visited)
                             } else {
@@ -286,7 +260,7 @@ fn compile_graph(
             let mut deduplicated = 0;
             let mut pending: Vec<ShortlistedCandidate> = Vec::new();
             for (proposal, raw, result) in screened {
-                let candidate = match result {
+                let (candidate, estimate) = match result {
                     Ok(candidate) => candidate,
                     Err(reason) => {
                         match reason {
@@ -306,18 +280,20 @@ fn compile_graph(
                     .iter_mut()
                     .find(|old| old.baseline.program == candidate.program)
                 {
+                    same.estimated_cycles = same.estimated_cycles.min(estimate);
                     same.recipes.extend([raw, candidate.recipe]);
                     deduplicated += 1;
                 } else {
                     let recipes = vec![raw, candidate.recipe.clone()];
                     pending.push(ShortlistedCandidate {
                         proposal,
+                        estimated_cycles: estimate,
                         baseline: candidate,
                         recipes,
                     });
                 }
             }
-            pending.sort_by_key(|candidate| candidate.baseline.program.estimated_cycles);
+            pending.sort_by_key(|candidate| candidate.estimated_cycles);
             let truncated = pending.len().saturating_sub(budget_end - state.attempts);
             pending.truncate(budget_end - state.attempts);
             tracing::info!(
@@ -366,7 +342,6 @@ fn compile_graph(
                     let result = evaluate_candidate(
                         &candidate.baseline.program,
                         package,
-                        state.mapping.as_deref(),
                         Arc::clone(&expansions),
                         selected.cache.clone(),
                         &runtime,
@@ -440,6 +415,7 @@ enum Skipped {
 /// mark aliases of a truncated or cancelled candidate as visited.
 struct ShortlistedCandidate {
     proposal: usize,
+    estimated_cycles: u64,
     baseline: Candidate,
     recipes: Vec<Recipe>,
 }
@@ -463,13 +439,12 @@ fn remember<'a>(
 fn evaluate_candidate(
     mid: &crate::MidProgram,
     package: &PackageConfig,
-    mapping: Option<&[u16]>,
     expansions: Arc<crate::low::expand::ExpansionCache>,
     mut cache: crate::ExchangeScheduleCache,
     runtime: &[u8],
 ) -> PackageBuildResult<EvaluatedCandidate> {
     let config = &package.pipeline;
-    let (program, _) = screen::expand_and_screen(mid, config, mapping, expansions)?;
+    let (program, _) = screen::expand_and_screen(mid, config, expansions)?;
     let provisional_placement = build_phase("place_provisional_storage", || {
         Ok(crate::place::place(&program)?)
     })?;
@@ -607,9 +582,11 @@ pub fn capture_exchange_baseline(
     let planning = &config.pipeline;
     validate_tile_count(u32::from(planning.tile_count))?;
     let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-    let mid = crate::planner::build_baseline(graph, planning, &costs)?;
-    let (low, placement, _) =
-        screen::expand_and_place(&mid, planning, config.tile_mapping.as_deref())?;
+    let mut mid = crate::planner::build_baseline(graph, planning, &costs)?;
+    if let Some(mapping) = &config.tile_mapping {
+        mid.remap_tiles(mapping)?;
+    }
+    let (low, placement, _) = screen::expand_and_place(&mid, planning)?;
     Ok(crate::exchange::capture_exchange_schedule(
         &low, &placement,
     )?)

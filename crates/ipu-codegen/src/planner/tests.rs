@@ -42,6 +42,165 @@ use std::collections::{BTreeMap, BTreeSet};
 const RANDOM_CASES: usize = 128;
 
 #[test]
+fn recipe_moves_one_consumer_without_moving_its_shared_input() {
+    use crate::tensor::OwnerMap;
+
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [8, 16]).unwrap();
+    let a = graph.gelu(x).unwrap();
+    let b = graph.gelu(x).unwrap();
+    graph.set_outputs([a, b]).unwrap();
+    let config = PipelineConfig::new(8).with_input(
+        x,
+        TensorFormat {
+            precision: Precision::F16,
+            layout: Layout::row_sharded(8),
+        },
+    );
+    let fragments = FragmentCache::default();
+    let baseline = build::select(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &fragments,
+        &Recipe::default(),
+    )
+    .unwrap();
+    let first = graph.operations()[0].id;
+    let mut recipe = baseline.recipe;
+    recipe.owners.operators.insert(first, OwnerMap::rotated(3));
+    let selected = build::select(&graph, &config, &Ipu21CostModel, &fragments, &recipe).unwrap();
+    selected.program.validate().unwrap();
+    crate::low::expand::expand_tiles(&selected.program, false).unwrap();
+    let input = selected.program.inputs[0].value;
+    assert_eq!(
+        selected.program.values[input.index() as usize].owners,
+        baseline.program.values[input.index() as usize].owners
+    );
+    for (index, &output) in selected.program.outputs.iter().enumerate() {
+        assert_eq!(
+            selected.program.values[output.index() as usize]
+                .owners
+                .rotation(),
+            if index == 0 { 3 } else { 0 }
+        );
+    }
+    let first = selected
+        .program
+        .walk_operations()
+        .find(|op| op.source == Some(first) && matches!(op.kind, MidOperationKind::Compute(_)))
+        .unwrap();
+    assert_ne!(first.inputs[0], input);
+    let mut stale = recipe;
+    let mut site = first.result_site(0).unwrap();
+    site.result = 1;
+    stale.owners.results.insert(site, OwnerMap::default());
+    assert!(build::select(&graph, &config, &Ipu21CostModel, &fragments, &stale).is_err());
+}
+
+#[test]
+fn recipe_can_place_gemm_partials_and_reduction_on_different_tiles() {
+    use crate::tensor::OwnerMap;
+
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [16, 128]).unwrap();
+    let w = graph.parameter("w", [128, 64]).unwrap();
+    let y = graph.gemm(x, w).unwrap();
+    graph.set_outputs([y]).unwrap();
+    let config = PipelineConfig::new(32)
+        .with_automatic_input(x, Precision::F16)
+        .with_automatic_input(w, Precision::F16)
+        .with_gemm_plan_constraint(GemmPlanConstraint {
+            source_operation: 0,
+            orientation: GemmOrientation::Normal,
+            row_partitions: 2,
+            column_partitions: 2,
+            inner_partitions: 2,
+            result_row_partitions: 1,
+            result_column_partitions: 1,
+            output_column_block: 32,
+            weight_memory_class: MemoryClass::Ipu21Interleaved,
+            reduction_staging: ReductionStaging::Complete,
+            local_weight_staging: LocalOperandStaging::Direct,
+        });
+    let fragments = FragmentCache::default();
+    let baseline = build::select(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &fragments,
+        &Recipe::default(),
+    )
+    .unwrap();
+    let site = |predicate: fn(&MidOperationKind) -> bool| {
+        baseline
+            .program
+            .walk_operations()
+            .find(|op| predicate(&op.kind))
+            .unwrap()
+            .result_site(0)
+            .unwrap()
+    };
+    let product = site(|kind| matches!(kind, MidOperationKind::Compute(Compute::Product(_))));
+    let sum = site(|kind| matches!(kind, MidOperationKind::Compute(Compute::Sum { .. })));
+    let mut recipe = baseline.recipe;
+    recipe.owners.results.insert(
+        product.clone(),
+        OwnerMap::embedded((0..8).map(|i| 2 * i).collect::<Vec<_>>()),
+    );
+    recipe
+        .owners
+        .results
+        .insert(sum.clone(), OwnerMap::embedded(vec![17, 21, 25, 29]));
+    let replay: Recipe = serde_json::from_slice(&serde_json::to_vec(&recipe).unwrap()).unwrap();
+    assert!(recipe == replay);
+    let selected = build::select(&graph, &config, &Ipu21CostModel, &fragments, &replay).unwrap();
+    selected.program.validate().unwrap();
+    let expanded = crate::low::expand::expand_tiles(&selected.program, false).unwrap();
+    let low = crate::low::lower_to_tiles(&expanded, false);
+    let tiles = |result: &crate::mid::ResultSite| {
+        let op = selected
+            .program
+            .walk_operations()
+            .find(|op| op.result_site(0).as_ref() == Some(result))
+            .unwrap();
+        low.value_shards(op.results[0])
+            .iter()
+            .map(|id| low.shards[id.index() as usize].tile)
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(tiles(&product), (0..8).map(|i| 2 * i).collect());
+    assert_eq!(tiles(&sum), BTreeSet::from([17, 21, 25, 29]));
+    for input in &baseline.program.inputs {
+        let before = &baseline.program.values[input.value.index() as usize];
+        let after = &selected.program.values[input.value.index() as usize];
+        assert_eq!(
+            before.owners, after.owners,
+            "moving compute must preserve resident inputs"
+        );
+    }
+    assert!(selected.program.operations.iter().any(|op| {
+        matches!(op.kind, MidOperationKind::Copy { .. })
+            && selected.program.values[op.inputs[0].index() as usize].owners
+                != selected.program.values[op.results[0].index() as usize].owners
+    }));
+    // Joint search proposals compose with the already independent homes; they
+    // must have the same meaning as relabeling the finished executable program.
+    let mapping = (0..config.tile_count).rev().collect::<Vec<_>>();
+    let remapped = replay
+        .remapped(&graph, &mapping, config.tile_count)
+        .unwrap();
+    let actual = build::select(&graph, &config, &Ipu21CostModel, &fragments, &remapped).unwrap();
+    let mut expected = selected.program;
+    expected.remap_tiles(&mapping).unwrap();
+    assert_eq!(actual.program.values, expected.values);
+    assert_eq!(actual.program.operations, expected.operations);
+    let valid = expected.clone();
+    assert!(expected.remap_tiles(&[0, 0, 2, 3]).is_err());
+    assert_eq!(expected, valid);
+}
+
+#[test]
 fn saturated_objectives_do_not_mutually_dominate() {
     let first = PlanMetrics {
         cycles: 100,

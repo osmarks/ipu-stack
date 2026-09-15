@@ -320,6 +320,30 @@ pub struct TileGraph {
 }
 
 impl TileGraph {
+    /// Exchange phases are whole-device work. Count their executions in the
+    /// authoritative region tree, without visiting every tile's projection.
+    pub(crate) fn exchange_multiplicities(&self) -> Vec<u64> {
+        fn count(region: &BlockRegion, repetitions: u64, counts: &mut [u64]) {
+            for operation in &region.operations {
+                match operation {
+                    BlockOperation::Exchange(id) => {
+                        counts[id.index() as usize] =
+                            counts[id.index() as usize].saturating_add(repetitions);
+                    }
+                    BlockOperation::Repeat(repeat) => count(
+                        &repeat.body,
+                        repetitions.saturating_mul(u64::from(repeat.count)),
+                        counts,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        let mut counts = vec![0; self.exchange_phases.len()];
+        count(&self.body, 1, &mut counts);
+        counts
+    }
+
     pub fn value_shards(&self, value: MidValueId) -> &[BlockValueId] {
         &self.value_shards[value.index() as usize]
     }

@@ -5,11 +5,19 @@ use crate::graph::ComputeGraph;
 use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeSet;
 
+/// A proposal contains decisions and, when available, a more specific ranking
+/// estimate. This estimate never changes the executable program's own costing.
+pub(crate) struct RecipeProposal {
+    pub recipe: Recipe,
+    pub estimated_cycles: Option<u64>,
+}
+
 pub(crate) fn proposals(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     incumbent: &Candidate,
-) -> Vec<Recipe> {
+    traffic: Option<&crate::exchange::MappingTraffic>,
+) -> Vec<RecipeProposal> {
     let operations = graph
         .walk_operations()
         .filter(|op| !matches!(op.kind, crate::OperationKind::Repeat(_)))
@@ -134,7 +142,92 @@ pub(crate) fn proposals(
             propose(recipe, &related);
         }
     }
+    let mut candidates = candidates
+        .into_iter()
+        .map(|recipe| RecipeProposal {
+            recipe,
+            estimated_cycles: None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(traffic) = traffic {
+        match owner_mapping(graph, incumbent, traffic) {
+            Ok(Some(proposal)) => candidates.push(proposal),
+            Ok(None) => {}
+            Err(error) => tracing::info!(%error, "could not propose owner mapping"),
+        }
+    }
     candidates
+}
+
+/// Preserve the existing block-transpose neighborhood as an ordinary joint
+/// ownership proposal. The fabric model scores relabeling all current endpoints;
+/// it does not approximate independent per-operator changes with one permutation.
+/// A permutation preserves the coarse mid estimate, so use the model's predicted
+/// cycle saving to rank this proposal with layout changes in the same shortlist.
+fn owner_mapping(
+    graph: &ComputeGraph,
+    incumbent: &Candidate,
+    traffic: &crate::exchange::MappingTraffic,
+) -> Result<Option<RecipeProposal>, crate::mid::ProgramError> {
+    let program = &incumbent.program;
+    let identity = (0..program.tile_count).collect::<Vec<_>>();
+    let baseline = traffic.score(&identity);
+    let mut blocks = BTreeSet::from([program.tile_count]);
+    for value in &program.values {
+        for axis in &value.tensor_type.format.layout.tiling.axes {
+            if let Some(stride) = axis.tile_stride {
+                blocks.extend(
+                    [stride, stride.saturating_mul(axis.partitions)]
+                        .into_iter()
+                        .filter(|&block| block > 1 && block <= program.tile_count),
+                );
+            }
+        }
+    }
+    let mut best = None;
+    let mut best_score = baseline;
+    let mut candidates = 0;
+    for block in blocks {
+        for width in 2..block {
+            if !block.is_multiple_of(width) {
+                continue;
+            }
+            let mapping = (0..program.tile_count)
+                .map(|tile| {
+                    let base = tile / block * block;
+                    let local = tile % block;
+                    if u32::from(base) + u32::from(block) <= u32::from(program.tile_count) {
+                        base + local % width * (block / width) + local / width
+                    } else {
+                        tile
+                    }
+                })
+                .collect::<Vec<_>>();
+            let score = traffic.score(&mapping);
+            candidates += 1;
+            tracing::debug!(block, width, cycles=score.0, pressure=%score.1, "modelled owner mapping");
+            if score.0 < baseline.0 && score < best_score {
+                best_score = score;
+                best = Some(mapping);
+            }
+        }
+    }
+    tracing::info!(candidates, baseline_cycles=baseline.0, candidate_cycles=best_score.0,
+        baseline_pressure=%baseline.1, candidate_pressure=%best_score.1,
+        "screened ownership proposal by exchange resource load");
+    best.map(|mapping| {
+        Ok(RecipeProposal {
+            recipe: incumbent
+                .recipe
+                .remapped(graph, &mapping, program.tile_count)?,
+            estimated_cycles: Some(
+                program
+                    .estimated_cycles
+                    .saturating_sub(baseline.0 - best_score.0),
+            ),
+        })
+    })
+    .transpose()
 }
 
 #[cfg(test)]
@@ -198,7 +291,8 @@ mod tests {
         let unrelated = graph.operations()[2].id;
         let default = incumbent.recipe.cast_storage.as_ref().unwrap().default;
         let mut joint = 0;
-        for recipe in proposals(&graph, &config, &incumbent) {
+        for proposal in proposals(&graph, &config, &incumbent, None) {
+            let recipe = proposal.recipe;
             let policy = recipe.cast_storage.as_ref().unwrap();
             assert_eq!(policy.default, default);
             if recipe.open_boundaries != incumbent.recipe.open_boundaries

@@ -4,6 +4,7 @@ use super::*;
 pub(crate) struct MappingTraffic {
     phases: Vec<MappingPhase>,
     tile_count: usize,
+    multiplicities: Vec<u64>,
 }
 
 impl MappingTraffic {
@@ -32,14 +33,15 @@ impl MappingTraffic {
         Ok(Self {
             phases,
             tile_count: usize::from(program.tile_count),
+            multiplicities: program.exchange_multiplicities(),
         })
     }
 
     /// Bottleneck cycles, then load-weighted mean pressure as a balancing tie-break.
     /// Active C600 execution indices pair adjacent tiles. Width eligibility is
     /// optimistic about route encoding; exact scheduling verifies finalists.
-    pub(crate) fn score(&self, mapping: &[u16], multiplicities: &[u64]) -> (u64, u128) {
-        self.phase_scores(mapping).zip(multiplicities).fold(
+    pub(crate) fn score(&self, mapping: &[u16]) -> (u64, u128) {
+        self.phase_scores(mapping).zip(&self.multiplicities).fold(
             (0u64, 0u128),
             |total, ((cycles, pressure), &count)| {
                 (
@@ -50,16 +52,6 @@ impl MappingTraffic {
                 )
             },
         )
-    }
-
-    pub(crate) fn phase_cycles(&self, mapping: &[u16]) -> Vec<u64> {
-        self.phase_scores(mapping)
-            .map(|score| {
-                score
-                    .0
-                    .saturating_add(crate::estimate::IPU21_TARGET_COSTS.exchange_phase_cycles)
-            })
-            .collect()
     }
 
     fn phase_scores(&self, mapping: &[u16]) -> impl Iterator<Item = (u64, u128)> {
@@ -222,6 +214,7 @@ mod tests {
         let traffic = MappingTraffic {
             phases: vec![MappingPhase::new(transfers, 4)],
             tile_count: 4,
+            multiplicities: vec![1],
         };
         // Reference scores from direct per-transfer resource accounting. All
         // 24 permutations cover the three distinct physical partner assignments.
@@ -262,6 +255,7 @@ mod tests {
                 4,
             )],
             tile_count: 4,
+            multiplicities: vec![1],
         };
         let scheduled = schedule_exchange_problem(
             4,
@@ -281,16 +275,21 @@ mod tests {
                 .saturating_sub(send(0).start_cycle.max(send(1).start_cycle))
                 > 50
         );
-        assert_eq!(traffic.score(&[0, 1, 2, 3], &[1]).0, 100);
-        assert_eq!(traffic.score(&[0, 2, 1, 3], &[1]).0, 100);
-        assert_eq!(traffic.score(&[0, 2, 1, 3], &[3]).0, 300);
+        assert_eq!(traffic.score(&[0, 1, 2, 3]).0, 100);
+        assert_eq!(traffic.score(&[0, 2, 1, 3]).0, 100);
+        let repeated = MappingTraffic {
+            multiplicities: vec![3],
+            ..traffic
+        };
+        assert_eq!(repeated.score(&[0, 2, 1, 3]).0, 300);
         let mut independent_addresses = transfer(0, &[2, 3], 128);
         independent_addresses.destinations[1].1 += 0x4000;
         let multicast = MappingTraffic {
             phases: vec![MappingPhase::new(vec![independent_addresses], 4)],
             tile_count: 4,
+            multiplicities: vec![1],
         };
-        assert_eq!(multicast.score(&[0, 1, 2, 3], &[1]).0, 64);
-        assert_eq!(multicast.score(&[0, 2, 1, 3], &[1]).0, 128);
+        assert_eq!(multicast.score(&[0, 1, 2, 3]).0, 64);
+        assert_eq!(multicast.score(&[0, 2, 1, 3]).0, 128);
     }
 }

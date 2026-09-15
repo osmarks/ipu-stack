@@ -34,6 +34,20 @@ impl OwnerMap {
         self.rotation
     }
 
+    /// A full identity embedding is the implicit device domain. Keep smaller
+    /// identity subsets explicit: their rotations wrap at a different length.
+    pub(crate) fn canonicalized(&self, tiles: u16) -> Self {
+        if self
+            .embedding
+            .as_ref()
+            .is_some_and(|map| map.iter().copied().eq(0..tiles))
+        {
+            Self::rotated(self.rotation)
+        } else {
+            self.clone()
+        }
+    }
+
     /// Rotate within the selected owner domain; the embedding itself is shared.
     pub(crate) fn with_rotation(&self, rotation: u16) -> Self {
         let rotation = self
@@ -64,6 +78,39 @@ impl OwnerMap {
 
     pub(crate) fn has_embedding(&self) -> bool {
         self.embedding.is_some()
+    }
+
+    /// Interpret this local assignment within a chosen working domain. An
+    /// implicit assignment rotates within that domain; an explicit one selects
+    /// its entries. The selected domain may be smaller than the whole device.
+    pub(crate) fn in_domain(&self, domain: &Self, tiles: u16) -> Option<Self> {
+        match &self.embedding {
+            None => domain.shifted(i32::from(self.rotation), tiles),
+            Some(embedding) => Some(Self {
+                rotation: self.rotation,
+                embedding: Some(
+                    embedding
+                        .iter()
+                        .map(|&tile| domain.tile(tile, tiles))
+                        .collect::<Option<Arc<[_]>>>()?,
+                ),
+            }),
+        }
+    }
+
+    /// Relabel physical tiles without changing distribution, domain or rotation.
+    /// The caller validates the shared device permutation once.
+    pub(crate) fn remapped(&self, mapping: &Arc<[u16]>) -> Option<Self> {
+        Some(Self {
+            rotation: self.rotation,
+            embedding: Some(match &self.embedding {
+                None => Arc::clone(mapping),
+                Some(embedding) => embedding
+                    .iter()
+                    .map(|&tile| mapping.get(usize::from(tile)).copied())
+                    .collect::<Option<Arc<[_]>>>()?,
+            }),
+        })
     }
 
     pub(crate) fn tile(&self, owner: u16, tiles: u16) -> Option<u16> {

@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Recipe {
     pub plans: BTreeMap<OperationId, OperatorPlan>,
+    #[serde(default)]
+    pub owners: crate::mid::OwnerChoices,
     pub open_boundaries: BTreeSet<ValueId>,
     /// Initial capacity-baseline or legacy checkpoint requests; converted to
     /// individual cast sites after expansion and never saved in this form.
@@ -29,6 +31,22 @@ pub(crate) struct Recipe {
 }
 
 impl Recipe {
+    pub(crate) fn remapped(
+        &self,
+        graph: &crate::ComputeGraph,
+        mapping: &[u16],
+        tile_count: u16,
+    ) -> Result<Self, crate::mid::ProgramError> {
+        let mut recipe = self.clone();
+        recipe.owners.remap_tiles(
+            graph.inputs().iter().map(|input| input.value),
+            graph.walk_operations().map(|operation| operation.id),
+            mapping,
+            tile_count,
+        )?;
+        Ok(recipe)
+    }
+
     /// Legacy ordinals are interpreted once, at the checkpoint/construction
     /// boundary. Executable mid and subsequent proposals use named sites only.
     pub(crate) fn resolve_cast_choices(
@@ -36,45 +54,23 @@ impl Recipe {
         program: &MidProgram,
         available: &BTreeSet<crate::mid::WorkSite>,
     ) -> crate::planner::error::LoweringResult<()> {
-        fn visit(
-            operations: &[crate::mid::MidOperation],
-            values: &[crate::mid::MidValue],
-            ordinals: &mut BTreeMap<Option<OperationId>, u32>,
-            requested: &mut BTreeSet<(Option<OperationId>, u32)>,
-            selected: &mut BTreeSet<crate::mid::WorkSite>,
-        ) -> crate::planner::error::LoweringResult<()> {
-            for operation in operations {
-                if let crate::mid::MidOperationKind::Repeat(repeat) = &operation.kind {
-                    visit(
-                        &repeat.body.operations,
-                        values,
-                        ordinals,
-                        requested,
-                        selected,
-                    )?;
-                } else if crate::mid::rewrite::fp8_cast(operation, values).is_some() {
-                    let ordinal = ordinals.entry(operation.source).or_default();
-                    if requested.remove(&(operation.source, *ordinal)) {
-                        selected.insert(operation.work_site().ok_or(
-                            crate::planner::error::LoweringError::UnknownLegacyCastChoice(
-                                operation.source,
-                                *ordinal,
-                            ),
-                        )?);
-                    }
-                    *ordinal += 1;
-                }
-            }
-            Ok(())
-        }
         if !self.legacy_cast_sites.is_empty() {
-            visit(
-                &program.operations,
-                &program.values,
-                &mut BTreeMap::new(),
-                &mut self.legacy_cast_sites,
-                &mut self.cast_before_copies,
-            )?;
+            let mut ordinals = BTreeMap::new();
+            for operation in program.walk_operations() {
+                if crate::mid::rewrite::fp8_cast(operation, &program.values).is_none() {
+                    continue;
+                }
+                let ordinal = ordinals.entry(operation.source).or_insert(0);
+                if self.legacy_cast_sites.remove(&(operation.source, *ordinal)) {
+                    self.cast_before_copies.insert(operation.work_site().ok_or(
+                        crate::planner::error::LoweringError::UnknownLegacyCastChoice(
+                            operation.source,
+                            *ordinal,
+                        ),
+                    )?);
+                }
+                *ordinal += 1;
+            }
             if let Some(&(source, ordinal)) = self.legacy_cast_sites.first() {
                 return Err(
                     crate::planner::error::LoweringError::UnknownLegacyCastChoice(source, ordinal),
@@ -118,6 +114,7 @@ impl Recipe {
             parallel_reductions: (usize, usize),
             disjoint_copy_sources: (bool, bool),
             cast_storage: (&'a Option<CastStoragePolicy>, &'a Option<CastStoragePolicy>),
+            owners: (&'a crate::mid::OwnerChoices, &'a crate::mid::OwnerChoices),
         }
         Changes {
             plans: self
@@ -146,6 +143,7 @@ impl Recipe {
             parallel_reductions: (before.parallel_reductions, self.parallel_reductions),
             disjoint_copy_sources: (before.disjoint_copy_sources, self.disjoint_copy_sources),
             cast_storage: (&before.cast_storage, &self.cast_storage),
+            owners: (&before.owners, &self.owners),
         }
     }
 }

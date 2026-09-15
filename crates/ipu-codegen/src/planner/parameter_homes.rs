@@ -1,7 +1,7 @@
-//! Choose persistent parameter homes and insert the copies those choices require.
+//! Choose default persistent parameter homes before mid binds operand movement.
 
 use crate::compile::PipelineConfig;
-use crate::mid::{MidOperation, MidValue, MidValueId};
+use crate::mid::{MidValue, MidValueId};
 use crate::planner::error::LoweringResult;
 #[cfg(test)]
 use crate::tensor::AmpOrder;
@@ -137,12 +137,11 @@ fn compact_matrix_layout(tensor: &TensorType, tiles: u16) -> Option<Layout> {
 /// Select persistent homes before capacity screening. Sequence members share
 /// one rotation; derived values follow that rotation but are not counted again.
 pub(super) fn assign_parameter_tiles(
-    values: &mut Vec<MidValue>,
-    operations: &mut Vec<MidOperation>,
+    values: &mut [MidValue],
     parameters: &[MidValueId],
     copies: &BTreeMap<MidValueId, u32>,
     tile_count: u16,
-) -> LoweringResult<bool> {
+) -> LoweringResult<()> {
     let mut groups = BTreeMap::<MidValueId, Vec<u64>>::new();
     for &id in parameters {
         let value = &values[id.index() as usize];
@@ -178,18 +177,13 @@ pub(super) fn assign_parameter_tiles(
         }
         offsets.insert(group, offset);
     }
-    let mut changed = false;
     for value in values.iter_mut() {
         if let Some(&offset) = offsets.get(&value.storage_group) {
             let owners = value.owners.with_rotation(offset);
-            changed |= value.owners != owners;
             value.owners = owners;
         }
     }
-    if changed {
-        crate::mid::bind_compute_owners(operations, values)?;
-    }
-    Ok(changed)
+    Ok(())
 }
 
 fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
@@ -217,7 +211,7 @@ fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
 mod tests {
     use crate::graph::{GraphInputKind, ValueId};
     use crate::low::default_copy_policy;
-    use crate::mid::{CoordinateMapping, MidInput, MidOperationKind, MidProgram};
+    use crate::mid::{CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram};
     use crate::tensor::{MemoryClass, Precision, TensorShape};
 
     use super::*;
@@ -338,14 +332,7 @@ mod tests {
             MidValueId::from_index(2),
             MidValueId::from_index(3),
         ];
-        assign_parameter_tiles(
-            &mut values,
-            &mut Vec::new(),
-            &parameters,
-            &BTreeMap::new(),
-            8,
-        )
-        .unwrap();
+        assign_parameter_tiles(&mut values, &parameters, &BTreeMap::new(), 8).unwrap();
         assert_eq!(values[0].owners, values[1].owners);
         assert_eq!(values[2].owners, values[4].owners);
         assert_ne!(values[0].owners, values[2].owners);
@@ -354,14 +341,7 @@ mod tests {
             .map(|v| v.owners.rotation())
             .collect::<Vec<_>>();
         values[4].tensor_type.shape = TensorShape(vec![16384]);
-        assign_parameter_tiles(
-            &mut values,
-            &mut Vec::new(),
-            &parameters,
-            &BTreeMap::new(),
-            8,
-        )
-        .unwrap();
+        assign_parameter_tiles(&mut values, &parameters, &BTreeMap::new(), 8).unwrap();
         assert_eq!(
             offsets,
             values

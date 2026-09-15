@@ -267,7 +267,7 @@ mod tests {
             }],
             ..MidProgram::default()
         };
-        crate::mid::bind_compute_owners(&mut program.operations, &mut program.values).unwrap();
+        crate::mid::ownership::bind_owners(&mut program.operations, &mut program.values).unwrap();
         program
     }
     fn caller() -> MidProgram {
@@ -332,6 +332,67 @@ mod tests {
                 values[id.index() as usize] = value;
             }
         }
+    }
+
+    #[test]
+    fn repeat_copies_a_moved_body_result_back_to_its_carried_home() {
+        let mut program = repeated_add();
+        let mut graph = crate::ComputeGraph::new();
+        let input = graph.host_input("x", [1, 16]).unwrap();
+        graph.add(input, input).unwrap();
+        let source = graph.operations()[0].id;
+        let MidOperationKind::Repeat(repeat) = &mut program.operations[0].kind else {
+            unreachable!()
+        };
+        let add = repeat.body.operations.last_mut().unwrap();
+        add.source = Some(source);
+        add.site = Some("add".into());
+        let site = add.result_site(0).unwrap();
+        let mut choices = crate::mid::OwnerChoices::default();
+        choices.results.insert(
+            site.clone(),
+            crate::tensor::OwnerMap::embedded(vec![0, 1, 2, 3]),
+        );
+        let original = program.clone();
+        program.apply_ownership(&choices).unwrap();
+        assert_eq!(
+            program, original,
+            "an explicit identity map preserves the input's home"
+        );
+        choices
+            .results
+            .insert(site, crate::tensor::OwnerMap::embedded(vec![3]));
+        assert!(program.apply_ownership(&choices).is_err());
+        assert_eq!(
+            program, original,
+            "a result choice cannot move aliased input storage"
+        );
+        let MidOperationKind::Repeat(repeat) = &mut program.operations[0].kind else {
+            unreachable!()
+        };
+        let add = repeat.body.operations.last_mut().unwrap();
+        let MidOperationKind::Compute(Compute::Kernel { output_aliases, .. }) = &mut add.kind
+        else {
+            unreachable!()
+        };
+        output_aliases.clear();
+        program.values[6].storage_group = id(6);
+        program.values[6].owners = crate::tensor::OwnerMap::default();
+        let inputs = program.values[..3].to_vec();
+        program.apply_ownership(&choices).unwrap();
+        program.validate().unwrap();
+        crate::low::expand::expand_tiles(&program, false).unwrap();
+        assert_eq!(program.values[..3], inputs);
+        let MidOperationKind::Repeat(repeat) = &program.operations[0].kind else {
+            unreachable!()
+        };
+        let yielded = &program.values[repeat.body.yields[0].index() as usize];
+        assert_eq!(yielded.owners, program.values[0].owners);
+        assert_ne!(yielded.owners, program.values[6].owners);
+        let mut values = vec![0; program.values.len()];
+        values[..3].copy_from_slice(&[3, 5, 7]);
+        execute(&program.operations, &mut values);
+        assert_eq!(values[3], 15);
     }
 
     #[test]

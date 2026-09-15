@@ -6,7 +6,7 @@ use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {
@@ -16,8 +16,6 @@ pub(crate) struct State {
     pub alternatives: BTreeMap<crate::OperationId, Vec<crate::planner::operator::OperatorPlan>>,
     pub inputs: BTreeMap<crate::ValueId, crate::TensorFormat>,
     pub visited: Vec<Recipe>,
-    pub mapping: Option<Vec<u16>>,
-    pub mapping_checked: bool,
     pub attempts: usize,
 }
 
@@ -38,10 +36,14 @@ impl State {
         normalized.exchange_diagnostics = false;
         let context = format!("{graph:?}\n{normalized:?}\n{mapping:?}");
         let Some(path) = &config.load_search_state else {
+            let recipe = match mapping {
+                Some(mapping) => Recipe::default().remapped(graph, mapping, config.tile_count)?,
+                None => Recipe::default(),
+            };
             return Ok(Self {
                 version: VERSION,
                 context,
-                mapping: mapping.map(<[u16]>::to_vec),
+                recipe,
                 ..Self::default()
             });
         };
@@ -51,6 +53,9 @@ impl State {
             })?;
         if matches!(saved["version"].as_u64(), Some(1 | 2)) {
             migrate_cast_schema(&mut saved)?;
+        }
+        if saved["version"] == 3 {
+            migrate_ownership_schema(&mut saved, graph, config.tile_count)?;
         }
         let mut state: Self = serde_json::from_value(saved).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
@@ -167,8 +172,52 @@ fn migrate_cast_schema(saved: &mut serde_json::Value) -> PackageBuildResult<()> 
             recipe(value)?;
         }
     }
-    saved["version"] = VERSION.into();
+    saved["version"] = 3.into();
     tracing::info!("migrating legacy cast choices to scoped policies");
+    Ok(())
+}
+
+/// The former global mapping applied to the incumbent and every visited recipe.
+/// Convert it into input homes and operator working domains, preserving scoped
+/// overrides and legacy cast fields until construction resolves their sites.
+fn migrate_ownership_schema(
+    saved: &mut serde_json::Value,
+    graph: &ComputeGraph,
+    tile_count: u16,
+) -> PackageBuildResult<()> {
+    let object = saved
+        .as_object_mut()
+        .ok_or_else(|| invalid("checkpoint is not an object"))?;
+    let mapping: Option<Vec<u16>> =
+        serde_json::from_value(object.remove("mapping").unwrap_or_default())
+            .map_err(|error| invalid(format!("invalid checkpoint tile mapping: {error}")))?;
+    object.remove("mapping_checked");
+    if let Some(mapping) = mapping {
+        let remap = |recipe: &mut serde_json::Value| -> PackageBuildResult<()> {
+            let mut owners: crate::mid::OwnerChoices = match recipe.get("owners") {
+                Some(value) => serde_json::from_value(value.clone())
+                    .map_err(|error| invalid(error.to_string()))?,
+                None => crate::mid::OwnerChoices::default(),
+            };
+            owners.remap_tiles(
+                graph.inputs().iter().map(|input| input.value),
+                graph.walk_operations().map(|operation| operation.id),
+                &mapping,
+                tile_count,
+            )?;
+            recipe["owners"] =
+                serde_json::to_value(owners).map_err(|error| invalid(error.to_string()))?;
+            Ok(())
+        };
+        remap(&mut saved["recipe"])?;
+        if let Some(visited) = saved["visited"].as_array_mut() {
+            for recipe in visited {
+                remap(recipe)?;
+            }
+        }
+    }
+    saved["version"] = VERSION.into();
+    tracing::info!("migrated global tile mapping into scoped recipe ownership");
     Ok(())
 }
 
@@ -233,6 +282,58 @@ fn context_difference(saved: &str, current: &str) -> String {
 mod tests {
     use super::*;
     use crate::estimate::Ipu21CostModel;
+
+    #[test]
+    fn legacy_mapping_migrates_incumbent_and_visits_into_owner_choices() {
+        let mut graph = ComputeGraph::new();
+        let x = graph.host_input("x", [32, 64]).unwrap();
+        let y = graph.gelu(x).unwrap();
+        graph.set_outputs([y]).unwrap();
+        let mut config = PipelineConfig::new(8).with_automatic_input(x, crate::Precision::F16);
+        let fragments = crate::planner::FragmentCache::default();
+        let baseline = crate::planner::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &Recipe::default(),
+        )
+        .unwrap();
+        let mut state = State::load(&graph, &config, None).unwrap();
+        state.recipe = baseline.recipe;
+        state.attempts = 19;
+        let mut saved = serde_json::to_value(state).unwrap();
+        let mapping = vec![0, 4, 1, 5, 2, 6, 3, 7];
+        saved["version"] = 3.into();
+        saved["mapping"] = serde_json::json!(mapping);
+        saved["mapping_checked"] = true.into();
+        saved["recipe"].as_object_mut().unwrap().remove("owners");
+        saved["visited"] = serde_json::json!([saved["recipe"].clone()]);
+        let path =
+            std::env::temp_dir().join(format!("ipu-owner-migration-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        config.load_search_state = Some(path.clone());
+        let resumed = State::load(&graph, &config, None).unwrap();
+        assert_eq!(resumed.attempts, 19);
+        assert!(resumed.visited[0] == resumed.recipe);
+        let actual = crate::planner::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &resumed.recipe,
+        )
+        .unwrap();
+        let mut expected = baseline.program;
+        expected.remap_tiles(&mapping).unwrap();
+        assert_eq!(actual.program.values, expected.values);
+        assert_eq!(actual.program.operations, expected.operations);
+        let saved = serde_json::to_value(resumed).unwrap();
+        assert!(saved.get("mapping").is_none());
+        assert!(saved.get("mapping_checked").is_none());
+        assert_eq!(saved["version"], VERSION);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn legacy_cast_storage_defaults_preserve_incumbent_and_visited_choices() {

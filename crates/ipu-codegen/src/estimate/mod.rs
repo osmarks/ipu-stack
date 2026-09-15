@@ -19,9 +19,11 @@ pub(crate) use mid::{
     analyze as analyze_mid, analyze_with_budget, operation_cycles,
     region_peak_memory_with_multiplicity, region_program,
 };
+#[cfg(test)]
+pub(crate) use program::program_cycles;
 pub(crate) use program::{
-    ProgramCycles, exchange_phase_estimate, program_cycles, program_cycles_analyzed,
-    program_footprint_analyzed, scheduled_program_cycles,
+    ProgramCycles, exchange_phase_estimate, program_cycles_analyzed, program_footprint_analyzed,
+    scheduled_program_cycles,
 };
 mod movement;
 mod tensor;

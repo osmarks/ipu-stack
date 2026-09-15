@@ -75,8 +75,10 @@ pub enum PackageBuildError {
     Integer(#[from] TryFromIntError),
     #[error("invalid package build: {0}")]
     Invalid(String),
-    #[error("mid-level lowering failed: {0}")]
-    Mid(#[from] crate::planner::LoweringError),
+    #[error("planning failed: {0}")]
+    Planning(#[from] crate::planner::LoweringError),
+    #[error(transparent)]
+    Program(#[from] crate::mid::ProgramError),
     #[error("tile scheduling failed: {0}")]
     Low(#[from] crate::ExpansionError),
     #[error("kernel planning failed: {0}")]

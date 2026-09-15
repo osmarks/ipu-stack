@@ -13,11 +13,11 @@ pub(crate) mod elementwise;
 mod fragment;
 mod output_fusion;
 mod ownership;
-pub(crate) use ownership::bind_compute_owners;
+pub(crate) use ownership::OwnerChoices;
 mod packing;
 mod residual;
 mod site;
-pub use site::{LocalSite, WorkSite};
+pub use site::{LocalSite, ResultSite, WorkSite};
 pub(crate) mod rewrite;
 mod validate;
 pub use compute::*;
@@ -95,6 +95,13 @@ impl MidOperation {
         })
     }
 
+    pub(crate) fn result_site(&self, result: usize) -> Option<ResultSite> {
+        Some(ResultSite {
+            work: self.work_site()?,
+            result: result.try_into().ok()?,
+        })
+    }
+
     /// Values read in the enclosing region, including a repeat's parameter sequences.
     pub(crate) fn read_values(&self) -> impl Iterator<Item = &MidValueId> {
         let sequences = match &self.kind {
@@ -147,6 +154,22 @@ pub struct MidProgram {
 }
 
 impl MidProgram {
+    /// Visit nested work once, without unrolling Repeat or changing its scope.
+    pub(crate) fn walk_operations(&self) -> impl Iterator<Item = &MidOperation> {
+        let mut regions = vec![self.operations.iter()];
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(operation) = regions.last_mut()?.next() {
+                    if let MidOperationKind::Repeat(repeat) = &operation.kind {
+                        regions.push(repeat.body.operations.iter());
+                    }
+                    return Some(operation);
+                }
+                regions.pop();
+            }
+        })
+    }
+
     /// Refresh derived costs after constructing or rewriting a complete program.
     pub(crate) fn refresh_estimates(&mut self) -> Option<()> {
         self.validate().ok()?;

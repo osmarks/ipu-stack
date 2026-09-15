@@ -75,16 +75,17 @@ generates the Rust declarations; assembly includes the inputs through `.set`.
 
 ```mermaid
 flowchart TD
-  G[ComputeGraph and PipelineConfig] --> P[planner::build::select: construct selected operators and boundaries]
+  G[ComputeGraph and PipelineConfig] --> P[planner::build::select: select families and construct boundaries]
   R[Recipe: selections and rewrite choices] --> P
   P --> I[emit_selected: construct and bind executable family fragment]
-  I --> W[Cast ordering, copy composition, fusions, ownership and storage rewrites]
+  I --> H[Choose persistent homes; apply Recipe ownership and bind movement]
+  H --> W[Cast ordering, copy composition, fusions, grouping and storage rewrites]
   W --> M[Executable MidProgram: Copy / Compute / Repeat]
   M --> E[low::expand: shard enumeration and physical realization]
   E --> O[Low simplification, relay selection and padding removal]
   O --> T[TileGraph]
   T --> F[Detailed exchange-footprint screen]
-  F --> L[Tile mapping and lower_to_tiles]
+  F --> L[lower_to_tiles: pure projection]
   L --> V[Provisional placement and exact exchange scheduling]
   V --> S[package::size_support: link and reserve code, rows and auxiliaries]
   S --> B[compile::evaluate_candidate: final placement and exchange replay]
@@ -135,12 +136,7 @@ unrelated policies stay fixed. Checkpoint loading migrates the old global boolea
 which is absent from current recipes. Packing and grouping policies remain global
 and are still a refactor requirement.
 
-The optional mapping search in
-[compile/placement.rs](../crates/ipu-codegen/src/compile/placement.rs) proposes
-one permutation over the entire active tile set. `map_tiles` changes every
-shard and local work item together. This preserves their existing ownership
-relationships; it cannot choose a different embedding for one operator's
-outputs while leaving unrelated values alone. Mid values now carry an
+Mid values carry an
 [OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs): a reusable embedding onto
 any subset of device tiles, applied after the selected owner-ordinal rotation.
 Explicit maps share their array through `Arc`; distribution stays in the tensor layout.
@@ -148,9 +144,24 @@ Expansion and memory accounting resolve owners through this same map. Mid
 [ownership binding](../crates/ipu-codegen/src/mid/ownership.rs) inserts explicit
 copies when a local compute operand or allocation alias needs another result's
 owners; distributed Sum retains its own contributor traffic. Repeat and fragment
-binding preserve the maps. The existing search still proposes only its old
-global permutations. Moving those proposals into scoped Recipe choices remains
-unfinished; representation support does not imply that search already uses it.
+binding preserve the maps. Recipe's `OwnerChoices` gives inputs and individual
+results a base home, and operators a working domain for new storage. Family-local
+embeddings and relative rotations are interpreted within that domain. Input
+homes and explicit result choices take precedence; conflicting choices for a
+shared storage group fail. A moved Repeat body copies its yield back to the
+carried state's home. The graph builder applies these choices after selecting
+default parameter homes and constructing boundaries, before the ordinary mid
+rewrites and their costing.
+
+[planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs) retains the
+existing block-transpose neighborhood as a joint change to those choices.
+Its fabric-load estimate ranks it alongside layout proposals; exact evaluation,
+acceptance, budget and visited-state handling use the same compiler loop. The
+model scores the proposed permutation of both endpoints in each existing
+transfer. Independently scoped embeddings are representable, but this search
+does not yet enumerate them or pretend that a single permutation prices them.
+Checkpoint version four moves legacy mappings into input/operator choices;
+there is no separate mapping state or low endpoint that mutates projected work.
 
 Fragment binding receives an explicit working embedding for unbound temporary
 groups. Input and result groups retain their separate, checked homes. A small
@@ -460,7 +471,7 @@ sites from encoded instructions.
 
 ## Costs and caches
 
-Compact costing reads layouts and mid primitives; detailed costing reads tile
+Compact costing reads layouts and mid operations; detailed costing reads tile
 geometry/timelines; scheduled costing substitutes real exchange horizons. Sharing
 kernel formulae does not make the first two equivalent. In particular, mid's
 `Sum` scratch/traffic formula approximates choices subsequently made by physical
@@ -468,7 +479,7 @@ reduction lowering.
 
 | Cache or retained analysis | Contents and key | Lifetime / owner |
 | --- | --- | --- |
-| `implementation::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | Owned by the search invocation, passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
+| `planner::cache::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | Owned by the search invocation, passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
 | `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
 | `ExpansionCache.geometry` | Byte interpretation, extents and ordered mappings to coverage/alignment/fragment facts; excludes ownership and packing policy | Same search in production; bounded at 32,768 entries |
 | `ExpansionCache.copies` | Normalized view geometry, copy order, same-buffer flag to relative local-copy descriptors | Same search; separately bounded at 32,768 entries |

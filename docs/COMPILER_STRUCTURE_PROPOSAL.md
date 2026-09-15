@@ -79,9 +79,12 @@ Mid values now use shared `OwnerMap` embeddings instead of scalar tile offsets.
 Maps may select arbitrary subsets; expansion, memory accounting and ownership
 comparisons observe the same assignment. Existing rotation behavior remains.
 Ownership-copy insertion belongs to mid and covers allocation aliases as well
-as callable operands. This representation work does not yet move the global
-mapping proposal into Recipe. Scoped ownership decisions and the remaining
-family storage, relocation and cache boundaries below still require work.
+as callable operands. Recipe now selects input homes, operator working domains
+and individual result homes. The old whole-device mapping neighborhood is an
+ordinary joint Recipe proposal, ranked with its fabric-load estimate; the
+separate mapping optimizer and low remapping pass are removed. Checkpoint
+version four migrates previous mappings into those choices. Family storage,
+packing/grouping scope and cache boundaries below still require work.
 Architectural SRAM, supervisor encodings, register IDs and physical routing now
 belong to the dependency-leaf `ipu-target` crate. Exchange construction consumes
 the target topology through explicit functions. Package validation and the driver
@@ -102,12 +105,13 @@ boundary. Missing requests and ambiguous names are rejected. Cast storage now
 uses a typed mid policy with site overrides, operator defaults and an effective
 initial default. Layout proposals pair donation with the affected operator and
 its direct consumers; they do not toggle donation throughout the graph. Old
-global cast-storage settings migrate at checkpoint loading. Ownership, packing
-and grouping policies below have not yet all moved to that scope.
+global cast-storage settings migrate at checkpoint loading. Packing and grouping
+policies below have not yet moved to that scope.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
-Input/result bindings remain independent and checked. Scoped ownership requests
-and the removal of the global mapping optimizer are still outstanding.
+Input/result bindings remain independent and checked. Mid applies scoped owner
+choices after default persistent homes are selected, then binds required operand
+movement. A moved Repeat body explicitly copies its yield to the carried home.
 The diagnoses below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

@@ -39,25 +39,37 @@ pub struct WorkSite {
     pub local: LocalSite,
 }
 
+/// A result slot is part of its compute/copy family's contract, rather than an
+/// arena index or the number of operations previously emitted.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ResultSite {
+    pub work: WorkSite,
+    pub result: u32,
+}
+
 /// JSON object keys cannot represent structured work identities. Keep their
 /// fields intact as key/value pairs, rejecting ambiguous duplicate requests.
 pub(super) mod map {
-    use super::WorkSite;
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
     use std::collections::BTreeMap;
 
-    pub fn serialize<T: Serialize, S: Serializer>(
-        values: &BTreeMap<WorkSite, T>,
+    pub fn serialize<K: Serialize, T: Serialize, S: Serializer>(
+        values: &BTreeMap<K, T>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         values.iter().collect::<Vec<_>>().serialize(serializer)
     }
 
-    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    pub fn deserialize<
+        'de,
+        K: Deserialize<'de> + Ord,
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    >(
         deserializer: D,
-    ) -> Result<BTreeMap<WorkSite, T>, D::Error> {
+    ) -> Result<BTreeMap<K, T>, D::Error> {
         let mut result = BTreeMap::new();
-        for (site, value) in Vec::<(WorkSite, T)>::deserialize(deserializer)? {
+        for (site, value) in Vec::<(K, T)>::deserialize(deserializer)? {
             if result.insert(site, value).is_some() {
                 return Err(D::Error::custom("duplicate work-site choice"));
             }
