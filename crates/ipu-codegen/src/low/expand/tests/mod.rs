@@ -1,3 +1,7 @@
+use super::copy::{
+    mapping::*,
+    realize::{MaterializationBatch, append_span_copies},
+};
 use crate::mid::MidOperationKind;
 use crate::planner::catalogue::ConcreteOperatorCandidate;
 use crate::tensor::{AMP_INNER_BLOCK, BlockMajorOrder};
@@ -194,7 +198,7 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
             value: None,
             reason: WorkReason::LayoutRearrangement,
         };
-        let mut batch = movement::MaterializationBatch::default();
+        let mut batch = MaterializationBatch::default();
         let mut region = BlockRegion::default();
         builder
             .prepare_mapped_views(
@@ -301,7 +305,7 @@ fn factor_mappings_keep_the_bound_source_selection() {
         reason: WorkReason::LayoutRearrangement,
     };
     let mut region = BlockRegion::default();
-    let mut batch = movement::MaterializationBatch::default();
+    let mut batch = MaterializationBatch::default();
     builder
         .prepare_mapped_views(
             mappings,
@@ -2533,7 +2537,7 @@ fn complete_panel_grid_stays_one_logical_exchange() {
         value: None,
         reason: WorkReason::LayoutRearrangement,
     };
-    let mut batch = movement::MaterializationBatch::default();
+    let mut batch = MaterializationBatch::default();
     let mut body = BlockRegion::default();
     state
         .prepare_mapped_views(
@@ -2629,7 +2633,7 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
     clipped_target.extents = crate::OperandWindow(vec![(1, 0, 12)])
         .select(&clipped_target.extents, false)
         .unwrap();
-    let parts = super::mapping::split_mapping_at_panel_boundaries(
+    let parts = super::copy::mapping::split_mapping_at_panel_boundaries(
         &state.shards[0],
         clipped_source.clone(),
         &state.shards[2],
@@ -2661,7 +2665,7 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
         value: None,
         reason: WorkReason::LayoutRearrangement,
     };
-    let mut batch = movement::MaterializationBatch::default();
+    let mut batch = MaterializationBatch::default();
     let mut body = BlockRegion::default();
     state
         .prepare_mapped_views(

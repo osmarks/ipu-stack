@@ -1,17 +1,42 @@
-//! Lower a whole-device Copy through coordinate mappings, physical realization
-//! and one batch of pre-exchange work, recipients and post-exchange work.
-//! Geometry helpers describe coverage; explicit policies constrain realization.
+//! Realize mapped copy regions as preparation, exchange and destination work.
 
 use super::*;
 use crate::mid::MidOperationKind;
 use crate::tensor::{BlockMajorOrder, TensorFormat};
 
+pub(in crate::low::expand) fn append_span_copies(
+    cache: &crate::storage::GeometryCache,
+    shards: &[BlockValue],
+    source: &ShardView,
+    destination: &ShardView,
+    tile: u16,
+    copies: &mut Vec<(u16, LocalCopy)>,
+    order: CopyOrder,
+) -> ExpansionResult<()> {
+    let a = source.bind(shards)?;
+    let b = destination.bind(shards)?;
+    let source_geometry = a.geometry(cache, order)?;
+    let target_geometry = b.geometry(cache, order)?;
+    let pair = cache.pair(&source_geometry, &target_geometry)?;
+    copies.extend(
+        LocalCopy::from_pair(
+            source.shard,
+            destination.shard,
+            a.backing.0 == b.backing.0,
+            &pair,
+        )?
+        .into_iter()
+        .map(|copy| (tile, copy)),
+    );
+    Ok(())
+}
+
 /// Work needed to populate ordinary destination blocks at one exchange boundary.
 #[derive(Default)]
-pub(super) struct MaterializationBatch {
+pub(in crate::low::expand) struct MaterializationBatch {
     transfers: BTreeMap<CopyOrder, BTreeMap<ShardView, Vec<ShardView>>>,
     before: Vec<(u16, LocalCopy)>,
-    pub(super) after: Vec<(u16, LocalCopy)>,
+    after: Vec<(u16, LocalCopy)>,
     kernels: Vec<(u16, KernelRun)>,
     loopback_candidates: Vec<(ShardView, ShardView, CopyOrder)>,
 }
@@ -147,7 +172,7 @@ impl TileGraphBuilder {
         )
     }
 
-    pub(super) fn unpack_amp_to_row_major(
+    fn unpack_amp_to_row_major(
         &mut self,
         source: MidValueId,
         provenance: WorkProvenance,
@@ -211,7 +236,7 @@ impl TileGraphBuilder {
         Ok(Some(staging_views))
     }
 
-    pub(super) fn local_rearrangement(
+    fn local_rearrangement(
         &mut self,
         operation: &MidOperation,
         inputs: &[ShardView],
@@ -253,278 +278,10 @@ impl TileGraphBuilder {
         }
         Ok(())
     }
-
-    fn offset_copy_mappings(
-        &mut self,
-        inputs: &[ShardView],
-        outputs: &[BlockValueId],
-        offsets: &[u32],
-    ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
-        let mut regions = CopyRegions::new(&self.shards, inputs);
-        let mut mappings = Vec::new();
-        for &output in outputs {
-            let destination = &self.shards[output.index() as usize];
-            let tile = destination.tile;
-            let mut source_region = destination.extents.clone();
-            offset_extents(&mut source_region, offsets, u32::checked_add)?;
-            let intersections = regions
-                .intersections(&source_region, tile)
-                .into_iter()
-                .map(|(_, source)| {
-                    (
-                        intersect_extents_with_shared_padding(
-                            &inputs[source].extents,
-                            &source_region,
-                        )
-                        .expect("selected intersection remains nonempty"),
-                        source,
-                    )
-                })
-                .collect::<Vec<_>>();
-            for (source_extents, source) in intersections {
-                let mut destination_extents = source_extents.clone();
-                offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
-                mappings.push((
-                    ShardView {
-                        shard: inputs[source].shard,
-                        extents: source_extents,
-                    },
-                    ShardView {
-                        shard: output,
-                        extents: destination_extents,
-                    },
-                ));
-            }
-        }
-        Ok(mappings)
-    }
-
-    pub(super) fn window_view_mappings(
-        &self,
-        sources: &[ShardView],
-        source_shape: &crate::TensorShape,
-        output_shards: &[BlockValueId],
-        view: AxisFactorView,
-        offsets: &[u32],
-    ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
-        let mut regions = CopyRegions::new(&self.shards, sources);
-        let mut mappings = Vec::new();
-        for &output in output_shards {
-            let mut output_extents = self.shards[output.index() as usize].extents.clone();
-            offset_extents(&mut output_extents, offsets, u32::checked_add)?;
-            let tile = self.shards[output.index() as usize].tile;
-            let output_shape = view
-                .output_shape(source_shape)
-                .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            for (extent, &size) in output_extents.iter_mut().zip(&output_shape.0) {
-                extent.logical_end = extent.logical_end.min(size);
-            }
-            if output_extents
-                .iter()
-                .any(|extent| extent.start >= extent.logical_end)
-            {
-                continue;
-            }
-            let split = view.split_axis;
-            let merge = view.merge_axis;
-            if view.reversed {
-                // A joined head is contiguous. Divide only at head boundaries,
-                // not at individual output columns as in the forward move.
-                let width = source_shape.0[split];
-                let split_extent = output_extents[split];
-                for stream in output_extents[merge].start..output_extents[merge].logical_end {
-                    let mut start = split_extent.start;
-                    while start < split_extent.logical_end {
-                        let base = start / width * width;
-                        let end = (base + width).min(split_extent.logical_end);
-                        let mut ranges = output_extents
-                            .iter()
-                            .map(|extent| (extent.start, extent.logical_end))
-                            .collect::<Vec<_>>();
-                        ranges[merge] = (stream, stream + 1);
-                        ranges[split] = (start, end);
-                        let target =
-                            view_source_extents(view, source_shape, &output_shape, &ranges)
-                                .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                        for (source_extents, source) in regions.intersections(&target, tile) {
-                            let mut destination_extents = source_extents.clone();
-                            destination_extents[merge].start = stream;
-                            destination_extents[merge].logical_end = stream + 1;
-                            destination_extents[merge].physical_end = stream + 1;
-                            destination_extents[split].start += base;
-                            destination_extents[split].logical_end += base;
-                            destination_extents[split].physical_end += base;
-                            offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
-                            mappings.push((
-                                ShardView {
-                                    shard: sources[source].shard,
-                                    extents: source_extents,
-                                },
-                                ShardView {
-                                    shard: output,
-                                    extents: destination_extents,
-                                },
-                            ));
-                        }
-                        start = end;
-                    }
-                }
-                continue;
-            }
-            let part_width = output_shape.0[split];
-            for stream in output_extents[merge].start..output_extents[merge].logical_end {
-                let mut stream_extents = output_extents.clone();
-                stream_extents[merge].start = stream;
-                stream_extents[merge].logical_end = stream + 1;
-                stream_extents[merge].physical_end = stream + 1;
-                let ranges = stream_extents
-                    .iter()
-                    .map(|extent| (extent.start, extent.logical_end))
-                    .collect::<Vec<_>>();
-                let target = view_source_extents(view, source_shape, &output_shape, &ranges)
-                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                let column_base = target[split]
-                    .start
-                    .checked_sub(stream_extents[split].start)
-                    .ok_or(ExpansionError::InvalidOperatorPlan)?;
-                for (mut source_extents, source) in regions.intersections(&target, tile) {
-                    let mut destination_extents = source_extents.clone();
-                    destination_extents[merge] = stream_extents[merge];
-                    destination_extents[split].start -= column_base;
-                    destination_extents[split].logical_end -= column_base;
-                    destination_extents[split].physical_end -= column_base;
-                    let source_shard = &sources[source];
-                    let complete_part = source_extents[split].start == column_base
-                        && source_extents[split].logical_end == column_base + part_width
-                        && source_shard.extents[split].start == column_base
-                        && source_shard.extents[split].logical_end == column_base + part_width;
-                    if complete_part {
-                        let source_padding = source_shard.extents[split]
-                            .physical_end
-                            .saturating_sub(source_extents[split].logical_end);
-                        let destination_padding = output_extents[split]
-                            .physical_end
-                            .saturating_sub(output_extents[split].logical_end);
-                        let padding = source_padding.min(destination_padding);
-                        source_extents[split].physical_end += padding;
-                        destination_extents[split].physical_end += padding;
-                    }
-                    offset_extents(&mut destination_extents, offsets, u32::checked_sub)?;
-                    let source_view = ShardView {
-                        shard: sources[source].shard,
-                        extents: source_extents,
-                    };
-                    let destination_view = ShardView {
-                        shard: output,
-                        extents: destination_extents,
-                    };
-                    mappings.push((source_view, destination_view));
-                }
-            }
-        }
-        Ok(mappings)
-    }
-
-    /// Match packed grids using their precision-specific panel shape. Irregular
-    /// boundaries use smaller clipped fragments with identical traversal, even
-    /// when the outer panel sequence and tile ownership differ.
-    pub(super) fn micro_panel_mappings(
-        &self,
-        mut mappings: Vec<(ShardView, ShardView)>,
-    ) -> ExpansionResult<Option<(Vec<(ShardView, ShardView)>, CopyOrder)>> {
-        for (source, destination) in &mut mappings {
-            extend_panel_row_padding(
-                &self.shards[source.shard.index() as usize],
-                source,
-                &self.shards[destination.shard.index() as usize],
-                destination,
-            );
-        }
-        // Complete grids have one shared traversal specification. Irregular
-        // boundaries retain the existing clipped-rectangle fallback below.
-        let regular = !mappings.is_empty()
-            && mappings.iter().all(|(source, destination)| {
-                let a = &self.shards[source.shard.index() as usize];
-                let b = &self.shards[destination.shard.index() as usize];
-                let rank = source.extents.len();
-                let other_rank = destination.extents.len();
-                rank >= 2
-                    && other_rank >= 2
-                    && a.tensor_type
-                        .format
-                        .supports_micro_panel_exchange(&b.tensor_type.format)
-                    && source.extents[rank - 2..]
-                        .iter()
-                        .zip(&destination.extents[other_rank - 2..])
-                        .all(|(x, y)| {
-                            x.physical_end - x.start == y.physical_end - y.start
-                                && x.logical_end - x.start == y.logical_end - y.start
-                        })
-                    && [(a, source), (b, destination)]
-                        .into_iter()
-                        .all(|(shard, view)| {
-                            crate::storage::panel_byte_traversal(shard.storage(), &view.extents)
-                                .is_ok_and(|traversal| traversal.word_aligned())
-                        })
-            });
-        if regular {
-            return Ok(Some((mappings, CopyOrder::Panels)));
-        }
-        let mut split = Vec::new();
-        for (source, destination) in mappings {
-            let source_shard = &self.shards[source.shard.index() as usize];
-            let destination_shard = &self.shards[destination.shard.index() as usize];
-            if !source_shard
-                .tensor_type
-                .format
-                .supports_micro_panel_exchange(&destination_shard.tensor_type.format)
-            {
-                return Ok(None);
-            }
-            let pieces = split_mapping_at_panel_boundaries(
-                source_shard,
-                source,
-                destination_shard,
-                destination,
-            )?;
-            for (source, destination) in pieces {
-                let source_spans = source.bind(&self.shards)?.traversal(CopyOrder::Physical)?;
-                let destination_spans = destination
-                    .bind(&self.shards)?
-                    .traversal(CopyOrder::Physical)?;
-                if !source_spans.word_aligned()
-                    || !destination_spans.word_aligned()
-                    || source_spans.byte_len() != destination_spans.byte_len()
-                {
-                    return Ok(None);
-                }
-                split.push((source, destination));
-            }
-        }
-        Ok(Some((split, CopyOrder::Physical)))
-    }
-}
-
-/// Translate a window to or from the source coordinate system.
-fn offset_extents(
-    extents: &mut [ShardExtent],
-    offsets: &[u32],
-    shift: fn(u32, u32) -> Option<u32>,
-) -> ExpansionResult<()> {
-    for (extent, &offset) in extents.iter_mut().zip(offsets) {
-        for coordinate in [
-            &mut extent.start,
-            &mut extent.logical_end,
-            &mut extent.physical_end,
-        ] {
-            *coordinate = shift(*coordinate, offset).ok_or(ExpansionError::IdOverflow)?;
-        }
-    }
-    Ok(())
 }
 
 impl TileGraphBuilder {
-    pub(super) fn prepare_mapped_views(
+    pub(in crate::low::expand) fn prepare_mapped_views(
         &mut self,
         mappings: Vec<(ShardView, ShardView)>,
         copy_order: CopyOrder,
@@ -742,7 +499,7 @@ impl TileGraphBuilder {
         Ok(view)
     }
 
-    pub(super) fn append_materialization(
+    pub(in crate::low::expand) fn append_materialization(
         &mut self,
         mut batch: MaterializationBatch,
         provenance: WorkProvenance,
@@ -789,7 +546,19 @@ impl TileGraphBuilder {
                 crate::kernel::CopyRun::bind(copy, &self.shards)?,
             )?;
         }
-        self.append_mixed_phase(batch.transfers, provenance, tiles)?;
+        let mut transfers = Vec::new();
+        for (order, mappings) in batch.transfers {
+            transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
+                destinations.sort_unstable();
+                destinations.dedup();
+                LogicalExchange {
+                    source,
+                    destinations,
+                    order,
+                }
+            }));
+        }
+        self.append_exchange_phase(transfers, provenance, tiles)?;
         for (tile, copy) in batch.after {
             self.append_local_copy(
                 tiles,
@@ -803,7 +572,7 @@ impl TileGraphBuilder {
         Ok(())
     }
 
-    pub(super) fn logical_view(&self, shard: BlockValueId) -> ShardView {
+    fn logical_view(&self, shard: BlockValueId) -> ShardView {
         let mut view = self.full_view(shard);
         for extent in &mut view.extents {
             extent.physical_end = extent.logical_end;

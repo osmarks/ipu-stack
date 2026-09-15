@@ -1,5 +1,6 @@
 //! Byte-copy descriptions and explicit movement requests, before placement.
-//! Local launch construction belongs to kernel::copy; this module declares the contracts.
+//! Mid copies carry these policies into low::expand::copy, which constructs
+//! their movement. kernel::copy coalesces and binds the local byte-copy launches.
 
 /// Requested realization of a whole-device coordinate copy. Explicit requests
 /// are checked by movement lowering; Automatic selects from the actual geometry.

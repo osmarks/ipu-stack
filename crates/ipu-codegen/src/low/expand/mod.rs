@@ -6,10 +6,7 @@ use crate::storage::GeometryCache;
 mod compute;
 
 mod buffers;
-mod copies;
-mod mapping;
-mod movement;
-mod ownership;
+mod copy;
 mod repeat;
 #[cfg(test)]
 use super::{view_byte_spans, view_byte_traversal};
@@ -24,10 +21,6 @@ use crate::{
     LayoutError, MemoryClass, MidOperation, MidProgram, MidRepeat, MidValueId, Precision,
     ShardExtent, TensorTiling, TensorType,
 };
-use copies::*;
-
-use mapping::*;
-use ownership::CopyRegions;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -234,21 +227,7 @@ impl TileGraphBuilder {
             );
             let group = copies;
             let lowered = if copies != 0 {
-                let mut batch = movement::MaterializationBatch::default();
-                for operation in &operations[index..index + group] {
-                    self.prepare_copy_tensor(operation, &mut batch, &mut tiles)?;
-                }
-                let mut provenance = operation_provenance(operation);
-                if copies > 1 {
-                    provenance.value = None;
-                }
-                if operations[index..index + group]
-                    .iter()
-                    .any(|next| next.source != operation.source)
-                {
-                    provenance.operation = None;
-                }
-                self.append_materialization(batch, provenance, &mut tiles)
+                self.lower_copies(&operations[index..index + group], &mut tiles)
             } else {
                 match &operation.kind {
                     MidOperationKind::Copy { .. } => {

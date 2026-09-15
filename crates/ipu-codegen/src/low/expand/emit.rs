@@ -3,27 +3,6 @@
 use super::*;
 
 impl TileGraphBuilder {
-    pub(super) fn append_mixed_phase(
-        &mut self,
-        mappings: impl IntoIterator<Item = (CopyOrder, BTreeMap<ShardView, Vec<ShardView>>)>,
-        provenance: WorkProvenance,
-        tiles: &mut BlockRegion,
-    ) -> ExpansionResult<()> {
-        let mut transfers = Vec::new();
-        for (order, mappings) in mappings {
-            transfers.extend(mappings.into_iter().map(|(source, mut destinations)| {
-                destinations.sort_unstable();
-                destinations.dedup();
-                LogicalExchange {
-                    source,
-                    destinations,
-                    order,
-                }
-            }));
-        }
-        self.append_exchange_phase(transfers, provenance, tiles)
-    }
-
     pub(super) fn append_exchange_phase(
         &mut self,
         transfers: Vec<LogicalExchange>,
