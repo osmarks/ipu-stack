@@ -234,12 +234,6 @@ impl OperandRequirement {
     }
 }
 
-pub(super) fn layout_has_empty_shards(layout: &Layout, shape: &TensorShape) -> bool {
-    layout
-        .resolve(shape)
-        .map_or(true, |resolved| resolved.has_empty_shards())
-}
-
 pub(super) fn default_dispatch(operator: OperatorFamily) -> OperatorDispatch {
     match operator {
         OperatorFamily::Gemm { .. } => blocked_gemm_dispatch(AMP_OUTPUT_COLUMN_BLOCK),
@@ -277,22 +271,6 @@ pub struct OperatorPlan {
     /// None allocates a fresh result. Some requires one compatible, writable
     /// input from this preference list; an empty list makes the plan infeasible.
     pub reuse_inputs: Option<Vec<u16>>,
-}
-
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq, Hash)]
-pub enum OperatorPlanError {
-    #[error("operator plan operand arity does not match its requirements")]
-    OperandArity,
-    #[error("operator plan dispatch does not match the selected operator")]
-    DispatchMismatch,
-    #[error("operator plan uses zero or incompatible block dimensions")]
-    InvalidBlocking,
-    #[error("operator plan requires corresponding activation and output tile groups")]
-    IncompatibleTileGroups,
-    #[error("operator dispatch does not support empty output shards")]
-    EmptyOutputShard,
-    #[error("blocked GEMM currently requires non-transposed AMP left/right/output formats")]
-    UnsupportedGemmLayout,
 }
 
 impl OperatorPlan {
@@ -333,37 +311,30 @@ impl OperatorPlan {
 
     pub(super) fn supports(&self, inputs: &[TensorType], output: &TensorShape) -> bool {
         if self.inputs.len() != inputs.len()
-            || self.output.layout.resolve(output).is_err()
-            || !self
-                .inputs
-                .iter()
-                .zip(inputs)
-                .all(|(requirement, input)| requirement.format.layout.resolve(&input.shape).is_ok())
+            || self.reuse_inputs.as_ref().is_some_and(|indices| {
+                !indices
+                    .iter()
+                    .any(|&index| self.can_reuse_input(index, inputs, output))
+            })
         {
             return false;
         }
-        if self.reuse_inputs.as_ref().is_some_and(|indices| {
-            !indices
-                .iter()
-                .any(|&index| self.can_reuse_input(index, inputs, output))
-        }) {
+        let Ok(layouts) = self
+            .inputs
+            .iter()
+            .zip(inputs)
+            .map(|(requirement, input)| requirement.format.layout.resolve(&input.shape))
+            .collect::<Result<Vec<_>, _>>()
+        else {
             return false;
-        }
-        let (planned_inputs, planned_output) = self.tensor_types(inputs, output);
-        self.validate(&planned_inputs, &planned_output).is_ok()
-    }
-    pub fn validate(
-        &self,
-        inputs: &[TensorType],
-        output: &TensorType,
-    ) -> Result<(), OperatorPlanError> {
-        if inputs.len() != self.inputs.len() {
-            return Err(OperatorPlanError::OperandArity);
-        }
+        };
+        let Ok(output_layout) = self.output.layout.resolve(output) else {
+            return false;
+        };
         if !matches!(self.dispatch, OperatorDispatch::LocalKernel)
-            && layout_has_empty_shards(&output.format.layout, &output.shape)
+            && output_layout.has_empty_shards()
         {
-            return Err(OperatorPlanError::EmptyOutputShard);
+            return false;
         }
         match (&self.operator, &self.dispatch) {
             (
@@ -377,58 +348,49 @@ impl OperatorPlan {
                     orientation,
                 },
             ) => {
-                let [left, right] = inputs else {
-                    return Err(OperatorPlanError::OperandArity);
-                };
-                if matches!(distribution, GemmDistribution::OutputStationary)
-                    && left.format.layout.tiling.tile_count
-                        != output.format.layout.tiling.tile_count
-                {
-                    return Err(OperatorPlanError::IncompatibleTileGroups);
-                }
-                let formats_match_orientation = match orientation {
-                    GemmOrientation::Normal => {
-                        matches!(left.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
-                            && matches!(
-                                right.format.layout.order,
-                                ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
-                            )
-                            && (output.format.layout.order
-                                == ElementOrder::Amp(if *multiply != Precision::F32 {
-                                    AmpOrder::Left
-                                } else {
-                                    AmpOrder::Output
-                                })
-                                || (*multiply == Precision::F16
-                                    && output.format.layout.order.gemm_output_group().is_some()
-                                    && !output.format.layout.order.gemm_output_transposed()))
-                    }
-                    GemmOrientation::Swapped => {
-                        matches!(
-                            left.format.layout.order,
-                            ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })
-                        ) && right.format.layout.order
-                            == ElementOrder::Amp(AmpOrder::TransposedLeft)
-                            && (output.format.layout.order
-                                == ElementOrder::Amp(if *multiply != Precision::F32 {
-                                    AmpOrder::TransposedLeft
-                                } else {
-                                    AmpOrder::TransposedOutput
-                                })
-                                || (*multiply == Precision::F16
-                                    && output.format.layout.order.gemm_output_group().is_some()
-                                    && output.format.layout.order.gemm_output_transposed()))
-                    }
-                };
-                if options.transpose_left || options.transpose_right || !formats_match_orientation {
-                    return Err(OperatorPlanError::UnsupportedGemmLayout);
-                }
-                if *inner_block == 0
+                if inputs.len() != 2
+                    || inputs.iter().any(|input| input.shape.0.len() < 2)
+                    || output.0.len() < 2
+                    || *inner_block == 0
                     || *output_column_block == 0
-                    || left.shape.0.len() < 2
-                    || output.shape.0.len() < 2
+                    || options.transpose_left
+                    || options.transpose_right
                 {
-                    return Err(OperatorPlanError::InvalidBlocking);
+                    return false;
+                }
+                let parallel = matches!(distribution, GemmDistribution::ParallelReduction { .. });
+                if !parallel
+                    && self.inputs[0].format.layout.tiling.tile_count
+                        != self.output.layout.tiling.tile_count
+                {
+                    return false;
+                }
+                let (left, right) = orientation.operand_indices();
+                let swapped = *orientation == GemmOrientation::Swapped;
+                let left_order = if swapped {
+                    AmpOrder::TransposedLeft
+                } else {
+                    AmpOrder::Left
+                };
+                let native_output = match (swapped, *multiply == Precision::F32) {
+                    (false, false) => AmpOrder::Left,
+                    (false, true) => AmpOrder::Output,
+                    (true, false) => AmpOrder::TransposedLeft,
+                    (true, true) => AmpOrder::TransposedOutput,
+                };
+                let right_matches = match self.inputs[right].format.layout.order {
+                    ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) => !swapped,
+                    ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => swapped,
+                    _ => false,
+                };
+                if self.inputs[left].format.layout.order != ElementOrder::Amp(left_order)
+                    || !right_matches
+                    || !(self.output.layout.order == ElementOrder::Amp(native_output)
+                        || (*multiply == Precision::F16
+                            && self.output.layout.order.gemm_output_group().is_some()
+                            && self.output.layout.order.gemm_output_transposed() == swapped))
+                {
+                    return false;
                 }
                 if let GemmDistribution::ParallelReduction {
                     row_partitions,
@@ -439,21 +401,12 @@ impl OperatorPlan {
                     ..
                 } = distribution
                 {
-                    let result_rows = row_partitions.saturating_mul(*result_row_partitions);
-                    let result_columns =
-                        column_partitions.saturating_mul(*result_column_partitions);
-                    let expected_tiles = result_rows.saturating_mul(result_columns);
-                    let row_axis = match orientation {
-                        GemmOrientation::Normal => TensorAxis::FromEnd(2),
-                        GemmOrientation::Swapped => TensorAxis::FromEnd(1),
-                    };
-                    let column_axis = match orientation {
-                        GemmOrientation::Normal => TensorAxis::FromEnd(1),
-                        GemmOrientation::Swapped => TensorAxis::FromEnd(2),
-                    };
-                    let axis_partitions = |axis| {
-                        output
-                            .format
+                    let rows = row_partitions.saturating_mul(*result_row_partitions);
+                    let columns = column_partitions.saturating_mul(*result_column_partitions);
+                    let row_axis = TensorAxis::FromEnd(if swapped { 1 } else { 2 });
+                    let column_axis = TensorAxis::FromEnd(if swapped { 2 } else { 1 });
+                    let parts = |axis| {
+                        self.output
                             .layout
                             .tiling
                             .axes
@@ -468,98 +421,52 @@ impl OperatorPlan {
                         || *result_column_partitions == 0
                         || result_row_partitions.saturating_mul(*result_column_partitions)
                             > *inner_partitions
-                        || output.format.layout.tiling.tile_count != expected_tiles
-                        || axis_partitions(row_axis) != Some(result_rows)
-                        || axis_partitions(column_axis) != Some(result_columns)
+                        || self.output.layout.tiling.tile_count != rows.saturating_mul(columns)
+                        || parts(row_axis) != Some(rows)
+                        || parts(column_axis) != Some(columns)
                     {
-                        return Err(OperatorPlanError::InvalidBlocking);
+                        return false;
                     }
                 }
-                let physical_left = match orientation {
-                    GemmOrientation::Normal => left,
-                    GemmOrientation::Swapped => right,
+                let left_layout = &layouts[left];
+                let right_layout = &layouts[right];
+                let inner_axis = orientation.matrix_axes(left_layout.padded_shape.0.len()).1;
+                let right_column_axis =
+                    orientation.matrix_axes(right_layout.padded_shape.0.len()).1;
+                let output_column_axis = orientation.matrix_axes(output.0.len()).1;
+                let (Some(output_axes), Some(right_axes)) =
+                    (output_layout.axes(), right_layout.axes())
+                else {
+                    return false;
                 };
-                let left_layout = physical_left
-                    .format
-                    .layout
-                    .resolve(&physical_left.shape)
-                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let output_layout = output
-                    .format
-                    .layout
-                    .resolve(&output.shape)
-                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let output_column_axis = output_layout.padded_shape.0.len()
-                    - match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 2,
-                    };
-                let output_axis = &output_layout
-                    .axes()
-                    .ok_or(OperatorPlanError::InvalidBlocking)?[output_column_axis];
-                let columns_per_output_shard = output_axis.maximum_extent();
-                let physical_right = match orientation {
-                    GemmOrientation::Normal => right,
-                    GemmOrientation::Swapped => left,
+                let output_columns = output_axes[output_column_axis].maximum_extent();
+                let right_columns = if parallel {
+                    right_axes[right_column_axis].maximum_extent()
+                } else {
+                    right_axes[right_column_axis].minimum_extent()
                 };
-                let right_layout = physical_right
-                    .format
-                    .layout
-                    .resolve(&physical_right.shape)
-                    .map_err(|_| OperatorPlanError::InvalidBlocking)?;
-                let right_column_axis = right_layout.padded_shape.0.len()
-                    - match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 2,
-                    };
-                let right_axis = &right_layout
-                    .axes()
-                    .ok_or(OperatorPlanError::InvalidBlocking)?[right_column_axis];
-                let columns_per_right_shard =
-                    if matches!(distribution, GemmDistribution::ParallelReduction { .. }) {
-                        right_axis.maximum_extent()
-                    } else {
-                        right_axis.minimum_extent()
-                    };
-                let grid_plan = left.format.layout.tiling.replicas > 1
-                    || right.format.layout.tiling.replicas > 1
-                    || right
+                let grid = self
+                    .inputs
+                    .iter()
+                    .any(|input| input.format.layout.tiling.replicas > 1)
+                    || self.inputs[1]
                         .format
                         .layout
                         .tiling
                         .axes
                         .iter()
                         .any(|axis| axis.axis == TensorAxis::FromEnd(2) && axis.partitions > 1);
-                if grid_plan
-                    && [&left_layout, &right_layout, &output_layout]
-                        .into_iter()
-                        .any(|layout| layout.has_empty_shards())
-                {
-                    return Err(OperatorPlanError::InvalidBlocking);
-                }
-                let physical_left_inner_axis = left_layout.padded_shape.0.len()
-                    - match orientation {
-                        GemmOrientation::Normal => 1,
-                        GemmOrientation::Swapped => 2,
-                    };
-                let balanced_output_columns =
-                    matches!(distribution, GemmDistribution::ParallelReduction { .. });
-                let output_shard_alignment = if balanced_output_columns {
+                let alignment = if parallel {
                     AMP_COLUMN_MICRO
                 } else {
                     *output_column_block
                 };
-                if !left_layout.padded_shape.0[physical_left_inner_axis]
-                    .is_multiple_of(*inner_block)
-                    || !output_layout.padded_shape.0[output_column_axis]
-                        .is_multiple_of(output_shard_alignment)
-                    || !columns_per_output_shard.is_multiple_of(output_shard_alignment)
-                    || (balanced_output_columns && columns_per_output_shard > *output_column_block)
-                    || columns_per_right_shard < *output_column_block
-                {
-                    return Err(OperatorPlanError::InvalidBlocking);
-                }
-                Ok(())
+                !(grid && layouts.iter().any(|layout| layout.has_empty_shards()))
+                    && left_layout.padded_shape.0[inner_axis].is_multiple_of(*inner_block)
+                    && output_layout.padded_shape.0[output_column_axis].is_multiple_of(alignment)
+                    && output_columns.is_multiple_of(alignment)
+                    && (!parallel || output_columns <= *output_column_block)
+                    && right_columns >= *output_column_block
             }
             (
                 OperatorFamily::LayerNorm
@@ -569,15 +476,9 @@ impl OperatorPlan {
                 OperatorDispatch::LocalKernel,
             )
             | (OperatorFamily::LayerNorm, OperatorDispatch::LayerNorm { .. }) => {
-                let output_tiles = output.format.layout.tiling.tile_count;
-                if inputs
-                    .iter()
-                    .any(|input| input.format.layout.tiling.tile_count != output_tiles)
-                {
-                    Err(OperatorPlanError::IncompatibleTileGroups)
-                } else {
-                    Ok(())
-                }
+                self.inputs.iter().all(|input| {
+                    input.format.layout.tiling.tile_count == self.output.layout.tiling.tile_count
+                })
             }
             (
                 OperatorFamily::FlashAttention {
@@ -592,60 +493,37 @@ impl OperatorPlan {
                     ..
                 },
             ) => {
-                let [query, key, value] = inputs else {
-                    return Err(OperatorPlanError::OperandArity);
+                let [query, key, value] = self.inputs.as_slice() else {
+                    return false;
                 };
-                if options.causal
-                    || *accumulate != AccumulationPrecision::F32
-                    || *key_block_rows == 0
-                    || !key_block_rows.is_multiple_of(AMP_INNER_BLOCK)
-                    || (!materialized && *key_block_rows != AMP_INNER_BLOCK)
-                    || *padded_query_dimension == 0
-                    || *padded_value_dimension == 0
-                    || !matches!(query.format.layout.order, ElementOrder::Amp(AmpOrder::Left))
-                    || !matches!(
-                        key.format.layout.order,
-                        ElementOrder::Amp(AmpOrder::TransposedRight)
-                    )
-                    || !matches!(
+                !options.causal
+                    && *accumulate == AccumulationPrecision::F32
+                    && *key_block_rows != 0
+                    && key_block_rows.is_multiple_of(AMP_INNER_BLOCK)
+                    && (*materialized || *key_block_rows == AMP_INNER_BLOCK)
+                    && *padded_query_dimension != 0
+                    && *padded_value_dimension != 0
+                    && query.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
+                    && key.format.layout.order == ElementOrder::Amp(AmpOrder::TransposedRight)
+                    && matches!(
                         value.format.layout.order,
                         ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
                     )
-                    || output.format.layout.order != ElementOrder::RowMajor
-                    || query.format.layout.tiling.tile_count
-                        != output.format.layout.tiling.tile_count
-                    || key.format.layout.tiling.tile_count != value.format.layout.tiling.tile_count
-                {
-                    Err(OperatorPlanError::InvalidBlocking)
-                } else {
-                    Ok(())
-                }
+                    && self.output.layout.order == ElementOrder::RowMajor
+                    && query.format.layout.tiling.tile_count == self.output.layout.tiling.tile_count
+                    && key.format.layout.tiling.tile_count == value.format.layout.tiling.tile_count
             }
-            (OperatorFamily::Slice(slice), OperatorDispatch::View) => {
-                let [input] = inputs else {
-                    return Err(OperatorPlanError::OperandArity);
+            (operator, OperatorDispatch::View) => {
+                let [input] = inputs else { return false };
+                let shape = match operator {
+                    OperatorFamily::View(view) => view.output_shape(&input.shape),
+                    OperatorFamily::Slice(slice) => slice.output_shape(&input.shape),
+                    _ => return false,
                 };
-                if slice.output_shape(&input.shape).as_ref() != Some(&output.shape)
-                    || input.format.precision != output.format.precision
-                {
-                    Err(OperatorPlanError::InvalidBlocking)
-                } else {
-                    Ok(())
-                }
+                shape.as_ref() == Some(output)
+                    && self.inputs[0].format.precision == self.output.precision
             }
-            (OperatorFamily::View(view), OperatorDispatch::View) => {
-                let [input] = inputs else {
-                    return Err(OperatorPlanError::OperandArity);
-                };
-                if view.output_shape(&input.shape).as_ref() != Some(&output.shape)
-                    || input.format.precision != output.format.precision
-                {
-                    Err(OperatorPlanError::InvalidBlocking)
-                } else {
-                    Ok(())
-                }
-            }
-            _ => Err(OperatorPlanError::DispatchMismatch),
+            _ => false,
         }
     }
 }
