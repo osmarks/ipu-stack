@@ -87,7 +87,7 @@ pub fn schedule_exchange_problem_with_priority(
                 "stream wave size must be nonzero".into(),
             ));
         }
-        materialize_stream_schedule(
+        streams::schedule(
             &topology,
             &scheduling,
             &incoming_bases,
@@ -96,7 +96,7 @@ pub fn schedule_exchange_problem_with_priority(
             matches!(priority, ExchangeSchedulingPriority::BalancedStreams(_)),
         )?
     } else {
-        materialize_greedy_schedule_with_priority(
+        greedy::schedule(
             &topology,
             &scheduling,
             &incoming_bases,
@@ -126,42 +126,4 @@ pub fn schedule_exchange_problem_with_priority(
         )?
     };
     finish_exchange_run(problem.phase, incoming_bases, optimized)
-}
-
-pub(super) fn balanced_stream_schedule(
-    topology: &Topology,
-    problem: &SchedulingProblem<'_>,
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    words: u32,
-) -> Result<OptimizedSchedule, ExchangeLoweringError> {
-    let schedule = materialize_stream_schedule(
-        topology,
-        problem,
-        incoming_bases,
-        receive_counts,
-        words,
-        true,
-    )?;
-    // Choose one compact policy. Complete-package placement accounts for the
-    // per-tile rows, including sharing; aggregate bytes are not a fit test.
-    Ok(OptimizedSchedule {
-        initial_horizon: schedule.horizon,
-        endpoint_lower_bound: endpoint_work_lower_bound(problem.transfers, problem.tile_count),
-        schedule,
-        selected_kind: "balanced-compact-streams",
-        neighborhood_improvements: 0,
-    })
-}
-
-pub(super) fn materialize_stream_schedule(
-    topology: &Topology,
-    problem: &SchedulingProblem<'_>,
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    words: u32,
-    balanced: bool,
-) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let order = order::stream_wave_order(problem, words, balanced);
-    materialize_valid_schedule_order(topology, problem, incoming_bases, receive_counts, &order)
 }

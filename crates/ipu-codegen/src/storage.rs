@@ -46,9 +46,6 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
-#[cfg(test)]
-mod sort_bench;
-
 /// Allocation-relative view identity. Storage traversal depends on precision,
 /// element order and these extents, not tile identity, memory class or tensor shape.
 #[derive(PartialEq, Eq, Hash)]

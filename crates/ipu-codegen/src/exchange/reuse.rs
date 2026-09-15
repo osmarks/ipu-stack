@@ -298,11 +298,12 @@ mod tests {
         };
         let pending = pending_from_problem(8, &problem).unwrap();
         let (counts, bases) = receive_configuration(&pending, 8).unwrap();
-        let aligned = materialize_greedy_schedule(
+        let aligned = greedy::schedule(
             &topology,
             &SchedulingProblem::new(&pending, 8),
             &bases,
             &counts,
+            ExchangeSchedulingPriority::Automatic,
         )
         .unwrap();
         assert!(

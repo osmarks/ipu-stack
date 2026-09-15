@@ -1,4 +1,11 @@
 //! Physical exchange programs generated from logical shard transfers.
+//!
+//! Selection constructs one SchedulingProblem with transfers and dependency edges.
+//! `greedy` schedules ready work against live endpoint availability; `matching`,
+//! `repair`, and `streams` propose dependency-respecting orders. All use the same
+//! MaterializedSchedule append path for memory hazards and the program builder
+//! for instruction compatibility. Policy comparison and acceptance stay here;
+//! replay invokes the same algorithms rather than maintaining implementations.
 
 use ipu_target::ipu21::fabric::Topology;
 use ipu_target::ipu21::memory::{
@@ -9,10 +16,12 @@ mod program;
 pub use program::*;
 mod hazards;
 use hazards::MemoryHistory;
-mod order;
+mod greedy;
+mod matching;
 mod packet;
+mod repair;
+mod streams;
 pub use diagnostic::diagnose_exchange_tile;
-use order::{critical_neighborhood_order, point_to_point_matching_wave_order};
 mod replay;
 pub use replay::{
     ExchangeSchedulingPriority, schedule_exchange_problem, schedule_exchange_problem_with_priority,
@@ -31,7 +40,7 @@ use crate::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhysicalExchangePhase {
@@ -1073,15 +1082,29 @@ fn optimize_pending_schedule(
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
     let problem = SchedulingProblem::new(pending, tile_count);
     if let Some(words) = stream_words {
-        return replay::balanced_stream_schedule(
+        let schedule = streams::schedule(
             topology,
             &problem,
             incoming_bases,
             receive_counts,
             words.get(),
-        );
+            true,
+        )?;
+        return Ok(OptimizedSchedule {
+            initial_horizon: schedule.horizon,
+            endpoint_lower_bound: endpoint_work_lower_bound(pending, tile_count),
+            schedule,
+            selected_kind: "balanced-compact-streams",
+            neighborhood_improvements: 0,
+        });
     }
-    let schedule = materialize_greedy_schedule(topology, &problem, incoming_bases, receive_counts)?;
+    let schedule = greedy::schedule(
+        topology,
+        &problem,
+        incoming_bases,
+        receive_counts,
+        ExchangeSchedulingPriority::Automatic,
+    )?;
     improve_pending_schedule(
         topology,
         &problem,
@@ -1103,11 +1126,11 @@ fn improve_pending_schedule(
 ) -> Result<OptimizedSchedule, ExchangeLoweringError> {
     let pending = problem.transfers;
     let tile_count = problem.tile_count;
-    let initial_horizon = schedule_score(&schedule);
+    let initial_horizon = schedule.horizon;
     let endpoint_lower_bound = endpoint_work_lower_bound(pending, tile_count);
     let mut selected_kind = initial_kind;
     let mut neighborhood_improvements = 0usize;
-    if let Some(order) = point_to_point_matching_wave_order(problem, &schedule.order) {
+    if let Some(order) = matching::order(problem, &schedule.order) {
         let matching = materialize_schedule_order(
             topology,
             problem,
@@ -1117,18 +1140,16 @@ fn improve_pending_schedule(
             false,
         );
         if let Ok(matching) = matching
-            && schedule_score(&matching) < schedule_score(&schedule)
+            && matching.horizon < schedule.horizon
         {
             schedule = matching;
             selected_kind = "matching-waves";
         }
     }
     loop {
-        let repaired_order =
-            critical_neighborhood_order(problem, &schedule, false).unwrap_or_else(|| {
-                critical_neighborhood_order(problem, &schedule, true)
-                    .expect("local repair has no work limit")
-            });
+        let repaired_order = repair::order(problem, &schedule, false).unwrap_or_else(|| {
+            repair::order(problem, &schedule, true).expect("local repair has no work limit")
+        });
         if repaired_order == schedule.order {
             break;
         }
@@ -1143,7 +1164,7 @@ fn improve_pending_schedule(
         let Ok(repaired) = repaired else {
             break;
         };
-        if schedule_score(&repaired) >= schedule_score(&schedule) {
+        if repaired.horizon >= schedule.horizon {
             break;
         }
         schedule = repaired;
@@ -1527,17 +1548,6 @@ fn coalesce_pending_transfers(transfers: Vec<PendingTransfer>) -> Vec<PendingTra
     merged
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ReadyTransfer {
-    moving_source: bool,
-    earliest_start: Reverse<u32>,
-    endpoint_pressure: u64,
-    fanout: u16,
-    words: u32,
-    source: Reverse<u16>,
-    index: Reverse<usize>,
-}
-
 /// Address/width-dependent facts shared by every trial for one physical phase.
 struct SchedulingProblem<'a> {
     transfers: &'a [PendingTransfer],
@@ -1572,256 +1582,6 @@ impl<'a> SchedulingProblem<'a> {
     }
     fn indegrees(&self) -> Vec<usize> {
         self.predecessors.iter().map(Vec::len).collect()
-    }
-}
-
-/// Incrementally list-schedules dependency-ready multicast hyperedges. Heap
-/// keys are lower bounds on their start time and are refreshed lazily as
-/// shared endpoints become busy.
-struct TransferScheduler<'a> {
-    transfers: &'a [PendingTransfer],
-    word_pressure: Vec<u64>,
-    dynamic_word_pressure: bool,
-    directional_pressure: bool,
-    dependents: &'a [Vec<usize>],
-    indegrees: Vec<usize>,
-    dependency_ready: Vec<u32>,
-    ready: BinaryHeap<ReadyTransfer>,
-    ready_groups: Vec<BinaryHeap<ReadyTransfer>>,
-    transfer_group: Vec<usize>,
-    completed: usize,
-}
-
-impl<'a> TransferScheduler<'a> {
-    #[cfg(test)]
-    fn new(problem: &'a SchedulingProblem<'_>) -> Self {
-        Self::with_priority(problem, ExchangeSchedulingPriority::Combined)
-    }
-
-    fn with_priority(
-        problem: &'a SchedulingProblem<'_>,
-        priority: ExchangeSchedulingPriority,
-    ) -> Self {
-        let transfers = problem.transfers;
-        let priority = match priority {
-            ExchangeSchedulingPriority::Automatic => {
-                // Point-to-point traffic benefits from draining the remaining
-                // send/receive workloads independently. Multicast choices free
-                // several receivers together and retain their combined pressure.
-                if transfers
-                    .iter()
-                    .all(|transfer| transfer.destinations.len() == 1)
-                {
-                    ExchangeSchedulingPriority::RemainingDirectional
-                } else {
-                    ExchangeSchedulingPriority::Combined
-                }
-            }
-            priority => priority,
-        };
-
-        let directional = matches!(
-            priority,
-            ExchangeSchedulingPriority::Directional
-                | ExchangeSchedulingPriority::RemainingDirectional
-        );
-        let word_pressure = if directional {
-            let mut pressure = vec![0; usize::from(problem.tile_count) * 2];
-            for transfer in transfers {
-                for resource in transfer.pressure_resources(true) {
-                    pressure[resource] +=
-                        u64::from(transfer.item_count().unwrap_or(transfer.words));
-                }
-            }
-            pressure
-        } else {
-            problem.word_pressure.clone()
-        };
-        let mut scheduler = Self {
-            transfers,
-            word_pressure,
-            directional_pressure: directional,
-            // Both production policies update remaining work. Static pressure
-            // remains available for controlled offline comparisons.
-            dynamic_word_pressure: matches!(
-                priority,
-                ExchangeSchedulingPriority::RemainingCombined
-                    | ExchangeSchedulingPriority::RemainingDirectional
-            ) || (priority == ExchangeSchedulingPriority::Combined
-                && transfers
-                    .iter()
-                    .any(|transfer| transfer.destinations.len() > 1)),
-            dependents: &problem.dependents,
-            indegrees: problem.indegrees(),
-            dependency_ready: vec![0; transfers.len()],
-            ready: BinaryHeap::new(),
-            ready_groups: Vec::new(),
-            transfer_group: Vec::new(),
-            completed: 0,
-        };
-        for index in 0..transfers.len() {
-            if scheduler.indegrees[index] == 0 {
-                scheduler.push_ready(index, 0);
-            }
-        }
-        // Initially ready transfers sharing the same endpoint roles have the
-        // same changing readiness and pressure. Their relative word/index
-        // priority is static, so only the best member needs a global entry.
-        // Later dependency releases remain individual entries.
-        let mut groups = BTreeMap::new();
-        scheduler.transfer_group.resize(transfers.len(), usize::MAX);
-        for candidate in std::mem::take(&mut scheduler.ready).into_vec() {
-            let index = candidate.index.0;
-            let transfer = &transfers[index];
-            let receivers = transfer
-                .destinations
-                .iter()
-                .map(|&(tile, _)| tile)
-                .collect::<Vec<_>>();
-            let group = *groups
-                .entry((transfer.source, transfer.reserved_source, receivers))
-                .or_insert_with(|| {
-                    let group = scheduler.ready_groups.len();
-                    scheduler.ready_groups.push(BinaryHeap::new());
-                    group
-                });
-            scheduler.transfer_group[index] = group;
-            scheduler.ready_groups[group].push(candidate);
-        }
-        scheduler.ready.extend(
-            scheduler
-                .ready_groups
-                .iter()
-                .filter_map(|queue| queue.peek().copied()),
-        );
-        scheduler
-    }
-
-    fn push_ready(&mut self, index: usize, earliest_start: u32) {
-        let transfer = &self.transfers[index];
-        let endpoint_pressure = transfer
-            .pressure_resources(self.directional_pressure)
-            // Bytes, rather than role count, approximate how long selecting
-            // this hyperedge frees work on the phase's congested endpoints.
-            .map(|tile| self.word_pressure[tile])
-            .sum::<u64>();
-        self.ready.push(ReadyTransfer {
-            moving_source: transfer.moving_source(),
-            earliest_start: Reverse(earliest_start),
-            endpoint_pressure,
-            fanout: u16::try_from(transfer.destinations.len()).expect("receivers fit tile count"),
-            words: transfer.item_count().unwrap_or(transfer.words),
-            source: Reverse(transfer.source),
-            index: Reverse(index),
-        });
-    }
-
-    fn refresh(
-        &self,
-        mut candidate: ReadyTransfer,
-        availability: &[TileAvailability],
-    ) -> ReadyTransfer {
-        let index = candidate.index.0;
-        let transfer = &self.transfers[index];
-        candidate.earliest_start = Reverse(
-            std::iter::once(self.dependency_ready[index])
-                .chain(std::iter::once(
-                    availability[usize::from(transfer.source)].send,
-                ))
-                .chain(
-                    transfer
-                        .reserved_source
-                        .into_iter()
-                        .map(|tile| availability[usize::from(tile)].send),
-                )
-                .chain(
-                    transfer
-                        .destinations
-                        .iter()
-                        .map(|&(tile, _)| availability[usize::from(tile)].receive),
-                )
-                .max()
-                .unwrap_or(0),
-        );
-        if self.dynamic_word_pressure {
-            candidate.endpoint_pressure = transfer
-                .pressure_resources(self.directional_pressure)
-                .map(|tile| self.word_pressure[tile])
-                .sum();
-        }
-        candidate
-    }
-
-    fn next(&mut self, tile_availability: &[TileAvailability]) -> Option<(usize, u32)> {
-        let mut repairs = 0;
-        loop {
-            let candidate = *self.ready.peek()?;
-            let current = self.refresh(candidate, tile_availability);
-            if candidate == current {
-                let index = candidate.index.0;
-                // Readiness ranks the queue; payload dependencies alone gate
-                // the row builder, which pipelines source selection/delivery.
-                if let Some(group) = self
-                    .transfer_group
-                    .get(index)
-                    .copied()
-                    .filter(|&group| group != usize::MAX)
-                {
-                    let queue = &mut self.ready_groups[group];
-                    let head = queue.pop().expect("nonempty ready group");
-                    debug_assert_eq!(head.index.0, index);
-                    if let Some(mut next) = queue.peek().copied() {
-                        next.earliest_start = current.earliest_start;
-                        *self.ready.peek_mut().expect("ready head") = next;
-                    } else {
-                        self.ready.pop();
-                    }
-                } else {
-                    self.ready.pop();
-                }
-                return Some((index, self.dependency_ready[index]));
-            }
-            repairs += 1;
-            // A wave can invalidate most keys. Once logarithmic root repairs
-            // cost a linear scan, refresh/reheapify once instead. Charge heap
-            // traversal four times the contiguous scan: the large ViT captures
-            // benefit from refreshing sooner than comparison counts suggest.
-            // Both readiness
-            // and pressure are monotone bounds, so this preserves eager priority.
-            if self.ready.len() >= 128
-                && 4 * repairs * self.ready.len().ilog2() as usize >= self.ready.len()
-            {
-                let mut entries = std::mem::take(&mut self.ready).into_vec();
-                for entry in &mut entries {
-                    *entry = self.refresh(*entry, tile_availability);
-                }
-                self.ready = BinaryHeap::from(entries);
-            } else {
-                *self.ready.peek_mut().expect("ready head") = current;
-            }
-        }
-    }
-
-    fn complete(&mut self, index: usize, completion: u32) {
-        self.completed += 1;
-        let transfer = &self.transfers[index];
-        if self.dynamic_word_pressure {
-            let items = u64::from(transfer.item_count().unwrap_or(transfer.words));
-            for tile in transfer.pressure_resources(self.directional_pressure) {
-                self.word_pressure[tile] = self.word_pressure[tile].saturating_sub(items);
-            }
-        }
-        for &dependent in &self.dependents[index] {
-            self.dependency_ready[dependent] = self.dependency_ready[dependent].max(completion);
-            self.indegrees[dependent] -= 1;
-            if self.indegrees[dependent] == 0 {
-                self.push_ready(dependent, self.dependency_ready[dependent]);
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.completed == self.transfers.len()
     }
 }
 
@@ -2158,93 +1918,6 @@ impl MaterializedSchedule {
     }
 }
 
-fn materialize_greedy_schedule(
-    topology: &Topology,
-    problem: &SchedulingProblem<'_>,
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    materialize_greedy_schedule_with_priority(
-        topology,
-        problem,
-        incoming_bases,
-        receive_counts,
-        ExchangeSchedulingPriority::Automatic,
-    )
-}
-
-fn materialize_greedy_schedule_with_priority(
-    topology: &Topology,
-    problem: &SchedulingProblem<'_>,
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    priority: ExchangeSchedulingPriority,
-) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let pending = problem.transfers;
-    let schedule = materialize_greedy_schedule_impl(
-        topology,
-        problem,
-        incoming_bases,
-        receive_counts,
-        false,
-        priority,
-    )?;
-    if schedule_encoding_is_valid(&schedule)? {
-        return Ok(schedule);
-    }
-    tracing::info!(
-        transfers = pending.len(),
-        "retrying exchange schedule with incremental instruction-alignment validation"
-    );
-    let started = std::time::Instant::now();
-    let result = materialize_greedy_schedule_impl(
-        topology,
-        problem,
-        incoming_bases,
-        receive_counts,
-        true,
-        priority,
-    );
-    tracing::info!(
-        transfers = pending.len(),
-        elapsed_ms = started.elapsed().as_millis(),
-        success = result.is_ok(),
-        "finished incremental instruction-alignment validation"
-    );
-    result
-}
-
-fn materialize_greedy_schedule_impl(
-    topology: &Topology,
-    problem: &SchedulingProblem<'_>,
-    incoming_bases: &[u32],
-    receive_counts: &[usize],
-    validate_encoding: bool,
-    priority: ExchangeSchedulingPriority,
-) -> Result<MaterializedSchedule, ExchangeLoweringError> {
-    let pending = problem.transfers;
-    let tile_count = problem.tile_count;
-    let mut schedule = MaterializedSchedule::new(tile_count, pending);
-    let mut scheduler = TransferScheduler::with_priority(problem, priority);
-    let mut last_transfer = vec![TilePredecessor::default(); usize::from(tile_count)];
-    while let Some((index, dependency_ready)) = scheduler.next(&schedule.tile_availability) {
-        let completion = schedule.append(
-            topology,
-            pending,
-            incoming_bases,
-            receive_counts,
-            index,
-            dependency_ready,
-            validate_encoding,
-            &mut last_transfer,
-        )?;
-        scheduler.complete(index, completion);
-    }
-    debug_assert!(scheduler.is_complete());
-    schedule.finish_horizon();
-    Ok(schedule)
-}
-
 fn materialize_valid_schedule_order(
     topology: &Topology,
     problem: &SchedulingProblem<'_>,
@@ -2350,10 +2023,6 @@ fn encoded_row_storage(
             let words = row.as_ref().map_or(0, |row| row.words().len());
             (maximum.max(words), total + words)
         }))
-}
-
-fn schedule_score(schedule: &MaterializedSchedule) -> u32 {
-    schedule.horizon
 }
 
 fn endpoint_work_lower_bound(pending: &[PendingTransfer], tile_count: u16) -> u32 {
@@ -2570,6 +2239,3 @@ pub fn inactive_exchange_program() -> Vec<u32> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod heap_bench;

@@ -1,4 +1,4 @@
-use super::order::maximum_ready_matching;
+use super::matching::maximum_ready_matching;
 use super::*;
 use crate::estimate::Ipu21CostModel;
 use crate::exchange::diagnostic::sender_address_instruction_groups;
@@ -6,105 +6,6 @@ use crate::exchange::patch_sender_instruction;
 use crate::planner::test_support::lower;
 use crate::{ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles, place};
 use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
-
-#[test]
-fn grouped_ready_queue_matches_eager_priority() {
-    let mut random = fastrand::Rng::with_seed(0x7061697273);
-    for case in 0..16 {
-        let tiles = if case & 4 == 0 { 8 } else { 32 };
-        let transfers = (0..1024)
-            .map(|index| {
-                let source = random.u16(0..tiles);
-                let destination = (source + random.u16(1..tiles)) % tiles;
-                let words = random.u32(1..=512);
-                let source_address = if case % 2 == 0 {
-                    0
-                } else {
-                    0x80000 + random.u32(0..16) * 4096
-                };
-                let destination_address = if case % 2 == 0 {
-                    0x80000 + index * 4096
-                } else {
-                    0x80000 + random.u32(0..16) * 4096
-                };
-                let mut destinations = vec![(destination, destination_address)];
-                if case & 2 != 0 {
-                    let other = (destination + 1) % tiles;
-                    if other != source {
-                        destinations.push((other, destination_address));
-                    }
-                }
-                PendingTransfer {
-                    source,
-                    source_shard: BlockValueId::from_index(u32::from(source)),
-                    source_offset: 0,
-                    source_addresses: vec![source_address],
-                    source_elements: effective_memory_elements(source_address, words),
-                    destinations,
-                    words,
-                    width: ExchangeItemWidth::Word32,
-                    reserved_source: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        let problem = SchedulingProblem::new(&transfers, tiles);
-        for priority in [
-            ExchangeSchedulingPriority::Automatic,
-            ExchangeSchedulingPriority::Combined,
-            ExchangeSchedulingPriority::Directional,
-            ExchangeSchedulingPriority::RemainingCombined,
-            ExchangeSchedulingPriority::RemainingDirectional,
-        ] {
-            let mut grouped = TransferScheduler::with_priority(&problem, priority);
-            assert!(!grouped.ready_groups.is_empty());
-            assert!(grouped.ready_groups.len() <= 2 * usize::from(tiles * (tiles - 1)));
-            let mut reference = TransferScheduler::with_priority(&problem, priority);
-            reference.ready = std::mem::take(&mut reference.ready_groups)
-                .into_iter()
-                .flatten()
-                .collect();
-            reference.transfer_group.clear();
-            let mut availability = vec![TileAvailability::default(); usize::from(tiles)];
-            while let Some(actual) = grouped.next(&availability) {
-                let expected = reference
-                    .ready
-                    .iter()
-                    .map(|&entry| reference.refresh(entry, &availability))
-                    .max()
-                    .unwrap();
-                assert_eq!(
-                    actual,
-                    (
-                        expected.index.0,
-                        reference.dependency_ready[expected.index.0]
-                    )
-                );
-                reference
-                    .ready
-                    .retain(|entry| entry.index != expected.index);
-                let (index, dependency) = actual;
-                let transfer = &transfers[index];
-                let source = usize::from(transfer.source);
-                let completion = transfer
-                    .destinations
-                    .iter()
-                    .map(|&(tile, _)| availability[usize::from(tile)].receive)
-                    .chain([availability[source].send, dependency])
-                    .max()
-                    .unwrap()
-                    + transfer.words;
-                availability[source].send = completion;
-                for &(tile, _) in &transfer.destinations {
-                    availability[usize::from(tile)].receive = completion;
-                }
-                grouped.complete(index, completion);
-                reference.complete(index, completion);
-            }
-            assert!(grouped.is_complete());
-            assert!(reference.is_complete());
-        }
-    }
-}
 
 #[test]
 fn loopback_packet_boundaries_preserve_repeat_sources() {
@@ -351,14 +252,11 @@ fn randomized_matching_wave_orders_preserve_memory_dependencies() {
         };
         let pending = pending_from_problem(tile_count, &problem).unwrap();
         let incumbent = (0..pending.len()).collect::<Vec<_>>();
-        let order = point_to_point_matching_wave_order(
-            &SchedulingProblem::new(&pending, tile_count),
-            &incumbent,
-        )
-        .expect("balanced point-to-point phases have a matching-wave candidate");
+        let order = matching::order(&SchedulingProblem::new(&pending, tile_count), &incumbent)
+            .expect("balanced point-to-point phases have a matching-wave candidate");
         assert_eq!(
             Some(order.clone()),
-            order::reference_matching_wave_order(
+            matching::reference_matching_wave_order(
                 &SchedulingProblem::new(&pending, tile_count),
                 &incumbent
             )
@@ -484,7 +382,7 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
         let pending = pending_from_problem(tile_count, &problem).unwrap();
         let (receive_counts, incoming_bases) = receive_configuration(&pending, tile_count).unwrap();
         let scheduling = SchedulingProblem::new(&pending, tile_count);
-        let baseline = replay::materialize_stream_schedule(
+        let baseline = streams::schedule(
             &topology,
             &scheduling,
             &incoming_bases,
@@ -493,12 +391,13 @@ fn randomized_captured_schedule_replays_are_deterministic_and_valid() {
             true,
         )
         .unwrap();
-        let optimized = replay::balanced_stream_schedule(
+        let optimized = optimize_pending_schedule(
             &topology,
-            &scheduling,
+            &pending,
             &incoming_bases,
             &receive_counts,
-            64,
+            tile_count,
+            std::num::NonZeroU32::new(64),
         )
         .unwrap();
         let (maximum, total) = encoded_row_storage(&baseline).unwrap();
@@ -694,137 +593,6 @@ fn randomized_eligible_physical_pairs_use_double_width_transfers() {
                     .unwrap()[0]
                     .is_none()
             );
-        }
-    }
-}
-
-#[test]
-fn randomized_transfer_schedules_preserve_hazards_without_same_role_overlap() {
-    let mut random = fastrand::Rng::with_seed(0x736c_6f74);
-    for _ in 0..64 {
-        let tile_count = random.u16(2..=32);
-        let transfer_count = random.usize(1..=256);
-        let transfers = (0..transfer_count)
-            .map(|_| {
-                let source = random.u16(0..tile_count);
-                let receiver_count = random.usize(1..=usize::from(tile_count.min(8) - 1));
-                let mut receivers = Vec::with_capacity(receiver_count);
-                while receivers.len() != receiver_count {
-                    let tile = random.u16(0..tile_count);
-                    if tile != source && !receivers.contains(&tile) {
-                        receivers.push(tile);
-                    }
-                }
-                let words = random.u32(1..=MAX_TRANSFER_WORDS);
-                PendingTransfer {
-                    source,
-                    source_shard: BlockValueId::from_index(u32::from(source)),
-                    source_offset: 0,
-                    destinations: receivers.into_iter().map(|tile| (tile, 0)).collect(),
-                    source_addresses: vec![0],
-                    source_elements: effective_memory_elements(0, words),
-                    words,
-                    width: ExchangeItemWidth::Word32,
-                    reserved_source: None,
-                }
-            })
-            .collect::<Vec<_>>();
-        let dependencies = memory_dependencies(&transfers, tile_count);
-        let problem = SchedulingProblem::new(&transfers, tile_count);
-        let mut scheduler = TransferScheduler::new(&problem);
-        let mut availability = vec![TileAvailability::default(); usize::from(tile_count)];
-        let mut occurrences = vec![0u8; transfers.len()];
-        let mut intervals = vec![(0u32, 0u32); transfers.len()];
-        while let Some((index, dependency_ready)) = scheduler.next(&availability) {
-            occurrences[index] += 1;
-            let transfer = &transfers[index];
-            let start = std::iter::once(dependency_ready)
-                .chain(std::iter::once(
-                    availability[usize::from(transfer.source)].send,
-                ))
-                .chain(
-                    transfer
-                        .destinations
-                        .iter()
-                        .map(|&(tile, _)| availability[usize::from(tile)].receive),
-                )
-                .max()
-                .unwrap_or(0);
-            let end = start.saturating_add(transfers[index].words);
-            intervals[index] = (start, end);
-            availability[usize::from(transfer.source)].send = end;
-            for &(tile, _) in &transfer.destinations {
-                availability[usize::from(tile)].receive = end;
-            }
-            scheduler.complete(index, end);
-        }
-        assert!(scheduler.is_complete());
-        assert!(occurrences.into_iter().all(|count| count == 1));
-        for &(before, after) in &dependencies {
-            assert!(intervals[before].1 <= intervals[after].0);
-        }
-        for tile in 0..tile_count {
-            let mut send_intervals = transfers
-                .iter()
-                .enumerate()
-                .filter(|(_, transfer)| transfer.source == tile)
-                .map(|(index, _)| intervals[index])
-                .collect::<Vec<_>>();
-            send_intervals.sort_unstable();
-            assert!(send_intervals.windows(2).all(|pair| pair[0].1 <= pair[1].0));
-            let mut receive_intervals = transfers
-                .iter()
-                .enumerate()
-                .filter(|(_, transfer)| {
-                    transfer
-                        .destinations
-                        .iter()
-                        .any(|&(destination, _)| destination == tile)
-                })
-                .map(|(index, _)| intervals[index])
-                .collect::<Vec<_>>();
-            receive_intervals.sort_unstable();
-            assert!(
-                receive_intervals
-                    .windows(2)
-                    .all(|pair| pair[0].1 <= pair[1].0)
-            );
-        }
-
-        let mut incumbent = MaterializedSchedule::new(tile_count, &transfers);
-        incumbent.order.extend(0..transfers.len());
-        let mut last_transfer = vec![None; usize::from(tile_count)];
-        for (index, transfer) in transfers.iter().enumerate() {
-            let predecessor = transfer
-                .tiles()
-                .filter_map(|tile| last_transfer[usize::from(tile)])
-                .max();
-            for tile in transfer.tiles() {
-                last_transfer[usize::from(tile)] = Some(index);
-            }
-            incumbent.timings[index] = Some(MaterializedTiming {
-                end: index as u32 + 1,
-                predecessor,
-            });
-        }
-        let repaired = critical_neighborhood_order(
-            &SchedulingProblem::new(&transfers, tile_count),
-            &incumbent,
-            true,
-        )
-        .unwrap();
-        let mut repaired_positions = vec![usize::MAX; transfers.len()];
-        for (position, &index) in repaired.iter().enumerate() {
-            assert_eq!(repaired_positions[index], usize::MAX);
-            repaired_positions[index] = position;
-        }
-        assert!(
-            repaired_positions
-                .iter()
-                .all(|position| *position != usize::MAX)
-        );
-        for &(before, after) in &dependencies {
-            assert!(repaired_positions[before] < repaired_positions[after]);
         }
     }
 }
@@ -1236,7 +1004,7 @@ fn compact_streams_order_inputs_before_ready_forwarders() {
     let pending = pending_from_problem(4, &phase).unwrap();
     let problem = SchedulingProblem::new(&pending, 4);
     for balanced in [false, true] {
-        let order = order::stream_wave_order(&problem, 1024, balanced);
+        let order = streams::order(&problem, 1024, balanced);
         assert_eq!(order.last(), Some(&2));
     }
 }
