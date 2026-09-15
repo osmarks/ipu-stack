@@ -185,8 +185,7 @@ fn fuse_region(
     changed | super::output_fusion::fuse(operations, values, required)
 }
 
-// Shared with the optimistic regional search: known fusion is not a missing kernel.
-pub(crate) fn compatible_fusion(
+fn compatible_fusion(
     kernel: &TileKernelSpec,
     left: &TensorType,
     right: &TensorType,

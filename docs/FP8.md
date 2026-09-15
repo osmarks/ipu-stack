@@ -203,7 +203,7 @@ row strides, combining row-major packing and conversion without an F16 staging
 allocation. The same primitive cost is used for conversion selection and compact
 mid costing; combined casting does not get charged a packing scratch buffer.
 Transposed AMP and block-major row-major cast/pack kernels are still separate
-missing capabilities, as shown by the optimistic diagnostic.
+missing capabilities.
 
 The linear F16-to-FP8 loop now has the SDK's two-bundle software pipeline:
 `ld64step` paired with `f16v8tof8`, then `ldst64pace`. A prologue/epilogue handles

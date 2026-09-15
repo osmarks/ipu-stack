@@ -330,8 +330,7 @@ Build inventory and final emission consume that same description. The former
 ABI lookup, symbolic scalar-getter list and specialization reconstruction are
 removed. Fixed entry points and parameterized implementations use one identity
 enum; there is no unspecified specialization for another pass to discover.
-FP8 output epilogues share their contract with mid fusion, and optimistic cast
-and packing queries use their families' capabilities. Local byte copies bind
+FP8 output epilogues share their contract with mid fusion. Local byte copies bind
 through [kernel/copy.rs](../crates/ipu-codegen/src/kernel/copy.rs): movement
 construction supplies the byte geometry, and `CopyRun` checks its ranges and
 selects the helper before append. Placement, costing, runtime symbol retention

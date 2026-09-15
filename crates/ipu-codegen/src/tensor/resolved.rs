@@ -57,6 +57,7 @@ pub(crate) struct ResolvedLayout {
     pub(crate) padded_shape: TensorShape,
     shape: TensorShape,
     tile_count: u16,
+    #[cfg(test)]
     replicas: u16,
     // Linear ownership can span several row fragments per tile, so it has no
     // independent axis partitions. Expand it only when concrete shards are needed.
@@ -112,6 +113,7 @@ impl Layout {
             padded_shape,
             shape: shape.clone(),
             tile_count: self.tiling.tile_count,
+            #[cfg(test)]
             replicas: self.tiling.replicas,
             linear_grain,
             axes,
@@ -132,6 +134,7 @@ impl ResolvedLayout {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn physical_elements(&self) -> u64 {
         if self.linear_grain.is_some() {
             return self.shape.elements();

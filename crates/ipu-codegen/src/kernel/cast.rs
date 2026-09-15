@@ -4,8 +4,7 @@
 
 use super::*;
 
-/// Cast format support is shared with optimistic planning. Packed FP16-to-FP8
-/// calls also carry the readable prefix and physical row bounds used by the
+/// Packed FP16-to-FP8 calls carry the readable prefix and physical row bounds used by the
 /// assembly loops, without a separate scalar getter recipe.
 pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     run.check_arity(1, 1)?;

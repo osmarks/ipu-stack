@@ -9,7 +9,7 @@ pub(crate) mod cast;
 pub(crate) mod cast_order;
 mod compute;
 mod copy;
-pub(crate) mod elementwise;
+mod elementwise;
 mod fragment;
 mod grouping;
 mod output_fusion;

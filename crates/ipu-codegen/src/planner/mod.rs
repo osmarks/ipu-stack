@@ -12,7 +12,6 @@ pub(crate) mod fragments;
 mod gemm;
 mod layernorm;
 pub(crate) mod operator;
-pub mod optimistic;
 mod parameter_homes;
 mod proposals;
 mod recipe;

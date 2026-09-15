@@ -66,8 +66,6 @@ requested features and measured improvements.
 * FP8 cast orders, distributed packing and producer fusions represent different
   data-movement choices, not interchangeable wrappers. Their code paths and
   numerical kernels have specific shape/precision contracts and measurements.
-  The standalone optimistic-layout search remains diagnostic; it does not
-  silently promise nonexistent kernels to production planning.
 * Padding-removal restrictions around mixed precisions, attention scratch and
   Repeat aliases are conservative correctness rules. Replacing those with
   precise range/version analysis would be new compiler functionality, not a

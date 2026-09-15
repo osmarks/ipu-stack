@@ -531,7 +531,6 @@ pub mod kernel;
 mod low;
 mod memory;
 mod mid;
-pub use planner::optimistic;
 mod package;
 mod place;
 mod planner;
