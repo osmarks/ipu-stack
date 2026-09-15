@@ -2,8 +2,8 @@
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
 use crate::mid::MidOperationKind;
 
-use crate::low::CopyPolicy;
 use crate::mid::{CoordinateMapping, MidOperation, MidValue, MidValueId, OperandIndexing};
+use crate::CopyPolicy;
 use crate::tensor::{ElementOrder, Padding, Precision, TensorAxis, TensorType};
 use std::collections::{BTreeMap, BTreeSet};
 

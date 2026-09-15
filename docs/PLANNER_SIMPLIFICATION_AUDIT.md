@@ -229,7 +229,7 @@ operations should use the same mechanism.
 
 ### Normalize GEMM plans
 
-GEMM precision and blocking currently appear in `MidOperator`,
+GEMM precision and blocking currently appear in `OperatorFamily`,
 `OperatorDispatch`, two `TileKernelSpec` values, and operand layouts. Candidate
 generation mutates these copies together and relies on a large validator to
 reject inconsistent combinations.

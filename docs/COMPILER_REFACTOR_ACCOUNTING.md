@@ -1,7 +1,6 @@
 # Compiler refactor: growth and representation ledger
 
 Audited on 2026-09-15, comparing **`1501698` → `b3b1bcd1`**.
-This is an accounting record, not a declaration that the refactor is complete or that every addition is justified.
 
 ## Totals and scope
 
@@ -15,9 +14,6 @@ This is an accounting record, not a declaration that the refactor is complete or
 - Other pre-cleanup commits removed **640**, leaving **+2,668** at the peak.
 - Seven subsequent cleanup commits removed **1,083**, leaving **+1,585**.
 - The five named-work/scoped-choice commits alone added **1,230** before cleanup. They expanded the decision representation and its supporting machinery, rather than merely relocating existing code.
-
-The same AST-based counter excludes comments, `cfg(test)` items, test/bench files and the `ipu-tests` benchmark crate. It includes Rust and device assembly/C++/header/definition sources; it does not count documentation or HTML/JS. These are the previously reported non-test figures, not raw `git diff --stat` lines.
-File moves contribute zero when their contents are unchanged. The columns below are **historical commit deltas**, not independent estimates of how much each feature costs today: subsequent commits touch overlapping code. Summing only growth rows would overstate the current increase.
 
 ## Every commit with positive net growth
 
@@ -48,11 +44,8 @@ File moves contribute zero when their contents are unchanged. The columns below 
 | `22c5a08e` | +28 | **Retain concrete views in low value bindings.** `TileGraphBuilder.logical_values`, concrete `bindings`/`value_views`, and `DiagnosticShard.view`. Replaced canonical shard-ID bindings plus the separate borrowed-view repair map. |
 | `7955237e` | +47 | **Centralize storage binding and alias-aware copy checks.** `BoundView { shard, extents, backing }`, `StorageAccess { alignment, access_tail_bytes }`, `AddressError`; shared root/origin/access binding. `StorageAccess` replaces placement `Requirement` and fields formerly embedded in `KernelAccess`. |
 | `6b41664a` | +136 | **Bind local copy helpers before they enter low.** `CopyKernel` and `CopyRun { movement, kernel, access }`; low stores checked copies. Replaces late helper selection but adds retained binding/access state and rebinding during coalescing. |
-| `9756530f` | +104 | **Measure warm expansion and retained geometry cache payload.** Warm expansion measurements, process-memory snapshots and retained-cache-size accounting. `ExpansionBenchmark.warm`, `ExpansionTiming.process_memory`; cache statistics have since moved to `GeometryCacheStats`/`CacheStats`. |
 
 ## Offsetting reductions
-
-These are needed to reconcile the growth table with the current total. A net-negative change can still introduce a type; those representations are listed below.
 
 | Commit | Net lines | Change |
 | --- | ---: | --- |
@@ -119,7 +112,7 @@ This inventory is against the baseline, with fields from the current tree. It in
 - **[Entry](../crates/ipu-codegen/src/planner/cache.rs)** (alias): `Arc<OnceLock<Option<Arc<MidProgram>>>>`. Internal fragment-cache synchronization/result alias.
 - **[FragmentCache](../crates/ipu-codegen/src/planner/cache.rs)** (struct): `entries: Mutex<HashMap<Key, Entry, FixedState>>`. Replaces the implementation map formerly inside `MemoizedCostModel`.
 - **[FragmentBuilder](../crates/ipu-codegen/src/planner/fragments.rs)** (struct): `program: MidProgram`. Replaces the old family implementation `Builder`; wraps a complete `MidProgram`.
-- **[OperatorFamily](../crates/ipu-codegen/src/planner/operator.rs)** (enum): `Gemm { options: GemmOptions, multiply: Precision, accumulate: AccumulationPrecision }`; `Gelu`; `LayerNorm`; `Add`; `View { 0: AxisFactorView }`; `Slice { 0: crate::graph::AxisSlice }`; `FlashAttention { options: AttentionOptions, accumulate: AccumulationPrecision }`. Renamed `MidOperator`; the compatibility export remains.
+- **[OperatorFamily](../crates/ipu-codegen/src/planner/operator.rs)** (enum): `Gemm { options: GemmOptions, multiply: Precision, accumulate: AccumulationPrecision }`; `Gelu`; `LayerNorm`; `Add`; `View { 0: AxisFactorView }`; `Slice { 0: crate::graph::AxisSlice }`; `FlashAttention { options: AttentionOptions, accumulate: AccumulationPrecision }`. Planner choice type; the old compatibility export has been removed.
 - **[RecipeProposal](../crates/ipu-codegen/src/planner/proposals.rs)** (struct): `recipe: Recipe`; `estimated_cycles: Option<u64>`. Additional named representation; its role is described in the growth table above.
 - **[Map](../crates/ipu-codegen/src/storage/geometry.rs)** (alias): `HashMap<K, V, foldhash::fast::FixedState>`. Internal foldhash map alias.
 - **[GeometryCacheStats](../crates/ipu-codegen/src/storage/geometry.rs)** (struct): `views: CacheStats`; `pairs: CacheStats`; `destinations: CacheStats`. Additional named representation; its role is described in the growth table above.
@@ -162,14 +155,5 @@ This inventory is against the baseline, with fields from the current tree. It in
 - **Expansion diagnostics:** added `ExpansionBenchmark.warm`, `ExpansionTiming.process_memory`, and structured `geometry_cache` statistics; removed the old tuple-shaped cache metrics.
 - **Geometry Memo:** replaces custom bucket/entry bookkeeping with `limit` and mutex-protected map/hit/miss state. Keys and normalized IDs are listed above.
 - **Error enums:** `LayoutError` gained `InvalidTilePermutation`/`InvalidOwnerMap`; `LoweringError` gained unavailable cast/storage-choice and program-error cases. Package/exchange/codegen errors gained target instruction/topology and program/planning conversions. Tile lowering now shares `AddressError`; expansion shares `KernelError`. These are extra validation/error surfaces, not operation capabilities.
-
-## Additions that have already been removed
-
-- Checkpoint migration functions and deferred legacy-choice fields.
-- Preallocated fragment-result bindings, their reconciliation map and synthetic returned-input copies.
-- Per-operation and per-Repeat-region cost annotations.
-- `StorageRequirements`, `OutputAliasing`, input-only fields on result requirements, and the duplicate local-kernel selection inside `OperatorDispatch::Pointwise`.
-- `OperatorPlanError` and temporary planned tensors used only to discard validation errors into a boolean.
-- The old separate expansion/cost geometry caches and cached unit-buffer copy recipes.
 
 The original proposal's long implementation paragraph mixed these transient additions, surviving changes and incomplete work. This ledger replaces that paragraph's accounting role; it does not imply that the remaining organization has passed a structural review.

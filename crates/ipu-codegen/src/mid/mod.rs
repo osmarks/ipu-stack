@@ -18,8 +18,9 @@ mod packing;
 pub(crate) mod rewrite;
 mod validate;
 pub use compute::*;
-pub use copy::CoordinateMapping;
+pub(crate) use copy::default_copy_policy;
 pub(crate) use copy::independent_copy_prefix;
+pub use copy::{CoordinateMapping, CopyPolicy, PackingPolicy};
 pub(crate) use fragment::append_fragment;
 pub use validate::ProgramError;
 
@@ -64,8 +65,8 @@ pub enum MidOperationKind {
     /// compatible storage per tile, but must preserve that layout's interpretation.
     Copy {
         mapping: CoordinateMapping,
-        policy: crate::CopyPolicy,
-        packing: crate::PackingPolicy,
+        policy: CopyPolicy,
+        packing: PackingPolicy,
     },
     /// Physical byte range initialized during tile expansion.
     FillZero {

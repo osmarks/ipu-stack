@@ -213,8 +213,8 @@ fn balanced_offset(loads: &[u64], bytes: &[u64]) -> u16 {
 #[cfg(test)]
 mod tests {
     use crate::graph::{GraphInputKind, ValueId};
-    use crate::low::default_copy_policy;
     use crate::mid::{CoordinateMapping, MidInput, MidOperation, MidProgram};
+    use crate::default_copy_policy;
     use crate::tensor::{MemoryClass, Precision, TensorShape};
 
     use super::*;

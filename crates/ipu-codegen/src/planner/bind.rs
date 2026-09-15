@@ -5,10 +5,10 @@ use crate::estimate::CostModel;
 use crate::graph::{Operation, OperationId, OperationKind, ValueId};
 use crate::mid::MidOperationKind;
 
-use crate::low::default_copy_policy;
 use crate::mid::{
     CoordinateMapping, MidOperation, MidValue, MidValueId, OperandIndexing, cast_order,
 };
+use crate::default_copy_policy;
 
 use crate::planner::cache::FragmentCache;
 use crate::planner::error::{LoweringError, LoweringResult};

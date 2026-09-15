@@ -65,11 +65,7 @@ impl<'a> TransferScheduler<'a> {
             priority => priority,
         };
 
-        let directional = matches!(
-            priority,
-            ExchangeSchedulingPriority::Directional
-                | ExchangeSchedulingPriority::RemainingDirectional
-        );
+        let directional = matches!(priority, ExchangeSchedulingPriority::RemainingDirectional);
         let word_pressure = if directional {
             let mut pressure = vec![0; usize::from(problem.tile_count) * 2];
             for transfer in transfers {
@@ -88,14 +84,11 @@ impl<'a> TransferScheduler<'a> {
             directional_pressure: directional,
             // Both production policies update remaining work. Static pressure
             // remains available for controlled offline comparisons.
-            dynamic_word_pressure: matches!(
-                priority,
-                ExchangeSchedulingPriority::RemainingCombined
-                    | ExchangeSchedulingPriority::RemainingDirectional
-            ) || (priority == ExchangeSchedulingPriority::Combined
-                && transfers
-                    .iter()
-                    .any(|transfer| transfer.destinations.len() > 1)),
+            dynamic_word_pressure: priority == ExchangeSchedulingPriority::RemainingDirectional
+                || (priority == ExchangeSchedulingPriority::Combined
+                    && transfers
+                        .iter()
+                        .any(|transfer| transfer.destinations.len() > 1)),
             dependents: &problem.dependents,
             indegrees: problem.indegrees(),
             dependency_ready: vec![0; transfers.len()],
@@ -390,8 +383,6 @@ mod tests {
             for priority in [
                 ExchangeSchedulingPriority::Automatic,
                 ExchangeSchedulingPriority::Combined,
-                ExchangeSchedulingPriority::Directional,
-                ExchangeSchedulingPriority::RemainingCombined,
                 ExchangeSchedulingPriority::RemainingDirectional,
             ] {
                 let mut grouped = TransferScheduler::with_priority(&problem, priority);
@@ -583,8 +574,6 @@ pub(super) enum ExchangeSchedulingPriority {
     #[default]
     Automatic,
     Combined,
-    Directional,
-    RemainingCombined,
     RemainingDirectional,
     #[cfg(test)]
     Streams(u32),

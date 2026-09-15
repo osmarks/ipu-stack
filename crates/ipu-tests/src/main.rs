@@ -4,7 +4,7 @@ use half::f16;
 use ipu_codegen::{
     AmpOrder, AttentionProducts, AttentionStrategy, AxisFactorView, BlockMajorOrder,
     CompiledPackage, ComputeGraph, DiagnosticTensor, GemmOrientation, GemmPlanConstraint, Layout,
-    MemoryClass, MidOperator, PackageConfig, PipelineConfig, Precision, ReductionStaging,
+    MemoryClass, OperatorFamily, PackageConfig, PipelineConfig, Precision, ReductionStaging,
     TensorFormat, amp_matrix_coordinates, block_major_matrix_coordinates, build_diagnostic_package,
     build_package,
 };
@@ -865,7 +865,7 @@ fn main() -> Result<()> {
             pipeline.operator_candidates.retain(|candidate| {
                 !matches!(
                     candidate.operator(),
-                    MidOperator::Gemm { multiply, .. } if multiply != Precision::F16
+                    OperatorFamily::Gemm { multiply, .. } if multiply != Precision::F16
                 )
             });
             pipeline.profiling = !arguments.no_profile;
@@ -994,7 +994,7 @@ fn main() -> Result<()> {
         }
         pipeline
             .operator_candidates
-            .retain(|candidate| !matches!(candidate.operator(), MidOperator::Gemm { .. }));
+            .retain(|candidate| !matches!(candidate.operator(), OperatorFamily::Gemm { .. }));
         pipeline
             .operator_candidates
             .push(ipu_codegen::OperatorCandidate::fp8_gemm(

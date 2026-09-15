@@ -1,4 +1,6 @@
-When migrating/refactoring something, DO NOT add extra adapters to the old behaviour; fully rewrite dependents. Aim for simplification and code reduction. Code should generally be straight-line and have an obvious hierarchical structure.
+When migrating/refactoring something, DO NOT add extra adapters to the old behaviour; fully rewrite dependents. Do not e.g. rearrange things into callbacks. Why would you do that? Aim for simplification and code reduction. Code should generally be straight-line and have an obvious hierarchical structure. If what I specify has unexpected architectural consequences, tell me before doing it.
+
+Unless they're very complex automations, in which case they should have a dedicated, reviewable script, do edits with your native edit tool and not Python scripts.
 
 # Commit reduction rule
 

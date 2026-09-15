@@ -3,8 +3,8 @@ use crate::estimate::operation_cycles;
 use crate::graph::OperationId;
 use crate::mid::MidOperationKind;
 
-use crate::low::CopyPolicy;
 use crate::mid::{MidOperation, MidValue, MidValueId, OperandIndexing};
+use crate::CopyPolicy;
 use crate::tensor::Precision;
 use std::collections::{BTreeMap, BTreeSet};
 

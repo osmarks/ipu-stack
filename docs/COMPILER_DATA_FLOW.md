@@ -36,8 +36,8 @@ are less clean than their names suggest:
 Selection emits executable family fragments directly into the program. There
 is no `Operator` variant, nested implementation, deferred-input state, or
 resolution pass. Selected family parameters are consumed during construction.
-The public `MidOperator` compatibility name aliases planner's `OperatorFamily`;
-it is not an executable mid node.
+The public planner choice type is `OperatorFamily`; it is not an executable mid
+node.
 Binding validation checks definitions, region scope, arity and alias indices at
 construction and rewrite boundaries. Numerical casts have one compute form;
 coordinate/layout movement has one Copy form with a selected movement policy.

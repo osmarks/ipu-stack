@@ -155,17 +155,10 @@ fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildR
         config.reuse_cast_inputs && !config.diagnostic_checkpoints,
         Arc::clone(&expansions),
     )?;
-    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &expansions)?;
-    if footprint.maximum_transfer_chunks_per_tile > config.exchange_transfer_limit_per_tile {
-        return Err(package::PackageBuildError::ExchangeTransferLimitExceeded {
-            transfers: footprint.maximum_transfer_chunks_per_tile,
-            limit: config.exchange_transfer_limit_per_tile,
-        });
-    }
     let program = crate::low::lower_to_tiles(&expanded, config.diagnostic_checkpoints);
-    drop(expanded);
     let provisional_placement = tracing::info_span!("place_provisional_storage")
         .in_scope(|| -> PackageBuildResult<_> { Ok(crate::place::place(&program)?) })?;
+
     let topology = active_topology(program.tile_count)?;
     let provisional_exchanges = tracing::info_span!("schedule_provisional_exchanges").in_scope(
         || -> PackageBuildResult<_> {
@@ -294,12 +287,10 @@ pub use package::{
 pub use place::profile::render_memory_profile;
 pub(crate) use place::*;
 pub use planner::ReductionStaging;
-pub use supervisor::*;
-// Compatibility name for planner choices; this is not an executable mid node.
-pub use planner::OperatorFamily as MidOperator;
-pub use planner::{GemmOrientation, OperatorCandidate};
+pub use planner::{GemmOrientation, OperatorCandidate, OperatorFamily};
 pub(crate) use storage::*;
 pub use storage::{amp_matrix_coordinates, block_major_matrix_coordinates};
+pub use supervisor::*;
 pub(crate) use tensor::*;
 pub use tensor::{
     AMP_COLUMN_MICRO, AmpOrder, BlockMajorOrder, GridOrder, Layout, MemoryClass, OwnerMap,

@@ -233,8 +233,8 @@ fn may_write_existing_storage(op: &MidOperation) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::graph::{GraphInputKind, ValueId};
-    use crate::low::CopyPolicy;
     use crate::mid::{MidInput, MidRegion, MidRepeat, rewrite};
+    use crate::CopyPolicy;
     use crate::tensor::TensorTiling;
 
     use super::*;

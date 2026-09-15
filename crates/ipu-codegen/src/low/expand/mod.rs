@@ -20,8 +20,8 @@ use crate::storage::ByteSpan;
 use crate::storage::StorageError;
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder, Layout,
-    LayoutError, MemoryClass, MidOperation, MidProgram, MidRepeat, MidValueId, Precision,
-    ShardExtent, TensorTiling, TensorType,
+    LayoutError, MemoryClass, MidOperation, MidProgram, MidRepeat, MidValueId, PackingPolicy,
+    Precision, ShardExtent, TensorTiling, TensorType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

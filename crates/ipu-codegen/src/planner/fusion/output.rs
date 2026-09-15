@@ -1,10 +1,10 @@
 //! Choose supported producer epilogues before or after redistribution.
 use super::rewrite::{apply_edits, producer_through_copies, same_storage};
-use crate::low::CopyPolicy;
 use crate::mid::MidOperationKind;
 use crate::mid::{
     CoordinateMapping, MidOperation, MidValue, MidValueId, OperandIndexing, cast_order,
 };
+use crate::CopyPolicy;
 use crate::tensor::{ElementOrder, TensorFormat};
 use std::collections::{BTreeMap, BTreeSet};
 

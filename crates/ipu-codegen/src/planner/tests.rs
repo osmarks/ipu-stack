@@ -1,12 +1,12 @@
 use crate::estimate::{CostModel, Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
 use crate::graph::{ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId};
 use crate::kernel::AccumulationPrecision;
-use crate::low::CopyPolicy;
 use crate::mid::MidOperationKind;
 use crate::mid::{
     CoordinateMapping, MidInput, MidOperation, MidProgram, MidValue, MidValueId, cast_order,
     expand_tiles,
 };
+use crate::CopyPolicy;
 use crate::planner::cache::FragmentCache;
 use crate::planner::candidates::{
     CandidateSearch, OutputDemand, OutputDemands, PlanMetrics, gemm_plan_matches,

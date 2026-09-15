@@ -234,7 +234,7 @@ pub(crate) fn configure(
     path: &Path,
 ) -> Result<()> {
     use ipu_codegen::{
-        MidOperator, Operation, OperationKind, OperatorCandidate, Precision, ValueId,
+        Operation, OperationKind, OperatorCandidate, OperatorFamily, Precision, ValueId,
     };
     let report: Value = serde_json::from_slice(&fs::read(path)?)?;
     ensure!(
@@ -330,7 +330,7 @@ pub(crate) fn configure(
     )?;
     pipeline
         .operator_candidates
-        .retain(|c| !matches!(c.operator(), MidOperator::Gemm { .. }));
+        .retain(|c| !matches!(c.operator(), OperatorFamily::Gemm { .. }));
     pipeline
         .operator_candidates
         .push(OperatorCandidate::parallel_gemm(pipeline.tile_count));

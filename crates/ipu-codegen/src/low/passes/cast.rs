@@ -138,8 +138,8 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
 #[cfg(test)]
 mod tests {
     use crate::graph::{GraphInputKind, ValueId};
-    use crate::low::CopyPolicy;
     use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat};
+    use crate::CopyPolicy;
     use crate::tensor::{AmpOrder, ElementOrder, Layout, TensorTiling, TensorType};
 
     use super::*;

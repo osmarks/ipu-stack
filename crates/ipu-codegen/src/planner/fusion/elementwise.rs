@@ -182,12 +182,12 @@ mod tests {
     use crate::PipelineConfig;
     use crate::estimate::Ipu21CostModel;
     use crate::graph::{ComputeGraph, GraphInputKind, ValueId};
-    use crate::low::CopyPolicy;
     use crate::mid::MidProgram;
     use crate::mid::{CoordinateMapping, MidInput};
     use crate::planner::catalogue::OperatorFormatPolicy;
     use crate::planner::operator::OperatorFamily;
     use crate::planner::test_support::lower;
+    use crate::CopyPolicy;
     use crate::tensor::{
         AmpOrder, AxisTiling, Layout, Padding, TensorAxis, TensorFormat, TensorTiling,
     };

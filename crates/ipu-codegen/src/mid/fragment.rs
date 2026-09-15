@@ -135,8 +135,8 @@ mod tests {
     use super::*;
     use crate::graph::{GraphInputKind, ValueId};
 
-    use crate::low::{CopyPolicy, PackingPolicy};
     use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat, OperandIndexing};
+    use crate::{CopyPolicy, PackingPolicy};
     use crate::tensor::{Layout, Precision, TensorType};
 
     fn id(i: u32) -> MidValueId {

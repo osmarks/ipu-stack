@@ -1,10 +1,67 @@
 //! Coordinate-copy semantics and composition before tile expansion.
 
-use crate::low::CopyPolicy;
 use crate::mid::MidOperationKind;
 use crate::mid::{MidOperation, MidProgram, MidValue, MidValueId};
 use crate::tensor::{AxisFactorView, TensorShape};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Requested realization of a whole-device coordinate copy. Explicit requests
+/// are checked by movement lowering; Automatic selects from the actual geometry.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum CopyPolicy {
+    #[default]
+    Automatic,
+    /// Run a rearrangement kernel on corresponding resident shards.
+    LocalKernel,
+    /// Transfer compatible physical spans directly to their destination.
+    DirectRetile,
+    /// Transfer logical values through row-major staging, then pack locally.
+    StageLogicalThenTransform,
+}
+
+pub(crate) fn default_copy_policy(from: &crate::Layout, to: &crate::Layout) -> CopyPolicy {
+    if from.order == to.order {
+        CopyPolicy::DirectRetile
+    } else {
+        CopyPolicy::StageLogicalThenTransform
+    }
+}
+
+/// Destination preparation for a selected copy. This is separate from its
+/// logical/physical traversal policy; changing it does not change tensor values.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum PackingPolicy {
+    #[default]
+    Automatic,
+    /// Use direct word movement without destination packing scratch.
+    Direct,
+    /// Populate row-major scratch, then pack into the destination.
+    Staged,
+}
 
 /// Map output coordinates back to the source: first add the window offsets,
 /// then apply the optional factor-axis view. Layout/storage order is separate.
