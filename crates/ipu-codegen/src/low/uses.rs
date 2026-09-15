@@ -7,7 +7,8 @@ use super::*;
 
 #[derive(Clone, Default)]
 pub(crate) struct StorageUse {
-    /// Enclosing structural lifetime; usize::MAX retains parameters and outputs.
+    /// Enclosing structural lifetime: inputs start at zero; parameters and
+    /// outputs end at usize::MAX. These endpoints identify external storage.
     pub first: Option<usize>,
     pub last: usize,
     pub last_write: Option<usize>,
@@ -19,8 +20,6 @@ pub(crate) struct StorageUse {
     pub boundary: bool,
     /// Includes possible writes through invariant/carried/iterated bindings.
     pub read_only: bool,
-    /// Graph input or output: donation must preserve the externally visible buffer.
-    pub external: bool,
     /// Copies, exchanges, checkpoints, outputs and opaque Repeat binding reads.
     pub non_kernel_read: bool,
 }
@@ -48,7 +47,6 @@ impl StorageUses {
             for view in program.value_views(input.value) {
                 uses.touch(view.shard, 0, false, false);
                 let allocation = &mut uses.allocations[uses.roots[view.shard.index() as usize]];
-                allocation.external = true;
                 if input.kind == crate::GraphInputKind::Parameter {
                     allocation.last = usize::MAX;
                 }
@@ -59,7 +57,6 @@ impl StorageUses {
         for &output in &program.outputs {
             for view in program.value_views(output) {
                 uses.touch(view.shard, usize::MAX, false, true);
-                uses.allocations[uses.roots[view.shard.index() as usize]].external = true;
             }
         }
         for allocation in &mut uses.allocations {

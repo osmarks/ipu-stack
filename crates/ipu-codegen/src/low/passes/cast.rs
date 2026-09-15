@@ -46,7 +46,8 @@ pub(super) fn donate(program: &mut TileGraph) -> ExpansionResult<()> {
         if from == to
             || uses.allocations[from].aliases != 1
             || uses.allocations[to].aliases != 1
-            || uses.allocations[from].external
+            || uses.allocations[from].first == Some(0)
+            || uses.allocations[from].last == usize::MAX
             || uses.allocations[from].boundary
             || uses.allocations[to].boundary
             || uses.allocations[from].writes == 0

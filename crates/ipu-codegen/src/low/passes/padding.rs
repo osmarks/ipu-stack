@@ -6,7 +6,6 @@
 //! by writes, copies and allocation reuse. This second proof cannot apply to
 //! mixed-precision arenas: finite FP32 bits need not encode finite FP16 values.
 
-use crate::low::storage::storage_root;
 use crate::low::*;
 use crate::mid::MidOperationKind;
 use crate::tensor::{AmpOrder, ElementOrder, Precision};
@@ -18,16 +17,14 @@ use std::collections::BTreeSet;
 pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
     let shards = &program.shards;
     let kernels = &program.kernel_runs;
-    let root = |id| storage_root(shards, id);
-    let mut candidates = BTreeSet::new();
     let uses = crate::low::uses::StorageUses::analyze(program);
+    let root = |id: BlockValueId| uses.roots[id.index() as usize];
+    let mut candidates = vec![false; uses.allocations.len()];
     let mut forbidden = uses
         .allocations
         .iter()
-        .enumerate()
-        .filter(|(_, use_)| use_.non_kernel_read)
-        .map(|(id, _)| BlockValueId::from_index(id as u32))
-        .collect::<BTreeSet<_>>();
+        .map(|use_| use_.non_kernel_read)
+        .collect::<Vec<_>>();
     for run in program.kernel_calls() {
         for view in &run.inputs {
             let block = &shards[view.shard.index() as usize];
@@ -50,16 +47,17 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
                     rows.logical_end == rows.physical_end || (matches!(run.kernel, MidOperationKind::Cast { .. }) && rows.physical_end - rows.start <= u16::MAX.into())
                 });
             if ignores_padding {
-                candidates.insert(root(view.shard));
+                candidates[root(view.shard)] = true;
             } else {
-                forbidden.insert(root(view.shard));
+                forbidden[root(view.shard)] = true;
             }
         }
         if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
-            forbidden.extend(run.outputs.iter().map(|view| root(view.shard)));
+            for view in &run.outputs {
+                forbidden[root(view.shard)] = true;
+            }
         }
     }
-    candidates.retain(|id| !forbidden.contains(id));
     let mut removed = 0;
     let mut keep = |operation: &BlockOperation| {
         if let BlockOperation::Compute { run: id, .. } = operation {
@@ -70,7 +68,8 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
                     padding_only: true,
                     ..
                 }
-            ) && candidates.contains(&root(run.outputs[0].shard))
+            ) && candidates[root(run.outputs[0].shard)]
+                && !forbidden[root(run.outputs[0].shard)]
             {
                 removed += 1;
                 return false;
@@ -91,7 +90,8 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
     {
         return;
     }
-    let root = |id| storage_root(&program.shards, id);
+    let uses = crate::low::uses::StorageUses::analyze(program);
+    let root = |id: BlockValueId| uses.roots[id.index() as usize];
     let mut parameter_storage = program
         .inputs
         .iter()
@@ -104,7 +104,7 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
         })
         .map(root)
         .collect::<BTreeSet<_>>();
-    let mut incoming = std::collections::BTreeMap::<BlockValueId, BTreeSet<BlockValueId>>::new();
+    let mut incoming = std::collections::BTreeMap::<usize, BTreeSet<usize>>::new();
     for operation in program.body.walk() {
         match operation {
             BlockOperation::Copy { copy, .. } => {
@@ -156,15 +156,12 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
             break;
         }
     }
-    let mut candidates = BTreeSet::new();
-    let uses = crate::low::uses::StorageUses::analyze(program);
+    let mut candidates = vec![false; uses.allocations.len()];
     let mut forbidden = uses
         .allocations
         .iter()
-        .enumerate()
-        .filter(|(_, use_)| use_.non_kernel_read)
-        .map(|(id, _)| BlockValueId::from_index(id as u32))
-        .collect::<BTreeSet<_>>();
+        .map(|use_| use_.non_kernel_read)
+        .collect::<Vec<_>>();
     for run in program.kernel_calls() {
         // Parameter packing supplies exact zero coefficients beyond logical K.
         // Only the activation operand can therefore tolerate arbitrary finite K
@@ -174,16 +171,17 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
             && parameter_storage.contains(&root(run.inputs[1].shard));
         for (index, view) in run.inputs.iter().enumerate() {
             if finite_left && index == 0 {
-                candidates.insert(root(view.shard));
+                candidates[root(view.shard)] = true;
             } else {
-                forbidden.insert(root(view.shard));
+                forbidden[root(view.shard)] = true;
             }
         }
         if !matches!(run.kernel, MidOperationKind::FillZero { .. }) {
-            forbidden.extend(run.outputs.iter().map(|output| root(output.shard)));
+            for view in &run.outputs {
+                forbidden[root(view.shard)] = true;
+            }
         }
     }
-    candidates.retain(|shard| !forbidden.contains(shard));
     let shards = &program.shards;
     let kernels = &program.kernel_runs;
     let mut valid_row_ranges = std::collections::BTreeMap::new();
@@ -196,7 +194,8 @@ pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
                 bytes,
                 padding_only: true,
             } = run.kernel
-                && candidates.contains(&storage_root(shards, run.outputs[0].shard))
+                && candidates[root(run.outputs[0].shard)]
+                && !forbidden[root(run.outputs[0].shard)]
             {
                 // Keep discarded row padding zero: arbitrary nonzero rows
                 // could overflow even though their outputs are unobserved.
