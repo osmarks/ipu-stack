@@ -1,4 +1,4 @@
-//! Execute affine packing tasks from exchange-gather.py with production helpers.
+//! Validate contiguous/affine copy helpers, including guards and Repeat pointers.
 use anyhow::{Result, ensure};
 use clap::Parser;
 use ipu_codegen::{
@@ -16,6 +16,14 @@ struct Arguments {
     device: ipu_tests::KernelDeviceOptions,
     #[arg(long)]
     output: PathBuf,
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(2..=8))]
+    word_bytes: u32,
+    #[arg(long)]
+    contiguous: bool,
+    #[arg(long, default_value_t = 1)]
+    repeats: u32,
+    #[arg(long, default_value = "device/static_runtime.S")]
+    runtime_source: PathBuf,
 }
 
 fn number(v: &serde_json::Value, key: &str) -> u32 {
@@ -26,6 +34,15 @@ fn main() -> Result<()> {
     ipu_runtime::init_tracing();
     let args = Arguments::parse();
     fs::create_dir_all(&args.output)?;
+    ensure!(
+        [2, 4, 8].contains(&args.word_bytes),
+        "word width must be 2, 4 or 8 bytes"
+    );
+    ensure!(args.repeats != 0, "Repeat count must be positive");
+    ensure!(
+        args.contiguous || args.word_bytes != 2,
+        "no strided halfword helper"
+    );
     let cases: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(&args.tasks)?)?;
     ensure!(cases.len() <= 1472, "too many cases");
     let mut programs = Vec::new();
@@ -34,6 +51,7 @@ fn main() -> Result<()> {
     let mut expected = Vec::new();
     for (tile, case) in cases.iter().enumerate() {
         let bytes = number(case, "bytes") as usize;
+        let repeat_stride = case["repeat_stride"].as_u64().unwrap_or(0) as u32;
         // Isolate packing from model placement: preserve standard/interleaved
         // classes, using fixture ranges clear of host exchange support.
         let input_address = 0x60000;
@@ -58,50 +76,105 @@ fn main() -> Result<()> {
             let ss = number(task, "source_stride");
             let ds = number(task, "destination_stride");
             ensure!(
-                [source, destination, size, ss, ds]
+                [source, destination, size, ss, ds, repeat_stride]
                     .iter()
-                    .all(|x| x % 8 == 0),
+                    .all(|x| x % args.word_bytes == 0),
                 "unaligned task"
             );
-            for row in 0..rows {
-                let a = (source + row * ss) as usize;
-                let b = (destination + row * ds) as usize;
+            ensure!(rows != 0 && size != 0, "empty task");
+            if args.contiguous {
                 ensure!(
-                    a + size as usize <= bytes && b + size as usize <= bytes,
-                    "out of bounds task"
+                    rows == 1 || (ss == size && ds == size),
+                    "noncontiguous task"
                 );
-                ensure!(
-                    covered[b..b + size as usize].iter().all(|x| !x),
-                    "overlapping tasks"
-                );
-                covered[b..b + size as usize].fill(true);
-                output[b..b + size as usize].copy_from_slice(&input[a..a + size as usize]);
             }
+            for iteration in 0..args.repeats {
+                for row in 0..rows {
+                    let a = (source + row * ss + iteration * repeat_stride) as usize;
+                    let b = (destination + row * ds + iteration * repeat_stride) as usize;
+                    ensure!(
+                        a + size as usize <= bytes && b + size as usize <= bytes,
+                        "out of bounds task"
+                    );
+                    ensure!(
+                        (iteration != 0 && repeat_stride == 0)
+                            || covered[b..b + size as usize].iter().all(|x| !x),
+                        "overlapping tasks"
+                    );
+                    covered[b..b + size as usize].fill(true);
+                    output[b..b + size as usize].copy_from_slice(&input[a..a + size as usize]);
+                }
+            }
+            let words = rows * size / args.word_bytes;
+            let (symbol, arguments) = match (args.contiguous, args.word_bytes) {
+                (true, 2) => (ipu_codegen::COPY_U16_SYMBOL, vec![words]),
+                (true, 4) => (ipu_codegen::COPY_U32_SYMBOL, vec![words]),
+                (true, 8) => (ipu_codegen::COPY_U64_SYMBOL, vec![words / 6, words % 6]),
+                (false, 4) => (
+                    ipu_codegen::COPY_STRIDED_U32_SYMBOL,
+                    vec![size / 4, rows, ss, ds],
+                ),
+                (false, 8) => (
+                    ipu_codegen::COPY_STRIDED_U64_SYMBOL,
+                    vec![size / 8, rows, ss, ds],
+                ),
+                _ => unreachable!(),
+            };
+            let address = |pointer, base, offset| {
+                if args.repeats > 1 {
+                    TileAddress::RepeatPointer {
+                        index: pointer,
+                        offset: offset as i32,
+                    }
+                } else {
+                    TileAddress::Absolute(base + offset)
+                }
+            };
             steps.push(TileStep::Compute(ComputeStep {
-                symbol: ipu_codegen::COPY_STRIDED_U64_SYMBOL.into(),
-                output_address: TileAddress::Absolute(output_address + destination),
-                input_addresses: vec![TileAddress::Absolute(input_address + source)],
-                arguments: vec![size / 8, rows, ss, ds],
+                symbol: symbol.into(),
+                output_address: address(1, output_address, destination),
+                input_addresses: vec![address(0, input_address, source)],
+                arguments,
                 profile: StepProfile {
-                    before: (index == 0).then_some(0x7f000),
-                    after: (index + 1 == tasks.len()).then_some(0x7f004),
+                    before: (args.repeats == 1 && index == 0).then_some(0x7f000),
+                    after: (args.repeats == 1 && index + 1 == tasks.len()).then_some(0x7f004),
                 },
             }));
         }
-        for (address, bytes) in [(input_address, input), (output_address, vec![0xcd; bytes])] {
+        if args.repeats > 1 {
+            steps = vec![TileStep::Repeat(ipu_codegen::RepeatStep {
+                count: args.repeats,
+                iterated_pointers: [input_address, output_address]
+                    .into_iter()
+                    .map(|initial_address| ipu_codegen::RepeatPointer {
+                        initial_address,
+                        stride_bytes: repeat_stride,
+                    })
+                    .collect(),
+                body: steps,
+                profile: StepProfile {
+                    before: Some(0x7f000),
+                    after: Some(0x7f004),
+                },
+            })];
+        }
+        for (address, initial, result) in [
+            (input_address, input.clone(), input),
+            (output_address, vec![0xcd; bytes], output),
+        ] {
             data.push(TileProgramData {
                 tile: tile as u16,
                 address,
-                data: bytes,
+                data: initial,
             });
+            slices.push(RegionSlice {
+                tile: u32::from(ipu_target::c600::logical_to_physical(tile as u16)),
+                tile_address: address,
+                file_offset: expected.len() as u64,
+                size: bytes as u64,
+            });
+            expected.extend(result);
         }
-        slices.push(RegionSlice {
-            tile: u32::from(ipu_target::c600::logical_to_physical(tile as u16)),
-            tile_address: output_address,
-            file_offset: expected.len() as u64,
-            size: bytes as u64,
-        });
-        expected.extend(output);
         programs.push(TileProgram {
             tile: tile as u16,
             steps,
@@ -121,7 +194,7 @@ fn main() -> Result<()> {
         &data,
         &outputs,
         &Toolchain::from_sdk(&args.device.sdk),
-        &PathBuf::from("device/static_runtime.S"),
+        &args.runtime_source,
     )?;
     let device = ipu_tests::KernelDevice::load(&args.device, &application)?;
     let runtime = device.runtime();

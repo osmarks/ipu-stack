@@ -397,6 +397,14 @@ alias chain so a Repeat override on an intermediate argument takes precedence
 over a more distant backing value. Kernel calls, local copies and exchange-base
 setup use that resolution with their selected byte offset.
 
+Runtime copy helpers take ordinary source/destination/count arguments, including
+halfword copies. The old halfword inline-address table and its special batching
+path in the general emitter are removed. The emitter only constructed that table
+for calls copying a single halfword between absolute addresses; it disagreed
+with the copy selector's advertised support for longer and Repeat-relative
+copies. The hardware copy checker covers both forms, alignment combinations and
+untouched source/destination bytes.
+
 ## What each later representation is for
 
 - `KernelRun` retains checked relative views, kernel specification and shared

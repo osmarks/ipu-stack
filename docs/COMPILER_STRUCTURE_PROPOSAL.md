@@ -134,8 +134,10 @@ format/strides with its allocation root and signed origin; kernels, copies,
 exchange expansion and detailed costing share it. Copy reordering observes
 backing identity, and dependency checks compare translated byte ranges. Placed
 address binding also belongs to low storage, retaining intermediate Repeat
-overrides through alias chains. Local-copy helper binding, remaining movement
-policies and cache consolidation are still unfinished.
+overrides through alias chains. Halfword copies now use an ordinary callable
+ABI, removing the emitter's inline-address table exception and supporting both
+multi-element and Repeat-relative calls. Local-copy helper binding, remaining
+movement policies and cache consolidation are still unfinished.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

@@ -443,53 +443,7 @@ fn emit_steps(
     profile_enabled_slot: Option<u16>,
     code_address: u32,
 ) -> Result<()> {
-    let mut index = 0;
-    while index < steps.len() {
-        let step = &steps[index];
-        if let TileStep::Compute(compute) = step
-            && compute.symbol == COPY_U16_SYMBOL
-            && let Some((source, destination)) = absolute_u16_copy(compute)
-        {
-            if let Some(address) = compute.profile.before {
-                emit_cycle_sample_at(code, symbols, address, profile_enabled_slot, code_address)?;
-            }
-            let mut copies = vec![(source, destination)];
-            let mut end = index + 1;
-            while end < steps.len()
-                && step_compute_profile(&steps[end - 1])
-                    .is_none_or(|profile| profile.after.is_none())
-            {
-                let TileStep::Compute(next) = &steps[end] else {
-                    break;
-                };
-                if next.symbol != COPY_U16_SYMBOL || next.profile.before.is_some() {
-                    break;
-                }
-                let Some(copy) = absolute_u16_copy(next) else {
-                    break;
-                };
-                copies.push(copy);
-                end += 1;
-                if next.profile.after.is_some() {
-                    break;
-                }
-            }
-            code.setzi(
-                4,
-                u32::try_from(copies.len())
-                    .map_err(|_| invalid("halfword copy table is too large"))?,
-            )?;
-            code.call(symbol(symbols, COPY_U16_SYMBOL)?, 10)?;
-            for (source, destination) in copies {
-                code.instruction(source);
-                code.instruction(destination);
-            }
-            if let Some(address) = step_compute_profile(&steps[end - 1]).and_then(|p| p.after) {
-                emit_cycle_sample_at(code, symbols, address, profile_enabled_slot, code_address)?;
-            }
-            index = end;
-            continue;
-        }
+    for step in steps {
         match step {
             TileStep::Exchange(exchange) => {
                 if let Some(address) = exchange.profile.before {
@@ -635,26 +589,8 @@ fn emit_steps(
                 code.instruction(PATCHED_BREAKPOINT_TRAP_BASE | u32::from(checkpoint.breakpoint))
             }
         }
-        index += 1;
     }
     Ok(())
-}
-
-fn absolute_u16_copy(compute: &ComputeStep) -> Option<(u32, u32)> {
-    let [TileAddress::Absolute(source)] = compute.input_addresses.as_slice() else {
-        return None;
-    };
-    let TileAddress::Absolute(destination) = compute.output_address else {
-        return None;
-    };
-    (compute.arguments.as_slice() == [1]).then_some((*source, destination))
-}
-
-fn step_compute_profile(step: &TileStep) -> Option<&StepProfile> {
-    match step {
-        TileStep::Compute(compute) => Some(&compute.profile),
-        TileStep::Exchange(_) | TileStep::Repeat(_) | TileStep::Checkpoint(_) => None,
-    }
 }
 
 fn validate(program: &TileProgram) -> Result<()> {

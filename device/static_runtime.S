@@ -134,8 +134,8 @@ static_copy_u32:
 	.size static_copy_u32, .-static_copy_u32
 
 	.section .text.static_copy_u16,"ax",@progbits
-	// Runtime helper ABI: m4 entry count and m10 points to inline
-	// (source address, destination address) pairs. It returns past the table.
+	// Runtime helper ABI: m2 destination, m3 source, m4 halfword count,
+	// m10 return. Preserve the other half of each touched 32-bit word.
 	.globl static_copy_u16
 	.p2align 2
 	.type static_copy_u16,@function
@@ -143,9 +143,6 @@ static_copy_u16:
 	.supervisor
 	brz $m4, .Lcopy_u16_done
 .Lcopy_u16:
-	ld32 $m3, $m10, $m15, 0
-	ld32 $m2, $m10, $m15, 1
-	add $m10, $m10, 8
 	mov $m6, $m3
 	shr $m6, $m6, 2
 	shl $m6, $m6, 2
@@ -175,6 +172,8 @@ static_copy_u16:
 .Lcopy_u16_store:
 	or $m0, $m0, $m1
 	st32 $m0, $m6, $m15, 0
+	add $m3, $m3, 2
+	add $m2, $m2, 2
 	sub $m4, $m4, 1
 	brnz $m4, .Lcopy_u16
 .Lcopy_u16_done:
