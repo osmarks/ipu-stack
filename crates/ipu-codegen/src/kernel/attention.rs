@@ -4,10 +4,105 @@
 use super::*;
 use crate::ShardView;
 
-pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
-    if run.outputs.len() != 1 {
-        return Err(KernelAbiError::RequirementMismatch);
+/// One contiguous workspace: optional field/component axes surround the
+/// flattened query rows. The same declaration constructs mid tensors and checks
+/// local call geometry; it does not prescribe their physical tile ownership.
+struct RowWorkspace {
+    precision: Precision,
+    leading: Option<u32>,
+    trailing: Option<u32>,
+}
+
+const SOFTMAX_WORKSPACES: [RowWorkspace; 3] = [
+    RowWorkspace {
+        precision: Precision::F32,
+        leading: Some(2),
+        trailing: None,
+    }, // maximum, denominator
+    RowWorkspace {
+        precision: Precision::F32,
+        leading: Some(2),
+        trailing: Some(3),
+    }, // max/sum, segment
+    RowWorkspace {
+        precision: Precision::F16,
+        leading: None,
+        trailing: Some(16),
+    }, // masked FP8 tail
+];
+
+fn softmax_workspace_specs(precision: Precision, masked: bool) -> Option<&'static [RowWorkspace]> {
+    let count = match precision {
+        Precision::F16 => 2,
+        Precision::F8F143 { .. } => 2 + usize::from(masked),
+        _ => return None,
+    };
+    Some(&SOFTMAX_WORKSPACES[..count])
+}
+
+impl RowWorkspace {
+    fn tensor(&self, probabilities: &crate::TensorType) -> Option<crate::TensorType> {
+        let rank = probabilities.shape.0.len();
+        if rank < 2 {
+            return None;
+        }
+        let mut tensor = probabilities.clone();
+        tensor.shape.0 = self
+            .leading
+            .into_iter()
+            .chain(probabilities.shape.0[..rank - 1].iter().copied())
+            .chain(self.trailing)
+            .collect();
+        tensor.format.precision = self.precision;
+        tensor.format.layout.order = ElementOrder::RowMajor;
+        tensor.format.layout.tiling = crate::tensor::project_tiling(probabilities, |axis| {
+            (axis + 1 < rank).then_some(axis + usize::from(self.leading.is_some()))
+        })?;
+        Some(tensor)
     }
+
+    fn accepts(&self, access: &KernelAccess, view: &ShardView, rows: u32) -> bool {
+        if access.format.precision != self.precision
+            || access.format.layout.order != ElementOrder::RowMajor
+        {
+            return false;
+        }
+        let mut dimensions = view.extents.as_slice();
+        if let Some(width) = self.leading {
+            let Some((axis, rest)) = dimensions.split_first() else {
+                return false;
+            };
+            if axis.physical_end - axis.start != width {
+                return false;
+            }
+            dimensions = rest;
+        }
+        if let Some(width) = self.trailing {
+            let Some((axis, rest)) = dimensions.split_last() else {
+                return false;
+            };
+            if axis.physical_end - axis.start != width {
+                return false;
+            }
+            dimensions = rest;
+        }
+        element_count(dimensions) == Ok(rows)
+    }
+}
+
+/// Persistent FP32 statistics and private FP32/F16 work storage. Probability
+/// values contain no state bytes, and merge consumes only the statistics result.
+pub(crate) fn softmax_workspaces(
+    probabilities: &crate::TensorType,
+    masked: bool,
+) -> Option<Vec<crate::TensorType>> {
+    softmax_workspace_specs(probabilities.format.precision, masked)?
+        .iter()
+        .map(|spec| spec.tensor(probabilities))
+        .collect()
+}
+
+pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
     let output = run.requirements.outputs[0].format.precision;
     let (implementation, arguments) = match run.kernel {
         TileKernelSpec::FlashAttention { .. } => {
@@ -31,8 +126,27 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
             key_columns,
             padded_key_columns,
         } => {
-            run.check_arity(1, 1)?;
+            let workspaces = softmax_workspace_specs(output, key_columns != padded_key_columns)
+                .ok_or(KernelAbiError::RequirementMismatch)?;
+            run.check_arity(1, 1 + workspaces.len())?;
             let rows = gemm_rows(run)?;
+            if key_columns == 0
+                || key_columns > padded_key_columns
+                || run.requirements.inputs[0].format.precision != Precision::F16
+                || run.requirements.inputs[0].format.layout.order
+                    != ElementOrder::Amp(AmpOrder::Left)
+                || run.requirements.outputs[0].format.layout.order
+                    != ElementOrder::Amp(AmpOrder::Left)
+                || matrix_extent(&run.outputs[0], false, true)? != padded_key_columns
+                || input_matrix_extent(run, false, true)? != padded_key_columns
+                || element_count(&run.inputs[0].extents[..run.inputs[0].extents.len() - 1])? != rows
+                || workspaces
+                    .iter()
+                    .zip(run.requirements.outputs[1..].iter().zip(&run.outputs[1..]))
+                    .any(|(workspace, (access, view))| !workspace.accepts(access, view, rows))
+            {
+                return Err(KernelAbiError::RequirementMismatch);
+            }
             (
                 KernelImplementation::Softmax(
                     head_dimension,
@@ -54,23 +168,55 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
         TileKernelSpec::AttentionMerge {
             value_dimension,
             padded_value_dimension,
-            key_block_columns,
             initial,
             final_block,
         } => {
             if output != Precision::F32 && !(output == Precision::F16 && final_block) {
                 return Err(KernelAbiError::Unavailable(run.kernel.clone()));
             }
-            run.check_arity(if output == Precision::F16 { 3 } else { 2 }, 1)?;
+            let previous = output == Precision::F16 && !initial;
+            run.check_arity(if previous { 3 } else { 2 }, 1)?;
+            let rows = gemm_rows(run)?;
+            let accumulator_width = value_dimension
+                .checked_add(2)
+                .and_then(|width| width.div_ceil(16).checked_mul(16))
+                .ok_or(KernelAbiError::ElementCountOverflow)?;
+            if value_dimension == 0
+                || value_dimension > padded_value_dimension
+                || run.requirements.inputs[0].format.precision != Precision::F16
+                || run.requirements.inputs[0].format.layout.order
+                    != ElementOrder::Amp(AmpOrder::Left)
+                || input_matrix_extent(run, false, true)? != padded_value_dimension
+                || element_count(&run.inputs[0].extents[..run.inputs[0].extents.len() - 1])? != rows
+                || run.requirements.outputs[0].format.layout.order != ElementOrder::RowMajor
+                || matrix_extent(&run.outputs[0], false, true)?
+                    != if output == Precision::F16 {
+                        padded_value_dimension
+                    } else {
+                        accumulator_width
+                    }
+                || !SOFTMAX_WORKSPACES[0].accepts(&run.requirements.inputs[1], &run.inputs[1], rows)
+                || (previous
+                    && (run.requirements.inputs[2].format.precision != Precision::F32
+                        || run.requirements.inputs[2].format.layout.order
+                            != ElementOrder::RowMajor
+                        || matrix_extent(&run.inputs[2], false, true)? != accumulator_width
+                        || element_count(
+                            &run.inputs[2].extents[..run.inputs[2].extents.len() - 1],
+                        )? != rows))
+            {
+                return Err(KernelAbiError::RequirementMismatch);
+            }
+            // The initial FP16 stage has no previous accumulator. Supply its
+            // unused ABI pointer slot here, without a fabricated mid operand.
+            let arguments = (output == Precision::F16 && initial)
+                .then_some(0)
+                .into_iter()
+                .chain([u32::from(initial), u32::from(final_block), rows])
+                .collect();
             (
-                KernelImplementation::Merge(
-                    value_dimension,
-                    padded_value_dimension,
-                    key_block_columns,
-                    output,
-                    run.requirements.inputs[1].format.precision,
-                ),
-                vec![u32::from(initial), u32::from(final_block), gemm_rows(run)?],
+                KernelImplementation::Merge(value_dimension, padded_value_dimension, output),
+                arguments,
             )
         }
         _ => return Err(KernelAbiError::RequirementMismatch),
@@ -217,26 +363,17 @@ impl KernelBuildPlan {
                     }
                     (name, symbol, "attention_softmax_f16.S", flags)
                 }
-                KernelImplementation::Merge(values, padded, keys, output, weights) => {
+                KernelImplementation::Merge(values, padded, output) => {
                     let suffix = match output {
                         Precision::F16 => "out16",
                         Precision::F32 => "out32",
                         _ => return Err(KernelAbiError::RequirementMismatch),
                     };
-                    let name = format!(
-                        "attention_merge_v{values}_p{padded}_k{keys}_{suffix}{}",
-                        if matches!(weights, Precision::F8F143 { .. }) {
-                            "_p8"
-                        } else {
-                            ""
-                        }
-                    );
+                    let name = format!("attention_merge_v{values}_p{padded}_{suffix}");
                     let symbol = format!("{name}_f16");
                     let flags = vec![
                         format!("-DATTENTION_VALUE_DIMENSION={values}"),
-                        format!("-DATTENTION_WEIGHT_BYTES={}", weights.bytes()),
                         format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded}"),
-                        format!("-DATTENTION_KEY_BLOCK_COLUMNS={keys}"),
                         format!("-DATTENTION_MERGE_SYMBOL={symbol}"),
                         format!(
                             "-DATTENTION_MERGE_OUTPUT_F16={}",

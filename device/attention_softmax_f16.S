@@ -2,12 +2,19 @@
 #include "attention_softmax_fp8.inc"
 #include "attention_softmax_panels.inc"
 
-// AMP-left panel order; FP16/FP8 probabilities with FP32 maxima and sums.
-// m2 weights, m3 scores, m4 query rows, m5 valid keys, m6 split-row flag.
-#if ATTENTION_FULL_BLOCK
-#define SOFTMAX_FRAME_BYTES 12
+// AMP-left probabilities, separate FP32 statistics/reduction workspace, and
+// optional FP16 masked-tail workspace. ABI: m2 probabilities, m3 scores,
+// m4 statistics, m5 reduction workspace, [m6 tail workspace], then rows/keys/mode.
+#if defined(ATTENTION_OUTPUT_F8) && !ATTENTION_FULL_BLOCK
+#define SOFTMAX_FRAME_BYTES 28
+#define SOFTMAX_ROWS $m7
+#define SOFTMAX_KEYS $m8
+#define SOFTMAX_SPLIT $m9
 #else
-#define SOFTMAX_FRAME_BYTES 16
+#define SOFTMAX_FRAME_BYTES 24
+#define SOFTMAX_ROWS $m6
+#define SOFTMAX_KEYS $m7
+#define SOFTMAX_SPLIT $m8
 #endif
 	.section .text.ATTENTION_SOFTMAX_SYMBOL,"ax",@progbits
 	.globl ATTENTION_SOFTMAX_SYMBOL
@@ -15,13 +22,17 @@
 	.type ATTENTION_SOFTMAX_SYMBOL,@function
 ATTENTION_SOFTMAX_SYMBOL:
 	.supervisor
-	// m6 selects the cheaper row schedule, as priced by the host cost model.
-	brz $m6, .Lsoftmax_whole
-	add $m11, $m11, -16
+	add $m11, $m11, -SOFTMAX_FRAME_BYTES
 	st32 $m2, $m11, $m15, 0
 	st32 $m3, $m11, $m15, 1
-	st32 $m4, $m11, $m15, 2
-	st32 $m5, $m11, $m15, 3
+	st32 SOFTMAX_ROWS, $m11, $m15, 2
+	st32 SOFTMAX_KEYS, $m11, $m15, 3
+	st32 $m4, $m11, $m15, 4
+	st32 $m5, $m11, $m15, 5
+#if defined(ATTENTION_OUTPUT_F8) && !ATTENTION_FULL_BLOCK
+	st32 $m6, $m11, $m15, 6
+#endif
+	brz SOFTMAX_SPLIT, .Lsoftmax_whole
 	setzi $m0, .Lsoftmax_split_max
 	runall $m0, $m11, 0
 	sync TEXCH_SYNCZONE_LOCAL
@@ -29,20 +40,10 @@ ATTENTION_SOFTMAX_SYMBOL:
 	runall $m0, $m11, 0
 	sync TEXCH_SYNCZONE_LOCAL
 	setzi $m0, .Lsoftmax_split_sum
-	runall $m0, $m11, 0
-	sync TEXCH_SYNCZONE_LOCAL
-	add $m11, $m11, 16
-	br $m10
+	bri .Lsoftmax_run_last
 .Lsoftmax_whole:
-	.supervisor
-	add $m11, $m11, -SOFTMAX_FRAME_BYTES
-	st32 $m2, $m11, $m15, 0
-	st32 $m3, $m11, $m15, 1
-	st32 $m4, $m11, $m15, 2
-#if !ATTENTION_FULL_BLOCK
-	st32 $m5, $m11, $m15, 3
-#endif
 	setzi $m0, .Lsoftmax_worker
+.Lsoftmax_run_last:
 	runall $m0, $m11, 0
 	sync TEXCH_SYNCZONE_LOCAL
 	add $m11, $m11, SOFTMAX_FRAME_BYTES
@@ -107,11 +108,8 @@ ATTENTION_SOFTMAX_SYMBOL:
 #endif
 	ldconst $a4, ATTENTION_SCALE_BITS
 	f32mul $a7, $a6, $a4
-	// Persistent maxima/denominators follow the packed weight matrix.
-	ld32 $m6, $mvertex_base, $m15, 0
-	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES
-	mul $m0, $m5, $m0
-	add $m6, $m6, $m0
+	// Persistent FP32 maximum and denominator planes.
+	ld32 $m6, $mvertex_base, $m15, 4
 	shl $m0, $m4, 2
 	add $m6, $m6, $m0
 	st32 $a7, $m6, $m15, 0

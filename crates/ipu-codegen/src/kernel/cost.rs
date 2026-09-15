@@ -85,12 +85,12 @@ fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
         return 0;
     }
     let full_panels = keys / 16;
-    let mut row = 31u64
+    let mut row = 28u64
         .saturating_add(2 * u64::from(full_panels != 0))
         .saturating_add(full_panels.saturating_mul(41));
     let launch = if keys == padded_keys {
         row = row.saturating_add(7);
-        216u64
+        222u64
     } else {
         row = row.saturating_add(5 + 6 * u64::from(full_panels != 0));
         let pairs = (keys % 16) / 2;
@@ -110,7 +110,7 @@ fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
 }
 
 // Three local stages: partial maxima, exponentials/partial sums, final sums.
-// A segment has ceil(padded_keys / 48) panels. 130 groups account for each
+// A segment has ceil(padded_keys / 48) panels. 123 groups account for each
 // segment's setup, row-state reductions, and address calculations; 408 cycles
 // cover the launches and 21 groups per final worker wave reduce the sums.
 fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
@@ -120,7 +120,7 @@ fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
     let segment = padded_keys
         .div_ceil(48)
         .saturating_mul(41)
-        .saturating_add(130);
+        .saturating_add(123);
     408u64
         .saturating_add(rows.div_ceil(2).saturating_mul(6).saturating_mul(segment))
         .saturating_add(rows.div_ceil(6).saturating_mul(126))
@@ -173,7 +173,7 @@ pub(crate) fn f16_attention_merge_cycles(
         return 0;
     }
     let panels = values / 16;
-    let row = (if initial { 27u64 } else { 34u64 })
+    let row = (if initial { 24u64 } else { 31u64 })
         .saturating_add(if output_f16 { 3 } else { 0 })
         .saturating_add(u64::from(panels != 0))
         .saturating_add(panels.saturating_mul(3))
@@ -407,21 +407,25 @@ mod tests {
     }
 
     #[test]
-    fn attention_row_models_match_hardware() {
-        for rows in [7, 8] {
-            assert_eq!(f16_softmax_cycles(rows, 64, 64), 2664);
-            assert_eq!(f16_softmax_cycles(rows, 25, 64), 2634);
-            assert_eq!(
-                f16_attention_merge_cycles(rows, 72, true, false, false),
-                2430
-            );
-            assert_eq!(
-                f16_attention_merge_cycles(rows, 72, false, false, false),
-                3378
-            );
-            assert_eq!(
-                f16_attention_merge_cycles(rows, 72, false, true, false),
-                3438
+    fn softmax_estimates_cover_measured_row_schedules() {
+        // IPU21, explicit probability/statistics/scratch buffers in separate
+        // elements, random inputs (typed-attention/softmax-*-random artifacts).
+        // Bank conflicts and worker skew are outside this coarse issue model.
+        for (rows, keys, padded, measured) in [
+            (1, 64, 64, 1422u64),
+            (7, 64, 64, 2640),
+            (8, 64, 64, 3168),
+            (1, 65, 80, 1770),
+            (7, 65, 80, 3330),
+            (8, 65, 80, 3774),
+            (1, 729, 768, 5190),
+            (7, 729, 768, 21456),
+            (8, 729, 768, 22536),
+        ] {
+            let estimated = f16_softmax_cycles(rows, keys, padded);
+            assert!(
+                estimated.abs_diff(measured) <= measured / 5,
+                "rows={rows} keys={keys}: estimated={estimated} measured={measured}"
             );
         }
         assert_eq!(f16_softmax_cycles(0, 64, 64), 0);
@@ -440,8 +444,6 @@ mod tests {
         assert!(!f16_softmax_split_rows(6, 729, 768));
         for rows in [7, 8] {
             assert!(f16_softmax_split_rows(rows, 729, 768));
-            // Uniform-input device measurements: 20,226 / 20,244 cycles.
-            assert_eq!(f16_softmax_cycles(rows, 729, 768), 19_524);
         }
     }
 

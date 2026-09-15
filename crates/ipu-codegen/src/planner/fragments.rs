@@ -81,14 +81,14 @@ pub(crate) fn build_fragment(
             b.emit(
                 "view",
                 vec![MidValueId::from_index(0)],
-                output.clone(),
+                [output.clone()],
                 MidOperationKind::Copy {
                     policy: crate::CopyPolicy::Automatic,
                     packing: crate::PackingPolicy::Automatic,
                     mapping,
                     reuse_local: false,
                 },
-            )
+            )[0]
         }
         OperatorDispatch::BlockedGemm {
             inner_block,
@@ -173,20 +173,23 @@ impl FragmentBuilder {
         &mut self,
         site: impl Into<LocalSite>,
         inputs: Vec<MidValueId>,
-        output: TensorType,
+        outputs: impl IntoIterator<Item = TensorType>,
         kind: MidOperationKind,
-    ) -> MidValueId {
-        let result = self.value(output);
+    ) -> Vec<MidValueId> {
+        let results = outputs
+            .into_iter()
+            .map(|output| self.value(output))
+            .collect::<Vec<_>>();
         self.program.operations.push(MidOperation {
             site: Some(site.into()),
             source: None,
             inputs,
-            results: vec![result],
+            results: results.clone(),
             kind,
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         });
-        result
+        results
     }
 
     pub(super) fn cast(
@@ -245,7 +248,7 @@ impl FragmentBuilder {
         self.emit(
             site,
             vec![input],
-            output,
+            [output],
             MidOperationKind::Copy {
                 policy: crate::CopyPolicy::Automatic,
                 packing: crate::PackingPolicy::Automatic,
@@ -255,7 +258,7 @@ impl FragmentBuilder {
                 },
                 reuse_local,
             },
-        )
+        )[0]
     }
 
     pub(super) fn kernel(
@@ -270,34 +273,36 @@ impl FragmentBuilder {
         self.compute(
             site,
             inputs,
-            output,
+            [(output, reuse)],
             Compute::Kernel {
                 kernel,
                 operands,
                 output_aliases: Vec::new(),
             },
-            reuse,
-        )
+        )[0]
     }
 
     pub(super) fn compute(
         &mut self,
         site: impl Into<LocalSite>,
         mut inputs: Vec<MidValueId>,
-        output: TensorType,
+        outputs: impl IntoIterator<Item = (TensorType, Option<MidValueId>)>,
         mut compute: Compute,
-        reuse: Option<MidValueId>,
-    ) -> MidValueId {
-        if let Some(value) = reuse {
-            let aliases = match &mut compute {
-                Compute::Product(product) => &mut product.output_aliases,
-                Compute::Kernel { output_aliases, .. } => output_aliases,
-                Compute::Sum { .. } => unreachable!("sum output ownership is independent"),
-            };
-            aliases.push((0, inputs.len()));
-            inputs.push(value);
+    ) -> Vec<MidValueId> {
+        let mut types = Vec::new();
+        for (output, reuse) in outputs {
+            if let Some(value) = reuse {
+                let aliases = match &mut compute {
+                    Compute::Product(product) => &mut product.output_aliases,
+                    Compute::Kernel { output_aliases, .. } => output_aliases,
+                    Compute::Sum { .. } => unreachable!("sum output ownership is independent"),
+                };
+                aliases.push((types.len(), inputs.len()));
+                inputs.push(value);
+            }
+            types.push(output);
         }
-        self.emit(site, inputs, output, MidOperationKind::Compute(compute))
+        self.emit(site, inputs, types, MidOperationKind::Compute(compute))
     }
 }
 

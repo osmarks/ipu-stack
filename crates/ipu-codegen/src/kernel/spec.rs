@@ -57,7 +57,6 @@ pub enum TileKernelSpec {
     AttentionMerge {
         value_dimension: u32,
         padded_value_dimension: u32,
-        key_block_columns: u32,
         initial: bool,
         final_block: bool,
     },

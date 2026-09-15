@@ -19,6 +19,7 @@ pub use spec::*;
 mod tests;
 pub(crate) use abi::*;
 use attention::AttentionKernelShape;
+pub(crate) use attention::softmax_workspaces;
 pub(crate) use binding::*;
 pub(crate) use build::*;
 pub(crate) use gemm::gemm_rows;

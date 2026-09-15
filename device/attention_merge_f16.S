@@ -1,9 +1,5 @@
 #include "arch/gc_tile_defines.h"
 
-#ifndef ATTENTION_WEIGHT_BYTES
-#define ATTENTION_WEIGHT_BYTES 2
-#endif
-
 #ifndef ATTENTION_MERGE_OUTPUT_F16
 #define ATTENTION_MERGE_OUTPUT_F16 0
 #endif
@@ -13,12 +9,6 @@
 #endif
 #ifndef ATTENTION_PADDED_VALUE_DIMENSION
 #define ATTENTION_PADDED_VALUE_DIMENSION ATTENTION_VALUE_DIMENSION
-#endif
-#ifndef ATTENTION_KEY_BLOCK_COLUMNS
-#define ATTENTION_KEY_BLOCK_COLUMNS 64
-#endif
-#if ATTENTION_KEY_BLOCK_COLUMNS <= 0 || ATTENTION_KEY_BLOCK_COLUMNS % 16 != 0
-#error "attention key block columns must be a positive multiple of 16"
 #endif
 #if ATTENTION_VALUE_DIMENSION <= 0 || ATTENTION_PADDED_VALUE_DIMENSION < ATTENTION_VALUE_DIMENSION
 #error "attention value dimensions are invalid"
@@ -130,9 +120,6 @@
 	add $m8, $m0, ATTENTION_VALUE_DIMENSION * 4
 #endif
 	ld32 $m4, $mvertex_base, $m15, 2
-	setzi $m2, ATTENTION_KEY_BLOCK_COLUMNS * ATTENTION_WEIGHT_BYTES
-	mul $m2, $m5, $m2
-	add $m4, $m4, $m2
 	shl $m2, $m9, 2
 	add $m4, $m4, $m2
 	ld32 $a0, $m4, $m15, 0

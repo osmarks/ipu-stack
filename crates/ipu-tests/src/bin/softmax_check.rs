@@ -27,8 +27,6 @@ struct Arguments {
     keys: Vec<u32>,
     #[command(flatten)]
     device: ipu_tests::KernelDeviceOptions,
-    #[arg(long)]
-    reference: PathBuf,
     #[arg(long, default_value = "device/attention_softmax_f16.S")]
     kernel: PathBuf,
     #[arg(long, default_value = "artifacts/softmax-upgrade/check")]
@@ -81,7 +79,9 @@ fn main() -> Result<()> {
             keys.div_ceil(if args.fp8_output { 32 } else { 16 })
                 * if args.fp8_output { 32 } else { 16 }
         };
-        for (tag, path) in [("old", &args.reference), ("new", &args.kernel)] {
+        {
+            let tag = "check";
+            let path = &args.kernel;
             for (name, value) in [
                 ("FULL_BLOCK", u32::from(keys == padded).to_string()),
                 ("KEY_BLOCK_COLUMNS", padded.to_string()),
@@ -93,8 +93,8 @@ fn main() -> Result<()> {
             ] {
                 source += &format!("#undef ATTENTION_{name}\n#define ATTENTION_{name} {value}\n");
             }
-            source += "#undef SOFTMAX_FRAME_BYTES\n#undef ATTENTION_OUTPUT_F8\n";
-            if args.fp8_output && tag == "new" {
+            source += "#undef SOFTMAX_FRAME_BYTES\n#undef SOFTMAX_ROWS\n#undef SOFTMAX_KEYS\n#undef SOFTMAX_SPLIT\n#undef ATTENTION_OUTPUT_F8\n";
+            if args.fp8_output {
                 source += "#define ATTENTION_OUTPUT_F8\n#define ATTENTION_OUTPUT_SCALE -4\n";
             }
             source += &softmax_source(path)?
@@ -118,7 +118,6 @@ fn main() -> Result<()> {
                 "test shape exceeds reserved memory"
             );
             let tile = cases.len() as u16;
-            let size = rows * (padded * 2 + 64);
             let mut scores = vec![0x7e00u16; (rows * padded) as usize];
             for r in 0..rows {
                 for k in 0..keys {
@@ -138,36 +137,55 @@ fn main() -> Result<()> {
                 address: 0x88000,
                 data: scores.iter().flat_map(|v| v.to_le_bytes()).collect(),
             });
-            let old = 0x5c008;
-            let new = old + size + 16;
+            // Separate memory elements deliberately rule out hidden adjacency
+            // between probabilities, persistent statistics, and worker scratch.
+            let probability = 0x6c008;
+            let statistics = 0x74008;
+            let reduction = 0x76008;
+            let tail = 0x78008;
+            let mut buffers = vec![
+                (
+                    probability,
+                    rows * padded * if args.fp8_output { 1 } else { 2 },
+                ),
+                (statistics, rows * 8),
+                (reduction, rows * 24),
+            ];
+            let mut addresses = vec![0x88000, statistics, reduction];
+            if args.fp8_output && keys != padded {
+                addresses.push(tail);
+                buffers.push((tail, rows * 32));
+            }
             // Host SEND cannot share an SRAM element with its executing code.
-            // Reserve whole output elements, including gaps between cases.
             data.push(TileProgramData {
                 tile,
-                address: 0x5c000,
+                address: 0x6c000,
                 data: vec![0x55; 0x10000],
             });
-            let mut steps = Vec::new();
-            for (index, (tag, address)) in [("old", old), ("new", new)].into_iter().enumerate() {
-                steps.push(TileStep::Compute(ComputeStep {
-                    symbol: format!("softmax_{tag}_{keys}"),
-                    output_address: TileAddress::Absolute(address),
-                    input_addresses: vec![TileAddress::Absolute(0x88000)],
+            programs.push(TileProgram {
+                tile,
+                steps: vec![TileStep::Compute(ComputeStep {
+                    symbol: format!("softmax_check_{keys}"),
+                    output_address: TileAddress::Absolute(probability),
+                    input_addresses: addresses.into_iter().map(TileAddress::Absolute).collect(),
                     arguments: vec![rows, keys, u32::from(args.split_rows && keys >= 128)],
                     profile: StepProfile {
-                        before: Some(0x7f000 + index as u32 * 8),
-                        after: Some(0x7f004 + index as u32 * 8),
+                        before: Some(0x7f000),
+                        after: Some(0x7f004),
                     },
-                }));
-            }
-            programs.push(TileProgram { tile, steps });
+                })],
+            });
             data.push(TileProgramData {
                 tile,
                 address: 0x7c000,
                 data: vec![0; 0x4000],
             });
             let physical = u32::from(ipu_target::c600::logical_to_physical(tile));
-            for (address, size) in [(0x7f000, 16), (old - 8, size + 16), (new - 8, size + 16)] {
+            for (address, size) in std::iter::once((0x7f000, 8)).chain(
+                buffers
+                    .iter()
+                    .map(|&(address, size)| (address - 8, size + 16)),
+            ) {
                 for start in (0..size).step_by(256) {
                     let chunk = (size - start).min(256);
                     slices.push(RegionSlice {
@@ -179,7 +197,7 @@ fn main() -> Result<()> {
                     file_offset += u64::from(chunk);
                 }
             }
-            cases.push((rows, keys, padded, scores));
+            cases.push((rows, keys, padded, scores, buffers));
         }
     }
     let wrapper = args.output.join("softmax_check.S");
@@ -209,7 +227,7 @@ fn main() -> Result<()> {
                 &application,
                 cases
                     .iter()
-                    .map(|(rows, keys, _, _)| format!("rows={rows} keys={keys}")),
+                    .map(|(rows, keys, ..)| format!("rows={rows} keys={keys}")),
             );
         })?;
     let output = session.finish(&executed)?;
@@ -222,87 +240,88 @@ fn main() -> Result<()> {
 
     let mut offset = 0;
     let mut measurements = vec![];
-    for (rows, keys, padded, scores) in cases {
-        let time: Vec<_> = output[offset..offset + 16]
+    for (rows, keys, padded, scores, buffers) in cases {
+        let time: Vec<_> = output[offset..offset + 8]
             .chunks_exact(4)
             .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
             .collect();
-        offset += 16;
-        let size = (rows * (padded * 2 + 64)) as usize;
-        let mut errors = [0.0f64; 2];
-        for (variant, error) in errors.iter_mut().enumerate() {
+        offset += 8;
+        let mut contents = Vec::new();
+        for (address, size) in buffers {
+            let size = size as usize;
             ensure!(
                 output[offset..offset + 8] == [0x55; 8]
                     && output[offset + 8 + size..offset + 16 + size] == [0x55; 8],
-                "guard rows={rows} keys={keys} variant={variant}"
+                "guard rows={rows} keys={keys} address=0x{address:x}"
             );
-            let bytes = &output[offset + 8..offset + 8 + size];
+            contents.push(&output[offset + 8..offset + 8 + size]);
             offset += size + 16;
-            let readhalf = |i: usize| {
-                f16::from_bits(u16::from_le_bytes(
-                    bytes[i * 2..i * 2 + 2].try_into().unwrap(),
-                ))
-                .to_f64()
-            };
-            let readfloat =
-                |i: usize| f32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as f64;
-            let fp8 = args.fp8_output && variant == 1;
-            let read_probability = |r: u32, k: u32| {
-                if fp8 {
-                    ipu_codegen::f143::f143_to_f32(
-                        bytes[(k / 32 * rows * 32 + r * 32 + k % 32) as usize],
-                        -4,
-                    ) as f64
+        }
+        let bytes = contents[0];
+        let statistics = contents[1];
+        let mut error = 0.0f64;
+        let readhalf = |i: usize| {
+            f16::from_bits(u16::from_le_bytes(
+                bytes[i * 2..i * 2 + 2].try_into().unwrap(),
+            ))
+            .to_f64()
+        };
+        let readfloat =
+            |i: usize| f32::from_le_bytes(statistics[i..i + 4].try_into().unwrap()) as f64;
+        let fp8 = args.fp8_output;
+        let read_probability = |r: u32, k: u32| {
+            if fp8 {
+                ipu_codegen::f143::f143_to_f32(
+                    bytes[(k / 32 * rows * 32 + r * 32 + k % 32) as usize],
+                    -4,
+                ) as f64
+            } else {
+                readhalf((k / 16 * rows * 16 + r * 16 + k % 16) as usize)
+            }
+        };
+        for r in 0..rows {
+            let index = |k: u32| (k / 16 * rows * 16 + r * 16 + k % 16) as usize;
+            let maximum = (0..keys)
+                .map(|k| f16::from_bits(scores[index(k)]).to_f64())
+                .fold(f64::NEG_INFINITY, f64::max);
+            let expected: Vec<_> = (0..keys)
+                .map(|k| {
+                    ((f16::from_bits(scores[index(k)]).to_f64() - maximum) / 72f64.sqrt()).exp()
+                })
+                .collect();
+            let sum: f64 = expected.iter().sum();
+            let denominator = readfloat(((rows + r) * 4) as usize);
+            let max = readfloat((r * 4) as usize);
+            ensure!(
+                denominator.is_finite()
+                    && denominator > 0.0
+                    && (max - maximum / 72f64.sqrt()).abs() < 0.01,
+                "bad row state rows={rows} keys={keys} max={max} denominator={denominator}"
+            );
+            let actual_sum: f64 = (0..keys).map(|k| read_probability(r, k)).sum();
+            ensure!(
+                (actual_sum - denominator).abs()
+                    < 0.001 + if fp8 { 0.07 } else { 0.002 } * actual_sum,
+                "bad sum {actual_sum} {denominator}"
+            );
+            for k in 0..padded {
+                let actual = read_probability(r, k);
+                if k >= keys {
+                    ensure!(
+                        actual == 0.0,
+                        "padding rows={rows} keys={keys} k={k}: {actual}"
+                    );
                 } else {
-                    readhalf((k / 16 * rows * 16 + r * 16 + k % 16) as usize)
-                }
-            };
-            for r in 0..rows {
-                let index = |k: u32| (k / 16 * rows * 16 + r * 16 + k % 16) as usize;
-                let maximum = (0..keys)
-                    .map(|k| f16::from_bits(scores[index(k)]).to_f64())
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let expected: Vec<_> = (0..keys)
-                    .map(|k| {
-                        ((f16::from_bits(scores[index(k)]).to_f64() - maximum) / 72f64.sqrt()).exp()
-                    })
-                    .collect();
-                let sum: f64 = expected.iter().sum();
-                let denominator = readfloat(
-                    (rows * padded * if fp8 { 1 } else { 2 } + rows * 4 + r * 4) as usize,
-                );
-                let max = readfloat((rows * padded * if fp8 { 1 } else { 2 } + r * 4) as usize);
-                ensure!(
-                    denominator.is_finite()
-                        && denominator > 0.0
-                        && (max - maximum / 72f64.sqrt()).abs() < 0.01,
-                    "bad row state rows={rows} keys={keys} variant={variant} max={max} denominator={denominator}"
-                );
-                let actual_sum: f64 = (0..keys).map(|k| read_probability(r, k)).sum();
-                ensure!(
-                    (actual_sum - denominator).abs()
-                        < 0.001 + if fp8 { 0.07 } else { 0.002 } * actual_sum,
-                    "bad sum {actual_sum} {denominator}"
-                );
-                for k in 0..padded {
-                    let actual = read_probability(r, k);
-                    if k >= keys {
-                        ensure!(
-                            actual == 0.0,
-                            "padding rows={rows} keys={keys} k={k}: {actual}"
-                        );
-                    } else {
-                        let delta = (actual / denominator - expected[k as usize] / sum).abs();
-                        ensure!(
-                            delta.is_finite() && delta < if fp8 { 0.02 } else { 0.001 },
-                            "probability rows={rows} keys={keys} variant={variant} r={r} k={k} delta={delta}"
-                        );
-                        *error = error.max(delta);
-                    }
+                    let delta = (actual / denominator - expected[k as usize] / sum).abs();
+                    ensure!(
+                        delta.is_finite() && delta < if fp8 { 0.02 } else { 0.001 },
+                        "probability rows={rows} keys={keys} r={r} k={k} delta={delta}"
+                    );
+                    error = error.max(delta);
                 }
             }
         }
-        measurements.push(serde_json::json!({"rows":rows,"keys":keys,"padded":padded,"old":time[1].wrapping_sub(time[0]),"new":time[3].wrapping_sub(time[2]),"max_probability_error":errors}));
+        measurements.push(serde_json::json!({"rows":rows,"keys":keys,"padded":padded,"cycles":time[1].wrapping_sub(time[0]),"max_probability_error":error}));
     }
     fs::write(
         args.output.join("measurements.json"),

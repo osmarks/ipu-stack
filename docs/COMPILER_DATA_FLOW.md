@@ -449,15 +449,22 @@ defines the output prefix and safe chunks; mid donation, low call construction
 and costing consume that description. The mid rewrite separately requires a net
 storage saving on each shard. A physically valid cast need not be profitable.
 
-Other physical access contracts still have multiple owners:
+[Attention construction](../crates/ipu-codegen/src/planner/attention.rs) emits
+softmax as a compute with typed results: probabilities, FP32 maxima/denominators,
+FP32 segment workspace, and an FP16 tail workspace when FP8 masking needs it.
+The [attention family](../crates/ipu-codegen/src/kernel/attention.rs) declares
+their row geometry and validates the complete local call. It supplies separate
+pointers to assembly; no adjacency or separation between memory elements is
+required. PV consumes the probability result directly, and merge consumes the
+statistics. Later blocks reuse the two persistent results through ordinary
+result aliases. Padding reuse therefore checks actual storage types, without
+recognizing attention kernel names. The initial merge has no previous-state
+operand; the family fills its unused ABI slot when emitting the call.
 
-- [attention construction](../crates/ipu-codegen/src/planner/attention.rs)
-  places FP32 statistics after probabilities inside a nominal F16/FP8 tensor.
-  It crops probability copies to exclude the statistics; finite-padding reuse
-  separately rejects attention kernels because their writes are not all F16.
-- `tile::local_copy_call` selects copy helpers and arguments. Runtime inventory
-  reuses that selection, but placement alignment and local-copy costing use
-  separate rules instead of a common checked helper binding.
+Local-copy access still has multiple owners: `tile::local_copy_call` selects
+helpers and arguments. Runtime inventory reuses that selection, but placement
+alignment and local-copy costing use separate rules instead of a common checked
+helper binding.
 
 ## Trace 5: exchange encoding retains relocation sites
 

@@ -78,10 +78,6 @@ impl FragmentBuilder {
                 return None;
             }
             weights_type.format.precision = Precision::F8F143 { scale_exponent };
-            // FP32 max/sum, segmented statistics and a 16-half masked tail.
-            weights_type.shape.0[2] = key_block + 64;
-        } else {
-            weights_type.shape.0[2] = key_block + AMP_COLUMN_MICRO;
         }
         weights_type.format.layout.memory_class = MemoryClass::Ipu21Standard;
         let mut product_type = scores_type.clone();
@@ -157,6 +153,7 @@ impl FragmentBuilder {
             value_panels
         };
         let mut weights = None;
+        let mut statistics = None;
         let mut result = None;
         for start in (0..key_rows).step_by(key_block as usize) {
             let valid = key_block.min(key_rows - start);
@@ -219,7 +216,7 @@ impl FragmentBuilder {
                 self.compute(
                     LocalSite::from("qk/product").at(start),
                     vec![query_buffer, k],
-                    scores_type.clone(),
+                    [(scores_type.clone(), None)],
                     Compute::Product(product(
                         query_width,
                         key_block,
@@ -228,22 +225,33 @@ impl FragmentBuilder {
                             ..qk_axes
                         },
                     )),
-                    None,
-                )
+                )[0]
             };
-            weights = Some(self.kernel(
+            let workspaces = crate::kernel::softmax_workspaces(&weights_type, valid != key_block)?;
+            let mut outputs = vec![(weights_type.clone(), weights)];
+            outputs.extend(
+                workspaces
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, tensor)| (tensor, if index == 0 { statistics } else { None })),
+            );
+            let softmax = self.compute(
                 LocalSite::from("softmax").at(start),
                 vec![scores],
-                weights_type.clone(),
-                TileKernelSpec::AttentionSoftmax {
-                    head_dimension: query.shape.0[2],
-                    key_columns: valid,
-                    padded_key_columns: key_block,
+                outputs,
+                Compute::Kernel {
+                    kernel: TileKernelSpec::AttentionSoftmax {
+                        head_dimension: query.shape.0[2],
+                        key_columns: valid,
+                        padded_key_columns: key_block,
+                    },
+                    operands: vec![OperandIndexing::local()],
+                    output_aliases: Vec::new(),
                 },
-                weights,
-                vec![OperandIndexing::local()],
-            ));
-            let weights_id = weights?;
+            );
+            weights = Some(softmax[0]);
+            statistics = Some(softmax[1]);
+            let weights_id = softmax[0];
             let v = if probability_value_grid.is_some() {
                 value_panels
             } else {
@@ -257,22 +265,9 @@ impl FragmentBuilder {
                 })
             };
             let product = if let Some(grid) = probability_value_grid {
-                // The softmax buffer also carries FP32 maximum/denominator
-                // words after key_block. Expose only probabilities and their
-                // zero padding: a distributed K grid can pad beyond key_block,
-                // and copying those statistics as FP16 yields NaNs even when
-                // the corresponding V coefficients are zero.
-                let mut probabilities = self.tensor(weights_id).clone();
-                probabilities.shape.0[2] = key_block;
-                let probabilities = self.copy(
-                    LocalSite::from("probabilities").at(start),
-                    weights_id,
-                    probabilities,
-                    vec![],
-                );
                 self.distributed_product(
                     LocalSite::from("pv").at(start),
-                    probabilities,
+                    weights_id,
                     v,
                     &product_type,
                     ProductAxes {
@@ -286,7 +281,7 @@ impl FragmentBuilder {
                 self.compute(
                     LocalSite::from("pv/product").at(start),
                     vec![weights_id, v],
-                    product_type.clone(),
+                    [(product_type.clone(), None)],
                     Compute::Product(Product {
                         operands: [
                             OperandWindow(vec![(2, 0, key_block)]),
@@ -301,17 +296,15 @@ impl FragmentBuilder {
                             },
                         )
                     }),
-                    None,
-                )
+                )[0]
             };
             let final_block = materialized || start + key_block >= key_rows;
             let direct_f16 = final_block && final_output.format.precision == Precision::F16;
-            let mut inputs = vec![product, weights_id];
-            if direct_f16 {
+            let mut inputs = vec![product, softmax[1]];
+            if direct_f16 && start != 0 {
                 // An explicit previous accumulator keeps FP32 state live while
                 // the final merge writes a separate, compact FP16 result.
-                // The initial-block path does not read this operand.
-                inputs.push(result.unwrap_or(product));
+                inputs.push(result?);
             }
             let indexing = vec![OperandIndexing::local(); inputs.len()];
             result = Some(self.kernel(
@@ -325,7 +318,6 @@ impl FragmentBuilder {
                 TileKernelSpec::AttentionMerge {
                     value_dimension: final_output.shape.0[2],
                     padded_value_dimension: value_width,
-                    key_block_columns: key_block,
                     initial: start == 0,
                     final_block,
                 },
@@ -447,15 +439,30 @@ mod tests {
             .kernel_runs
             .iter()
             .find(|run| matches!(run.kernel, TileKernelSpec::AttentionSoftmax { .. }))
-            .unwrap()
-            .outputs[0]
-            .shard;
-        // The five PV groups consume 800 columns. The first 768 are weights;
-        // [768, 784) contains FP32 metadata that can encode FP16 NaNs.
+            .unwrap();
+        let probabilities = softmax.outputs[0].shard;
+        let statistics = softmax.outputs[1].shard;
+        assert_eq!(
+            expanded.shards[probabilities.index() as usize]
+                .tensor_type
+                .shape
+                .0,
+            [1, 2, 768]
+        );
+        assert_eq!(
+            expanded.shards[statistics.index() as usize]
+                .tensor_type
+                .format
+                .precision,
+            Precision::F32
+        );
+        assert_ne!(probabilities, statistics);
+        // Five PV groups need 800 columns, but only 768 exist in the probability
+        // value. The extra columns must be padding, never the separate FP32 state.
         let mut probability_transfers = 0;
         for phase in &expanded.exchange_phases {
             for transfer in &phase.transfers {
-                if transfer.source.shard == softmax {
+                if transfer.source.shard == probabilities {
                     assert!(transfer.source.extents[2].physical_end <= 768);
                     probability_transfers += 1;
                 }

@@ -37,15 +37,12 @@ f16v8tof8 $a0:1, $a0:3
 st64step $a0:1, $mzero, $m2+=, 1
 .endm
 
-// Only a masked tail uses temporary FP16 storage, 32 bytes per query row
-// after the FP32 statistics scratch. Complete panels never round-trip SRAM.
+// Only a masked tail uses the explicit FP16 workspace (32 bytes per row).
+// Complete panels never round-trip SRAM.
 .macro SOFTMAX_BEGIN_TAIL
 #ifdef ATTENTION_OUTPUT_F8
 mov $m1, $m2
-ld32 $m2, $mvertex_base, $m15, 0
-setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS + 32
-mul $m0, $m5, $m0
-add $m2, $m2, $m0
+ld32 $m2, $mvertex_base, $m15, 6
 shl $m0, $m4, 5
 add $m2, $m2, $m0
 #endif

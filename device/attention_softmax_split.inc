@@ -1,4 +1,4 @@
-// Three contiguous panel segments per row; scratch follows maxima/sums.
+// Three contiguous panel segments per row, with an explicit FP32 workspace.
 
 	.macro SOFTMAX_SPLIT_INIT
 	ld32 $m5, $mvertex_base, $m15, 2
@@ -20,10 +20,8 @@
 	.macro SOFTMAX_SPLIT_ROW
 	ld32 $m2, $mvertex_base, $m15, 0
 	ld32 $m3, $mvertex_base, $m15, 1
-	// Three FP32 maxima and three sums use the existing extra 16 halves/row.
-	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES + 8
-	mul $m6, $m5, $m0
-	add $m6, $m6, $m2
+	// [maximum/sum, query row, segment] FP32 workspace.
+	ld32 $m6, $mvertex_base, $m15, 5
 	setzi $m0, 3
 	mul $m0, $m4, $m0
 	add $m0, $m0, $m9
@@ -128,10 +126,7 @@
 	brnz $m9, .Lsoftmax_split_scale
 	ldconst $a1, ATTENTION_SCALE_BITS
 	f32mul $a2, $a0, $a1
-	ld32 $m0, $mvertex_base, $m15, 0
-	setzi $m1, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES
-	mul $m1, $m5, $m1
-	add $m0, $m0, $m1
+	ld32 $m0, $mvertex_base, $m15, 4
 	shl $m1, $m4, 2
 	add $m0, $m0, $m1
 	st32 $a2, $m0, $m15, 0
@@ -228,9 +223,8 @@
 	.p2align 3
 .Lsoftmax_split_sum:
 	ld32 $m5, $mvertex_base, $m15, 2
-	ld32 $m2, $mvertex_base, $m15, 0
-	setzi $m0, ATTENTION_KEY_BLOCK_COLUMNS * SOFTMAX_ELEMENT_BYTES + 4
-	mul $m0, $m5, $m0
+	ld32 $m2, $mvertex_base, $m15, 4
+	shl $m0, $m5, 2
 	add $m2, $m2, $m0
 	get $m4, $WSR
 	and $m4, $m4, CSR_W_WSR__CTXTID_M1__MASK
@@ -239,9 +233,10 @@
 	brz $m0, .Lsoftmax_done
 	shl $m0, $m4, 2
 	add $m3, $m2, $m0
-	setzi $m0, 16
+	ld32 $m6, $mvertex_base, $m15, 5
+	setzi $m0, 12
 	mul $m0, $m5, $m0
-	add $m6, $m2, $m0
+	add $m6, $m6, $m0
 	setzi $m0, 12
 	mul $m0, $m4, $m0
 	add $m6, $m6, $m0

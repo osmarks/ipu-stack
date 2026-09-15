@@ -117,6 +117,15 @@ actual assignment, preserving alias-relative rotations without an implicit
 constructor offset. Version-six checkpoints resolve the old bases and global
 grouping requests once. Unrelated groups and result homes remain fixed when
 search explicitly removes choices affected by a layout change.
+Attention softmax now declares separate typed probability, statistics and worker
+workspace results through the same multi-result compute constructor. Its family
+shares workspace geometry between construction and local call validation;
+assembly receives explicit pointers. PV no longer copies a probability prefix,
+merge consumes FP32 statistics without key-size/weight-precision specialization,
+and the finite-padding proof no longer recognizes attention names. Initial merge
+calls also no longer fabricate a previous-state operand. Resolved storage reads,
+local-copy binding, remaining movement policies and cache consolidation are still
+unfinished.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

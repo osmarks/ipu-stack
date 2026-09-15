@@ -305,7 +305,7 @@ pub(super) enum KernelImplementation {
     ),
     Attention(AttentionKernelShape),
     Softmax(u32, u32, u32, Precision),
-    Merge(u32, u32, u32, Precision, Precision),
+    Merge(u32, u32, Precision),
     Rearrange((RearrangeTarget, u32, u32, u32, u32)),
     Unpack((UnpackSource, u32, u32, u32, u32)),
 }

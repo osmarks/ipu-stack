@@ -143,19 +143,20 @@ impl FragmentBuilder {
                 let products = self.compute(
                     "partials",
                     vec![left, weights],
-                    partials,
+                    [(partials, None)],
                     Compute::Product(product(GemmKernelMode::Initialize)),
-                    None,
-                );
-                Some(self.emit(
-                    "reduce",
-                    vec![products],
-                    output.clone(),
-                    MidOperationKind::Compute(Compute::Sum {
-                        axis: 0,
-                        staging: reduction_staging,
-                    }),
-                ))
+                )[0];
+                Some(
+                    self.emit(
+                        "reduce",
+                        vec![products],
+                        [output.clone()],
+                        MidOperationKind::Compute(Compute::Sum {
+                            axis: 0,
+                            staging: reduction_staging,
+                        }),
+                    )[0],
+                )
             }
             GemmDistribution::OutputStationary => {
                 // Bounded K panels are separate tensor values in mid. Their
@@ -182,13 +183,14 @@ impl FragmentBuilder {
                     && left_panel.format.layout.order == left_source_type.format.layout.order
                     && right_panel.format.layout.order == right_source_type.format.layout.order
                 {
-                    return Some(self.compute(
-                        "product",
-                        vec![left, right],
-                        output.clone(),
-                        Compute::Product(product(GemmKernelMode::Initialize)),
-                        None,
-                    ));
+                    return Some(
+                        self.compute(
+                            "product",
+                            vec![left, right],
+                            [(output.clone(), None)],
+                            Compute::Product(product(GemmKernelMode::Initialize)),
+                        )[0],
+                    );
                 }
                 for (tensor, axis) in [
                     (&mut left_panel, left_inner),
@@ -224,17 +226,18 @@ impl FragmentBuilder {
                     ro[right_inner] = start;
                     let l = self.copy(LocalSite::from("left").at(start), left, l, lo);
                     let r = self.copy(LocalSite::from("right").at(start), right, r, ro);
-                    result = Some(self.compute(
-                        LocalSite::from("product").at(start),
-                        vec![l, r],
-                        output.clone(),
-                        Compute::Product(product(if result.is_none() {
-                            GemmKernelMode::Initialize
-                        } else {
-                            GemmKernelMode::Accumulate
-                        })),
-                        result,
-                    ));
+                    result = Some(
+                        self.compute(
+                            LocalSite::from("product").at(start),
+                            vec![l, r],
+                            [(output.clone(), result)],
+                            Compute::Product(product(if result.is_none() {
+                                GemmKernelMode::Initialize
+                            } else {
+                                GemmKernelMode::Accumulate
+                            })),
+                        )[0],
+                    );
                 }
                 result
             }
@@ -368,7 +371,7 @@ impl FragmentBuilder {
         let result = self.compute(
             site.child("partials"),
             vec![l, r],
-            product,
+            [(product, None)],
             Compute::Product(Product {
                 multiply,
                 accumulate: if fp8_scale.is_some() {
@@ -384,20 +387,19 @@ impl FragmentBuilder {
                 operands: Default::default(),
                 output_aliases: Vec::new(),
             }),
-            None,
-        );
+        )[0];
         if grid.inner > 1 {
             let mut reduced = output.clone();
             reduced.shape.0[2] = columns;
             let sum = self.emit(
                 site.child("reduce"),
                 vec![result],
-                reduced,
+                [reduced],
                 MidOperationKind::Compute(Compute::Sum {
                     axis: 0,
                     staging: ReductionStaging::Complete,
                 }),
-            );
+            )[0];
             Some(self.copy(site.child("output"), sum, output.clone(), vec![]))
         } else {
             Some(self.copy(site.child("output"), result, output.clone(), vec![]))

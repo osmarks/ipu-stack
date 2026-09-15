@@ -367,7 +367,6 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
                 TileKernelSpec::AttentionMerge {
                     value_dimension: values,
                     padded_value_dimension: values,
-                    key_block_columns: 64,
                     initial: true,
                     final_block: false,
                 },
@@ -377,56 +376,85 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
     }
     let mut calls = Vec::new();
     for (kernel, rows) in stages {
-        let (inputs, expected) = match kernel {
-            TileKernelSpec::AttentionSoftmax { key_columns, .. } => (1, vec![rows, key_columns, 0]),
-            TileKernelSpec::AttentionMerge { .. } => (2, vec![1, 0, rows]),
+        let (inputs, outputs, expected) = match kernel {
+            TileKernelSpec::AttentionSoftmax {
+                key_columns,
+                padded_key_columns,
+                ..
+            } => {
+                let probability = crate::TensorType::new(
+                    [rows, padded_key_columns],
+                    Precision::F16,
+                    Layout::amp_left(16, 1),
+                );
+                let mut outputs = vec![probability.clone()];
+                outputs.extend(
+                    softmax_workspaces(&probability, key_columns != padded_key_columns).unwrap(),
+                );
+                (vec![probability], outputs, vec![rows, key_columns, 0])
+            }
+            TileKernelSpec::AttentionMerge {
+                value_dimension, ..
+            } => (
+                vec![
+                    crate::TensorType::new(
+                        [rows, value_dimension],
+                        Precision::F16,
+                        Layout::amp_left(16, 1),
+                    ),
+                    crate::TensorType::new([2, rows], Precision::F32, Layout::row_sharded(1)),
+                ],
+                vec![crate::TensorType::new(
+                    [rows, value_dimension + 2],
+                    Precision::F32,
+                    Layout {
+                        order: ElementOrder::RowMajor,
+                        ..Layout::amp_left(16, 1)
+                    },
+                )],
+                vec![1, 0, rows],
+            ),
             _ => unreachable!(),
         };
-        let format = TensorFormat {
-            precision: if inputs == 2 {
-                Precision::F32
-            } else {
-                Precision::F16
-            },
-            layout: Layout::row_major(TensorTiling::replicated(1)),
-        };
-        let output = ShardView {
-            shard: BlockValueId::from_index(0),
-            extents: [rows, 16]
-                .into_iter()
-                .enumerate()
-                .map(|(axis, size)| ShardExtent {
-                    axis: axis as u16,
-                    start: 0,
-                    logical_end: size,
-                    physical_end: size,
-                })
-                .collect(),
-        };
-        let run = KernelRun::new(
+        let input_count = inputs.len();
+        let shards = inputs
+            .into_iter()
+            .chain(outputs)
+            .enumerate()
+            .map(|(index, tensor_type)| BlockValue {
+                id: BlockValueId::from_index(index as u32),
+                tile: 0,
+                extents: tensor_type
+                    .format
+                    .layout
+                    .shard_extents(&tensor_type.shape)
+                    .unwrap()[0]
+                    .1
+                    .clone(),
+                tensor_type,
+                definition: crate::ShardDefinition::Staging,
+            })
+            .collect::<Vec<_>>();
+        let views = shards
+            .iter()
+            .map(|shard| ShardView {
+                shard: shard.id,
+                extents: shard.extents.clone(),
+            })
+            .collect::<Vec<_>>();
+        let run = KernelRun::bind(
             WorkProvenance {
                 operation: None,
                 value: None,
                 reason: WorkReason::OperatorKernel,
             },
             kernel,
-            (0..inputs).map(|_| output.clone()).collect(),
-            vec![output],
-            KernelRequirements {
-                inputs: vec![
-                    KernelAccess::new(
-                        TensorFormat {
-                            precision: Precision::F16,
-                            ..format.clone()
-                        },
-                        8
-                    );
-                    inputs
-                ],
-                outputs: vec![KernelAccess::new(format, 8)],
-                distinct_elements: Vec::new(),
-            },
-        );
+            views[..input_count].to_vec(),
+            views[input_count..].to_vec(),
+            &shards,
+            &mut Vec::new(),
+        )
+        .unwrap();
         let call = run.call().unwrap();
         assert_eq!(call.arguments, expected);
         calls.push(call);
