@@ -1,8 +1,11 @@
 //! Direct multicast versus gathering native panels once and forwarding them.
 //! Both use the same exchange phase; scratch is visible to normal placement.
-use super::*;
 use crate::low::storage::storage_root;
+use crate::low::*;
+use crate::{AmpOrder, CopyOrder, ElementOrder, MemoryClass, ShardExtent};
+use std::collections::{BTreeMap, BTreeSet};
 
+#[tracing::instrument(name = "select_relays", skip_all)]
 pub(super) fn select(
     program: &mut TileGraph,
     analysis: &crate::storage::GeometryCache,
@@ -287,6 +290,7 @@ fn candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Layout, MidValueId, Precision, TensorTiling, TensorType};
 
     fn fixture() -> TileGraph {
         let mut tensor = TensorType {

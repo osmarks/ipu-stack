@@ -6,9 +6,9 @@
 //! by writes, copies and allocation reuse. This second proof cannot apply to
 //! mixed-precision arenas: finite FP32 bits need not encode finite FP16 values.
 
-use super::*;
 use crate::kernel::TileKernelSpec;
 use crate::low::storage::storage_root;
+use crate::low::*;
 use crate::tensor::{AmpOrder, ElementOrder, Precision};
 use std::collections::BTreeSet;
 
@@ -51,6 +51,7 @@ fn non_kernel_read_storage(program: &TileGraph) -> BTreeSet<BlockValueId> {
 
 /// Row-major FP8 packing reads only logical columns/rows and writes its own
 /// output padding. Drop input padding clears when that is the sole reader.
+#[tracing::instrument(skip_all)]
 pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
     let shards = &program.shards;
     let kernels = &program.kernel_runs;
@@ -111,6 +112,7 @@ pub(super) fn omit_unread_fp8_input_padding(program: &mut TileGraph) {
     tracing::info!(removed, "eliminated unread FP8 cast input padding clears");
 }
 
+#[tracing::instrument(skip_all)]
 pub(super) fn reuse_finite_padding(program: &mut TileGraph) {
     if program
         .shards

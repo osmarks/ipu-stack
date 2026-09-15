@@ -1,19 +1,20 @@
 //! Local transformations of expanded tile regions, before tile projection.
 
-use super::copy::CopyPattern;
-use super::graph::{
-    BlockOperation, BlockRegion, BlockValue, BlockValueId, ExchangePhase, ExchangePhaseId,
-    LocalCopy, LocalCopyId, LogicalExchange, ShardView, TileGraph, WorkProvenance, WorkReason,
-};
-use super::storage::{storage_location, storage_root};
 use crate::kernel::CopyRun;
+use crate::low::copy::CopyPattern;
+use crate::low::graph::{
+    BlockOperation, BlockRegion, BlockValue, BlockValueId, ExchangePhase, ExchangePhaseId,
+    LocalCopy, LocalCopyId, LogicalExchange, ShardView, WorkProvenance, WorkReason,
+};
+use crate::low::storage::{storage_location, storage_root};
 use crate::storage::{CopyOrder, StorageResult, StridedSpan};
 use std::collections::BTreeMap;
 
 /// Move copy-only gaps before or after a shared exchange when they commute
 /// with every conflicting access. Scheduling still orders transfers within the
 /// merged phase; this pass does not choose their execution order.
-pub(super) fn group_exchanges(
+#[tracing::instrument(skip_all)]
+pub(in crate::low) fn group_exchanges(
     region: &mut BlockRegion,
     phases: &mut Vec<ExchangePhase>,
     copies: &[CopyRun],
@@ -220,9 +221,12 @@ fn copy_overlaps_view(
 
 /// Merge contiguous copies between distinct allocations while preserving each
 /// tile's compute order and all exchange/repeat/checkpoint boundaries.
-fn merge_copies(
+/// Rebuild the live copy table as operations are retained, including repeats.
+#[tracing::instrument(skip_all)]
+pub(super) fn merge_copies(
     region: &mut BlockRegion,
-    copies: &mut [CopyRun],
+    old: &[CopyRun],
+    copies: &mut Vec<CopyRun>,
     roots: &[BlockValueId],
     shards: &[BlockValue],
 ) -> StorageResult<usize> {
@@ -232,7 +236,7 @@ fn merge_copies(
     for mut operation in operations {
         match &mut operation {
             BlockOperation::Copy { tile, copy } => {
-                let next = copies[copy.0 as usize].movement();
+                let next = old[copy.0 as usize].movement();
                 if let Some(first) = previous.get(tile) {
                     let first = copies[first.0 as usize].movement();
                     if first.pattern == CopyPattern::Contiguous
@@ -253,6 +257,9 @@ fn merge_copies(
                         continue;
                     }
                 }
+                let value = old[copy.0 as usize].clone();
+                *copy = LocalCopyId(copies.len() as u32);
+                copies.push(value);
                 previous.insert(*tile, *copy);
             }
             BlockOperation::Compute { tile, .. } => {
@@ -260,57 +267,13 @@ fn merge_copies(
             }
             BlockOperation::Repeat(repeat) => {
                 previous.clear();
-                merged += merge_copies(&mut repeat.body, copies, roots, shards)?;
+                merged += merge_copies(&mut repeat.body, old, copies, roots, shards)?;
             }
             BlockOperation::Exchange(_) | BlockOperation::Checkpoint(..) => previous.clear(),
         }
         region.operations.push(operation);
     }
     Ok(merged)
-}
-
-fn compact_copies(region: &mut BlockRegion, old: &[CopyRun], copies: &mut Vec<CopyRun>) {
-    for operation in &mut region.operations {
-        match operation {
-            BlockOperation::Copy { copy, .. } => {
-                let value = old[copy.0 as usize].clone();
-                *copy = LocalCopyId(copies.len() as u32);
-                copies.push(value);
-            }
-            BlockOperation::Repeat(repeat) => compact_copies(&mut repeat.body, old, copies),
-            _ => {}
-        }
-    }
-}
-
-pub(super) fn simplify(program: &mut TileGraph) -> StorageResult<()> {
-    let grouped = group_exchanges(
-        &mut program.body,
-        &mut program.exchange_phases,
-        &program.local_copies,
-        &program.shards,
-    )?;
-    if grouped != 0 {
-        tracing::debug!(grouped, "consolidated exchange boundaries");
-    }
-
-    let roots = program
-        .shards
-        .iter()
-        .map(|value| storage_root(&program.shards, value.id))
-        .collect::<Vec<_>>();
-    let merged = merge_copies(
-        &mut program.body,
-        &mut program.local_copies,
-        &roots,
-        &program.shards,
-    )?;
-    if merged != 0 {
-        let old = std::mem::take(&mut program.local_copies);
-        compact_copies(&mut program.body, &old, &mut program.local_copies);
-        tracing::debug!(merged, "merged adjacent low copies");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -483,22 +446,40 @@ mod tests {
                 movement(1, 2, 3, 8, 8),
                 movement(0, 0, 4, 0, 8),
                 movement(0, 0, 4, 8, 8),
+                BlockOperation::Repeat(Box::new(BlockRepeat {
+                    provenance: WorkProvenance {
+                        operation: None,
+                        value: None,
+                        reason: WorkReason::OperatorInputs,
+                    },
+                    count: 2,
+                    bindings: vec![],
+                    body: BlockRegion {
+                        operations: vec![movement(0, 0, 1, 0, 8), movement(0, 0, 1, 8, 8)],
+                    },
+                })),
+                movement(0, 0, 1, 16, 8),
             ],
         };
         let roots = [0, 1, 2, 3, 0].map(BlockValueId);
-        assert_eq!(
-            merge_copies(&mut region, &mut copies, &roots, &shards).unwrap(),
-            1
-        );
         let mut compact = Vec::new();
-        compact_copies(&mut region, &copies, &mut compact);
-        assert_eq!(compact.len(), 7);
-        assert_eq!(compact[0].movement().bytes, 24);
-        assert!(compact[1..].iter().all(|copy| copy.movement().bytes == 8));
         assert_eq!(
-            merge_copies(&mut region, &mut compact, &roots, &shards).unwrap(),
+            merge_copies(&mut region, &copies, &mut compact, &roots, &shards).unwrap(),
+            2
+        );
+        assert_eq!(compact.len(), 9);
+        assert_eq!(compact[0].movement().bytes, 24);
+        assert!(compact[1..7].iter().all(|copy| copy.movement().bytes == 8));
+        assert_eq!(compact[7].movement().bytes, 16);
+        assert_eq!(compact[8].movement().bytes, 8);
+        let before = region.clone();
+        let mut again = Vec::new();
+        assert_eq!(
+            merge_copies(&mut region, &compact, &mut again, &roots, &shards).unwrap(),
             0
         );
+        assert_eq!(region, before);
+        assert_eq!(again, compact);
     }
 
     #[test]

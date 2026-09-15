@@ -12,7 +12,6 @@ mod mapping;
 mod movement;
 mod ownership;
 mod reduce;
-mod relay;
 mod repeat;
 #[cfg(test)]
 use super::{view_byte_spans, view_byte_traversal};
@@ -79,7 +78,6 @@ pub(crate) fn expand_tiles_cached(
     if graph.tile_count == 0 {
         return Err(ExpansionError::EmptyTileGroup);
     }
-    let start = Instant::now();
     let mut state = TileGraphBuilder::new(graph, Arc::clone(&cache))?;
     let body = state.build_region(&graph.operations, checkpoints)?;
     for value in graph
@@ -119,21 +117,10 @@ pub(crate) fn expand_tiles_cached(
             })
             .collect(),
     };
-    let build_time = start.elapsed();
-    let start = Instant::now();
-    crate::low::passes::simplify(&mut program)?;
-    let simplify_time = start.elapsed();
-    let start = Instant::now();
-    relay::select(&mut program, &cache)?;
-    let relay_time = start.elapsed();
-    crate::low::initialization::omit_unread_fp8_input_padding(&mut program);
-    crate::low::initialization::reuse_finite_padding(&mut program);
+    crate::low::passes::run(&mut program, &cache)?;
     tracing::debug!(
         shards = program.shards.len(),
         exchange_phases = program.exchange_phases.len(),
-        build_ms = build_time.as_secs_f64() * 1000.0,
-        simplify_ms = simplify_time.as_secs_f64() * 1000.0,
-        relay_ms = relay_time.as_secs_f64() * 1000.0,
         "built logical tile schedule"
     );
     Ok(Arc::new(program))

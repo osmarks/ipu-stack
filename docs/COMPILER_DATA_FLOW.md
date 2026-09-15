@@ -318,11 +318,14 @@ construction supplies the byte geometry, and `CopyRun` checks its ranges and
 selects the helper before append. Placement, costing, runtime symbol retention
 and emission consume that binding. Coalescing explicitly rebinds the changed
 descriptor.
-After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
-groups exchanges across commuting local copies, then merges adjacent copies.
-It checks read/write hazards against completed storage bindings and respects
-compute, Repeat and checkpoint boundaries. It compacts the exchange arena and
-remaps references in all regions before the relay and padding passes run.
+After construction, [low/passes/mod.rs](../crates/ipu-codegen/src/low/passes/mod.rs)
+runs exchange grouping, copy merging, relay selection and padding elimination
+in that order. [movement.rs](../crates/ipu-codegen/src/low/passes/movement.rs)
+checks read/write hazards against completed storage bindings and respects
+compute, Repeat and checkpoint boundaries. Merging rebuilds the live copy table;
+exchange grouping compacts its arena and remaps references in all regions.
+Relay selection sees the merged exchanges; padding analysis sees the readers
+and scratch allocations introduced by relay selection.
 
 [buffers.rs](../crates/ipu-codegen/src/low/expand/buffers.rs) binds logical values
 to concrete `ShardView`s. A borrowed copy replaces the result's binding with its
@@ -388,7 +391,7 @@ untouched source/destination bytes.
 
 ## Trace 4: live low work and storage contracts
 
-[initialization.rs](../crates/ipu-codegen/src/low/initialization.rs) removes proven
+[padding.rs](../crates/ipu-codegen/src/low/passes/padding.rs) removes proven
 redundant padding clears from `TileGraph.body`, including Repeat bodies, at the
 end of expansion. Its analyses walk live operations, not unused arena entries.
 The graph records whether the remaining work requires finite initial scratch.

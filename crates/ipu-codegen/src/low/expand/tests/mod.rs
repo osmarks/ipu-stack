@@ -124,7 +124,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                 .unwrap();
             // Appending records the requested sequence; motion is an explicit pass.
             assert_eq!(builder.phases.len(), 2);
-            crate::low::passes::group_exchanges(
+            crate::low::passes::movement::group_exchanges(
                 &mut region,
                 &mut builder.phases,
                 &builder.local_copies,
@@ -132,7 +132,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
             )
             .unwrap();
             assert_eq!(
-                crate::low::passes::group_exchanges(
+                crate::low::passes::movement::group_exchanges(
                     &mut region,
                     &mut builder.phases,
                     &builder.local_copies,
