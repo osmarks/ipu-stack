@@ -319,8 +319,8 @@ mod tests {
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let fused = mid
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
@@ -394,8 +394,8 @@ mod tests {
         program.outputs = vec![MidValueId(4), MidValueId(5)];
         let fused = program
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .unwrap();
         assert_eq!(fused.outputs, program.outputs);
@@ -493,8 +493,8 @@ mod tests {
         program.operations.push(norm);
         let fused = program
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .unwrap();
         assert_eq!(fused.operations[0].results[1], MidValueId(4));
@@ -530,8 +530,8 @@ mod tests {
         }
         let fused = program
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .expect("partial residual statistics should save a scan");
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);

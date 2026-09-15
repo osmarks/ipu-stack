@@ -1,6 +1,9 @@
 //! Allocation requirements and region liveness; no cycle pricing.
 
 use super::*;
+use ipu_target::ipu21::memory::{
+    IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES, IPU21_STANDARD_FIXED_BYTES,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct MemoryUsage {
@@ -72,12 +75,12 @@ impl MemoryPeaks {
         reserved_standard_bytes: u64,
         tile_memory_budget_bytes: u64,
     ) -> bool {
-        self.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+        self.interleaved <= u64::from(IPU21_INTERLEAVED_REGION_BYTES)
             // Row storage is a coarse ranking estimate: it sums independent
             // phase maxima and cannot prove that an allocation is impossible.
             // Exact encoded rows participate in package acceptance after scheduling.
             && self.total.saturating_add(reserved_standard_bytes)
-                <= tile_memory_budget_bytes.min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+                <= tile_memory_budget_bytes.min(u64::from(IPU21_PLANNED_DATA_BYTES))
             && self.standard_contiguous_overflow_with_reservation(reserved_standard_bytes) == 0
     }
 
@@ -91,9 +94,9 @@ impl MemoryPeaks {
     ) -> u64 {
         // A standard buffer can use all of region 1 when interleaved
         // temporaries are dead. Do not subtract an unrelated class peak.
-        let upper_standard = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
-        let lower_standard = u64::from(crate::memory::IPU21_STANDARD_FIXED_BYTES)
-            .saturating_sub(reserved_standard_bytes);
+        let upper_standard = u64::from(IPU21_INTERLEAVED_REGION_BYTES);
+        let lower_standard =
+            u64::from(IPU21_STANDARD_FIXED_BYTES).saturating_sub(reserved_standard_bytes);
         self.maximum_standard_allocation
             .saturating_sub(lower_standard.max(upper_standard))
     }

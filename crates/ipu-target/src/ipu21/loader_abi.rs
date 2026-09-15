@@ -1,7 +1,7 @@
 //! SDK secondary-loader transport contract shared by package validation and
 //! the driver. Loadable SRAM ends before architectural SRAM; frame counts and
 //! the startup handoff are properties of this loader, not of IPU21 instructions.
-use ipu_target::ipu21::memory::TILE_MEMORY_BASE;
+use super::memory::TILE_MEMORY_BASE;
 
 // The secondary loader installs framed application payload at the SDK image's
 // launch slot. Applications reserve that word and enter at the following word.

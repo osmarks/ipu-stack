@@ -1,5 +1,6 @@
 //! Package already resolved tile programs for low-level diagnostics.
 use super::*;
+use ipu_target::ipu21::memory::IPU21_DATA_BASE;
 
 /// Builds an application from address-resolved tile programs.
 ///
@@ -128,7 +129,7 @@ pub fn build_tile_program_package(
                 bytes,
                 alignment: 4,
                 bounds: ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE
-                    ..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
+                    ..ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT,
                 end_alignment: 4,
                 guard_after: 0,
             })?
@@ -198,7 +199,7 @@ pub fn build_tile_program_package(
     };
     let mut run_outputs = outputs.to_vec();
     run_outputs.push(finish);
-    let host_bounds = crate::IPU21_DATA_BASE..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT;
+    let host_bounds = IPU21_DATA_BASE..ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT;
     let sizing_host_base = memory.next_free(
         RUNTIME_EXECUTABLE_START,
         RUNTIME_EXECUTABLE_START..ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
@@ -381,8 +382,8 @@ fn collect_compute_symbols(symbols: &mut Vec<String>, steps: &[crate::TileStep])
 fn split_aperture_data(
     data: &[crate::TileProgramData],
 ) -> PackageBuildResult<(Vec<crate::TileProgramData>, Vec<crate::TileProgramData>)> {
-    let start = crate::runtime_layout::EXCHANGE_WINDOW_BASE;
-    let end = start + crate::runtime_layout::EXCHANGE_WINDOW_BYTES;
+    let start = ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE;
+    let end = start + ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BYTES;
     let mut loader = Vec::new();
     let mut aperture = BTreeMap::<u16, Vec<crate::TileProgramData>>::new();
     for segment in data {
@@ -443,8 +444,8 @@ mod tests {
     use super::*;
     #[test]
     fn aperture_initial_values_are_word_aligned_and_kept_out_of_loader_data() {
-        let start = crate::runtime_layout::EXCHANGE_WINDOW_BASE;
-        let end = start + crate::runtime_layout::EXCHANGE_WINDOW_BYTES;
+        let start = ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE;
+        let end = start + ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BYTES;
         let input = vec![
             crate::TileProgramData {
                 tile: 0,

@@ -9,10 +9,10 @@ mod search;
 use crate::MemoryClass;
 use crate::low::storage::StorageAccess;
 use crate::low::{LowProgram, TileWorkList, TileWorkRef};
-use crate::memory::IPU21_DATA_BASE;
 use crate::{BlockValueId, ShardDefinition};
 use crate::{StorageError, shard_storage_bytes};
-use ipu_package::loader_abi::APPLICATION_LOAD_LIMIT;
+use ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT;
+use ipu_target::ipu21::memory::IPU21_DATA_BASE;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,8 +98,9 @@ impl Lifetime {
 /// The host protocol owns this range before and after device execution.
 /// It is never available to persistent support, inputs or outputs.
 pub(crate) const HOST_SCRATCH_RANGE: (u32, u32) = (
-    crate::runtime_layout::EXCHANGE_WINDOW_BASE,
-    crate::runtime_layout::EXCHANGE_WINDOW_BASE + crate::runtime_layout::EXCHANGE_WINDOW_BYTES,
+    ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE,
+    ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE
+        + ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BYTES,
 );
 
 pub fn place(program: &LowProgram) -> Result<Placement, PlacementError> {

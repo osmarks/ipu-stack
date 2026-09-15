@@ -2,7 +2,7 @@
 #define IPU_CONSTANT(name, type, value) .set name, value
 #include "../crates/ipu-target/include/ipu21_registers.def"
 #include "../crates/ipu-target/include/ipu21_instruction.def"
-#include "runtime_layout.def"
+#include "../crates/ipu-target/include/runtime_layout.def"
 #undef IPU_CONSTANT
 
 	.text

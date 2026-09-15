@@ -255,7 +255,6 @@ fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildR
 }
 
 pub mod f143;
-pub mod runtime_layout;
 
 mod estimate;
 pub mod exchange;
@@ -287,7 +286,6 @@ pub use low::{
     BlockValue, BlockValueId, ShardDefinition, ShardView, logical_view_byte_spans,
     shard_storage_bytes,
 };
-pub(crate) use memory::*;
 pub use mid::ReductionStaging;
 pub(crate) use mid::*;
 pub use package::{

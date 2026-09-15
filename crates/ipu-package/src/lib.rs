@@ -27,14 +27,12 @@ pub use profile::*;
 
 pub const SCHEMA_VERSION: u32 = 5;
 pub const TARGET_IPU21: &str = "ipu21";
-pub mod loader_abi;
 // Compatibility exports; the defining owners are target and loader ABI.
 pub use ipu_target::ipu21::memory::{
     IPU21_EXECUTABLE_MEMORY_LIMIT, IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE,
     IPU21_INTERLEAVED_REGION_LIMIT, IPU21_SUPERVISOR_FETCH_LOOKAHEAD, TILE_MEMORY_BASE,
     TILE_MEMORY_ELEMENT_SIZE, TILE_MEMORY_SIZE,
 };
-pub use loader_abi::APPLICATION_LOAD_LIMIT as IPU21_APPLICATION_MEMORY_LIMIT;
 pub const SEGMENT_READ: u32 = 1;
 pub const SEGMENT_WRITE: u32 = 2;
 pub const SEGMENT_EXECUTE: u32 = 4;

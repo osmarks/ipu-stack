@@ -325,8 +325,8 @@ fn fp8_conversion_precedes_operand_replication() {
 #[test]
 fn randomized_memory_peaks_allow_noncoincident_classes() {
     let mut random = fastrand::Rng::with_seed(0x636c_6173_735f_7372);
-    let capacity = u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES);
-    let interleaved_capacity = u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES);
+    let capacity = u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES);
+    let interleaved_capacity = u64::from(ipu_target::ipu21::memory::IPU21_INTERLEAVED_REGION_BYTES);
     let element = u64::from(ipu_target::ipu21::memory::IPU21_INTERLEAVED_ELEMENT_SIZE);
     let mut admitted_noncoincident_peaks = 0;
     for _ in 0..RANDOM_CASES * 16 {

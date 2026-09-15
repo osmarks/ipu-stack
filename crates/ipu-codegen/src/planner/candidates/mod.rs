@@ -9,6 +9,7 @@ use crate::{
     AttentionStrategy, ConversionStreamingPolicy, GemmOutputPacking, GemmPlanConstraint,
     PipelineConfig,
 };
+use ipu_target::ipu21::memory::{IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES};
 use rayon::prelude::*;
 
 use crate::planner::cache::FragmentCache;
@@ -1088,9 +1089,9 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                     .saturating_add(partial_bytes);
                 let reduction_bytes = partial_bytes.saturating_mul(4);
                 let temporary_bytes = convolution_bytes.max(reduction_bytes);
-                if temporary_bytes > u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                if temporary_bytes > u64::from(IPU21_PLANNED_DATA_BYTES)
                     || right_bytes.saturating_add(partial_bytes)
-                        > u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+                        > u64::from(IPU21_INTERLEAVED_REGION_BYTES)
                 {
                     continue;
                 }
@@ -1814,11 +1815,11 @@ pub(super) fn plan_fits_operator_memory(
             standard: peak.standard.max(tensor.standard),
             interleaved: peak.interleaved.max(tensor.interleaved),
         });
-    peak.interleaved <= u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES)
+    peak.interleaved <= u64::from(IPU21_INTERLEAVED_REGION_BYTES)
         && peak
             .total()
             .saturating_add(config.standard_memory_reservation_bytes)
             <= config
                 .tile_memory_budget_bytes
-                .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+                .min(u64::from(IPU21_PLANNED_DATA_BYTES))
 }

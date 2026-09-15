@@ -6,6 +6,7 @@ use crate::planner::error::LoweringResult;
 #[cfg(test)]
 use crate::tensor::AmpOrder;
 use crate::tensor::{ElementOrder, Layout, TensorType};
+use ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES;
 use std::collections::BTreeMap;
 
 /// Keep small broadcasts in transfer-sized chunks rather than eight-byte
@@ -19,7 +20,7 @@ pub(super) fn compact_parameter_layout(
         let grain = tensor.format.layout.tiling.linear_grain()?;
         let limit = config
             .tile_memory_budget_bytes
-            .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES))
+            .min(u64::from(IPU21_PLANNED_DATA_BYTES))
             .saturating_sub(config.standard_memory_reservation_bytes);
         let chunks_per_owner =
             limit / (u64::from(grain) * tensor.format.precision.bytes() * u64::from(copies));
@@ -54,7 +55,7 @@ pub(super) fn compact_parameter_layout(
     (bytes.saturating_add(config.standard_memory_reservation_bytes)
         <= config
             .tile_memory_budget_bytes
-            .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)))
+            .min(u64::from(IPU21_PLANNED_DATA_BYTES)))
     .then_some(layout)
 }
 

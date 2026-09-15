@@ -13,6 +13,21 @@ pub const IPU21_INTERLEAVED_MEMORY_BASE: u32 = IPU21_EXECUTABLE_MEMORY_LIMIT;
 pub const IPU21_INTERLEAVED_REGION_LIMIT: u32 = TILE_MEMORY_BASE + TILE_MEMORY_SIZE;
 pub const IPU21_INTERLEAVED_ELEMENT_SIZE: u32 = 2 * TILE_MEMORY_ELEMENT_SIZE;
 
+// Memory available under the resident runtime and SDK loader contracts.
+/// First byte after the permanently reserved runtime state.
+pub const IPU21_DATA_BASE: u32 =
+    super::runtime_layout::RUNTIME_STATE_BASE + super::runtime_layout::RUNTIME_STATE_BYTES;
+/// Loader-populatable region 1 storage available to interleaved data.
+pub const IPU21_INTERLEAVED_REGION_BYTES: u32 =
+    super::loader_abi::APPLICATION_LOAD_LIMIT - IPU21_INTERLEAVED_MEMORY_BASE;
+/// Standard-addressable storage which is not borrowed from region 1.
+pub const IPU21_STANDARD_FIXED_BYTES: u32 = IPU21_INTERLEAVED_MEMORY_BASE - IPU21_DATA_BASE;
+/// Total tile SRAM available to planned values after permanent runtime state.
+pub const IPU21_PLANNED_DATA_BYTES: u32 =
+    IPU21_STANDARD_FIXED_BYTES + IPU21_INTERLEAVED_REGION_BYTES;
+/// Default standard-memory allowance for linked support, exchange rows and profiling.
+pub const IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES: u32 = 3 * TILE_MEMORY_ELEMENT_SIZE;
+
 /// Base addresses of SRAM contention regions touched by a word range.
 /// Interleaved accesses occupy pairs of physical elements.
 pub fn effective_memory_elements(address: u32, words: u32) -> Vec<u32> {

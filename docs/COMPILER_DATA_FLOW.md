@@ -65,14 +65,16 @@ physical routing/pairing. Its C600 module supplies the compute-tile inventory.
 takes that topology to construct multicast and point-to-point programs. Timing
 selection, row encoding and measured scheduling margins remain in exchange.
 
-[loader_abi](../crates/ipu-package/src/loader_abi.rs) defines the SDK secondary
+[loader_abi](../crates/ipu-target/src/ipu21/loader_abi.rs) defines the SDK secondary
 loader's frame sizes, startup handoff and loadable address limit. Package
 validation and the driver consume those definitions. The limit is smaller than
 architectural SRAM and is not a target-capacity constant. Codegen imports this
-ABI directly and has no dependency on the driver.
+ABI from `ipu-target` and has no dependency on the driver.
 
-[runtime_layout](../crates/ipu-codegen/src/runtime_layout.rs) supplies the resident
-runtime's window, descriptor and stack conventions. Host packet encoding receives
+[runtime_layout](../crates/ipu-target/src/ipu21/runtime_layout.rs) supplies the resident
+runtime's window, descriptor and stack conventions. The usable-memory constants
+in `ipu-target::ipu21::memory` derive from these runtime and loader contracts.
+Host packet encoding receives
 the configured window base; it does not select a runtime address. Rust and
 [static_runtime.S](../device/static_runtime.S) read the same `.def` inputs for
 register IDs, supervisor opcodes and runtime layout. [build/abi.rs](../build/abi.rs)

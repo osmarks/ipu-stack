@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
 pub const CONFIG_BAR_SIZE: usize = 0x80000;
-pub use ipu_package::loader_abi::*;
+pub use ipu_target::ipu21::loader_abi::*;
 pub use ipu_target::ipu21::memory::TILE_MEMORY_SIZE;
 const TILE_DEBUG_BASE: u32 = 0x30000;
 const TILE_DEBUG_TILE_STRIDE: u32 = 0x40;

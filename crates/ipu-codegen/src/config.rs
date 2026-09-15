@@ -5,6 +5,9 @@ use crate::planner::OperatorCandidate;
 use crate::planner::catalogue::{default_operator_candidates, operator_candidates_for_tile_count};
 use crate::planner::operator::{GemmOrientation, LocalOperandStaging};
 use crate::tensor::{MemoryClass, Precision, TensorFormat};
+use ipu_target::ipu21::memory::{
+    IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES, IPU21_PLANNED_DATA_BYTES,
+};
 use std::collections::{BTreeMap, BTreeSet};
 /// Exact blocked-GEMM geometry retained for planner diagnosis. Constraints
 /// are keyed by the source graph operation and bypass candidate pruning and
@@ -160,10 +163,8 @@ impl PipelineConfig {
             exchange_table_cost_per_byte: 0,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,
-            standard_memory_reservation_bytes: u64::from(
-                crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
-            ),
-            tile_memory_budget_bytes: u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+            standard_memory_reservation_bytes: u64::from(IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+            tile_memory_budget_bytes: u64::from(IPU21_PLANNED_DATA_BYTES),
             profiling: false,
             diagnostic_checkpoints: false,
             conversion_streaming: ConversionStreamingPolicy::WhenRequired,

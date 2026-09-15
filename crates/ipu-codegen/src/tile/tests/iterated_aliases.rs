@@ -171,12 +171,12 @@ fn repeat_pointers_use_complete_placed_access_requirements() {
         let low = lower_to_tiles(&std::sync::Arc::new(graph), false);
         // The same sequence contract must work in either physical region.
         for base in [
-            crate::memory::IPU21_DATA_BASE,
+            ipu_target::ipu21::memory::IPU21_DATA_BASE,
             ipu_target::ipu21::memory::IPU21_INTERLEAVED_MEMORY_BASE,
         ] {
             let placement = crate::place::place_with_ranges(
                 &low,
-                &[(base, ipu_package::loader_abi::APPLICATION_LOAD_LIMIT)],
+                &[(base, ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT)],
             )
             .unwrap();
             let sequence = &low.repeat_runs[0].binding.iterated[0];

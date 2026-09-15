@@ -2,6 +2,7 @@
 //! Tensor search, placement and exchange scheduling belong to the compiler driver.
 use ipu_target::ipu21::fabric::Topology;
 use ipu_target::ipu21::instruction::{encode_br_m, encode_setzi_m};
+use ipu_target::ipu21::memory::IPU21_DATA_BASE;
 use ipu_target::ipu21::memory::TILE_MEMORY_BASE;
 mod bindings;
 use bindings::{PackageBindings, auxiliary_ranges};
@@ -19,26 +20,27 @@ use crate::host;
 use crate::low::LowProgram;
 use crate::memory::{
     MemoryAllocation, MemoryLayoutError, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE,
-    RUNTIME_STATE_BASE, RUNTIME_STATE_BYTES, TileMemoryMap, WORKER_STACK_HEADROOM,
-};
-use crate::runtime_layout::{
-    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, HOST_RUN_SYMBOL, PRNG_SEED_SYMBOL,
-    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, SAMPLE_CYCLE_SYMBOL,
-    WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL, WORKER_SYNC_CONTEXT_SYMBOL,
+    TileMemoryMap,
 };
 use crate::{
     CodegenOptions, KernelBuildPlan, TileProgram, TileProgramLowering, emit, shard_storage_bytes,
 };
 use crate::{PipelineConfig, Precision, TileGraph};
+use ipu_target::ipu21::runtime_layout::{
+    COMPLETE_SYMBOL, COMPLETION_ADDRESS_SYMBOL, HOST_RUN_SYMBOL, PRNG_SEED_SYMBOL,
+    PROGRAM_ADDRESS_SYMBOL, REPEAT_CALL_SYMBOL, RUNTIME_ENTRY_SYMBOL, RUNTIME_STATE_BASE,
+    RUNTIME_STATE_BYTES, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL, WORKER_STACK_BASE_SYMBOL,
+    WORKER_STACK_HEADROOM, WORKER_SYNC_CONTEXT_SYMBOL,
+};
 
 use ipu_elf::{ElfError, LinkOptions, LinkedImage, Toolchain, link};
-use ipu_package::loader_abi::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use ipu_package::{
     Application, Binding, DEBUG_ALL_TILES, DebugRegion, DebugSymbol, EntryPoint,
     PROFILE_CYCLES_BINDING, PackageError, ProfileExchangeActivity, ProfileExchangeActivityKind,
     ProfileMetadata, ProfileStep, ProfileStepKind, RegionSlice, SEGMENT_EXECUTE, SEGMENT_READ,
     SEGMENT_WRITE, Segment, TileImage, TileProfilePlan,
 };
+use ipu_target::ipu21::loader_abi::{APPLICATION_LOAD_BASE, TILES_PER_BATCH};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -691,7 +693,10 @@ fn link_runtime(
         &LinkOptions {
             image_base: TILE_MEMORY_BASE,
             regions: vec![
-                (SUPPORT_START, crate::runtime_layout::EXCHANGE_WINDOW_BASE),
+                (
+                    SUPPORT_START,
+                    ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE,
+                ),
                 (
                     RUNTIME_EXECUTABLE_START,
                     ipu_target::ipu21::memory::IPU21_EXECUTABLE_MEMORY_LIMIT,
@@ -708,18 +713,18 @@ fn runtime_retained_symbols(program: &LowProgram, config: &PipelineConfig) -> Ve
     let mut symbols = vec![COMPLETE_SYMBOL.into()];
     if !program.exchange_phases.is_empty() {
         symbols.push(WORKER_BARRIER_SYMBOL.into());
-        symbols.push(crate::runtime_layout::PATCH_ROW_SYMBOL.into());
+        symbols.push(ipu_target::ipu21::runtime_layout::PATCH_ROW_SYMBOL.into());
         if !program.repeat_runs.is_empty() {
-            symbols.push(crate::runtime_layout::PATCH_REPEAT_TABLES_SYMBOL.into());
-            symbols.push(crate::runtime_layout::PATCH_REPEAT_ARITHMETIC_SYMBOL.into());
+            symbols.push(ipu_target::ipu21::runtime_layout::PATCH_REPEAT_TABLES_SYMBOL.into());
+            symbols.push(ipu_target::ipu21::runtime_layout::PATCH_REPEAT_ARITHMETIC_SYMBOL.into());
         }
     }
     if config.profiling {
         symbols.push(SAMPLE_CYCLE_SYMBOL.into());
     }
     if !program.inputs.is_empty() || !program.outputs.is_empty() {
-        symbols.push(crate::runtime_layout::HOST_RUN_SYMBOL.into());
-        symbols.push(crate::runtime_layout::REPEAT_CALL_SYMBOL.into());
+        symbols.push(ipu_target::ipu21::runtime_layout::HOST_RUN_SYMBOL.into());
+        symbols.push(ipu_target::ipu21::runtime_layout::REPEAT_CALL_SYMBOL.into());
     }
     symbols
 }
@@ -746,7 +751,7 @@ fn runtime_symbols(
         (PROGRAM_ADDRESS_SYMBOL.into(), program_address),
         (COMPLETION_ADDRESS_SYMBOL.into(), COMPLETION_ADDRESS),
         (
-            crate::runtime_layout::HOST_STAGING_SYMBOL.into(),
+            ipu_target::ipu21::runtime_layout::HOST_STAGING_SYMBOL.into(),
             host_staging_address,
         ),
     ]))
@@ -784,11 +789,11 @@ fn linked_end(linked: &LinkedImage) -> PackageBuildResult<u32> {
 fn reserve_fixed_runtime_memory(memory: &mut TileMemoryMap) -> PackageBuildResult<()> {
     memory.reserve(
         "host exchange aperture",
-        crate::runtime_layout::EXCHANGE_WINDOW_BASE
-            ..crate::runtime_layout::EXCHANGE_WINDOW_BASE
-                + crate::runtime_layout::EXCHANGE_WINDOW_BYTES,
+        ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE
+            ..ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE
+                + ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BYTES,
     )?;
-    memory.reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)?;
+    memory.reserve("runtime state", RUNTIME_STATE_BASE..IPU21_DATA_BASE)?;
     Ok(())
 }
 
@@ -969,19 +974,19 @@ mod tests {
     fn runtime_state_tail_can_hold_data_but_never_code() {
         let mut memory = TileMemoryMap::new();
         memory
-            .reserve("runtime state", RUNTIME_STATE_BASE..crate::IPU21_DATA_BASE)
+            .reserve("runtime state", RUNTIME_STATE_BASE..IPU21_DATA_BASE)
             .unwrap();
         let data = memory
             .allocate(MemoryRequest {
                 name: "host descriptors",
                 bytes: 6280,
                 alignment: 4,
-                bounds: crate::IPU21_DATA_BASE..ipu_package::loader_abi::APPLICATION_LOAD_LIMIT,
+                bounds: IPU21_DATA_BASE..ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT,
                 end_alignment: 4,
                 guard_after: 0,
             })
             .unwrap();
-        assert_eq!(data.range.start, crate::IPU21_DATA_BASE);
+        assert_eq!(data.range.start, IPU21_DATA_BASE);
         assert!(data.range.end < RUNTIME_EXECUTABLE_START);
         let code = allocate_package_code(&mut memory, "code", 128, 8, 0).unwrap();
         assert_eq!(code.range.start, RUNTIME_EXECUTABLE_START);

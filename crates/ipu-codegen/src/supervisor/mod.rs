@@ -3,10 +3,6 @@
 use crate::kernel::abi::{
     FIRST_INPUT_REGISTER, LAST_VALUE_REGISTER, OUTPUT_REGISTER, RETURN_REGISTER,
 };
-use crate::runtime_layout::{
-    COMPLETE_SYMBOL, HOST_RUN_SYMBOL, PATCH_REPEAT_ARITHMETIC_SYMBOL, PATCH_REPEAT_TABLES_SYMBOL,
-    PATCH_ROW_SYMBOL, REPEAT_CALL_SYMBOL, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL,
-};
 use ipu_target::ipu21::instruction::{
     SANS_INACTIVE_INSTRUCTION, SYNC_SUPERVISOR_INSTRUCTION, encode_add_m_immediate, encode_br_m,
     encode_brz_m_immediate, encode_call_m_immediate, encode_ld32_m_immediate, encode_put_special_m,
@@ -14,6 +10,10 @@ use ipu_target::ipu21::instruction::{
 };
 use ipu_target::ipu21::registers::{
     INCOMING_BASE, INCOMING_DCOUNT, INCOMING_FORMAT, INCOMING_MUX, INCOMING_MUXPAIR, OUTGOING_BASE,
+};
+use ipu_target::ipu21::runtime_layout::{
+    COMPLETE_SYMBOL, HOST_RUN_SYMBOL, PATCH_REPEAT_ARITHMETIC_SYMBOL, PATCH_REPEAT_TABLES_SYMBOL,
+    PATCH_ROW_SYMBOL, REPEAT_CALL_SYMBOL, SAMPLE_CYCLE_SYMBOL, WORKER_BARRIER_SYMBOL,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

@@ -1,8 +1,10 @@
-use crate::runtime_layout::{HOST_CLOSE_ADDRESS, HOST_PACKET_ADDRESS, HOST_STAGING_ADDRESS};
 use crate::{HostPhase, HostProgram};
 use ipu_package::{
     Binding, HostCall, HostExchange, HostPage, HostSlice, RegionSlice, SEGMENT_EXECUTE,
     SEGMENT_READ, Segment,
+};
+use ipu_target::ipu21::runtime_layout::{
+    HOST_CLOSE_ADDRESS, HOST_PACKET_ADDRESS, HOST_STAGING_ADDRESS,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -82,7 +84,7 @@ pub(crate) fn plan(
         transfer.copy_destination = Some(transfer.tile_address);
         transfer.tile_address = HOST_STAGING_ADDRESS;
         crate::exchange::plan_host_to_tile(
-            crate::runtime_layout::EXCHANGE_WINDOW_BASE,
+            ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -162,7 +164,7 @@ pub(crate) fn plan(
         programs,
         segments: all_segments,
         protocol: HostExchange {
-            startup_mark: ipu_package::loader_abi::HOST_EXCHANGE_HANDOFF_MARK,
+            startup_mark: ipu_target::ipu21::loader_abi::HOST_EXCHANGE_HANDOFF_MARK,
             command_page: 0,
             command_offset: 0,
             pages: vec![
@@ -427,7 +429,7 @@ fn phase_instructions(
 fn target_program(transfer: Transfer) -> PackageBuildResult<crate::exchange::TileToHostProgram> {
     Ok(match transfer.direction {
         Direction::ToTile => crate::exchange::assemble_host_to_tile_target_program(
-            crate::runtime_layout::EXCHANGE_WINDOW_BASE,
+            ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -435,7 +437,7 @@ fn target_program(transfer: Transfer) -> PackageBuildResult<crate::exchange::Til
             HOST_PACKET_ADDRESS + 8,
         )?,
         Direction::ToHost => crate::exchange::assemble_tile_to_host_target_program(
-            crate::runtime_layout::EXCHANGE_WINDOW_BASE,
+            ipu_target::ipu21::runtime_layout::EXCHANGE_WINDOW_BASE,
             transfer.physical_tile,
             transfer.tile_address,
             transfer.host_offset,
@@ -451,7 +453,7 @@ fn descriptor_words(
     packet_source: u32,
     packet_words: u32,
     target_only: bool,
-) -> PackageBuildResult<[u32; crate::runtime_layout::HOST_RUN_DESCRIPTOR_WORDS]> {
+) -> PackageBuildResult<[u32; ipu_target::ipu21::runtime_layout::HOST_RUN_DESCRIPTOR_WORDS]> {
     let (destination, copy_words) = target
         .and_then(|transfer| Some((transfer.copy_destination?, transfer.bytes / 4)))
         .unwrap_or_default();

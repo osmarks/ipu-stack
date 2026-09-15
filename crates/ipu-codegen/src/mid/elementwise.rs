@@ -300,8 +300,8 @@ mod tests {
         };
         let fused = program
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .unwrap();
         assert_eq!(fused.operations.len(), 2);
@@ -331,8 +331,8 @@ mod tests {
         assert!(
             independent
                 .with_elementwise_fusions(
-                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
                 )
                 .is_some()
         );
@@ -340,8 +340,8 @@ mod tests {
         assert!(
             independent
                 .with_elementwise_fusions(
-                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
                 )
                 .is_none()
         );
@@ -374,8 +374,8 @@ mod tests {
         });
         let fused_norm = norm
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .unwrap();
         assert_eq!(fused_norm.operations.len(), 4); // activation, gamma, beta copies + LN
@@ -401,8 +401,8 @@ mod tests {
         });
         let fused_bias = bias
             .with_elementwise_fusions(
-                u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
             )
             .unwrap();
         assert_eq!(fused_bias.operations.len(), 3); // activation/bias copies + producer
@@ -417,8 +417,8 @@ mod tests {
         assert!(
             program
                 .with_elementwise_fusions(
-                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
                 )
                 .is_none()
         );
@@ -518,8 +518,8 @@ mod tests {
                     ..MidProgram::default()
                 };
                 let fused = program.with_elementwise_fusions(
-                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
                 );
                 // The faster FP16 affine path makes separate LN + cast
                 // cheaper at this width, even for one row.
@@ -540,8 +540,10 @@ mod tests {
                 assert!(
                     program
                         .with_elementwise_fusions(
-                            u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                            u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)
+                            u64::from(
+                                ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES
+                            ),
+                            u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES)
                         )
                         .is_none()
                 );
@@ -606,8 +608,8 @@ mod tests {
                 }
                 let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
                 let fused = mid.with_elementwise_fusions(
-                    u64::from(crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
-                    u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES),
+                    u64::from(ipu_target::ipu21::memory::IPU21_PLANNED_DATA_BYTES),
                 );
                 assert_eq!(fused.is_some(), !keep_sum, "norm={norm}");
                 if let Some(fused) = fused {

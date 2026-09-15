@@ -1,6 +1,7 @@
 //! Opt-in explanations of the planner's existing memory estimate.
 use super::*;
 use crate::{Compute, ComputeGraph, MidOperationKind, PipelineConfig};
+use ipu_target::ipu21::memory::{IPU21_INTERLEAVED_REGION_BYTES, IPU21_PLANNED_DATA_BYTES};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -260,8 +261,8 @@ fn profile(
         tile_count: config.tile_count,
         budget_bytes: config
             .tile_memory_budget_bytes
-            .min(u64::from(crate::memory::IPU21_PLANNED_DATA_BYTES)),
-        interleaved_budget_bytes: u64::from(crate::memory::IPU21_INTERLEAVED_REGION_BYTES),
+            .min(u64::from(IPU21_PLANNED_DATA_BYTES)),
+        interleaved_budget_bytes: u64::from(IPU21_INTERLEAVED_REGION_BYTES),
         standard_contiguous_overflow_bytes: peak.standard_contiguous_overflow_with_reservation(
             config.standard_memory_reservation_bytes,
         ),
