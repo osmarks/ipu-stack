@@ -51,10 +51,7 @@ pub struct ShardView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardDefinition {
     Value(MidValueId),
-    /// Transient storage populated by one or more exchange phases.
-    ExchangeStaging,
-    LocalCopy(BlockValueId),
-    /// Persistent scratch allocation populated by local copies or exchanges.
+    /// Scratch storage populated by compute, local copies or exchanges.
     Staging,
     Alias(BlockValueId),
     /// Alias intentionally used as an in-place operation destination.
@@ -65,8 +62,6 @@ pub enum ShardDefinition {
         source: BlockValueId,
         offset: i32,
     },
-    /// Canonical format placeholder replaced by dispatch-local staging.
-    Unmaterialized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

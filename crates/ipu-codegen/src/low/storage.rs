@@ -49,8 +49,7 @@ pub(crate) fn bind_storage(
         || root.tile != shard.tile
         || matches!(
             root.definition,
-            ShardDefinition::Unmaterialized
-                | ShardDefinition::Alias(_)
+            ShardDefinition::Alias(_)
                 | ShardDefinition::WritableAlias(_)
                 | ShardDefinition::ShiftedAlias { .. }
         )
@@ -301,8 +300,6 @@ mod tests {
         assert_eq!(addresses, vec![2, 3, 4, 5, 18, 19, 20, 21]);
         assert_eq!(bound.shard.tensor_type.format.precision.bytes(), 1);
 
-        shards[0].definition = ShardDefinition::Unmaterialized;
-        assert!(view.bind(&shards).is_err());
         shards[0].definition = ShardDefinition::Alias(BlockValueId(3));
         assert!(view.bind(&shards).is_err(), "alias cycle");
         shards[0].definition = ShardDefinition::Alias(BlockValueId(9));

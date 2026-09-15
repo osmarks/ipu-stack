@@ -455,8 +455,7 @@ pub(crate) fn diagnostic_tensor(
         .iter()
         .filter_map(|view| {
             let storage = low.shards.get(view.shard.index() as usize)?;
-            (storage.definition != crate::ShardDefinition::Unmaterialized)
-                .then_some((view, storage))
+            Some((view, storage))
         })
         .map(|(view, storage)| {
             let address = placement

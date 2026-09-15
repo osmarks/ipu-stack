@@ -467,13 +467,8 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
             lifetimes[shard.shard.index() as usize].touch(u32::MAX);
         }
     }
-    for (index, lifetime) in lifetimes.iter_mut().enumerate() {
-        if !lifetime.seen
-            && !matches!(
-                program.shards[index].definition,
-                ShardDefinition::Unmaterialized
-            )
-        {
+    for lifetime in &mut lifetimes {
+        if !lifetime.seen {
             lifetime.touch(0);
         }
     }
@@ -1889,13 +1884,8 @@ mod tests {
             )
             .unwrap();
             let kernels = KernelBuildPlan::from_program(&low).unwrap();
-            let resident = low
-                .shards
-                .iter()
-                .filter(|shard| !matches!(shard.definition, crate::ShardDefinition::Unmaterialized))
-                .collect::<Vec<_>>();
-            assert_eq!(placement.shard_addresses.len(), resident.len());
-            for shard in resident {
+            assert_eq!(placement.shard_addresses.len(), low.shards.len());
+            for shard in &low.shards {
                 let address = placement.shard_addresses[&shard.id];
                 match shard.tensor_type.format.layout.memory_class {
                     MemoryClass::Ipu21Interleaved => {

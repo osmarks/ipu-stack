@@ -211,7 +211,7 @@ fn candidate(
                 tile,
                 tensor_type: tensor_type.clone(),
                 extents: extents.clone(),
-                definition: ShardDefinition::ExchangeStaging,
+                definition: ShardDefinition::Staging,
             };
             let expected = u64::from(shard_storage_bytes(&relay)?);
             let mut covered = 0u64;
@@ -417,7 +417,7 @@ mod tests {
         assert!(
             program.shards[48..]
                 .iter()
-                .all(|s| s.definition == ShardDefinition::ExchangeStaging)
+                .all(|s| s.definition == ShardDefinition::Staging)
         );
     }
 

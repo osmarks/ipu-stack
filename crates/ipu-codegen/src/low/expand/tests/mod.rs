@@ -349,20 +349,6 @@ fn factor_mappings_keep_the_bound_source_selection() {
             )
             .is_err()
     );
-    let mut unavailable = builder.shards[source.index() as usize].clone();
-    unavailable.definition = ShardDefinition::Unmaterialized;
-    let unavailable = builder.push_shard(unavailable).unwrap();
-    assert!(matches!(
-        builder.bind_kernel(
-            provenance,
-            MidOperationKind::Gelu,
-            vec![builder.full_view(unavailable)],
-            vec![builder.full_view(source)]
-        ),
-        Err(ExpansionError::Kernel(crate::KernelError::Storage(
-            StorageError::InvalidView
-        )))
-    ));
 }
 
 fn format(tiles: u16) -> TensorFormat {
@@ -406,14 +392,6 @@ fn panel_construction_keeps_both_operand_casts_materialized() {
     let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
     for cast in casts {
         assert!(!low.value_views(cast.results[0]).is_empty());
-        assert!(
-            low.value_views(cast.results[0])
-                .iter()
-                .all(|shard| !matches!(
-                    low.shards[shard.shard.index() as usize].definition,
-                    ShardDefinition::Unmaterialized
-                ))
-        );
     }
 }
 
@@ -817,11 +795,6 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
         for run in &low.kernel_runs {
             if matches!(run.kernel, MidOperationKind::Gemm { .. }) {
                 let input = &run.inputs[0];
-                assert_ne!(
-                    low.shards[input.shard.index() as usize].definition,
-                    ShardDefinition::Unmaterialized,
-                    "case {case}"
-                );
                 let inner = input.extents.last().unwrap();
                 let MidOperationKind::Gemm { inner_block, .. } = &run.kernel else {
                     continue;
@@ -899,7 +872,7 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
 #[test]
 fn randomized_same_order_retiles_exchange_into_final_values() {
     let mut random = fastrand::Rng::with_seed(0x6469_7265_6374_7265);
-    for case in 0..CASES {
+    for _ in 0..CASES {
         let source_rows = 1_u16 << random.u32(0..=3);
         let source_columns = 1_u16 << random.u32(0..=3);
         let tiles = source_rows * source_columns;
@@ -963,12 +936,6 @@ fn randomized_same_order_retiles_exchange_into_final_values() {
                 ));
             }
         }
-        assert!(
-            low.shards
-                .iter()
-                .all(|shard| !matches!(shard.definition, ShardDefinition::ExchangeStaging)),
-            "case {case}"
-        );
         assert!(low.local_copies.iter().all(|copy| {
             low.shards[copy.movement().source.index() as usize].tile
                 == low.shards[copy.movement().destination.index() as usize].tile
@@ -1267,7 +1234,7 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
                     physical_end: AMP_COLUMN_MICRO,
                 },
             ],
-            definition: ShardDefinition::ExchangeStaging,
+            definition: ShardDefinition::Staging,
         };
         let destination = BlockValue {
             id: BlockValueId(1),
@@ -1298,7 +1265,7 @@ fn randomized_micro_panel_mappings_carry_word_aligned_row_padding() {
                     physical_end: AMP_COLUMN_MICRO,
                 },
             ],
-            definition: ShardDefinition::ExchangeStaging,
+            definition: ShardDefinition::Staging,
         };
         let logical_view = |shard: &BlockValue| ShardView {
             shard: shard.id,
@@ -1405,8 +1372,6 @@ fn randomized_schedules_make_kernel_operands_resident() {
                 assert!(transfer.destinations.iter().all(|destination| matches!(
                     low.shards[destination.shard.index() as usize].definition,
                     ShardDefinition::Value(_)
-                        | ShardDefinition::ExchangeStaging
-                        | ShardDefinition::LocalCopy(_)
                         | ShardDefinition::Staging
                 )));
             }
@@ -1455,13 +1420,6 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
                 })
                 .unwrap();
             assert_eq!(add.inputs[0].extents[0].logical_end, 1);
-            assert!(
-                !matches!(
-                    low.shards[add.inputs[0].shard.index() as usize].definition,
-                    ShardDefinition::Unmaterialized
-                ),
-                "broadcast must resolve locally reused input views"
-            );
             assert_eq!(
                 low.shards[add.inputs[0].shard.index() as usize].tile,
                 tile.tile

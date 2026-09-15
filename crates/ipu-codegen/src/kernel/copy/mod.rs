@@ -253,9 +253,6 @@ mod tests {
         }
         shards[1].tile = 1;
         assert!(CopyRun::bind(copy.clone(), &shards).is_err());
-        shards[1].tile = 0;
-        shards[0].definition = crate::ShardDefinition::Unmaterialized;
-        assert!(CopyRun::bind(copy, &shards).is_err());
 
         let shards = buffers(&[64, 64]);
         let mut copy = LocalCopy {
