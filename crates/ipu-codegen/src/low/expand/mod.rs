@@ -1,11 +1,13 @@
 //! Expand selected whole-device primitives into tile-local calls and movement.
+//!
+//! This module owns builder state, region dispatch, and shared graph construction.
+//! `compute` binds resident operands to calls; `copy` realizes movement and its
+//! initialization; `repeat` constructs loop bodies and their storage bindings.
 
 use crate::mid::MidOperationKind;
-mod emit;
 use crate::storage::GeometryCache;
 mod compute;
 
-mod buffers;
 mod copy;
 mod repeat;
 #[cfg(test)]
@@ -257,69 +259,125 @@ impl TileGraphBuilder {
         Ok(tiles)
     }
 
-    /// All these clears precede the copies. Overwriting a covered gap is safe
-    /// and cheaper than another launch when the gap is sufficiently small.
-    fn append_copy_clears(
+    // Shared graph construction: bind calls, assign table IDs, and register
+    // resident value views. Operator-specific selection lives in the child modules.
+    fn bind_kernel(
         &mut self,
-        tiles: &mut BlockRegion,
-        shard: BlockValueId,
-        ranges: &[crate::ByteSpan],
         provenance: WorkProvenance,
-    ) -> ExpansionResult<()> {
-        let block = &self.program.shards[shard.index() as usize];
-        let padding = crate::storage::uncovered_bytes(
-            block.storage(),
-            [block.extents.as_slice()],
-            CopyOrder::Semantic,
-        )?;
-        let padding_only = !padding.is_empty() && ranges == padding;
-        let bytes = shard_storage_bytes(block)?;
-        let mut ranges = ranges
-            .iter()
-            .map(|range| {
-                let start = range.offset / 8 * 8;
-                let end = (u64::from(range.offset) + u64::from(range.bytes)).div_ceil(8) * 8;
-                crate::ByteSpan {
-                    offset: start,
-                    bytes: end.min(u64::from(bytes)) as u32 - start,
-                }
-            })
-            .peekable();
-        let launch_bytes = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles * 48;
-        while let Some(mut range) = ranges.next() {
-            while let Some(next) = ranges.peek()
-                && u64::from(next.offset.saturating_sub(range.offset + range.bytes)) <= launch_bytes
-            {
-                range.bytes = next.offset + next.bytes - range.offset;
-                ranges.next();
-            }
-            self.append_zero_range(tiles, shard, range, padding_only, provenance)?;
+        kernel: MidOperationKind,
+        inputs: Vec<ShardView>,
+        outputs: Vec<ShardView>,
+    ) -> ExpansionResult<KernelRun> {
+        Ok(KernelRun::bind(
+            provenance,
+            kernel,
+            inputs,
+            outputs,
+            &self.program.shards,
+            &mut self.kernel_metadata,
+        )?)
+    }
+
+    fn push_shard(&mut self, mut shard: BlockValue) -> ExpansionResult<BlockValueId> {
+        let id = BlockValueId(
+            u32::try_from(self.program.shards.len()).map_err(|_| ExpansionError::IdOverflow)?,
+        );
+        shard.id = id;
+        self.program.shards.push(shard);
+        Ok(id)
+    }
+
+    fn value_views(&self, value: MidValueId) -> ExpansionResult<&[ShardView]> {
+        self.program
+            .value_views
+            .get(value.index() as usize)
+            .filter(|shards| !shards.is_empty())
+            .map(Vec::as_slice)
+            .ok_or(ExpansionError::UnknownValue(value))
+    }
+
+    fn full_view(&self, shard: BlockValueId) -> ShardView {
+        ShardView {
+            shard,
+            extents: self.program.shards[shard.index() as usize].extents.clone(),
         }
+    }
+
+    /// Bind a whole allocation when a write/region ABI needs its exact strides.
+    /// Read consumers use value_views and keep their logical selection.
+    fn allocation_shards(&self, value: MidValueId) -> ExpansionResult<Vec<BlockValueId>> {
+        self.value_views(value)?
+            .iter()
+            .map(|view| {
+                if view.extents != self.program.shards[view.shard.index() as usize].extents {
+                    return Err(ExpansionError::InvalidOperatorPlan);
+                }
+                Ok(view.shard)
+            })
+            .collect()
+    }
+
+    fn append_exchange_phase(
+        &mut self,
+        transfers: Vec<LogicalExchange>,
+        provenance: WorkProvenance,
+        tiles: &mut BlockRegion,
+    ) -> ExpansionResult<()> {
+        if transfers.is_empty() {
+            return Ok(());
+        }
+        let id = ExchangePhaseId(
+            u32::try_from(self.program.exchange_phases.len())
+                .map_err(|_| ExpansionError::IdOverflow)?,
+        );
+        self.program.exchange_phases.push(ExchangePhase {
+            id,
+            provenance,
+            transfers,
+        });
+        tracing::debug!(
+            phase = id.index(),
+            operation = ?provenance.operation.map(OperationId::index),
+            value = ?provenance.value.map(MidValueId::index),
+            reason = ?provenance.reason,
+            "scheduled exchange phase"
+        );
+        tiles.operations.push(BlockOperation::Exchange(id));
         Ok(())
     }
 
-    fn append_zero_range(
+    fn append_kernel(
         &mut self,
         tiles: &mut BlockRegion,
-        shard: BlockValueId,
-        range: crate::ByteSpan,
-        padding_only: bool,
-        provenance: WorkProvenance,
+        tile: u16,
+        run: KernelRun,
     ) -> ExpansionResult<()> {
-        let tile = self.program.shards[shard.index() as usize].tile;
-        {
-            let run = self.bind_kernel(
-                provenance,
-                MidOperationKind::FillZero {
-                    offset: range.offset,
-                    bytes: range.bytes,
-                    padding_only,
-                },
-                Vec::new(),
-                vec![self.full_view(shard)],
-            )?;
-            self.append_kernel(tiles, tile, run)
-        }
+        let id = KernelRunId(
+            u32::try_from(self.program.kernel_runs.len())
+                .map_err(|_| ExpansionError::IdOverflow)?,
+        );
+        self.program.kernel_runs.push(run);
+        tiles
+            .operations
+            .push(BlockOperation::Compute { tile, run: id });
+        Ok(())
+    }
+
+    fn append_local_copy(
+        &mut self,
+        tiles: &mut BlockRegion,
+        tile: u16,
+        copy: crate::kernel::CopyRun,
+    ) -> ExpansionResult<()> {
+        let id = LocalCopyId(
+            u32::try_from(self.program.local_copies.len())
+                .map_err(|_| ExpansionError::IdOverflow)?,
+        );
+        self.program.local_copies.push(copy);
+        tiles
+            .operations
+            .push(BlockOperation::Copy { tile, copy: id });
+        Ok(())
     }
 }
 

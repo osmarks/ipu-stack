@@ -104,6 +104,20 @@ impl TileGraphBuilder {
             })));
         Ok(())
     }
+    fn corresponding_shard(
+        &self,
+        value: MidValueId,
+        target: BlockValueId,
+    ) -> ExpansionResult<BlockValueId> {
+        let target = &self.program.shards[target.index() as usize];
+        self.allocation_shards(value)?
+            .into_iter()
+            .filter(|shard| self.program.shards[shard.index() as usize].extents == target.extents)
+            .min_by_key(|shard| {
+                u8::from(self.program.shards[shard.index() as usize].tile != target.tile)
+            })
+            .ok_or(ExpansionError::UnknownValue(value))
+    }
 }
 
 fn value_can_alias(value: MidValueId, target: MidValueId, operations: &[MidOperation]) -> bool {

@@ -468,6 +468,71 @@ impl TileGraphBuilder {
 
     // Destination packing cannot repair halfword reads from a source panel.
     // Gather that logical slice locally before sending it as whole words.
+    /// All these clears precede the copies. Overwriting a covered gap is safe
+    /// and cheaper than another launch when the gap is sufficiently small.
+    fn append_copy_clears(
+        &mut self,
+        tiles: &mut BlockRegion,
+        shard: BlockValueId,
+        ranges: &[crate::ByteSpan],
+        provenance: WorkProvenance,
+    ) -> ExpansionResult<()> {
+        let block = &self.program.shards[shard.index() as usize];
+        let padding = crate::storage::uncovered_bytes(
+            block.storage(),
+            [block.extents.as_slice()],
+            CopyOrder::Semantic,
+        )?;
+        let padding_only = !padding.is_empty() && ranges == padding;
+        let bytes = shard_storage_bytes(block)?;
+        let mut ranges = ranges
+            .iter()
+            .map(|range| {
+                let start = range.offset / 8 * 8;
+                let end = (u64::from(range.offset) + u64::from(range.bytes)).div_ceil(8) * 8;
+                crate::ByteSpan {
+                    offset: start,
+                    bytes: end.min(u64::from(bytes)) as u32 - start,
+                }
+            })
+            .peekable();
+        let launch_bytes = crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles * 48;
+        while let Some(mut range) = ranges.next() {
+            while let Some(next) = ranges.peek()
+                && u64::from(next.offset.saturating_sub(range.offset + range.bytes)) <= launch_bytes
+            {
+                range.bytes = next.offset + next.bytes - range.offset;
+                ranges.next();
+            }
+            self.append_zero_range(tiles, shard, range, padding_only, provenance)?;
+        }
+        Ok(())
+    }
+
+    fn append_zero_range(
+        &mut self,
+        tiles: &mut BlockRegion,
+        shard: BlockValueId,
+        range: crate::ByteSpan,
+        padding_only: bool,
+        provenance: WorkProvenance,
+    ) -> ExpansionResult<()> {
+        let tile = self.program.shards[shard.index() as usize].tile;
+        {
+            let run = self.bind_kernel(
+                provenance,
+                MidOperationKind::FillZero {
+                    offset: range.offset,
+                    bytes: range.bytes,
+                    padding_only,
+                },
+                Vec::new(),
+                vec![self.full_view(shard)],
+            )?;
+            self.append_kernel(tiles, tile, run)
+        }
+    }
+
     fn pack_exchange_source(
         &mut self,
         source: ShardView,
@@ -489,12 +554,24 @@ impl TileGraphBuilder {
             return Err(ExpansionError::InvalidCopyPlan);
         }
         let precision = shard.tensor_type.format.precision;
-        let staging = self.push_packed_buffer(
+        let elements =
+            u32::try_from(bytes / precision.bytes()).map_err(|_| ExpansionError::IdOverflow)?;
+        let staging = self.push_shard(BlockValue {
+            id: BlockValueId(0),
             tile,
-            u32::try_from(bytes / precision.bytes()).map_err(|_| ExpansionError::IdOverflow)?,
-            precision,
-            ShardDefinition::Staging,
-        )?;
+            tensor_type: TensorType::new(
+                [elements],
+                precision,
+                Layout::row_major(TensorTiling::replicated(1)),
+            ),
+            extents: vec![ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: elements,
+                physical_end: elements,
+            }],
+            definition: ShardDefinition::Staging,
+        })?;
         let view = self.full_view(staging);
         append_span_copies(
             &self.cache,

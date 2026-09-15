@@ -137,7 +137,7 @@ impl TileGraphBuilder {
         Ok(())
     }
 
-    pub(super) fn elementwise_view(
+    fn elementwise_view(
         &self,
         source: &ShardView,
         shape: &crate::TensorShape,
@@ -173,10 +173,7 @@ impl TileGraphBuilder {
 
     /// Preserve per-tile fragment order without rescanning all shards for each
     /// output. Lifetime-only dependencies follow the explicit operands.
-    pub(super) fn views_by_tile(
-        &self,
-        inputs: &[MidValueId],
-    ) -> ExpansionResult<Vec<Vec<Vec<ShardView>>>> {
+    fn views_by_tile(&self, inputs: &[MidValueId]) -> ExpansionResult<Vec<Vec<Vec<ShardView>>>> {
         inputs
             .iter()
             .map(|&value| {
@@ -190,7 +187,7 @@ impl TileGraphBuilder {
             .collect()
     }
 
-    pub(super) fn bind_compute_aliases(
+    fn bind_compute_aliases(
         &mut self,
         outputs: &[BlockValueId],
         aliases: &[(usize, usize)],
