@@ -40,16 +40,6 @@ pub(crate) struct PackageSupport {
     pub(super) exchange_rows: Option<MemoryAllocation>,
 }
 
-impl PackageSupport {
-    pub(crate) fn exchange_row_capacity(&self) -> u32 {
-        self.exchange_rows.as_ref().map_or(0, |storage| {
-            storage.reserved.end
-                - ipu_target::ipu21::memory::IPU21_SUPERVISOR_FETCH_LOOKAHEAD
-                - storage.range.start
-        })
-    }
-}
-
 pub(crate) fn size_support(
     program: &LowProgram,
     provisional_placement: &crate::Placement,

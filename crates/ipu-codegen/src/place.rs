@@ -4,10 +4,8 @@ use ipu_target::ipu21::memory::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
 mod dump;
-mod exchange;
 pub(crate) mod profile;
 mod search;
-pub(crate) use exchange::ExchangeConflicts;
 
 use crate::MemoryClass;
 use crate::low::storage::StorageAccess;

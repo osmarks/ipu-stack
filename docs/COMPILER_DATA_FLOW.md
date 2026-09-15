@@ -164,8 +164,7 @@ expands each retained candidate and checks transfer geometry before scheduling.
 [package/support.rs](../crates/ipu-codegen/src/package/support.rs) measures and
 reserves linked code, host/tile programs, rows, descriptors and profiling storage.
 Sizing never places tensors or schedules exchanges. The driver performs final
-placement and exchange replay, then explicitly evaluates the best cheap address
-proposal and retains it only if its exchanges improve within row capacity.
+placement and exchange replay using the normal allocator's result.
 Package emission consumes the retained result and checks all measured capacities.
 
 The provisional/final passes remain necessary: support changes available addresses,

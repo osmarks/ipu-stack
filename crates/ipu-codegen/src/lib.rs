@@ -2,7 +2,6 @@
 //! through explicit expansion, support sizing, placement and exchange feedback.
 //! The accepted result owns one final placement, schedule, package and cache.
 mod config;
-mod exchange_placement;
 
 use crate::estimate::Ipu21CostModel;
 use crate::estimate::memory_profile::write as memory_profile;
@@ -16,7 +15,6 @@ use crate::package::{
 use crate::planner::proposals;
 use crate::planner::{Candidate, Recipe, build};
 use ipu_elf::Toolchain;
-use ipu_target::ipu21::fabric::Topology;
 use rayon::prelude::*;
 use std::{path::PathBuf, sync::Arc};
 
@@ -478,7 +476,7 @@ fn evaluate_candidate(
     )?;
     drop(provisional_exchanges);
     drop(provisional_placement);
-    let mut placement =
+    let placement =
         tracing::info_span!("place_storage").in_scope(|| -> PackageBuildResult<_> {
             Ok(crate::place::place_with_auxiliary(
                 &program,
@@ -487,7 +485,7 @@ fn evaluate_candidate(
                 &support.profile_requests,
             )?)
         })?;
-    let mut exchanges =
+    let exchanges =
         tracing::info_span!("lower_exchanges").in_scope(|| -> PackageBuildResult<_> {
             Ok(crate::exchange::lower_exchanges_cached(
                 &program,
@@ -497,49 +495,6 @@ fn evaluate_candidate(
                 &mut cache,
             )?)
         })?;
-    tracing::info_span!("optimize_exchange_placement").in_scope(|| -> PackageBuildResult<_> {
-        if let Some(proposal) = exchange_placement::propose_exchange_placement(
-            &program,
-            &support.available_ranges,
-            &support.profile_requests,
-            &placement,
-        )? {
-            // A failed/slower alternative cannot contaminate the accepted cache.
-            let mut alternative_cache = cache.clone();
-            match crate::exchange::lower_exchanges_cached(
-                &program,
-                &proposal.placement,
-                &topology,
-                config.exchange_stream_words,
-                &mut alternative_cache,
-            ) {
-                Ok(alternative) => {
-                    let baseline_cycles =
-                        exchange_placement::exchange_cycles(&program, &exchanges.phases);
-                    let candidate_cycles =
-                        exchange_placement::exchange_cycles(&program, &alternative.phases);
-                    let row_bytes = crate::tile::compact_exchange_table_bytes(
-                        &alternative.phases,
-                        u16::try_from(Topology::c600().tile_count())?,
-                        program.tile_count,
-                    )?;
-                    let row_capacity = support.exchange_row_capacity();
-                    let accepted = candidate_cycles < baseline_cycles && row_bytes <= row_capacity;
-                    tracing::info!(offset = proposal.offset, baseline_score = %proposal.baseline_score,
-                        score = %proposal.score, baseline_cycles, candidate_cycles, row_bytes,
-                        row_capacity, accepted, "evaluated exchange placement candidate");
-                    if accepted {
-                        placement = proposal.placement;
-                        exchanges = alternative;
-                        cache = alternative_cache;
-                    }
-                }
-                Err(error) => tracing::info!(offset = proposal.offset, %error,
-                    "rejected unschedulable exchange placement"),
-            }
-        }
-        Ok(())
-    })?;
     let final_cost =
         crate::estimate::scheduled_program_cycles(&program.program, &exchanges.phases)?;
     tracing::info!(
