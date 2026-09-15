@@ -2617,5 +2617,16 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             build::build_candidate(&graph, &config, &Ipu21CostModel, &FragmentCache::default(), &recipe),
             Err(LoweringError::UnavailableCastChoice(site)) if site == unavailable
         ));
+        recipe.cast_before_copies.remove(&unavailable);
+        recipe
+            .cast_storage
+            .as_mut()
+            .unwrap()
+            .sites
+            .insert(unavailable.clone(), crate::mid::cast::CastStorage::Separate);
+        assert!(matches!(
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &FragmentCache::default(), &recipe),
+            Err(LoweringError::UnavailableCastStorageChoice(site)) if site == unavailable
+        ));
     }
 }

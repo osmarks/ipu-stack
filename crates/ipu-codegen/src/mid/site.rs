@@ -38,3 +38,30 @@ pub struct WorkSite {
     pub source: OperationId,
     pub local: LocalSite,
 }
+
+/// JSON object keys cannot represent structured work identities. Keep their
+/// fields intact as key/value pairs, rejecting ambiguous duplicate requests.
+pub(super) mod map {
+    use super::WorkSite;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        values: &BTreeMap<WorkSite, T>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        values.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<WorkSite, T>, D::Error> {
+        let mut result = BTreeMap::new();
+        for (site, value) in Vec::<(WorkSite, T)>::deserialize(deserializer)? {
+            if result.insert(site, value).is_some() {
+                return Err(D::Error::custom("duplicate work-site choice"));
+            }
+        }
+        Ok(result)
+    }
+}

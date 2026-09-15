@@ -75,7 +75,7 @@ fn saved_search_preserves_budget_aliases_and_order() {
         state
             .visited
             .iter()
-            .all(|recipe| recipe.in_place_casts.is_some())
+            .all(|recipe| recipe.cast_storage.is_some())
     );
     config.pipeline.optimization_steps = 0;
     let rebuilt = run(&config, 2);

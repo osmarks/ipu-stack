@@ -6,6 +6,8 @@ use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
+const VERSION: u32 = 3;
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {
     version: u32,
@@ -37,7 +39,7 @@ impl State {
         let context = format!("{graph:?}\n{normalized:?}\n{mapping:?}");
         let Some(path) = &config.load_search_state else {
             return Ok(Self {
-                version: 2,
+                version: VERSION,
                 context,
                 mapping: mapping.map(<[u16]>::to_vec),
                 ..Self::default()
@@ -47,21 +49,21 @@ impl State {
             serde_json::from_slice(&std::fs::read(path)?).map_err(|error| {
                 invalid(format!("invalid search state {}: {error}", path.display()))
             })?;
-        if saved["version"] == 1 {
-            migrate_cast_site_schema(&mut saved)?;
+        if matches!(saved["version"].as_u64(), Some(1 | 2)) {
+            migrate_cast_schema(&mut saved)?;
         }
         let mut state: Self = serde_json::from_value(saved).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
-        if state.version == 2
+        if state.version == VERSION
             && state.context != context
             && matches_legacy_context(graph, &state.context, &context)
         {
             state.context = context.clone();
             tracing::info!("migrated checkpoint context without redundant bookkeeping");
         }
-        if state.version != 2 || state.context != context {
-            let detail = if state.version != 2 {
+        if state.version != VERSION || state.context != context {
+            let detail = if state.version != VERSION {
                 format!("unsupported schema version {}", state.version)
             } else {
                 context_difference(&state.context, &context)
@@ -122,27 +124,51 @@ impl State {
     }
 }
 
-/// Version one identified casts by their emission order within an operator.
-/// Carry those requests only until family construction can resolve their names.
-/// A new checkpoint serializes named choices, never these compatibility fields.
-fn migrate_cast_site_schema(saved: &mut serde_json::Value) -> PackageBuildResult<()> {
-    fn recipe(value: &mut serde_json::Value) -> PackageBuildResult<()> {
+/// Old ordinals survive only until construction can resolve their names. The
+/// former global storage switch becomes the effective default of a scoped policy.
+fn migrate_cast_schema(saved: &mut serde_json::Value) -> PackageBuildResult<()> {
+    let ordinal_sites = saved["version"] == 1;
+    let recipe = |value: &mut serde_json::Value| -> PackageBuildResult<()> {
         let object = value
             .as_object_mut()
             .ok_or_else(|| invalid("checkpoint recipe is not an object"))?;
-        if let Some(casts) = object.remove("cast_before_copies") {
+        if ordinal_sites && let Some(casts) = object.remove("cast_before_copies") {
             object.insert("legacy_cast_sites".into(), casts);
         }
+        if let Some(storage) = object.remove("in_place_casts")
+            && !storage.is_null()
+        {
+            use crate::mid::cast::{CastStorage, CastStoragePolicy};
+            let reuse = storage
+                .as_bool()
+                .ok_or_else(|| invalid("in_place_casts is not a boolean"))?;
+            let policy = CastStoragePolicy::new(if reuse {
+                CastStorage::ReuseIfSmaller
+            } else {
+                CastStorage::Separate
+            });
+            if object
+                .insert(
+                    "cast_storage".into(),
+                    serde_json::to_value(policy).map_err(|error| invalid(error.to_string()))?,
+                )
+                .is_some()
+            {
+                return Err(invalid(
+                    "checkpoint mixes legacy and scoped cast-storage choices",
+                ));
+            }
+        }
         Ok(())
-    }
+    };
     recipe(&mut saved["recipe"])?;
     if let Some(visited) = saved["visited"].as_array_mut() {
         for value in visited {
             recipe(value)?;
         }
     }
-    saved["version"] = 2.into();
-    tracing::info!("migrating ordinal cast choices to family-local sites");
+    saved["version"] = VERSION.into();
+    tracing::info!("migrating legacy cast choices to scoped policies");
     Ok(())
 }
 
@@ -209,6 +235,37 @@ mod tests {
     use crate::estimate::Ipu21CostModel;
 
     #[test]
+    fn legacy_cast_storage_defaults_preserve_incumbent_and_visited_choices() {
+        use crate::mid::cast::{CastStorage, CastStoragePolicy};
+        for reuse in [false, true] {
+            let mut saved = serde_json::to_value(State::default()).unwrap();
+            saved["version"] = 2.into();
+            saved["attempts"] = 17.into();
+            saved["recipe"]
+                .as_object_mut()
+                .unwrap()
+                .remove("cast_storage");
+            saved["recipe"]["in_place_casts"] = reuse.into();
+            saved["visited"] = serde_json::json!([saved["recipe"].clone()]);
+            migrate_cast_schema(&mut saved).unwrap();
+            let state: State = serde_json::from_value(saved).unwrap();
+            let expected = CastStoragePolicy::new(if reuse {
+                CastStorage::ReuseIfSmaller
+            } else {
+                CastStorage::Separate
+            });
+            assert_eq!(state.attempts, 17);
+            assert_eq!(state.recipe.cast_storage, Some(expected.clone()));
+            assert_eq!(state.visited[0].cast_storage, Some(expected));
+            assert!(
+                serde_json::to_value(state).unwrap()["recipe"]
+                    .get("in_place_casts")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn ordinal_cast_checkpoint_replays_and_saves_named_choices() {
         use crate::planner::{build_candidate, cache::FragmentCache};
 
@@ -261,6 +318,11 @@ mod tests {
         state.attempts = 29;
         let mut saved = serde_json::to_value(&state).unwrap();
         saved["version"] = 1.into();
+        saved["recipe"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cast_storage");
+        saved["recipe"]["in_place_casts"] = false.into();
         saved["recipe"]["cast_before_copies"] = serde_json::json!([[
             state.recipe.cast_before_copies.first().unwrap().source,
             ordinal
@@ -286,9 +348,10 @@ mod tests {
         resumed.save(&config, &actual, &config).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(saved["version"], 2);
+        assert_eq!(saved["version"], VERSION);
         assert!(saved["recipe"].get("legacy_cast_sites").is_none());
         assert!(saved["recipe"].get("early_casts").is_none());
+        assert!(saved["recipe"].get("in_place_casts").is_none());
         let replay = State::load(&graph, &config, None).unwrap();
         assert_eq!(replay.attempts, 29);
         assert!(replay.recipe == actual.recipe);

@@ -123,8 +123,17 @@ Names never depend on arena IDs or the number of earlier emitted operations.
 Cast-order requests in Recipe refer to these sites. Checkpoint loading preserves
 old ordinal requests only until construction can resolve them; new checkpoints
 store names. Missing cast choices are errors, and mid validation rejects names
-that ambiguously refer to more than one operation. The other preparation policies
-are still global and remain a refactor requirement.
+that ambiguously refer to more than one operation.
+
+Cast-storage policy belongs to [mid/cast.rs](../crates/ipu-codegen/src/mid/cast.rs).
+Recipe stores an effective default, operator defaults and individual site
+overrides. Operator defaults also cover casts introduced by a new layout. The
+rewrite realizes reuse only for safe, storage-saving donations and records the
+result in the ordinary allocation aliases. Search proposes individual choices
+and joint layout/donation changes for an operator and its direct consumers;
+unrelated policies stay fixed. Checkpoint loading migrates the old global boolean,
+which is absent from current recipes. Packing and grouping policies remain global
+and are still a refactor requirement.
 
 The optional mapping search in
 [compile/placement.rs](../crates/ipu-codegen/src/compile/placement.rs) proposes

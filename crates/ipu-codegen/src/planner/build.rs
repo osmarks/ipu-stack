@@ -34,6 +34,7 @@ pub(crate) fn build_candidate(
     recipe: &Recipe,
 ) -> LoweringResult<Candidate> {
     let mut selected = select(graph, config, costs, fragments, recipe)?;
+    selected.recipe.normalize(config);
     let mut program = selected.program;
     selected.cast_sites = program.reorder_casts(&BTreeSet::new());
     selected
@@ -71,14 +72,38 @@ pub(crate) fn build_candidate(
             .with_disjoint_copy_sources(config.diagnostic_checkpoints)
             .unwrap_or(program);
     }
-    if recipe.in_place_casts.unwrap_or(config.capacity_baseline) && !config.diagnostic_checkpoints {
-        selected.program.reuse_cast_inputs();
+    let storage = selected.recipe.cast_storage.as_ref().unwrap();
+    if let Some(source) = storage.operators.keys().find(|&&source| {
+        !graph
+            .walk_operations()
+            .any(|operation| operation.id == source)
+    }) {
+        return Err(crate::mid::ProgramError::Invalid(format!(
+            "cast-storage policy names unknown operator {source:?}"
+        ))
+        .into());
+    }
+    if config.diagnostic_checkpoints {
+        if !storage.sites.is_empty() || !storage.operators.is_empty() {
+            return Err(crate::mid::ProgramError::Invalid(
+                "cast-storage overrides cannot apply with diagnostic checkpoints".into(),
+            )
+            .into());
+        }
+    } else {
+        selected.cast_storage_sites = selected.program.reuse_cast_inputs(storage);
+        if let Some(site) = storage
+            .sites
+            .keys()
+            .find(|site| !selected.cast_storage_sites.contains(site))
+        {
+            return Err(LoweringError::UnavailableCastStorageChoice(site.clone()));
+        }
     }
     selected
         .program
         .refresh_estimates()
         .ok_or(LoweringError::InvalidImplementation)?;
-    selected.recipe.normalize(config);
     Ok(selected)
 }
 
@@ -186,6 +211,7 @@ pub(crate) fn select(
     program.validate()?;
     Ok(Candidate {
         cast_sites: BTreeSet::new(),
+        cast_storage_sites: BTreeSet::new(),
         program,
         recipe: builder.recipe,
         alternatives: builder.alternatives,

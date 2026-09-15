@@ -260,6 +260,23 @@ impl ComputeGraph {
         &self.operations
     }
 
+    /// Preorder traversal of semantic operations, including Repeat itself and
+    /// its body once. This does not unroll iterations or infer dataflow edges.
+    pub(crate) fn walk_operations(&self) -> impl Iterator<Item = &Operation> {
+        let mut regions = vec![self.operations.iter()];
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(operation) = regions.last_mut()?.next() {
+                    if let OperationKind::Repeat(repeat) = &operation.kind {
+                        regions.push(repeat.body.operations.iter());
+                    }
+                    return Some(operation);
+                }
+                regions.pop();
+            }
+        })
+    }
+
     /// Inputs consumed in the enclosing region, including the used prefix of
     /// each Repeat sequence. Preserve multiplicity for use-count accounting.
     pub(crate) fn operation_inputs<'a>(

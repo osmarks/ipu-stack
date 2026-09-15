@@ -3,13 +3,75 @@ use crate::kernel::TileKernelSpec;
 use crate::kernel::cast::{CAST_PREFIX_BYTES, CastChunks};
 use crate::mid::{
     Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, OperandIndexing,
+    WorkSite,
 };
 use crate::tensor::Precision;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum CastStorage {
+    #[default]
+    Separate,
+    /// Reuse a fresh input only when alias safety permits it and every shard
+    /// saves storage. This is a memory policy; the shifted cast may run slower.
+    ReuseIfSmaller,
+}
+
+impl CastStorage {
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Separate => Self::ReuseIfSmaller,
+            Self::ReuseIfSmaller => Self::Separate,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CastStoragePolicy {
+    pub default: CastStorage,
+    /// A family default also covers casts introduced by a joint layout change.
+    #[serde(default)]
+    pub operators: BTreeMap<crate::OperationId, CastStorage>,
+    #[serde(default, with = "super::site::map")]
+    pub sites: BTreeMap<WorkSite, CastStorage>,
+}
+
+impl CastStoragePolicy {
+    pub(crate) fn new(default: CastStorage) -> Self {
+        Self {
+            default,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn for_operator(&self, source: Option<crate::OperationId>) -> CastStorage {
+        source
+            .and_then(|id| self.operators.get(&id))
+            .copied()
+            .unwrap_or(self.default)
+    }
+
+    pub(crate) fn for_site(&self, site: &WorkSite) -> CastStorage {
+        self.sites
+            .get(site)
+            .copied()
+            .unwrap_or_else(|| self.for_operator(Some(site.source)))
+    }
+}
 
 impl MidProgram {
-    pub(crate) fn reuse_cast_inputs(&mut self) {
-        donate(&mut self.operations, &mut self.values, &self.outputs, false);
+    pub(crate) fn reuse_cast_inputs(&mut self, policy: &CastStoragePolicy) -> BTreeSet<WorkSite> {
+        let mut sites = BTreeSet::new();
+        donate(
+            &mut self.operations,
+            &mut self.values,
+            &self.outputs,
+            false,
+            policy,
+            &mut sites,
+        );
+        sites
     }
 }
 
@@ -18,6 +80,8 @@ fn donate(
     values: &mut [MidValue],
     required: &[MidValueId],
     bound_outputs: bool,
+    policy: &CastStoragePolicy,
+    sites: &mut BTreeSet<WorkSite>,
 ) {
     // Repeat binds yielded storage to the previous iteration's input. A
     // displaced donor could then overlap that input during its producer.
@@ -54,12 +118,24 @@ fn donate(
                 values,
                 &repeat.body.yields,
                 true,
+                policy,
+                sites,
             );
             continue;
         }
         let Some((input, output)) = super::rewrite::fp8_cast(&operations[index], values) else {
             continue;
         };
+        let storage = if let Some(site) = operations[index].work_site() {
+            let storage = policy.for_site(&site);
+            sites.insert(site);
+            storage
+        } else {
+            policy.for_operator(operations[index].source)
+        };
+        if storage == CastStorage::Separate {
+            continue;
+        }
         if bound.contains(&output) {
             continue;
         }
@@ -217,6 +293,100 @@ mod tests {
     }
 
     #[test]
+    fn storage_choices_are_local_and_operator_defaults_cover_new_casts() {
+        let mut graph = crate::ComputeGraph::new();
+        let input = graph.host_input("input", [64, 576]).unwrap();
+        let first = graph.gelu(input).unwrap();
+        graph.gelu(first).unwrap();
+        let sources = [graph.operations()[0].id, graph.operations()[1].id];
+        let fragment = fixture(ElementOrder::RowMajor, &[64, 576]);
+        let mut program = MidProgram {
+            tile_count: 1,
+            values: vec![fragment.values[0].clone()],
+            inputs: fragment.inputs.clone(),
+            ..MidProgram::default()
+        };
+        for (source, role) in [
+            (sources[0], "left"),
+            (sources[0], "right"),
+            (sources[1], "left"),
+        ] {
+            let mut fragment = fragment.clone();
+            fragment.operations[0].site = Some(super::super::LocalSite::from(role).child("copy"));
+            fragment.operations[1].site = Some(super::super::LocalSite::from(role).child("cast"));
+            let mut result = fragment.values[2].clone();
+            result.id = MidValueId(program.values.len() as u32);
+            result.storage_group = result.id;
+            let output = result.id;
+            program.values.push(result);
+            program.outputs.push(output);
+            super::super::append_fragment(
+                &fragment,
+                &[MidValueId(0)],
+                &[output],
+                Some(source),
+                1,
+                &mut program.values,
+                &mut program.operations,
+            )
+            .unwrap();
+        }
+        let casts = program
+            .operations
+            .iter()
+            .filter(|operation| {
+                super::super::rewrite::fp8_cast(operation, &program.values).is_some()
+            })
+            .map(|operation| operation.work_site().unwrap())
+            .collect::<Vec<_>>();
+        let mut policy = CastStoragePolicy::default();
+        policy
+            .sites
+            .insert(casts[1].clone(), CastStorage::ReuseIfSmaller);
+        let check = |policy: &CastStoragePolicy, expected: &[bool]| {
+            let mut selected = program.clone();
+            assert_eq!(
+                selected.reuse_cast_inputs(policy),
+                casts.iter().cloned().collect()
+            );
+            selected.validate().unwrap();
+            let aliased = casts
+                .iter()
+                .map(|site| {
+                    let op = selected
+                        .operations
+                        .iter()
+                        .find(|op| op.work_site().as_ref() == Some(site))
+                        .unwrap();
+                    selected.values[op.inputs[0].index() as usize].storage_group
+                        == selected.values[op.results[0].index() as usize].storage_group
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(aliased, expected);
+            let tiles = crate::low::expand::expand_tiles(&selected, false).unwrap();
+            crate::KernelBuildPlan::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
+        };
+        check(&policy, &[false, true, false]);
+        policy
+            .operators
+            .insert(sources[0], CastStorage::ReuseIfSmaller);
+        policy.sites.clear();
+        policy.sites.insert(casts[0].clone(), CastStorage::Separate);
+        // The right cast has no explicit site choice: the family default
+        // applies to it without affecting the independent source operation.
+        check(&policy, &[false, true, false]);
+        let serialized = serde_json::to_vec(&policy).unwrap();
+        check(
+            &serde_json::from_slice(&serialized).unwrap(),
+            &[false, true, false],
+        );
+        let mut duplicate = serde_json::to_value(&policy).unwrap();
+        let entry = duplicate["sites"][0].clone();
+        duplicate["sites"].as_array_mut().unwrap().push(entry);
+        assert!(serde_json::from_value::<CastStoragePolicy>(duplicate).is_err());
+    }
+
+    #[test]
     fn donation_preserves_parameters_and_cast_calls_never_overlap_unread_input() {
         for (order, shape) in [
             (ElementOrder::Amp(AmpOrder::Left), vec![164, 384]),
@@ -228,7 +398,7 @@ mod tests {
                 .unwrap()
                 .1;
             let before = crate::estimate::operation_cost(&mid.operations[1], &mid.values).unwrap();
-            mid.reuse_cast_inputs();
+            mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
             let after = crate::estimate::operation_cost(&mid.operations[1], &mid.values).unwrap();
             assert!(after.0.total > before.0.total);
             assert_eq!(after.1.total(), 0);
@@ -291,12 +461,12 @@ mod tests {
         let mut mid = fixture(ElementOrder::Amp(AmpOrder::Left), &[164, 384]);
         mid.outputs.push(MidValueId(1));
         let old = mid.clone();
-        mid.reuse_cast_inputs();
+        mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         assert_eq!(mid, old);
         mid.outputs.pop();
         mid.operations.remove(0);
         let old = mid.clone();
-        mid.reuse_cast_inputs();
+        mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         assert_eq!(mid, old);
     }
 
@@ -306,7 +476,7 @@ mod tests {
         assert!(CastChunks::new(ElementOrder::RowMajor, &dimensions).is_some());
         let mut mid = fixture(ElementOrder::RowMajor, &dimensions);
         let before = mid.clone();
-        mid.reuse_cast_inputs();
+        mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         assert_eq!(mid, before);
     }
 
@@ -341,7 +511,7 @@ mod tests {
             estimated_cycles: 0,
             estimated_exchange_cycles: 0,
         });
-        mid.reuse_cast_inputs();
+        mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
         crate::place::place(&low).unwrap();
@@ -354,7 +524,14 @@ mod tests {
 
         let mut mid = fixture(ElementOrder::RowMajor, &[65536]);
         let old = mid.clone();
-        donate(&mut mid.operations, &mut mid.values, &mid.outputs, true);
+        donate(
+            &mut mid.operations,
+            &mut mid.values,
+            &mid.outputs,
+            true,
+            &CastStoragePolicy::new(CastStorage::ReuseIfSmaller),
+            &mut BTreeSet::new(),
+        );
         assert_eq!(mid, old);
         // An alias of a yield has the same restriction.
         let mut alias = mid.values[2].clone();
@@ -376,7 +553,14 @@ mod tests {
             estimated_exchange_cycles: 0,
         });
         let old = mid.clone();
-        donate(&mut mid.operations, &mut mid.values, &[MidValueId(3)], true);
+        donate(
+            &mut mid.operations,
+            &mut mid.values,
+            &[MidValueId(3)],
+            true,
+            &CastStoragePolicy::new(CastStorage::ReuseIfSmaller),
+            &mut BTreeSet::new(),
+        );
         assert_eq!(mid, old);
     }
 
@@ -395,7 +579,7 @@ mod tests {
             policy: CopyPolicy::LocalKernel,
             packing: crate::PackingPolicy::Automatic,
         };
-        mid.reuse_cast_inputs();
+        mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
         assert_eq!(low.value_shards(low.outputs[0]).len(), 2);

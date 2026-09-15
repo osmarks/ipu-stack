@@ -2,6 +2,7 @@
 use crate::compile::PipelineConfig;
 use crate::graph::{OperationId, ValueId};
 use crate::mid::MidProgram;
+use crate::mid::cast::{CastStorage, CastStoragePolicy};
 
 use crate::planner::operator::OperatorPlan;
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ pub(crate) struct Recipe {
     pub parallel_reductions: usize,
     pub disjoint_copy_sources: bool,
     #[serde(default)]
-    pub in_place_casts: Option<bool>,
+    pub cast_storage: Option<CastStoragePolicy>,
 }
 
 impl Recipe {
@@ -96,13 +97,19 @@ impl Recipe {
     }
 
     pub(crate) fn normalize(&mut self, config: &PipelineConfig) {
-        self.in_place_casts = Some(self.in_place_casts.unwrap_or(config.capacity_baseline));
+        self.cast_storage.get_or_insert_with(|| {
+            CastStoragePolicy::new(if config.capacity_baseline {
+                CastStorage::ReuseIfSmaller
+            } else {
+                CastStorage::Separate
+            })
+        });
     }
 
-    pub(crate) fn changes(&self, before: &Self) -> impl std::fmt::Debug {
+    pub(crate) fn changes<'a>(&'a self, before: &'a Self) -> impl std::fmt::Debug + 'a {
         #[derive(Debug)]
         #[allow(dead_code)] // Fields are consumed by Debug only.
-        struct Changes {
+        struct Changes<'a> {
             plans: BTreeSet<OperationId>,
             boundaries: Vec<ValueId>,
             casts: Vec<crate::mid::WorkSite>,
@@ -110,7 +117,7 @@ impl Recipe {
             packing_rows: (Option<u16>, Option<u16>),
             parallel_reductions: (usize, usize),
             disjoint_copy_sources: (bool, bool),
-            in_place_casts: (Option<bool>, Option<bool>),
+            cast_storage: (&'a Option<CastStoragePolicy>, &'a Option<CastStoragePolicy>),
         }
         Changes {
             plans: self
@@ -138,7 +145,7 @@ impl Recipe {
             packing_rows: (before.packing_rows, self.packing_rows),
             parallel_reductions: (before.parallel_reductions, self.parallel_reductions),
             disjoint_copy_sources: (before.disjoint_copy_sources, self.disjoint_copy_sources),
-            in_place_casts: (before.in_place_casts, self.in_place_casts),
+            cast_storage: (&before.cast_storage, &self.cast_storage),
         }
     }
 }
@@ -148,4 +155,5 @@ pub(crate) struct Candidate {
     pub recipe: Recipe,
     pub alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
     pub cast_sites: BTreeSet<crate::mid::WorkSite>,
+    pub cast_storage_sites: BTreeSet<crate::mid::WorkSite>,
 }
