@@ -261,10 +261,10 @@ impl TileGraphBuilder {
         outputs: &[BlockValueId],
         offsets: &[u32],
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
-        let mut regions = CopyRegions::new(&self.shards, inputs);
+        let mut regions = CopyRegions::new(&self.program.shards, inputs);
         let mut mappings = Vec::new();
         for &output in outputs {
-            let destination = &self.shards[output.index() as usize];
+            let destination = &self.program.shards[output.index() as usize];
             let tile = destination.tile;
             let mut source_region = destination.extents.clone();
             offset_extents(&mut source_region, offsets, u32::checked_add)?;
@@ -308,12 +308,12 @@ impl TileGraphBuilder {
         view: AxisFactorView,
         offsets: &[u32],
     ) -> ExpansionResult<Vec<(ShardView, ShardView)>> {
-        let mut regions = CopyRegions::new(&self.shards, sources);
+        let mut regions = CopyRegions::new(&self.program.shards, sources);
         let mut mappings = Vec::new();
         for &output in output_shards {
-            let mut output_extents = self.shards[output.index() as usize].extents.clone();
+            let mut output_extents = self.program.shards[output.index() as usize].extents.clone();
             offset_extents(&mut output_extents, offsets, u32::checked_add)?;
-            let tile = self.shards[output.index() as usize].tile;
+            let tile = self.program.shards[output.index() as usize].tile;
             let output_shape = view
                 .output_shape(source_shape)
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
@@ -435,9 +435,9 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<Option<(Vec<(ShardView, ShardView)>, CopyOrder)>> {
         for (source, destination) in &mut mappings {
             extend_panel_row_padding(
-                &self.shards[source.shard.index() as usize],
+                &self.program.shards[source.shard.index() as usize],
                 source,
-                &self.shards[destination.shard.index() as usize],
+                &self.program.shards[destination.shard.index() as usize],
                 destination,
             );
         }
@@ -445,8 +445,8 @@ impl TileGraphBuilder {
         // boundaries retain the existing clipped-rectangle fallback below.
         let regular = !mappings.is_empty()
             && mappings.iter().all(|(source, destination)| {
-                let a = &self.shards[source.shard.index() as usize];
-                let b = &self.shards[destination.shard.index() as usize];
+                let a = &self.program.shards[source.shard.index() as usize];
+                let b = &self.program.shards[destination.shard.index() as usize];
                 let rank = source.extents.len();
                 let other_rank = destination.extents.len();
                 rank >= 2
@@ -473,8 +473,8 @@ impl TileGraphBuilder {
         }
         let mut split = Vec::new();
         for (source, destination) in mappings {
-            let source_shard = &self.shards[source.shard.index() as usize];
-            let destination_shard = &self.shards[destination.shard.index() as usize];
+            let source_shard = &self.program.shards[source.shard.index() as usize];
+            let destination_shard = &self.program.shards[destination.shard.index() as usize];
             if !source_shard
                 .tensor_type
                 .format
@@ -489,9 +489,11 @@ impl TileGraphBuilder {
                 destination,
             )?;
             for (source, destination) in pieces {
-                let source_spans = source.bind(&self.shards)?.traversal(CopyOrder::Physical)?;
+                let source_spans = source
+                    .bind(&self.program.shards)?
+                    .traversal(CopyOrder::Physical)?;
                 let destination_spans = destination
-                    .bind(&self.shards)?
+                    .bind(&self.program.shards)?
                     .traversal(CopyOrder::Physical)?;
                 if !source_spans.word_aligned()
                     || !destination_spans.word_aligned()

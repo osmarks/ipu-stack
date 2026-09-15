@@ -16,21 +16,23 @@ impl TileGraphBuilder {
             kernel,
             inputs,
             outputs,
-            &self.shards,
+            &self.program.shards,
             &mut self.kernel_metadata,
         )?)
     }
 
     pub(super) fn push_shard(&mut self, mut shard: BlockValue) -> ExpansionResult<BlockValueId> {
-        let id =
-            BlockValueId(u32::try_from(self.shards.len()).map_err(|_| ExpansionError::IdOverflow)?);
+        let id = BlockValueId(
+            u32::try_from(self.program.shards.len()).map_err(|_| ExpansionError::IdOverflow)?,
+        );
         shard.id = id;
-        self.shards.push(shard);
+        self.program.shards.push(shard);
         Ok(id)
     }
 
     pub(super) fn value_views(&self, value: MidValueId) -> ExpansionResult<&[ShardView]> {
-        self.bindings
+        self.program
+            .value_views
             .get(value.index() as usize)
             .filter(|shards| !shards.is_empty())
             .map(Vec::as_slice)
@@ -40,7 +42,7 @@ impl TileGraphBuilder {
     pub(super) fn full_view(&self, shard: BlockValueId) -> ShardView {
         ShardView {
             shard,
-            extents: self.shards[shard.index() as usize].extents.clone(),
+            extents: self.program.shards[shard.index() as usize].extents.clone(),
         }
     }
 
@@ -53,7 +55,7 @@ impl TileGraphBuilder {
         self.value_views(value)?
             .iter()
             .map(|view| {
-                if view.extents != self.shards[view.shard.index() as usize].extents {
+                if view.extents != self.program.shards[view.shard.index() as usize].extents {
                     return Err(ExpansionError::InvalidOperatorPlan);
                 }
                 Ok(view.shard)
@@ -66,11 +68,13 @@ impl TileGraphBuilder {
         value: MidValueId,
         target: BlockValueId,
     ) -> ExpansionResult<BlockValueId> {
-        let target = &self.shards[target.index() as usize];
+        let target = &self.program.shards[target.index() as usize];
         self.allocation_shards(value)?
             .into_iter()
-            .filter(|shard| self.shards[shard.index() as usize].extents == target.extents)
-            .min_by_key(|shard| u8::from(self.shards[shard.index() as usize].tile != target.tile))
+            .filter(|shard| self.program.shards[shard.index() as usize].extents == target.extents)
+            .min_by_key(|shard| {
+                u8::from(self.program.shards[shard.index() as usize].tile != target.tile)
+            })
             .ok_or(ExpansionError::UnknownValue(value))
     }
 

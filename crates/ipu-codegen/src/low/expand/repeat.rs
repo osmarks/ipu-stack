@@ -32,7 +32,7 @@ impl TileGraphBuilder {
             }
         }
         let body = self.build_region(&repeat.body.operations, false)?;
-        let mut bindings = (0..self.tile_count)
+        let mut bindings = (0..self.program.tile_count)
             .map(|tile| BlockRepeatBinding {
                 tile,
                 carried: Vec::new(),
@@ -48,13 +48,15 @@ impl TileGraphBuilder {
                 let initial = self.corresponding_shard(operation.inputs[index], argument)?;
                 let yielded = self.corresponding_shard(repeat.body.yields[index], argument)?;
                 let result = self.corresponding_shard(operation.results[index], argument)?;
-                self.shards[argument.index() as usize].definition = ShardDefinition::Alias(initial);
+                self.program.shards[argument.index() as usize].definition =
+                    ShardDefinition::Alias(initial);
                 if yielded != argument {
-                    self.shards[yielded.index() as usize].definition =
+                    self.program.shards[yielded.index() as usize].definition =
                         ShardDefinition::WritableAlias(argument);
                 }
-                self.shards[result.index() as usize].definition = ShardDefinition::Alias(initial);
-                let tile = self.shards[argument.index() as usize].tile;
+                self.program.shards[result.index() as usize].definition =
+                    ShardDefinition::Alias(initial);
+                let tile = self.program.shards[argument.index() as usize].tile;
                 bindings[usize::from(tile)].carried.push(RepeatCarried {
                     initial,
                     argument,
@@ -65,7 +67,7 @@ impl TileGraphBuilder {
         }
         for index in repeat.carried_inputs..expected_inputs {
             for argument in self.allocation_shards(repeat.body.arguments[index])? {
-                let tile = self.shards[argument.index() as usize].tile;
+                let tile = self.program.shards[argument.index() as usize].tile;
                 bindings[usize::from(tile)]
                     .invariants
                     .push(RepeatInvariant {
@@ -82,7 +84,7 @@ impl TileGraphBuilder {
                     .iter()
                     .map(|value| self.corresponding_shard(*value, argument))
                     .collect::<ExpansionResult<Vec<_>>>()?;
-                let tile = self.shards[argument.index() as usize].tile;
+                let tile = self.program.shards[argument.index() as usize].tile;
                 bindings[usize::from(tile)]
                     .iterated
                     .push(RepeatIterated { inputs, argument });

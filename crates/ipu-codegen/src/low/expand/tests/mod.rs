@@ -50,14 +50,14 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
             )
             .unwrap();
             let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
-            let mut ids = vec![builder.shards[0].id];
+            let mut ids = vec![builder.program.shards[0].id];
             for tile in [1, 2, 1] {
-                let mut shard = builder.shards[0].clone();
+                let mut shard = builder.program.shards[0].clone();
                 shard.tile = tile;
                 shard.definition = ShardDefinition::Staging;
                 ids.push(builder.push_shard(shard).unwrap());
             }
-            let mut alias_shard = builder.shards[ids[1].index() as usize].clone();
+            let mut alias_shard = builder.program.shards[ids[1].index() as usize].clone();
             alias_shard.definition = ShardDefinition::WritableAlias(ids[1]);
             let alias_id = builder.push_shard(alias_shard).unwrap();
             let mut from = builder.full_view(ids[0]);
@@ -83,7 +83,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                     &mut region,
                 )
                 .unwrap();
-            builder.local_copies.push(
+            builder.program.local_copies.push(
                 crate::kernel::CopyRun::bind(
                     LocalCopy {
                         source: if alias && source == 1 {
@@ -110,7 +110,7 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                             CopyPattern::Contiguous
                         },
                     },
-                    &builder.shards,
+                    &builder.program.shards,
                 )
                 .unwrap(),
             );
@@ -127,26 +127,26 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                 .append_exchange_phase(vec![second], provenance, &mut region)
                 .unwrap();
             // Appending records the requested sequence; motion is an explicit pass.
-            assert_eq!(builder.phases.len(), 2);
+            assert_eq!(builder.program.exchange_phases.len(), 2);
             crate::low::passes::movement::group_exchanges(
                 &mut region,
-                &mut builder.phases,
-                &builder.local_copies,
-                &builder.shards,
+                &mut builder.program.exchange_phases,
+                &builder.program.local_copies,
+                &builder.program.shards,
             )
             .unwrap();
             assert_eq!(
                 crate::low::passes::movement::group_exchanges(
                     &mut region,
-                    &mut builder.phases,
-                    &builder.local_copies,
-                    &builder.shards
+                    &mut builder.program.exchange_phases,
+                    &builder.program.local_copies,
+                    &builder.program.shards
                 )
                 .unwrap(),
                 0
             );
             assert_eq!(
-                builder.phases.len(),
+                builder.program.exchange_phases.len(),
                 if blocked { 2 } else { 1 },
                 "alias={alias}, source={source}, destination={destination}, offset={offset}"
             );
@@ -155,10 +155,13 @@ fn exchange_grouping_moves_disjoint_copy_rows_and_preserves_dependencies() {
                 hoisted
             );
             if !blocked {
-                assert_eq!(builder.phases[0].transfers.len(), 2);
-                assert_eq!(builder.phases[0].transfers[0].source.shard, ids[0]);
+                assert_eq!(builder.program.exchange_phases[0].transfers.len(), 2);
                 assert_eq!(
-                    builder.phases[0].transfers[1].source.shard,
+                    builder.program.exchange_phases[0].transfers[0].source.shard,
+                    ids[0]
+                );
+                assert_eq!(
+                    builder.program.exchange_phases[0].transfers[1].source.shard,
                     ids[next_source]
                 );
             }
@@ -181,10 +184,10 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         let config = PipelineConfig::new(3).with_input(input, format(1));
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
-        let source = builder.full_view(builder.shards[0].id);
+        let source = builder.full_view(builder.program.shards[0].id);
         let mut mappings = Vec::new();
         for tile in 0..=remote_count {
-            let mut destination = builder.shards[0].clone();
+            let mut destination = builder.program.shards[0].clone();
             destination.tile = tile;
             destination.definition = ShardDefinition::Staging;
             if interleaved {
@@ -214,22 +217,19 @@ fn local_materialization_joins_only_compatible_existing_multicasts() {
         builder
             .append_materialization(batch, provenance, &mut region)
             .unwrap();
-        assert_eq!(builder.local_copies.is_empty(), loopback);
+        assert_eq!(builder.program.local_copies.is_empty(), loopback);
         let self_receivers = builder
-            .phases
+            .program
+            .exchange_phases
             .iter()
             .flat_map(|phase| &phase.transfers)
             .flat_map(|transfer| &transfer.destinations)
-            .filter(|view| builder.shards[view.shard.index() as usize].tile == 0)
+            .filter(|view| builder.program.shards[view.shard.index() as usize].tile == 0)
             .count();
         assert_eq!(self_receivers, usize::from(loopback));
         if loopback {
-            let mut graph = (*crate::expand_tiles(&mid).unwrap()).clone();
-            graph.shards = builder.shards;
-            graph.exchange_phases = builder.phases;
-            graph.local_copies = builder.local_copies;
-            graph.kernel_runs = builder.kernel_runs;
-            graph.body = region;
+            builder.program.body = region;
+            let graph = builder.program;
             let low = crate::low::lower_to_tiles(&Arc::new(graph), false);
             // Force standard storage into the shared upper region as well.
             let placement = crate::place::place_with_ranges(
@@ -273,14 +273,14 @@ fn factor_mappings_keep_the_bound_source_selection() {
     let config = PipelineConfig::new(1).with_input(input, format(1));
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let mut builder = TileGraphBuilder::new(&mid, Arc::default()).unwrap();
-    let source = builder.shards[0].id;
+    let source = builder.program.shards[0].id;
     let mut source_view = builder.full_view(source);
     source_view.extents = crate::OperandWindow(vec![(1, 0, 2)])
         .select(&source_view.extents, false)
         .unwrap();
     let source_shape = crate::TensorShape(vec![1, 2, 32]);
     let view = crate::AxisFactorView::new(2, 0, 2);
-    let mut destination = builder.shards[0].clone();
+    let mut destination = builder.program.shards[0].clone();
     destination.tensor_type.shape = view.output_shape(&source_shape).unwrap();
     destination.extents[0].logical_end = 2;
     destination.extents[0].physical_end = 2;
@@ -320,9 +320,10 @@ fn factor_mappings_keep_the_bound_source_selection() {
     builder
         .append_materialization(batch, provenance, &mut region)
         .unwrap();
-    assert!(!builder.local_copies.is_empty());
+    assert!(!builder.program.local_copies.is_empty());
     assert!(
         builder
+            .program
             .local_copies
             .iter()
             .all(|copy| copy.movement().source == source)
@@ -2510,17 +2511,17 @@ fn complete_panel_grid_stays_one_logical_exchange() {
     state
         .append_materialization(batch, provenance, &mut body)
         .unwrap();
-    assert_eq!(state.phases.len(), 1);
-    let [transfer] = state.phases[0].transfers.as_slice() else {
+    assert_eq!(state.program.exchange_phases.len(), 1);
+    let [transfer] = state.program.exchange_phases[0].transfers.as_slice() else {
         panic!("expanded panel grid");
     };
     let pairs = |order| {
-        view_byte_traversal(&state.shards[0], &source, order)
+        view_byte_traversal(&state.program.shards[0], &source, order)
             .unwrap()
             .spans()
             .flat_map(|s| s.offset..s.offset + s.bytes)
             .zip(
-                view_byte_traversal(&state.shards[1], &destination, order)
+                view_byte_traversal(&state.program.shards[1], &destination, order)
                     .unwrap()
                     .spans()
                     .flat_map(|s| s.offset..s.offset + s.bytes),
@@ -2528,7 +2529,7 @@ fn complete_panel_grid_stays_one_logical_exchange() {
             .collect::<BTreeSet<_>>()
     };
     assert_eq!(
-        pairs(transfer.span_order(&state.shards)),
+        pairs(transfer.span_order(&state.program.shards)),
         pairs(CopyOrder::Semantic)
     );
 }
@@ -2591,17 +2592,17 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
         .select(&clipped_target.extents, false)
         .unwrap();
     let parts = super::copy::mapping::split_mapping_at_panel_boundaries(
-        &state.shards[0],
+        &state.program.shards[0],
         clipped_source.clone(),
-        &state.shards[2],
+        &state.program.shards[2],
         clipped_target.clone(),
     )
     .unwrap();
     assert_eq!(parts.len(), 2, "32x12 FP8 panels, not four 16x12 halves");
     let mut actual = BTreeSet::new();
     for (a, b) in &parts {
-        let a = view_byte_traversal(&state.shards[0], a, CopyOrder::Physical).unwrap();
-        let b = view_byte_traversal(&state.shards[2], b, CopyOrder::Physical).unwrap();
+        let a = view_byte_traversal(&state.program.shards[0], a, CopyOrder::Physical).unwrap();
+        let b = view_byte_traversal(&state.program.shards[2], b, CopyOrder::Physical).unwrap();
         assert_eq!(a.spans().count(), 1);
         actual.extend(
             a.spans()
@@ -2609,8 +2610,18 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
                 .zip(b.spans().flat_map(|s| s.offset..s.offset + s.bytes)),
         );
     }
-    let a = view_byte_traversal(&state.shards[0], &clipped_source, CopyOrder::Semantic).unwrap();
-    let b = view_byte_traversal(&state.shards[2], &clipped_target, CopyOrder::Semantic).unwrap();
+    let a = view_byte_traversal(
+        &state.program.shards[0],
+        &clipped_source,
+        CopyOrder::Semantic,
+    )
+    .unwrap();
+    let b = view_byte_traversal(
+        &state.program.shards[2],
+        &clipped_target,
+        CopyOrder::Semantic,
+    )
+    .unwrap();
     let expected = a
         .spans()
         .flat_map(|s| s.offset..s.offset + s.bytes)
@@ -2639,7 +2650,8 @@ fn fp8_clipped_panels_do_not_fragment_regular_destinations() {
         .append_materialization(batch, provenance, &mut body)
         .unwrap();
     let regular = state
-        .phases
+        .program
+        .exchange_phases
         .iter()
         .flat_map(|p| &p.transfers)
         .filter(|t| t.destinations.iter().any(|d| d.shard == BlockValueId(1)))

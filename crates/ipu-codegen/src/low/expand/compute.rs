@@ -33,9 +33,9 @@ impl TileGraphBuilder {
         }) {
             return Err(ExpansionError::ResultArity);
         }
-        let mut next_fragment = vec![0; usize::from(self.tile_count)];
+        let mut next_fragment = vec![0; usize::from(self.program.tile_count)];
         for output in outputs {
-            let block = &self.shards[output.index() as usize];
+            let block = &self.program.shards[output.index() as usize];
             let tile = block.tile;
             let ordinal = next_fragment[usize::from(tile)];
             next_fragment[usize::from(tile)] += 1;
@@ -66,7 +66,7 @@ impl TileGraphBuilder {
                                 .find_map(|source| {
                                     self.elementwise_view(
                                         source,
-                                        &self.logical_values[value.index() as usize]
+                                        &self.program.logical_values[value.index() as usize]
                                             .tensor_type
                                             .shape,
                                         output,
@@ -143,7 +143,7 @@ impl TileGraphBuilder {
         shape: &crate::TensorShape,
         output: BlockValueId,
     ) -> Option<ShardView> {
-        let output = &self.shards[output.index() as usize];
+        let output = &self.program.shards[output.index() as usize];
         let indexing = Broadcast::new(&shape.0, &output.tensor_type.shape.0)?;
         let mut view = source.clone();
         for (axis, extent) in view.extents.iter_mut().enumerate() {
@@ -180,9 +180,9 @@ impl TileGraphBuilder {
         inputs
             .iter()
             .map(|&value| {
-                let mut tiles = vec![Vec::new(); usize::from(self.tile_count)];
+                let mut tiles = vec![Vec::new(); usize::from(self.program.tile_count)];
                 for source in self.value_views(value)? {
-                    tiles[usize::from(self.shards[source.shard.index() as usize].tile)]
+                    tiles[usize::from(self.program.shards[source.shard.index() as usize].tile)]
                         .push(source.clone());
                 }
                 Ok(tiles)
@@ -198,16 +198,17 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<()> {
         for &(result, input) in aliases {
             let target = *outputs.get(result).ok_or(ExpansionError::ResultArity)?;
-            let tile = self.shards[target.index() as usize].tile;
+            let tile = self.program.shards[target.index() as usize].tile;
             let previous = inputs_by_tile[input][usize::from(tile)]
                 .iter()
                 .find(|source| {
-                    source.extents == self.shards[target.index() as usize].extents
-                        && source.extents == self.shards[source.shard.index() as usize].extents
+                    source.extents == self.program.shards[target.index() as usize].extents
+                        && source.extents
+                            == self.program.shards[source.shard.index() as usize].extents
                 })
                 .map(|source| source.shard)
                 .ok_or(ExpansionError::InvalidOperatorPlan)?;
-            self.shards[target.index() as usize].definition =
+            self.program.shards[target.index() as usize].definition =
                 ShardDefinition::WritableAlias(previous);
         }
         Ok(())

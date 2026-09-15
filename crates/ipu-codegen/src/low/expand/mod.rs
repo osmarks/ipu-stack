@@ -76,7 +76,7 @@ pub(crate) fn expand_tiles_cached(
         return Err(ExpansionError::EmptyTileGroup);
     }
     let mut state = TileGraphBuilder::new(graph, Arc::clone(&cache))?;
-    let body = state.build_region(&graph.operations, checkpoints)?;
+    state.program.body = state.build_region(&graph.operations, checkpoints)?;
     for value in graph
         .inputs
         .iter()
@@ -85,35 +85,7 @@ pub(crate) fn expand_tiles_cached(
     {
         state.value_views(value)?;
     }
-    let mut program = TileGraph {
-        tile_count: graph.tile_count,
-        requires_finite_scratch: false,
-        shards: state.shards,
-        exchange_phases: state.phases,
-        inputs: graph.inputs.clone(),
-        body,
-        kernel_runs: state.kernel_runs,
-        local_copies: state.local_copies,
-        value_views: state.bindings,
-        outputs: graph.outputs.clone(),
-        logical_values: state.logical_values,
-        checkpoints: graph
-            .operations
-            .iter()
-            .enumerate()
-            .filter(|(index, operation)| {
-                graph
-                    .operations
-                    .get(index + 1)
-                    .is_none_or(|next| next.source != operation.source)
-            })
-            .filter_map(|(_, operation)| {
-                operation
-                    .source
-                    .map(|source| (source, operation.results.clone()))
-            })
-            .collect(),
-    };
+    let mut program = state.program;
     crate::low::passes::run(&mut program, &cache, reuse_cast_inputs)?;
     tracing::debug!(
         shards = program.shards.len(),
@@ -125,14 +97,8 @@ pub(crate) fn expand_tiles_cached(
 
 struct TileGraphBuilder {
     cache: Arc<GeometryCache>,
-    tile_count: u16,
+    program: TileGraph,
     storage_groups: Vec<MidValueId>,
-    shards: Vec<BlockValue>,
-    bindings: Vec<Vec<ShardView>>,
-    logical_values: Vec<crate::MidValue>,
-    phases: Vec<ExchangePhase>,
-    kernel_runs: Vec<KernelRun>,
-    local_copies: Vec<crate::kernel::CopyRun>,
     kernel_metadata: Vec<Arc<KernelRunMetadata>>,
 }
 
@@ -141,18 +107,34 @@ impl TileGraphBuilder {
         let tile_count = graph.tile_count;
         let mut state = Self {
             cache,
-            tile_count,
+            program: TileGraph {
+                tile_count: graph.tile_count,
+                requires_finite_scratch: false,
+                shards: Vec::new(),
+                exchange_phases: Vec::new(),
+                inputs: graph.inputs.clone(),
+                body: BlockRegion::default(),
+                kernel_runs: Vec::new(),
+                local_copies: Vec::new(),
+                value_views: vec![Vec::new(); graph.values.len()],
+                outputs: graph.outputs.clone(),
+                logical_values: graph.values.clone(),
+                checkpoints: graph
+                    .operations
+                    .chunk_by(|a, b| a.source == b.source)
+                    .filter_map(|group| {
+                        let operation = group.last()?;
+                        operation
+                            .source
+                            .map(|source| (source, operation.results.clone()))
+                    })
+                    .collect(),
+            },
             storage_groups: graph
                 .values
                 .iter()
                 .map(|value| value.storage_group)
                 .collect(),
-            shards: Vec::new(),
-            bindings: vec![Vec::new(); graph.values.len()],
-            logical_values: graph.values.clone(),
-            phases: Vec::new(),
-            kernel_runs: Vec::new(),
-            local_copies: Vec::new(),
             kernel_metadata: Vec::new(),
         };
         let mut used = graph
@@ -204,7 +186,7 @@ impl TileGraphBuilder {
                 })?;
                 value_views.push(state.full_view(id));
             }
-            state.bindings[value.id.index() as usize] = value_views;
+            state.program.value_views[value.id.index() as usize] = value_views;
         }
         Ok(state)
     }
@@ -266,8 +248,8 @@ impl TileGraphBuilder {
                 operation = index,
                 source = ?operation.source.map(OperationId::index),
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                shards = self.shards.len(),
-                exchange_phases = self.phases.len(),
+                shards = self.program.shards.len(),
+                exchange_phases = self.program.exchange_phases.len(),
                 "lowered mid operation to tile work"
             );
             index += group.max(1);
@@ -284,7 +266,7 @@ impl TileGraphBuilder {
         ranges: &[crate::ByteSpan],
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
-        let block = &self.shards[shard.index() as usize];
+        let block = &self.program.shards[shard.index() as usize];
         let padding = crate::storage::uncovered_bytes(
             block.storage(),
             [block.extents.as_slice()],
@@ -324,7 +306,7 @@ impl TileGraphBuilder {
         padding_only: bool,
         provenance: WorkProvenance,
     ) -> ExpansionResult<()> {
-        let tile = self.shards[shard.index() as usize].tile;
+        let tile = self.program.shards[shard.index() as usize].tile;
         {
             let run = self.bind_kernel(
                 provenance,

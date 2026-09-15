@@ -62,11 +62,11 @@ impl TileGraphBuilder {
         };
         let inputs = self.value_views(*input)?.to_vec();
         let outputs = self.allocation_shards(*output)?;
-        let source_shape = self.logical_values[input.index() as usize]
+        let source_shape = self.program.logical_values[input.index() as usize]
             .tensor_type
             .shape
             .clone();
-        let output_order = self.shards[outputs
+        let output_order = self.program.shards[outputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
             .index() as usize]
@@ -88,7 +88,7 @@ impl TileGraphBuilder {
         } else {
             inputs
         };
-        let source_order = self.shards[inputs
+        let source_order = self.program.shards[inputs
             .first()
             .ok_or(ExpansionError::InvalidOperatorPlan)?
             .shard
@@ -154,11 +154,11 @@ impl TileGraphBuilder {
         for output in outputs {
             if !covered.contains(&output)
                 && matches!(
-                    self.shards[output.index() as usize].definition,
+                    self.program.shards[output.index() as usize].definition,
                     ShardDefinition::Value(_)
                 )
             {
-                let bytes = shard_storage_bytes(&self.shards[output.index() as usize])?;
+                let bytes = shard_storage_bytes(&self.program.shards[output.index() as usize])?;
                 self.append_zero_range(
                     body,
                     output,
@@ -187,7 +187,7 @@ impl TileGraphBuilder {
     ) -> ExpansionResult<Option<Vec<ShardView>>> {
         let sources = self.value_views(source)?.to_vec();
         for source_view in &sources {
-            let source = &self.shards[source_view.shard.index() as usize];
+            let source = &self.program.shards[source_view.shard.index() as usize];
             let compatible = source_view.extents.len() >= 2
                 && source.tensor_type.format.precision == Precision::F16
                 && match source.tensor_type.format.layout.order {
@@ -217,9 +217,9 @@ impl TileGraphBuilder {
 
         let mut staging_views = Vec::with_capacity(sources.len());
         for source_view in sources {
-            let block = &self.shards[source_view.shard.index() as usize];
+            let block = &self.program.shards[source_view.shard.index() as usize];
             let tile = block.tile;
-            let mut staging_type = self.logical_values[source.index() as usize]
+            let mut staging_type = self.program.logical_values[source.index() as usize]
                 .tensor_type
                 .clone();
             let to = Layout::row_major(TensorTiling::replicated(1));
@@ -259,8 +259,8 @@ impl TileGraphBuilder {
             .zip(outputs.iter().copied())
             .collect::<Vec<_>>();
         for (input, output) in shards {
-            let source = &self.shards[input.shard.index() as usize];
-            let destination = &self.shards[output.index() as usize];
+            let source = &self.program.shards[input.shard.index() as usize];
+            let destination = &self.program.shards[output.index() as usize];
             if source.tile != destination.tile
                 || input.extents.len() != destination.extents.len()
                 || input
@@ -317,12 +317,12 @@ impl TileGraphBuilder {
                 |(mappings, order)| (mappings, order, order),
             );
             let transfers = batch.transfers.entry(exchange_order).or_default();
-            let destination = &self.shards[destination_shard.index() as usize];
+            let destination = &self.program.shards[destination_shard.index() as usize];
             let geometric_mappings = mappings
                 .iter()
                 .map(|(source, target)| {
-                    let source = source.bind(&self.shards)?;
-                    target.bind(&self.shards)?;
+                    let source = source.bind(&self.program.shards)?;
+                    target.bind(&self.program.shards)?;
                     if target.shard != destination_shard {
                         return Err(ExpansionError::InvalidCopyPlan);
                     }
@@ -360,7 +360,7 @@ impl TileGraphBuilder {
             let staging = if let Some(staging) = &preparation {
                 Some(self.push_shard(BlockValue {
                     id: BlockValueId(0),
-                    tile: self.shards[destination_shard.index() as usize].tile,
+                    tile: self.program.shards[destination_shard.index() as usize].tile,
                     tensor_type: staging.tensor_type.clone(),
                     extents: staging.extents.clone(),
                     definition: ShardDefinition::Staging,
@@ -369,7 +369,7 @@ impl TileGraphBuilder {
                 None
             };
             if let Some(staging) = staging {
-                let block = &self.shards[staging.index() as usize];
+                let block = &self.program.shards[staging.index() as usize];
                 let ranges = crate::storage::uncovered_bytes(
                     block.storage(),
                     mappings
@@ -386,12 +386,12 @@ impl TileGraphBuilder {
                         extent.physical_end = extent.logical_end;
                     }
                 }
-                let source_tile = self.shards[source.shard.index() as usize].tile;
-                let destination_tile = self.shards[destination.shard.index() as usize].tile;
+                let source_tile = self.program.shards[source.shard.index() as usize].tile;
+                let destination_tile = self.program.shards[destination.shard.index() as usize].tile;
                 if source_tile == destination_tile {
                     if staging.is_none()
                         && copy_order == exchange_order
-                        && self.shards[source.shard.index() as usize]
+                        && self.program.shards[source.shard.index() as usize]
                             .tensor_type
                             .format
                             .layout
@@ -410,7 +410,7 @@ impl TileGraphBuilder {
                     };
                     append_span_copies(
                         &self.cache,
-                        &self.shards,
+                        &self.program.shards,
                         &source,
                         &destination,
                         destination_tile,
@@ -420,7 +420,7 @@ impl TileGraphBuilder {
                 } else {
                     if exchange_order != CopyOrder::Panels
                         && !source
-                            .bind(&self.shards)?
+                            .bind(&self.program.shards)?
                             .traversal(exchange_order)?
                             .word_aligned()
                     {
@@ -436,7 +436,7 @@ impl TileGraphBuilder {
             }
             if let Some(staging) = staging {
                 let staging = self.full_view(staging);
-                let tile = self.shards[destination_shard.index() as usize].tile;
+                let tile = self.program.shards[destination_shard.index() as usize].tile;
                 if let Some(kernel) = preparation
                     .as_ref()
                     .and_then(|staging| staging.kernel.as_ref())
@@ -453,7 +453,7 @@ impl TileGraphBuilder {
                 } else {
                     append_span_copies(
                         &self.cache,
-                        &self.shards,
+                        &self.program.shards,
                         &staging,
                         &self.logical_view(destination_shard),
                         tile,
@@ -479,9 +479,12 @@ impl TileGraphBuilder {
         if let Some(view) = packed.get(&key) {
             return Ok(view.clone());
         }
-        let shard = &self.shards[source.shard.index() as usize];
+        let shard = &self.program.shards[source.shard.index() as usize];
         let tile = shard.tile;
-        let bytes = source.bind(&self.shards)?.traversal(order)?.byte_len();
+        let bytes = source
+            .bind(&self.program.shards)?
+            .traversal(order)?
+            .byte_len();
         if bytes == 0 || !bytes.is_multiple_of(4) {
             return Err(ExpansionError::InvalidCopyPlan);
         }
@@ -495,7 +498,7 @@ impl TileGraphBuilder {
         let view = self.full_view(staging);
         append_span_copies(
             &self.cache,
-            &self.shards,
+            &self.program.shards,
             &source,
             &view,
             tile,
@@ -516,31 +519,31 @@ impl TileGraphBuilder {
             let transfers = batch.transfers.entry(order).or_default();
             // Keep the existing multicast send; only add its local receiver.
             // Placement separates same-class source/receiver SRAM elements.
-            let source_spans = source.bind(&self.shards)?.traversal(order)?;
-            let destination_spans = destination.bind(&self.shards)?.traversal(order)?;
+            let source_spans = source.bind(&self.program.shards)?.traversal(order)?;
+            let destination_spans = destination.bind(&self.program.shards)?.traversal(order)?;
             let aligned = source_spans.word_aligned() && destination_spans.word_aligned();
             if let Some(destinations) = transfers.get_mut(&source)
                 && destinations.len() >= 2
                 && aligned
                 // The local receiver must not split existing messages further.
                 && destinations.iter().any(|view| {
-                    view.bind(&self.shards).and_then(|bound| bound.traversal(order)).is_ok_and(|remote|
+                    view.bind(&self.program.shards).and_then(|bound| bound.traversal(order)).is_ok_and(|remote|
                         remote.spans().map(|span| span.bytes)
                             .eq(destination_spans.spans().map(|span| span.bytes)))
                 })
                 && destinations.iter().all(|view| {
-                    self.shards[view.shard.index() as usize].tile
-                        != self.shards[source.shard.index() as usize].tile
+                    self.program.shards[view.shard.index() as usize].tile
+                        != self.program.shards[source.shard.index() as usize].tile
                 })
             {
                 destinations.push(destination);
             } else {
                 append_span_copies(
                     &self.cache,
-                    &self.shards,
+                    &self.program.shards,
                     &source,
                     &destination,
-                    self.shards[source.shard.index() as usize].tile,
+                    self.program.shards[source.shard.index() as usize].tile,
                     &mut batch.after,
                     order,
                 )?;
@@ -550,7 +553,7 @@ impl TileGraphBuilder {
             self.append_local_copy(
                 tiles,
                 tile,
-                crate::kernel::CopyRun::bind(copy, &self.shards)?,
+                crate::kernel::CopyRun::bind(copy, &self.program.shards)?,
             )?;
         }
         let mut transfers = Vec::new();
@@ -570,7 +573,7 @@ impl TileGraphBuilder {
             self.append_local_copy(
                 tiles,
                 tile,
-                crate::kernel::CopyRun::bind(copy, &self.shards)?,
+                crate::kernel::CopyRun::bind(copy, &self.program.shards)?,
             )?;
         }
         for (tile, run) in batch.kernels {

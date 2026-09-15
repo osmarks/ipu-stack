@@ -13,9 +13,10 @@ impl TileGraphBuilder {
             return Ok(());
         }
         let id = ExchangePhaseId(
-            u32::try_from(self.phases.len()).map_err(|_| ExpansionError::IdOverflow)?,
+            u32::try_from(self.program.exchange_phases.len())
+                .map_err(|_| ExpansionError::IdOverflow)?,
         );
-        self.phases.push(ExchangePhase {
+        self.program.exchange_phases.push(ExchangePhase {
             id,
             provenance,
             transfers,
@@ -38,9 +39,10 @@ impl TileGraphBuilder {
         run: KernelRun,
     ) -> ExpansionResult<()> {
         let id = KernelRunId(
-            u32::try_from(self.kernel_runs.len()).map_err(|_| ExpansionError::IdOverflow)?,
+            u32::try_from(self.program.kernel_runs.len())
+                .map_err(|_| ExpansionError::IdOverflow)?,
         );
-        self.kernel_runs.push(run);
+        self.program.kernel_runs.push(run);
         tiles
             .operations
             .push(BlockOperation::Compute { tile, run: id });
@@ -54,9 +56,10 @@ impl TileGraphBuilder {
         copy: crate::kernel::CopyRun,
     ) -> ExpansionResult<()> {
         let id = LocalCopyId(
-            u32::try_from(self.local_copies.len()).map_err(|_| ExpansionError::IdOverflow)?,
+            u32::try_from(self.program.local_copies.len())
+                .map_err(|_| ExpansionError::IdOverflow)?,
         );
-        self.local_copies.push(copy);
+        self.program.local_copies.push(copy);
         tiles
             .operations
             .push(BlockOperation::Copy { tile, copy: id });
