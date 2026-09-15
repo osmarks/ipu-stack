@@ -1157,38 +1157,28 @@ fn main() -> Result<()> {
                     )?,
                     arguments.timeout_seconds,
                 )?;
-            } else if matches!(arguments.workload, Workload::MlpSmoke) {
+            } else if matches!(
+                arguments.workload,
+                Workload::MlpSmoke | Workload::SiglipAttentionBenchmark
+            ) {
                 let (_, maximum_error) = run_reference(
                     &runtime,
                     &application,
                     &graph,
                     compiled_package
                         .as_ref()
-                        .context("MLP smoke requires a newly compiled package")?,
+                        .context("reference validation requires a newly compiled package")?,
                     arguments.timeout_seconds,
-                    ReferenceCheck::Elementwise((0.02, 0.0)),
+                    ReferenceCheck::Elementwise((0.001, 0.02)),
                     false,
                     1,
                     None,
-                    None,
+                    arguments
+                        .profile_output
+                        .as_deref()
+                        .map(|path| (path, arguments.clock_hz)),
                 )?;
-                println!(
-                    "mlpNumericalChecks={} maximumAbsoluteError={maximum_error:.6} numericalTest=PASS",
-                    u32::from(active_tiles) * 64
-                );
-            } else if matches!(arguments.workload, Workload::SiglipAttentionBenchmark) {
-                run_projected_attention_benchmark(
-                    &runtime,
-                    &application,
-                    compiled_package
-                        .as_ref()
-                        .context("attention validation needs logical storage metadata")?,
-                    arguments.attention_blocks,
-                    arguments.attention_heads,
-                    arguments.clock_hz,
-                    arguments.timeout_seconds,
-                    arguments.profile_output.as_deref(),
-                )?;
+                println!("referenceMaximumAbsoluteError={maximum_error:.6} numericalTest=PASS");
             } else if matches!(arguments.workload, Workload::AttentionSmoke) {
                 let (heads, query_rows, key_rows) = (4, 17, 19);
                 let query_dimension = SIGLIP_ATTENTION_HEAD_DIMENSION;
@@ -1514,60 +1504,6 @@ fn run_reference(
         fs::write(directory.join("output.bin"), &output)?;
     }
     Ok((output, maximum_error))
-}
-
-fn run_projected_attention_benchmark(
-    runtime: &Runtime,
-    application: &Application,
-    package: &CompiledPackage,
-    blocks: u32,
-    heads: u32,
-    clock_hz: u64,
-    timeout_seconds: u64,
-    profile_output: Option<&Path>,
-) -> Result<()> {
-    let model_width = heads
-        .checked_mul(SIGLIP_ATTENTION_HEAD_DIMENSION)
-        .context("attention model width overflow")?;
-    let (weights, input_bytes) = constant_inputs(application, package, |name| {
-        if name == "input" {
-            1.0
-        } else {
-            1.0 / model_width as f32
-        }
-    })?;
-    let actual = run_initialized_program(
-        runtime,
-        application,
-        &weights,
-        &input_bytes,
-        timeout_seconds,
-    )?;
-    write_profile(application, &actual, clock_hz, profile_output)?;
-
-    let tensor = package
-        .outputs
-        .iter()
-        .find(|tensor| tensor.name.as_deref() == Some("output.0"))
-        .context("attention package has no logical output storage map")?;
-    let expected = expected_projection_value(model_width).powi(i32::try_from(blocks)?);
-    let reference = vec![expected; usize::try_from(tensor.shape.elements())?];
-    let maximum_error = verify_logical_output(
-        application,
-        tensor,
-        &actual,
-        &reference,
-        ReferenceCheck::Elementwise((0.02, 0.0)),
-    )?;
-    println!(
-        "attentionNumericalChecks={} blocks={blocks} expected={expected:.6} maxError={maximum_error:.6} numericalTest=PASS",
-        reference.len()
-    );
-    Ok(())
-}
-
-fn expected_projection_value(model_width: u32) -> f32 {
-    half_to_f32(f32_to_half(1.0 / model_width as f32)) * model_width as f32
 }
 
 fn run_attention_smoke(
