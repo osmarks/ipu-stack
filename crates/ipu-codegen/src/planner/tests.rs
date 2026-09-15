@@ -1,4 +1,4 @@
-use crate::estimate::{CostModel, Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
+use crate::estimate::{Ipu21CostModel, MemoizedCostModel, MemoryPeaks};
 use crate::graph::{ComputeGraph, GemmOptions, GraphInputKind, OperationKind, ValueId};
 use crate::kernel::AccumulationPrecision;
 use crate::mid::MidOperationKind;
@@ -6,7 +6,6 @@ use crate::mid::{
     CoordinateMapping, MidInput, MidOperation, MidProgram, MidValue, MidValueId, cast_order,
     expand_tiles,
 };
-use crate::CopyPolicy;
 use crate::planner::cache::FragmentCache;
 use crate::planner::candidates::{
     CandidateSearch, OutputDemand, OutputDemands, PlanMetrics, gemm_plan_matches,
@@ -659,43 +658,6 @@ fn assert_conversions_are_explicit(lowered: &MidProgram, operations: &[MidOperat
     }
 }
 
-struct ColumnParityCost;
-
-impl CostModel for ColumnParityCost {
-    fn operator_cycle_override(
-        &self,
-        plan: &OperatorPlan,
-        _inputs: &[TensorType],
-        output: &TensorType,
-    ) -> Option<u64> {
-        let preferred = if output.shape.0.last().unwrap().is_multiple_of(2) {
-            Precision::F16
-        } else {
-            Precision::F32
-        };
-        Some(match plan.operator {
-            OperatorFamily::Gemm { multiply, .. } if multiply == preferred => 0,
-            OperatorFamily::Gemm { .. } => 1,
-            _ => 0,
-        })
-    }
-
-    fn cast_format_cycles(&self, _input: &TensorType, _output: &crate::TensorFormat) -> u64 {
-        0
-    }
-
-    fn rearrangement_cost(
-        &self,
-        _shape: &TensorShape,
-        _precision: Precision,
-        _strategy: CopyPolicy,
-        _from: &Layout,
-        _to: &Layout,
-    ) -> crate::estimate::RearrangementCost {
-        crate::estimate::RearrangementCost::default()
-    }
-}
-
 #[test]
 fn randomized_axis_tiling_applies_or_rejects_padding() {
     let mut random = fastrand::Rng::with_seed(0x7469_6c65);
@@ -758,7 +720,7 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
         let batches = (0..random.usize(0..=3))
             .map(|_| random.u32(1..=2))
             .collect::<Vec<_>>();
-        let multiply = precision(&mut random);
+        let multiply = Precision::F16;
         let left_format = format(multiply, Layout::amp_left(64, tiles));
         let right_format = format(
             multiply,
@@ -771,14 +733,7 @@ fn randomized_gemm_lowering_makes_every_format_boundary_explicit() {
                 MemoryClass::Ipu21Standard,
             ),
         );
-        let output_format = format(
-            multiply,
-            if multiply == Precision::F16 {
-                Layout::amp_left_result(tiles)
-            } else {
-                Layout::amp_output(tiles)
-            },
-        );
+        let output_format = format(multiply, Layout::amp_left_result(tiles));
         let accumulate = gemm_accumulation_precision(multiply);
         let candidate = ConcreteOperatorCandidate::new(
             OperatorFamily::Gemm {
@@ -878,56 +833,6 @@ fn randomized_gemm_lowering_rejects_per_batch_weights() {
             lower(&graph, &config, &Ipu21CostModel),
             Err(LoweringError::UnsupportedGemmBatching(_))
         ));
-    }
-}
-
-#[test]
-fn randomized_gemms_choose_precision_independently_within_one_graph() {
-    let mut random = fastrand::Rng::with_seed(0x6d75_6c74);
-    for case in 0..RANDOM_CASES / 4 {
-        let tiles = random.u16(1..=64);
-        let rows = u32::from(tiles) * small_dimension(&mut random);
-        let inner = random.u32(1..=64);
-        let even_columns = random.u32(1..=16) * 2;
-        let odd_columns = random.u32(1..=16) * 2 - 1;
-        let layout = Layout::row_sharded(tiles);
-        let mut graph = ComputeGraph::new();
-        let left = graph.host_input("left", [rows, inner]).unwrap();
-        let even_right = graph.parameter("even", [inner, even_columns]).unwrap();
-        let odd_right = graph.parameter("odd", [inner, odd_columns]).unwrap();
-        let even = graph.gemm(left, even_right).unwrap();
-        let odd = graph.gemm(left, odd_right).unwrap();
-        graph.set_outputs([even, odd]).unwrap();
-        let input_format = format(precision(&mut random), layout);
-        let config = PipelineConfig::new(tiles)
-            .with_input(left, input_format.clone())
-            .with_input(even_right, input_format.clone())
-            .with_input(odd_right, input_format);
-
-        let lowered = lower(&graph, &config, &ColumnParityCost).unwrap();
-        let chosen = lowered
-            .operations
-            .iter()
-            .filter_map(|operation| match operation.kind {
-                MidOperationKind::Gemm { multiply, .. } => Some(multiply),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            chosen,
-            vec![Precision::F16, Precision::F32],
-            "random case {case}"
-        );
-        for &output in &lowered.outputs {
-            assert_eq!(
-                value(&lowered, output)
-                    .tensor_type
-                    .format
-                    .layout
-                    .memory_class,
-                MemoryClass::Ipu21Interleaved
-            );
-        }
     }
 }
 

@@ -14,12 +14,10 @@ pub struct KernelObjects {
     pub compilations: Vec<KernelCompilation>,
     /// All callable entry points, including kernels supplied by the runtime object.
     pub(super) symbols: BTreeSet<String>,
-    pub(super) gemms: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
 }
 
 impl KernelObjects {
-    /// Family construction registers objects directly. GEMMs defer only the
-    /// pairing of row-count variants; this collector does not select kernels.
+    /// Family construction registers objects directly; this collector only deduplicates them.
     pub fn from_program(program: &crate::TileGraph) -> Result<Self, KernelError> {
         let mut plan = Self::default();
         for work in program.body.walk() {
@@ -34,7 +32,6 @@ impl KernelObjects {
                 _ => {}
             }
         }
-        plan.add_gemms();
         // Only compiler-generated C++ codelets need the worker stack symbols.
         // Derive this from the selected recipes, including assembly fast paths.
         if plan

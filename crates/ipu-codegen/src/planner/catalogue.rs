@@ -210,46 +210,26 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             };
             let mut grid = Vec::new();
             let mut placements = vec![
-                (
-                    Precision::F16,
-                    AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
-                ),
-                (
-                    Precision::F16,
-                    AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
-                ),
-                (
-                    Precision::F32,
-                    AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
-                ),
+                AmpWeightPlacement::resident(MemoryClass::Ipu21Standard),
+                AmpWeightPlacement::resident(MemoryClass::Ipu21Interleaved),
             ];
             if rows > 1 {
                 placements.extend([
-                    (
-                        Precision::F16,
-                        AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
-                    ),
-                    (
-                        Precision::F16,
-                        AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Interleaved),
-                    ),
-                    (
-                        Precision::F32,
-                        AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
-                    ),
+                    AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Standard),
+                    AmpWeightPlacement::sharded(rows, MemoryClass::Ipu21Interleaved),
                 ]);
             }
             // Two-way F16 interleaving lets each peer retain half of a full
             // kernel-width column shard. Keep the automatic search bounded;
             // explicit layouts may use any divisor of the row grid.
             if rows > 2 && rows.is_multiple_of(2) {
-                placements.push((
-                    Precision::F16,
-                    AmpWeightPlacement::sharded(2, MemoryClass::Ipu21Interleaved),
+                placements.push(AmpWeightPlacement::sharded(
+                    2,
+                    MemoryClass::Ipu21Interleaved,
                 ));
             }
-            for (precision, weights) in placements {
-                for &output_columns in amp_output_column_blocks(precision) {
+            for weights in placements {
+                for output_columns in [AMP_OUTPUT_COLUMN_BLOCK, 128, 32] {
                     // A narrow resident interleaved shard can avoid streaming
                     // when a 64-column shard would exceed region capacity.
                     // Narrow streamed panels increase multicast-role pressure
@@ -261,7 +241,7 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
                         continue;
                     }
                     let candidate = amp_grid_gemm_operator_candidate(
-                        precision,
+                        Precision::F16,
                         64,
                         output_columns,
                         grid_shape,
@@ -273,18 +253,13 @@ pub(crate) fn operator_candidates_for_tile_count(tile_count: u16) -> Vec<Operato
             grid
         })
         .collect::<Vec<_>>();
-    for precision in [Precision::F16, Precision::F32] {
-        for &output_columns in amp_output_column_blocks(precision)
-            .iter()
-            .filter(|&&columns| columns >= AMP_OUTPUT_COLUMN_BLOCK)
-        {
-            candidates.push(amp_gemm_operator_candidate(
-                precision,
-                64,
-                output_columns,
-                tile_count,
-            ));
-        }
+    for output_columns in [AMP_OUTPUT_COLUMN_BLOCK, 128] {
+        candidates.push(amp_gemm_operator_candidate(
+            Precision::F16,
+            64,
+            output_columns,
+            tile_count,
+        ));
     }
     for input in [0, 1] {
         candidates.push(
@@ -542,13 +517,6 @@ impl AmpWeightPlacement {
             inner_partitions,
             memory_class,
         }
-    }
-}
-
-pub(super) fn amp_output_column_blocks(precision: Precision) -> &'static [u32] {
-    match precision {
-        Precision::F16 => &[AMP_OUTPUT_COLUMN_BLOCK, 128, 32],
-        Precision::F32 | Precision::F8F143 { .. } => &[AMP_OUTPUT_COLUMN_BLOCK],
     }
 }
 

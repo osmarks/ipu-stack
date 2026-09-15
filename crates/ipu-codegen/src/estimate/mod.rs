@@ -31,8 +31,6 @@ use crate::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[cfg(test)]
-pub(crate) use cycles::RearrangementCost;
 pub use cycles::{CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel};
 pub(crate) use cycles::{EXCHANGE_FRAGMENT_CONTROLS, MemoizedCostModel, exchange_work_cycles};
 pub(crate) use memory::*;

@@ -1,4 +1,4 @@
-//! GEMM assembly specializations, paired by physical row count.
+//! FP16/FP8 GEMM entry points and shared worker/dispatch objects.
 
 use super::*;
 use crate::mid::MidOperationKind;
@@ -26,14 +26,11 @@ fn cycles(
     if multiply == Precision::F16 && group != 0 {
         return f16_packed_gemm_cycles(rows, inner, columns, interleaved);
     }
-    if multiply != Precision::F32 && interleaved {
+    if interleaved {
         return interleaved_f16_gemm_cycles(rows, inner, columns);
     }
-    let (row_cycles, group_cycles) = match multiply {
-        Precision::F16 => (rows, 1063),
-        Precision::F32 => (rows.saturating_mul(4), 2126),
-        Precision::F8F143 { .. } => (rows, 1063),
-    };
+    let row_cycles = rows;
+    let group_cycles = 1063;
     294u64.saturating_add(
         inner.div_ceil(16).saturating_mul(
             columns
@@ -167,7 +164,7 @@ pub(super) fn call(
     else {
         return Err(KernelError::RequirementMismatch);
     };
-    if (weights == GemmWeightLoad::Interleaved && multiply == Precision::F32)
+    if multiply == Precision::F32
         || (matches!(multiply, Precision::F8F143 { .. })
             && (accumulate != AccumulationPrecision::F16
                 || output.format.precision != Precision::F16))
@@ -185,11 +182,95 @@ pub(super) fn call(
     let rows = gemm_rows(output)?;
     let group = output.format.layout.order.gemm_output_group().unwrap_or(0);
     if let Some(build) = build {
-        build
-            .gemms
-            .entry((precision, weights, inner_block, output_columns, group))
-            .or_default()
-            .insert(rows);
+        let source = "gemm_f16_amp.S";
+        let prefix = if matches!(precision, Precision::F8F143 { .. }) {
+            "f8"
+        } else {
+            "f16"
+        };
+        let weight_suffix = if weights == GemmWeightLoad::Interleaved {
+            "_interleaved"
+        } else {
+            ""
+        };
+        let dispatch = format!("gemm_{prefix}{weight_suffix}_dispatch");
+        let precision_flags = if matches!(precision, Precision::F8F143 { .. }) {
+            vec!["-DGEMM_NATIVE_FP8=1".into()]
+        } else {
+            Vec::new()
+        };
+        let mut dispatch_flags = precision_flags.clone();
+        dispatch_flags.extend([
+            "-DGEMM_DISPATCH_ONLY=1".into(),
+            format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
+        ]);
+        if weights == GemmWeightLoad::Interleaved {
+            dispatch_flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
+        }
+        build.add_compilation(KernelCompilation {
+            source,
+            name: dispatch.clone(),
+            flags: dispatch_flags,
+        });
+
+        // Workers depend on precision and output packing, not row count or weight loading.
+        let worker = format!("gemm_{prefix}_packed{group}_worker");
+        let worker_flags = [
+            format!("-DGEMM_WORKER_SYMBOL={worker}"),
+            format!("-DGEMM_WORKER_OUTPUT_SYMBOL={worker}_output"),
+            format!("-DGEMM_WORKER_INNER_SYMBOL={worker}_inner"),
+        ];
+        let mut flags = precision_flags.clone();
+        flags.extend(worker_flags.iter().cloned());
+        flags.extend([
+            "-DGEMM_WORKER_ONLY=1".into(),
+            format!("-DGEMM_OUTPUT_GROUP={group}"),
+            format!("-DGEMM_OUTPUT_GROUP_SHIFT={}", group.max(16).ilog2() - 4),
+        ]);
+        build.add_compilation(KernelCompilation {
+            source,
+            name: worker,
+            flags,
+        });
+
+        let mut flags = precision_flags;
+        flags.extend(worker_flags);
+        flags.extend([
+            format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
+            format!("-DGEMM_OUTPUT_GROUP={group}"),
+            format!("-DGEMM_ROWS={rows}"),
+            format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
+            format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block}"),
+            format!(
+                "-DGEMM_INIT_SYMBOL={}",
+                specialized_gemm_symbol(
+                    precision,
+                    weights,
+                    GemmKernelMode::Initialize,
+                    inner_block,
+                    output_columns,
+                    rows,
+                    group
+                )
+            ),
+            format!(
+                "-DGEMM_ACCUMULATE_SYMBOL={}",
+                specialized_gemm_symbol(
+                    precision,
+                    weights,
+                    GemmKernelMode::Accumulate,
+                    inner_block,
+                    output_columns,
+                    rows,
+                    group
+                )
+            ),
+        ]);
+        build.add_compilation(KernelCompilation {
+            source,
+            name: format!("gemm_{prefix}{weight_suffix}_packed{group}_k{inner_block}_c{output_columns}_r{rows}"),
+            flags,
+        });
     }
     let mut call = KernelCall::new(
         specialized_gemm_symbol(
@@ -281,7 +362,7 @@ pub(super) fn specialized_gemm_symbol(
 ) -> String {
     let prefix = match precision {
         Precision::F16 => "f16",
-        Precision::F32 => "f32",
+        Precision::F32 => unreachable!("FP32 GEMM is unsupported"),
         Precision::F8F143 { .. } => "f8",
     };
     let weights = if weights == GemmWeightLoad::Interleaved {
@@ -299,157 +380,6 @@ pub(super) fn specialized_gemm_symbol(
         GemmKernelMode::Accumulate => "accumulate",
     };
     format!("gemm_{prefix}_{operation}_rows{weights}{packed}_k{inner}_c{columns}_r{rows}")
-}
-
-impl KernelObjects {
-    pub(super) fn add_gemms(&mut self) {
-        for ((precision, weights, inner_block, output_columns, output_group), rows) in
-            std::mem::take(&mut self.gemms)
-        {
-            let values = rows.into_iter().collect::<Vec<_>>();
-            let (source, prefix) = match precision {
-                Precision::F16 => ("gemm_f16_amp.S", "f16"),
-                Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
-                Precision::F8F143 { .. } => ("gemm_f16_amp.S", "f8"),
-            };
-            let weight_suffix = if weights == GemmWeightLoad::Interleaved {
-                "_interleaved"
-            } else {
-                ""
-            };
-            let dispatch = format!("gemm_{prefix}{weight_suffix}_dispatch");
-            if precision != Precision::F32 {
-                let mut flags = vec![
-                    "-DGEMM_DISPATCH_ONLY=1".into(),
-                    format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
-                ];
-                if matches!(precision, Precision::F8F143 { .. }) {
-                    flags.push("-DGEMM_NATIVE_FP8=1".into());
-                }
-                if weights == GemmWeightLoad::Interleaved {
-                    flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
-                }
-                self.add_compilation(KernelCompilation {
-                    source,
-                    name: dispatch.clone(),
-                    flags,
-                });
-            }
-            let weight_suffix = if output_group == 0 {
-                weight_suffix.to_owned()
-            } else {
-                format!("{weight_suffix}_packed{output_group}")
-            };
-            // The worker depends on precision and store permutation, not GEMM
-            // extents, coefficient load mode, or the scale exponent.
-            let worker = format!("gemm_{prefix}_packed{output_group}_worker");
-            let worker_flags = vec![
-                format!("-DGEMM_WORKER_SYMBOL={worker}"),
-                format!("-DGEMM_WORKER_OUTPUT_SYMBOL={worker}_output"),
-                format!("-DGEMM_WORKER_INNER_SYMBOL={worker}_inner"),
-            ];
-            if precision != Precision::F32 {
-                let mut flags = worker_flags.clone();
-                flags.extend([
-                    "-DGEMM_WORKER_ONLY=1".into(),
-                    format!("-DGEMM_OUTPUT_GROUP={output_group}"),
-                    format!(
-                        "-DGEMM_OUTPUT_GROUP_SHIFT={}",
-                        output_group.max(16).ilog2() - 4
-                    ),
-                ]);
-                if matches!(precision, Precision::F8F143 { .. }) {
-                    flags.push("-DGEMM_NATIVE_FP8=1".into());
-                }
-                self.add_compilation(KernelCompilation {
-                    source,
-                    name: worker,
-                    flags,
-                });
-            }
-            for pair in values.chunks(2) {
-                let small = pair[0];
-                let large = *pair.last().expect("nonempty GEMM row pair");
-                let symbols = [
-                    (GemmKernelMode::Initialize, small),
-                    (GemmKernelMode::Initialize, large),
-                    (GemmKernelMode::Accumulate, small),
-                    (GemmKernelMode::Accumulate, large),
-                ]
-                .map(|(mode, rows)| {
-                    specialized_gemm_symbol(
-                        precision,
-                        weights,
-                        mode,
-                        inner_block,
-                        output_columns,
-                        rows,
-                        output_group,
-                    )
-                });
-                let single_rows = pair.len() == 1;
-                let mut flags = vec![
-                    format!("-DGEMM_DISPATCH_SYMBOL={dispatch}"),
-                    format!("-DGEMM_OUTPUT_GROUP={output_group}"),
-                    format!(
-                        "-DGEMM_OUTPUT_GROUP_SHIFT={}",
-                        output_group.max(16).ilog2() - 4
-                    ),
-                    format!("-DGEMM_SMALL_ROWS={small}"),
-                    format!("-DGEMM_LARGE_ROWS={large}"),
-                    format!("-DGEMM_OUTPUT_COLUMNS={output_columns}"),
-                    format!("-DGEMM_INNER_BLOCK_DIMENSION={inner_block}"),
-                    format!("-DGEMM_INIT_SMALL_SYMBOL={}", symbols[0]),
-                    format!("-DGEMM_INIT_LARGE_SYMBOL={}", symbols[1]),
-                    format!("-DGEMM_ACCUMULATE_SMALL_SYMBOL={}", symbols[2]),
-                    format!("-DGEMM_ACCUMULATE_LARGE_SYMBOL={}", symbols[3]),
-                ];
-                if matches!(precision, Precision::F8F143 { .. }) {
-                    flags.push("-DGEMM_NATIVE_FP8=1".into());
-                }
-                flags.extend(worker_flags.iter().cloned());
-                if single_rows {
-                    flags.push("-DGEMM_SINGLE_ROWS=1".into());
-                }
-                if precision == Precision::F32 {
-                    // This source has fixed entry-point names and emits both
-                    // row stubs even for a single-row-count object.
-                    for (index, entry) in [
-                        "init_small",
-                        "init_large",
-                        "accumulate_small",
-                        "accumulate_large",
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let unused = if single_rows && index % 2 != 0 {
-                            "_unused"
-                        } else {
-                            ""
-                        };
-                        flags.push(format!(
-                            "-Dgemm_f32_{entry}_rows={}{unused}",
-                            symbols[index]
-                        ));
-                    }
-                    for mode in ["init", "accumulate"] {
-                        flags.push(format!("-Dgemm_f32_{mode}_common=gemm_f32_{mode}_k{inner_block}_c{output_columns}_r{small}_r{large}"));
-                    }
-                }
-                if weights == GemmWeightLoad::Interleaved {
-                    flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
-                }
-                self.add_compilation(KernelCompilation {
-                source,
-                name: format!(
-                    "gemm_{prefix}{weight_suffix}_k{inner_block}_c{output_columns}_r{small}_r{large}"
-                ),
-                flags,
-            });
-            }
-        }
-    }
 }
 
 /// Interleaved F16 AMP K16/C16 group: four issue cycles per row plus retained

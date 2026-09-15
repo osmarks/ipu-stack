@@ -32,6 +32,9 @@ impl FragmentBuilder {
         product: Product,
         operands: Vec<OperandIndexing>,
     ) -> Option<MidValueId> {
+        if product.multiply == Precision::F32 {
+            return None;
+        }
         let [left, right] = inputs.as_slice() else {
             return None;
         };

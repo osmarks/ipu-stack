@@ -291,7 +291,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             .find(|unit| {
                 unit.flags
                     .iter()
-                    .any(|flag| flag.starts_with("-DGEMM_SMALL_ROWS="))
+                    .any(|flag| flag.starts_with("-DGEMM_ROWS="))
             })
             .unwrap();
         assert_eq!(plan.compilations.len(), 3);
@@ -314,13 +314,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             specialization
                 .flags
                 .iter()
-                .any(|flag| flag == &format!("-DGEMM_SMALL_ROWS={}", planned_rows[0]))
-        );
-        assert!(
-            specialization
-                .flags
-                .iter()
-                .any(|flag| flag == "-DGEMM_SINGLE_ROWS=1")
+                .any(|flag| flag == &format!("-DGEMM_ROWS={}", planned_rows[0]))
         );
         assert!(
             plan.retained_symbols()
