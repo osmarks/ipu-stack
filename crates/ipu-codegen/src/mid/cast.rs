@@ -235,6 +235,32 @@ mod tests {
                 placement.shard_addresses[&input],
                 placement.shard_addresses[&output] + 32768
             );
+            let mut metadata = Vec::new();
+            let sample = &low.kernel_runs[0];
+            for donated in [false, true, false] {
+                let mut shards = low.shards.clone();
+                if !donated {
+                    shards[output.index() as usize].definition = crate::ShardDefinition::Staging;
+                }
+                let run = crate::KernelRun::bind(
+                    sample.provenance,
+                    sample.kernel.clone(),
+                    sample.inputs.clone(),
+                    sample.outputs.clone(),
+                    &shards,
+                    &mut metadata,
+                )
+                .unwrap();
+                assert_eq!(
+                    run.requirements.outputs[0].storage.alignment,
+                    if donated { CAST_PREFIX_BYTES } else { 8 }
+                );
+            }
+            assert_eq!(
+                metadata.len(),
+                2,
+                "ordinary and donated casts need distinct cached contracts"
+            );
             let mut written = 0;
             for run in &low.kernel_runs {
                 run.call().unwrap();

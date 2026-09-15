@@ -571,19 +571,6 @@ fn collect_requirements(
         match work {
             BlockOperation::Compute { run, .. } => {
                 let run = &program.kernel_runs[run.0 as usize];
-                // Shifted writable donations use element-sized cast chunks.
-                // Read-only aliases introduced by copy elimination do not.
-                for view in &run.outputs {
-                    if matches!(
-                        program.shards[view.shard.index() as usize].definition,
-                        ShardDefinition::ShiftedAlias { .. }
-                    ) {
-                        requirements[view.shard.index() as usize].alignment = requirements
-                            [view.shard.index() as usize]
-                            .alignment
-                            .max(crate::kernel::cast::CAST_PREFIX_BYTES);
-                    }
-                }
                 for operands in &run.requirements.distinct_elements {
                     let shards = operands
                         .iter()

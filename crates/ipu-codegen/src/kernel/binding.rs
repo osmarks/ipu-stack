@@ -1,7 +1,7 @@
 //! Address-independent kernel access contracts and call geometry.
 
 use super::*;
-use crate::low::{KernelRun, ShardView};
+use crate::low::{KernelRun, ShardDefinition, ShardView};
 use crate::low::{KernelRunMetadata, WorkProvenance};
 use crate::mid::MidOperationKind;
 use crate::tensor::TensorFormat;
@@ -37,41 +37,6 @@ pub struct KernelRequirements {
     pub inputs: Vec<KernelAccess>,
     pub outputs: Vec<KernelAccess>,
     pub distinct_elements: Vec<Vec<MemoryOperand>>,
-}
-
-impl KernelRequirements {
-    pub fn new(
-        kernel: &MidOperationKind,
-        inputs: impl IntoIterator<Item = TensorFormat>,
-        outputs: impl IntoIterator<Item = TensorFormat>,
-    ) -> Self {
-        let alignment = match kernel {
-            MidOperationKind::Gemm { .. } => 32,
-            // Includes rearrangement fast paths: these use 64-bit accesses
-            // even when the tensor elements are F16.
-            _ => 8,
-        };
-        let mut requirements = Self {
-            inputs: inputs
-                .into_iter()
-                .map(|format| KernelAccess::new(format, alignment))
-                .collect(),
-            outputs: outputs
-                .into_iter()
-                .map(|format| KernelAccess::new(format, alignment))
-                .collect(),
-            distinct_elements: Vec::new(),
-        };
-        if let MidOperationKind::Gemm { multiply, .. } = kernel
-            && let Some(left) = requirements.inputs.first_mut()
-        {
-            left.storage.access_tail_bytes = 8 * multiply.bytes() as u32;
-            requirements
-                .distinct_elements
-                .push(vec![MemoryOperand::Output(0), MemoryOperand::Input(0)]);
-        }
-        requirements
-    }
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -171,11 +136,27 @@ impl KernelRun {
             }
         }
         let format = |view: &ShardView| &shards[view.shard.index() as usize].tensor_type.format;
+        let alignment = match kernel {
+            MidOperationKind::Gemm { .. } => 32,
+            MidOperationKind::Cast {
+                from: Precision::F16,
+                to: Precision::F8F143 { .. },
+            } if matches!(
+                shards[output.shard.index() as usize].definition,
+                ShardDefinition::ShiftedAlias { .. }
+            ) =>
+            {
+                cast::CAST_PREFIX_BYTES
+            }
+            // Rearrangement fast paths also use 64-bit accesses for F16 values.
+            _ => 8,
+        };
         let shared = metadata.iter().find(|metadata| {
             metadata.provenance == provenance
                 && metadata.kernel == kernel
                 && metadata.requirements.inputs.len() == inputs.len()
                 && metadata.requirements.outputs.len() == outputs.len()
+                && metadata.requirements.outputs[0].storage.alignment == alignment
                 && inputs
                     .iter()
                     .zip(&metadata.requirements.inputs)
@@ -185,13 +166,23 @@ impl KernelRun {
         let shared = if let Some(shared) = shared {
             Arc::clone(shared)
         } else {
+            let access = |view: &ShardView| KernelAccess::new(format(view).clone(), alignment);
+            let mut requirements = KernelRequirements {
+                inputs: inputs.iter().map(access).collect(),
+                outputs: outputs.iter().map(access).collect(),
+                distinct_elements: Vec::new(),
+            };
+            if let MidOperationKind::Gemm { multiply, .. } = kernel
+                && let Some(left) = requirements.inputs.first_mut()
+            {
+                left.storage.access_tail_bytes = 8 * multiply.bytes() as u32;
+                requirements
+                    .distinct_elements
+                    .push(vec![MemoryOperand::Output(0), MemoryOperand::Input(0)]);
+            }
             let shared = Arc::new(KernelRunMetadata {
                 provenance,
-                requirements: KernelRequirements::new(
-                    &kernel,
-                    inputs.iter().map(|view| format(view).clone()),
-                    outputs.iter().map(|view| format(view).clone()),
-                ),
+                requirements,
                 kernel,
             });
             metadata.push(Arc::clone(&shared));

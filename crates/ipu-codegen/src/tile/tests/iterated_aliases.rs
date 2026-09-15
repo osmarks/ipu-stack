@@ -311,17 +311,15 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
         extents: shards[shard.index() as usize].extents.clone(),
     };
     let kernel = MidOperationKind::Gelu;
-    let run = KernelRun::new(
+    let run = KernelRun::bind(
         low.repeat_runs[0].provenance,
-        kernel.clone(),
+        kernel,
         vec![view(source)],
         vec![view(output)],
-        KernelRequirements::new(
-            &kernel,
-            [shards[source.index() as usize].tensor_type.format.clone()],
-            vec![shards[output.index() as usize].tensor_type.format.clone()],
-        ),
-    );
+        &shards,
+        &mut vec![],
+    )
+    .unwrap();
     let call = materialize_kernel_run(
         &run,
         &shards,

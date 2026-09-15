@@ -835,11 +835,11 @@ fn unsupported_kernel_formats_fail_at_call_construction() {
             1,
         ),
     ] {
-        let requirements = KernelRequirements::new(
-            &kernel,
-            (0..inputs).map(|_| format.clone()),
-            vec![format.clone()],
-        );
+        let requirements = KernelRequirements {
+            inputs: vec![KernelAccess::new(format.clone(), 8); inputs],
+            outputs: vec![KernelAccess::new(format.clone(), 8)],
+            distinct_elements: vec![],
+        };
         let view = ShardView {
             shard: BlockValueId(0),
             extents: vec![ShardExtent {
@@ -893,7 +893,11 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
         kernel.clone(),
         vec![view(0, [1, 2]), view(1, [1, 2])],
         vec![view(2, [1, 2])],
-        KernelRequirements::new(&kernel, [format.clone(), format.clone()], vec![format]),
+        KernelRequirements {
+            inputs: vec![KernelAccess::new(format.clone(), 8); 2],
+            outputs: vec![KernelAccess::new(format, 8)],
+            distinct_elements: vec![],
+        },
     );
     run.call().unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.
