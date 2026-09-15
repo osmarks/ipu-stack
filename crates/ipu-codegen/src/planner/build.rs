@@ -37,9 +37,7 @@ pub(crate) fn build_candidate(
     selected.recipe.normalize(config);
     let mut program = selected.program;
     selected.cast_sites = program.reorder_casts(&BTreeSet::new());
-    selected
-        .recipe
-        .resolve_cast_choices(&program, &selected.cast_sites)?;
+    selected.recipe.resolve_cast_choices(&selected.cast_sites)?;
     if !selected.recipe.cast_before_copies.is_empty() {
         program.reorder_casts(&selected.recipe.cast_before_copies);
     }
@@ -55,7 +53,6 @@ pub(crate) fn build_candidate(
             .unwrap_or(program)
     };
     if !config.diagnostic_checkpoints {
-        selected.recipe.resolve_packing_choices(&selected.program)?;
         selected.packing_choices = selected
             .program
             .packing_choices(&super::proposals::PACKING_ROWS, &selected.recipe.packing);
@@ -71,12 +68,7 @@ pub(crate) fn build_candidate(
             )
             .into());
         }
-        // The old global hint was disabled by diagnostic checkpoints too.
-        selected.recipe.legacy_packing_rows = None;
     }
-    selected
-        .recipe
-        .resolve_legacy_grouping(&mut selected.program, config.diagnostic_checkpoints)?;
     if config.diagnostic_checkpoints && !selected.recipe.reduction_groups.is_empty() {
         return Err(crate::mid::ProgramError::Invalid(
             "reduction grouping cannot apply with diagnostic checkpoints".into(),
@@ -246,7 +238,6 @@ pub(crate) fn select(
         estimated_exchange_cycles: 0,
         peak_memory: MemoryPeaks::default(),
     };
-    builder.recipe.resolve_result_homes(&program)?;
     program.apply_ownership(&builder.recipe.owners)?;
     program.validate()?;
     Ok(Candidate {

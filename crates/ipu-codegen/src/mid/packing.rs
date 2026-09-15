@@ -60,42 +60,6 @@ impl MidProgram {
             .collect()
     }
 
-    /// Resolve the old global preference once. It packed every eligible copy
-    /// using the destination's map, and fell back to the original program if a
-    /// workspace exceeded that domain. Subsequent recipes contain named choices.
-    pub(crate) fn legacy_packing_choices(
-        &self,
-        rows: NonZeroU16,
-    ) -> Result<BTreeMap<WorkSite, PanelPacking>, ProgramError> {
-        let mut choices = BTreeMap::new();
-        for operation in self.walk_operations() {
-            let Some(target) = packing_target(operation, &self.values) else {
-                continue;
-            };
-            let Some(layout) = packing_layout(&target.tensor_type, self.tile_count, rows) else {
-                continue;
-            };
-            if target
-                .owners
-                .validate(layout.tiling.tile_count, self.tile_count)
-                .is_err()
-            {
-                return Ok(BTreeMap::new());
-            }
-            let site = operation.work_site().ok_or_else(|| {
-                ProgramError::Invalid("legacy packing request cannot name an anonymous copy".into())
-            })?;
-            choices.insert(
-                site,
-                PanelPacking {
-                    rows,
-                    workspace: target.owners.clone(),
-                },
-            );
-        }
-        Ok(choices)
-    }
-
     pub(crate) fn apply_packing(
         &mut self,
         choices: &BTreeMap<WorkSite, PanelPacking>,
@@ -461,8 +425,10 @@ mod tests {
                 .into_iter()
                 .filter_map(|rows| {
                     let choices = program
-                        .legacy_packing_choices(NonZeroU16::new(rows).unwrap())
-                        .unwrap();
+                        .packing_choices(&[rows], &BTreeMap::new())
+                        .into_iter()
+                        .map(|(site, choices)| (site, choices.into_iter().next().unwrap()))
+                        .collect::<BTreeMap<_, _>>();
                     if choices.is_empty() {
                         return None;
                     }

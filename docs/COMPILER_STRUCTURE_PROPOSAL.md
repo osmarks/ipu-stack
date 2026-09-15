@@ -82,8 +82,7 @@ Ownership-copy insertion belongs to mid and covers allocation aliases as well
 as callable operands. Recipe now selects input homes, operator working domains
 and individual result homes. The old whole-device mapping neighborhood is an
 ordinary joint Recipe proposal, ranked with its fabric-load estimate; the
-separate mapping optimizer and low remapping pass are removed. Checkpoint
-version four migrates previous mappings into those choices. Family storage
+separate mapping optimizer and low remapping pass are removed. Family storage
 and cache boundaries below still require work.
 Architectural SRAM, supervisor encodings, register IDs and physical routing now
 belong to the dependency-leaf `ipu-target` crate. Exchange construction consumes
@@ -99,24 +98,21 @@ the retained sites; their address/group reconstruction walks are removed.
 The independent decoders live in exchange diagnostics and check emitted metadata
 in the randomized encoding tests. This does not change scheduling policy.
 Family constructors now label executable work with stable local roles and block
-coordinates. Cast-order requests use these sites and source-operation provenance;
-version-one checkpoint ordinals are resolved only at the loading/construction
-boundary. Missing requests and ambiguous names are rejected. Cast storage now
+coordinates. Cast-order requests use these sites and source-operation provenance.
+Missing requests and ambiguous names are rejected. Cast storage now
 uses a typed mid policy with site overrides, operator defaults and an effective
 initial default. Layout proposals pair donation with the affected operator and
-its direct consumers; they do not toggle donation throughout the graph. Old
-global cast-storage settings migrate at checkpoint loading. Packing now selects
+its direct consumers; they do not toggle donation throughout the graph. Packing now selects
 panel rows and an explicit workspace per named copy, preserving the destination's
 layout and home. Construction rejects unavailable choices; layout proposals can
-explicitly remove affected choices. Version-five checkpoints migrate the previous
-global row hint once, and physical relabeling includes packing workspaces.
+explicitly remove affected choices, and physical relabeling includes packing workspaces.
 Grouping now names independent reductions. Its rewrite only changes order;
 disjoint reduction/preparation homes use the ordinary ownership choices and
 check physical overlap across different domains. Explicit result homes name the
 actual assignment, preserving alias-relative rotations without an implicit
-constructor offset. Version-six checkpoints resolve the old bases and global
-grouping requests once. Unrelated groups and result homes remain fixed when
-search explicitly removes choices affected by a layout change.
+constructor offset. Unrelated groups and result homes remain fixed when
+search explicitly removes choices affected by a layout change. Checkpoint migrations
+and their deferred legacy choices have been removed; old states require a new search.
 Attention softmax now declares separate typed probability, statistics and worker
 workspace results through the same multi-result compute constructor. Its family
 shares workspace geometry between construction and local call validation;

@@ -9,8 +9,6 @@ pub enum LoweringError {
     UnavailableCastChoice(crate::mid::WorkSite),
     #[error("cast-storage choice is unavailable at {0:?}")]
     UnavailableCastStorageChoice(crate::mid::WorkSite),
-    #[error("legacy cast choice has no constructed site: operation {0:?}, ordinal {1}")]
-    UnknownLegacyCastChoice(Option<OperationId>, u32),
     #[error("selected operator implementation is invalid")]
     InvalidImplementation,
     #[error(transparent)]

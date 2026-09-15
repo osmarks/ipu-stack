@@ -121,9 +121,8 @@ a role within the family, algorithmic block coordinates, and the containing
 source operation. Binding retains the role when substituting actual values;
 rewrites retain it for the same work and name generated copies as children.
 Names never depend on arena IDs or the number of earlier emitted operations.
-Cast-order requests in Recipe refer to these sites. Checkpoint loading preserves
-old ordinal requests only until construction can resolve them; new checkpoints
-store names. Missing cast choices are errors, and mid validation rejects names
+Cast-order requests in Recipe refer to these sites. Missing cast choices are
+errors, and mid validation rejects names
 that ambiguously refer to more than one operation.
 
 Cast-storage policy belongs to [mid/cast.rs](../crates/ipu-codegen/src/mid/cast.rs).
@@ -132,8 +131,7 @@ overrides. Operator defaults also cover casts introduced by a new layout. The
 rewrite realizes reuse only for safe, storage-saving donations and records the
 result in the ordinary allocation aliases. Search proposes individual choices
 and joint layout/donation changes for an operator and its direct consumers;
-unrelated policies stay fixed. Checkpoint loading migrates the old global boolean,
-which is absent from current recipes.
+unrelated policies stay fixed.
 
 [Panel packing](../crates/ipu-codegen/src/mid/packing.rs) has a separate choice
 for each named copy: panel rows and an absolute workspace owner map. It inserts
@@ -142,9 +140,8 @@ result. The result retains its selected layout and home; the workspace can use
 more tiles. Before rewriting, the planner asks for feasible choices from its
 existing four row sizes. An unavailable requested site or workspace is an error.
 Layout/cast proposals may explicitly remove affected packing choices, while
-unrelated choices remain fixed. Version-five checkpoints resolve the old global
-row hint once; new checkpoints retain only named choices. Joint tile-mapping
-proposals also remap packing workspaces.
+unrelated choices remain fixed. Joint tile-mapping proposals also remap packing
+workspaces.
 
 [Grouping](../crates/ipu-codegen/src/mid/grouping.rs) proposes named independent
 reductions and disjoint result homes. The homes enter the ordinary ownership
@@ -153,8 +150,8 @@ group. It checks read/write hazards and region boundaries before changing order.
 Preparation proposals use the same result-home policy without an ordering rewrite.
 Both proposals check actual tiles when domains differ. The existing bounded joint
 neighborhood remains; recipes can retain unrelated groups independently.
-Version-six checkpoints resolve old global grouping requests once. Layout changes
-can explicitly remove affected groups and homes, as with packing choices.
+Layout changes can explicitly remove affected groups and homes, as with packing
+choices.
 
 Mid values carry an
 [OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs): a reusable embedding onto
@@ -207,7 +204,9 @@ its schedule-cache snapshot; only the winner's final cache is promoted. The form
 `ScheduledPlan`, separate `BuiltApplication`, `validate` wrapper and finalization
 callback are removed. Checkpoints store recipes/progress in
 [planner/checkpoint.rs](../crates/ipu-codegen/src/planner/checkpoint.rs). The graph builder, family choices/catalogues, fragment cache and direct construction
-now live under [planner](../crates/ipu-codegen/src/planner/mod.rs).
+now live under [planner](../crates/ipu-codegen/src/planner/mod.rs). Checkpoints
+require the current schema and matching graph/configuration; obsolete states
+are rejected and the search must be rerun. There is no migration path.
 [compile/config.rs](../crates/ipu-codegen/src/compile/config.rs) owns pipeline
 configuration. Mid contains executable semantics, binding and rewrites. Mapping
 proposals still need scoped recipes.

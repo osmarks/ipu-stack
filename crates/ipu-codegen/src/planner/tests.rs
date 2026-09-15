@@ -159,12 +159,6 @@ fn named_reduction_groups_replay_through_normal_ownership_and_lowering() {
     let rebuilt =
         build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &replay).unwrap();
     assert_eq!(rebuilt.program, grouped.program);
-    let mut legacy = baseline.recipe.clone();
-    legacy.legacy_parallel_reductions = 2;
-    let migrated =
-        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &legacy).unwrap();
-    assert_eq!(migrated.program, grouped.program);
-    assert!(migrated.recipe == grouped.recipe);
     // An explicit home denotes the actual output assignment even when a
     // constructor has already rotated that storage group.
     let mut rotated = baseline.program.clone();
@@ -182,15 +176,6 @@ fn named_reduction_groups_replay_through_normal_ownership_and_lowering() {
     {
         alias.owners = alias.owners.shifted(5, rotated.tile_count).unwrap();
     }
-    let mut legacy_home = Recipe::default();
-    legacy_home
-        .legacy_result_bases
-        .insert(site.clone(), requested.clone());
-    legacy_home.resolve_result_homes(&rotated).unwrap();
-    assert_eq!(
-        legacy_home.owners.results[site],
-        requested.shifted(5, rotated.tile_count).unwrap()
-    );
     rotated
         .apply_ownership(&crate::mid::OwnerChoices {
             results: choice.homes.clone(),
@@ -2893,4 +2878,111 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             Err(LoweringError::UnavailableCastStorageChoice(site)) if site == unavailable
         ));
     }
+}
+
+#[test]
+fn layout_search_can_replace_scoped_packing() {
+    use crate::planner::catalogue::pointwise_operator_candidate;
+    use crate::planner::operator::OutputAliasing;
+    use crate::tensor::{BlockMajorOrder, ElementOrder, Layout, Precision, TensorFormat};
+
+    let mut graph = ComputeGraph::new();
+    let x = graph.host_input("x", [512, 32]).unwrap();
+    let z = graph.host_input("z", [512, 32]).unwrap();
+    let a = graph.gelu(x).unwrap();
+    let b = graph.gelu(z).unwrap();
+    graph.set_outputs([a, b]).unwrap();
+    let plain = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_sharded(64),
+    };
+    let mut target = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_sharded(2),
+    };
+    target.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+        row_block: 256,
+        column_block: 16,
+    });
+    let plan = |format: TensorFormat| {
+        pointwise_operator_candidate(
+            crate::planner::OperatorFamily::Gelu,
+            [format.clone()],
+            format,
+        )
+        .with_output_aliasing(OutputAliasing::MayAliasInputs(vec![0]))
+        .plan
+    };
+    let config = PipelineConfig::new(64)
+        .with_input(x, plain.clone())
+        .with_input(z, plain.clone());
+    let mut recipe = Recipe::default();
+    recipe.open_boundaries.extend([a, b]);
+    for operation in graph.operations() {
+        recipe.plans.insert(operation.id, plan(target.clone()));
+    }
+    let fragments = crate::planner::FragmentCache::default();
+    let baseline =
+        crate::planner::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &recipe)
+            .unwrap();
+    assert_eq!(baseline.packing_choices.len(), 2);
+    let mut scoped = baseline.recipe.clone();
+    scoped.packing = baseline
+        .packing_choices
+        .iter()
+        .map(|(site, choices)| {
+            (
+                site.clone(),
+                choices
+                    .iter()
+                    .find(|choice| choice.rows.get() == 128)
+                    .unwrap()
+                    .clone(),
+            )
+        })
+        .collect();
+    let mut actual =
+        crate::planner::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &scoped)
+            .unwrap();
+
+    let source = graph.operations()[0].id;
+    let alternative = plan(plain);
+    actual
+        .alternatives
+        .insert(source, vec![alternative.clone()]);
+    let proposals = crate::planner::proposals(&graph, &config, &actual, None);
+    let changed = |recipe: &Recipe| recipe.plans.get(&source) == Some(&alternative);
+    let preserved = proposals
+        .iter()
+        .find(|p| changed(&p.recipe) && p.recipe.packing == actual.recipe.packing)
+        .unwrap();
+    assert!(
+        crate::planner::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &fragments,
+            &preserved.recipe
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("packing")
+    );
+    let cleared = proposals
+        .iter()
+        .find(|p| {
+            changed(&p.recipe)
+                && p.recipe.packing.len() == 1
+                && p.recipe.packing.keys().all(|site| site.source != source)
+        })
+        .unwrap();
+    crate::planner::build_candidate(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &fragments,
+        &cleared.recipe,
+    )
+    .unwrap();
 }
