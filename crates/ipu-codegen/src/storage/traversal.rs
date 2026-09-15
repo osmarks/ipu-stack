@@ -503,23 +503,6 @@ impl StridedSpan {
 }
 
 impl ByteTraversal {
-    /// Heap payload retained by this traversal. Shared repeat bodies are counted
-    /// per owning reference, making this a conservative cache-size estimate.
-    pub(crate) fn heap_bytes(&self) -> usize {
-        fn heap(node: &Node) -> usize {
-            match &node.kind {
-                Kind::Run(_) => 0,
-                Kind::Repeat { body, .. } => {
-                    2 * size_of::<usize>() + size_of::<Node>() + heap(body)
-                }
-                Kind::Sequence(nodes) => {
-                    nodes.capacity() * size_of::<Node>() + nodes.iter().map(heap).sum::<usize>()
-                }
-            }
-        }
-        self.parts.capacity() * size_of::<Node>() + self.parts.iter().map(heap).sum::<usize>()
-    }
-
     pub(crate) fn regular_span(&self) -> Option<StridedSpan> {
         fn regular(node: &Node) -> Option<StridedSpan> {
             let mut span = match &node.kind {

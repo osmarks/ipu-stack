@@ -571,9 +571,7 @@ Destination facts retain no cost-dependent staging decisions. Changing packing
 policy reuses the facts. Exchange fragment size remains an explicit analysis input.
 
 [Historical cache measurements](LOW_FRAGMENT_CACHE_2026_09_09.md) cover earlier
-implementations. `--benchmark-expansion` now records cold and warm expansions,
-recosting, footprint analysis, retained-payload estimates and process RSS. All use
-the same geometry cache; `--benchmark-expansion-uncached` disables it throughout.
-The retained-byte estimate includes table capacity and can count shared traversal
-nodes more than once. RSS also includes the rest of the compiler and freed pages
-retained by the allocator.
+implementations. `--benchmark-expansion` records expansion, recosting and footprint
+analysis timings, cache counters and process RSS. `--benchmark-expansion-uncached`
+disables the shared geometry cache throughout. Cache allocation estimates and the
+automatic warm rerun have been removed; use a memory profiler for retained memory.

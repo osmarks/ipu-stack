@@ -16,8 +16,7 @@ pub struct ExpansionBenchmark {
     /// Whole-process Linux RSS, including caches and allocator-retained pages.
     pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
     pub baseline: ExpansionTiming,
-    /// A second candidate expansion with the same shared geometry cache.
-    pub warm: Option<ExpansionTiming>,
+    pub geometry_cache: crate::storage::GeometryCacheStats,
     /// Matching selections are opportunities, not validated reusable graph fragments.
     pub selection_reuse: std::collections::BTreeMap<&'static str, SelectionReuse>,
 }
@@ -54,9 +53,6 @@ pub struct SelectionReuse {
 
 #[derive(serde::Serialize)]
 pub struct ExpansionTiming {
-    pub process_memory: BTreeMap<&'static str, Option<ProcessMemory>>,
-    /// Shared geometry counters are cumulative across cold/warm expansion and costing.
-    pub geometry_cache: crate::storage::GeometryCacheStats,
     pub mid_operations: usize,
     pub mid_values: usize,
     pub expand_ms: f64,
@@ -168,40 +164,6 @@ pub fn benchmark_mid_expansion(
         }
     }
     selections_in(&mid, &mid.operations, &mut selections);
-    let baseline = measure_expansion(&mid, config, &cache)?;
-    let warm = cache_enabled
-        .then(|| measure_expansion(&mid, config, &cache))
-        .transpose()?;
-    drop(mid);
-    memory.insert("after_mid_drop", process_memory());
-    Ok(ExpansionBenchmark {
-        planning_ms,
-        mid_cost_ms,
-        mid_cycles: mid_cost.total,
-        process_memory: memory,
-        baseline,
-        warm,
-        selection_reuse: selections
-            .into_iter()
-            .map(|(kind, (occurrences, keys))| {
-                (
-                    kind,
-                    SelectionReuse {
-                        occurrences,
-                        distinct: keys.len(),
-                    },
-                )
-            })
-            .collect(),
-    })
-}
-
-fn measure_expansion(
-    mid: &crate::MidProgram,
-    config: &PipelineConfig,
-    cache: &Arc<crate::storage::GeometryCache>,
-) -> PackageBuildResult<ExpansionTiming> {
-    let mut memory = BTreeMap::from([("start", process_memory())]);
     let start = Instant::now();
     let expanded = crate::low::expand::expand_tiles_cached(
         &mid,
@@ -211,10 +173,10 @@ fn measure_expansion(
     let expand_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("expanded", process_memory());
     let start = Instant::now();
-    let low_cost = crate::estimate::program_cycles_analyzed(&expanded, None, cache)?;
+    let low_cost = crate::estimate::program_cycles_analyzed(&expanded, None, &cache)?;
     let recost_ms = start.elapsed().as_secs_f64() * 1000.0;
     let start = Instant::now();
-    let footprint = crate::estimate::program_footprint_analyzed(&expanded, cache)?;
+    let footprint = crate::estimate::program_footprint_analyzed(&expanded, &cache)?;
     let footprint_ms = start.elapsed().as_secs_f64() * 1000.0;
     memory.insert("footprint", process_memory());
     let start = Instant::now();
@@ -229,9 +191,7 @@ fn measure_expansion(
     let cloned = std::hint::black_box(expanded.kernel_runs.clone());
     let clone_kernel_runs_ms = start.elapsed().as_secs_f64() * 1000.0;
     drop(cloned);
-    let mut timing = ExpansionTiming {
-        process_memory: BTreeMap::new(),
-        geometry_cache: cache.stats(),
+    let timing = ExpansionTiming {
         mid_operations: mid.operations.len(),
         mid_values: mid.values.len(),
         expand_ms,
@@ -261,9 +221,27 @@ fn measure_expansion(
             .map(|t| t.destinations.len())
             .sum(),
     };
-    drop((low, expanded));
+    drop((low, expanded, mid));
     memory.insert("after_plan_drop", process_memory());
-    timing.process_memory = memory;
     tracing::info!(expand_ms, tile_lists_ms, "benchmarked mid-to-low expansion");
-    Ok(timing)
+    Ok(ExpansionBenchmark {
+        planning_ms,
+        mid_cost_ms,
+        mid_cycles: mid_cost.total,
+        process_memory: memory,
+        baseline: timing,
+        geometry_cache: cache.stats(),
+        selection_reuse: selections
+            .into_iter()
+            .map(|(kind, (occurrences, keys))| {
+                (
+                    kind,
+                    SelectionReuse {
+                        occurrences,
+                        distinct: keys.len(),
+                    },
+                )
+            })
+            .collect(),
+    })
 }

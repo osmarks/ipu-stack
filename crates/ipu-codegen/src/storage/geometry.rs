@@ -25,8 +25,6 @@ pub struct CacheStats {
     pub entries: usize,
     pub hits: u64,
     pub misses: u64,
-    /// Capacity-based payload estimate, excluding allocator bookkeeping.
-    pub retained_bytes: usize,
 }
 
 struct Memo<K, V> {
@@ -60,18 +58,12 @@ impl<K: Eq + Hash, V> Memo<K, V> {
         }
         Ok(value)
     }
-    fn stats(&self, heap: impl Fn(&K, &V) -> usize) -> CacheStats {
+    fn stats(&self) -> CacheStats {
         let state = self.state.lock().unwrap();
         CacheStats {
             entries: state.0.len(),
             hits: state.1,
             misses: state.2,
-            retained_bytes: state.0.capacity() * (size_of::<(K, Arc<V>)>() + 1)
-                + state
-                    .0
-                    .iter()
-                    .map(|(key, value)| 2 * size_of::<usize>() + size_of::<V>() + heap(key, value))
-                    .sum::<usize>(),
         }
     }
 }
@@ -173,14 +165,6 @@ impl DestinationGeometry {
             .map(Vec::as_slice)
             .map_err(Clone::clone)
     }
-    fn heap_bytes(&self) -> usize {
-        self.coverage.heap_bytes()
-            + self
-                .uncovered
-                .get()
-                .and_then(|r| r.as_ref().ok())
-                .map_or(0, |spans| spans.capacity() * size_of::<ByteSpan>())
-    }
 }
 
 pub(crate) struct GeometryCache {
@@ -192,8 +176,7 @@ impl Default for GeometryCache {
     fn default() -> Self {
         Self {
             // The measured MLP B2 and SigLIP candidates contain up to 60k views
-            // and 150k pairs. These are entry limits, not byte budgets; benchmark
-            // diagnostics separately report the actual retained payload.
+            // and 150k pairs. These are entry limits, not byte budgets.
             views: Memo::new(131_072),
             pairs: Memo::new(262_144),
             destinations: Memo::new(32_768),
@@ -210,20 +193,9 @@ impl GeometryCache {
     }
     pub(crate) fn stats(&self) -> GeometryCacheStats {
         GeometryCacheStats {
-            views: self
-                .views
-                .stats(|(_, key), view| key.heap_bytes() + view.traversal.heap_bytes()),
-            pairs: self
-                .pairs
-                .stats(|_, pair| pair.rows.capacity() * size_of::<[StridedSpan; 2]>()),
-            destinations: self.destinations.stats(|key, geometry| {
-                key.coverage.capacity() * size_of::<u64>()
-                    + key
-                        .pairs
-                        .as_ref()
-                        .map_or(0, |pairs| pairs.capacity() * size_of::<(u64, u64)>())
-                    + geometry.heap_bytes()
-            }),
+            views: self.views.stats(),
+            pairs: self.pairs.stats(),
+            destinations: self.destinations.stats(),
         }
     }
     pub(crate) fn view(
