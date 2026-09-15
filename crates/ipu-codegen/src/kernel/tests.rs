@@ -231,7 +231,11 @@ fn randomized_gemm_row_specializations_follow_physical_output_orientation() {
             } else {
                 semantic_rows
             };
-        assert_eq!(gemm_rows(&run).unwrap(), expected, "random case {case}");
+        assert_eq!(
+            gemm_rows(run.geometry(MemoryOperand::Output(0))).unwrap(),
+            expected,
+            "random case {case}"
+        );
     }
 }
 
@@ -472,8 +476,8 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
         calls.push(call);
     }
     let mut plan = KernelBuildPlan::default();
-    plan.add_attention_stages(
-        calls
+    plan.add_attention(
+        &calls
             .iter()
             .map(|call| call.implementation.clone())
             .collect(),
@@ -495,20 +499,20 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
     // These layouts have identical matrix sizes and C++ order indices, but
     // require different worker code. They must coexist in one linked package.
     let targets = [(8, 16), (16, 8), (64, 16)];
-    let mut inventory = KernelInventory::default();
+    let mut implementations = BTreeSet::new();
     for (row_block, column_block) in targets {
-        inventory.rearrangements.insert((
-            RearrangeTarget::BlockMajor {
+        implementations.insert(KernelImplementation::Rearrange((
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                 row_block,
                 column_block,
-            },
+            }),
             128,
             128,
             128,
             128,
-        ));
+        )));
     }
-    let plan = KernelBuildPlan::from_inventory(inventory).unwrap();
+    let plan = KernelBuildPlan::from_implementations(implementations).unwrap();
     let objects = plan
         .compilations
         .iter()
@@ -519,10 +523,10 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
     assert_eq!(symbols.len(), targets.len());
     for (row_block, column_block) in targets {
         let symbol = &plan.symbols[&KernelImplementation::Rearrange((
-            RearrangeTarget::BlockMajor {
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                 row_block,
                 column_block,
-            },
+            }),
             128,
             128,
             128,
@@ -664,7 +668,11 @@ fn packed_gemm_stores_bind_without_output_copies() {
                     continue;
                 }
                 products += 1;
-                assert!(gemm_rows(run).unwrap().is_multiple_of(16));
+                assert!(
+                    gemm_rows(run.geometry(MemoryOperand::Output(0)))
+                        .unwrap()
+                        .is_multiple_of(16)
+                );
                 assert_eq!(
                     run.requirements.outputs[0]
                         .format
@@ -690,11 +698,11 @@ fn packed_gemm_stores_bind_without_output_copies() {
 
 #[test]
 fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
-    let plan = KernelBuildPlan::from_inventory(KernelInventory {
-        exact_symbols: BTreeSet::from(["cast_f32_f16"]),
-        ..KernelInventory::default()
-    })
-    .unwrap();
+    let plan =
+        KernelBuildPlan::from_implementations(BTreeSet::from([KernelImplementation::Exact(
+            "cast_f32_f16",
+        )]))
+        .unwrap();
     for count in [1, 2, 11, 12, 13, 72, 729, 1152] {
         let format = |precision| TensorFormat {
             precision,
@@ -742,18 +750,18 @@ fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
     // Sharing kernels across row tails must not erase this distinction.
     for columns in [14, 16] {
         let shape = rearrange::rearrangement_specialization(
-            RearrangeTarget::BlockMajor {
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                 row_block: 64,
                 column_block: 16,
-            },
+            }),
             63,
             64,
             columns,
             16,
         );
-        let mut inventory = KernelInventory::default();
-        inventory.rearrangements.insert(shape);
-        let plan = KernelBuildPlan::from_inventory(inventory).unwrap();
+        let mut implementations = BTreeSet::new();
+        implementations.insert(KernelImplementation::Rearrange(shape));
+        let plan = KernelBuildPlan::from_implementations(implementations).unwrap();
         let source = plan
             .compilations
             .iter()
@@ -782,10 +790,12 @@ fn worker_stack_support_follows_cpp_recipes() {
             true,
         ),
     ] {
-        let plan = KernelBuildPlan::from_inventory(KernelInventory {
-            exact_symbols: symbols.into_iter().collect(),
-            ..KernelInventory::default()
-        })
+        let plan = KernelBuildPlan::from_implementations(
+            symbols
+                .into_iter()
+                .map(KernelImplementation::Exact)
+                .collect(),
+        )
         .unwrap();
         assert_eq!(
             plan.compilations
@@ -796,16 +806,14 @@ fn worker_stack_support_follows_cpp_recipes() {
         );
     }
     // The hand-written softmax worker does not use a compiler-managed stack.
-    let plan = KernelBuildPlan::from_inventory(KernelInventory {
-        attention_stages: BTreeSet::from([KernelImplementation::Softmax(
+    let plan =
+        KernelBuildPlan::from_implementations(BTreeSet::from([KernelImplementation::Softmax(
             64,
             32,
             32,
             Precision::F16,
-        )]),
-        ..KernelInventory::default()
-    })
-    .unwrap();
+        )]))
+        .unwrap();
     assert_eq!(plan.compilations.len(), 1);
     assert_eq!(plan.compilations[0].source, "attention_softmax_f16.S");
 }
@@ -990,4 +998,34 @@ fn binding_checks_backing_strides_before_placement() {
             MidOperationKind::Gelu
         )))
     ));
+}
+#[test]
+fn object_registration_reuses_identical_definitions_and_rejects_conflicts() {
+    let mut plan = KernelBuildPlan::default();
+    let unit = KernelCompilation {
+        source: "worker_support.S",
+        name: "worker_support".into(),
+        flags: Vec::new(),
+    };
+    plan.add_compilation(unit.clone());
+    plan.add_compilation(unit.clone());
+    assert_eq!(plan.compilations, vec![unit.clone()]);
+    for conflicting in [
+        KernelCompilation {
+            source: "worker_call.S",
+            ..unit.clone()
+        },
+        KernelCompilation {
+            flags: vec!["-DOTHER=1".into()],
+            ..unit.clone()
+        },
+    ] {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                plan.add_compilation(conflicting);
+            }))
+            .is_err()
+        );
+        assert_eq!(plan.compilations, vec![unit.clone()]);
+    }
 }

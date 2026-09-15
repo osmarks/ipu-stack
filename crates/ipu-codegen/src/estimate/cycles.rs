@@ -1,12 +1,9 @@
 //! Analytical IPU21 cycle estimation used during operator planning.
 
-use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic, maximum_shard_bytes};
+use crate::estimate::{ExchangeEndpointTraffic, conversion_traffic};
 use crate::graph::TensorShape;
 use crate::planner::operator::OperatorPlan;
-use crate::{
-    AmpOrder, BlockMajorOrder, CopyPolicy, ElementOrder, Layout, Precision, TensorFormat,
-    TensorType,
-};
+use crate::{CopyPolicy, ElementOrder, Layout, Precision, TensorFormat, TensorType};
 use foldhash::fast::FixedState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -20,12 +17,7 @@ pub trait CostModel: Sync {
     ) -> Option<u64> {
         None
     }
-    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64;
-    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
-        let mut packed = input.clone();
-        packed.format.layout = output.layout.clone();
-        self.cast_cycles(&packed, output.precision)
-    }
+    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64;
     fn rearrangement_cost(
         &self,
         shape: &TensorShape,
@@ -92,9 +84,6 @@ impl<C: CostModel> CostModel for MemoizedCostModel<'_, C> {
         output: &TensorType,
     ) -> Option<u64> {
         self.inner.operator_cycle_override(plan, inputs, output)
-    }
-    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
-        self.inner.cast_cycles(input, to)
     }
     fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
         self.inner.cast_format_cycles(input, output)
@@ -186,92 +175,27 @@ pub(super) fn exchange_fragment_price(bytes: u64, phases: u64, fragments: u64) -
     (cycles, rows)
 }
 
-// Indexed F16 layout transforms execute scalar address arithmetic as well as
-// their loads and stores. The transposed-right panel is a contiguous copy:
-// its final coefficient permutation is performed by the GEMM's ld*putcs
-// sequence. Keep these costs separate from ideal memcpy bandwidth.
-const IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT: u64 = 10;
-// Full AMP-left panels use four 64-bit load/store pairs, including pointer
-// updates. Allow the panel loop and row setup in the rounded per-element price.
-const IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT: u64 = 1;
-const IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT: u64 = 3;
-pub(crate) fn row_major_pack_cycles(tensor: &TensorType, elements: u64) -> u64 {
-    pack_geometry_cycles(super::primitive::Geometry::Tensor(tensor), elements)
-}
-
-pub(super) fn pack_geometry_cycles(tensor: super::primitive::Geometry<'_>, elements: u64) -> u64 {
-    let cycles_per_element = match tensor.format().layout.order {
-        ElementOrder::RowMajor => return 0,
-        ElementOrder::Amp(AmpOrder::TransposedRight) => {
-            IPU21_CONTIGUOUS_PANEL_PACK_CYCLES_PER_ELEMENT
-        }
-        ElementOrder::Amp(AmpOrder::Left) => IPU21_AMP_LEFT_PACK_CYCLES_PER_ELEMENT,
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-            row_block,
-            column_block,
-        }) if row_block.is_multiple_of(16)
-            && column_block == 16
-            && tensor
-                .trailing_dimension(1)
-                .is_some_and(|rows| rows <= u32::from(row_block))
-            && tensor
-                .trailing_dimension(0)
-                .is_some_and(|columns| columns.is_multiple_of(4)) =>
-        {
-            let columns = u64::from(tensor.trailing_dimension(0).unwrap());
-            let rows = u64::from(row_block);
-            return crate::kernel::cost::f16_coefficient_pack_cycles(
-                elements.div_ceil(rows * columns.div_ceil(16) * 16),
-                rows,
-                columns,
-            );
-        }
-        ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. }) | ElementOrder::Amp(_) => {
-            IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT
-        }
-        ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. }) => {
-            IPU21_INDEXED_F16_TRANSFORM_CYCLES_PER_ELEMENT
-        }
-    };
-    elements
-        .saturating_mul(cycles_per_element)
-        .saturating_add(IPU21_TARGET_COSTS.kernel_launch_cycles)
-}
-
 impl CostModel for Ipu21CostModel {
-    fn cast_cycles(&self, input: &TensorType, to: Precision) -> u64 {
-        let elements = maximum_shard_bytes(input).div_ceil(input.format.precision.bytes());
-        let columns = input
-            .format
-            .layout
-            .resolve(&input.shape)
-            .ok()
-            .and_then(|resolved| {
-                resolved
-                    .axes()
-                    .and_then(|axes| axes.last())
-                    .map(|axis| u64::from(axis.maximum_extent()))
-            })
-            .unwrap_or(elements)
-            .max(1);
-        let panel_rows = input
-            .format
-            .layout
-            .order
-            .fp8_cast_panel_rows(elements / columns, columns);
-        super::primitive::cast_cycles(
-            input.format.precision,
-            to,
-            elements,
-            if input.format.layout.order == ElementOrder::Amp(AmpOrder::Left)
-                && panel_rows == 1
-                && columns.is_multiple_of(32)
-            {
-                0
-            } else {
-                panel_rows
+    fn cast_format_cycles(&self, input: &TensorType, output: &TensorFormat) -> u64 {
+        let destination = TensorType {
+            shape: input.shape.clone(),
+            format: output.clone(),
+        };
+        let (Some(source), Some(destination)) = (
+            super::mid::local_tensor(input),
+            super::mid::local_tensor(&destination),
+        ) else {
+            return u64::MAX;
+        };
+        crate::kernel::KernelCall::select(
+            &crate::mid::MidOperationKind::Cast {
+                from: input.format.precision,
+                to: output.precision,
             },
+            &[crate::kernel::Geometry::Tensor(&source)],
+            &[crate::kernel::Geometry::Tensor(&destination)],
         )
+        .map_or(u64::MAX, |call| call.cycles())
     }
 
     fn rearrangement_cost(

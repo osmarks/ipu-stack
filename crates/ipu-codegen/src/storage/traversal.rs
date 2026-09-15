@@ -531,6 +531,44 @@ pub(crate) struct StridedSpan {
 }
 
 impl StridedSpan {
+    /// Exact intersection of affine row sets. Equal-stride groups need one
+    /// interval check; otherwise scan the smaller group without expanding it.
+    pub(crate) fn overlaps_rows(self, other: Self) -> bool {
+        if self.rows == 0 || other.rows == 0 || self.bytes == 0 || other.bytes == 0 {
+            return false;
+        }
+        if self.stride == other.stride {
+            let (first, second) = if self.offset <= other.offset {
+                (self, other)
+            } else {
+                (other, self)
+            };
+            return first.overlaps(
+                0,
+                ByteSpan {
+                    offset: second.offset,
+                    bytes: second.bytes,
+                },
+                0,
+            );
+        }
+        let (short, long) = if self.rows <= other.rows {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        (0..short.rows).any(|row| {
+            long.overlaps(
+                0,
+                ByteSpan {
+                    offset: short.offset,
+                    bytes: short.bytes,
+                },
+                i64::from(row) * i64::from(short.stride),
+            )
+        })
+    }
+
     /// Compare allocation-relative accesses with possibly different signed alias
     /// origins. The affine rows need not be expanded into individual spans.
     pub(crate) fn overlaps(self, origin: i64, span: ByteSpan, span_origin: i64) -> bool {

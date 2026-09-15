@@ -1051,7 +1051,7 @@ pub(super) fn parallel_reduction_candidates_for_orientation(
                 // invocation structure, including its fixed weight-feed and
                 // worker/supervisor cost. Pure arithmetic work is almost
                 // constant across grids and incorrectly favors tiny row runs.
-                let row_run_cycles = crate::kernel::cost::f16_gemm_microgroup_cycles(
+                let row_run_cycles = crate::kernel::gemm::f16_gemm_microgroup_cycles(
                     outer_rows.saturating_mul(u64::from(local_rows)),
                 );
                 let compute = u64::from(local_columns)

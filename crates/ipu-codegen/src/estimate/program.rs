@@ -27,10 +27,10 @@ fn cached_kernel_cycles<'a>(run: &'a KernelRun, costs: &mut KernelCosts<'a>) -> 
     });
     if let Some((_, cycles)) = found {
         #[cfg(test)]
-        assert_eq!(*cycles, kernel_cycles(run));
+        assert_eq!(*cycles, run.cycles());
         return *cycles;
     }
-    let cycles = kernel_cycles(run);
+    let cycles = run.cycles();
     variants.push((run, cycles));
     cycles
 }
@@ -291,24 +291,6 @@ fn geometry_traffic(
         assert_eq!(storage.as_deref(), expected_storage.as_ref());
     }
     Ok(traffic)
-}
-
-fn kernel_cycles<'a>(run: &'a KernelRun) -> u64 {
-    let geometry = |view: &'a crate::ShardView, format: &'a crate::TensorFormat| {
-        super::primitive::Geometry::Storage(crate::storage::TensorStorage {
-            format,
-            extents: &view.extents,
-        })
-    };
-    super::primitive::kernel_cycles(
-        &run.kernel,
-        |index| {
-            let operand = run.inputs.get(index)?;
-            let access = run.requirements.inputs.get(index)?;
-            Some(geometry(operand, &access.format))
-        },
-        geometry(&run.outputs[0], &run.requirements.outputs[0].format),
-    )
 }
 
 #[cfg(test)]

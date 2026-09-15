@@ -1,24 +1,20 @@
-//! Kernel ABI, specialization recipes, and placed call materialization.
+//! Each family owns its specs, call geometry, costs, and device build rules.
+//! `binding` shares ABI and operand checks; `build` collects implementations
+//! and supplies compilation/wrapper helpers. Placement only supplies addresses.
 
 pub mod abi;
-pub(crate) mod copy;
+pub mod copy;
 pub(crate) use copy::CopyRun;
-mod attention;
+pub(crate) mod attention;
 mod binding;
 mod build;
 pub(crate) mod cast;
-pub(crate) mod cost;
-mod gemm;
-mod inventory;
-mod normalization;
-mod output;
-mod padding;
-pub(crate) use padding::PaddingRequirement;
-mod pointwise;
+pub(crate) mod gemm;
+pub(crate) mod normalization;
+pub(crate) mod pointwise;
 pub(crate) mod rearrange;
-mod reduce;
-mod spec;
-pub use spec::*;
+pub(crate) mod reduce;
+pub use gemm::{AccumulationPrecision, GemmAxes, GemmKernelMode, GemmWeightLoad};
 #[cfg(test)]
 mod tests;
 use attention::AttentionKernelShape;
@@ -26,8 +22,6 @@ pub(crate) use attention::softmax_workspaces;
 pub(crate) use binding::*;
 pub(crate) use build::*;
 pub(crate) use gemm::gemm_rows;
-use inventory::*;
-use rearrange::{RearrangeTarget, UnpackSource};
 
 use crate::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 
@@ -37,6 +31,126 @@ use crate::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
+
+impl crate::mid::MidOperationKind {
+    /// Address requirements for one operand and the family’s distinct-element
+    /// group. Binding applies this same contract when interning and constructing
+    /// metadata; shifted storage affects the cast contract, not the allocator.
+    pub(super) fn access(
+        &self,
+        operand: MemoryOperand,
+        output: &BlockValue,
+    ) -> (crate::low::storage::StorageAccess, &'static [MemoryOperand]) {
+        match *self {
+            Self::Gemm { multiply, .. } => gemm::access(multiply, operand),
+            Self::Cast { from, to } => cast::access(from, to, output),
+            _ => (
+                crate::low::storage::StorageAccess {
+                    alignment: 8,
+                    access_tail_bytes: 0,
+                },
+                &[],
+            ),
+        }
+    }
+}
+
+impl KernelCall {
+    /// The only operation-to-kernel dispatch. Both estimation and bound calls
+    /// select a concrete ABI from local geometry, before addresses exist.
+    pub(crate) fn select(
+        kernel: &crate::mid::MidOperationKind,
+        inputs: &[Geometry<'_>],
+        outputs: &[Geometry<'_>],
+    ) -> Result<Self, KernelAbiError> {
+        use crate::mid::MidOperationKind::*;
+        match kernel {
+            Gemm { .. } => gemm::call(kernel, inputs, outputs),
+            Gelu | BiasGelu | Add => pointwise::call(kernel, inputs, outputs),
+            LayerNorm
+            | AddLayerNorm
+            | LayerNormMoments
+            | AddLayerNormMoments
+            | LayerNormApply { .. } => normalization::call(kernel, inputs, outputs),
+            FlashAttention { .. } | AttentionSoftmax { .. } | AttentionMerge { .. } => {
+                attention::call(kernel, inputs, outputs)
+            }
+            Cast { .. } => cast::call(kernel, inputs, outputs),
+            Rearrange { .. } => rearrange::call(kernel, inputs, outputs),
+            ReductionSum { .. } => reduce::call(kernel, inputs, outputs),
+            FillZero { .. } => copy::fill_call(kernel, inputs, outputs),
+            _ => Err(KernelAbiError::RequirementMismatch),
+        }
+    }
+
+    /// Price the selected implementation and its actual scalar arguments.
+    pub(crate) fn cycles(&self) -> u64 {
+        match &self.implementation {
+            KernelImplementation::Gemm(..) => gemm::cycles(&self.implementation),
+            KernelImplementation::Attention(_)
+            | KernelImplementation::Softmax(..)
+            | KernelImplementation::Merge(..) => attention::cycles(self),
+            KernelImplementation::Rearrange(_) | KernelImplementation::Unpack(_) => {
+                rearrange::cycles(self)
+            }
+            // Decode the exact ABI once; family helpers price typed dimensions.
+            KernelImplementation::Exact(symbol) => match (*symbol, self.arguments.as_slice()) {
+                ("gelu_tanh_approx_f16", &[count]) => {
+                    pointwise::gelu_row_cycles(count.into(), false)
+                }
+                ("bias_gelu_f16", &[rows, width]) => {
+                    pointwise::f16_bias_gelu_cycles(rows.into(), width.into())
+                }
+                ("add_f16", &[count, left, right]) => {
+                    pointwise::f16_add_cycles(count.into(), left.into(), right.into())
+                }
+                ("gelu_f8", &[rows, width, ..]) => {
+                    pointwise::fp8_gelu_cycles(rows.into(), width.into())
+                }
+                ("bias_gelu_f8", &[rows, width, _, packed, ..]) => {
+                    pointwise::fp8_bias_gelu_cycles(rows.into(), width.into(), packed != 0)
+                }
+                ("layer_norm_f16" | "add_layer_norm_f16", &[rows, width]) => {
+                    normalization::layernorm_cycles(
+                        rows.into(),
+                        width.into(),
+                        *symbol == "add_layer_norm_f16",
+                        true,
+                    )
+                }
+                ("layer_norm_f8", &[rows, width, _, packed]) => {
+                    normalization::fp8_layernorm_cycles(rows.into(), width.into(), packed != 0)
+                }
+                ("layer_norm_moments" | "add_layer_norm_moments", &[rows, width]) => {
+                    normalization::f16_layernorm_moments_cycles(
+                        rows.into(),
+                        width.into(),
+                        *symbol == "add_layer_norm_moments",
+                    )
+                }
+                ("layer_norm_apply", &[rows, width, parts]) => {
+                    normalization::f16_layernorm_apply_cycles(
+                        rows.into(),
+                        width.into(),
+                        parts as u16,
+                    )
+                }
+                ("cast_f16_f8", &[count, _, _, panel_rows, ..]) => {
+                    cast::f16_fp8_cycles(count.into(), panel_rows.into())
+                }
+                ("cast_f32_f16", &[count, ..]) => cast::stream_cycles(count.into(), 4, 2),
+                ("cast_f8_f8", &[count, ..]) => cast::stream_cycles(count.into(), 1, 1),
+                ("cast_f8_f16", &[count, ..]) => cast::stream_cycles(count.into(), 1, 2),
+                ("cast_f8_f32", &[count, ..]) => cast::stream_cycles(count.into(), 1, 4),
+                ("cast_f32_f8", &[count, ..]) => cast::stream_cycles(count.into(), 4, 1),
+                ("reduce_sum_f16", &[partials, count]) => {
+                    reduce::f16_reduction_cycles(count.into(), u64::from(partials) + 1)
+                }
+                _ => copy::cycles(symbol, &self.arguments),
+            },
+        }
+    }
+}
 
 /// Resolves one scheduled call after placement has assigned each shard base.
 /// Layout conversion supplies the byte offset; the build plan supplies the

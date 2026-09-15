@@ -4,6 +4,66 @@
 use super::*;
 use crate::mid::MidOperationKind;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn softmax_work_counts_probability_rows_without_workspace_bytes() {
+        for precision in [Precision::F16, Precision::F8F143 { scale_exponent: 0 }] {
+            let input =
+                crate::TensorType::new([6, 128], Precision::F16, crate::Layout::amp_left(16, 1));
+            let mut probability = input.clone();
+            probability.format.precision = precision;
+            let mut outputs = vec![probability.clone()];
+            outputs.extend(crate::kernel::softmax_workspaces(&probability, false).unwrap());
+            let tensors = std::iter::once(input).chain(outputs).collect::<Vec<_>>();
+            let views = tensors
+                .iter()
+                .enumerate()
+                .map(|(index, tensor)| crate::ShardView {
+                    shard: crate::BlockValueId::from_index(index as u32),
+                    extents: tensor.format.layout.shard_extents(&tensor.shape).unwrap()[0]
+                        .1
+                        .clone(),
+                })
+                .collect::<Vec<_>>();
+            let accesses = tensors
+                .iter()
+                .map(|tensor| crate::KernelAccess::new(tensor.format.clone(), 8))
+                .collect::<Vec<_>>();
+            let run = crate::KernelRun::new(
+                crate::WorkProvenance {
+                    operation: None,
+                    value: None,
+                    reason: crate::WorkReason::OperatorKernel,
+                },
+                MidOperationKind::AttentionSoftmax {
+                    head_dimension: 64,
+                    key_columns: 128,
+                    padded_key_columns: 128,
+                },
+                views[..1].to_vec(),
+                views[1..].to_vec(),
+                crate::KernelRequirements {
+                    inputs: accesses[..1].to_vec(),
+                    outputs: accesses[1..].to_vec(),
+                    distinct_elements: Vec::new(),
+                },
+            );
+            let (useful, issued, _) = work_estimate(&run).unwrap();
+            // Six whole rows, eight panels each, plus five row reductions.
+            let slots = if precision == Precision::F16 {
+                29.0
+            } else {
+                31.0
+            };
+            assert_eq!(useful, 6.0 * (8.0 * slots + 5.0));
+            assert_eq!(issued, useful);
+        }
+    }
+}
+
 pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'static str)> {
     let logical: u64 = run.outputs[0]
         .extents
@@ -169,25 +229,23 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
         MidOperationKind::FillZero {
             padding_only: true, ..
         } => return Some((0.0, 0.0, "padding initialization: no useful tensor work")),
-        MidOperationKind::AttentionSoftmax {
-            key_columns,
-            padded_key_columns,
-            ..
-        } => {
+        MidOperationKind::AttentionSoftmax { key_columns, .. } => {
             // Full panels: five maximum reductions, four MIXes and one
             // accumulator readout, eight exps, eight FP16 additions, one
             // conversion and two FP32 additions: 29 arithmetic issue slots.
             // The narrow tail retains the original eight-slot pair sequence.
             let fp8 = matches!(precision, Precision::F8F143 { .. });
-            let state = if fp8 { 64 } else { 16 };
-            let rows = logical / u64::from(padded_key_columns + state);
-            let physical_rows = physical / u64::from(padded_key_columns + state);
+            let row_axes = &run.outputs[0].extents[..run.outputs[0].extents.len() - 1];
+            let rows: u64 = row_axes
+                .iter()
+                .map(|e| u64::from(e.logical_end - e.start))
+                .product();
+            let physical_rows: u64 = row_axes
+                .iter()
+                .map(|e| u64::from(e.physical_end - e.start))
+                .product();
             let panel_slots = if fp8 { 31.0 } else { 29.0 };
-            let row_reductions = if crate::kernel::cost::f16_softmax_split_rows(
-                physical_rows,
-                u64::from(key_columns),
-                u64::from(padded_key_columns),
-            ) {
+            let row_reductions = if run.call().ok()?.arguments[2] != 0 {
                 15.0
             } else {
                 5.0

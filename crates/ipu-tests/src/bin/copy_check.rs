@@ -108,18 +108,18 @@ fn main() -> Result<()> {
             }
             let words = rows * size / args.word_bytes;
             let (symbol, arguments) = match (args.contiguous, args.word_bytes) {
-                (true, 2) => (ipu_codegen::kernel::abi::COPY_U16_SYMBOL, vec![words]),
-                (true, 4) => (ipu_codegen::kernel::abi::COPY_U32_SYMBOL, vec![words]),
+                (true, 2) => (ipu_codegen::kernel::copy::COPY_U16_SYMBOL, vec![words]),
+                (true, 4) => (ipu_codegen::kernel::copy::COPY_U32_SYMBOL, vec![words]),
                 (true, 8) => (
-                    ipu_codegen::kernel::abi::COPY_U64_SYMBOL,
+                    ipu_codegen::kernel::copy::COPY_U64_SYMBOL,
                     vec![words / 6, words % 6],
                 ),
                 (false, 4) => (
-                    ipu_codegen::kernel::abi::COPY_STRIDED_U32_SYMBOL,
+                    ipu_codegen::kernel::copy::COPY_STRIDED_U32_SYMBOL,
                     vec![size / 4, rows, ss, ds],
                 ),
                 (false, 8) => (
-                    ipu_codegen::kernel::abi::COPY_STRIDED_U64_SYMBOL,
+                    ipu_codegen::kernel::copy::COPY_STRIDED_U64_SYMBOL,
                     vec![size / 8, rows, ss, ds],
                 ),
                 _ => unreachable!(),

@@ -3,119 +3,73 @@
 use super::*;
 use crate::mid::MidOperationKind;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum RearrangeTarget {
-    AmpLeft,
-    AmpTransposedRight,
-    BlockMajor { row_block: u16, column_block: u16 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum UnpackSource {
-    AmpOutput,
-    AmpTransposedLeft,
-    Blocked(BlockMajorOrder),
-}
-
-impl UnpackSource {
-    pub(super) fn from_order(order: ElementOrder) -> Option<Self> {
-        match order {
-            ElementOrder::Amp(AmpOrder::Output) => Some(Self::AmpOutput),
-            ElementOrder::Amp(AmpOrder::TransposedLeft) => Some(Self::AmpTransposedLeft),
-            ElementOrder::BlockMajor(order) => Some(Self::Blocked(order)),
-            _ => None,
-        }
-    }
-
-    pub(super) const fn codelet_index(self) -> u32 {
-        match self {
-            Self::AmpOutput => 0,
-            Self::AmpTransposedLeft => 1,
-            Self::Blocked(BlockMajorOrder::Matrix { .. }) => 2,
-            Self::Blocked(BlockMajorOrder::TransposedMatrix { .. }) => 3,
-        }
-    }
-}
-
-impl RearrangeTarget {
-    pub(super) fn from_order(order: ElementOrder) -> Option<Self> {
-        match order {
-            ElementOrder::Amp(AmpOrder::Left) => Some(Self::AmpLeft),
-            ElementOrder::Amp(AmpOrder::TransposedRight) => Some(Self::AmpTransposedRight),
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block,
-                column_block,
-            }) => Some(Self::BlockMajor {
-                row_block,
-                column_block,
-            }),
-            _ => None,
-        }
-    }
-
-    pub(super) const fn codelet_index(self) -> u32 {
-        match self {
-            Self::AmpLeft => 0,
-            Self::AmpTransposedRight => 1,
-            Self::BlockMajor { .. } => 2,
-        }
+// These indices are the device workers' ABI, not another layout representation.
+fn order_index(order: ElementOrder, unpack: bool) -> Option<u32> {
+    match (unpack, order) {
+        (true, ElementOrder::Amp(AmpOrder::Output))
+        | (false, ElementOrder::Amp(AmpOrder::Left)) => Some(0),
+        (true, ElementOrder::Amp(AmpOrder::TransposedLeft))
+        | (false, ElementOrder::Amp(AmpOrder::TransposedRight)) => Some(1),
+        (_, ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })) => Some(2),
+        (true, ElementOrder::BlockMajor(BlockMajorOrder::TransposedMatrix { .. })) => Some(3),
+        _ => None,
     }
 }
 
 pub(crate) fn supported(from: ElementOrder, to: ElementOrder, precision: Precision) -> bool {
     precision == Precision::F16
-        && ((UnpackSource::from_order(from).is_some() && to == ElementOrder::RowMajor)
-            || (from == ElementOrder::RowMajor && RearrangeTarget::from_order(to).is_some()))
+        && ((order_index(from, true).is_some() && to == ElementOrder::RowMajor)
+            || (from == ElementOrder::RowMajor && order_index(to, false).is_some()))
 }
 
-pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
-    run.check_arity(1, 1)?;
-    let MidOperationKind::Rearrange { from, to } = &run.kernel else {
+pub(super) fn call(
+    kernel: &MidOperationKind,
+    inputs: &[Geometry<'_>],
+    outputs: &[Geometry<'_>],
+) -> Result<KernelCall, KernelAbiError> {
+    check_arity(inputs, outputs, 1, 1)?;
+    let MidOperationKind::Rearrange { from, to } = kernel else {
         return Err(KernelAbiError::RequirementMismatch);
     };
-    if !supported(
-        from.order,
-        to.order,
-        run.requirements.outputs[0].format.precision,
-    ) {
-        return Err(KernelAbiError::Unavailable(run.kernel.clone()));
+    if !supported(from.order, to.order, outputs[0].format().precision) {
+        return Err(KernelAbiError::Unavailable(kernel.clone()));
     }
-    let rows = matrix_extent(&run.outputs[0], true, false)?;
-    let physical_rows = matrix_extent(&run.outputs[0], false, false)?;
-    let columns = matrix_extent(&run.outputs[0], true, true)?;
-    let physical_columns = matrix_extent(&run.outputs[0], false, true)?;
-    let matrices = matrix_count(run)?;
-    let (implementation, arguments) = if from.order == ElementOrder::RowMajor {
-        let target =
-            RearrangeTarget::from_order(to.order).ok_or(KernelAbiError::RequirementMismatch)?;
-        (
-            KernelImplementation::Rearrange(rearrangement_specialization(
-                target,
-                rows,
-                physical_rows,
-                columns,
-                physical_columns,
-            )),
-            vec![
-                rows,
-                physical_rows,
-                target.codelet_index(),
-                columns,
-                physical_columns,
-                matrices,
-            ],
-        )
+    let rows = outputs[0].matrix_extent(true, false)?;
+    let physical_rows = outputs[0].matrix_extent(false, false)?;
+    let columns = outputs[0].matrix_extent(true, true)?;
+    let physical_columns = outputs[0].matrix_extent(false, true)?;
+    let matrices = inputs[0]
+        .widths()
+        .take(inputs[0].rank().saturating_sub(2))
+        .try_fold(1u32, |count, width| count.checked_mul(width))
+        .ok_or(KernelAbiError::ElementCountOverflow)?;
+    let unpack = from.order != ElementOrder::RowMajor;
+    let geometry = if unpack { inputs[0] } else { outputs[0] };
+    let shape = (
+        if unpack { from.order } else { to.order },
+        geometry.matrix_extent(true, false)?,
+        geometry.matrix_extent(false, false)?,
+        geometry.matrix_extent(true, true)?,
+        geometry.matrix_extent(false, true)?,
+    );
+    let implementation = if unpack {
+        KernelImplementation::Unpack(shape)
     } else {
-        (
-            KernelImplementation::Unpack((
-                UnpackSource::from_order(from.order).ok_or(KernelAbiError::RequirementMismatch)?,
-                input_matrix_extent(run, true, false)?,
-                input_matrix_extent(run, false, false)?,
-                input_matrix_extent(run, true, true)?,
-                input_matrix_extent(run, false, true)?,
-            )),
-            vec![matrices, rows, physical_rows, columns, physical_columns],
-        )
+        KernelImplementation::Rearrange(rearrangement_specialization(
+            shape.0, shape.1, shape.2, shape.3, shape.4,
+        ))
+    };
+    let arguments = if from.order == ElementOrder::RowMajor {
+        vec![
+            rows,
+            physical_rows,
+            order_index(to.order, false).ok_or(KernelAbiError::RequirementMismatch)?,
+            columns,
+            physical_columns,
+            matrices,
+        ]
+    } else {
+        vec![matrices, rows, physical_rows, columns, physical_columns]
     };
     Ok(KernelCall {
         implementation,
@@ -124,15 +78,71 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
 }
 
 pub(crate) fn supports_row_major_population(order: ElementOrder) -> bool {
-    order == ElementOrder::RowMajor || RearrangeTarget::from_order(order).is_some()
+    order == ElementOrder::RowMajor || order_index(order, false).is_some()
+}
+
+pub(crate) fn estimate(from: ElementOrder, input: Geometry<'_>, output: Geometry<'_>) -> u64 {
+    if from == output.format().layout.order {
+        return 0;
+    }
+    let mut source = input.format().layout.clone();
+    source.order = from;
+    let kernel = MidOperationKind::Rearrange {
+        from: source,
+        to: output.format().layout.clone(),
+    };
+    KernelCall::select(&kernel, &[input], &[output]).map_or(u64::MAX, |call| call.cycles())
+}
+
+/// Assembly selection is shared by build construction and geometry costing.
+fn assembly(
+    order: ElementOrder,
+    unpack: bool,
+    rows: u32,
+    physical_rows: u32,
+    columns: u32,
+    physical_columns: u32,
+) -> Option<&'static str> {
+    match (unpack, order) {
+        (true, ElementOrder::Amp(AmpOrder::TransposedLeft)) => Some("unpack_transposed_amp_f16.S"),
+        (false, ElementOrder::Amp(AmpOrder::Left))
+            if columns.is_multiple_of(2) && physical_columns.is_multiple_of(AMP_COLUMN_MICRO) =>
+        {
+            Some("rearrange_amp_left_f16.S")
+        }
+        (
+            false,
+            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                row_block,
+                column_block,
+            }),
+        ) if u32::from(row_block) == physical_rows
+            && physical_rows.is_multiple_of(AMP_COLUMN_MICRO)
+            && u32::from(column_block) == AMP_COLUMN_MICRO
+            && columns.is_multiple_of(4)
+            && physical_columns.is_multiple_of(AMP_COLUMN_MICRO) =>
+        {
+            Some("rearrange_block_major_f16.S")
+        }
+        (false, ElementOrder::Amp(AmpOrder::TransposedRight))
+            if (rows, physical_rows, columns, physical_columns) == (64, 64, 16, 16) =>
+        {
+            Some("rearrange_transposed_right_f16.S")
+        }
+        _ => None,
+    }
 }
 
 impl KernelBuildPlan {
-    pub(super) fn add_unpack(&mut self, shape: (UnpackSource, u32, u32, u32, u32)) {
-        let (order, logical_rows, physical_rows, logical_columns, physical_columns) = shape;
-        let order_index = order.codelet_index();
+    pub(super) fn add_rearrangement(&mut self, key: &KernelImplementation) {
+        let (unpack, &(order, rows, physical_rows, columns, physical_columns)) = match key {
+            KernelImplementation::Unpack(shape) => (true, shape),
+            KernelImplementation::Rearrange(shape) => (false, shape),
+            _ => unreachable!("rearrangement implementation"),
+        };
+        let index = order_index(order, unpack).expect("supported rearrangement order");
         let (row_block, column_block) = match order {
-            UnpackSource::Blocked(
+            ElementOrder::BlockMajor(
                 BlockMajorOrder::Matrix {
                     row_block,
                     column_block,
@@ -142,141 +152,97 @@ impl KernelBuildPlan {
                     column_block,
                 },
             ) => (row_block, column_block),
-            _ => (16, 16),
-        };
-        let suffix = format!(
-            "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
-        );
-        let suffix = if order_index >= 2 {
-            format!("{suffix}_b{row_block}_{column_block}")
-        } else {
-            suffix
-        };
-        let vertex = format!("UnpackAmpToRowMajorF16_{suffix}");
-        let call = format!("unpack_amp_to_row_major_f16_{suffix}");
-        self.symbols
-            .insert(KernelImplementation::Unpack(shape), call.clone());
-        let mut flags = vec![
-            format!("-DUNPACK_LOGICAL_ROWS={logical_rows}"),
-            format!("-DUNPACK_PHYSICAL_ROWS={physical_rows}"),
-            format!("-DUNPACK_LOGICAL_COLUMNS={logical_columns}"),
-            format!("-DUNPACK_PHYSICAL_COLUMNS={physical_columns}"),
-        ];
-        if order_index == 1 {
-            flags.push(format!("-DUNPACK_CALL_SYMBOL={call}"));
-            self.compilations.push(KernelCompilation {
-                source: "unpack_transposed_amp_f16.S",
-                name: format!("unpack_transposed_amp_f16_{suffix}"),
-                flags,
-            });
-        } else {
-            flags.extend([
-                "-O2".into(),
-                format!("-DUNPACK_SOURCE_ORDER={order_index}"),
-                format!("-DUNPACK_ROW_BLOCK={row_block}"),
-                format!("-DUNPACK_COLUMN_BLOCK={column_block}"),
-                format!("-DUNPACK_VERTEX_NAME={vertex}"),
-            ]);
-            self.add_vertex(
-                "unpack_amp_f16.cpp",
-                &call,
-                &vertex,
-                flags,
-                &[3, 2, 4, 5, 6, 7, 8, 9],
-            );
-        }
-    }
-
-    pub(super) fn add_rearrangement(&mut self, shape: (RearrangeTarget, u32, u32, u32, u32)) {
-        let (order, logical_rows, physical_rows, logical_columns, physical_columns) = shape;
-        let order_index = order.codelet_index();
-        let (row_block, column_block) = match order {
-            RearrangeTarget::BlockMajor {
-                row_block,
-                column_block,
-            } => (row_block, column_block),
             _ => (AMP_INNER_BLOCK as u16, AMP_COLUMN_MICRO as u16),
         };
-        let suffix = format!(
-            "o{order_index}_r{logical_rows}_p{physical_rows}_c{logical_columns}_p{physical_columns}"
-        );
-        let suffix = if matches!(order, RearrangeTarget::BlockMajor { .. }) {
-            format!("{suffix}_b{row_block}x{column_block}")
+        let mut suffix =
+            format!("o{index}_r{rows}_p{physical_rows}_c{columns}_p{physical_columns}");
+        if matches!(order, ElementOrder::BlockMajor(_)) {
+            let separator = if unpack { "_" } else { "x" };
+            suffix.push_str(&format!("_b{row_block}{separator}{column_block}"));
+        }
+        let (prefix, vertex, call, source) = if unpack {
+            (
+                "UNPACK",
+                "UnpackAmpToRowMajorF16",
+                "unpack_amp_to_row_major_f16",
+                "unpack_amp_f16.cpp",
+            )
         } else {
-            suffix
+            (
+                "REARRANGE",
+                "RearrangeRowMajorToAmpF16",
+                "rearrange_row_major_to_amp_f16",
+                "rearrange_f16.cpp",
+            )
         };
-        let vertex = format!("RearrangeRowMajorToAmpF16_{suffix}");
-        let call = format!("rearrange_row_major_to_amp_f16_{suffix}");
-        self.symbols
-            .insert(KernelImplementation::Rearrange(shape), call.clone());
-        let assembly = if order == RearrangeTarget::AmpLeft
-            && logical_columns.is_multiple_of(2)
-            && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
-        {
-            Some("rearrange_amp_left_f16.S")
-        } else if matches!(order, RearrangeTarget::BlockMajor { .. })
-            && u32::from(row_block) == physical_rows
-            && physical_rows.is_multiple_of(AMP_COLUMN_MICRO)
-            && u32::from(column_block) == AMP_COLUMN_MICRO
-            && logical_columns.is_multiple_of(4)
-            && physical_columns.is_multiple_of(AMP_COLUMN_MICRO)
-        {
-            Some("rearrange_block_major_f16.S")
-        } else if order == RearrangeTarget::AmpTransposedRight
-            && logical_rows == 64
-            && physical_rows == 64
-            && logical_columns == 16
-            && physical_columns == 16
-        {
-            Some("rearrange_transposed_right_f16.S")
-        } else {
-            None
-        };
+        let vertex = format!("{vertex}_{suffix}");
+        let call = format!("{call}_{suffix}");
+        self.symbols.insert(key.clone(), call.clone());
         let mut flags = vec![
-            format!("-DREARRANGE_LOGICAL_ROWS={logical_rows}"),
-            format!("-DREARRANGE_PHYSICAL_ROWS={physical_rows}"),
-            format!("-DREARRANGE_LOGICAL_COLUMNS={logical_columns}"),
-            format!("-DREARRANGE_PHYSICAL_COLUMNS={physical_columns}"),
+            format!("-D{prefix}_LOGICAL_ROWS={rows}"),
+            format!("-D{prefix}_PHYSICAL_ROWS={physical_rows}"),
+            format!("-D{prefix}_LOGICAL_COLUMNS={columns}"),
+            format!("-D{prefix}_PHYSICAL_COLUMNS={physical_columns}"),
         ];
-        if let Some(source) = assembly {
-            flags.push(format!("-DREARRANGE_CALL_SYMBOL={call}"));
-            self.compilations.push(KernelCompilation {
+        if let Some(source) = assembly(
+            order,
+            unpack,
+            rows,
+            physical_rows,
+            columns,
+            physical_columns,
+        ) {
+            flags.push(format!("-D{prefix}_CALL_SYMBOL={call}"));
+            let name = if unpack {
+                "unpack_transposed_amp_f16"
+            } else {
+                "rearrange_f16_codelet"
+            };
+            self.add_compilation(KernelCompilation {
                 source,
-                name: format!("rearrange_f16_codelet_{suffix}"),
+                name: format!("{name}_{suffix}"),
                 flags,
             });
         } else {
+            let direction = if unpack { "SOURCE" } else { "TARGET" };
             flags.extend([
                 "-O2".into(),
-                format!("-DREARRANGE_TARGET_ORDER={order_index}"),
-                format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"),
-                format!("-DREARRANGE_ROW_BLOCK={row_block}"),
-                format!("-DREARRANGE_COLUMN_BLOCK={column_block}"),
-                format!("-DREARRANGE_VERTEX_NAME={vertex}"),
+                format!("-D{prefix}_{direction}_ORDER={index}"),
+            ]);
+            if !unpack {
+                flags.push(format!("-DREARRANGE_INNER_DIMENSION={AMP_COLUMN_MICRO}"));
+            }
+            flags.extend([
+                format!("-D{prefix}_ROW_BLOCK={row_block}"),
+                format!("-D{prefix}_COLUMN_BLOCK={column_block}"),
+                format!("-D{prefix}_VERTEX_NAME={vertex}"),
             ]);
             self.add_vertex(
-                "rearrange_f16.cpp",
+                source,
                 &call,
                 &vertex,
                 flags,
                 &[3, 2, 4, 5, 6, 7, 8, 9],
+                "worker_call.S",
+                Vec::new(),
             );
         }
     }
 }
 
 pub(super) fn rearrangement_specialization(
-    order: RearrangeTarget,
+    order: ElementOrder,
     mut logical_rows: u32,
     physical_rows: u32,
     logical_columns: u32,
     physical_columns: u32,
-) -> (RearrangeTarget, u32, u32, u32, u32) {
+) -> (ElementOrder, u32, u32, u32, u32) {
     if physical_rows == AMP_INNER_BLOCK
         && logical_rows < physical_rows
         && matches!(
             order,
-            RearrangeTarget::AmpTransposedRight | RearrangeTarget::BlockMajor { .. }
+            ElementOrder::Amp(AmpOrder::TransposedRight)
+                | ElementOrder::BlockMajor(BlockMajorOrder::Matrix { .. })
         )
     {
         // Row tails share one worker, but column alignment selects wide loads.
@@ -290,4 +256,80 @@ pub(super) fn rearrangement_specialization(
         logical_columns,
         physical_columns,
     )
+}
+
+/// Word-pair transpose in unpack_transposed_amp_f16.S: six workers distribute
+/// row pairs, with about fifteen issue slots per two columns. Physical geometry
+/// does not retain logical tail masks, whose branches add some extra work.
+pub(crate) fn f16_transposed_unpack_cycles(matrices: u64, rows: u64, columns: u64) -> u64 {
+    300u64.saturating_add(
+        matrices
+            .saturating_mul(rows.div_ceil(12))
+            .saturating_mul(100u64.saturating_add(columns.div_ceil(2).saturating_mul(90))),
+    )
+}
+
+/// Paired-row coefficient packing. Complete 16-column panels use an unrolled
+/// transpose; other aligned widths retain column indexing and bounds checks.
+/// Six worker contexts distribute pairs, including the physical zero-padding.
+pub(crate) fn f16_coefficient_pack_cycles(matrices: u64, rows: u64, columns: u64) -> u64 {
+    let pair = if columns == 16 {
+        60
+    } else {
+        12 + columns.div_ceil(16) * 4 * 35
+    };
+    300u64.saturating_add(
+        matrices
+            .saturating_mul(rows.div_ceil(12))
+            .saturating_mul(6)
+            .saturating_mul(pair),
+    )
+}
+
+pub(super) fn cycles(call: &KernelCall) -> u64 {
+    let (unpack, (order, rows, physical_rows, columns, physical_columns)) =
+        match call.implementation {
+            KernelImplementation::Unpack(shape) => (true, shape),
+            KernelImplementation::Rearrange(shape) => (false, shape),
+            _ => return u64::MAX,
+        };
+    let matrices = u64::from(call.arguments[if unpack { 0 } else { 5 }]);
+    let elements = matrices
+        .saturating_mul(u64::from(physical_rows))
+        .saturating_mul(u64::from(physical_columns));
+    if physical_rows == 0 || physical_columns == 0 {
+        return 0;
+    }
+    let selected = assembly(
+        order,
+        unpack,
+        rows,
+        physical_rows,
+        columns,
+        physical_columns,
+    );
+    match selected {
+        Some("unpack_transposed_amp_f16.S") => f16_transposed_unpack_cycles(
+            elements.div_ceil(u64::from(physical_rows) * u64::from(physical_columns)),
+            u64::from(physical_rows),
+            u64::from(physical_columns),
+        ),
+        Some("rearrange_block_major_f16.S") => f16_coefficient_pack_cycles(
+            elements.div_ceil(u64::from(physical_rows) * u64::from(physical_columns)),
+            u64::from(physical_rows),
+            u64::from(columns),
+        ),
+        _ => {
+            // Transposed-right's coefficient permutation is performed by GEMM's
+            // ld*putcs sequence even in the C++ fallback.
+            let per_element = match (unpack, order, selected) {
+                (false, ElementOrder::Amp(AmpOrder::TransposedRight), _) => 3,
+                (_, _, Some("rearrange_amp_left_f16.S")) => 1,
+                _ => 10,
+            };
+            elements
+                .saturating_mul(per_element)
+                .saturating_add(crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles)
+        }
+    }
 }

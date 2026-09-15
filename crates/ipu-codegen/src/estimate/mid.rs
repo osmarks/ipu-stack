@@ -367,7 +367,7 @@ fn analyze_storage<const PER_TILE: bool>(
     Some((cycles, peak))
 }
 
-fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
+pub(super) fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
     let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
     let shape = if let Some(axes) = resolved.axes() {
         TensorShape(axes.iter().map(|axis| axis.maximum_extent()).collect())
@@ -416,17 +416,26 @@ pub(crate) fn operation_cost(
         return Some((ProgramCycles::default(), MemoryUsage::default(), 0));
     }
     let output = tensor(*operation.results.first()?);
-    let mut out = local_tensor(output)?;
-    for &(axis, start, end) in operation
-        .output_windows
-        .first()
-        .into_iter()
-        .flat_map(|w| &w.0)
-    {
-        out.shape.0[axis as usize] = out.shape.0[axis as usize]
-            .saturating_sub(start)
-            .min(end.checked_sub(start)?);
-    }
+    let outputs = operation
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| {
+            let mut local = local_tensor(tensor(id))?;
+            for &(axis, start, end) in operation
+                .output_windows
+                .get(index)
+                .into_iter()
+                .flat_map(|w| &w.0)
+            {
+                local.shape.0[axis as usize] = local.shape.0[axis as usize]
+                    .saturating_sub(start)
+                    .min(end.checked_sub(start)?);
+            }
+            Some(local)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let out = &outputs[0];
     let mut scratch = MemoryUsage::default();
     let mut rows = 0;
     let mut price = ProgramCycles::default();
@@ -477,24 +486,42 @@ pub(crate) fn operation_cost(
                 && !input.format.supports_micro_panel_exchange(&output.format)
             {
                 scratch.standard = bytes;
-                let elements = bytes.div_ceil(output.format.precision.bytes());
-                price.total = price.total.saturating_add(
-                    if output.format.layout.order == ElementOrder::RowMajor {
-                        elements.saturating_mul(10)
-                    } else {
-                        row_major_pack_cycles(&out, elements)
-                    },
-                );
+                // Packed destinations are populated from row-major staging.
+                // Other mappings use generic copies, already charged above;
+                // absence of a specialized kernel does not make them invalid.
+                let from = if output.format.layout.order == ElementOrder::RowMajor {
+                    input.format.layout.order
+                } else {
+                    ElementOrder::RowMajor
+                };
+                if crate::kernel::rearrange::supported(
+                    from,
+                    output.format.layout.order,
+                    output.format.precision,
+                ) {
+                    price.total = price
+                        .total
+                        .saturating_add(crate::kernel::rearrange::estimate(
+                            from,
+                            crate::kernel::Geometry::Tensor(out),
+                            crate::kernel::Geometry::Tensor(out),
+                        ));
+                }
             }
         }
         MidOperationKind::Repeat(_) => unreachable!(),
         kernel => {
             let inputs = operand_tensors(operation, values)?;
-            price.total = super::primitive::kernel_cycles(
-                kernel,
-                |i| inputs.get(i).map(super::primitive::Geometry::Tensor),
-                super::primitive::Geometry::Tensor(&out),
-            );
+            let inputs = inputs
+                .iter()
+                .map(crate::kernel::Geometry::Tensor)
+                .collect::<Vec<_>>();
+            let outputs = outputs
+                .iter()
+                .map(crate::kernel::Geometry::Tensor)
+                .collect::<Vec<_>>();
+            price.total = crate::kernel::KernelCall::select(kernel, &inputs, &outputs)
+                .map_or(u64::MAX, |call| call.cycles());
         }
     }
     Some((price, scratch, rows))

@@ -1,5 +1,5 @@
 use super::*;
-use crate::kernel::abi::COPY_U64_SYMBOL;
+use crate::kernel::copy::COPY_U64_SYMBOL;
 use crate::mid::MidOperationKind;
 
 use crate::*;

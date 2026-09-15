@@ -680,7 +680,7 @@ impl CostModel for ColumnParityCost {
         })
     }
 
-    fn cast_cycles(&self, _input: &TensorType, _to: Precision) -> u64 {
+    fn cast_format_cycles(&self, _input: &TensorType, _output: &crate::TensorFormat) -> u64 {
         0
     }
 

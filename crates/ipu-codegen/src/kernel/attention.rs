@@ -2,8 +2,37 @@
 //! every stage shares its worker code across query-row counts.
 
 use super::*;
-use crate::ShardView;
 use crate::mid::MidOperationKind;
+
+pub(super) fn cycles(call: &KernelCall) -> u64 {
+    match call.implementation {
+        KernelImplementation::Attention(shape) => u64::from(shape.matrices)
+            .saturating_mul(u64::from(shape.query_rows))
+            .saturating_mul(u64::from(shape.key_rows))
+            .saturating_mul(u64::from(shape.query_dimension) + u64::from(shape.value_dimension))
+            .saturating_mul(4)
+            .div_ceil(6)
+            .saturating_add(crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles),
+        KernelImplementation::Softmax(_, keys, padded, output) => softmax_output_cycles(
+            u64::from(call.arguments[0]),
+            u64::from(keys),
+            u64::from(padded),
+            matches!(output, Precision::F8F143 { .. }),
+            call.arguments[2] != 0,
+        ),
+        KernelImplementation::Merge(columns, _, output) => {
+            let args = &call.arguments[call.arguments.len() - 3..];
+            f16_attention_merge_cycles(
+                u64::from(args[2]),
+                u64::from(columns),
+                args[0] != 0,
+                args[1] != 0,
+                output == Precision::F16,
+            )
+        }
+        _ => u64::MAX,
+    }
+}
 
 /// One contiguous workspace: optional field/component axes surround the
 /// flattened query rows. The same declaration constructs mid tensors and checks
@@ -62,32 +91,28 @@ impl RowWorkspace {
         Some(tensor)
     }
 
-    fn accepts(&self, access: &KernelAccess, view: &ShardView, rows: u32) -> bool {
-        if access.format.precision != self.precision
-            || access.format.layout.order != ElementOrder::RowMajor
+    fn accepts(&self, geometry: Geometry<'_>, rows: u32) -> bool {
+        if geometry.format().precision != self.precision
+            || geometry.format().layout.order != ElementOrder::RowMajor
         {
             return false;
         }
-        let mut dimensions = view.extents.as_slice();
-        if let Some(width) = self.leading {
-            let Some((axis, rest)) = dimensions.split_first() else {
-                return false;
-            };
-            if axis.physical_end - axis.start != width {
-                return false;
+        let mut dimensions = geometry.extents();
+        for (width, leading) in [(self.leading, true), (self.trailing, false)] {
+            if let Some(width) = width {
+                let axis = if leading {
+                    dimensions.next()
+                } else {
+                    dimensions.next_back()
+                };
+                if axis.is_none_or(|axis| axis.physical_end - axis.start != width) {
+                    return false;
+                }
             }
-            dimensions = rest;
         }
-        if let Some(width) = self.trailing {
-            let Some((axis, rest)) = dimensions.split_last() else {
-                return false;
-            };
-            if axis.physical_end - axis.start != width {
-                return false;
-            }
-            dimensions = rest;
-        }
-        element_count(dimensions) == Ok(rows)
+        dimensions.try_fold(1u32, |count, axis| {
+            count.checked_mul(axis.physical_end - axis.start)
+        }) == Some(rows)
     }
 }
 
@@ -103,22 +128,28 @@ pub(crate) fn softmax_workspaces(
         .collect()
 }
 
-pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
-    let output = run.requirements.outputs[0].format.precision;
-    let (implementation, arguments) = match run.kernel {
+pub(super) fn call(
+    kernel: &MidOperationKind,
+    inputs: &[Geometry<'_>],
+    outputs: &[Geometry<'_>],
+) -> Result<KernelCall, KernelAbiError> {
+    let output = outputs
+        .first()
+        .ok_or(KernelAbiError::RequirementMismatch)?
+        .format()
+        .precision;
+    let (implementation, arguments) = match *kernel {
         MidOperationKind::FlashAttention { .. } => {
-            run.check_arity(3, 1)?;
+            check_arity(inputs, outputs, 3, 1)?;
             if output != Precision::F32
-                || run
-                    .requirements
-                    .inputs
+                || inputs
                     .iter()
-                    .any(|input| input.format.precision != Precision::F16)
+                    .any(|input| input.format().precision != Precision::F16)
             {
-                return Err(KernelAbiError::Unavailable(run.kernel.clone()));
+                return Err(KernelAbiError::Unavailable(kernel.clone()));
             }
             (
-                KernelImplementation::Attention(attention_shape(run)?),
+                KernelImplementation::Attention(attention_shape(kernel, inputs)?),
                 Vec::new(),
             )
         }
@@ -129,22 +160,22 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
         } => {
             let workspaces = softmax_workspace_specs(output, key_columns != padded_key_columns)
                 .ok_or(KernelAbiError::RequirementMismatch)?;
-            run.check_arity(1, 1 + workspaces.len())?;
-            let rows = gemm_rows(run)?;
+            check_arity(inputs, outputs, 1, 1 + workspaces.len())?;
+            let rows = gemm_rows(outputs[0])?;
             if key_columns == 0
                 || key_columns > padded_key_columns
-                || run.requirements.inputs[0].format.precision != Precision::F16
-                || run.requirements.inputs[0].format.layout.order
-                    != ElementOrder::Amp(AmpOrder::Left)
-                || run.requirements.outputs[0].format.layout.order
-                    != ElementOrder::Amp(AmpOrder::Left)
-                || matrix_extent(&run.outputs[0], false, true)? != padded_key_columns
-                || input_matrix_extent(run, false, true)? != padded_key_columns
-                || element_count(&run.inputs[0].extents[..run.inputs[0].extents.len() - 1])? != rows
+                || inputs[0].format().precision != Precision::F16
+                || inputs[0].format().layout.order != ElementOrder::Amp(AmpOrder::Left)
+                || outputs[0].format().layout.order != ElementOrder::Amp(AmpOrder::Left)
+                || outputs[0].matrix_extent(false, true)? != padded_key_columns
+                || inputs[0].matrix_extent(false, true)? != padded_key_columns
+                || u32::try_from(inputs[0].rows())
+                    .map_err(|_| KernelAbiError::ElementCountOverflow)?
+                    != rows
                 || workspaces
                     .iter()
-                    .zip(run.requirements.outputs[1..].iter().zip(&run.outputs[1..]))
-                    .any(|(workspace, (access, view))| !workspace.accepts(access, view, rows))
+                    .zip(&outputs[1..])
+                    .any(|(workspace, &geometry)| !workspace.accepts(geometry, rows))
             {
                 return Err(KernelAbiError::RequirementMismatch);
             }
@@ -158,7 +189,7 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
                 vec![
                     rows,
                     key_columns,
-                    u32::from(cost::f16_softmax_split_rows(
+                    u32::from(f16_softmax_split_rows(
                         u64::from(rows),
                         u64::from(key_columns),
                         u64::from(padded_key_columns),
@@ -173,38 +204,38 @@ pub(super) fn call(run: &KernelRun) -> Result<KernelCall, KernelAbiError> {
             final_block,
         } => {
             if output != Precision::F32 && !(output == Precision::F16 && final_block) {
-                return Err(KernelAbiError::Unavailable(run.kernel.clone()));
+                return Err(KernelAbiError::Unavailable(kernel.clone()));
             }
             let previous = output == Precision::F16 && !initial;
-            run.check_arity(if previous { 3 } else { 2 }, 1)?;
-            let rows = gemm_rows(run)?;
+            check_arity(inputs, outputs, if previous { 3 } else { 2 }, 1)?;
+            let rows = gemm_rows(outputs[0])?;
             let accumulator_width = value_dimension
                 .checked_add(2)
                 .and_then(|width| width.div_ceil(16).checked_mul(16))
                 .ok_or(KernelAbiError::ElementCountOverflow)?;
             if value_dimension == 0
                 || value_dimension > padded_value_dimension
-                || run.requirements.inputs[0].format.precision != Precision::F16
-                || run.requirements.inputs[0].format.layout.order
-                    != ElementOrder::Amp(AmpOrder::Left)
-                || input_matrix_extent(run, false, true)? != padded_value_dimension
-                || element_count(&run.inputs[0].extents[..run.inputs[0].extents.len() - 1])? != rows
-                || run.requirements.outputs[0].format.layout.order != ElementOrder::RowMajor
-                || matrix_extent(&run.outputs[0], false, true)?
+                || inputs[0].format().precision != Precision::F16
+                || inputs[0].format().layout.order != ElementOrder::Amp(AmpOrder::Left)
+                || inputs[0].matrix_extent(false, true)? != padded_value_dimension
+                || u32::try_from(inputs[0].rows())
+                    .map_err(|_| KernelAbiError::ElementCountOverflow)?
+                    != rows
+                || outputs[0].format().layout.order != ElementOrder::RowMajor
+                || outputs[0].matrix_extent(false, true)?
                     != if output == Precision::F16 {
                         padded_value_dimension
                     } else {
                         accumulator_width
                     }
-                || !SOFTMAX_WORKSPACES[0].accepts(&run.requirements.inputs[1], &run.inputs[1], rows)
+                || !SOFTMAX_WORKSPACES[0].accepts(inputs[1], rows)
                 || (previous
-                    && (run.requirements.inputs[2].format.precision != Precision::F32
-                        || run.requirements.inputs[2].format.layout.order
-                            != ElementOrder::RowMajor
-                        || matrix_extent(&run.inputs[2], false, true)? != accumulator_width
-                        || element_count(
-                            &run.inputs[2].extents[..run.inputs[2].extents.len() - 1],
-                        )? != rows))
+                    && (inputs[2].format().precision != Precision::F32
+                        || inputs[2].format().layout.order != ElementOrder::RowMajor
+                        || inputs[2].matrix_extent(false, true)? != accumulator_width
+                        || u32::try_from(inputs[2].rows())
+                            .map_err(|_| KernelAbiError::ElementCountOverflow)?
+                            != rows))
             {
                 return Err(KernelAbiError::RequirementMismatch);
             }
@@ -238,60 +269,62 @@ pub(crate) struct AttentionKernelShape {
     pub(crate) scale_bits: u32,
 }
 
-pub(crate) fn attention_shape(run: &KernelRun) -> Result<AttentionKernelShape, KernelAbiError> {
+fn attention_shape<'a>(
+    kernel: &MidOperationKind,
+    inputs: &[Geometry<'a>],
+) -> Result<AttentionKernelShape, KernelAbiError> {
     let MidOperationKind::FlashAttention {
         options,
         accumulate,
-    } = &run.kernel
+    } = kernel
     else {
         return Err(KernelAbiError::RequirementMismatch);
     };
-    if options.causal || *accumulate != crate::AccumulationPrecision::F32 {
+    if options.causal || *accumulate != AccumulationPrecision::F32 {
         return Err(KernelAbiError::RequirementMismatch);
     }
-    let [query, key, value] = run.inputs.as_slice() else {
+    let (Some(query), Some(key), Some(value), None) = (
+        inputs.first().copied(),
+        inputs.get(1).copied(),
+        inputs.get(2).copied(),
+        inputs.get(3),
+    ) else {
         return Err(KernelAbiError::RequirementMismatch);
     };
-    let extents = |view: &ShardView| {
-        view.extents
-            .iter()
-            .map(|extent| extent.physical_end - extent.start)
-            .collect::<Vec<_>>()
-    };
-    let query = extents(query);
-    let key = extents(key);
-    let value = extents(value);
-    if query.len() < 2 || query.len() != key.len() || query.len() != value.len() {
-        return Err(KernelAbiError::RequirementMismatch);
-    }
-    let rank = query.len();
-    if query[..rank - 2] != key[..rank - 2]
-        || query[..rank - 2] != value[..rank - 2]
-        || query[rank - 1] != key[rank - 1]
-        || key[rank - 2] != value[rank - 2]
+    let rank = query.rank();
+    if rank < 2
+        || key.rank() != rank
+        || value.rank() != rank
+        || (0..rank - 2).any(|axis| {
+            query.dimension(axis) != key.dimension(axis)
+                || query.dimension(axis) != value.dimension(axis)
+        })
+        || query.dimension(rank - 1) != key.dimension(rank - 1)
+        || key.dimension(rank - 2) != value.dimension(rank - 2)
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
-    let matrices = query[..rank - 2]
-        .iter()
-        .try_fold(1u32, |product, &extent| product.checked_mul(extent))
+    let matrices = query
+        .widths()
+        .take(rank - 2)
+        .try_fold(1u32, |count, width| count.checked_mul(width))
         .ok_or(KernelAbiError::ElementCountOverflow)?;
     let scale = options
         .scale
         .as_value()
-        .unwrap_or_else(|| 1.0 / (query[rank - 1] as f32).sqrt());
+        .unwrap_or_else(|| 1.0 / (query.dimension(rank - 1) as f32).sqrt());
     Ok(AttentionKernelShape {
         matrices,
-        query_rows: query[rank - 2],
-        key_rows: key[rank - 2],
-        query_dimension: query[rank - 1],
-        value_dimension: value[rank - 1],
+        query_rows: query.dimension(rank - 2),
+        key_rows: key.dimension(rank - 2),
+        query_dimension: query.dimension(rank - 1),
+        value_dimension: value.dimension(rank - 1),
         scale_bits: scale.to_bits(),
     })
 }
 
 impl KernelBuildPlan {
-    pub(super) fn add_attention(&mut self, shape: AttentionKernelShape) {
+    fn add_flash_attention(&mut self, shape: AttentionKernelShape) {
         let suffix = format!(
             "m{}_q{}_k{}_d{}_v{}_{:08x}",
             shape.matrices,
@@ -318,18 +351,23 @@ impl KernelBuildPlan {
             &vertex,
             flags,
             &[3, 4, 5, 2],
+            "worker_call.S",
+            Vec::new(),
         );
         self.symbols
             .insert(KernelImplementation::Attention(shape), call_symbol);
     }
 
-    pub(super) fn add_attention_stages(
+    pub(super) fn add_attention(
         &mut self,
-        stages: BTreeSet<KernelImplementation>,
+        stages: &BTreeSet<KernelImplementation>,
     ) -> Result<(), KernelAbiError> {
-        let mut compiled = BTreeSet::new();
-        for key in stages {
+        for key in stages.iter().cloned() {
             let (name, symbol, source, flags) = match key {
+                KernelImplementation::Attention(ref shape) => {
+                    self.add_flash_attention(shape.clone());
+                    continue;
+                }
                 KernelImplementation::Softmax(head, keys, padded, precision) => {
                     let full = keys == padded;
                     let name = format!(
@@ -383,17 +421,198 @@ impl KernelBuildPlan {
                     ];
                     (name, symbol, "attention_merge_f16.S", flags)
                 }
-                _ => return Err(KernelAbiError::RequirementMismatch),
+                _ => continue,
             };
             self.symbols.insert(key, symbol.clone());
-            if compiled.insert(symbol.clone()) {
-                self.compilations.push(KernelCompilation {
-                    source,
-                    name,
-                    flags,
-                });
-            }
+            self.add_compilation(KernelCompilation {
+                source,
+                name,
+                flags,
+            });
         }
         Ok(())
+    }
+}
+
+/// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 41
+/// issue groups per full 16-key panel. Masked pairs and zero padding use short
+/// scalar loops; no tile program needs to be constructed to price them.
+fn f16_softmax_whole_rows(rows: u64, keys: u64, padded_keys: u64) -> u64 {
+    if rows == 0 {
+        return 0;
+    }
+    let full_panels = keys / 16;
+    let mut row = 28u64
+        .saturating_add(2 * u64::from(full_panels != 0))
+        .saturating_add(full_panels.saturating_mul(41));
+    let launch = if keys == padded_keys {
+        row = row.saturating_add(7);
+        222u64
+    } else {
+        row = row.saturating_add(5 + 6 * u64::from(full_panels != 0));
+        let pairs = (keys % 16) / 2;
+        let zero_pairs = 8 - (keys % 16).div_ceil(2);
+        let zero_panels = (padded_keys / 16).saturating_sub(full_panels.saturating_add(1));
+        row = row
+            .saturating_add(21)
+            .saturating_add(if full_panels != 0 { 4 } else { 2 })
+            .saturating_add(2 * u64::from(pairs != 0))
+            .saturating_add(12 * pairs + 12 * (keys % 2))
+            .saturating_add(u64::from(zero_pairs != 0) + 2 * zero_pairs)
+            .saturating_add(u64::from(zero_panels != 0))
+            .saturating_add(zero_panels.saturating_mul(10));
+        234
+    };
+    launch.saturating_add(rows.div_ceil(6).saturating_mul(6).saturating_mul(row))
+}
+
+// Three local stages: partial maxima, exponentials/partial sums, final sums.
+// A segment has ceil(padded_keys / 48) panels. 123 groups account for each
+// segment's setup, row-state reductions, and address calculations; 408 cycles
+// cover the launches and 21 groups per final worker wave reduce the sums.
+fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
+    if keys < 128 || rows == 0 {
+        return u64::MAX;
+    }
+    let segment = padded_keys
+        .div_ceil(48)
+        .saturating_mul(41)
+        .saturating_add(123);
+    408u64
+        .saturating_add(rows.div_ceil(2).saturating_mul(6).saturating_mul(segment))
+        .saturating_add(rows.div_ceil(6).saturating_mul(126))
+}
+
+/// The ABI and the planner use the same choice; no tile program is built here.
+fn f16_softmax_split_rows(rows: u64, keys: u64, padded_keys: u64) -> bool {
+    f16_softmax_split_cycles(rows, keys, padded_keys)
+        < f16_softmax_whole_rows(rows, keys, padded_keys)
+}
+
+/// The FP8 epilogue keeps the same row schedule, with two eight-value casts
+/// per score panel, half-panel addressing and a bounded masked-tail drain.
+fn softmax_output_cycles(rows: u64, keys: u64, padded_keys: u64, fp8: bool, split: bool) -> u64 {
+    let base = if split {
+        f16_softmax_split_cycles(rows, keys, padded_keys)
+    } else {
+        f16_softmax_whole_rows(rows, keys, padded_keys)
+    };
+    if !fp8 {
+        return base;
+    }
+    base.saturating_add(
+        rows.div_ceil(if split { 2 } else { 6 })
+            .saturating_mul(6)
+            .saturating_mul(
+                padded_keys
+                    .div_ceil(if split { 48 } else { 16 })
+                    .saturating_mul(7)
+                    .saturating_add(8),
+            ),
+    )
+}
+
+/// Merge preserves FP32 state. Pair loops issue four groups for initialization
+/// and six for updates; final normalization is folded into the row coefficients.
+pub(crate) fn f16_attention_merge_cycles(
+    rows: u64,
+    values: u64,
+    initial: bool,
+    final_block: bool,
+    output_f16: bool,
+) -> u64 {
+    if rows == 0 {
+        return 0;
+    }
+    let panels = values / 16;
+    let row = (if initial { 24u64 } else { 31u64 })
+        .saturating_add(if output_f16 { 3 } else { 0 })
+        .saturating_add(u64::from(panels != 0))
+        .saturating_add(panels.saturating_mul(3))
+        .saturating_add(
+            values
+                .div_ceil(2)
+                .saturating_mul((if initial { 4 } else { 6 }) + u64::from(output_f16)),
+        )
+        .saturating_add(if final_block {
+            if initial { 3 } else { 5 }
+        } else {
+            0
+        });
+    222u64.saturating_add(rows.div_ceil(6).saturating_mul(6).saturating_mul(row))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn softmax_estimates_cover_measured_row_schedules() {
+        // IPU21, explicit probability/statistics/scratch buffers in separate
+        // elements, random inputs (typed-attention/softmax-*-random artifacts).
+        // Bank conflicts and worker skew are outside this coarse issue model.
+        for (rows, keys, padded, measured) in [
+            (1, 64, 64, 1422u64),
+            (7, 64, 64, 2640),
+            (8, 64, 64, 3168),
+            (1, 65, 80, 1770),
+            (7, 65, 80, 3330),
+            (8, 65, 80, 3774),
+            (1, 729, 768, 5190),
+            (7, 729, 768, 21456),
+            (8, 729, 768, 22536),
+        ] {
+            let estimated = softmax_output_cycles(
+                rows,
+                keys,
+                padded,
+                false,
+                f16_softmax_split_rows(rows, keys, padded),
+            );
+            assert!(
+                estimated.abs_diff(measured) <= measured / 5,
+                "rows={rows} keys={keys}: estimated={estimated} measured={measured}"
+            );
+        }
+        assert_eq!(softmax_output_cycles(0, 64, 64, false, false), 0);
+        assert_eq!(
+            softmax_output_cycles(u64::MAX, u64::MAX, u64::MAX, false, false),
+            u64::MAX
+        );
+        assert_eq!(
+            f16_attention_merge_cycles(u64::MAX, u64::MAX, false, true, false),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn softmax_segmentation_prices_launches_and_worker_rounding() {
+        assert!(f16_softmax_split_rows(1, 128, 128));
+        assert!(!f16_softmax_split_rows(7, 128, 128));
+        assert!(!f16_softmax_split_rows(8, 128, 128));
+        assert!(!f16_softmax_split_rows(6, 729, 768));
+        for rows in [7, 8] {
+            assert!(f16_softmax_split_rows(rows, 729, 768));
+        }
+    }
+
+    #[test]
+    fn softmax_cost_follows_the_encoded_schedule_even_when_slower() {
+        for rows in [1, 6, 7, 8] {
+            for precision in [Precision::F16, Precision::F8F143 { scale_exponent: 0 }] {
+                let mut call = KernelCall {
+                    implementation: KernelImplementation::Softmax(64, 729, 768, precision),
+                    arguments: vec![rows, 729, 0],
+                };
+                let whole = call.cycles();
+                call.arguments[2] = 1;
+                let split = call.cycles();
+                assert_ne!(whole, split, "cost must not silently reselect the schedule");
+                assert_eq!(
+                    split < whole,
+                    f16_softmax_split_rows(u64::from(rows), 729, 768),
+                );
+            }
+        }
     }
 }

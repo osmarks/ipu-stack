@@ -708,9 +708,16 @@ fn select_destination_packing(
                     fragments.saturating_mul(crate::estimate::EXCHANGE_FRAGMENT_CONTROLS),
                 )
                 .saturating_add(clear_cycles)
-                    < crate::estimate::row_major_pack_cycles(
-                        destination,
-                        bytes.div_ceil(destination.format.precision.bytes().max(1)),
+                    < crate::kernel::rearrange::estimate(
+                        ElementOrder::RowMajor,
+                        crate::kernel::Geometry::Storage(crate::storage::TensorStorage {
+                            format: &destination.format,
+                            extents,
+                        }),
+                        crate::kernel::Geometry::Storage(crate::storage::TensorStorage {
+                            format: &destination.format,
+                            extents,
+                        }),
                     )
             });
             !direct
