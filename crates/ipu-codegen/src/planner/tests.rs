@@ -23,7 +23,6 @@ use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperandMaterialization,
     OperandRequirement, OperatorDispatch, OperatorFamily, OperatorPlan, default_dispatch,
 };
-use crate::planner::recipe::Recipe;
 use crate::planner::{bind, build, candidates, test_support::lower};
 use crate::tensor::{
     AMP_COLUMN_MICRO, AMP_INNER_BLOCK, AMP_OUTPUT_COLUMN_BLOCK, AmpOrder, AxisFactorView,
@@ -75,34 +74,14 @@ fn whole_program_reduction_grouping_replays_and_lowers() {
         });
     }
     let fragments = FragmentCache::default();
-    let initial = Recipe {
-        open_boundaries: BTreeSet::from([a, b, av, bv]),
-        ..Default::default()
-    };
-    let baseline =
-        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &initial).unwrap();
-    let recipe = baseline.recipe.clone();
     config.parallel_reductions = 2;
-    let grouped = build::build_candidate(
-        &graph,
-        &config,
-        &Ipu21CostModel,
-        &FragmentCache::default(),
-        &recipe,
-    )
-    .unwrap();
-    grouped.program.validate().unwrap();
-    let tiles = crate::expand_tiles(&grouped.program).unwrap();
+    let grouped = build::baseline(&graph, &config, &Ipu21CostModel, &fragments).unwrap();
+    grouped.validate().unwrap();
+    let tiles = crate::expand_tiles(&grouped).unwrap();
     crate::KernelBuildPlan::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
-    let replay = build::build_candidate(
-        &graph,
-        &config,
-        &Ipu21CostModel,
-        &FragmentCache::default(),
-        &grouped.recipe,
-    )
-    .unwrap();
-    assert_eq!(grouped.program, replay.program);
+    let replay =
+        build::baseline(&graph, &config, &Ipu21CostModel, &FragmentCache::default()).unwrap();
+    assert_eq!(grouped, replay);
 }
 
 #[test]
@@ -1213,15 +1192,13 @@ fn blocked_attention_reserves_online_state_between_accumulator_rows() {
         .with_automatic_input(q, Precision::F16)
         .with_automatic_input(k, Precision::F16)
         .with_automatic_input(v, Precision::F16);
-    let mid = build::build_candidate(
+    let mid = build::baseline(
         &graph,
         &config,
         &Ipu21CostModel,
         &crate::planner::cache::FragmentCache::default(),
-        &Recipe::default(),
     )
-    .unwrap()
-    .program;
+    .unwrap();
     let low = crate::expand_tiles(&mid).unwrap();
     let mut intermediate = 0;
     for run in &low.kernel_runs {
@@ -1258,15 +1235,13 @@ fn materialized_attention_packs_values_for_the_full_product() {
         .with_automatic_input(query, Precision::F16)
         .with_automatic_input(key, Precision::F16)
         .with_automatic_input(value, Precision::F16);
-    let mid = crate::planner::build::build_candidate(
+    let mid = crate::planner::build::baseline(
         &graph,
         &config,
         &Ipu21CostModel,
         &crate::planner::cache::FragmentCache::default(),
-        &crate::planner::Recipe::default(),
     )
-    .unwrap()
-    .program;
+    .unwrap();
     let product = mid
         .operations
         .iter()
@@ -1319,6 +1294,11 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
     let weight = graph.parameter("weight", [1, 1152, 4304]).unwrap();
     let output = graph.gemm(input, weight).unwrap();
     graph.set_outputs([output]).unwrap();
+    let inputs = [
+        TensorType::new([1, 729, 1152], Precision::F16, Layout::row_sharded(1472)),
+        TensorType::new([1, 1152, 4304], Precision::F16, Layout::row_sharded(1472)),
+    ];
+    let shape = TensorShape::new([1, 729, 4304]);
     let mut plans = Vec::new();
     for (r, c, k) in [(4, 92, 4), (3, 27, 18)] {
         let config = PipelineConfig::new(1472)
@@ -1337,23 +1317,23 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
                 reduction_staging: ReductionStaging::Complete,
                 local_weight_staging: LocalOperandStaging::Direct,
             });
-        let selected = build::select(
-            &graph,
+        let mut selected = candidates::plans(
+            &graph.operations()[0],
+            &inputs,
+            &[false, true],
+            &shape,
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &Recipe::default(),
-        )
-        .unwrap();
-        plans.push(selected.recipe.plans.values().next().unwrap().clone());
+            true,
+            None,
+            &[],
+            &[],
+        );
+        plans.push(selected.remove(0));
     }
-    let inputs = [
-        TensorType::new([1, 729, 1152], Precision::F16, Layout::row_sharded(1472)),
-        TensorType::new([1, 1152, 4304], Precision::F16, Layout::row_sharded(1472)),
-    ];
-    let output = TensorShape::new([1, 729, 4304]);
     let boundary_bytes = |plan: &OperatorPlan| {
-        let (inputs, output) = plan.tensor_types(&inputs, &output);
+        let (inputs, output) = plan.tensor_types(&inputs, &shape);
         inputs
             .iter()
             .chain(std::iter::once(&output))
@@ -1365,7 +1345,7 @@ fn shortlist_prices_execution_instead_of_boundary_storage() {
     let selected = retain_operator_candidates(
         plans,
         &inputs,
-        &output,
+        &shape,
         &Ipu21CostModel,
         &crate::planner::cache::FragmentCache::default(),
         1,
@@ -1653,15 +1633,13 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
         config.attention_fp8_scales = scales;
-        let mid = crate::planner::build::build_candidate(
+        let mid = crate::planner::build::baseline(
             &graph,
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::default(),
         )
-        .unwrap()
-        .program;
+        .unwrap();
         let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
         let kernels = crate::KernelBuildPlan::from_program(&tiled).unwrap();
@@ -1722,15 +1700,13 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = crate::planner::build::build_candidate(
+        let mid = crate::planner::build::baseline(
             &graph,
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::default(),
         )
-        .unwrap()
-        .program;
+        .unwrap();
         assert_eq!(
             mid.values[mid.outputs[0].index() as usize]
                 .tensor_type
@@ -2219,40 +2195,35 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
                 },
             );
         }
-        let late = build::build_candidate(
+        let late = build::baseline(
             &graph,
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &Recipe::default(),
         )
         .unwrap();
         for with_v in [false, true] {
             config.attention_fp8_scales[1] = with_v.then_some(-4);
-            let recipe = late.recipe.clone();
             config.cast_before_copies = true;
-            let early = build::build_candidate(
+            let early = build::baseline(
                 &graph,
                 &config,
                 &Ipu21CostModel,
                 &crate::planner::cache::FragmentCache::default(),
-                &recipe,
             )
             .unwrap();
-            assert_ne!(early.program.operations, late.program.operations);
-            assert_eq!(early.config, config);
-            let tiles = crate::expand_tiles(&early.program).unwrap();
+            assert_ne!(early.operations, late.operations);
+            let tiles = crate::expand_tiles(&early).unwrap();
             let low = crate::lower_to_tiles(&tiles, false);
             crate::KernelBuildPlan::from_program(&low).unwrap();
-            let replay = build::build_candidate(
+            let replay = build::baseline(
                 &graph,
                 &config,
                 &Ipu21CostModel,
                 &crate::planner::cache::FragmentCache::default(),
-                &early.recipe,
             )
             .unwrap();
-            assert_eq!(replay.program, early.program);
+            assert_eq!(replay, early);
         }
     }
 }

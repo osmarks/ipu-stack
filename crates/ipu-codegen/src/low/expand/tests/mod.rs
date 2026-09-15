@@ -1689,13 +1689,34 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::default(),
+            false,
         )
         .unwrap();
-        let plan = selected.recipe.plans.values().next().unwrap();
+        let product = selected
+            .operations
+            .iter()
+            .find(|operation| {
+                matches!(
+                    operation.kind,
+                    MidOperationKind::Compute(Compute::Product(_))
+                )
+            })
+            .unwrap();
         let config = config
-            .with_input(left, plan.inputs[0].format.clone())
-            .with_input(right, plan.inputs[1].format.clone());
+            .with_input(
+                left,
+                selected.values[product.inputs[0].index() as usize]
+                    .tensor_type
+                    .format
+                    .clone(),
+            )
+            .with_input(
+                right,
+                selected.values[product.inputs[1].index() as usize]
+                    .tensor_type
+                    .format
+                    .clone(),
+            );
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {

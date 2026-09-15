@@ -1,21 +1,17 @@
-//! Compiler driver: search over executable mid candidates, then compile each
-//! through explicit expansion, support sizing, placement and exchange feedback.
-//! The accepted result owns one final placement, schedule, package and cache.
+//! Compiler driver: build the baseline mid program, then expand, size support,
+//! place storage, schedule exchanges, and emit the application.
 mod config;
 
 use crate::estimate::Ipu21CostModel;
 use crate::estimate::memory_profile::write as memory_profile;
 use crate::kernel::KernelBuildPlan;
 use crate::low::LowProgram;
-use crate::memory::TileMemoryMap;
 use crate::package::{
     DiagnosticCheckpoint, PackageBuildResult, active_topology, diagnostic_tensor, package_inputs,
     package_multiply_precisions, package_precisions, validate_tile_count,
 };
-use crate::planner::proposals;
-use crate::planner::{Candidate, Recipe, build};
+use crate::planner::build;
 use ipu_elf::Toolchain;
-use rayon::prelude::*;
 use std::{path::PathBuf, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -28,15 +24,12 @@ pub struct PackageConfig {
     pub pipeline: PipelineConfig,
 }
 
-struct EvaluatedCandidate {
+struct Compilation {
     program: LowProgram,
     placement: crate::Placement,
     exchanges: Vec<crate::exchange::PhysicalExchangePhase>,
     application: ipu_package::Application,
-    support_memory: TileMemoryMap,
     exchange_code_base: u32,
-    cycles: u64,
-    cache: crate::ExchangeScheduleCache,
 }
 
 /// Compiles and packages a compute graph into a directly loadable IPU21
@@ -134,12 +127,8 @@ fn build_package_with_checkpoints(
     })
 }
 
-fn compile_graph(
-    graph: &ComputeGraph,
-    package: &PackageConfig,
-) -> PackageBuildResult<EvaluatedCandidate> {
+fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildResult<Compilation> {
     let config = &package.pipeline;
-    let tile_mapping = config.tile_mapping.as_deref();
     validate_tile_count(u32::from(config.tile_count))?;
     let runtime =
         tracing::info_span!("compile_runtime").in_scope(|| -> PackageBuildResult<_> {
@@ -149,283 +138,19 @@ fn compile_graph(
                     .compile(&package.runtime_source, "static_runtime", &[])?;
             Ok(std::fs::read(artifact.object)?)
         })?;
-    let selected = tracing::info_span!("plan_package").in_scope(|| -> PackageBuildResult<_> {
-        let costs = crate::estimate::MemoizedCostModel::new(&Ipu21CostModel);
-        let fragments = crate::planner::cache::FragmentCache::default();
-        let expansions = Arc::new(crate::storage::GeometryCache::default());
-        let mut attempted_recipes: Vec<(Recipe, PipelineConfig)> = Vec::new();
-        let mut attempts = 0;
-        let mut incumbent =
-            build::build_candidate(graph, config, &costs, &fragments, &Recipe::default())?;
-        memory_profile(graph, config, &incumbent.program, "baseline")?;
-        let mut selected = evaluate_candidate(
-            &incumbent.program,
-            package,
-            Arc::clone(&expansions),
-            crate::ExchangeScheduleCache::default(),
-            &runtime,
-        )?;
-        tracing::info!(cycles = selected.cycles, "validated search incumbent");
-        // Fix logical homes for the remaining local search.
-        for (input, planned) in graph.inputs().iter().zip(&incumbent.program.inputs) {
-            incumbent.config.inputs.insert(
-                input.value,
-                incumbent.program.values[planned.value.index() as usize]
-                    .tensor_type
-                    .format
-                    .clone(),
-            );
-        }
-        while attempts < config.optimization_steps {
-            let traffic = if tile_mapping.is_none() {
-                crate::exchange::MappingTraffic::new(&selected.program, &selected.placement)
-                    .map_err(
-                        |error| tracing::info!(%error, "could not estimate ownership proposals"),
-                    )
-                    .ok()
-            } else {
-                None
-            };
-            let proposed = proposals(graph, &incumbent, traffic.as_ref());
-            let proposed_count = proposed.len();
-            let screened = proposed
-                .into_par_iter()
-                .enumerate()
-                .filter(|(_, proposal)| {
-                    !attempted_recipes.iter().any(|(recipe, config)| {
-                        recipe == &proposal.recipe && config == &proposal.config
-                    })
-                })
-                .map(|(proposal, proposed)| {
-                    let raw = (proposed.recipe, proposed.config);
-                    let span = tracing::debug_span!("local_screen", round = attempts, proposal);
-                    let _entered = span.enter();
-                    let candidate =
-                        build::build_candidate(graph, &raw.1, &costs, &fragments, &raw.0);
-                    let candidate = match candidate {
-                        Ok(candidate) => {
-                            let visited = attempted_recipes.iter().any(|(recipe, config)| {
-                                recipe == &candidate.recipe && config == &candidate.config
-                            });
-                            let estimate = proposed
-                                .estimated_cycles
-                                .unwrap_or(candidate.program.estimated_cycles);
-                            let keep = !visited && estimate < incumbent.program.estimated_cycles;
-                            tracing::debug!(
-                                incumbent_estimate = incumbent.program.estimated_cycles,
-                                candidate_estimate = estimate,
-                                visited, keep, delta = ?candidate.recipe.changes(&incumbent.recipe),
-                                "screened local recipe"
-                            );
-                            if keep {
-                                Ok((candidate, estimate))
-                            } else if visited {
-                                Err(Skipped::Visited)
-                            } else {
-                                Err(Skipped::NotCheaper)
-                            }
-                        }
-                        Err(error) => {
-                            tracing::debug!(%error, "discarded invalid local recipe");
-                            Err(Skipped::Invalid)
-                        }
-                    };
-                    (proposal, raw, candidate)
-                })
-                .collect::<Vec<_>>();
-            let mut visited = proposed_count - screened.len();
-            let mut invalid = 0;
-            let mut not_cheaper = 0;
-            let mut deduplicated = 0;
-            let mut pending: Vec<ShortlistedCandidate> = Vec::new();
-            for (proposal, raw, result) in screened {
-                let (candidate, estimate) = match result {
-                    Ok(candidate) => candidate,
-                    Err(reason) => {
-                        match reason {
-                            Skipped::Invalid => invalid += 1,
-                            Skipped::NotCheaper => not_cheaper += 1,
-                            Skipped::Visited => {
-                                visited += 1;
-                                if !attempted_recipes.contains(&raw) {
-                                    attempted_recipes.push(raw);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                };
-                if let Some(same) = pending
-                    .iter_mut()
-                    .find(|old| old.baseline.program == candidate.program)
-                {
-                    same.estimated_cycles = same.estimated_cycles.min(estimate);
-                    same.recipes
-                        .extend([raw, (candidate.recipe, candidate.config)]);
-                    deduplicated += 1;
-                } else {
-                    let recipes = vec![raw, (candidate.recipe.clone(), candidate.config.clone())];
-                    pending.push(ShortlistedCandidate {
-                        proposal,
-                        estimated_cycles: estimate,
-                        baseline: candidate,
-                        recipes,
-                    });
-                }
-            }
-            pending.sort_by_key(|candidate| candidate.estimated_cycles);
-            let truncated = pending
-                .len()
-                .saturating_sub(config.optimization_steps - attempts);
-            pending.truncate(config.optimization_steps - attempts);
-            tracing::info!(
-                round = attempts,
-                proposed = proposed_count,
-                invalid,
-                visited,
-                not_cheaper,
-                deduplicated,
-                truncated,
-                shortlisted = pending.len(),
-                "screened local search round"
-            );
-            if pending.is_empty() {
-                break;
-            }
-            for (index, candidate) in pending.iter().enumerate() {
-                let scope = format!("local-{}-candidate-{index}", attempts);
-                if let Err(error) = memory_profile(
-                    graph,
-                    &candidate.baseline.config,
-                    &candidate.baseline.program,
-                    &scope,
-                ) {
-                    tracing::warn!(%error, scope, "skipped candidate memory profile");
-                }
-            }
-            tracing::info!(
-                candidates = pending.len(),
-                threads = rayon::current_num_threads(),
-                "evaluating ordered local candidates concurrently"
-            );
-            // One Rayon pool serves both candidate builds and their internal work.
-            // find_first cancels unstarted later work once the earliest improvement
-            // is known. Each speculative build owns its schedule-cache snapshot;
-            // only the selected cache becomes the next incumbent's cache.
-            let winner = pending
-                .par_iter()
-                .enumerate()
-                .map(|(index, candidate)| {
-                    let attempt = attempts + index;
-                    let span = tracing::info_span!(
-                        "local_candidate",
-                        attempt,
-                        proposal = candidate.proposal
-                    );
-                    let _entered = span.enter();
-                    let result = evaluate_candidate(
-                        &candidate.baseline.program,
-                        package,
-                        Arc::clone(&expansions),
-                        selected.cache.clone(),
-                        &runtime,
-                    );
-                    match result {
-                        Ok(plan) if plan.cycles < selected.cycles => Some((index, plan)),
-                        Ok(plan) => {
-                            let candidate_cycles = plan.cycles;
-                            tracing::info!(
-                                candidate_cycles,
-                                cycles = selected.cycles,
-                                "retained faster incumbent"
-                            );
-                            None
-                        }
-                        Err(error) => {
-                            tracing::info!(%error, "retained feasible incumbent");
-                            None
-                        }
-                    }
-                })
-                .find_first(Option::is_some)
-                .flatten();
-            let Some((index, plan)) = winner else {
-                remember(&mut attempted_recipes, pending.iter());
-                // No shortlisted program improves the incumbent.
-                break;
-            };
-            let candidate_cycles = plan.cycles;
-            remember(&mut attempted_recipes, pending[..=index].iter());
-            let mut candidate = pending.swap_remove(index).baseline;
-            tracing::info!(
-                attempt = attempts + index,
-                before = selected.cycles,
-                after = candidate_cycles,
-                delta = ?candidate.recipe.changes(&incumbent.recipe),
-                "accepted local layout improvement"
-            );
-            attempts += index + 1;
-            for (id, alternatives) in incumbent.alternatives {
-                candidate.alternatives.entry(id).or_insert(alternatives);
-            }
-            incumbent = candidate;
-            selected = plan;
-        }
-        Ok(selected)
+    let mid = tracing::info_span!("build_baseline").in_scope(|| {
+        build::baseline(
+            graph,
+            config,
+            &crate::estimate::MemoizedCostModel::new(&Ipu21CostModel),
+            &crate::planner::cache::FragmentCache::default(),
+        )
     })?;
-    if let Some(directory) = &config.memory_profile_directory {
-        crate::place::profile::write(
-            directory,
-            &selected.program,
-            &selected.placement,
-            &selected.support_memory,
-            &selected.application,
-        )?;
-    }
-    Ok(selected)
-}
-
-enum Skipped {
-    Invalid,
-    Visited,
-    NotCheaper,
-}
-
-/// All recipes lowering to one program travel together until validation. Do not
-/// mark aliases of a truncated or cancelled candidate as visited.
-struct ShortlistedCandidate {
-    proposal: usize,
-    estimated_cycles: u64,
-    baseline: Candidate,
-    recipes: Vec<(Recipe, PipelineConfig)>,
-}
-
-fn remember<'a>(
-    visited: &mut Vec<(Recipe, PipelineConfig)>,
-    candidates: impl IntoIterator<Item = &'a ShortlistedCandidate>,
-) {
-    for recipe in candidates
-        .into_iter()
-        .flat_map(|candidate| &candidate.recipes)
-    {
-        if !visited.contains(recipe) {
-            visited.push(recipe.clone());
-        }
-    }
-}
-
-/// Compile one complete candidate. Provisional addresses are local to sizing;
-/// only the final placement, exchanges and package escape this procedure.
-fn evaluate_candidate(
-    mid: &crate::MidProgram,
-    package: &PackageConfig,
-    expansions: Arc<crate::storage::GeometryCache>,
-    mut cache: crate::ExchangeScheduleCache,
-    runtime: &[u8],
-) -> PackageBuildResult<EvaluatedCandidate> {
-    let config = &package.pipeline;
+    memory_profile(graph, config, &mid, "baseline")?;
+    let mut cache = crate::ExchangeScheduleCache::default();
+    let expansions = Arc::new(crate::storage::GeometryCache::default());
     let expanded = crate::low::expand::expand_tiles_cached(
-        mid,
+        &mid,
         config.diagnostic_checkpoints,
         Arc::clone(&expansions),
     )?;
@@ -456,7 +181,7 @@ fn evaluate_candidate(
         .in_scope(|| -> PackageBuildResult<_> { Ok(KernelBuildPlan::from_program(&program)?) })?;
     let objects =
         tracing::info_span!("compile_kernels").in_scope(|| -> PackageBuildResult<_> {
-            let mut objects = vec![runtime.to_vec()];
+            let mut objects = vec![runtime];
             for compilation in &kernel_plan.compilations {
                 let artifact = package.toolchain.compile(
                     package.kernel_source_directory.join(compilation.source),
@@ -511,15 +236,21 @@ fn evaluate_candidate(
         config,
         package.invocations,
     )?;
-    Ok(EvaluatedCandidate {
+    if let Some(directory) = &config.memory_profile_directory {
+        crate::place::profile::write(
+            directory,
+            &program,
+            &placement,
+            &support.memory,
+            &application,
+        )?;
+    }
+    Ok(Compilation {
         program,
         placement,
         exchanges,
         application,
-        support_memory: support.memory,
         exchange_code_base: support.exchange_code_base,
-        cycles: final_cost.total,
-        cache,
     })
 }
 

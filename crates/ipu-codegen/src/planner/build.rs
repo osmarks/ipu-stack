@@ -2,9 +2,7 @@
 
 use crate::PipelineConfig;
 use crate::estimate::{CostModel, MemoryPeaks};
-use crate::graph::{
-    ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, ValueId,
-};
+use crate::graph::{ComputeGraph, GraphInputKind, Operation, OperationKind, Repeat, ValueId};
 use crate::mid::{
     CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion, MidRepeat,
     MidValueId,
@@ -17,21 +15,18 @@ use crate::planner::catalogue::{
     shape_aware_active_tile_counts,
 };
 use crate::planner::error::{LoweringError, LoweringResult};
-use crate::planner::operator::{OperandMaterialization, OperatorDispatch, OperatorPlan};
+use crate::planner::operator::{OperandMaterialization, OperatorDispatch};
 use crate::planner::parameter_homes;
-use crate::planner::recipe::{Candidate, Recipe};
 use crate::tensor::{TensorFormat, TensorShape, TensorType};
 use std::collections::BTreeMap;
 
-pub(crate) fn build_candidate(
+pub(crate) fn baseline(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
     fragments: &FragmentCache,
-    recipe: &Recipe,
-) -> LoweringResult<Candidate> {
-    let mut selected = select(graph, config, costs, fragments, recipe)?;
-    let mut program = selected.program;
+) -> LoweringResult<MidProgram> {
+    let mut program = select(graph, config, costs, fragments, false)?;
     if config.cast_before_copies {
         program.reorder_casts();
     }
@@ -59,22 +54,21 @@ pub(crate) fn build_candidate(
     if let Some(mapping) = &config.tile_mapping {
         program.remap_tiles(mapping)?;
     }
-    selected.program = program;
-    selected
-        .program
+    program
         .refresh_estimates()
         .ok_or(LoweringError::InvalidImplementation)?;
-    Ok(selected)
+    Ok(program)
 }
 
+/// Construct operator implementations. Kernel tests expose their native outputs;
+/// the baseline requests canonical boundaries and ranks memory before cycles.
 pub(crate) fn select(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
     fragments: &FragmentCache,
-    recipe: &Recipe,
-) -> LoweringResult<Candidate> {
-    let selected_config = config.clone();
+    expose_outputs: bool,
+) -> LoweringResult<MidProgram> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
     }
@@ -97,11 +91,9 @@ pub(crate) fn select(
         config,
         costs,
         fragments,
-        recipe: recipe.clone(),
+        expose_outputs,
         state: ValueBuilder::default(),
         values: BTreeMap::new(),
-        alternatives: BTreeMap::new(),
-        optimizing: !recipe.plans.is_empty() || !recipe.open_boundaries.is_empty(),
     };
     let mut inputs = Vec::new();
     for input in graph.inputs() {
@@ -168,12 +160,7 @@ pub(crate) fn select(
     };
     crate::mid::ownership::bind_owners(&mut program.operations, &mut program.values)?;
     program.validate()?;
-    Ok(Candidate {
-        program,
-        config: selected_config,
-        recipe: builder.recipe,
-        alternatives: builder.alternatives,
-    })
+    Ok(program)
 }
 
 struct Builder<'a, C> {
@@ -181,11 +168,9 @@ struct Builder<'a, C> {
     config: &'a PipelineConfig,
     costs: &'a C,
     fragments: &'a FragmentCache,
-    recipe: Recipe,
+    expose_outputs: bool,
     state: ValueBuilder,
     values: BTreeMap<ValueId, MidValueId>,
-    alternatives: BTreeMap<OperationId, Vec<OperatorPlan>>,
-    optimizing: bool,
 }
 
 impl<C: CostModel> Builder<'_, C> {
@@ -238,18 +223,14 @@ impl<C: CostModel> Builder<'_, C> {
                 self.config,
                 &demands,
             );
-            let mut plans = if let Some(plan) = self.recipe.plans.get(&operation.id) {
-                vec![plan.clone()]
-            } else {
-                search.generate(
-                    &types,
-                    &parameters,
-                    &automatic,
-                    shape,
-                    self.costs,
-                    self.fragments,
-                )?
-            };
+            let mut plans = search.generate(
+                &types,
+                &parameters,
+                &automatic,
+                shape,
+                self.costs,
+                self.fragments,
+            )?;
             // Prefer the AMP attention family over the scalar reference kernel
             // when this shape has a supported whole-device implementation.
             if plans
@@ -259,7 +240,7 @@ impl<C: CostModel> Builder<'_, C> {
                 plans.retain(|plan| matches!(plan.dispatch, OperatorDispatch::Attention { .. }));
             }
             let rank = |cycles, memory: MemoryPeaks| {
-                let (first, last) = if self.optimizing {
+                let (first, last) = if self.expose_outputs {
                     (cycles, memory.total)
                 } else {
                     (memory.total, cycles)
@@ -275,123 +256,115 @@ impl<C: CostModel> Builder<'_, C> {
                     last,
                 )
             };
-            let selected = if let Some(plan) = self.recipe.plans.get(&operation.id) {
-                plan.clone()
-            } else {
-                plans
-                    .iter()
-                    .filter_map(|plan| {
-                        if !self.config.capacity_baseline {
-                            let (inputs, output) = plan.tensor_types(&types, shape);
-                            let implementation = self.fragments.get(plan, &inputs, &output)?;
-                            let mut state = ValueBuilder::default();
-                            let mut conversions = Vec::new();
-                            for ((source, requirement), &automatic) in
-                                types.iter().zip(&plan.inputs).zip(&automatic)
-                            {
-                                let id = state.value(operation.results[0], source.clone());
-                                if automatic {
-                                    state.automatic_inputs.insert(id);
-                                }
-                                ensure_format(
-                                    id,
-                                    requirement.format.clone(),
-                                    // This baseline prices whole-input transitions even
-                                    // for panel candidates. Their bounded lifetime is
-                                    // represented by the family fragment's memory peak.
-                                    OperandMaterialization::Complete,
-                                    operation.id,
-                                    self.costs,
-                                    &mut state,
-                                    &mut conversions,
-                                );
-                            }
-                            let memory = implementation.peak_memory;
-                            let cycles = self
-                                .costs
-                                .operator_cycle_override(plan, &inputs, &output)
-                                .unwrap_or(implementation.estimated_cycles)
-                                .saturating_add(state.conversion_cycles);
-                            return Some((rank(cycles, memory), plan));
-                        }
-                        // Lower the actual boundary -> operator -> boundary sequence.
-                        // The operator alone omits live source buffers and cast/pack
-                        // temporaries, which can be larger than its own scratch.
+            let selected = plans
+                .iter()
+                .filter_map(|plan| {
+                    if !self.config.capacity_baseline {
+                        let (inputs, output) = plan.tensor_types(&types, shape);
+                        let implementation = self.fragments.get(plan, &inputs, &output)?;
                         let mut state = ValueBuilder::default();
-                        let mut initial = Vec::new();
-                        for (index, (&origin, source)) in
-                            operation.inputs.iter().zip(&types).enumerate()
+                        let mut conversions = Vec::new();
+                        for ((source, requirement), &automatic) in
+                            types.iter().zip(&plan.inputs).zip(&automatic)
                         {
-                            let id = state.value(origin, source.clone());
-                            if automatic[index] {
+                            let id = state.value(operation.results[0], source.clone());
+                            if automatic {
                                 state.automatic_inputs.insert(id);
                             }
-                            if parameters[index] {
-                                state.parameter_values.insert(id);
-                            }
-                            if let Some(&copies) = self.state.copies.get(&ids[index]) {
-                                state.copies.insert(id, copies);
-                            }
-                            initial.push(id);
+                            ensure_format(
+                                id,
+                                requirement.format.clone(),
+                                // This baseline prices whole-input transitions even
+                                // for panel candidates. Their bounded lifetime is
+                                // represented by the family fragment's memory peak.
+                                OperandMaterialization::Complete,
+                                operation.id,
+                                self.costs,
+                                &mut state,
+                                &mut conversions,
+                            );
                         }
-                        let mut sequence = Vec::new();
-                        let results = emit_selected(
-                            operation,
-                            &initial,
-                            shape.clone(),
-                            plan,
-                            self.recipe.open_boundaries.contains(&operation.results[0]),
-                            self.config,
-                            self.costs,
-                            self.fragments,
-                            &mut state,
-                            &mut sequence,
-                        )
-                        .ok()?;
-                        // Inputs with later consumers remain live through conversion.
-                        let mut live = results;
-                        live.extend(
-                            initial
-                                .iter()
-                                .zip(&operation.inputs)
-                                .filter(|(_, origin)| uses.get(origin) != Some(&1))
-                                .map(|(&id, _)| id),
-                        );
-                        let fragment = crate::estimate::region_program(
-                            self.config.tile_count,
-                            &initial,
-                            &sequence,
-                            &live,
-                            &state.values,
-                        );
-                        let mut fragment = fragment;
-                        if self.config.cast_before_copies {
-                            fragment.reorder_casts();
+                        let memory = implementation.peak_memory;
+                        let cycles = self
+                            .costs
+                            .operator_cycle_override(plan, &inputs, &output)
+                            .unwrap_or(implementation.estimated_cycles)
+                            .saturating_add(state.conversion_cycles);
+                        return Some((rank(cycles, memory), plan));
+                    }
+                    // Lower the actual boundary -> operator -> boundary sequence.
+                    // The operator alone omits live source buffers and cast/pack
+                    // temporaries, which can be larger than its own scratch.
+                    let mut state = ValueBuilder::default();
+                    let mut initial = Vec::new();
+                    for (index, (&origin, source)) in
+                        operation.inputs.iter().zip(&types).enumerate()
+                    {
+                        let id = state.value(origin, source.clone());
+                        if automatic[index] {
+                            state.automatic_inputs.insert(id);
                         }
-                        fragment.compose_copies();
-                        let (cycles, memory) = crate::estimate::analyze_with_budget(
-                            &fragment,
-                            &BTreeMap::new(),
-                            self.config,
-                        )?;
-                        let cycles = cycles.total;
+                        if parameters[index] {
+                            state.parameter_values.insert(id);
+                        }
+                        if let Some(&copies) = self.state.copies.get(&ids[index]) {
+                            state.copies.insert(id, copies);
+                        }
+                        initial.push(id);
+                    }
+                    let mut sequence = Vec::new();
+                    let results = emit_selected(
+                        operation,
+                        &initial,
+                        shape.clone(),
+                        plan,
+                        self.expose_outputs,
+                        self.config,
+                        self.costs,
+                        self.fragments,
+                        &mut state,
+                        &mut sequence,
+                    )
+                    .ok()?;
+                    // Inputs with later consumers remain live through conversion.
+                    let mut live = results;
+                    live.extend(
+                        initial
+                            .iter()
+                            .zip(&operation.inputs)
+                            .filter(|(_, origin)| uses.get(origin) != Some(&1))
+                            .map(|(&id, _)| id),
+                    );
+                    let fragment = crate::estimate::region_program(
+                        self.config.tile_count,
+                        &initial,
+                        &sequence,
+                        &live,
+                        &state.values,
+                    );
+                    let mut fragment = fragment;
+                    if self.config.cast_before_copies {
+                        fragment.reorder_casts();
+                    }
+                    fragment.compose_copies();
+                    let (cycles, memory) = crate::estimate::analyze_with_budget(
+                        &fragment,
+                        &BTreeMap::new(),
+                        self.config,
+                    )?;
+                    let cycles = cycles.total;
 
-                        Some((rank(cycles, memory), plan))
-                    })
-                    .min_by_key(|(score, _)| *score)
-                    .map(|(_, plan)| plan.clone())
-                    .ok_or(LoweringError::NoCandidate(operation.id))?
-            };
-            if !self.recipe.plans.contains_key(&operation.id) {
-                self.alternatives.insert(operation.id, plans);
-            }
-            self.recipe.plans.insert(operation.id, selected.clone());
+                    Some((rank(cycles, memory), plan))
+                })
+                .min_by_key(|(score, _)| *score)
+                .map(|(_, plan)| plan.clone())
+                .ok_or(LoweringError::NoCandidate(operation.id))?;
             let results = emit_selected(
                 operation,
                 &ids,
                 shape.clone(),
                 &selected,
-                self.recipe.open_boundaries.contains(&operation.results[0]),
+                self.expose_outputs,
                 self.config,
                 self.costs,
                 self.fragments,
@@ -588,16 +561,14 @@ mod tests {
         let config = PipelineConfig::new(8)
             .with_automatic_input(x, Precision::F16)
             .with_automatic_input(weight, Precision::F16);
-        let baseline = build_candidate(
+        let baseline = baseline(
             &graph,
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &Recipe::default(),
         )
         .unwrap();
         let op = baseline
-            .program
             .operations
             .iter()
             .find(|op| matches!(op.kind, MidOperationKind::Repeat(_)))
@@ -605,11 +576,11 @@ mod tests {
         let MidOperationKind::Repeat(repeat) = &op.kind else {
             unreachable!()
         };
-        let home = &baseline.program.values[op.inputs[1].index() as usize];
-        let argument = &baseline.program.values[repeat.body.arguments[1].index() as usize];
+        let home = &baseline.values[op.inputs[1].index() as usize];
+        let argument = &baseline.values[repeat.body.arguments[1].index() as usize];
         assert_eq!(home.tensor_type, argument.tensor_type);
         assert_eq!(home.owners, argument.owners);
-        let low = crate::low::expand::expand_tiles(&baseline.program, false).unwrap();
+        let low = crate::low::expand::expand_tiles(&baseline, false).unwrap();
         crate::place(&crate::lower_to_tiles(&low, false)).unwrap();
     }
 
@@ -658,16 +629,14 @@ mod tests {
                 .unwrap()[0];
             graph.set_outputs([output]).unwrap();
             let costs = MemoizedCostModel::new(&Ipu21CostModel);
-            let baseline = build_candidate(
+            let baseline = baseline(
                 &graph,
                 &config,
                 &costs,
                 &crate::planner::cache::FragmentCache::default(),
-                &Recipe::default(),
             )
             .unwrap();
             let repeat = baseline
-                .program
                 .operations
                 .iter()
                 .find_map(|op| match &op.kind {
@@ -677,12 +646,12 @@ mod tests {
                 .unwrap();
             assert_eq!(repeat.count, count);
             assert_eq!(repeat.iterated_inputs[0].len(), count as usize);
-            let argument = &baseline.program.values[repeat.body.arguments[1].index() as usize];
+            let argument = &baseline.values[repeat.body.arguments[1].index() as usize];
             assert_eq!(argument.tensor_type.format.layout.tiling.replicas, 1);
-            let carried = &baseline.program.values[repeat.body.arguments[0].index() as usize];
-            let yielded = &baseline.program.values[repeat.body.yields[0].index() as usize];
+            let carried = &baseline.values[repeat.body.arguments[0].index() as usize];
+            let yielded = &baseline.values[repeat.body.yields[0].index() as usize];
             assert_eq!(carried.tensor_type.format, yielded.tensor_type.format);
-            let low = crate::low::expand::expand_tiles(&baseline.program, false).unwrap();
+            let low = crate::low::expand::expand_tiles(&baseline, false).unwrap();
             let low = crate::lower_to_tiles(&low, false);
             for run in &low.kernel_runs {
                 run.call().unwrap();

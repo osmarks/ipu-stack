@@ -130,10 +130,7 @@ struct Arguments {
     /// Per-operator candidate catalogue breadth (default comes from PipelineConfig).
     #[arg(long, conflicts_with = "reuse_package")]
     operator_candidate_limit: Option<usize>,
-    /// Maximum ordered local improvement steps; later candidates may be built speculatively.
-    #[arg(long, default_value_t = 8, conflicts_with = "reuse_package")]
-    optimization_steps: usize,
-    /// Use the experimental capacity-first baseline before local optimization.
+    /// Use the experimental capacity-first baseline.
     #[arg(long)]
     capacity_baseline: bool,
     /// Use compact exchange rows with endpoint-balanced waves of this many words.
@@ -187,9 +184,9 @@ struct Arguments {
     /// Compare native and packed GEMM stores, or force one for diagnostics.
     #[arg(long, value_parser = ["auto", "native", "packed"], default_value = "auto")]
     gemm_output_packing: String,
-    /// Offer batches of up to this many independent reductions (1 disables).
-    #[arg(long, default_value_t = 3)]
-    max_parallel_reductions: usize,
+    /// Group up to this many independent reductions (zero disables grouping).
+    #[arg(long, default_value_t = 0)]
+    parallel_reductions: usize,
     /// Fuse shared-input QKV projections (and MAP KV) in attention and ViT benchmarks.
     #[arg(long)]
     fuse_qkv: bool,
@@ -673,11 +670,10 @@ fn main() -> Result<()> {
     if let Some(width) = arguments.operator_candidate_limit {
         pipeline = pipeline.with_operator_candidate_limit(width);
     }
-    pipeline.optimization_steps = arguments.optimization_steps;
     pipeline.capacity_baseline = arguments.capacity_baseline;
     pipeline.reuse_cast_inputs = arguments.capacity_baseline;
     pipeline.exchange_stream_words = arguments.exchange_stream_words;
-    pipeline.max_parallel_reductions = arguments.max_parallel_reductions;
+    pipeline.parallel_reductions = arguments.parallel_reductions;
     pipeline.gemm_output_packing = match arguments.gemm_output_packing.as_str() {
         "native" => ipu_codegen::GemmOutputPacking::Native,
         "packed" => ipu_codegen::GemmOutputPacking::Packed,

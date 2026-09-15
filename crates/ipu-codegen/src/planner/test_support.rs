@@ -1,27 +1,17 @@
 //! Operator tests expose intermediate boundaries independently of package policy.
 use crate::PipelineConfig;
 use crate::estimate::CostModel;
-use crate::graph::{ComputeGraph, GraphInputKind, Operation, OperationKind, ValueId};
+use crate::graph::{ComputeGraph, GraphInputKind};
 use crate::mid::MidProgram;
 use crate::planner::cache::FragmentCache;
-use crate::planner::{LoweringError, LoweringResult, Recipe, build};
+use crate::planner::{LoweringError, LoweringResult, build};
 use crate::tensor::{Layout, TensorFormat};
-use std::collections::BTreeSet;
 
 pub(crate) fn lower(
     graph: &ComputeGraph,
     config: &PipelineConfig,
     costs: &impl CostModel,
 ) -> LoweringResult<MidProgram> {
-    // Operator/kernel tests exercise a neighborhood with exposed boundaries.
-    fn outputs(ops: &[Operation], ids: &mut BTreeSet<ValueId>) {
-        for op in ops {
-            ids.extend(&op.results);
-            if let OperationKind::Repeat(repeat) = &op.kind {
-                outputs(&repeat.body.operations, ids);
-            }
-        }
-    }
     // These fixtures test operator lowering with explicit distributed host
     // bindings, independently of the package baseline's coarser boundary policy.
     let mut config = config.clone();
@@ -46,11 +36,8 @@ pub(crate) fn lower(
             );
         }
     }
-    let mut recipe = Recipe::default();
-    outputs(graph.operations(), &mut recipe.open_boundaries);
     config.cast_before_copies = true;
-    let mut program =
-        build::select(graph, &config, costs, &FragmentCache::default(), &recipe)?.program;
+    let mut program = build::select(graph, &config, costs, &FragmentCache::default(), true)?;
     program.reorder_casts();
     program.compose_copies();
     program

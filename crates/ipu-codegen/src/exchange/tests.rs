@@ -573,15 +573,13 @@ fn gemm_smoke_reblocking_uses_word_aligned_exchange() {
                 layout: Layout::block_major_matrix(64, tiles),
             },
         );
-    let mid = crate::planner::build::build_candidate(
+    let mid = crate::planner::build::baseline(
         &graph,
         &config,
         &Ipu21CostModel,
         &crate::planner::cache::FragmentCache::default(),
-        &crate::planner::Recipe::default(),
     )
-    .unwrap()
-    .program;
+    .unwrap();
     let expanded = crate::low::expand::expand_tiles(&mid, true).unwrap();
     let low = lower_to_tiles(&expanded, false);
     let placement = place(&low).unwrap();

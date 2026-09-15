@@ -36,17 +36,12 @@ pub enum GemmOutputPacking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
     pub tile_count: u16,
-    /// Initial bijection from planned tile indices to execution tile indices.
-    /// A supplied map disables automatic ownership-remapping proposals.
+    /// Bijection from planned tile indices to execution tile indices.
     pub tile_mapping: Option<Vec<u16>>,
-    /// Maximum ordered local search steps after establishing a baseline.
-    /// Parallel speculation can validate later proposals that an earlier
-    /// improvement invalidates; these do not advance the search.
-    pub optimization_steps: usize,
     /// Prefer distributed boundaries and conversion-inclusive memory costs.
     /// Experimental: smaller tensor peaks can still require larger exchange rows.
     pub capacity_baseline: bool,
-    /// Initial rewrite settings; local search may propose alternatives.
+    /// Rewrite settings applied to the baseline.
     pub cast_before_copies: bool,
     pub reuse_cast_inputs: bool,
     /// Rows per distributed packing task; zero retains the original ownership.
@@ -68,7 +63,7 @@ pub struct PipelineConfig {
     pub gemm_precisions: BTreeMap<OperationId, Precision>,
     /// Add near-capacity tile counts derived from graph tensor extents.
     pub shape_aware_active_tile_counts: bool,
-    /// Per-operator catalogue breadth before local neighborhood evaluation.
+    /// Per-operator catalogue breadth during baseline selection.
     pub operator_candidate_limit: usize,
     /// Hard limit on actual compact encoded exchange tables per tile.
     /// Set to u64::MAX to disable this limit.
@@ -77,21 +72,18 @@ pub struct PipelineConfig {
     /// scheduling. Repeat bodies count once. Independent of encoded bytes.
     /// Set to u64::MAX to disable this complexity limit.
     pub exchange_transfer_limit_per_tile: u64,
-    /// Search-only penalty per estimated exchange-table byte. Does not change
-    /// reported execution cycles. Budget failures automatically retry with
-    /// stronger penalties to preserve simpler prefixes earlier in the graph.
+    /// Selection penalty per estimated exchange-table byte; does not change
+    /// reported execution cycles.
     pub exchange_table_cost_per_byte: u64,
     /// Diagnostic constraints which retain only one GEMM plan family for the
     /// named source operations.
     pub gemm_plan_constraints: Vec<GemmPlanConstraint>,
     /// Compare native output with panel-packed projection output, or force a mode for diagnostics.
     pub gemm_output_packing: GemmOutputPacking,
-    /// Maximum independent sums offered as one spatially distributed batch.
-    pub max_parallel_reductions: usize,
     /// Standard-addressed SRAM retained for exchange tables, profiling data,
     /// host commands, and generated tile programs built after planning.
     pub standard_memory_reservation_bytes: u64,
-    /// Optional JSON/HTML estimator profiles for the baseline and local proposals.
+    /// Optional JSON/HTML estimator profiles for the baseline.
     /// These explain planner decisions, not concrete placement.
     pub memory_profile_directory: Option<std::path::PathBuf>,
     /// Maximum SRAM per tile available to planned values and the standard
@@ -155,7 +147,6 @@ impl PipelineConfig {
             operator_candidates: default_operator_candidates(tile_count),
             gemm_precisions: BTreeMap::new(),
             shape_aware_active_tile_counts: true,
-            optimization_steps: 8,
             capacity_baseline: false,
             cast_before_copies: false,
             reuse_cast_inputs: false,
@@ -169,7 +160,6 @@ impl PipelineConfig {
             exchange_table_cost_per_byte: 0,
             gemm_plan_constraints: Vec::new(),
             gemm_output_packing: GemmOutputPacking::Automatic,
-            max_parallel_reductions: 3,
             standard_memory_reservation_bytes: u64::from(
                 crate::memory::IPU21_DEFAULT_SUPPORT_RESERVATION_BYTES,
             ),

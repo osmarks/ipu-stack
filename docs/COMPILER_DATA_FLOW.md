@@ -1,6 +1,6 @@
 # Compiler data flow
 
-Source review: 2026-09-14, with direct mid construction and low-work ownership incorporated.
+Source review: 2026-09-15, with direct baseline compilation.
 This describes the current implementation.
 [Structural proposal](COMPILER_STRUCTURE_PROPOSAL.md) describes the proposed changes.
 Older experiment reports explain history, not the current pipeline.
@@ -9,9 +9,8 @@ Older experiment reports explain history, not the current pipeline.
 
 The public entry point is `build_package` in
 [lib.rs](../crates/ipu-codegen/src/lib.rs). Its `compile_graph` routine
-compiles the runtime and builds an executable baseline. It
-calls `evaluate_candidate` directly for the incumbent and shortlisted alternatives.
-Even with zero optimization steps, the baseline must produce a complete package.
+compiles the runtime, builds an executable baseline, expands it, places storage,
+schedules exchanges and emits the complete package. There is no outer plan search.
 
 The driver ends at package assembly. [supervisor.rs](../crates/ipu-codegen/src/supervisor/mod.rs)
 owns the address-resolved `TileProgram` and emits its supervisor instructions.
@@ -31,12 +30,12 @@ are less clean than their names suggest:
 | `MidProgram` | Executable whole-device `Copy`, `Compute` (including casts, products and sums), and `Repeat` | Rewrites, tile calls, physical copy recipes, some staging/alias decisions, routing, addresses |
 | `TileGraph` | Shards, relative views, local copies, multicast source/recipient groups, kernel runs, structured control | Physical addresses, exact exchange instructions, linked symbols |
 | `LowProgram` | An `Arc<TileGraph>` plus per-tile work indexes and Repeat bindings | Placement and executable construction |
-| `EvaluatedCandidate` | Driver result: low program, final placement/exchanges, application, cost and accepted cache | No unresolved compilation work; search may replace the complete result |
+| `Compilation` | Driver result: low program, final placement/exchanges and application | No unresolved compilation work |
 | `Application` | Tile images, host bindings/protocol, debug/profile metadata | Loading and execution |
 
 Selection emits executable family fragments directly into the program. There
 is no `Operator` variant, nested implementation, deferred-input state, or
-resolution pass. `Recipe` retains the selected family parameters separately.
+resolution pass. Selected family parameters are consumed during construction.
 The public `MidOperator` compatibility name aliases planner's `OperatorFamily`;
 it is not an executable mid node.
 Binding validation checks definitions, region scope, arity and alias indices at
@@ -92,7 +91,6 @@ again and compilation recipes do not carry a second list of entry points.
 ```mermaid
 flowchart TD
   G[ComputeGraph and PipelineConfig] --> P[planner::build::select: select families and construct boundaries]
-  R[Recipe: selections and open boundaries] --> P
   P --> I[emit_selected: construct and bind executable family fragment]
   I --> H[Choose persistent homes; apply configured ownership and bind movement]
   H --> W[Cast ordering, copy composition, fusions, grouping and storage rewrites]
@@ -104,21 +102,14 @@ flowchart TD
   F --> L[lower_to_tiles: pure projection]
   L --> V[Provisional placement and exact exchange scheduling]
   V --> S[package::size_support: link and reserve code, rows and auxiliaries]
-  S --> B[compile::evaluate_candidate: final placement and exchange replay]
+  S --> B[compile_graph: final placement and exchange replay]
   B --> C[Score address alternatives; schedule at most one and check row capacity]
   C --> A[package::emit_package: bind final addresses, emit and check capacities]
-  A -. accepted incumbent guides next recipe .-> R
 ```
 
-[planner::build_candidate](../crates/ipu-codegen/src/planner/build.rs) controls the mid
-rewrite order. [compile_graph](../crates/ipu-codegen/src/lib.rs)
-keeps a fully evaluated incumbent. [planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs)
-generates recipes without evaluating packages; the driver rebuilds their mid
-programs, screens using compact estimated cycles, and evaluates promising
-candidates concurrently. It accepts the first improvement in shortlist order,
-not the best of an exhaustively evaluated beam. Logical input homes are fixed
-from the initial incumbent. A recipe is a search decision record; it is not
-another executable representation.
+[planner::build::baseline](../crates/ipu-codegen/src/planner/build.rs) selects each
+operator using memory-first ranking and controls the mid rewrite order.
+[compile_graph](../crates/ipu-codegen/src/lib.rs) compiles this one program.
 
 The source sequence for high-to-mid construction is explicit: `planner/build.rs`
 walks operations and regions, `planner/candidates.rs` supplies choices, and
@@ -135,12 +126,8 @@ planner/tensor/configuration names through the mid module.
 Whole-program settings live in `PipelineConfig` in
 [config.rs](../crates/ipu-codegen/src/config.rs): early FP8 casts,
 cast-buffer reuse, packing row size, reduction-group limit, disjoint preparation,
-and a device tile permutation. Operator layout selections remain in `Recipe.plans`.
-`Recipe.open_boundaries` records intermediate values whose layouts may change.
-`Candidate` holds the executable program, its configuration, recipe, and alternative
-operator layouts. Proposals carry the changed configuration; search tracks both
-configuration and recipe when recognizing previously evaluated candidates.
-There are no named work identities, override maps, or available-choice inventories.
+and a device tile permutation. Operator alternatives exist only while selecting
+the next operation; construction returns the executable `MidProgram` directly.
 
 [planner/build.rs](../crates/ipu-codegen/src/planner/build.rs) constructs mid,
 moves casts when enabled, composes copies, applies elementwise fusion and the
@@ -151,16 +138,10 @@ original destination and uses a larger workspace only when its layout is feasibl
 Grouping checks dependencies and physical tile overlap within each Repeat region.
 
 Mid values retain [OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs) embeddings;
-removing recipe overrides does not restrict the tensor representation to flat tile
-ranges. Grouping moves aliases together, preserving their relative rotations.
+the tensor representation is not restricted to flat tile ranges. Grouping moves
+aliases together, preserving their relative rotations.
 [Ownership binding](../crates/ipu-codegen/src/mid/ownership.rs) inserts copies for
 compute operands that need a result's owners and restores carried Repeat homes.
-
-[planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs) proposes global
-option changes alongside operator layouts and boundary changes. Its tile-mapping
-proposal retains the existing block-transpose neighborhood and fabric-load ranking.
-Checkpoint version eight records the global options; older schemas are rejected
-without migration. Local optimization of these options is intentionally absent.
 
 Fragment binding receives an explicit working embedding for unbound temporary
 groups. Input and result groups retain their separate, checked homes. A small
@@ -168,9 +149,8 @@ result subset therefore cannot accidentally restrict a larger workspace. The
 planner currently supplies the ordinary device embedding; this argument is a
 binding contract, not an additional mapping search.
 
-[evaluate_candidate](../crates/ipu-codegen/src/lib.rs)
-expands each retained candidate and checks transfer geometry before scheduling.
-`evaluate_candidate` keeps provisional addresses local while
+[compile_graph](../crates/ipu-codegen/src/lib.rs)
+expands the baseline and keeps provisional addresses local while
 [package/support.rs](../crates/ipu-codegen/src/package/support.rs) measures and
 reserves linked code, host/tile programs, rows, descriptors and profiling storage.
 Sizing never places tensors or schedules exchanges. The driver performs final
@@ -178,15 +158,12 @@ placement and exchange replay using the normal allocator's result.
 Package emission consumes the retained result and checks all measured capacities.
 
 The provisional/final passes remain necessary: support changes available addresses,
-and addresses can change hazards and row sharing. Each speculative candidate owns
-its schedule-cache snapshot; only the winner's final cache is promoted. The former
-`ScheduledPlan`, separate `BuiltApplication`, `validate` wrapper and finalization
-callback are removed. Attempt counts and visited recipes are local to the driver;
-search always starts from the baseline. The graph builder, family choices/catalogues,
+and addresses can change hazards and row sharing. One schedule cache carries
+reusable work from provisional scheduling to final placement. The graph builder, family choices/catalogues,
 fragment cache and direct construction live under
 [planner](../crates/ipu-codegen/src/planner/mod.rs).
 [config.rs](../crates/ipu-codegen/src/config.rs) owns pipeline
-configuration. Mid contains executable semantics, binding and rewrites. Mapping proposals use the global recipe permutation.
+configuration. Mid contains executable semantics, binding and rewrites.
 
 The reported final cycles still combine modelled kernel work with scheduled
 exchange horizons. They are not hardware measurements.
@@ -518,13 +495,13 @@ reduction lowering.
 
 | Cache or retained analysis | Contents and key | Lifetime / owner |
 | --- | --- | --- |
-| `planner::cache::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | Owned by the search invocation, passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
-| `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | Same search; foldhash and `OnceLock` |
-| `storage::GeometryCache` | Normalized byte views, matched source/target rows and destination coverage; excludes ownership, selected kernels and placement | One search, shared by expansion and costing; bounded view/pair/destination tables using foldhash |
+| `planner::cache::FragmentCache` | `(OperatorPlan, actual input types, output type)` to executable mid fragment | One baseline build; passed explicitly to construction/selection; foldhash and per-key `OnceLock` |
+| `MemoizedCostModel.rearrangements` | Shape, precision, strategy, source/destination layouts to coarse price | One baseline build; foldhash and `OnceLock` |
+| `storage::GeometryCache` | Normalized byte views, matched source/target rows and destination coverage; excludes ownership, selected kernels and placement | Expansion and costing; bounded view/pair/destination tables using foldhash |
 | `CopyRegions.targets` | Requested logical region to clipped source regions/replica owners | One source set during a copy or conversion; avoids repeating intersection work for replicas |
 | `TileGraphBuilder.kernel_metadata` | Shared provenance/kernel/format access contracts, found by linear lookup | One expansion; operand views remain per call |
 | Timeline `KernelCosts` | Interned call metadata plus physical widths to cycles | One timeline evaluation |
-| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order, normalized encoded rows and the policy under which they were selected | Incumbent plus speculative candidate snapshots; policy compatibility and physical replay are validated |
+| `ExchangeScheduleCache` | Phase-indexed structure fingerprint, widths, order, normalized encoded rows and the policy under which they were selected | Provisional and final placement of one program; policy compatibility and physical replay are validated |
 | ELF artifact cache | Source/includes, effective flags, target and tool identity to immutable compiled objects | On disk across builds |
 
 Shared geometry entries are immutable; construction runs outside the cache lock.

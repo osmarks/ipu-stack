@@ -30,9 +30,7 @@ mod streams;
 pub use diagnostic::diagnose_exchange_tile;
 mod relocation;
 mod reuse;
-mod traffic;
 pub use reuse::ExchangeScheduleCache;
-pub(crate) use traffic::MappingTraffic;
 
 use crate::{
     BlockValueId, ExchangePhaseId, LogicalExchange, LowProgram, Placement, ShardDefinition,
@@ -1678,4 +1676,4 @@ fn spans_share_effective_memory_element(
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-use tests::{schedule_exchange_problem, transfer, validate_exchange_schedule};
+use tests::{transfer, validate_exchange_schedule};

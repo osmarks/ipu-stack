@@ -41,9 +41,8 @@ relay tiles and forwarding them in the same exchange. It uses the existing
 cycle and row-storage estimates, includes relay scratch in placement, and adds
 no tuning option or packing kernel. See the [relay measurements](docs/EXCHANGE_GATHER_2026_09_12.md).
 
-The planner first builds a baseline with canonical layout boundaries and compact
-parameter storage, then evaluates local improvements. Accepted changes retain a
-complete feasible package. `--optimization-steps 0` selects the baseline alone.
+The compiler builds a baseline with canonical layout boundaries and compact
+parameter storage, then lowers and packages it directly.
 The experimental `--capacity-baseline` uses more distributed activation boundaries
 and includes conversions in memory ranking. It has enabled batch-2 PE capacity
 runs, but is not a general solution to larger-batch SigLIP planning.
@@ -105,7 +104,7 @@ Build and run all six images with the weights resident:
 RAYON_NUM_THREADS=16 RUST_LOG=info target/release/ipu-trivial-test "$IPU_CONFIG" \
   --sdk "$POPLAR_SDK_ENABLED" --runtime-source device/static_runtime.S \
   --workload siglip-vit-benchmark --vit-layers 27 --vit-batch 1 \
-  --fuse-qkv --optimization-steps 8 --exchange-stream-words 1024 \
+  --fuse-qkv --exchange-stream-words 1024 \
   --reference-run --reference-fp32 --reference-inferences 6 \
   --reference-fixture artifacts/pretrained/fixture \
   --reference-calibration artifacts/pretrained/calibration.json \

@@ -13,13 +13,9 @@ mod gemm;
 mod layernorm;
 pub(crate) mod operator;
 mod parameter_homes;
-mod proposals;
-mod recipe;
 pub use catalogue::OperatorCandidate;
 pub use error::{LoweringError, LoweringResult};
 pub use operator::{GemmOrientation, LocalOperandStaging, OperatorFamily};
-pub(crate) use proposals::proposals;
-pub(crate) use recipe::{Candidate, Recipe};
 #[cfg(test)]
 pub(crate) mod test_support;
 

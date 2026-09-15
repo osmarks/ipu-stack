@@ -1000,15 +1000,13 @@ mod tests {
             .with_automatic_input(q, Precision::F16)
             .with_automatic_input(k, Precision::F16)
             .with_automatic_input(v, Precision::F16);
-        let mid = crate::planner::build::build_candidate(
+        let mid = crate::planner::build::baseline(
             &graph,
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &crate::planner::Recipe::default(),
         )
-        .unwrap()
-        .program;
+        .unwrap();
         let low = crate::low::expand::expand_tiles(&mid, false).unwrap();
         assert!(
             low.logical_values
