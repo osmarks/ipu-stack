@@ -26,9 +26,6 @@ pub struct PackageConfig {
     pub runtime_source: PathBuf,
     pub kernel_source_directory: PathBuf,
     pub pipeline: PipelineConfig,
-    /// Initial bijection from planned tile indices to execution tile indices.
-    /// A supplied map disables automatic ownership-remapping proposals.
-    pub tile_mapping: Option<Vec<u16>>,
 }
 
 struct EvaluatedCandidate {
@@ -143,7 +140,7 @@ fn compile_graph(
     package: &PackageConfig,
 ) -> PackageBuildResult<EvaluatedCandidate> {
     let config = &package.pipeline;
-    let tile_mapping = package.tile_mapping.as_deref();
+    let tile_mapping = config.tile_mapping.as_deref();
     validate_tile_count(u32::from(config.tile_count))?;
     let runtime =
         tracing::info_span!("compile_runtime").in_scope(|| -> PackageBuildResult<_> {

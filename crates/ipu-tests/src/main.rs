@@ -1074,13 +1074,13 @@ fn main() -> Result<()> {
         reference_fixture::configure(&graph, &mut pipeline, path)?;
     }
     pipeline.memory_profile_directory = arguments.memory_profile_directory.clone();
+    pipeline.tile_mapping = arguments
+        .tile_mapping
+        .as_ref()
+        .map(|path| -> Result<Vec<u16>> { Ok(serde_json::from_slice(&fs::read(path)?)?) })
+        .transpose()?;
     let package_config = PackageConfig {
         invocations: arguments.reference_inferences,
-        tile_mapping: arguments
-            .tile_mapping
-            .as_ref()
-            .map(|path| -> Result<Vec<u16>> { Ok(serde_json::from_slice(&fs::read(path)?)?) })
-            .transpose()?,
         toolchain: Toolchain::from_sdk(&arguments.sdk),
         kernel_source_directory: runtime_source
             .parent()

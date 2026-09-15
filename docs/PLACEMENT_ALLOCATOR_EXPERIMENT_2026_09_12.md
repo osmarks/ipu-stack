@@ -1,6 +1,9 @@
 # Placement search experiment, 2026-09-12
 
-The initial standalone [prototype](../tools/placement_experiment.py) recovers a real
+Historical experiment: the dump/corpus tools and commands below have since been
+removed. The production allocator and its in-tree regression tests remain.
+
+The initial standalone prototype recovers a real
 fragmented tile and improves on the current two-order allocator on synthetic
 bank-constrained instances. Its order-repair algorithm is not integrated into
 production; the address search described below is. The difficult

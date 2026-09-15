@@ -459,34 +459,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    #[ignore = "external fixture corpus benchmark; set IPU_STACK_PLACEMENT_CORPUS"]
-    fn fixture_corpus() {
-        let directory = std::env::var_os("IPU_STACK_PLACEMENT_CORPUS").expect("fixture directory");
-        let mut results = Vec::new();
-        let mut paths = std::fs::read_dir(directory)
-            .unwrap()
-            .map(|p| p.unwrap().path())
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .collect::<Vec<_>>();
-        paths.sort();
-        for path in paths {
-            let problem: Problem = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let now = std::time::Instant::now();
-            let result = place(
-                &problem.requests,
-                &Arena::new(&problem.ranges, problem.interleaved_offset),
-            );
-            let seconds = now.elapsed().as_secs_f64();
-            if let Some(placement) = &result.placement {
-                check(&problem, placement);
-            }
-            results.push(
-                serde_json::json!({"path":path,"nodes":result.nodes,"seconds":seconds,
-                "placement":result.placement,"excess_live_bytes":result.excess_live_bytes}),
-            );
-        }
-        println!("{}", serde_json::to_string(&results).unwrap());
-    }
 }

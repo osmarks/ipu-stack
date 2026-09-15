@@ -3,7 +3,6 @@
 use ipu_target::ipu21::memory::{
     IPU21_INTERLEAVED_ELEMENT_SIZE, IPU21_INTERLEAVED_MEMORY_BASE, TILE_MEMORY_ELEMENT_SIZE,
 };
-mod dump;
 pub(crate) mod profile;
 mod search;
 
@@ -68,7 +67,8 @@ pub enum PlacementError {
     Overflow,
 }
 
-#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct Lifetime {
     first: u32,
     last: u32,
@@ -868,10 +868,7 @@ fn allocate_tile(
         arena,
         addresses,
     ) {
-        Ok(()) => {
-            dump::capture(tile, &requests, arena, true);
-            return Ok(());
-        }
+        Ok(()) => return Ok(()),
         Err(PlacementError::OutOfMemory { .. }) => {}
         Err(error) => return Err(error),
     }
@@ -912,11 +909,9 @@ fn allocate_tile(
                 arena.record(request, start, end);
                 assign_request(request, start, members, member_offsets, addresses)?;
             }
-            dump::capture(tile, &requests, arena, true);
             return Ok(());
         }
     }
-    dump::capture(tile, &requests, arena, result.is_ok());
     result?;
     tracing::debug!(
         tile,
@@ -987,9 +982,10 @@ fn assign_request(
     Ok(())
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 struct AllocationRequest {
-    #[serde(default)]
+    #[cfg_attr(test, serde(default))]
     auxiliary: Option<usize>,
     class: MemoryClass,
     /// Iterated values need a wider physical stride if placed in region 1.

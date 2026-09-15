@@ -36,6 +36,9 @@ pub enum GemmOutputPacking {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineConfig {
     pub tile_count: u16,
+    /// Initial bijection from planned tile indices to execution tile indices.
+    /// A supplied map disables automatic ownership-remapping proposals.
+    pub tile_mapping: Option<Vec<u16>>,
     /// Maximum ordered local search steps after establishing a baseline.
     /// Parallel speculation can validate later proposals that an earlier
     /// improvement invalidates; these do not advance the search.
@@ -137,6 +140,7 @@ impl PipelineConfig {
     pub fn new(tile_count: u16) -> Self {
         Self {
             tile_count,
+            tile_mapping: None,
             memory_profile_directory: None,
             inputs: BTreeMap::new(),
             automatic_inputs: BTreeMap::new(),
