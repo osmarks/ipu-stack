@@ -29,25 +29,59 @@ pub(super) fn eliminate(program: &mut TileGraph) -> ExpansionResult<()> {
                 .iter()
                 .map(|view| view.shard)
         })
+        .filter(|&id| id.index() as usize == root(id) && uses.allocations[root(id)].read_only)
         .map(root)
         .collect::<BTreeSet<_>>();
+    // Parameter origin alone says nothing about the destination's padding.
+    // Propagate the proof only through complete, identical physical layouts.
+    // Partial/shifted/rearranged writes require a finer proof and remain unknown.
+    let preserves_padding = |source: BlockValueId, destination: BlockValueId| {
+        let a = &program.shards[source.index() as usize];
+        let b = &program.shards[destination.index() as usize];
+        source.index() as usize == root(source)
+            && destination.index() as usize == root(destination)
+            && !uses.allocations[root(destination)].boundary
+            && a.extents == b.extents
+            && a.tensor_type.format.precision == b.tensor_type.format.precision
+            && a.tensor_type.format.layout.order == b.tensor_type.format.layout.order
+    };
     let mut incoming = std::collections::BTreeMap::<usize, BTreeSet<usize>>::new();
     for operation in program.body.walk() {
         match operation {
             BlockOperation::Copy { copy, .. } => {
                 let copy = program.local_copies[copy.0 as usize].movement();
-                incoming
-                    .entry(root(copy.destination))
-                    .or_default()
-                    .insert(root(copy.source));
+                incoming.entry(root(copy.destination)).or_default().insert(
+                    if preserves_padding(copy.source, copy.destination)
+                        && copy.source_offset == 0
+                        && copy.destination_offset == 0
+                        && copy.pattern == CopyPattern::Contiguous
+                        && copy.bytes
+                            == crate::low::storage::shard_storage_bytes(
+                                &program.shards[copy.destination.index() as usize],
+                            )?
+                    {
+                        root(copy.source)
+                    } else {
+                        root(copy.destination)
+                    },
+                );
             }
             BlockOperation::Exchange(id) => {
                 for transfer in &program.exchange_phases[id.index() as usize].transfers {
                     for destination in &transfer.destinations {
-                        incoming
-                            .entry(root(destination.shard))
-                            .or_default()
-                            .insert(root(transfer.source.shard));
+                        incoming.entry(root(destination.shard)).or_default().insert(
+                            if preserves_padding(transfer.source.shard, destination.shard)
+                                && transfer.source.extents
+                                    == program.shards[transfer.source.shard.index() as usize]
+                                        .extents
+                                && destination.extents
+                                    == program.shards[destination.shard.index() as usize].extents
+                            {
+                                root(transfer.source.shard)
+                            } else {
+                                root(destination.shard)
+                            },
+                        );
                     }
                 }
             }
@@ -130,6 +164,19 @@ pub(super) fn eliminate(program: &mut TileGraph) -> ExpansionResult<()> {
                 PaddingRequirement::FiniteIfZero { region, zero }
                     if all_f16
                         && parameter_storage.contains(&root(zero.shard))
+                        && storage_location(&program.shards, zero.shard).1 == 0
+                        && program.shards[zero.shard.index() as usize].extents
+                            == program.shards[root(zero.shard)].extents
+                        && program.shards[zero.shard.index() as usize]
+                            .tensor_type
+                            .format
+                            .layout
+                            .order
+                            == program.shards[root(zero.shard)]
+                                .tensor_type
+                                .format
+                                .layout
+                                .order
                         && zero
                             .extents
                             .iter()
@@ -585,7 +632,7 @@ mod tests {
         let mut staged = graph.shards[1].clone();
         staged.id = BlockValueId(3);
         graph.shards.push(staged);
-        append_copy(graph, 1, 3, 256);
+        append_copy(graph, 1, 3, 2048);
         graph.kernel_runs[1].inputs[1].shard = BlockValueId(3);
         let mut mixed = program.clone();
         append_copy(&mut mixed, 2, 3, 8);
@@ -600,5 +647,68 @@ mod tests {
         assert!(!has_clear(&program));
         assert!(has_clear(&mixed));
         assert!(has_clear(&overwritten));
+    }
+
+    #[test]
+    fn parameter_copy_must_preserve_the_zero_region() {
+        for partial in [false, true] {
+            let mut program = fixture();
+            let mut staged = program.shards[1].clone();
+            staged.id = BlockValueId(3);
+            program.shards.push(staged);
+            if !partial {
+                // Live coefficients are copied into the narrower destination's padding.
+                program.shards[1].extents[0].logical_end = 64;
+                program.shards[1].tensor_type.shape.0[0] = 64;
+                program.value_views[0][0].extents = program.shards[1].extents.clone();
+            }
+            append_copy(&mut program, 1, 3, if partial { 256 } else { 2048 });
+            program.kernel_runs[1].inputs[1].shard = BlockValueId(3);
+            eliminate(&mut program).unwrap();
+            assert!(has_clear(&program), "partial={partial}");
+        }
+    }
+
+    #[test]
+    fn parameter_exchange_must_cover_identical_padding() {
+        for case in 0..3 {
+            let mut program = fixture();
+            let mut staged = program.shards[1].clone();
+            staged.id = BlockValueId(3);
+            program.shards.push(staged);
+            if case == 1 {
+                program.shards[1].extents[0].logical_end = 64;
+                program.shards[1].tensor_type.shape.0[0] = 64;
+                program.value_views[0][0].extents = program.shards[1].extents.clone();
+            }
+            let mut source = ShardView {
+                shard: BlockValueId(1),
+                extents: program.shards[1].extents.clone(),
+            };
+            let mut destination = ShardView {
+                shard: BlockValueId(3),
+                extents: program.shards[3].extents.clone(),
+            };
+            if case == 2 {
+                source.extents[0].physical_end = 48;
+                destination.extents[0].physical_end = 48;
+            }
+            program.exchange_phases.push(ExchangePhase {
+                id: ExchangePhaseId(0),
+                provenance: program.kernel_runs[1].provenance,
+                transfers: vec![LogicalExchange {
+                    source,
+                    destinations: vec![destination],
+                    order: CopyOrder::Physical,
+                }],
+            });
+            program
+                .body
+                .operations
+                .insert(0, BlockOperation::Exchange(ExchangePhaseId(0)));
+            program.kernel_runs[1].inputs[1].shard = BlockValueId(3);
+            eliminate(&mut program).unwrap();
+            assert_eq!(has_clear(&program), case != 0, "case={case}");
+        }
     }
 }

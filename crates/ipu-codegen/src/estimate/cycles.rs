@@ -182,8 +182,8 @@ impl CostModel for Ipu21CostModel {
             format: output.clone(),
         };
         let (Some(source), Some(destination)) = (
-            super::mid::local_tensor(input),
-            super::mid::local_tensor(&destination),
+            crate::OperandWindow::default().local_tensor(input, false),
+            crate::OperandWindow::default().local_tensor(&destination, false),
         ) else {
             return u64::MAX;
         };

@@ -41,14 +41,22 @@ impl FragmentBuilder {
             output.clone(),
         ];
         let mut shapes = Vec::new();
-        for tensor in &tensors {
-            let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
+        let mut windows = [OperandWindow::default(), OperandWindow::default()];
+        for (i, operand) in operands.iter().enumerate() {
+            let OperandIndexing::Local(window) = operand else {
+                return None;
+            };
+            *windows.get_mut(i)? = window.clone();
+        }
+        for (i, tensor) in tensors.iter().enumerate() {
+            tensor.format.layout.resolve(&tensor.shape).ok()?.axes()?;
             shapes.push(
-                resolved
-                    .axes()?
-                    .iter()
-                    .map(|a| a.maximum_extent())
-                    .collect::<Vec<_>>(),
+                windows
+                    .get(i)
+                    .unwrap_or(&OperandWindow::default())
+                    .local_tensor(tensor, false)?
+                    .shape
+                    .0,
             );
         }
         let axes = product.axes;
@@ -60,16 +68,6 @@ impl FragmentBuilder {
         } else {
             ri + 1
         };
-        let mut windows = [OperandWindow::default(), OperandWindow::default()];
-        for (i, operand) in operands.iter().enumerate() {
-            let OperandIndexing::Local(window) = operand else {
-                return None;
-            };
-            windows[i] = window.clone();
-            for &(axis, start, end) in &window.0 {
-                shapes[i][axis as usize] = shapes[i][axis as usize].min(end.checked_sub(start)?);
-            }
-        }
         let inner = shapes[0][li];
         if product.inner_block == 0 || product.output_columns == 0 || inner != shapes[1][ri] {
             return None;

@@ -367,46 +367,6 @@ fn analyze_storage<const PER_TILE: bool>(
     Some((cycles, peak))
 }
 
-pub(super) fn local_tensor(tensor: &TensorType) -> Option<TensorType> {
-    let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
-    let shape = if let Some(axes) = resolved.axes() {
-        TensorShape(axes.iter().map(|axis| axis.maximum_extent()).collect())
-    } else {
-        TensorShape(vec![u32::try_from(resolved.maximum_tile_elements()).ok()?])
-    };
-    Some(TensorType {
-        shape,
-        format: tensor.format.clone(),
-    })
-}
-
-fn operand_tensors(operation: &MidOperation, values: &[MidValue]) -> Option<Vec<TensorType>> {
-    operation
-        .inputs
-        .iter()
-        .take(operation.operands.len())
-        .enumerate()
-        .map(|(index, &id)| {
-            let mut local = local_tensor(&values[id.index() as usize].tensor_type)?;
-            for &(axis, start, end) in operation
-                .operand_window(index)
-                .into_iter()
-                .flat_map(|window| &window.0)
-            {
-                let width = &mut local.shape.0[usize::from(axis)];
-                if matches!(
-                    operation.operands[index],
-                    crate::OperandIndexing::Fragment(_)
-                ) {
-                    *width = width.saturating_sub(start);
-                }
-                *width = (*width).min(end.checked_sub(start)?);
-            }
-            Some(local)
-        })
-        .collect()
-}
-
 pub(crate) fn operation_cost(
     operation: &MidOperation,
     values: &[MidValue],
@@ -421,18 +381,11 @@ pub(crate) fn operation_cost(
         .iter()
         .enumerate()
         .map(|(index, &id)| {
-            let mut local = local_tensor(tensor(id))?;
-            for &(axis, start, end) in operation
+            operation
                 .output_windows
                 .get(index)
-                .into_iter()
-                .flat_map(|w| &w.0)
-            {
-                local.shape.0[axis as usize] = local.shape.0[axis as usize]
-                    .saturating_sub(start)
-                    .min(end.checked_sub(start)?);
-            }
-            Some(local)
+                .unwrap_or(&crate::OperandWindow::default())
+                .local_tensor(tensor(id), true)
         })
         .collect::<Option<Vec<_>>>()?;
     let out = &outputs[0];
@@ -511,7 +464,20 @@ pub(crate) fn operation_cost(
         }
         MidOperationKind::Repeat(_) => unreachable!(),
         kernel => {
-            let inputs = operand_tensors(operation, values)?;
+            let inputs = operation
+                .inputs
+                .iter()
+                .zip(&operation.operands)
+                .map(|(&id, indexing)| match indexing {
+                    crate::OperandIndexing::Local(window) => window.local_tensor(tensor(id), false),
+                    crate::OperandIndexing::Fragment(window) => {
+                        window.local_tensor(tensor(id), true)
+                    }
+                    crate::OperandIndexing::Elementwise { .. } => {
+                        crate::OperandWindow::default().local_tensor(tensor(id), false)
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
             let inputs = inputs
                 .iter()
                 .map(crate::kernel::Geometry::Tensor)
