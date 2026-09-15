@@ -72,22 +72,15 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             for row in &mut plan.receivers {
                 patch_receiver_address(row, destination_address)?;
             }
-            let prepared = plan.prepare(0)?;
             let helpers = if paired {
                 vec![topology.paired_logical(0)?]
             } else {
                 vec![]
             };
             let mut builder = PhaseProgramBuilder::new(tiles);
-            let offset = builder.earliest_transfer_offset(
-                0,
-                &helpers,
-                &destinations,
-                &prepared,
-                items,
-                0,
-            )?;
-            builder.append_transfer_at(0, &helpers, &destinations, &prepared, offset, items)?;
+            let offset =
+                builder.earliest_transfer_offset(0, &helpers, &destinations, &plan, items, 0)?;
+            builder.append_transfer_at(0, &helpers, &destinations, &plan, offset, items)?;
             let phase = builder.finish()?;
             let end = row_address
                 + phase
@@ -131,7 +124,6 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
                     patch_receiver_address(row, address)?;
                 }
             }
-            let prepared = plan.prepare(0)?;
             let helpers = if paired {
                 vec![topology.paired_logical(0)?]
             } else {
@@ -139,15 +131,9 @@ pub(crate) fn build(toolchain: &Toolchain, runtime_source: &Path) -> Result<Stre
             };
             let items = if paired { words / 2 } else { words };
             let mut builder = PhaseProgramBuilder::new(tiles);
-            let offset = builder.earliest_transfer_offset(
-                0,
-                &helpers,
-                &destinations,
-                &prepared,
-                items,
-                0,
-            )?;
-            builder.append_transfer_at(0, &helpers, &destinations, &prepared, offset, items)?;
+            let offset =
+                builder.earliest_transfer_offset(0, &helpers, &destinations, &plan, items, 0)?;
+            builder.append_transfer_at(0, &helpers, &destinations, &plan, offset, items)?;
             sections.push(builder.finish()?);
             for &tile in &destinations {
                 data.push(TileProgramData {

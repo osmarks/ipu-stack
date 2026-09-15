@@ -251,12 +251,11 @@ pub(crate) fn build_wide(
         }
         let mut builder = PhaseProgramBuilder::new(execution_tiles);
         let paired_source = topology.paired_logical(source)?;
-        let prepared = plan.prepare(0)?;
         let schedule_offset = builder.earliest_transfer_offset(
             source,
             &[paired_source],
             &destinations,
-            &prepared,
+            &plan,
             items,
             0,
         )?;
@@ -264,7 +263,7 @@ pub(crate) fn build_wide(
             source,
             &[paired_source],
             &destinations,
-            &prepared,
+            &plan,
             schedule_offset,
             items,
         )?;
@@ -658,18 +657,17 @@ pub(crate) fn build(
             for (row, &address) in plan.receivers.iter_mut().zip(&destination_addresses) {
                 patch_receiver_address(row, address)?;
             }
-            let prepared = plan.prepare(0)?;
             let requested_schedule_offset = schedule_offset.unwrap_or(0);
             let schedule_offset = builder.earliest_transfer_offset(
                 source,
                 &[],
                 &destinations,
-                &prepared,
+                &plan,
                 words,
                 requested_schedule_offset,
             )?;
             let timing = builder
-                .append_transfer_at(source, &[], &destinations, &prepared, schedule_offset, words)
+                .append_transfer_at(source, &[], &destinations, &plan, schedule_offset, words)
                 .with_context(|| {
                     format!(
                         "case {case} cannot encode transfer {source} -> {destinations:?} at schedule offset {schedule_offset}"
@@ -1623,15 +1621,9 @@ fn overlap_specs(
     let outgoing =
         ipu_codegen::exchange::point_to_point(topology, pivot, outgoing_destination, words)?;
     let empty = PhaseProgramBuilder::new(u16::try_from(topology.tile_count())?);
-    let incoming_base =
-        empty.transfer_timing_at(incoming_source, &[pivot], &incoming.prepare(0)?, 0, words)?;
-    let outgoing_base = empty.transfer_timing_at(
-        pivot,
-        &[outgoing_destination],
-        &outgoing.prepare(0)?,
-        0,
-        words,
-    )?;
+    let incoming_base = empty.transfer_timing_at(incoming_source, &[pivot], &incoming, 0, words)?;
+    let outgoing_base =
+        empty.transfer_timing_at(pivot, &[outgoing_destination], &outgoing, 0, words)?;
     let incoming_start = incoming_base.receivers[0].payload_start;
     let outgoing_start = outgoing_base.payload_start;
     let anchor = incoming_start.max(outgoing_start);
@@ -1674,7 +1666,7 @@ fn paired_control_words(
     maximum: u32,
 ) -> Result<Option<u32>> {
     let plan = ipu_codegen::exchange::point_to_point(&topology, source, receiver, 1)?;
-    let receiver = plan.receivers[0];
+    let receiver = plan.receivers[0].clone();
     let timing = scheduled_receiver_timing(&receiver, 0)?;
     Ok(timing
         .pointer_event

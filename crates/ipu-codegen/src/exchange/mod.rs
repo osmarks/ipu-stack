@@ -1,10 +1,17 @@
 //! Physical exchange programs generated from logical shard transfers.
 //!
+//! The compiler enters through `lower_exchanges_cached`: resolve shard addresses,
+//! schedule each phase, encode its tile rows, and attach Repeat relocations.
+//! Hardware probes can instead construct `TransferPlan`s with `point_to_point`,
+//! `multicast`, or `paired_multicast` and assemble them with `PhaseProgramBuilder`.
+//! The re-exported host packet/program constructors serve the runtime's host
+//! exchange protocol; they do not participate in tile-to-tile scheduling.
+//!
 //! Selection constructs one SchedulingProblem with transfers and dependency edges.
 //! `greedy` schedules ready work against live endpoint availability; `matching`,
 //! `repair`, and `streams` propose dependency-respecting orders. All use the same
 //! MaterializedSchedule append path for memory hazards and the program builder
-//! for instruction compatibility. Policy comparison and acceptance stay here;
+//! for instruction compatibility. Policy comparison and acceptance stay here.
 //! Tests invoke the same algorithms rather than maintaining implementations.
 
 use ipu_target::ipu21::fabric::Topology;
@@ -1562,7 +1569,7 @@ fn append_transfer(
             patch_receiver_address(row, *address)?;
         }
     }
-    let plan = plan.prepare(message)?;
+    plan.sender.message = message;
     let mut schedule_offset = requested_offset;
     loop {
         let previous = schedule_offset;

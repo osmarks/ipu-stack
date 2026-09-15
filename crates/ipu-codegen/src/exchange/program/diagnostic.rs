@@ -511,13 +511,15 @@ pub(super) fn validate_tile_program(
         let mut end = None;
         let contiguous = actual_sends
             .iter()
-            .filter(|(start, end, _)| *start < expected.end_cycles && expected.start_cycles < *end)
+            .filter(|(start, end, _)| {
+                *start < expected.timing.payload_end && expected.timing.payload_start < *end
+            })
             .all(|&(start, next, _)| {
-                let adjacent = start == end.unwrap_or(expected.start_cycles);
+                let adjacent = start == end.unwrap_or(expected.timing.payload_start);
                 end = Some(next);
                 adjacent
             });
-        if !contiguous || end != Some(expected.end_cycles) {
+        if !contiguous || end != Some(expected.timing.payload_end) {
             return Err(ExchangeError::Schedule("encoded sender interval mismatch"));
         }
     }
@@ -525,7 +527,7 @@ pub(super) fn validate_tile_program(
         let belongs_to_sender = schedule
             .senders
             .iter()
-            .any(|sender| sender.start_cycles <= start && end <= sender.end_cycles);
+            .any(|sender| sender.timing.payload_start <= start && end <= sender.timing.payload_end);
         if !belongs_to_sender {
             return Err(ExchangeError::Schedule(
                 "unexpected encoded outgoing interval",

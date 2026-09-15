@@ -39,10 +39,7 @@ pub(super) fn split_self_receive_conflicts(
                 crate::exchange::paired_multicast(&topology, transfer.source, &tiles, count)?
             }
         };
-        if !plan
-            .prepare(0)?
-            .receiver_conflicts_with_send_start(receiver)
-        {
+        if !plan.receiver_conflicts_with_send_start(receiver) {
             result.push(transfer);
             continue;
         }

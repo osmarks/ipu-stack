@@ -601,7 +601,7 @@ mod tests {
             crate::exchange::patch_sender_address(&mut plan.sender, address).unwrap();
             let mut builder = crate::exchange::PhaseProgramBuilder::new(2);
             builder
-                .append_transfer_at(0, &[], &[1], &plan.prepare(0).unwrap(), 0, 4)
+                .append_transfer_at(0, &[], &[1], &plan, 0, 4)
                 .unwrap();
             builder.finish().unwrap().programs.remove(0).unwrap()
         };
