@@ -200,8 +200,9 @@ impl CostModel for Ipu21CostModel {
                 format: output,
                 extents: &destination,
             }],
+            None,
         )
-        .map_or(u64::MAX, |call| call.cycles())
+        .map_or(u64::MAX, |call| call.cycles)
     }
 
     fn rearrangement_cost(

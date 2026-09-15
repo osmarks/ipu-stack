@@ -518,7 +518,7 @@ fn copied_scalar_keeps_its_semantic_broadcast_shape() {
         .iter()
         .find(|run| run.kernel == MidOperationKind::Add)
         .unwrap();
-    run.call().unwrap();
+    run.call(None).unwrap();
     let scalar = &run.inputs[1];
     assert_eq!(
         crate::low::storage::storage_root(&graph.shards, scalar.shard),
@@ -589,7 +589,6 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
         let graph = expand_tiles(&mid, false).unwrap();
         let low = crate::low::lower_to_tiles(&graph, false);
         let placement = crate::place(&low).unwrap();
-        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut covered = std::collections::BTreeSet::new();
         for run in low.kernel_calls() {
             if run.kernel != MidOperationKind::AddLayerNormMoments {
@@ -599,7 +598,6 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                 run,
                 &low.shards,
                 &placement.shard_addresses,
-                &kernels,
                 &Default::default(),
             )
             .unwrap();
@@ -681,7 +679,7 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
             .map(|view| view.shard)
             .collect::<Vec<_>>();
         for run in &low.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
         }
         let placement = crate::place(&low).unwrap();
         for &shard in &copied {

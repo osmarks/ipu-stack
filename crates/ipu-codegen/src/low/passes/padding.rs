@@ -150,47 +150,51 @@ pub(super) fn eliminate(program: &mut TileGraph) -> ExpansionResult<()> {
         {
             continue;
         }
-        let call = run.call().map_err(crate::kernel::KernelError::from)?;
+        let call = run.call(None)?;
         for (operand, input) in run.inputs.iter().enumerate() {
             let readers = &clears[root(input.shard)];
             if readers.is_empty() {
                 continue;
             }
-            let (regions, finite) = match call
-                .input_padding(run, operand)
-                .map_err(crate::kernel::KernelError::from)?
-            {
-                PaddingRequirement::Unread(regions) => (regions, false),
+            let (regions, finite) = match if operand == 0 {
+                &call.padding
+            } else {
+                &PaddingRequirement::Required
+            } {
+                PaddingRequirement::Unread(regions) => (regions.as_slice(), false),
                 PaddingRequirement::FiniteIfZero { region, zero }
                     if all_f16
-                        && parameter_storage.contains(&root(zero.shard))
-                        && storage_location(&program.shards, zero.shard).1 == 0
-                        && program.shards[zero.shard.index() as usize].extents
-                            == program.shards[root(zero.shard)].extents
-                        && program.shards[zero.shard.index() as usize]
+                        && parameter_storage.contains(&root(run.inputs[1].shard))
+                        && storage_location(&program.shards, run.inputs[1].shard).1 == 0
+                        && program.shards[run.inputs[1].shard.index() as usize].extents
+                            == program.shards[root(run.inputs[1].shard)].extents
+                        && program.shards[run.inputs[1].shard.index() as usize]
                             .tensor_type
                             .format
                             .layout
                             .order
-                            == program.shards[root(zero.shard)]
+                            == program.shards[root(run.inputs[1].shard)]
                                 .tensor_type
                                 .format
                                 .layout
                                 .order
                         && zero
-                            .extents
                             .iter()
-                            .zip(&program.shards[zero.shard.index() as usize].extents)
+                            .zip(&program.shards[run.inputs[1].shard.index() as usize].extents)
                             .any(|(region, storage)| region.start >= storage.logical_end) =>
                 {
-                    (vec![region], true)
+                    (std::slice::from_ref(region), true)
                 }
-                _ => (Vec::new(), false),
+                _ => (&[][..], false),
             };
             let ranges = regions
                 .iter()
                 .map(|region| {
-                    let bound = region.bind(&program.shards)?;
+                    let view = crate::ShardView {
+                        shard: input.shard,
+                        extents: region.clone(),
+                    };
+                    let bound = view.bind(&program.shards)?;
                     Ok((bound.traversal(CopyOrder::Physical)?, bound.backing.1))
                 })
                 .collect::<Result<Vec<_>, crate::storage::StorageError>>()?;

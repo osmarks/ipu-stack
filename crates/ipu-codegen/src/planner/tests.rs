@@ -79,7 +79,7 @@ fn whole_program_reduction_grouping_replays_and_lowers() {
     let grouped = build::baseline(&graph, &config, &Ipu21CostModel, &fragments).unwrap();
     grouped.validate().unwrap();
     let tiles = crate::expand_tiles(&grouped).unwrap();
-    crate::KernelBuildPlan::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
+    crate::KernelObjects::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
     let replay =
         build::baseline(&graph, &config, &Ipu21CostModel, &FragmentCache::default()).unwrap();
     assert_eq!(grouped, replay);
@@ -131,11 +131,11 @@ fn short_layernorm_selects_feature_shards_and_fp32_moments() {
     for run in &low.kernel_runs {
         if matches!(run.kernel, MidOperationKind::LayerNormMoments) {
             assert_eq!(run.requirements.outputs[0].precision, Precision::F32);
-            run.call().unwrap();
+            run.call(None).unwrap();
             moments += 1;
         }
         if matches!(run.kernel, MidOperationKind::LayerNormApply { .. }) {
-            run.call().unwrap();
+            run.call(None).unwrap();
             applies += 1;
         }
     }
@@ -1010,7 +1010,7 @@ fn randomized_single_use_views_compose_into_panel_copies() {
         assert!(cycles.total > 0);
         assert!(cycles.total >= cycles.exchange);
         let tiled = crate::low::lower_to_tiles(&program, config.diagnostic_checkpoints);
-        crate::KernelBuildPlan::from_program(&tiled)
+        crate::KernelObjects::from_program(&tiled)
             .unwrap_or_else(|error| panic!("random case {case}: {error}"));
         for run in &tiled.kernel_runs {
             assert_eq!(run.inputs.len(), run.requirements.inputs.len());
@@ -1611,7 +1611,7 @@ fn fp8_attention_products_expand_with_odd_key_and_channel_tails() {
         .unwrap();
         let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
-        let kernels = crate::KernelBuildPlan::from_program(&tiled).unwrap();
+        let kernels = crate::KernelObjects::from_program(&tiled).unwrap();
         assert!(
             kernels
                 .compilations
@@ -1685,7 +1685,7 @@ fn attention_profile_flops_exclude_scratch_padding_and_key_tails() {
         );
         let tiles = crate::low::expand::expand_tiles(&mid, true).unwrap();
         let tiled = crate::low::lower_to_tiles(&tiles, false);
-        crate::KernelBuildPlan::from_program(&tiled).unwrap();
+        crate::KernelObjects::from_program(&tiled).unwrap();
         for phase in &tiles.exchange_phases {
             for transfer in &phase.transfers {
                 let source = &tiles.shards[transfer.source.shard.index() as usize];
@@ -1824,14 +1824,14 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         );
         assert_eq!(packed.format.layout.tiling.tile_count, 1);
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-        crate::KernelBuildPlan::from_program(&low).unwrap();
+        crate::KernelObjects::from_program(&low).unwrap();
         let calls: Vec<_> = low
             .kernel_runs
             .iter()
             .filter(|run| matches!(run.kernel, MidOperationKind::Cast { .. }))
             .collect();
         assert_eq!(calls.len(), 1);
-        let arguments = calls[0].call().unwrap().arguments;
+        let arguments = calls[0].call(None).unwrap().arguments;
         assert_eq!(arguments[3], if rows == 1 { 0 } else { rows });
         assert_eq!(arguments[5], 128);
     }
@@ -2181,7 +2181,7 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             assert_ne!(early.operations, late.operations);
             let tiles = crate::expand_tiles(&early).unwrap();
             let low = crate::lower_to_tiles(&tiles, false);
-            crate::KernelBuildPlan::from_program(&low).unwrap();
+            crate::KernelObjects::from_program(&low).unwrap();
             let replay = build::baseline(
                 &graph,
                 &config,

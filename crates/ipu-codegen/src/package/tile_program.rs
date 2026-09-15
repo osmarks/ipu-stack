@@ -42,7 +42,7 @@ pub fn build_tile_program_package(
     let (mut data, aperture) = split_aperture_data(data)?;
     let runtime_artifact = toolchain.compile(runtime_source, "static_runtime", &[])?;
     let objects = vec![fs::read(runtime_artifact.object)?];
-    let kernels = KernelBuildPlan::default();
+    let kernels = KernelObjects::default();
     let mut retained_runtime = vec![
         COMPLETE_SYMBOL,
         HOST_RUN_SYMBOL,

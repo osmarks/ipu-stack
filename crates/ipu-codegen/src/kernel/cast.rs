@@ -59,6 +59,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
+    build: Option<&mut KernelObjects>,
 ) -> Result<KernelCall, KernelError> {
     check_arity(inputs, outputs, 1, 1)?;
     let MidOperationKind::Cast { from, to } = *kernel else {
@@ -67,7 +68,22 @@ pub(super) fn call(
     let symbol = symbol(from, to).ok_or_else(|| KernelError::Unavailable(kernel.clone()))?;
     let count = outputs[0].count()?;
     if !matches!(from, Precision::F8F143 { .. }) && !matches!(to, Precision::F8F143 { .. }) {
-        return Ok(KernelCall::exact(symbol, vec![count]));
+        if let Some(build) = build {
+            build.add_vertex(
+                "cast_f32_f16.cpp",
+                symbol,
+                "CastF32ToF16",
+                vec!["-O2".into()],
+                &[3, 2, 4],
+                "worker_call.S",
+                Vec::new(),
+            );
+        }
+        return Ok(KernelCall::new(
+            symbol,
+            vec![count],
+            stream_cycles(count.into(), from.bytes().into(), to.bytes().into()),
+        ));
     }
     let order = outputs[0].format.layout.order;
     let row_pack = inputs[0].format.layout.order == ElementOrder::RowMajor
@@ -85,18 +101,18 @@ pub(super) fn call(
             _ => 0,
         })
     };
-    let source_metadata = if from == Precision::F16 && row_pack {
+    let (source_metadata, readable_rows) = if from == Precision::F16 && row_pack {
         let physical = inputs[0].matrix_extent(false, false)?;
         let logical = inputs[0].matrix_extent(true, false)?;
         // The FP16 source-scale word carries two row bounds. Zero retains
         // initialization when the compact descriptor cannot represent them.
         if logical < physical && physical <= u16::MAX.into() {
-            (physical << 16) | logical
+            ((physical << 16) | logical, logical)
         } else {
-            0
+            (0, physical)
         }
     } else {
-        scale(from)?
+        (scale(from)?, 0)
     };
     let source_extent = if row_pack {
         let logical = inputs[0].matrix_extent(true, true)?;
@@ -113,7 +129,34 @@ pub(super) fn call(
     } else {
         0
     };
-    Ok(KernelCall::exact(
+    if let Some(build) = build {
+        let (from, to) = (from.bytes(), to.bytes());
+        let vertex = format!("Cast{from}To{to}");
+        build.add_vertex(
+            "cast_f8.cpp",
+            symbol,
+            &vertex,
+            vec![
+                "-O2".into(),
+                format!("-DINPUT_BYTES={from}"),
+                format!("-DOUTPUT_BYTES={to}"),
+                format!("-DCAST_VERTEX={vertex}"),
+            ],
+            &[3, 2, 4, 5, 6, 7, 8, 9],
+            if (from, to) == (2, 1) {
+                "cast_f8_call.S"
+            } else {
+                "worker_call.S"
+            },
+            Vec::new(),
+        );
+    }
+    let cycles = if f16_to_f8 {
+        f16_fp8_cycles(count.into(), panel_rows.into())
+    } else {
+        stream_cycles(count.into(), from.bytes().into(), to.bytes().into())
+    };
+    let mut call = KernelCall::new(
         symbol,
         vec![
             count,
@@ -123,7 +166,14 @@ pub(super) fn call(
             source_extent,
             source_columns,
         ],
-    ))
+        cycles,
+    );
+    if f16_to_f8 && panel_rows != 0 && source_columns != 0 {
+        // These are the actual selected read bounds. Descriptor overflow uses
+        // physical rows in both the device ABI and the padding proof.
+        call.padding = input_padding(inputs[0], readable_rows, source_extent)?;
+    }
+    Ok(call)
 }
 
 /// Select and validate the FP16-to-FP8 traversal once for both calls and costs.
@@ -245,37 +295,20 @@ impl CastChunks {
     }
 }
 
-pub(super) fn input_padding(
-    call: &KernelCall,
-    run: &KernelRun,
+fn input_padding(
+    input: TensorStorage<'_>,
+    rows: u32,
+    columns: u32,
 ) -> Result<PaddingRequirement, KernelError> {
-    let input = &run.inputs[0];
-    let [_, row_bounds, _, panel_rows, columns, stride] = call.arguments.as_slice() else {
-        return Err(KernelError::RequirementMismatch);
-    };
-    if *stride == 0 || *panel_rows == 0 {
-        return Ok(PaddingRequirement::Required);
-    }
     let rank = input.extents.len();
-    if rank < 2 {
-        return Err(KernelError::RequirementMismatch);
-    }
-    // These are the actual bounds decoded by cast_f8.cpp. A zero
-    // descriptor reads physical rows, including on the overflow fallback.
-    let rows = if *row_bounds == 0 {
-        run.geometry(MemoryOperand::Input(0))
-            .matrix_extent(false, false)?
-    } else {
-        row_bounds & 0xffff
-    };
     let mut regions = Vec::new();
-    for (axis, count) in [(rank - 2, rows), (rank - 1, *columns)] {
-        let mut region = input.clone();
+    for (axis, count) in [(rank - 2, rows), (rank - 1, columns)] {
+        let mut region = input.extents.to_vec();
         // Outer padding is not covered by the matrix descriptor.
-        for extent in &mut region.extents[..rank - 2] {
+        for extent in &mut region[..rank - 2] {
             extent.physical_end = extent.logical_end;
         }
-        let extent = &mut region.extents[axis];
+        let extent = &mut region[axis];
         extent.start = extent
             .start
             .checked_add(count)
@@ -286,54 +319,4 @@ pub(super) fn input_padding(
         }
     }
     Ok(PaddingRequirement::Unread(regions))
-}
-
-impl KernelBuildPlan {
-    pub(super) fn add_casts(&mut self, exact_symbols: &BTreeSet<&'static str>) {
-        if exact_symbols.contains("cast_f32_f16") {
-            self.add_vertex(
-                "cast_f32_f16.cpp",
-                "cast_f32_f16",
-                "CastF32ToF16",
-                vec!["-O2".into()],
-                &[3, 2, 4],
-                "worker_call.S",
-                Vec::new(),
-            );
-        }
-        // Scales are call arguments, so all FP8 scales share these recipes.
-        let f8 = Precision::F8F143 { scale_exponent: 0 };
-        for (from, to) in [
-            (f8, f8),
-            (f8, Precision::F16),
-            (f8, Precision::F32),
-            (Precision::F16, f8),
-            (Precision::F32, f8),
-        ] {
-            let symbol = cast::symbol(from, to).expect("FP8 cast implementation");
-            if !exact_symbols.contains(symbol) {
-                continue;
-            }
-            let (from, to) = (from.bytes(), to.bytes());
-            let vertex = format!("Cast{from}To{to}");
-            self.add_vertex(
-                "cast_f8.cpp",
-                symbol,
-                &vertex,
-                vec![
-                    "-O2".into(),
-                    format!("-DINPUT_BYTES={from}"),
-                    format!("-DOUTPUT_BYTES={to}"),
-                    format!("-DCAST_VERTEX={vertex}"),
-                ],
-                &[3, 2, 4, 5, 6, 7, 8, 9],
-                if (from, to) == (2, 1) {
-                    "cast_f8_call.S"
-                } else {
-                    "worker_call.S"
-                },
-                Vec::new(),
-            );
-        }
-    }
 }

@@ -1207,8 +1207,8 @@ mod tests {
     use crate::estimate::Ipu21CostModel;
     use crate::planner::test_support::lower;
     use crate::{
-        ComputeGraph, KernelBuildPlan, Layout, PipelineConfig, Precision, TensorFormat,
-        lower_to_tiles, materialize_kernel_run,
+        ComputeGraph, Layout, PipelineConfig, Precision, TensorFormat, lower_to_tiles,
+        materialize_kernel_run,
     };
 
     #[test]
@@ -1878,7 +1878,6 @@ mod tests {
                 random.u32(0..8) * 4096,
             )
             .unwrap();
-            let kernels = KernelBuildPlan::from_program(&low).unwrap();
             assert_eq!(placement.shard_addresses.len(), low.shards.len());
             for shard in &low.shards {
                 let address = placement.shard_addresses[&shard.id];
@@ -1900,7 +1899,6 @@ mod tests {
                             run,
                             &low.shards,
                             &placement.shard_addresses,
-                            &kernels,
                             &BTreeMap::new(),
                         )
                         .unwrap();

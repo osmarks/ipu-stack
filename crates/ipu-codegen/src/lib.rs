@@ -4,7 +4,7 @@ mod config;
 
 use crate::estimate::Ipu21CostModel;
 use crate::estimate::memory_profile::write as memory_profile;
-use crate::kernel::KernelBuildPlan;
+use crate::kernel::KernelObjects;
 use crate::low::LowProgram;
 use crate::package::{
     DiagnosticCheckpoint, PackageBuildResult, active_topology, diagnostic_tensor, package_inputs,
@@ -179,7 +179,7 @@ fn compile_graph(graph: &ComputeGraph, package: &PackageConfig) -> PackageBuildR
         },
     )?;
     let kernel_plan = tracing::info_span!("plan_kernels")
-        .in_scope(|| -> PackageBuildResult<_> { Ok(KernelBuildPlan::from_program(&program)?) })?;
+        .in_scope(|| -> PackageBuildResult<_> { Ok(KernelObjects::from_program(&program)?) })?;
     let objects =
         tracing::info_span!("compile_kernels").in_scope(|| -> PackageBuildResult<_> {
             let mut objects = vec![runtime];

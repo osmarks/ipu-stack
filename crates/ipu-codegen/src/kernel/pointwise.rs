@@ -15,6 +15,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
+    build: Option<&mut KernelObjects>,
 ) -> Result<KernelCall, KernelError> {
     check_arity(
         inputs,
@@ -38,7 +39,29 @@ pub(super) fn call(
             "gelu_f8"
         };
         arguments.push(output.matrix_extent(false, true)?);
-        return Ok(KernelCall::exact(symbol, arguments));
+        let width = inputs[0].matrix_extent(false, true)?;
+        let rows = inputs[0].count()? / width;
+        let bias = *kernel == MidOperationKind::BiasGelu;
+        if let Some(build) = build {
+            build.add_compilation(KernelCompilation {
+                source: "gelu_f8.S",
+                name: symbol.into(),
+                flags: bias
+                    .then_some("-DGELU_WITH_BIAS".into())
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        let cycles = if bias {
+            fp8_bias_gelu_cycles(
+                rows.into(),
+                width.into(),
+                output.format.layout.order == ElementOrder::Amp(AmpOrder::Left),
+            )
+        } else {
+            fp8_gelu_cycles(rows.into(), width.into())
+        };
+        return Ok(KernelCall::new(symbol, arguments, cycles));
     }
     let count = output.count()?;
     match kernel {
@@ -57,16 +80,35 @@ pub(super) fn call(
                     divisor: 2,
                 });
             }
-            Ok(KernelCall::exact(symbol, vec![count]))
+            if let Some(build) = build {
+                build.add_compilation(KernelCompilation {
+                    source: "gelu_f16.S",
+                    name: symbol.into(),
+                    flags: Vec::new(),
+                });
+            }
+            Ok(KernelCall::new(
+                symbol,
+                vec![count],
+                gelu_row_cycles(count.into(), false),
+            ))
         }
         MidOperationKind::BiasGelu => {
             let width = f16_row_width(kernel, inputs, output)?;
             if inputs[0].extents != output.extents || inputs[1].count()? != width {
                 return Err(KernelError::RequirementMismatch);
             }
-            Ok(KernelCall::exact(
+            if let Some(build) = build {
+                build.add_compilation(KernelCompilation {
+                    source: "gelu_f16.S",
+                    name: "bias_gelu_f16".into(),
+                    flags: vec!["-DGELU_WITH_BIAS".into()],
+                });
+            }
+            Ok(KernelCall::new(
                 "bias_gelu_f16",
                 vec![count / width, width],
+                f16_bias_gelu_cycles((count / width).into(), width.into()),
             ))
         }
         MidOperationKind::Add => {
@@ -90,9 +132,22 @@ pub(super) fn call(
                     }
                 }
             }
-            Ok(KernelCall::exact(
+            if let Some(build) = build {
+                build.add_vertex(
+                    "elementwise_f16.cpp",
+                    "add_f16",
+                    "AddF16",
+                    vec!["-O2".into(), "-DVERTEX_AddF16".into()],
+                    &[3, 4, 2, 5, 6, 7],
+                    "worker_call.S",
+                    Vec::new(),
+                );
+            }
+            let (left, right) = (inputs[0].count()?, inputs[1].count()?);
+            Ok(KernelCall::new(
                 "add_f16",
-                vec![count, inputs[0].count()?, inputs[1].count()?],
+                vec![count, left, right],
+                f16_add_cycles(count.into(), left.into(), right.into()),
             ))
         }
         _ => Err(KernelError::RequirementMismatch),
@@ -194,36 +249,6 @@ pub(crate) fn fp8_gelu_cycles(rows: u64, width: u64) -> u64 {
     138u64.saturating_add(
         rows.saturating_mul(372u64.saturating_add(width.div_ceil(192).saturating_mul(1002))),
     )
-}
-
-impl KernelBuildPlan {
-    pub(super) fn add_pointwise(&mut self, exact_symbols: &BTreeSet<&'static str>) {
-        if exact_symbols.contains("add_f16") {
-            self.add_vertex(
-                "elementwise_f16.cpp",
-                "add_f16",
-                "AddF16",
-                vec!["-O2".into(), "-DVERTEX_AddF16".into()],
-                &[3, 4, 2, 5, 6, 7],
-                "worker_call.S",
-                Vec::new(),
-            );
-        }
-        for (source, symbol, extra) in [
-            ("gelu_f16.S", "gelu_tanh_approx_f16", None),
-            ("gelu_f16.S", "bias_gelu_f16", Some("-DGELU_WITH_BIAS")),
-            ("gelu_f8.S", "gelu_f8", None),
-            ("gelu_f8.S", "bias_gelu_f8", Some("-DGELU_WITH_BIAS")),
-        ] {
-            if exact_symbols.contains(symbol) {
-                self.add_compilation(KernelCompilation {
-                    source,
-                    name: symbol.into(),
-                    flags: extra.into_iter().map(str::to_owned).collect(),
-                });
-            }
-        }
-    }
 }
 
 #[cfg(test)]

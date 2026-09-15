@@ -609,12 +609,10 @@ mod tests {
             }
             assert_eq!(binding.slices.len(), 3);
             let placement = crate::place(&low).unwrap();
-            let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
-            let lowering = crate::TileProgramLowering::new(
-                &low, &placement, &exchanges, &kernels, 0x60000, 2, false,
-            )
-            .unwrap();
+            let lowering =
+                crate::TileProgramLowering::new(&low, &placement, &exchanges, 0x60000, 2, false)
+                    .unwrap();
             for tile in 0..2 {
                 let mut program = lowering.lower_tile(tile).unwrap();
                 let expected_count = profile_step_count(&low, &low.tiles[tile as usize]);
@@ -670,12 +668,10 @@ mod tests {
                 .unwrap();
         let low = crate::lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
         let placement = crate::place(&low).unwrap();
-        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let exchanges = crate::lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
-        let lowering = crate::TileProgramLowering::new(
-            &low, &placement, &exchanges, &kernels, 0x60000, 1, false,
-        )
-        .unwrap();
+        let lowering =
+            crate::TileProgramLowering::new(&low, &placement, &exchanges, 0x60000, 1, false)
+                .unwrap();
         let mut program = lowering.lower_tile(0).unwrap();
         let count = profile_step_count(&low, &low.tiles[0]);
         let base = 0x58000;

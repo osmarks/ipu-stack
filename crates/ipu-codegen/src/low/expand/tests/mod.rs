@@ -1350,7 +1350,7 @@ fn randomized_schedules_make_kernel_operands_resident() {
             for work in tile.work.iter() {
                 if let BlockOperation::Compute { run, .. } = work {
                     let run = &low.kernel_runs[run.0 as usize];
-                    run.call().unwrap();
+                    run.call(None).unwrap();
                     assert_eq!(
                         low.shards[run.outputs[0].shard.index() as usize].tile,
                         tile.tile

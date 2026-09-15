@@ -14,6 +14,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
+    build: Option<&mut KernelObjects>,
 ) -> Result<KernelCall, KernelError> {
     let arity = match kernel {
         MidOperationKind::LayerNorm => 3,
@@ -31,7 +32,31 @@ pub(super) fn call(
     let input = inputs[0];
     let output = outputs[0];
     if let Some(arguments) = fp8_arguments(kernel, inputs, output)? {
-        return Ok(KernelCall::exact("layer_norm_f8", arguments));
+        if let Some(build) = build {
+            build.add_vertex(
+                "elementwise_f16.cpp",
+                "layer_norm_f8",
+                "LayerNormF16",
+                vec![
+                    "-O2".into(),
+                    "-DVERTEX_LayerNormF16".into(),
+                    "-DNORM_FP8".into(),
+                ],
+                &[],
+                "layer_norm_f16.S",
+                vec!["-DNORM_FP8".into()],
+            );
+        }
+        let columns = input.matrix_extent(false, true)?;
+        return Ok(KernelCall::new(
+            "layer_norm_f8",
+            arguments,
+            fp8_layernorm_cycles(
+                (input.count()? / columns).into(),
+                columns.into(),
+                output.format.layout.order == ElementOrder::Amp(AmpOrder::Left),
+            ),
+        ));
     }
     let output_elements = output.count()?;
     if matches!(
@@ -45,13 +70,33 @@ pub(super) fn call(
         {
             return Err(KernelError::RequirementMismatch);
         }
-        return Ok(KernelCall::exact(
-            if *kernel == MidOperationKind::LayerNorm {
-                "layer_norm_f16"
-            } else {
-                "add_layer_norm_f16"
-            },
+        let add = *kernel == MidOperationKind::AddLayerNorm;
+        let symbol = if add {
+            "add_layer_norm_f16"
+        } else {
+            "layer_norm_f16"
+        };
+        if let Some(build) = build {
+            let flags: Vec<_> = add
+                .then_some("-DNORM_WITH_ADD".into())
+                .into_iter()
+                .collect();
+            let mut codelet = vec!["-O2".into(), "-DVERTEX_LayerNormF16".into()];
+            codelet.extend(flags.iter().cloned());
+            build.add_vertex(
+                "elementwise_f16.cpp",
+                symbol,
+                "LayerNormF16",
+                codelet,
+                &[],
+                "layer_norm_f16.S",
+                flags,
+            );
+        }
+        return Ok(KernelCall::new(
+            symbol,
             vec![output_elements / width, width],
+            layernorm_cycles((output_elements / width).into(), width.into(), add, true),
         ));
     }
     if *kernel == MidOperationKind::AddLayerNormMoments
@@ -78,7 +123,7 @@ pub(super) fn call(
     {
         return Err(KernelError::RequirementMismatch);
     }
-    let (symbol, arguments) = match kernel {
+    let call = match kernel {
         MidOperationKind::LayerNormMoments | MidOperationKind::AddLayerNormMoments => {
             if output.format.precision != Precision::F32
                 || output_elements != statistics
@@ -88,13 +133,33 @@ pub(super) fn call(
             {
                 return Err(KernelError::RequirementMismatch);
             }
-            (
-                if *kernel == MidOperationKind::LayerNormMoments {
-                    "layer_norm_moments"
-                } else {
-                    "add_layer_norm_moments"
-                },
+            let add = *kernel == MidOperationKind::AddLayerNormMoments;
+            let symbol = if add {
+                "add_layer_norm_moments"
+            } else {
+                "layer_norm_moments"
+            };
+            if let Some(build) = build {
+                let flags: Vec<_> = add
+                    .then_some("-DNORM_STORE_SUM".into())
+                    .into_iter()
+                    .collect();
+                let mut codelet = vec!["-O2".into(), "-DVERTEX_LayerNormMoments".into()];
+                codelet.extend(flags.iter().cloned());
+                build.add_vertex(
+                    "layer_norm_distributed.cpp",
+                    symbol,
+                    "LayerNormMoments",
+                    codelet,
+                    &[],
+                    "layer_norm_moments.S",
+                    flags,
+                );
+            }
+            KernelCall::new(
+                symbol,
                 vec![rows, width],
+                f16_layernorm_moments_cycles(rows.into(), width.into(), add),
             )
         }
         MidOperationKind::LayerNormApply { parts } => {
@@ -113,11 +178,28 @@ pub(super) fn call(
             {
                 return Err(KernelError::RequirementMismatch);
             }
-            ("layer_norm_apply", vec![rows, width, u32::from(*parts)])
+            {
+                if let Some(build) = build {
+                    build.add_vertex(
+                        "layer_norm_distributed.cpp",
+                        "layer_norm_apply",
+                        "LayerNormApply",
+                        vec!["-O2".into(), "-DVERTEX_LayerNormApply".into()],
+                        &[3, 4, 5, 6, 2, 7, 8, 9],
+                        "worker_call.S",
+                        Vec::new(),
+                    );
+                }
+                KernelCall::new(
+                    "layer_norm_apply",
+                    vec![rows, width, u32::from(*parts)],
+                    f16_layernorm_apply_cycles(rows.into(), width.into(), *parts),
+                )
+            }
         }
         _ => return Err(KernelError::RequirementMismatch),
     };
-    Ok(KernelCall::exact(symbol, arguments))
+    Ok(call)
 }
 
 /// Mean and centered variance retain FP32 precision. Aligned full groups use
@@ -188,53 +270,6 @@ pub(crate) fn fp8_layernorm_cycles(rows: u64, width: u64, packed: bool) -> u64 {
             6
         })),
     ))
-}
-
-impl KernelBuildPlan {
-    pub(super) fn add_normalization(&mut self, exact_symbols: &BTreeSet<&'static str>) {
-        for (source, wrapper, vertex, variants) in [
-            (
-                "elementwise_f16.cpp",
-                "layer_norm_f16.S",
-                "LayerNormF16",
-                &[
-                    ("layer_norm_f16", None),
-                    ("add_layer_norm_f16", Some("-DNORM_WITH_ADD")),
-                    ("layer_norm_f8", Some("-DNORM_FP8")),
-                ][..],
-            ),
-            (
-                "layer_norm_distributed.cpp",
-                "layer_norm_moments.S",
-                "LayerNormMoments",
-                &[
-                    ("layer_norm_moments", None),
-                    ("add_layer_norm_moments", Some("-DNORM_STORE_SUM")),
-                ][..],
-            ),
-        ] {
-            for &(symbol, extra) in variants {
-                if !exact_symbols.contains(symbol) {
-                    continue;
-                }
-                let flags: Vec<_> = extra.into_iter().map(str::to_owned).collect();
-                let mut codelet_flags = vec!["-O2".into(), format!("-DVERTEX_{vertex}")];
-                codelet_flags.extend(flags.iter().cloned());
-                self.add_vertex(source, symbol, vertex, codelet_flags, &[], wrapper, flags);
-            }
-        }
-        if exact_symbols.contains("layer_norm_apply") {
-            self.add_vertex(
-                "layer_norm_distributed.cpp",
-                "layer_norm_apply",
-                "LayerNormApply",
-                vec!["-O2".into(), "-DVERTEX_LayerNormApply".into()],
-                &[3, 4, 5, 6, 2, 7, 8, 9],
-                "worker_call.S",
-                Vec::new(),
-            );
-        }
-    }
 }
 
 #[cfg(test)]

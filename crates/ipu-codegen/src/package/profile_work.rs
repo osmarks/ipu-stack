@@ -229,7 +229,11 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
         MidOperationKind::FillZero {
             padding_only: true, ..
         } => return Some((0.0, 0.0, "padding initialization: no useful tensor work")),
-        MidOperationKind::AttentionSoftmax { key_columns, .. } => {
+        MidOperationKind::AttentionSoftmax {
+            key_columns,
+            padded_key_columns,
+            ..
+        } => {
             // Full panels: five maximum reductions, four MIXes and one
             // accumulator readout, eight exps, eight FP16 additions, one
             // conversion and two FP32 additions: 29 arithmetic issue slots.
@@ -245,7 +249,11 @@ pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'stati
                 .map(|e| u64::from(e.physical_end - e.start))
                 .product();
             let panel_slots = if fp8 { 31.0 } else { 29.0 };
-            let row_reductions = if run.call().ok()?.arguments[2] != 0 {
+            let row_reductions = if crate::kernel::attention::f16_softmax_split_rows(
+                physical_rows,
+                u64::from(key_columns),
+                u64::from(padded_key_columns),
+            ) {
                 15.0
             } else {
                 5.0

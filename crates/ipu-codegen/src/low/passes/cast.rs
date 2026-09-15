@@ -568,7 +568,7 @@ mod tests {
                 .iter()
                 .filter(|r| matches!(r.kernel, MidOperationKind::Cast { .. }))
             {
-                run.call().unwrap();
+                run.call(None).unwrap();
                 let src = &run.inputs[0];
                 let dst = &run.outputs[0];
                 let spans = |v: &crate::ShardView| {

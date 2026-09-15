@@ -9,7 +9,7 @@ use super::{
     reserve_linked_image, runtime_retained_symbols,
 };
 use crate::host;
-use crate::kernel::KernelBuildPlan;
+use crate::kernel::KernelObjects;
 use crate::low::LowProgram;
 use crate::memory::{
     MemoryAllocation, MemoryRequest, PROFILE_END_CYCLE, PROFILE_START_CYCLE, TileMemoryMap,
@@ -29,7 +29,7 @@ pub(crate) struct PackageSupport {
     pub(crate) profile_requests: Vec<Vec<crate::place::AuxiliaryRequest>>,
     pub(crate) exchange_code_base: u32,
     pub(super) objects: Vec<Vec<u8>>,
-    pub(super) kernel_plan: KernelBuildPlan,
+    pub(super) kernel_plan: KernelObjects,
     pub(super) retained_runtime: Vec<&'static str>,
     pub(super) layout: LinkedImage,
     pub(super) physical_to_logical: Vec<u16>,
@@ -47,7 +47,7 @@ pub(crate) fn size_support(
     provisional_exchanges: &[crate::PhysicalExchangePhase],
     config: &PipelineConfig,
     objects: Vec<Vec<u8>>,
-    kernel_plan: KernelBuildPlan,
+    kernel_plan: KernelObjects,
     invocations: u32,
 ) -> PackageBuildResult<PackageSupport> {
     let topology = active_topology(program.tile_count)?;
@@ -188,7 +188,6 @@ pub(crate) fn size_support(
         program,
         provisional_placement,
         provisional_exchanges,
-        &kernel_plan,
         // Sizing only: emission uses fixed-width address materialization.
         RUNTIME_EXECUTABLE_START,
         execution_tile_count,

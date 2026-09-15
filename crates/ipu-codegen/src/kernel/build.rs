@@ -1,4 +1,4 @@
-//! Device object recipes for the selected kernel specializations.
+//! Device object collection and shared compilation/wrapper construction.
 
 use super::*;
 
@@ -10,65 +10,31 @@ pub struct KernelCompilation {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct KernelBuildPlan {
+pub struct KernelObjects {
     pub compilations: Vec<KernelCompilation>,
     /// All callable entry points, including kernels supplied by the runtime object.
-    pub(super) symbols: BTreeMap<KernelImplementation, String>,
+    pub(super) symbols: BTreeSet<String>,
+    pub(super) gemms: BTreeMap<(Precision, GemmWeightLoad, u32, u32, u32), BTreeSet<u32>>,
 }
 
-impl KernelBuildPlan {
-    /// Collect resolved implementation keys; only GEMM needs additional grouping
-    /// to share worker objects across row-count variants.
+impl KernelObjects {
+    /// Family construction registers objects directly. GEMMs defer only the
+    /// pairing of row-count variants; this collector does not select kernels.
     pub fn from_program(program: &crate::TileGraph) -> Result<Self, KernelError> {
-        let implementations = program
-            .body
-            .walk()
-            .filter_map(|work| match work {
-                BlockOperation::Compute { run, .. } => Some(
-                    program.kernel_runs[run.0 as usize]
-                        .call()
-                        .map(|call| call.implementation),
-                ),
-                BlockOperation::Copy { copy, .. } => Some(Ok(KernelImplementation::Exact(
-                    program.local_copies[copy.0 as usize].symbol(),
-                ))),
-                _ => None,
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        Self::from_implementations(implementations)
-    }
-
-    pub(super) fn from_implementations(
-        implementations: BTreeSet<KernelImplementation>,
-    ) -> Result<Self, KernelError> {
-        let exact_symbols = implementations
-            .iter()
-            .filter_map(|key| match key {
-                KernelImplementation::Exact(symbol) => Some(*symbol),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let mut plan = Self {
-            compilations: Vec::new(),
-            symbols: exact_symbols
-                .iter()
-                .map(|&symbol| (KernelImplementation::Exact(symbol), symbol.to_owned()))
-                .collect(),
-        };
-        plan.add_gemms(&implementations);
-        plan.add_normalization(&exact_symbols);
-        plan.add_pointwise(&exact_symbols);
-        plan.add_reduction(&exact_symbols);
-        plan.add_casts(&exact_symbols);
-        for key in &implementations {
-            if matches!(
-                key,
-                KernelImplementation::Unpack(_) | KernelImplementation::Rearrange(_)
-            ) {
-                plan.add_rearrangement(key);
+        let mut plan = Self::default();
+        for work in program.body.walk() {
+            match work {
+                BlockOperation::Compute { run, .. } => {
+                    program.kernel_runs[run.0 as usize].call(Some(&mut plan))?;
+                }
+                BlockOperation::Copy { copy, .. } => {
+                    plan.symbols
+                        .insert(program.local_copies[copy.0 as usize].symbol().into());
+                }
+                _ => {}
             }
         }
-        plan.add_attention(&implementations)?;
+        plan.add_gemms();
         // Only compiler-generated C++ codelets need the worker stack symbols.
         // Derive this from the selected recipes, including assembly fast paths.
         if plan
@@ -133,21 +99,7 @@ impl KernelBuildPlan {
         });
     }
 
-    pub(super) fn symbol<'a>(
-        &'a self,
-        implementation: &KernelImplementation,
-    ) -> Result<&'a str, KernelError> {
-        match implementation {
-            KernelImplementation::Exact(symbol) => Ok(symbol),
-            _ => self
-                .symbols
-                .get(implementation)
-                .map(String::as_str)
-                .ok_or(KernelError::RequirementMismatch),
-        }
-    }
-
     pub fn retained_symbols(&self) -> impl Iterator<Item = &str> {
-        self.symbols.values().map(String::as_str)
+        self.symbols.iter().map(String::as_str)
     }
 }

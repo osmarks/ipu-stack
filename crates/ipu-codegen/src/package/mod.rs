@@ -23,7 +23,7 @@ use crate::memory::{
     TileMemoryMap,
 };
 use crate::{
-    CodegenOptions, KernelBuildPlan, TileProgram, TileProgramLowering, emit, shard_storage_bytes,
+    CodegenOptions, KernelObjects, TileProgram, TileProgramLowering, emit, shard_storage_bytes,
 };
 use crate::{PipelineConfig, Precision, TileGraph};
 use ipu_target::ipu21::runtime_layout::{
@@ -288,7 +288,6 @@ pub(crate) fn emit_package(
         program,
         placement,
         exchanges,
-        kernel_plan,
         exchange_code_base,
         execution_tile_count,
         true,
@@ -606,7 +605,7 @@ pub(crate) fn active_topology(tile_count: u16) -> PackageBuildResult<Topology> {
 
 struct TileBuildContext<'a> {
     objects: &'a [Vec<u8>],
-    kernel_plan: &'a KernelBuildPlan,
+    kernel_plan: &'a KernelObjects,
     retained_runtime: &'a [&'a str],
     code_address: u32,
     host_staging_address: u32,
@@ -682,7 +681,7 @@ fn link_runtime(
     physical_tile: u32,
     program_address: u32,
     host_staging_address: u32,
-    kernel_plan: &KernelBuildPlan,
+    kernel_plan: &KernelObjects,
     retained_runtime: &[&str],
 ) -> PackageBuildResult<LinkedImage> {
     let sync_context = physical_tile

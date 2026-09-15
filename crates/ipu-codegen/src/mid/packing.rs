@@ -275,7 +275,7 @@ mod tests {
                                 ..
                             })
                         ));
-                        run.call().unwrap();
+                        run.call(None).unwrap();
                         packs += 1;
                     }
                 }

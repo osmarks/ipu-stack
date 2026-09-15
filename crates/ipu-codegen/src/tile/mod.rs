@@ -10,9 +10,9 @@ mod iterated_aliases;
 
 use crate::{
     BlockOperation, BlockValueId, ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep,
-    KernelBuildPlan, LowProgram, PhysicalExchangePhase, PlacedExchangeRow, Placement,
-    RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress, TileProgram, TileStep,
-    TileWorkList, materialize_kernel_run,
+    LowProgram, PhysicalExchangePhase, PlacedExchangeRow, Placement, RepeatPointer, RepeatRun,
+    RepeatStep, StepProfile, TileAddress, TileProgram, TileStep, TileWorkList,
+    materialize_kernel_run,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,7 +23,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct TileProgramLowering<'a> {
     program: &'a LowProgram,
     placement: &'a Placement,
-    kernels: &'a KernelBuildPlan,
     exchanges: &'a [PhysicalExchangePhase],
     phases: BTreeMap<ExchangePhaseId, &'a PhysicalExchangePhase>,
     exchange_code_base: u32,
@@ -82,7 +81,6 @@ impl<'a> TileProgramLowering<'a> {
         program: &'a LowProgram,
         placement: &'a Placement,
         exchanges: &'a [PhysicalExchangePhase],
-        kernels: &'a KernelBuildPlan,
         exchange_code_base: u32,
         execution_tile_count: u16,
         validate_exchange_placement: bool,
@@ -115,7 +113,6 @@ impl<'a> TileProgramLowering<'a> {
         Ok(Self {
             program,
             placement,
-            kernels,
             exchanges,
             phases,
             exchange_code_base,
@@ -151,7 +148,6 @@ impl<'a> TileProgramLowering<'a> {
                     self.program,
                     work,
                     self.placement,
-                    self.kernels,
                     &self.phases,
                     &rows,
                     &BTreeMap::new(),
@@ -178,7 +174,6 @@ fn lower_work(
     program: &LowProgram,
     tile: &TileWorkList,
     placement: &Placement,
-    kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
     overrides: &BTreeMap<BlockValueId, TileAddress>,
@@ -245,7 +240,6 @@ fn lower_work(
                 &program.kernel_runs[run.0 as usize],
                 &program.shards,
                 &placement.shard_addresses,
-                kernels,
                 overrides,
             )?),
             BlockOperation::Repeat(repeat) => {
@@ -257,7 +251,6 @@ fn lower_work(
                     program,
                     repeat,
                     placement,
-                    kernels,
                     phases,
                     exchange_rows,
                 )?)
@@ -279,7 +272,6 @@ fn lower_repeat(
     program: &LowProgram,
     repeat: &RepeatRun,
     placement: &Placement,
-    kernels: &KernelBuildPlan,
     phases: &BTreeMap<ExchangePhaseId, &PhysicalExchangePhase>,
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
 ) -> Result<RepeatStep, TileLoweringError> {
@@ -306,7 +298,6 @@ fn lower_repeat(
         program,
         &repeat.body,
         placement,
-        kernels,
         phases,
         exchange_rows,
         &overrides,
@@ -713,7 +704,6 @@ mod tests {
             &program,
             &program.tiles[0],
             &placement,
-            &KernelBuildPlan::default(),
             &BTreeMap::new(),
             &BTreeMap::new(),
             &overrides,
@@ -767,14 +757,12 @@ mod tests {
                 config.diagnostic_checkpoints,
             );
             let placement = place(&low).unwrap();
-            let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let exchanges = lower_exchanges(&low, &placement, &Topology::c600()).unwrap();
             let filler_tiles = random.u16(1..=4);
             let lowering = TileProgramLowering::new(
                 &low,
                 &placement,
                 &exchanges,
-                &kernels,
                 0x4d000,
                 tiles + filler_tiles,
                 false,

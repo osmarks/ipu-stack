@@ -137,57 +137,47 @@ impl CopyRun {
 
     pub(crate) fn call(&self) -> KernelCall {
         let words = self.movement.bytes / self.word_bytes;
-        let arguments = match self.movement.pattern {
+        let (arguments, cycles) = match self.movement.pattern {
             CopyPattern::Strided {
                 rows,
                 row_bytes,
                 source_stride,
                 destination_stride,
-            } => vec![
-                row_bytes / self.word_bytes,
-                rows,
-                source_stride,
-                destination_stride,
-            ],
-            CopyPattern::Contiguous if self.word_bytes == 8 => {
-                return KernelCall::copy_u64(words);
+            } => {
+                let words = row_bytes / self.word_bytes;
+                let workers = u64::from(WORKER_CONTEXTS);
+                (
+                    vec![words, rows, source_stride, destination_stride],
+                    294 + u64::from(rows).div_ceil(workers) * workers * (2 * u64::from(words) + 6),
+                )
             }
-            CopyPattern::Contiguous => vec![words],
+            CopyPattern::Contiguous if self.word_bytes == 8 => return KernelCall::copy_u64(words),
+            CopyPattern::Contiguous => (
+                vec![words],
+                if self.word_bytes == 2 {
+                    112 + u64::from(words) * 129
+                } else {
+                    104 + u64::from(words) * 23
+                },
+            ),
         };
-        KernelCall::exact(self.symbol(), arguments)
+        KernelCall::new(self.symbol(), arguments, cycles)
     }
 
     pub(crate) fn cycles(&self) -> u64 {
-        self.call().cycles()
+        self.call().cycles
     }
 }
 
 impl KernelCall {
     pub(super) fn copy_u64(words: u32) -> Self {
-        Self::exact(
+        Self::new(
             COPY_U64_SYMBOL,
             vec![words / WORKER_CONTEXTS, words % WORKER_CONTEXTS],
+            246 + u64::from(words).div_ceil(u64::from(WORKER_CONTEXTS))
+                * u64::from(WORKER_CONTEXTS)
+                * 2,
         )
-    }
-}
-
-pub(super) fn cycles(symbol: &str, arguments: &[u32]) -> u64 {
-    let workers = u64::from(WORKER_CONTEXTS);
-    match (symbol, arguments) {
-        (COPY_U16_SYMBOL, &[words]) => 112 + u64::from(words) * 129,
-        (COPY_U32_SYMBOL, &[words]) => 104 + u64::from(words) * 23,
-        (COPY_U64_SYMBOL, &[whole, tail]) => {
-            246 + (u64::from(whole) + u64::from(tail != 0)) * workers * 2
-        }
-        (COPY_STRIDED_U32_SYMBOL | COPY_STRIDED_U64_SYMBOL, &[words, rows, _, _]) => {
-            294 + u64::from(rows).div_ceil(workers) * workers * (2 * u64::from(words) + 6)
-        }
-        (FILL_ZERO_U64_SYMBOL, &[whole, tail]) => {
-            u64::from(whole)
-                + u64::from(tail != 0)
-                + crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles
-        }
-        _ => u64::MAX,
     }
 }
 
@@ -214,9 +204,10 @@ pub(super) fn fill_call(
             divisor: 8,
         });
     }
-    Ok(KernelCall::exact(
-        crate::kernel::copy::FILL_ZERO_U64_SYMBOL,
+    Ok(KernelCall::new(
+        FILL_ZERO_U64_SYMBOL,
         vec![bytes / 8 / 6, bytes / 8 % 6],
+        u64::from(bytes / 8).div_ceil(6) + crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles,
     ))
 }
 

@@ -89,7 +89,6 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
 fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
     for partials in [1, 2] {
         let (low, placement) = iterated_sum(partials);
-        let kernels = KernelBuildPlan::from_program(&low).unwrap();
         let phases = crate::exchange::lower_exchanges(
             &low,
             &placement,
@@ -97,8 +96,7 @@ fn sum_aliases_follow_iterated_parameters_in_local_copies_and_exchanges() {
         )
         .unwrap();
         let lowering =
-            TileProgramLowering::new(&low, &placement, &phases, &kernels, 0x100, partials, false)
-                .unwrap();
+            TileProgramLowering::new(&low, &placement, &phases, 0x100, partials, false).unwrap();
         let mut moving_reads = 0;
         let mut moving_sends = 0;
         for tile in 0..partials {
@@ -188,7 +186,6 @@ fn repeat_pointers_use_placed_sequence_strides() {
                     placement.shard_addresses[&sequence.argument] + index as u32 * stride
                 );
             }
-            let kernels = KernelBuildPlan::from_program(&low).unwrap();
             let phases = crate::exchange::lower_exchanges(
                 &low,
                 &placement,
@@ -196,8 +193,7 @@ fn repeat_pointers_use_placed_sequence_strides() {
             )
             .unwrap();
             let lowering =
-                TileProgramLowering::new(&low, &placement, &phases, &kernels, 0x100, 2, false)
-                    .unwrap();
+                TileProgramLowering::new(&low, &placement, &phases, 0x100, 2, false).unwrap();
             let program = lowering.lower_tile(0).unwrap();
             let TileStep::Repeat(repeat) = &program.steps[0] else {
                 panic!("repeat")
@@ -311,14 +307,8 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
         &mut vec![],
     )
     .unwrap();
-    let call = materialize_kernel_run(
-        &run,
-        &shards,
-        &placement.shard_addresses,
-        &KernelBuildPlan::default(),
-        &overrides,
-    )
-    .unwrap();
+    let call =
+        materialize_kernel_run(&run, &shards, &placement.shard_addresses, &overrides).unwrap();
     assert_eq!(
         call.input_addresses,
         [TileAddress::RepeatPointer {

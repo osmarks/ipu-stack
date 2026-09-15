@@ -4,36 +4,6 @@
 use super::*;
 use crate::mid::MidOperationKind;
 
-pub(super) fn cycles(call: &KernelCall) -> u64 {
-    match call.implementation {
-        KernelImplementation::Attention(shape) => u64::from(shape.matrices)
-            .saturating_mul(u64::from(shape.query_rows))
-            .saturating_mul(u64::from(shape.key_rows))
-            .saturating_mul(u64::from(shape.query_dimension) + u64::from(shape.value_dimension))
-            .saturating_mul(4)
-            .div_ceil(6)
-            .saturating_add(crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles),
-        KernelImplementation::Softmax(_, keys, padded, output) => softmax_output_cycles(
-            u64::from(call.arguments[0]),
-            u64::from(keys),
-            u64::from(padded),
-            matches!(output, Precision::F8F143 { .. }),
-            call.arguments[2] != 0,
-        ),
-        KernelImplementation::Merge(columns, _, output) => {
-            let args = &call.arguments[call.arguments.len() - 3..];
-            f16_attention_merge_cycles(
-                u64::from(args[2]),
-                u64::from(columns),
-                args[0] != 0,
-                args[1] != 0,
-                output == Precision::F16,
-            )
-        }
-        _ => u64::MAX,
-    }
-}
-
 /// One contiguous workspace: optional field/component axes surround the
 /// flattened query rows. The same declaration constructs mid tensors and checks
 /// local call geometry; it does not prescribe their physical tile ownership.
@@ -132,13 +102,14 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
+    build: Option<&mut KernelObjects>,
 ) -> Result<KernelCall, KernelError> {
     let output = outputs
         .first()
         .ok_or(KernelError::RequirementMismatch)?
         .format
         .precision;
-    let (implementation, arguments) = match *kernel {
+    let call = match *kernel {
         MidOperationKind::FlashAttention { .. } => {
             check_arity(inputs, outputs, 3, 1)?;
             if output != Precision::F32
@@ -148,10 +119,7 @@ pub(super) fn call(
             {
                 return Err(KernelError::Unavailable(kernel.clone()));
             }
-            (
-                KernelImplementation::Attention(attention_shape(kernel, inputs)?),
-                Vec::new(),
-            )
+            flash(attention_shape(kernel, inputs)?, build)
         }
         MidOperationKind::AttentionSoftmax {
             head_dimension,
@@ -164,6 +132,8 @@ pub(super) fn call(
             let rows = gemm_rows(outputs[0])?;
             if key_columns == 0
                 || key_columns > padded_key_columns
+                || (matches!(output, Precision::F8F143 { .. })
+                    && !padded_key_columns.is_multiple_of(32))
                 || inputs[0].format.precision != Precision::F16
                 || inputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
                 || outputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
@@ -178,22 +148,52 @@ pub(super) fn call(
             {
                 return Err(KernelError::RequirementMismatch);
             }
-            (
-                KernelImplementation::Softmax(
-                    head_dimension,
-                    key_columns,
-                    padded_key_columns,
-                    output,
+            let full = key_columns == padded_key_columns;
+            let head = head_dimension;
+            let padded = padded_key_columns;
+            let name = format!(
+                "attention_softmax_d{head}_p{padded}_{}",
+                if full { "full" } else { "tail" }
+            );
+            let symbol = match output {
+                Precision::F16 => format!("{name}_f16"),
+                Precision::F8F143 { scale_exponent } => {
+                    format!("{name}_f8_s{scale_exponent}").replace('-', "m")
+                }
+                _ => return Err(KernelError::RequirementMismatch),
+            };
+            if let Some(build) = build {
+                let scale_bits = (1.0_f32 / (head as f32).sqrt()).to_bits();
+                let mut flags = vec![
+                    format!("-DATTENTION_HEAD_DIMENSION={head}"),
+                    format!("-DATTENTION_FULL_BLOCK={}", u8::from(full)),
+                    format!("-DATTENTION_KEY_BLOCK_COLUMNS={padded}"),
+                    format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
+                    format!("-DATTENTION_SOFTMAX_SYMBOL={symbol}"),
+                ];
+                if let Precision::F8F143 { scale_exponent } = output {
+                    flags.extend([
+                        "-DATTENTION_OUTPUT_F8".into(),
+                        format!("-DATTENTION_OUTPUT_SCALE={scale_exponent}"),
+                    ]);
+                }
+                build.add_compilation(KernelCompilation {
+                    source: "attention_softmax_f16.S",
+                    name: symbol.clone(),
+                    flags,
+                });
+            }
+            let split = f16_softmax_split_rows(rows.into(), key_columns.into(), padded.into());
+            KernelCall::new(
+                symbol,
+                vec![rows, key_columns, u32::from(split)],
+                softmax_output_cycles(
+                    rows.into(),
+                    key_columns.into(),
+                    padded.into(),
+                    matches!(output, Precision::F8F143 { .. }),
+                    split,
                 ),
-                vec![
-                    rows,
-                    key_columns,
-                    u32::from(f16_softmax_split_rows(
-                        u64::from(rows),
-                        u64::from(key_columns),
-                        u64::from(padded_key_columns),
-                    )),
-                ],
             )
         }
         MidOperationKind::AttentionMerge {
@@ -244,17 +244,45 @@ pub(super) fn call(
                 .into_iter()
                 .chain([u32::from(initial), u32::from(final_block), rows])
                 .collect();
-            (
-                KernelImplementation::Merge(value_dimension, padded_value_dimension, output),
+            let values = value_dimension;
+            let padded = padded_value_dimension;
+            let suffix = if output == Precision::F16 {
+                "out16"
+            } else {
+                "out32"
+            };
+            let name = format!("attention_merge_v{values}_p{padded}_{suffix}");
+            let symbol = format!("{name}_f16");
+            if let Some(build) = build {
+                build.add_compilation(KernelCompilation {
+                    source: "attention_merge_f16.S",
+                    name,
+                    flags: vec![
+                        format!("-DATTENTION_VALUE_DIMENSION={values}"),
+                        format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded}"),
+                        format!("-DATTENTION_MERGE_SYMBOL={symbol}"),
+                        format!(
+                            "-DATTENTION_MERGE_OUTPUT_F16={}",
+                            u8::from(output == Precision::F16)
+                        ),
+                    ],
+                });
+            }
+            KernelCall::new(
+                symbol,
                 arguments,
+                f16_attention_merge_cycles(
+                    rows.into(),
+                    values.into(),
+                    initial,
+                    final_block,
+                    output == Precision::F16,
+                ),
             )
         }
         _ => return Err(KernelError::RequirementMismatch),
     };
-    Ok(KernelCall {
-        implementation,
-        arguments,
-    })
+    Ok(call)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -321,18 +349,18 @@ fn attention_shape<'a>(
     })
 }
 
-impl KernelBuildPlan {
-    fn add_flash_attention(&mut self, shape: AttentionKernelShape) {
-        let suffix = format!(
-            "m{}_q{}_k{}_d{}_v{}_{:08x}",
-            shape.matrices,
-            shape.query_rows,
-            shape.key_rows,
-            shape.query_dimension,
-            shape.value_dimension,
-            shape.scale_bits,
-        );
-        let call_symbol = format!("flash_attention_online_f16_{suffix}");
+fn flash(shape: AttentionKernelShape, build: Option<&mut KernelObjects>) -> KernelCall {
+    let suffix = format!(
+        "m{}_q{}_k{}_d{}_v{}_{:08x}",
+        shape.matrices,
+        shape.query_rows,
+        shape.key_rows,
+        shape.query_dimension,
+        shape.value_dimension,
+        shape.scale_bits,
+    );
+    let call_symbol = format!("flash_attention_online_f16_{suffix}");
+    if let Some(build) = build {
         let vertex = format!("FlashAttentionOnlineF16_{suffix}");
         let flags = vec![
             format!("-DATTENTION_MATRICES={}", shape.matrices),
@@ -343,7 +371,7 @@ impl KernelBuildPlan {
             format!("-DATTENTION_SCALE={}", f32::from_bits(shape.scale_bits)),
             format!("-DATTENTION_VERTEX_NAME={vertex}"),
         ];
-        self.add_vertex(
+        build.add_vertex(
             "flash_attention_online_f16.cpp",
             &call_symbol,
             &vertex,
@@ -352,84 +380,15 @@ impl KernelBuildPlan {
             "worker_call.S",
             Vec::new(),
         );
-        self.symbols
-            .insert(KernelImplementation::Attention(shape), call_symbol);
     }
-
-    pub(super) fn add_attention(
-        &mut self,
-        stages: &BTreeSet<KernelImplementation>,
-    ) -> Result<(), KernelError> {
-        for key in stages.iter().cloned() {
-            let (name, symbol, source, flags) = match key {
-                KernelImplementation::Attention(ref shape) => {
-                    self.add_flash_attention(shape.clone());
-                    continue;
-                }
-                KernelImplementation::Softmax(head, keys, padded, precision) => {
-                    let full = keys == padded;
-                    let name = format!(
-                        "attention_softmax_d{head}_p{padded}_{}",
-                        if full { "full" } else { "tail" }
-                    );
-                    let symbol = match precision {
-                        Precision::F16 => format!("{name}_f16"),
-                        Precision::F8F143 { scale_exponent } => {
-                            format!("{name}_f8_s{scale_exponent}")
-                        }
-                        _ => return Err(KernelError::RequirementMismatch),
-                    };
-                    let name = symbol.replace('-', "m");
-                    let symbol = name.clone();
-                    let scale_bits = (1.0_f32 / (head as f32).sqrt()).to_bits();
-                    let mut flags = vec![
-                        format!("-DATTENTION_HEAD_DIMENSION={head}"),
-                        format!("-DATTENTION_FULL_BLOCK={}", u8::from(full)),
-                        format!("-DATTENTION_KEY_BLOCK_COLUMNS={padded}"),
-                        format!("-DATTENTION_SCALE_BITS=0x{scale_bits:08x}"),
-                        format!("-DATTENTION_SOFTMAX_SYMBOL={symbol}"),
-                    ];
-                    if let Precision::F8F143 { scale_exponent } = precision {
-                        if !padded.is_multiple_of(32) {
-                            return Err(KernelError::RequirementMismatch);
-                        }
-                        flags.extend([
-                            "-DATTENTION_OUTPUT_F8".into(),
-                            format!("-DATTENTION_OUTPUT_SCALE={scale_exponent}"),
-                        ]);
-                    }
-                    (name, symbol, "attention_softmax_f16.S", flags)
-                }
-                KernelImplementation::Merge(values, padded, output) => {
-                    let suffix = match output {
-                        Precision::F16 => "out16",
-                        Precision::F32 => "out32",
-                        _ => return Err(KernelError::RequirementMismatch),
-                    };
-                    let name = format!("attention_merge_v{values}_p{padded}_{suffix}");
-                    let symbol = format!("{name}_f16");
-                    let flags = vec![
-                        format!("-DATTENTION_VALUE_DIMENSION={values}"),
-                        format!("-DATTENTION_PADDED_VALUE_DIMENSION={padded}"),
-                        format!("-DATTENTION_MERGE_SYMBOL={symbol}"),
-                        format!(
-                            "-DATTENTION_MERGE_OUTPUT_F16={}",
-                            u8::from(output == Precision::F16)
-                        ),
-                    ];
-                    (name, symbol, "attention_merge_f16.S", flags)
-                }
-                _ => continue,
-            };
-            self.symbols.insert(key, symbol.clone());
-            self.add_compilation(KernelCompilation {
-                source,
-                name,
-                flags,
-            });
-        }
-        Ok(())
-    }
+    let cycles = u64::from(shape.matrices)
+        .saturating_mul(u64::from(shape.query_rows))
+        .saturating_mul(u64::from(shape.key_rows))
+        .saturating_mul(u64::from(shape.query_dimension) + u64::from(shape.value_dimension))
+        .saturating_mul(4)
+        .div_ceil(6)
+        .saturating_add(crate::estimate::IPU21_TARGET_COSTS.kernel_launch_cycles);
+    KernelCall::new(call_symbol, Vec::new(), cycles)
 }
 
 /// Row-wise softmax: four-wide maxima and pipelined MIX/exp/store/sum take 41
@@ -482,7 +441,7 @@ fn f16_softmax_split_cycles(rows: u64, keys: u64, padded_keys: u64) -> u64 {
 }
 
 /// The ABI and the planner use the same choice; no tile program is built here.
-fn f16_softmax_split_rows(rows: u64, keys: u64, padded_keys: u64) -> bool {
+pub(crate) fn f16_softmax_split_rows(rows: u64, keys: u64, padded_keys: u64) -> bool {
     f16_softmax_split_cycles(rows, keys, padded_keys)
         < f16_softmax_whole_rows(rows, keys, padded_keys)
 }
@@ -591,26 +550,6 @@ mod tests {
         assert!(!f16_softmax_split_rows(6, 729, 768));
         for rows in [7, 8] {
             assert!(f16_softmax_split_rows(rows, 729, 768));
-        }
-    }
-
-    #[test]
-    fn softmax_cost_follows_the_encoded_schedule_even_when_slower() {
-        for rows in [1, 6, 7, 8] {
-            for precision in [Precision::F16, Precision::F8F143 { scale_exponent: 0 }] {
-                let mut call = KernelCall {
-                    implementation: KernelImplementation::Softmax(64, 729, 768, precision),
-                    arguments: vec![rows, 729, 0],
-                };
-                let whole = call.cycles();
-                call.arguments[2] = 1;
-                let split = call.cycles();
-                assert_ne!(whole, split, "cost must not silently reselect the schedule");
-                assert_eq!(
-                    split < whole,
-                    f16_softmax_split_rows(u64::from(rows), 729, 768),
-                );
-            }
         }
     }
 }

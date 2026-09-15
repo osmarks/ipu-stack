@@ -318,13 +318,11 @@ mod tests {
         );
         assert!(!low.repeat_runs.is_empty());
         let placement = crate::place(&low).unwrap();
-        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         for run in &low.kernel_runs {
             crate::materialize_kernel_run(
                 run,
                 &low.shards,
                 &placement.shard_addresses,
-                &kernels,
                 &BTreeMap::new(),
             )
             .unwrap();
@@ -403,15 +401,13 @@ mod tests {
         }
         let low = crate::lower_to_tiles(&std::sync::Arc::new(expanded), false);
         let placement = crate::place(&low).unwrap();
-        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut sums = 0;
         for run in &low.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
             let call = crate::materialize_kernel_run(
                 run,
                 &low.shards,
                 &placement.shard_addresses,
-                &kernels,
                 &BTreeMap::new(),
             )
             .unwrap();
@@ -431,13 +427,13 @@ mod tests {
                 }
                 let mut invalid = run.clone();
                 invalid.outputs.pop();
-                assert!(invalid.call().is_err());
+                assert!(invalid.call(None).is_err());
                 let mut invalid = run.clone();
                 std::sync::Arc::make_mut(&mut invalid.metadata)
                     .requirements
                     .distinct_elements
                     .push(vec![crate::MemoryOperand::Output(2)]);
-                assert!(invalid.call().is_err());
+                assert!(invalid.call(None).is_err());
                 assert_eq!(call.input_addresses.len(), 3);
                 assert_ne!(call.output_address, call.input_addresses[2]);
                 assert_eq!(call.arguments, vec![1, 9216]);
@@ -484,7 +480,7 @@ mod tests {
         assert_eq!(fused.outputs, program.outputs);
         let graph = crate::expand_tiles(&fused).unwrap();
         for run in &graph.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
         }
         assert!(
             graph
@@ -514,15 +510,13 @@ mod tests {
             .expect("partial residual statistics should save a scan");
         let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
         let placement = crate::place(&low).unwrap();
-        let kernels = crate::KernelBuildPlan::from_program(&low).unwrap();
         let mut applied = 0;
         for run in &low.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
             let call = crate::materialize_kernel_run(
                 run,
                 &low.shards,
                 &placement.shard_addresses,
-                &kernels,
                 &BTreeMap::new(),
             )
             .unwrap();

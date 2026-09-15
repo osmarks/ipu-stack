@@ -5,12 +5,14 @@ use crate::mid::MidOperationKind;
 
 use serde::{Deserialize, Serialize};
 
-pub(super) fn cycles(implementation: &KernelImplementation) -> u64 {
-    let KernelImplementation::Gemm(multiply, weights, inner_block, output_columns, _, rows, group) =
-        *implementation
-    else {
-        return u64::MAX;
-    };
+fn cycles(
+    multiply: Precision,
+    weights: GemmWeightLoad,
+    inner_block: u32,
+    output_columns: u32,
+    rows: u32,
+    group: u32,
+) -> u64 {
     let rows = u64::from(rows);
     let columns = u64::from(output_columns);
     // Native FP8 uses the same instruction sequence for 32 K
@@ -149,6 +151,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
+    build: Option<&mut KernelObjects>,
 ) -> Result<KernelCall, KernelError> {
     check_arity(inputs, outputs, 2, 1)?;
     let output = outputs[0];
@@ -159,7 +162,7 @@ pub(super) fn call(
         inner_block,
         output_columns,
         mode,
-        ..
+        axes,
     } = *kernel
     else {
         return Err(KernelError::RequirementMismatch);
@@ -179,18 +182,32 @@ pub(super) fn call(
         ),
         _ => (multiply, Vec::new()),
     };
-    Ok(KernelCall {
-        implementation: KernelImplementation::Gemm(
+    let rows = gemm_rows(output)?;
+    let group = output.format.layout.order.gemm_output_group().unwrap_or(0);
+    if let Some(build) = build {
+        build
+            .gemms
+            .entry((precision, weights, inner_block, output_columns, group))
+            .or_default()
+            .insert(rows);
+    }
+    let mut call = KernelCall::new(
+        specialized_gemm_symbol(
             precision,
             weights,
+            mode,
             inner_block,
             output_columns,
-            mode,
-            gemm_rows(output)?,
-            output.format.layout.order.gemm_output_group().unwrap_or(0),
+            rows,
+            group,
         ),
         arguments,
-    })
+        cycles(precision, weights, inner_block, output_columns, rows, group),
+    );
+    if precision == Precision::F16 {
+        call.padding = input_padding(inputs[0], inputs[1], axes, inner_block)?;
+    }
+    Ok(call)
 }
 
 /// Packed stores use the leading address of one column group, with the row
@@ -254,46 +271,42 @@ pub(crate) fn gemm_rows(output: TensorStorage<'_>) -> Result<u32, KernelError> {
 }
 
 pub(super) fn specialized_gemm_symbol(
-    prefix: &str,
+    precision: Precision,
+    weights: GemmWeightLoad,
     mode: GemmKernelMode,
-    weight_suffix: &str,
-    inner_block: u32,
-    output_columns: u32,
-    size: &str,
-    small_rows: u32,
-    large_rows: u32,
+    inner: u32,
+    columns: u32,
+    rows: u32,
+    group: u32,
 ) -> String {
+    let prefix = match precision {
+        Precision::F16 => "f16",
+        Precision::F32 => "f32",
+        Precision::F8F143 { .. } => "f8",
+    };
+    let weights = if weights == GemmWeightLoad::Interleaved {
+        "_interleaved"
+    } else {
+        ""
+    };
+    let packed = if group == 0 {
+        String::new()
+    } else {
+        format!("_packed{group}")
+    };
     let operation = match mode {
         GemmKernelMode::Initialize => "init",
         GemmKernelMode::Accumulate => "accumulate",
     };
-    format!(
-        "gemm_{prefix}_{operation}_{size}_rows{weight_suffix}_k{inner_block}_c{output_columns}_r{small_rows}_r{large_rows}"
-    )
+    format!("gemm_{prefix}_{operation}_rows{weights}{packed}_k{inner}_c{columns}_r{rows}")
 }
 
-impl KernelBuildPlan {
-    pub(super) fn add_gemms(&mut self, implementations: &BTreeSet<KernelImplementation>) {
-        let mut rows = BTreeMap::<_, BTreeSet<_>>::new();
-        for key in implementations {
-            if let KernelImplementation::Gemm(
-                precision,
-                weights,
-                inner,
-                columns,
-                mode,
-                count,
-                group,
-            ) = key
-            {
-                rows.entry((*precision, *weights, *inner, *columns, *group))
-                    .or_default()
-                    .insert((*count, *mode));
-            }
-        }
-        for ((precision, weights, inner_block, output_columns, output_group), used) in rows {
-            let mut values = used.iter().map(|&(rows, _)| rows).collect::<Vec<_>>();
-            values.dedup();
+impl KernelObjects {
+    pub(super) fn add_gemms(&mut self) {
+        for ((precision, weights, inner_block, output_columns, output_group), rows) in
+            std::mem::take(&mut self.gemms)
+        {
+            let values = rows.into_iter().collect::<Vec<_>>();
             let (source, prefix) = match precision {
                 Precision::F16 => ("gemm_f16_amp.S", "f16"),
                 Precision::F32 => ("gemm_f32_64_amp.S", "f32"),
@@ -357,22 +370,21 @@ impl KernelBuildPlan {
             for pair in values.chunks(2) {
                 let small = pair[0];
                 let large = *pair.last().expect("nonempty GEMM row pair");
-                let variants = [
-                    (GemmKernelMode::Initialize, "small", small),
-                    (GemmKernelMode::Initialize, "large", large),
-                    (GemmKernelMode::Accumulate, "small", small),
-                    (GemmKernelMode::Accumulate, "large", large),
-                ];
-                let symbols = variants.map(|(mode, size, _)| {
+                let symbols = [
+                    (GemmKernelMode::Initialize, small),
+                    (GemmKernelMode::Initialize, large),
+                    (GemmKernelMode::Accumulate, small),
+                    (GemmKernelMode::Accumulate, large),
+                ]
+                .map(|(mode, rows)| {
                     specialized_gemm_symbol(
-                        prefix,
+                        precision,
+                        weights,
                         mode,
-                        &weight_suffix,
                         inner_block,
                         output_columns,
-                        size,
-                        small,
-                        large,
+                        rows,
+                        output_group,
                     )
                 });
                 let single_rows = pair.len() == 1;
@@ -399,26 +411,34 @@ impl KernelBuildPlan {
                 if single_rows {
                     flags.push("-DGEMM_SINGLE_ROWS=1".into());
                 }
+                if precision == Precision::F32 {
+                    // This source has fixed entry-point names and emits both
+                    // row stubs even for a single-row-count object.
+                    for (index, entry) in [
+                        "init_small",
+                        "init_large",
+                        "accumulate_small",
+                        "accumulate_large",
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let unused = if single_rows && index % 2 != 0 {
+                            "_unused"
+                        } else {
+                            ""
+                        };
+                        flags.push(format!(
+                            "-Dgemm_f32_{entry}_rows={}{unused}",
+                            symbols[index]
+                        ));
+                    }
+                    for mode in ["init", "accumulate"] {
+                        flags.push(format!("-Dgemm_f32_{mode}_common=gemm_f32_{mode}_k{inner_block}_c{output_columns}_r{small}_r{large}"));
+                    }
+                }
                 if weights == GemmWeightLoad::Interleaved {
                     flags.push("-DGEMM_INTERLEAVED_WEIGHTS=1".into());
-                }
-                for (index, (symbol, (mode, _, rows))) in
-                    symbols.into_iter().zip(variants).enumerate()
-                {
-                    if used.contains(&(rows, mode)) && (index % 2 == 0 || !single_rows) {
-                        self.symbols.insert(
-                            KernelImplementation::Gemm(
-                                precision,
-                                weights,
-                                inner_block,
-                                output_columns,
-                                mode,
-                                rows,
-                                output_group,
-                            ),
-                            symbol,
-                        );
-                    }
                 }
                 self.add_compilation(KernelCompilation {
                 source,
@@ -479,26 +499,22 @@ pub(crate) fn f16_packed_gemm_cycles(
     )
 }
 
-pub(super) fn input_padding(
-    run: &KernelRun,
+fn input_padding(
+    input: TensorStorage<'_>,
+    weights: TensorStorage<'_>,
+    axes: GemmAxes,
     inner: u32,
 ) -> Result<PaddingRequirement, KernelError> {
-    let input = &run.inputs[0];
-    let MidOperationKind::Gemm { axes, .. } = run.kernel else {
-        return Err(KernelError::RequirementMismatch);
-    };
-    let mut region = input.clone();
-    let mut zero = run.inputs[1].clone();
     let left = axes
         .left_inner
-        .resolve(region.extents.len())
+        .resolve(input.extents.len())
         .map_err(|_| KernelError::RequirementMismatch)?;
     let right = axes
         .right_inner
-        .resolve(zero.extents.len())
+        .resolve(weights.extents.len())
         .map_err(|_| KernelError::RequirementMismatch)?;
-    let l = region.extents[left];
-    let r = zero.extents[right];
+    let l = input.extents[left];
+    let r = weights.extents[right];
     if l.start != r.start {
         return Ok(PaddingRequirement::Required);
     }
@@ -511,17 +527,19 @@ pub(super) fn input_padding(
     if start >= end {
         return Ok(PaddingRequirement::Required);
     }
+    let mut region = input.extents.to_vec();
+    let mut zero = weights.extents.to_vec();
     // Discarded rows must remain zero; finite values there can
     // overflow even though the corresponding outputs are unused.
-    for (axis, extent) in region.extents.iter_mut().enumerate() {
+    for (axis, extent) in region.iter_mut().enumerate() {
         if axis != left {
             extent.physical_end = extent.logical_end;
         }
     }
     for (view, axis) in [(&mut region, left), (&mut zero, right)] {
-        view.extents[axis].start = start;
-        view.extents[axis].logical_end = start;
-        view.extents[axis].physical_end = end;
+        view[axis].start = start;
+        view[axis].logical_end = start;
+        view[axis].physical_end = end;
     }
     Ok(PaddingRequirement::FiniteIfZero { region, zero })
 }

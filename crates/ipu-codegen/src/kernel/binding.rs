@@ -119,7 +119,7 @@ impl KernelRun {
     }
 
     pub(crate) fn cycles(&self) -> u64 {
-        self.call().map_or(u64::MAX, |call| call.cycles())
+        self.call(None).map_or(u64::MAX, |call| call.cycles)
     }
 
     pub(super) fn geometry(&self, operand: MemoryOperand) -> TensorStorage<'_> {
@@ -200,7 +200,7 @@ impl KernelRun {
             inputs,
             outputs,
         };
-        run.call()?;
+        run.call(None)?;
         if matches!(run.kernel, MidOperationKind::Gemm { .. }) {
             run.product_flops = Some(gemm::product_flops(&run)?);
         }
@@ -259,45 +259,32 @@ pub(super) fn fp8_scale_argument(scale: i32) -> Result<u32, KernelError> {
     }
 }
 
-/// The same key selects a build recipe and resolves its eventual call.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum KernelImplementation {
-    Exact(&'static str),
-    Gemm(
-        Precision,
-        GemmWeightLoad,
-        u32,
-        u32,
-        GemmKernelMode,
-        u32,
-        u32,
-    ),
-    Attention(AttentionKernelShape),
-    Softmax(u32, u32, u32, Precision),
-    Merge(u32, u32, Precision),
-    Rearrange((ElementOrder, u32, u32, u32, u32)),
-    Unpack((ElementOrder, u32, u32, u32, u32)),
-}
-
-/// Derived facts for one bound invocation. The implementation key is complete
-/// before build collection; only its linked symbol and operand addresses remain.
+/// Results of family selection. Costs and access proofs use the same local
+/// dimensions as the ABI; no later pass decodes argument words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KernelCall {
-    pub(super) implementation: KernelImplementation,
+    pub symbol: String,
     pub arguments: Vec<u32>,
+    pub cycles: u64,
+    pub padding: PaddingRequirement,
 }
 
 impl KernelCall {
-    pub(super) fn exact(symbol: &'static str, arguments: Vec<u32>) -> Self {
+    pub(super) fn new(symbol: impl Into<String>, arguments: Vec<u32>, cycles: u64) -> Self {
         Self {
-            implementation: KernelImplementation::Exact(symbol),
+            symbol: symbol.into(),
             arguments,
+            cycles,
+            padding: PaddingRequirement::Required,
         }
     }
 }
 
 impl KernelRun {
-    pub(crate) fn call(&self) -> Result<KernelCall, KernelError> {
+    pub(crate) fn call(
+        &self,
+        build: Option<&mut KernelObjects>,
+    ) -> Result<KernelCall, KernelError> {
         if self.inputs.len() != self.requirements.inputs.len()
             || self.outputs.len() != self.requirements.outputs.len()
             || self
@@ -315,7 +302,7 @@ impl KernelRun {
         let outputs = (0..self.outputs.len())
             .map(|index| self.geometry(MemoryOperand::Output(index as u16)))
             .collect::<Vec<_>>();
-        KernelCall::select(&self.kernel, &inputs, &outputs)
+        KernelCall::select(&self.kernel, &inputs, &outputs, build)
     }
 }
 
@@ -425,27 +412,12 @@ pub(super) fn f16_row_width(
     Ok(width)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PaddingRequirement {
     Required,
-    Unread(Vec<ShardView>),
-    FiniteIfZero { region: ShardView, zero: ShardView },
-}
-
-impl KernelCall {
-    pub(crate) fn input_padding(
-        &self,
-        run: &KernelRun,
-        operand: usize,
-    ) -> Result<PaddingRequirement, KernelError> {
-        if operand != 0 {
-            return Ok(PaddingRequirement::Required);
-        }
-        match self.implementation {
-            KernelImplementation::Exact("cast_f16_f8") => cast::input_padding(self, run),
-            KernelImplementation::Gemm(Precision::F16, _, inner, _, _, _, _) => {
-                gemm::input_padding(run, inner)
-            }
-            _ => Ok(PaddingRequirement::Required),
-        }
-    }
+    Unread(Vec<Vec<crate::ShardExtent>>),
+    FiniteIfZero {
+        region: Vec<crate::ShardExtent>,
+        zero: Vec<crate::ShardExtent>,
+    },
 }

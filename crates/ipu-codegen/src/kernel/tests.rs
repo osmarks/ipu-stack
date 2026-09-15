@@ -23,7 +23,6 @@ fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
         .with_input(bias, format);
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-    let build = KernelBuildPlan::from_program(&low).unwrap();
     let addresses = low
         .shards
         .iter()
@@ -31,7 +30,7 @@ fn column_sharded_add_partitions_multi_row_broadcast_parameters() {
         .collect();
     for run in &low.kernel_runs {
         if matches!(run.kernel, MidOperationKind::Add) {
-            materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new()).unwrap();
+            materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new()).unwrap();
             assert_eq!(
                 run.inputs[1].extents.last().unwrap().physical_end
                     - run.inputs[1].extents.last().unwrap().start,
@@ -61,7 +60,6 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
         .with_input(y, format);
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-    let build = KernelBuildPlan::from_program(&low).unwrap();
     let addresses = low
         .shards
         .iter()
@@ -75,7 +73,7 @@ fn packed_add_keeps_padding_in_dense_operand_view() {
                 ElementOrder::Amp(AmpOrder::Left)
             );
             packed_adds += 1;
-            materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new()).unwrap();
+            materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new()).unwrap();
         }
     }
     assert_eq!(packed_adds, 2);
@@ -101,7 +99,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
     config.operator_candidates = vec![crate::planner::OperatorCandidate::fp8_gemm(64, -4)];
     let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
     let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-    let plan = KernelBuildPlan::from_program(&low).unwrap();
+    let plan = KernelObjects::from_program(&low).unwrap();
     assert!(plan.compilations.iter().any(|compilation| {
         compilation
             .flags
@@ -127,7 +125,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                         run.requirements.outputs[0].layout.order,
                         ElementOrder::RowMajor
                     );
-                    let abi = run.call().unwrap();
+                    let abi = run.call(None).unwrap();
                     assert!(abi.arguments[3] > 0);
                 }
                 MidOperationKind::Gemm {
@@ -139,7 +137,7 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                     assert_eq!(multiply, fp8);
                     assert_eq!(accumulate, AccumulationPrecision::F16);
                     assert_eq!(run.requirements.outputs[0].precision, Precision::F16);
-                    assert_eq!(run.call().unwrap().arguments, vec![(-8i32) as u32]);
+                    assert_eq!(run.call(None).unwrap().arguments, vec![(-8i32) as u32]);
                     let mut rescaled = run.clone();
                     let metadata = std::sync::Arc::make_mut(&mut rescaled.metadata);
                     if let MidOperationKind::Gemm { multiply, .. } = &mut metadata.kernel {
@@ -149,10 +147,10 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
                         input.precision = Precision::F8F143 { scale_exponent: 1 };
                     }
                     assert_eq!(
-                        run.call().unwrap().implementation,
-                        rescaled.call().unwrap().implementation
+                        run.call(None).unwrap().symbol,
+                        rescaled.call(None).unwrap().symbol
                     );
-                    assert_eq!(rescaled.call().unwrap().arguments, vec![2]);
+                    assert_eq!(rescaled.call(None).unwrap().arguments, vec![2]);
                 }
                 _ => {}
             }
@@ -281,7 +279,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
             &crate::expand_tiles(&mid).unwrap(),
             config.diagnostic_checkpoints,
         );
-        let plan = KernelBuildPlan::from_program(&low).unwrap();
+        let plan = KernelObjects::from_program(&low).unwrap();
         let addresses = low
             .shards
             .iter()
@@ -304,13 +302,13 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 .count(),
             1
         );
-        let planned_rows = plan
-            .symbols
-            .keys()
-            .filter_map(|key| match key {
-                KernelImplementation::Gemm(_, _, _, _, _, rows, _) => Some(*rows),
-                _ => None,
-            })
+        let planned_rows = low
+            .kernel_runs
+            .iter()
+            .filter(|run| matches!(run.kernel, MidOperationKind::Gemm { .. }))
+            .map(|run| gemm_rows(run.geometry(MemoryOperand::Output(0))).unwrap())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         assert!(
             specialization
@@ -340,18 +338,15 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
                 }
             })
         {
-            let call = run.call().unwrap();
+            let call = run.call(None).unwrap();
             assert!(
                 plan.retained_symbols()
-                    .any(|symbol| symbol == plan.symbol(&call.implementation).unwrap())
+                    .any(|symbol| symbol == call.symbol.as_str())
             );
             assert!(call.arguments.is_empty());
-            let compute =
-                materialize_kernel_run(run, &low.shards, &addresses, &plan, &BTreeMap::new())
-                    .unwrap_or_else(|error| {
-                        panic!("batch={batch} tiles={tiles} run={run:?}: {error}")
-                    });
-            assert_eq!(compute.symbol, plan.symbol(&call.implementation).unwrap());
+            let compute = materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("batch={batch} tiles={tiles} run={run:?}: {error}"));
+            assert_eq!(compute.symbol, call.symbol.as_str());
             assert_eq!(compute.input_addresses.len(), 2);
         }
     }
@@ -359,6 +354,7 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
 
 #[test]
 fn attention_stages_support_multiple_configurations_and_block_sizes() {
+    let mut plan = KernelObjects::default();
     let mut stages = Vec::new();
     for head in [32, 64] {
         for padded in [32, 64] {
@@ -470,25 +466,17 @@ fn attention_stages_support_multiple_configurations_and_block_sizes() {
             &mut Vec::new(),
         )
         .unwrap();
-        let call = run.call().unwrap();
+        let call = run.call(Some(&mut plan)).unwrap();
         assert_eq!(call.arguments, expected);
         calls.push(call);
     }
-    let mut plan = KernelBuildPlan::default();
-    plan.add_attention(
-        &calls
-            .iter()
-            .map(|call| call.implementation.clone())
-            .collect(),
-    )
-    .unwrap();
     // Four dimension pairs each have full/masked softmax, plus two merges.
     // Query-row counts share assembly instead of producing more codelets.
     assert_eq!(plan.compilations.len(), 10);
     for call in calls {
         assert!(
             plan.retained_symbols()
-                .any(|symbol| symbol == plan.symbol(&call.implementation).unwrap())
+                .any(|symbol| symbol == call.symbol.as_str())
         );
     }
 }
@@ -498,9 +486,10 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
     // These layouts have identical matrix sizes and C++ order indices, but
     // require different worker code. They must coexist in one linked package.
     let targets = [(8, 16), (16, 8), (64, 16)];
-    let mut implementations = BTreeSet::new();
+    let mut plan = KernelObjects::default();
+    let mut calls = Vec::new();
     for (row_block, column_block) in targets {
-        implementations.insert(KernelImplementation::Rearrange((
+        calls.push(packing_call(
             ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                 row_block,
                 column_block,
@@ -509,9 +498,9 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
             128,
             128,
             128,
-        )));
+            Some(&mut plan),
+        ));
     }
-    let plan = KernelBuildPlan::from_implementations(implementations).unwrap();
     let objects = plan
         .compilations
         .iter()
@@ -520,17 +509,8 @@ fn block_rearrangements_have_distinct_objects_and_symbols() {
     assert_eq!(objects.len(), plan.compilations.len());
     let symbols = plan.retained_symbols().collect::<BTreeSet<_>>();
     assert_eq!(symbols.len(), targets.len());
-    for (row_block, column_block) in targets {
-        let symbol = &plan.symbols[&KernelImplementation::Rearrange((
-            ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                row_block,
-                column_block,
-            }),
-            128,
-            128,
-            128,
-            128,
-        ))];
+    for ((row_block, column_block), call) in targets.into_iter().zip(calls) {
+        let symbol = &call.symbol;
         assert!(symbols.contains(symbol.as_str()));
         let object = plan
             .compilations
@@ -599,13 +579,11 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
         },
     );
     let addresses = BTreeMap::from([(shard.id, 0x60000)]);
-    let plan = KernelBuildPlan::default();
     let materialize = |run: &KernelRun| {
         materialize_kernel_run(
             run,
             std::slice::from_ref(&shard),
             &addresses,
-            &plan,
             &BTreeMap::new(),
         )
     };
@@ -614,7 +592,7 @@ fn zero_ranges_use_range_arguments_and_stay_inside_the_output_view() {
         compute.output_address,
         TileAddress::Absolute(0x60000 + 32 + 16)
     );
-    assert_eq!(run.call().unwrap().arguments, vec![1, 1]);
+    assert_eq!(run.call(None).unwrap().arguments, vec![1, 1]);
     for (offset, bytes) in [(48, 56), (1, 8), (0, 7), (u32::MAX - 7, 16)] {
         let run = KernelRun::new(
             run.provenance,
@@ -655,7 +633,6 @@ fn packed_gemm_stores_bind_without_output_copies() {
                         distribution: crate::planner::operator::GemmDistribution::OutputStationary, .. } if candidate_orientation == orientation)));
             let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
             let low = lower_to_tiles(&crate::expand_tiles(&mid).unwrap(), false);
-            let build = KernelBuildPlan::from_program(&low).unwrap();
             let addresses = low
                 .shards
                 .iter()
@@ -677,8 +654,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
                     Some(64)
                 );
                 let step =
-                    materialize_kernel_run(run, &low.shards, &addresses, &build, &BTreeMap::new())
-                        .unwrap();
+                    materialize_kernel_run(run, &low.shards, &addresses, &BTreeMap::new()).unwrap();
                 assert!(step.symbol.contains("packed64"));
                 let source = &low.shards[run.outputs[0].shard.index() as usize];
                 assert_eq!(
@@ -693,11 +669,7 @@ fn packed_gemm_stores_bind_without_output_copies() {
 
 #[test]
 fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
-    let plan =
-        KernelBuildPlan::from_implementations(BTreeSet::from([KernelImplementation::Exact(
-            "cast_f32_f16",
-        )]))
-        .unwrap();
+    let mut plan = KernelObjects::default();
     for count in [1, 2, 11, 12, 13, 72, 729, 1152] {
         let format = |precision| TensorFormat {
             precision,
@@ -730,11 +702,11 @@ fn f32_to_f16_cast_calls_cover_partial_worker_waves() {
                 distinct_elements: Vec::new(),
             },
         );
-        let call = run.call().unwrap();
+        let call = run.call(Some(&mut plan)).unwrap();
         assert_eq!(call.arguments, [count]);
         assert!(
             plan.retained_symbols()
-                .any(|symbol| symbol == plan.symbol(&call.implementation).unwrap())
+                .any(|symbol| symbol == call.symbol.as_str())
         );
     }
 }
@@ -744,7 +716,8 @@ fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
     // 14 columns have a two-halfword tail: a 64-bit load would cross the row.
     // Sharing kernels across row tails must not erase this distinction.
     for columns in [14, 16] {
-        let shape = rearrange::rearrangement_specialization(
+        let mut plan = KernelObjects::default();
+        packing_call(
             ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
                 row_block: 64,
                 column_block: 16,
@@ -753,10 +726,8 @@ fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
             64,
             columns,
             16,
+            Some(&mut plan),
         );
-        let mut implementations = BTreeSet::new();
-        implementations.insert(KernelImplementation::Rearrange(shape));
-        let plan = KernelBuildPlan::from_implementations(implementations).unwrap();
         let source = plan
             .compilations
             .iter()
@@ -772,45 +743,6 @@ fn shared_row_tails_preserve_column_alignment_for_wide_packing() {
             }
         );
     }
-}
-
-#[test]
-fn worker_stack_support_follows_cpp_recipes() {
-    for (symbols, expected) in [
-        (vec![], false),
-        (vec!["gelu_f8", "reduce_sum_f16"], false),
-        (vec!["layer_norm_f16"], true),
-        (
-            vec!["layer_norm_f8", "add_layer_norm_moments", "add_f16"],
-            true,
-        ),
-    ] {
-        let plan = KernelBuildPlan::from_implementations(
-            symbols
-                .into_iter()
-                .map(KernelImplementation::Exact)
-                .collect(),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.compilations
-                .iter()
-                .filter(|unit| unit.source == "worker_support.S")
-                .count(),
-            usize::from(expected)
-        );
-    }
-    // The hand-written softmax worker does not use a compiler-managed stack.
-    let plan =
-        KernelBuildPlan::from_implementations(BTreeSet::from([KernelImplementation::Softmax(
-            64,
-            32,
-            32,
-            Precision::F16,
-        )]))
-        .unwrap();
-    assert_eq!(plan.compilations.len(), 1);
-    assert_eq!(plan.compilations[0].source, "attention_softmax_f16.S");
 }
 
 #[test]
@@ -863,7 +795,7 @@ fn unsupported_kernel_formats_fail_at_call_construction() {
             vec![view],
             requirements,
         );
-        assert_eq!(run.call(), Err(KernelError::Unavailable(kernel)));
+        assert_eq!(run.call(None), Err(KernelError::Unavailable(kernel)));
     }
 }
 
@@ -902,10 +834,10 @@ fn bias_gelu_rejects_broadcast_volume_overflow() {
             distinct_elements: vec![],
         },
     );
-    run.call().unwrap();
+    run.call(None).unwrap();
     // An unchecked u32 product wraps to the expected bias width of two.
     run.inputs[1] = view(1, [2, (1 << 31) + 1]);
-    assert_eq!(run.call(), Err(KernelError::ElementCountOverflow));
+    assert_eq!(run.call(None), Err(KernelError::ElementCountOverflow));
 }
 
 #[test]
@@ -957,14 +889,7 @@ fn binding_checks_backing_strides_before_placement() {
             if rows == 1 || columns == 16 {
                 let run = bound.unwrap();
                 let addresses = BTreeMap::from([(shards[0].id, 0x60000), (shards[1].id, 0x70000)]);
-                materialize_kernel_run(
-                    &run,
-                    &shards,
-                    &addresses,
-                    &KernelBuildPlan::default(),
-                    &BTreeMap::new(),
-                )
-                .unwrap();
+                materialize_kernel_run(&run, &shards, &addresses, &BTreeMap::new()).unwrap();
             } else {
                 assert!(matches!(bound, Err(KernelError::FragmentedView { .. })));
             }
@@ -994,7 +919,7 @@ fn binding_checks_backing_strides_before_placement() {
 }
 #[test]
 fn object_registration_reuses_identical_definitions_and_rejects_conflicts() {
-    let mut plan = KernelBuildPlan::default();
+    let mut plan = KernelObjects::default();
     let unit = KernelCompilation {
         source: "worker_support.S",
         name: "worker_support".into(),
@@ -1021,4 +946,46 @@ fn object_registration_reuses_identical_definitions_and_rejects_conflicts() {
         );
         assert_eq!(plan.compilations, vec![unit.clone()]);
     }
+}
+
+fn packing_call(
+    order: ElementOrder,
+    rows: u32,
+    physical_rows: u32,
+    columns: u32,
+    physical_columns: u32,
+    build: Option<&mut KernelObjects>,
+) -> KernelCall {
+    let source = TensorFormat {
+        precision: Precision::F16,
+        layout: Layout::row_sharded(1),
+    };
+    let mut target = source.clone();
+    target.layout.order = order;
+    let extents = [(rows, physical_rows), (columns, physical_columns)]
+        .into_iter()
+        .enumerate()
+        .map(|(axis, (logical_end, physical_end))| ShardExtent {
+            axis: axis as u16,
+            start: 0,
+            logical_end,
+            physical_end,
+        })
+        .collect::<Vec<_>>();
+    KernelCall::select(
+        &MidOperationKind::Rearrange {
+            from: source.layout.clone(),
+            to: target.layout.clone(),
+        },
+        &[TensorStorage {
+            format: &source,
+            extents: &extents,
+        }],
+        &[TensorStorage {
+            format: &target,
+            extents: &extents,
+        }],
+        build,
+    )
+    .unwrap()
 }

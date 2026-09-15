@@ -270,7 +270,7 @@ mod tests {
         assert!(matches!(fused.operations[1].kind, MidOperationKind::Gelu));
         let graph = crate::expand_tiles(&fused).unwrap();
         for run in &graph.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
         }
         // Independent arithmetic may intervene; an aliased write may not.
         let mut independent = program.clone();
@@ -317,7 +317,7 @@ mod tests {
         assert!(matches!(last.kind, MidOperationKind::LayerNorm));
         let graph = crate::expand_tiles(&fused_norm).unwrap();
         for run in &graph.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
         }
         let mut bias = norm.clone();
         bias.operations[0].inputs.truncate(2);
@@ -331,7 +331,7 @@ mod tests {
         assert_ne!(last.inputs[1], bias.operations[0].inputs[1]);
         let graph = crate::expand_tiles(&fused_bias).unwrap();
         for run in &graph.kernel_runs {
-            run.call().unwrap();
+            run.call(None).unwrap();
         }
         program.outputs.push(MidValueId::from_index(1));
         assert!(crate::planner::fusion::fuse(&program).is_none());
@@ -445,9 +445,9 @@ mod tests {
                 if let Some(fused) = fused {
                     let low = crate::lower_to_tiles(&crate::expand_tiles(&fused).unwrap(), false);
                     assert_eq!(low.kernel_runs.len(), 1);
-                    low.kernel_runs[0].call().unwrap();
-                    crate::KernelBuildPlan::from_program(&low).unwrap();
-                    let call = low.kernel_runs[0].call().unwrap();
+                    low.kernel_runs[0].call(None).unwrap();
+                    crate::KernelObjects::from_program(&low).unwrap();
+                    let call = low.kernel_runs[0].call(None).unwrap();
                     let mut expected = vec![rows, 1152, (-4i32) as u32, 1];
                     if !norm {
                         expected.extend([1152, 1152]);
@@ -544,7 +544,7 @@ mod tests {
                             run.kernel,
                             MidOperationKind::BiasGelu | MidOperationKind::AddLayerNorm
                         ) {
-                            run.call().unwrap();
+                            run.call(None).unwrap();
                             count += 1;
                         }
                     }

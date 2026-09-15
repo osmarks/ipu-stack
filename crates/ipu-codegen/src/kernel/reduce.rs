@@ -8,6 +8,7 @@ pub(super) fn call(
     kernel: &MidOperationKind,
     inputs: &[TensorStorage<'_>],
     outputs: &[TensorStorage<'_>],
+    build: Option<&mut KernelObjects>,
 ) -> Result<KernelCall, KernelError> {
     let MidOperationKind::ReductionSum { partials } = *kernel else {
         return Err(KernelError::RequirementMismatch);
@@ -40,9 +41,17 @@ pub(super) fn call(
             divisor: 8,
         });
     }
-    Ok(KernelCall::exact(
+    if let Some(build) = build {
+        build.add_compilation(KernelCompilation {
+            source: "reduce_add_f16.S",
+            name: "reduce_add_f16".into(),
+            flags: Vec::new(),
+        });
+    }
+    Ok(KernelCall::new(
         "reduce_sum_f16",
         vec![u32::from(partials - 1), count],
+        f16_reduction_cycles(count.into(), partials.into()),
     ))
 }
 
@@ -59,18 +68,6 @@ pub(crate) fn f16_reduction_cycles(elements: u64, partials: u64) -> u64 {
             .saturating_mul(6)
             .saturating_mul(11u64.saturating_add(partials.saturating_sub(1).saturating_mul(2))),
     )
-}
-
-impl KernelBuildPlan {
-    pub(super) fn add_reduction(&mut self, exact_symbols: &BTreeSet<&'static str>) {
-        if exact_symbols.contains("reduce_sum_f16") {
-            self.add_compilation(KernelCompilation {
-                source: "reduce_add_f16.S",
-                name: "reduce_add_f16".into(),
-                flags: Vec::new(),
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -114,6 +111,7 @@ mod tests {
                 &MidOperationKind::ReductionSum { partials: 1 },
                 &[geometry],
                 &[geometry],
+                None,
             )
             .unwrap();
             let [whole, remainder] = call.arguments.as_slice() else {
@@ -127,11 +125,8 @@ mod tests {
                 covered.extend(start * 8..(start + count) * 8);
             }
             assert_eq!(covered, (0..elements * 2).collect::<Vec<_>>());
-            assert_eq!(
-                call.implementation,
-                KernelImplementation::Exact(copy::COPY_U64_SYMBOL)
-            );
-            assert!(call.cycles() >= 246);
+            assert_eq!(call.symbol, copy::COPY_U64_SYMBOL);
+            assert!(call.cycles >= 246);
         }
     }
 }

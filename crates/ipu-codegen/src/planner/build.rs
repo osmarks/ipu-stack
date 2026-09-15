@@ -660,7 +660,7 @@ mod tests {
             let low = crate::low::expand::expand_tiles(&baseline, false).unwrap();
             let low = crate::lower_to_tiles(&low, false);
             for run in &low.kernel_runs {
-                run.call().unwrap();
+                run.call(None).unwrap();
             }
             crate::place(&low).unwrap();
         }

@@ -502,8 +502,8 @@ pub(crate) fn operation_cost(
                     extents,
                 })
                 .collect::<Vec<_>>();
-            price.total = crate::kernel::KernelCall::select(kernel, &inputs, &outputs)
-                .map_or(u64::MAX, |call| call.cycles());
+            price.total = crate::kernel::KernelCall::select(kernel, &inputs, &outputs, None)
+                .map_or(u64::MAX, |call| call.cycles);
         }
     }
     Some((price, scratch, rows))

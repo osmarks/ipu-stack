@@ -1,6 +1,6 @@
-//! Each family owns its specs, call geometry, costs, and device build rules.
-//! `binding` shares ABI and operand checks; `build` collects implementations
-//! and supplies compilation/wrapper helpers. Placement only supplies addresses.
+//! Each family constructs its ABI, cost and padding contract together.
+//! `binding` shares operand checks; `build` collects object definitions and
+//! supplies compilation/wrapper helpers. Placement only supplies addresses.
 
 use crate::storage::TensorStorage;
 
@@ -19,7 +19,6 @@ pub(crate) mod reduce;
 pub use gemm::{AccumulationPrecision, GemmAxes, GemmKernelMode, GemmWeightLoad};
 #[cfg(test)]
 mod tests;
-use attention::AttentionKernelShape;
 pub(crate) use attention::softmax_workspaces;
 pub(crate) use binding::*;
 pub(crate) use build::*;
@@ -64,108 +63,46 @@ impl KernelCall {
         kernel: &crate::mid::MidOperationKind,
         inputs: &[TensorStorage<'_>],
         outputs: &[TensorStorage<'_>],
+        mut build: Option<&mut KernelObjects>,
     ) -> Result<Self, KernelError> {
         use crate::mid::MidOperationKind::*;
-        match kernel {
-            Gemm { .. } => gemm::call(kernel, inputs, outputs),
-            Gelu | BiasGelu | Add => pointwise::call(kernel, inputs, outputs),
+        let call = match kernel {
+            Gemm { .. } => gemm::call(kernel, inputs, outputs, build.as_deref_mut()),
+            Gelu | BiasGelu | Add => pointwise::call(kernel, inputs, outputs, build.as_deref_mut()),
             LayerNorm
             | AddLayerNorm
             | LayerNormMoments
             | AddLayerNormMoments
-            | LayerNormApply { .. } => normalization::call(kernel, inputs, outputs),
-            FlashAttention { .. } | AttentionSoftmax { .. } | AttentionMerge { .. } => {
-                attention::call(kernel, inputs, outputs)
+            | LayerNormApply { .. } => {
+                normalization::call(kernel, inputs, outputs, build.as_deref_mut())
             }
-            Cast { .. } => cast::call(kernel, inputs, outputs),
-            Rearrange { .. } => rearrange::call(kernel, inputs, outputs),
-            ReductionSum { .. } => reduce::call(kernel, inputs, outputs),
+            FlashAttention { .. } | AttentionSoftmax { .. } | AttentionMerge { .. } => {
+                attention::call(kernel, inputs, outputs, build.as_deref_mut())
+            }
+            Cast { .. } => cast::call(kernel, inputs, outputs, build.as_deref_mut()),
+            Rearrange { .. } => rearrange::call(kernel, inputs, outputs, build.as_deref_mut()),
+            ReductionSum { .. } => reduce::call(kernel, inputs, outputs, build.as_deref_mut()),
             FillZero { .. } => copy::fill_call(kernel, inputs, outputs),
             _ => Err(KernelError::RequirementMismatch),
+        }?;
+        if let Some(build) = build {
+            build.symbols.insert(call.symbol.clone());
         }
-    }
-
-    /// Price the selected implementation and its actual scalar arguments.
-    pub(crate) fn cycles(&self) -> u64 {
-        match &self.implementation {
-            KernelImplementation::Gemm(..) => gemm::cycles(&self.implementation),
-            KernelImplementation::Attention(_)
-            | KernelImplementation::Softmax(..)
-            | KernelImplementation::Merge(..) => attention::cycles(self),
-            KernelImplementation::Rearrange(_) | KernelImplementation::Unpack(_) => {
-                rearrange::cycles(self)
-            }
-            // Decode the exact ABI once; family helpers price typed dimensions.
-            KernelImplementation::Exact(symbol) => match (*symbol, self.arguments.as_slice()) {
-                ("gelu_tanh_approx_f16", &[count]) => {
-                    pointwise::gelu_row_cycles(count.into(), false)
-                }
-                ("bias_gelu_f16", &[rows, width]) => {
-                    pointwise::f16_bias_gelu_cycles(rows.into(), width.into())
-                }
-                ("add_f16", &[count, left, right]) => {
-                    pointwise::f16_add_cycles(count.into(), left.into(), right.into())
-                }
-                ("gelu_f8", &[rows, width, ..]) => {
-                    pointwise::fp8_gelu_cycles(rows.into(), width.into())
-                }
-                ("bias_gelu_f8", &[rows, width, _, packed, ..]) => {
-                    pointwise::fp8_bias_gelu_cycles(rows.into(), width.into(), packed != 0)
-                }
-                ("layer_norm_f16" | "add_layer_norm_f16", &[rows, width]) => {
-                    normalization::layernorm_cycles(
-                        rows.into(),
-                        width.into(),
-                        *symbol == "add_layer_norm_f16",
-                        true,
-                    )
-                }
-                ("layer_norm_f8", &[rows, width, _, packed]) => {
-                    normalization::fp8_layernorm_cycles(rows.into(), width.into(), packed != 0)
-                }
-                ("layer_norm_moments" | "add_layer_norm_moments", &[rows, width]) => {
-                    normalization::f16_layernorm_moments_cycles(
-                        rows.into(),
-                        width.into(),
-                        *symbol == "add_layer_norm_moments",
-                    )
-                }
-                ("layer_norm_apply", &[rows, width, parts]) => {
-                    normalization::f16_layernorm_apply_cycles(
-                        rows.into(),
-                        width.into(),
-                        parts as u16,
-                    )
-                }
-                ("cast_f16_f8", &[count, _, _, panel_rows, ..]) => {
-                    cast::f16_fp8_cycles(count.into(), panel_rows.into())
-                }
-                ("cast_f32_f16", &[count, ..]) => cast::stream_cycles(count.into(), 4, 2),
-                ("cast_f8_f8", &[count, ..]) => cast::stream_cycles(count.into(), 1, 1),
-                ("cast_f8_f16", &[count, ..]) => cast::stream_cycles(count.into(), 1, 2),
-                ("cast_f8_f32", &[count, ..]) => cast::stream_cycles(count.into(), 1, 4),
-                ("cast_f32_f8", &[count, ..]) => cast::stream_cycles(count.into(), 4, 1),
-                ("reduce_sum_f16", &[partials, count]) => {
-                    reduce::f16_reduction_cycles(count.into(), u64::from(partials) + 1)
-                }
-                _ => copy::cycles(symbol, &self.arguments),
-            },
-        }
+        Ok(call)
     }
 }
 
 /// Resolves one scheduled call after placement has assigned each shard base.
-/// Layout conversion supplies the byte offset; the build plan supplies the
-/// linked specialization and ABI scalar values.
+/// Layout conversion supplies byte offsets; family construction supplies the
+/// entry-point name and ABI scalar values independently of object collection.
 pub fn materialize_kernel_run(
     run: &KernelRun,
     shards: &[BlockValue],
     shard_addresses: &BTreeMap<BlockValueId, u32>,
-    plan: &KernelBuildPlan,
     overrides: &BTreeMap<BlockValueId, TileAddress>,
 ) -> Result<ComputeStep, KernelError> {
-    let call = run.call()?;
-    let symbol = plan.symbol(&call.implementation)?.to_owned();
+    let call = run.call(None)?;
+    let symbol = call.symbol;
     let resolve = |operand: MemoryOperand| -> Result<TileAddress, KernelError> {
         let view = run
             .operand_view(operand)
