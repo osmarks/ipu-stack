@@ -123,26 +123,25 @@ pub(super) fn emit_selected(
     let fragment = fragments
         .get(plan, &input_types, &output)
         .ok_or(LoweringError::InvalidImplementation)?;
-    let result = state.value(operation.results[0], output);
-    if matches!(
-        operation.kind,
-        OperationKind::View(_) | OperationKind::Slice(_)
-    ) && inputs.iter().any(|id| state.parameter_values.contains(id))
-    {
-        state.parameter_values.insert(result);
-    }
-    crate::mid::append_fragment(
+    let results = crate::mid::append_fragment(
         &fragment,
         &bound,
-        &[result],
         &crate::tensor::OwnerMap::default(),
         Some(operation.id),
+        operation.results[0],
         tile_count,
         &mut state.values,
         operations,
     )
     .ok_or(LoweringError::InvalidImplementation)?;
-    values.insert(operation.results[0], result);
+    if matches!(
+        operation.kind,
+        OperationKind::View(_) | OperationKind::Slice(_)
+    ) && inputs.iter().any(|id| state.parameter_values.contains(id))
+    {
+        state.parameter_values.extend(&results);
+    }
+    values.extend(operation.results.iter().copied().zip(results));
     Ok(())
 }
 

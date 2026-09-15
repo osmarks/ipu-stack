@@ -1,62 +1,32 @@
-//! Bind an already executable fragment into an enclosing mid region.
-use super::{CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId};
-use crate::graph::OperationId;
-use crate::low::{CopyPolicy, PackingPolicy};
-use std::collections::BTreeMap;
+//! Bind executable work to enclosing inputs and return its actual result values.
+use super::{MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId};
+use crate::graph::{OperationId, ValueId};
+use crate::tensor::OwnerMap;
 
-/// Substitute complete boundary bindings, preserving the fragment's operations
-/// and ownership groups. Unbound groups use the explicit working embedding
-/// unless the fragment declares one, preserving relative rotations. A small
-/// result's embedding does not restrict the fragment's intermediate work.
-/// Groups shared with a boundary retain that boundary's mapping instead.
-/// New temporaries belong to the caller's semantic result for diagnostics.
-/// A returned input is connected to a distinct caller result by an explicit
-/// identity copy, which ordinary copy lowering can reuse locally.
+/// Inputs keep their existing ownership groups; new groups use the working
+/// embedding and the fragment's relative rotations. Result homes are chosen by
+/// the ordinary ownership pass, rather than by preallocating boundary slots.
+/// Returning an input or returning one value twice needs no extra operation.
 /// Failure leaves both caller vectors unchanged.
 pub(crate) fn append_fragment(
     fragment: &MidProgram,
     inputs: &[MidValueId],
-    outputs: &[MidValueId],
-    working: &crate::tensor::OwnerMap,
+    working: &OwnerMap,
     source: Option<OperationId>,
+    origin: ValueId,
     tile_count: u16,
     values: &mut Vec<MidValue>,
     operations: &mut Vec<MidOperation>,
-) -> Option<()> {
-    if tile_count == 0
-        || fragment.tile_count > tile_count
-        || fragment.inputs.len() != inputs.len()
-        || fragment.outputs.len() != outputs.len()
+) -> Option<Vec<MidValueId>> {
+    if tile_count == 0 || fragment.tile_count > tile_count || fragment.inputs.len() != inputs.len()
     {
         return None;
     }
     fragment.validate().ok()?;
     let mut ids = vec![None; fragment.values.len()];
     let mut groups = vec![None; fragment.values.len()];
-    let mut returned = Vec::new();
-    let mut output_bindings = BTreeMap::new();
-    for (&from, &to) in fragment.outputs.iter().zip(outputs) {
-        if output_bindings
-            .insert(to, from)
-            .is_some_and(|old| old != from)
-        {
-            return None;
-        }
-    }
-    let bindings = fragment
-        .inputs
-        .iter()
-        .zip(inputs)
-        .map(|(input, &to)| (true, input.value, to))
-        .chain(
-            fragment
-                .outputs
-                .iter()
-                .zip(outputs)
-                .map(|(&from, &to)| (false, from, to)),
-        );
-    for (input, from, to) in bindings {
-        let template = &fragment.values[from.index() as usize];
+    for (input, &to) in fragment.inputs.iter().zip(inputs) {
+        let template = &fragment.values[input.value.index() as usize];
         let actual = values.get(to.index() as usize)?;
         if actual.id != to
             || actual.tensor_type != template.tensor_type
@@ -71,106 +41,78 @@ pub(crate) fn append_fragment(
                 tile_count,
             )
             .ok()?;
-        if let Some(existing) = ids[from.index() as usize] {
-            if existing != to {
-                if input || inputs.contains(&to) {
-                    return None;
-                }
-                if !returned.contains(&(existing, to)) {
-                    returned.push((existing, to));
-                }
-            }
-            continue;
-        }
-        if !input && inputs.contains(&to) {
-            return None; // A computed result cannot redefine an enclosing input.
-        }
-        let group = &mut groups[template.storage_group.index() as usize];
         let binding = (
             actual.storage_group,
             actual
                 .owners
                 .shifted(-i32::from(template.owners.rotation()), tile_count)?,
         );
+        let group = &mut groups[template.storage_group.index() as usize];
         if group.as_ref().is_some_and(|old| old != &binding) {
-            return None; // Bound members of one ownership group must agree.
+            return None;
         }
         *group = Some(binding);
-        ids[from.index() as usize] = Some(to);
+        ids[input.value.index() as usize] = Some(to);
     }
-    let origin = outputs
-        .first()
-        .or_else(|| inputs.first())
-        .map(|to| values[to.index() as usize].origin);
-    let mut next = values.len();
-    for value in &fragment.values {
-        let binding = &mut ids[value.id.index() as usize];
-        if binding.is_none() {
-            let id = MidValueId::from_index(u32::try_from(next).ok()?);
-            next = next.checked_add(1)?;
-            *binding = Some(id);
-            let owners = if value.owners.has_embedding() {
-                value.owners.with_rotation(working.rotation())
-            } else {
-                working.clone()
-            };
-            groups[value.storage_group.index() as usize].get_or_insert((id, owners));
+    let mut added = Vec::new();
+    // Allocate results first to retain the existing stable allocation order.
+    for &from in fragment
+        .outputs
+        .iter()
+        .chain(fragment.values.iter().map(|v| &v.id))
+    {
+        if ids[from.index() as usize].is_none() {
+            let id = MidValueId::from_index(u32::try_from(values.len() + added.len()).ok()?);
+            ids[from.index() as usize] = Some(id);
+            added.push(fragment.values[from.index() as usize].clone());
         }
     }
-    let mut added = Vec::with_capacity(next - values.len());
-    for template in &fragment.values {
-        let id = ids[template.id.index() as usize]?;
-        if id.index() as usize >= values.len() {
-            let (storage_group, owners) =
-                groups[template.storage_group.index() as usize].as_ref()?;
-            let owners = owners.shifted(i32::from(template.owners.rotation()), tile_count)?;
-            owners
-                .validate(
-                    template.tensor_type.format.layout.tiling.tile_count,
-                    tile_count,
-                )
-                .ok()?;
-            added.push(MidValue {
-                id,
-                storage_group: *storage_group,
-                owners,
-                tensor_type: template.tensor_type.clone(),
-                origin: origin.unwrap_or(template.origin),
-            });
-        }
+    let ids = ids.into_iter().collect::<Option<Vec<_>>>()?;
+    for value in &added {
+        let owners = if value.owners.has_embedding() {
+            value.owners.with_rotation(working.rotation())
+        } else {
+            working.clone()
+        };
+        groups[value.storage_group.index() as usize]
+            .get_or_insert((ids[value.id.index() as usize], owners));
+    }
+    for value in &mut added {
+        let (storage_group, owners) = groups[value.storage_group.index() as usize].as_ref()?;
+        value.owners = owners.shifted(i32::from(value.owners.rotation()), tile_count)?;
+        value
+            .owners
+            .validate(
+                value.tensor_type.format.layout.tiling.tile_count,
+                tile_count,
+            )
+            .ok()?;
+        value.id = ids[value.id.index() as usize];
+        value.storage_group = *storage_group;
+        value.origin = origin;
     }
     let mut bound = fragment.operations.clone();
-    remap_operations(&mut bound, &ids, source)?;
-    bound.extend(returned.into_iter().map(|(input, result)| MidOperation {
-        site: None,
-        source,
-        inputs: vec![input],
-        results: vec![result],
-        kind: MidOperationKind::Copy {
-            mapping: CoordinateMapping::default(),
-            reuse_local: true,
-            policy: CopyPolicy::Automatic,
-            packing: PackingPolicy::Automatic,
-        },
-    }));
+    remap_operations(&mut bound, &ids, source);
+    let results = fragment
+        .outputs
+        .iter()
+        .map(|id| ids[id.index() as usize])
+        .collect();
     values.extend(added);
     operations.extend(bound);
-    Some(())
+    Some(results)
 }
 
 fn remap_operations(
     operations: &mut [MidOperation],
-    ids: &[Option<MidValueId>],
+    ids: &[MidValueId],
     source: Option<OperationId>,
-) -> Option<()> {
-    let remap = |value: &mut MidValueId| {
-        *value = ids.get(value.index() as usize).copied().flatten()?;
-        Some(())
-    };
+) {
+    let remap = |value: &mut MidValueId| *value = ids[value.index() as usize];
     for operation in operations {
         operation.source = source.or(operation.source);
         for value in operation.inputs.iter_mut().chain(&mut operation.results) {
-            remap(value)?;
+            remap(value);
         }
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
             for value in repeat
@@ -180,12 +122,11 @@ fn remap_operations(
                 .chain(&mut repeat.body.arguments)
                 .chain(&mut repeat.body.yields)
             {
-                remap(value)?;
+                remap(value);
             }
-            remap_operations(&mut repeat.body.operations, ids, source)?;
+            remap_operations(&mut repeat.body.operations, ids, source);
         }
     }
-    Some(())
 }
 
 #[cfg(test)]
@@ -193,7 +134,8 @@ mod tests {
     use super::*;
     use crate::graph::{GraphInputKind, ValueId};
     use crate::kernel::TileKernelSpec;
-    use crate::mid::{Compute, MidInput, MidRegion, MidRepeat, OperandIndexing};
+    use crate::low::{CopyPolicy, PackingPolicy};
+    use crate::mid::{Compute, CoordinateMapping, MidInput, MidRegion, MidRepeat, OperandIndexing};
     use crate::tensor::{Layout, Precision, TensorType};
 
     fn id(i: u32) -> MidValueId {
@@ -263,8 +205,8 @@ mod tests {
         program
     }
     fn caller() -> MidProgram {
-        let mut values = (0..6).map(value).collect::<Vec<_>>();
-        for i in [2, 5] {
+        let mut values = (0..5).map(value).collect::<Vec<_>>();
+        for i in [2] {
             values[i].storage_group = id(2);
             values[i].owners = crate::tensor::OwnerMap::rotated(7);
         }
@@ -275,7 +217,6 @@ mod tests {
         MidProgram {
             tile_count: 16,
             inputs: (0..5).map(input).collect(),
-            outputs: vec![id(5)],
             values,
             ..MidProgram::default()
         }
@@ -389,6 +330,9 @@ mod tests {
 
     #[test]
     fn small_result_home_does_not_restrict_working_owners() {
+        let mut graph = crate::ComputeGraph::new();
+        let input_value = graph.host_input("x", [4, 16]).unwrap();
+        graph.gelu(input_value).unwrap();
         let mut fragment = MidProgram {
             tile_count: 4,
             inputs: vec![input(0)],
@@ -417,33 +361,39 @@ mod tests {
                 },
             });
         }
-        let mut result = fragment.values[2].clone();
-        result.id = id(1);
-        result.storage_group = id(1);
-        result.owners = crate::tensor::OwnerMap::embedded(vec![10]);
         let mut bound = MidProgram {
             tile_count: 16,
             inputs: vec![input(0)],
-            outputs: vec![id(1)],
-            values: vec![fragment.values[0].clone(), result],
+            values: vec![fragment.values[0].clone()],
             ..MidProgram::default()
         };
-        bound.values[0].owners = crate::tensor::OwnerMap::embedded(vec![1, 4, 7, 9]);
+        bound.values[0].owners = OwnerMap::embedded(vec![1, 4, 7, 9]);
         let original = bound.clone();
-        let working = crate::tensor::OwnerMap::embedded(vec![2, 3, 5, 6]);
-        append_fragment(
+        let working = OwnerMap::embedded(vec![2, 3, 5, 6]);
+        for (index, operation) in fragment.operations.iter_mut().enumerate() {
+            operation.site = Some(super::super::LocalSite::from("copy").at(index as u32));
+        }
+        bound.outputs = append_fragment(
             &fragment,
             &[id(0)],
-            &[id(1)],
             &working,
-            None,
+            Some(graph.operations()[0].id),
+            ValueId::from_index(0),
             bound.tile_count,
             &mut bound.values,
             &mut bound.operations,
         )
         .unwrap();
-        assert_eq!(bound.values[0..2], original.values);
+        let site = bound.operations.last().unwrap().result_site(0).unwrap();
+        let mut choices = crate::mid::OwnerChoices::default();
+        choices.results.insert(site, OwnerMap::embedded(vec![10]));
+        bound.apply_ownership(&choices).unwrap();
+        assert_eq!(bound.values[..1], original.values);
         assert_eq!(bound.values[2].owners, working);
+        assert_eq!(
+            bound.values[bound.outputs[0].index() as usize].owners,
+            OwnerMap::embedded(vec![10])
+        );
         bound.validate().unwrap();
         crate::low::expand::expand_tiles(&bound, false).unwrap();
 
@@ -452,9 +402,9 @@ mod tests {
             append_fragment(
                 &fragment,
                 &[id(0)],
-                &[id(1)],
                 &crate::tensor::OwnerMap::embedded(vec![2]),
                 None,
+                ValueId::from_index(0),
                 invalid.tile_count,
                 &mut invalid.values,
                 &mut invalid.operations
@@ -470,7 +420,7 @@ mod tests {
             let fragment = repeated_add();
             let mut bound = caller();
             if embedded {
-                for i in [2, 5] {
+                for i in [2] {
                     bound.values[i].owners =
                         crate::tensor::OwnerMap::embedded(vec![2, 7, 10, 3]).with_rotation(1);
                 }
@@ -480,16 +430,16 @@ mod tests {
                 }
             }
             fragment.validate().unwrap();
-            let working = bound.values[5]
+            let working = bound.values[2]
                 .owners
                 .shifted(-1, bound.tile_count)
                 .unwrap();
-            append_fragment(
+            bound.outputs = append_fragment(
                 &fragment,
                 &[id(2), id(3), id(4)],
-                &[id(5)],
                 &working,
                 None,
+                ValueId::from_index(5),
                 bound.tile_count,
                 &mut bound.values,
                 &mut bound.operations,
@@ -533,8 +483,8 @@ mod tests {
             let mut fragment = repeated_add();
             let mut bound = caller();
             match variant {
-                0 => bound.values[5].tensor_type.format.precision = Precision::F32,
-                1 => bound.values[5].storage_group = id(5),
+                0 => bound.values[2].tensor_type.format.precision = Precision::F32,
+                1 => bound.values[4].storage_group = id(4),
                 2 => {
                     let MidOperationKind::Repeat(repeat) = &mut fragment.operations[0].kind else {
                         panic!()
@@ -549,9 +499,9 @@ mod tests {
                 append_fragment(
                     &fragment,
                     &[id(2), id(3), id(4)],
-                    &[id(5)],
                     &crate::tensor::OwnerMap::default(),
                     None,
+                    ValueId::from_index(5),
                     bound.tile_count,
                     &mut bound.values,
                     &mut bound.operations
@@ -563,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn returning_an_input_defines_every_requested_result() {
+    fn returning_an_input_reuses_the_value_in_every_result_slot() {
         let fragment = MidProgram {
             tile_count: 1,
             inputs: vec![input(0)],
@@ -574,25 +524,32 @@ mod tests {
         let mut bound = MidProgram {
             tile_count: 1,
             inputs: vec![input(1)],
-            values: (0..4).map(value).collect(),
-            outputs: vec![id(2), id(3)],
+            values: (0..2).map(value).collect(),
             ..MidProgram::default()
         };
-        append_fragment(
+        bound.outputs = append_fragment(
             &fragment,
             &[id(1)],
-            &[id(2), id(3)],
             &crate::tensor::OwnerMap::default(),
             None,
+            ValueId::from_index(0),
             1,
             &mut bound.values,
             &mut bound.operations,
         )
         .unwrap();
         bound.validate().unwrap();
-        let mut values = vec![0, 11, 0, 0];
+        let mut values = vec![0, 11];
         execute(&bound.operations, &mut values);
-        assert_eq!(&values[2..], &[11, 11]);
+        assert_eq!(
+            bound
+                .outputs
+                .iter()
+                .map(|id| values[id.index() as usize])
+                .collect::<Vec<_>>(),
+            [11, 11]
+        );
+        assert_eq!(bound.values.len(), 2);
         assert_eq!(bound.values[1].storage_group, id(1));
     }
 }

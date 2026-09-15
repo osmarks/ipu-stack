@@ -70,9 +70,10 @@ choices/catalogues, executable fragment construction/cache and persistent home
 selection now belong to planner; pipeline configuration belongs to compile.
 Mid no longer supplies those definitions through parent imports. Broadcast and
 ownership projection are neutral tensor geometry, while rewrite sequence costing
-belongs to estimate. Fragment binding checks complete input/output contracts,
-preserves ownership groups and relative offsets, remaps Repeat recursively, and
-connects returned inputs to requested result values with explicit identity copies.
+belongs to estimate. Fragment binding checks input contracts, preserves ownership
+groups and relative offsets, remaps Repeat recursively, and returns the actual
+result values. Result homes use the ownership pass; binding does not preallocate
+outputs or manufacture identity copies for returned inputs.
 Invalid bindings cannot leave partially appended values or operations. Program
 validation has its own error type, independent of planning failures.
 Mid values now use shared `OwnerMap` embeddings instead of scalar tile offsets.

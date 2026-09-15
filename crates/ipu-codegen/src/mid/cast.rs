@@ -309,23 +309,18 @@ mod tests {
             let mut fragment = fragment.clone();
             fragment.operations[0].site = Some(super::super::LocalSite::from(role).child("copy"));
             fragment.operations[1].site = Some(super::super::LocalSite::from(role).child("cast"));
-            let mut result = fragment.values[2].clone();
-            result.id = MidValueId(program.values.len() as u32);
-            result.storage_group = result.id;
-            let output = result.id;
-            program.values.push(result);
-            program.outputs.push(output);
-            super::super::append_fragment(
+            let outputs = super::super::append_fragment(
                 &fragment,
                 &[MidValueId(0)],
-                &[output],
                 &crate::tensor::OwnerMap::default(),
                 Some(source),
+                fragment.values[2].origin,
                 1,
                 &mut program.values,
                 &mut program.operations,
             )
             .unwrap();
+            program.outputs.extend(outputs);
         }
         let casts = program
             .operations
