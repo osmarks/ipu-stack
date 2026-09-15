@@ -264,12 +264,6 @@ fn analyze_allocations(program: &LowProgram) -> Result<AllocationAnalysis, Place
         let root = sets.find(index);
         let combined = root_requirements.entry(root).or_default();
         combined.alignment = combined.alignment.max(requirement.alignment);
-        if matches!(
-            program.shards[index].definition,
-            ShardDefinition::ShiftedAlias { .. }
-        ) {
-            combined.alignment = combined.alignment.max(32768);
-        }
         combined.access_tail_bytes = combined
             .access_tail_bytes
             .max(requirement.access_tail_bytes);
@@ -577,6 +571,19 @@ fn collect_requirements(
         match work {
             BlockOperation::Compute { run, .. } => {
                 let run = &program.kernel_runs[run.0 as usize];
+                // Shifted writable donations use element-sized cast chunks.
+                // Read-only aliases introduced by copy elimination do not.
+                for view in &run.outputs {
+                    if matches!(
+                        program.shards[view.shard.index() as usize].definition,
+                        ShardDefinition::ShiftedAlias { .. }
+                    ) {
+                        requirements[view.shard.index() as usize].alignment = requirements
+                            [view.shard.index() as usize]
+                            .alignment
+                            .max(crate::kernel::cast::CAST_PREFIX_BYTES);
+                    }
+                }
                 for operands in &run.requirements.distinct_elements {
                     let shards = operands
                         .iter()

@@ -51,69 +51,106 @@ fn copied_columns(columns: u32) -> MidProgram {
 }
 
 #[test]
-fn backed_windows_compose_offsets_without_exposing_mutations() {
-    for mutable in [false, true] {
-        let mut mid = copied_columns(16);
-        mid.values[1].tensor_type.shape.0[0] = 2;
-        let mut result = mid.values[1].clone();
-        result.id = MidValueId::from_index(2);
-        result.storage_group = result.id;
-        mid.values.push(result);
-        if let MidOperationKind::Copy { mapping, .. } = &mut mid.operations[0].kind {
-            mapping.offsets = vec![1, 0];
-        }
-        let mut consumer = mid.operations[0].clone();
-        consumer.kind = MidOperationKind::Gelu;
-        consumer.inputs = vec![MidValueId::from_index(1)];
-        consumer.results = vec![MidValueId::from_index(2)];
-        consumer.operands = vec![OperandIndexing::Fragment(crate::OperandWindow(vec![(
-            0, 1, 2,
-        )]))];
-        mid.operations.push(consumer.clone());
-        mid.outputs = consumer.results.clone();
-        if mutable {
-            let mut alias = mid.values[0].clone();
-            alias.id = MidValueId::from_index(3);
-            alias.storage_group = alias.id;
-            mid.values.push(alias);
-            consumer.inputs = vec![MidValueId::from_index(0)];
-            consumer.results = vec![MidValueId::from_index(3)];
-            consumer.output_aliases = vec![(0, 0)];
-            mid.operations.insert(0, consumer);
-        }
-        mid.use_views();
-        if mutable {
-            assert!(matches!(
-                mid.operations[1].kind,
-                MidOperationKind::Copy { .. }
-            ));
-        } else {
-            assert_eq!(mid.operations.len(), 1);
-            let OperandIndexing::Fragment(window) = &mid.operations[0].operands[0] else {
-                panic!("copy was not replaced with a backed window");
-            };
-            let source = &mid.values[0].tensor_type;
-            let shards = source.format.layout.shard_extents(&source.shape).unwrap();
-            let backing = &shards[0].1;
-            let selected = window.select(backing, true).unwrap();
-            let span = crate::storage::byte_traversal(
-                crate::storage::TensorStorage {
-                    format: &source.format,
-                    extents: backing,
-                },
-                &selected,
-                true,
-            )
-            .unwrap()
-            .contiguous_span()
+fn copy_alias_preserves_destination_coordinates_at_a_source_offset() {
+    let mut mid = copied_columns(16);
+    mid.values[1].tensor_type.shape.0[0] = 2;
+    if let MidOperationKind::Copy { mapping, .. } = &mut mid.operations[0].kind {
+        mapping.offsets = vec![1, 0];
+    }
+    let graph = expand_tiles(&mid, false).unwrap();
+    let input = graph.value_views(mid.inputs[0].value)[0].shard;
+    let mut output = graph.value_views(mid.outputs[0])[0].clone();
+    assert_eq!(output.extents[0].start, 0);
+    assert_eq!(
+        crate::low::storage::storage_location(&graph.shards, output.shard),
+        (input, 64)
+    );
+    output.extents[0].start = 1;
+    let span =
+        crate::low::storage::view_byte_spans(&graph.shards[output.shard.index() as usize], &output)
             .unwrap();
-            // Source row 1 was copied; consumer row 1 therefore reads row 2.
-            let data = (0..64u32).collect::<Vec<_>>();
+    let data = (0..64u32).collect::<Vec<_>>();
+    let start = (64 + span[0].offset) / 4;
+    assert_eq!(
+        &data[start as usize..start as usize + 16],
+        &(32..48).collect::<Vec<_>>()
+    );
+    let low = crate::low::lower_to_tiles(&graph, false);
+    let placement = crate::place(&low).unwrap();
+    assert_eq!(
+        placement.shard_addresses[&output.shard] - placement.shard_addresses[&input],
+        64
+    );
+}
+
+#[test]
+fn distributed_copy_borrows_local_storage_and_materializes_remote_storage() {
+    let mut mid = copied_columns(16);
+    mid.tile_count = 2;
+    mid.values[1].tensor_type.format.layout.tiling = TensorTiling::replicated(2);
+    let graph = expand_tiles(&mid, false).unwrap();
+    let input = graph.value_views(mid.inputs[0].value)[0].shard;
+    let outputs = graph.value_views(mid.outputs[0]);
+    assert_eq!(outputs.len(), 2);
+    for output in outputs {
+        let shard = &graph.shards[output.shard.index() as usize];
+        if shard.tile == 0 {
             assert_eq!(
-                &data[(span.offset / 4) as usize..((span.offset + span.bytes) / 4) as usize],
-                &(32..48).collect::<Vec<_>>()
+                crate::low::storage::storage_location(&graph.shards, shard.id),
+                (input, 0)
+            );
+        } else {
+            assert_eq!(
+                crate::low::storage::storage_root(&graph.shards, shard.id),
+                shard.id
+            );
+            assert!(
+                graph
+                    .exchange_phases
+                    .iter()
+                    .flat_map(|p| &p.transfers)
+                    .any(|t| t.source.shard == input
+                        && t.destinations.iter().any(|v| v.shard == shard.id))
             );
         }
+    }
+    crate::place(&crate::low::lower_to_tiles(&graph, false)).unwrap();
+}
+
+#[test]
+fn copy_elimination_preserves_values_across_in_place_writes() {
+    for mutated in [0, 1] {
+        let mut mid = copied_columns(16);
+        for value in &mut mid.values {
+            value.tensor_type.format.precision = Precision::F16;
+        }
+        let mut result = mid.values[mutated].clone();
+        result.id = MidValueId::from_index(2);
+        result.storage_group = mid.values[mutated].storage_group;
+        mid.values.push(result);
+        mid.operations.push(MidOperation {
+            source: None,
+            inputs: vec![MidValueId::from_index(mutated as u32)],
+            results: vec![MidValueId::from_index(2)],
+            kind: MidOperationKind::Gelu,
+            operands: vec![OperandIndexing::Elementwise { result: 0 }],
+            output_aliases: vec![(0, 0)],
+            output_windows: vec![],
+        });
+        mid.outputs.push(MidValueId::from_index(2));
+        let graph = expand_tiles(&mid, false).unwrap();
+        let input = graph.value_views(MidValueId::from_index(0))[0].shard;
+        let output = graph.value_views(MidValueId::from_index(1))[0].shard;
+        assert_ne!(
+            crate::low::storage::storage_root(&graph.shards, input),
+            crate::low::storage::storage_root(&graph.shards, output)
+        );
+        assert!(
+            graph
+                .local_copies
+                .iter()
+                .any(|copy| copy.movement().destination == output)
+        );
     }
 }
 
@@ -153,7 +190,6 @@ fn reduction_fragment_accepts_a_materialized_crop() {
         &mut mid.operations,
     )
     .unwrap();
-    mid.use_views();
     expand_tiles(&mid, false).unwrap();
 }
 
@@ -264,7 +300,10 @@ fn exported_copies_have_complete_storage_and_preserve_values() {
         let placement = crate::place(&low).unwrap();
         assert!(placement.shard_addresses.contains_key(&output));
         let source = (0..64u32).collect::<Vec<_>>();
-        let actual = {
+        let actual = if crate::low::storage::storage_root(&low.shards, output) == input {
+            assert!(low.local_copies.is_empty());
+            source.clone()
+        } else {
             let mut actual = vec![u32::MAX; (4 * columns) as usize];
             for copy in &low.local_copies {
                 let copy = copy.movement();
@@ -477,7 +516,7 @@ fn copied_scalar_keeps_its_semantic_broadcast_shape() {
     });
     mid.values.push(result);
     let graph = expand_tiles(&mid, false).unwrap();
-    assert!(!graph.local_copies.is_empty());
+    assert!(graph.local_copies.is_empty());
     let run = graph
         .kernel_runs
         .iter()
@@ -485,6 +524,10 @@ fn copied_scalar_keeps_its_semantic_broadcast_shape() {
         .unwrap();
     run.call().unwrap();
     let scalar = &run.inputs[1];
+    assert_eq!(
+        crate::low::storage::storage_root(&graph.shards, scalar.shard),
+        graph.value_views(graph.inputs[0].value)[0].shard
+    );
     assert_ne!(
         scalar.shard,
         graph.value_views(graph.inputs[0].value)[0].shard

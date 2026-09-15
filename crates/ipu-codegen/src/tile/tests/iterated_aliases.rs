@@ -79,7 +79,6 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
     };
     repeat.body.operations = operations;
     repeat.body.yields = vec![result];
-    mid.use_views();
     let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
     let low = crate::low::lower_to_tiles(&graph, false);
     let placement = place(&low).unwrap();

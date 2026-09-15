@@ -61,8 +61,8 @@ pub struct MidValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidOperationKind {
-    /// Materialize a distributed value in its declared layout. Non-owning
-    /// selections are operand windows on the original value, never Copy results.
+    /// Produce a distributed value in its declared layout. Lowering may alias
+    /// compatible storage per tile, but must preserve that layout's interpretation.
     Copy {
         mapping: CoordinateMapping,
         policy: crate::CopyPolicy,

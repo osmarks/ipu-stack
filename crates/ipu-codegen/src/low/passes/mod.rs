@@ -9,6 +9,7 @@ use crate::low::storage::storage_root;
 use crate::storage::GeometryCache;
 
 pub(super) fn run(program: &mut TileGraph, geometry: &GeometryCache) -> ExpansionResult<()> {
+    movement::eliminate_copies(program)?;
     let grouped = movement::group_exchanges(
         &mut program.body,
         &mut program.exchange_phases,

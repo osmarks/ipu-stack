@@ -10,6 +10,156 @@ use crate::low::storage::{storage_location, storage_root};
 use crate::storage::{CopyOrder, StorageResult, StridedSpan};
 use std::collections::BTreeMap;
 
+/// Forward a whole-buffer byte copy without changing any consumer's geometry.
+/// Count actual writes through aliases; a source must be stable after the copy
+/// and the destination must have no other writer. Repeat bindings may supply
+/// read-only sources; their destinations and mutable storage remain independent.
+pub(in crate::low) fn eliminate_copies(program: &mut crate::low::TileGraph) -> StorageResult<()> {
+    let roots = program
+        .shards
+        .iter()
+        .map(|s| storage_root(&program.shards, s.id))
+        .collect::<Vec<_>>();
+    let mut writes = vec![0usize; roots.len()];
+    let mut last_write = vec![None; roots.len()];
+    let mut alignment = vec![1u32; roots.len()];
+    let mut boundary = vec![false; roots.len()];
+    let mut distinct = vec![std::collections::BTreeSet::new(); roots.len()];
+    for (index, op) in program.body.walk().enumerate() {
+        let mut write = |id: BlockValueId| {
+            let root = roots[id.index() as usize].index() as usize;
+            writes[root] += 1;
+            last_write[root] = Some(index);
+        };
+        match op {
+            BlockOperation::Compute { run, .. } => {
+                let run = &program.kernel_runs[run.0 as usize];
+                for group in &run.requirements.distinct_elements {
+                    for (i, &a) in group.iter().enumerate() {
+                        let a = roots[run.operand_view(a).unwrap().shard.index() as usize].index()
+                            as usize;
+                        for &b in &group[..i] {
+                            let b = roots[run.operand_view(b).unwrap().shard.index() as usize]
+                                .index() as usize;
+                            distinct[a].insert(b);
+                            distinct[b].insert(a);
+                        }
+                    }
+                }
+                for view in &run.outputs {
+                    write(view.shard);
+                }
+                for (view, requirement) in run
+                    .inputs
+                    .iter()
+                    .zip(&run.requirements.inputs)
+                    .chain(run.outputs.iter().zip(&run.requirements.outputs))
+                {
+                    let root = roots[view.shard.index() as usize].index() as usize;
+                    alignment[root] = alignment[root].max(requirement.storage.alignment);
+                }
+            }
+            BlockOperation::Copy { copy, .. } => {
+                let copy = &program.local_copies[copy.0 as usize];
+                write(copy.movement().destination);
+                for (id, access) in copy.accesses() {
+                    let root = roots[id.index() as usize].index() as usize;
+                    alignment[root] = alignment[root].max(access.alignment);
+                }
+            }
+            BlockOperation::Exchange(id) => {
+                for transfer in &program.exchange_phases[id.index() as usize].transfers {
+                    for view in &transfer.destinations {
+                        write(view.shard);
+                    }
+                }
+            }
+            BlockOperation::Repeat(repeat) => {
+                for id in repeat.bindings.iter().flat_map(|b| b.bound_shards()) {
+                    boundary[roots[id.index() as usize].index() as usize] = true;
+                }
+            }
+            BlockOperation::Checkpoint(..) => {}
+        }
+    }
+    let mut read_only = writes.iter().map(|&count| count == 0).collect::<Vec<_>>();
+    for op in program.body.walk() {
+        if let BlockOperation::Repeat(repeat) = op {
+            for binding in &repeat.bindings {
+                for invariant in &binding.invariants {
+                    read_only[roots[invariant.argument.index() as usize].index() as usize] &=
+                        read_only[roots[invariant.input.index() as usize].index() as usize];
+                }
+                for iterated in &binding.iterated {
+                    let immutable = iterated
+                        .inputs
+                        .iter()
+                        .all(|id| read_only[roots[id.index() as usize].index() as usize]);
+                    read_only[roots[iterated.argument.index() as usize].index() as usize] &=
+                        immutable;
+                }
+            }
+        }
+    }
+    let mut removed = std::collections::BTreeSet::new();
+    for (index, op) in program.body.walk().enumerate() {
+        let BlockOperation::Copy { copy: id, .. } = op else {
+            continue;
+        };
+        let copy = program.local_copies[id.0 as usize].movement();
+        let source = &program.shards[copy.source.index() as usize];
+        let destination = &program.shards[copy.destination.index() as usize];
+        let source_bytes = crate::low::storage::shard_storage_bytes(source)?;
+        let from = roots[copy.source.index() as usize].index() as usize;
+        let to = roots[copy.destination.index() as usize].index() as usize;
+        let backing = storage_root(&program.shards, copy.source).index() as usize;
+        if copy.pattern != CopyPattern::Contiguous
+            || copy.destination_offset != 0
+            || copy.bytes != crate::low::storage::shard_storage_bytes(destination)?
+            || copy
+                .source_offset
+                .checked_add(copy.bytes)
+                .is_none_or(|end| end > source_bytes)
+            || source.tile != destination.tile
+            || source.tensor_type.format.layout.memory_class
+                != destination.tensor_type.format.layout.memory_class
+            || from == to
+            || roots[copy.destination.index() as usize] != copy.destination
+            || writes[to] != 1
+            || last_write[from].is_some_and(|last| last >= index)
+            || (boundary[from] && !read_only[from])
+            || boundary[to]
+            || distinct[to].contains(&backing)
+            || (storage_location(&program.shards, copy.source).1 + i64::from(copy.source_offset))
+                .rem_euclid(i64::from(alignment[to]))
+                != 0
+        {
+            continue;
+        }
+        let Ok(offset) = i32::try_from(copy.source_offset) else {
+            continue;
+        };
+        program.shards[copy.destination.index() as usize].definition = if offset == 0 {
+            crate::ShardDefinition::Alias(copy.source)
+        } else {
+            crate::ShardDefinition::ShiftedAlias {
+                source: copy.source,
+                offset,
+            }
+        };
+        removed.insert(*id);
+        for other in std::mem::take(&mut distinct[to]) {
+            distinct[other].remove(&to);
+            distinct[other].insert(backing);
+            distinct[backing].insert(other);
+        }
+    }
+    program.body.retain(
+        &mut |op| !matches!(op, BlockOperation::Copy { copy, .. } if removed.contains(copy)),
+    );
+    Ok(())
+}
+
 /// Move copy-only gaps before or after a shared exchange when they commute
 /// with every conflicting access. Scheduling still orders transfers within the
 /// merged phase; this pass does not choose their execution order.

@@ -58,7 +58,6 @@ pub(crate) fn baseline(
     if let Some(mapping) = &config.tile_mapping {
         program.remap_tiles(mapping)?;
     }
-    program.use_views();
     program
         .refresh_estimates()
         .ok_or(LoweringError::InvalidImplementation)?;

@@ -59,7 +59,7 @@ pub enum ShardDefinition {
     Alias(BlockValueId),
     /// Alias intentionally used as an in-place operation destination.
     WritableAlias(BlockValueId),
-    /// Writable storage donation at a signed byte displacement from its source.
+    /// Storage alias at a signed byte displacement from its source.
     /// Placement reserves the union and preserves this offset through aliases.
     ShiftedAlias {
         source: BlockValueId,
