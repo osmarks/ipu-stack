@@ -124,7 +124,6 @@ pub(super) fn fuse(
             current.results[0]
         };
         let fused = MidOperation {
-            site: add.site.clone(),
             inputs: add.inputs.clone(),
             results: vec![stats, sum],
             kind: MidOperationKind::Compute(Compute::Kernel {
@@ -176,10 +175,6 @@ pub(super) fn fuse(
             tensor_type.format.layout.tiling.replicas *= target_parts;
             let id = MidValueId(values.len() as u32);
             let copy = MidOperation {
-                site: current
-                    .site
-                    .as_ref()
-                    .map(|site| site.child("statistics.copy")),
                 source: current.source,
                 inputs: vec![stats],
                 results: vec![id],
@@ -386,7 +381,6 @@ mod tests {
             ),
         ] {
             program.operations.push(MidOperation {
-                site: None,
                 source: None,
                 results: vec![result],
                 kind: MidOperationKind::Compute(Compute::Kernel {
@@ -482,7 +476,6 @@ mod tests {
             value.storage_group = value.id;
             value.tensor_type.format.layout = Layout::row_sharded(2);
             program.operations.push(MidOperation {
-                site: None,
                 source: None,
                 inputs: vec![source],
                 results: vec![value.id],

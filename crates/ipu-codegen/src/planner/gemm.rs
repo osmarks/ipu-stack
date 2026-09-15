@@ -2,9 +2,7 @@
 
 use super::fragments::{FragmentBuilder, project_grid};
 use crate::kernel::{AccumulationPrecision, GemmKernelMode};
-use crate::mid::{
-    Compute, LocalSite, MidOperationKind, MidValueId, Product, ProductAxes, ReductionStaging,
-};
+use crate::mid::{Compute, MidOperationKind, MidValueId, Product, ProductAxes, ReductionStaging};
 use crate::planner::operator::{
     GemmDistribution, GemmOrientation, LocalOperandStaging, OperatorFamily, OperatorPlan,
     ProductGrid,
@@ -73,7 +71,7 @@ impl FragmentBuilder {
                 reduction_staging,
                 ..
             } => {
-                let left = self.copy("left", left, left_type.clone(), vec![]);
+                let left = self.copy(left, left_type.clone(), vec![]);
                 let mut partial = plan.dispatch.gemm_partial_tensor(output);
                 // Partials follow compute rows, including padding/group boundaries;
                 // the final result may partition those rows differently.
@@ -105,7 +103,6 @@ impl FragmentBuilder {
                     right_staging.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
                 }
                 let weights = self.materialize(
-                    "right",
                     right,
                     right_staging,
                     vec![],
@@ -137,14 +134,12 @@ impl FragmentBuilder {
                     .checked_mul(column_partitions)?
                     .checked_mul(inner_partitions)?;
                 let products = self.compute(
-                    "partials",
                     vec![left, weights],
                     [(partials, None)],
                     Compute::Product(product(GemmKernelMode::Initialize)),
                 )[0];
                 Some(
                     self.emit(
-                        "reduce",
                         vec![products],
                         [output.clone()],
                         MidOperationKind::Compute(Compute::Sum {
@@ -181,7 +176,6 @@ impl FragmentBuilder {
                 {
                     return Some(
                         self.compute(
-                            "product",
                             vec![left, right],
                             [(output.clone(), None)],
                             Compute::Product(product(GemmKernelMode::Initialize)),
@@ -220,11 +214,10 @@ impl FragmentBuilder {
                     lo[left_inner] = start;
                     let mut ro = vec![0; r.shape.0.len()];
                     ro[right_inner] = start;
-                    let l = self.copy(LocalSite::from("left").at(start), left, l, lo);
-                    let r = self.copy(LocalSite::from("right").at(start), right, r, ro);
+                    let l = self.copy(left, l, lo);
+                    let r = self.copy(right, r, ro);
                     result = Some(
                         self.compute(
-                            LocalSite::from("product").at(start),
                             vec![l, r],
                             [(output.clone(), result)],
                             Compute::Product(product(if result.is_none() {
@@ -246,7 +239,7 @@ impl FragmentBuilder {
     /// redistribution (or a sum of explicit partials) into its consumer layout.
     pub(super) fn distributed_product(
         &mut self,
-        site: LocalSite,
+
         left: MidValueId,
         right: MidValueId,
         output: &TensorType,
@@ -340,10 +333,10 @@ impl FragmentBuilder {
             })
         };
         r.format.layout.memory_class = MemoryClass::Ipu21Interleaved;
-        let l = self.copy(site.child("left.copy"), left, l, vec![]);
-        let r = self.copy(site.child("right.copy"), right, r, vec![]);
-        let l = self.cast(site.child("left.cast"), l, multiply);
-        let r = self.cast(site.child("right.cast"), r, multiply);
+        let l = self.copy(left, l, vec![]);
+        let r = self.copy(right, r, vec![]);
+        let l = self.cast(l, multiply);
+        let r = self.cast(r, multiply);
         let mut product = output.clone();
         product.shape.0[2] = columns;
         product.format.layout.order = ElementOrder::Amp(AmpOrder::Left);
@@ -365,7 +358,6 @@ impl FragmentBuilder {
                 .push(dim(0, grid.inner, 1, inner_stride));
         }
         let result = self.compute(
-            site.child("partials"),
             vec![l, r],
             [(product, None)],
             Compute::Product(Product {
@@ -388,7 +380,6 @@ impl FragmentBuilder {
             let mut reduced = output.clone();
             reduced.shape.0[2] = columns;
             let sum = self.emit(
-                site.child("reduce"),
                 vec![result],
                 [reduced],
                 MidOperationKind::Compute(Compute::Sum {
@@ -396,9 +387,9 @@ impl FragmentBuilder {
                     staging: ReductionStaging::Complete,
                 }),
             )[0];
-            Some(self.copy(site.child("output"), sum, output.clone(), vec![]))
+            Some(self.copy(sum, output.clone(), vec![]))
         } else {
-            Some(self.copy(site.child("output"), result, output.clone(), vec![]))
+            Some(self.copy(result, output.clone(), vec![]))
         }
     }
 }

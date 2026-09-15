@@ -4,8 +4,8 @@
 use crate::graph::{GraphInputKind, ValueId};
 use crate::kernel::TileKernelSpec;
 use crate::mid::{
-    Compute, CoordinateMapping, LocalSite, MidInput, MidOperation, MidOperationKind, MidProgram,
-    MidValue, MidValueId, OperandIndexing,
+    Compute, CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidValue,
+    MidValueId, OperandIndexing,
 };
 use crate::planner::operator::{OperatorDispatch, OperatorFamily, OperatorPlan};
 use crate::tensor::{
@@ -37,12 +37,7 @@ pub(crate) fn build_fragment(
                 if matches!(indexing, OperandIndexing::Elementwise { .. }) {
                     resident.format.layout.tiling = broadcast_operand_tiling(input, output)?;
                 }
-                operands.push(b.copy(
-                    LocalSite::from("operand").at(index as u32),
-                    MidValueId::from_index(index as u32),
-                    resident,
-                    vec![],
-                ));
+                operands.push(b.copy(MidValueId::from_index(index as u32), resident, vec![]));
             }
             let reuse = plan.reuse_inputs.as_ref().and_then(|indices| {
                 indices.iter().find_map(|&index| {
@@ -55,8 +50,8 @@ pub(crate) fn build_fragment(
                 kernel_output.format.precision = Precision::F32;
             }
             let indexing = vec![indexing; operands.len()];
-            let result = b.kernel("compute", operands, kernel_output, kernel, reuse, indexing);
-            b.cast("output.cast", result, output.format.precision)
+            let result = b.kernel(operands, kernel_output, kernel, reuse, indexing);
+            b.cast(result, output.format.precision)
         }
         OperatorDispatch::View => {
             let mapping = match plan.operator {
@@ -72,7 +67,6 @@ pub(crate) fn build_fragment(
                 _ => return None,
             };
             b.emit(
-                "view",
                 vec![MidValueId::from_index(0)],
                 [output.clone()],
                 MidOperationKind::Copy {
@@ -164,7 +158,7 @@ impl FragmentBuilder {
 
     pub(super) fn emit(
         &mut self,
-        site: impl Into<LocalSite>,
+
         inputs: Vec<MidValueId>,
         outputs: impl IntoIterator<Item = TensorType>,
         kind: MidOperationKind,
@@ -174,7 +168,6 @@ impl FragmentBuilder {
             .map(|output| self.value(output))
             .collect::<Vec<_>>();
         self.program.operations.push(MidOperation {
-            site: Some(site.into()),
             source: None,
             inputs,
             results: results.clone(),
@@ -183,12 +176,7 @@ impl FragmentBuilder {
         results
     }
 
-    pub(super) fn cast(
-        &mut self,
-        site: impl Into<LocalSite>,
-        input: MidValueId,
-        precision: Precision,
-    ) -> MidValueId {
+    pub(super) fn cast(&mut self, input: MidValueId, precision: Precision) -> MidValueId {
         let mut output = self.tensor(input).clone();
         let from = output.format.precision;
         if from == precision {
@@ -196,7 +184,6 @@ impl FragmentBuilder {
         }
         output.format.precision = precision;
         self.kernel(
-            site,
             vec![input],
             output,
             TileKernelSpec::Cast {
@@ -210,17 +197,17 @@ impl FragmentBuilder {
 
     pub(super) fn copy(
         &mut self,
-        site: impl Into<LocalSite>,
+
         input: MidValueId,
         output: TensorType,
         offsets: Vec<u32>,
     ) -> MidValueId {
-        self.materialize(site, input, output, offsets, true)
+        self.materialize(input, output, offsets, true)
     }
 
     pub(super) fn materialize(
         &mut self,
-        site: impl Into<LocalSite>,
+
         input: MidValueId,
         output: TensorType,
         offsets: Vec<u32>,
@@ -237,7 +224,6 @@ impl FragmentBuilder {
             return input;
         }
         self.emit(
-            site,
             vec![input],
             [output],
             MidOperationKind::Copy {
@@ -254,7 +240,7 @@ impl FragmentBuilder {
 
     pub(super) fn kernel(
         &mut self,
-        site: impl Into<LocalSite>,
+
         inputs: Vec<MidValueId>,
         output: TensorType,
         kernel: TileKernelSpec,
@@ -262,7 +248,6 @@ impl FragmentBuilder {
         operands: Vec<OperandIndexing>,
     ) -> MidValueId {
         self.compute(
-            site,
             inputs,
             [(output, reuse)],
             Compute::Kernel {
@@ -275,7 +260,7 @@ impl FragmentBuilder {
 
     pub(super) fn compute(
         &mut self,
-        site: impl Into<LocalSite>,
+
         mut inputs: Vec<MidValueId>,
         outputs: impl IntoIterator<Item = (TensorType, Option<MidValueId>)>,
         mut compute: Compute,
@@ -293,7 +278,7 @@ impl FragmentBuilder {
             }
             types.push(output);
         }
-        self.emit(site, inputs, types, MidOperationKind::Compute(compute))
+        self.emit(inputs, types, MidOperationKind::Compute(compute))
     }
 }
 

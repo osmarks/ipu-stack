@@ -1,103 +1,27 @@
-//! Propose independent work and result homes, then apply only the requested order.
-//!
-//! Ownership uses the ordinary result-home policy. Grouping never moves a value
-//! to another tile, and it never crosses a Repeat boundary.
+//! Group independent reductions and distribute their preparation across tiles.
+//! These whole-program passes choose groups directly within each Repeat region.
 use super::{
     Compute, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId, ProgramError,
-    ResultSite, WorkSite, independent_copy_prefix,
+    independent_copy_prefix,
 };
 use crate::tensor::{AmpOrder, ElementOrder, OwnerMap};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ReductionGroup {
-    pub members: Vec<WorkSite>,
-}
-
-/// A joint search proposal. The homes enter Recipe's existing ownership policy;
-/// only the named reduction order is retained as a grouping choice.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct GroupProposal {
-    pub reductions: Vec<ReductionGroup>,
-    pub homes: BTreeMap<ResultSite, OwnerMap>,
-}
-
 impl MidProgram {
-    pub(crate) fn propose_reduction_groups(&self, limit: usize) -> GroupProposal {
-        let mut proposal = GroupProposal::default();
+    pub(crate) fn group_reductions(&mut self, limit: usize) -> Result<(), ProgramError> {
         if limit < 2 {
-            return proposal;
+            return Ok(());
         }
-        visit_regions(
-            &self.operations,
+        group_region(
+            &mut self.operations,
+            &mut self.values,
             &self.outputs,
-            &mut |operations, required| {
-                let eligible = reduction_outputs(operations, &self.values, required);
-                let mut start = 0;
-                while start < operations.len() {
-                    if !eligible.contains(&start) {
-                        start += 1;
-                        continue;
-                    }
-                    let mut selected = vec![start];
-                    for next in start + 1..operations.len() {
-                        let op = &operations[next];
-                        if selected.len() >= limit
-                            || !(matches!(
-                                op.kind,
-                                MidOperationKind::Copy { .. }
-                                    | MidOperationKind::Compute(Compute::Sum { .. })
-                            ) || matches!(&op.kind, MidOperationKind::Compute(Compute::Product(product)) if product.output_aliases.is_empty()))
-                            || selected
-                                .iter()
-                                .any(|&index| conflicts(&operations[index], op, &self.values))
-                        {
-                            break;
-                        }
-                        if eligible.contains(&next) {
-                            let mut candidate = selected.clone();
-                            candidate.push(next);
-                            if separate_homes(
-                                candidate.iter().map(|&i| &operations[i]),
-                                &self.values,
-                                self.tile_count,
-                            )
-                            .is_none()
-                            {
-                                break;
-                            }
-                            selected = candidate;
-                        }
-                    }
-                    if selected.len() < 2 {
-                        start += 1;
-                        continue;
-                    }
-                    let homes = separate_homes(
-                        selected.iter().map(|&i| &operations[i]),
-                        &self.values,
-                        self.tile_count,
-                    )
-                    .unwrap();
-                    proposal.homes.extend(homes);
-                    proposal.reductions.push(ReductionGroup {
-                        members: selected
-                            .iter()
-                            .map(|&i| operations[i].work_site().unwrap())
-                            .collect(),
-                    });
-                    start = selected.last().copied().unwrap() + 1;
-                }
-            },
-        );
-        proposal
+            self.tile_count,
+            limit,
+        )?;
+        super::ownership::bind_owners(&mut self.operations, &mut self.values)
     }
-
-    pub(crate) fn propose_preparation_homes(
-        &self,
-        checkpoints: bool,
-    ) -> BTreeMap<ResultSite, OwnerMap> {
+    pub(crate) fn distribute_preparation(&mut self, checkpoints: bool) -> Result<(), ProgramError> {
         let mut homes = BTreeMap::new();
         let groups = self
             .values
@@ -153,89 +77,109 @@ impl MidProgram {
                 }
             },
         );
-        homes
+        apply_homes(&mut self.values, &homes, self.tile_count)?;
+        super::ownership::bind_owners(&mut self.operations, &mut self.values)
     }
+}
 
-    /// Delay each named group to its last member. Check the complete request
-    /// before mutation: missing members, region crossings, reused members and
-    /// read/write hazards cannot silently turn an explicit choice into a no-op.
-    pub(crate) fn group_reductions(
-        &mut self,
-        groups: &[ReductionGroup],
-    ) -> Result<(), ProgramError> {
-        if groups.is_empty() {
-            return Ok(());
+fn group_region(
+    operations: &mut Vec<MidOperation>,
+    values: &mut [MidValue],
+    required: &[MidValueId],
+    tiles: u16,
+    limit: usize,
+) -> Result<(), ProgramError> {
+    for op in operations.iter_mut() {
+        if let MidOperationKind::Repeat(repeat) = &mut op.kind {
+            group_region(
+                &mut repeat.body.operations,
+                values,
+                &repeat.body.yields,
+                tiles,
+                limit,
+            )?;
         }
-        let mut remaining = BTreeSet::new();
-        for group in groups {
-            if group.members.len() < 2
-                || group
-                    .members
-                    .iter()
-                    .any(|site| !remaining.insert(site.clone()))
-            {
-                return Err(ProgramError::Invalid(
-                    "reduction groups need distinct members and at least two reductions".into(),
-                ));
-            }
-        }
-        let mut checked = BTreeMap::new();
-        let mut error = None;
-        visit_regions(&self.operations, &self.outputs, &mut |operations, _| {
-            let indexes = operations
-                .iter()
-                .enumerate()
-                .filter_map(|(i, op)| op.work_site().map(|site| (site, i)))
-                .collect::<BTreeMap<_, _>>();
-            for group in groups {
-                let Some(indices) = group
-                    .members
-                    .iter()
-                    .map(|site| indexes.get(site).copied())
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
-                let valid = indices.windows(2).all(|pair| pair[0] < pair[1])
-                    && indices.iter().all(|&i| {
-                        matches!(
-                            operations[i].kind,
-                            MidOperationKind::Compute(Compute::Sum { .. })
-                        )
-                    })
-                    && indices.iter().all(|&i| {
-                        (i + 1..=*indices.last().unwrap()).all(|j| {
-                            !matches!(operations[j].kind, MidOperationKind::Repeat(_))
-                                && !conflicts(&operations[i], &operations[j], &self.values)
-                        })
-                    });
-                if !valid {
-                    error = Some(ProgramError::Invalid(format!(
-                        "reduction group crosses a dependency: {:?}",
-                        group.members
-                    )));
-                    continue;
-                }
-                for site in &group.members {
-                    remaining.remove(site);
-                }
-                checked.insert(
-                    group.members.last().unwrap().clone(),
-                    group.members.iter().cloned().collect::<BTreeSet<_>>(),
-                );
-            }
-        });
-        if let Some(error) = error {
-            return Err(error);
-        }
-        if !remaining.is_empty() {
-            return Err(ProgramError::Invalid(format!(
-                "reduction group has unavailable members or crosses a region: {remaining:?}"
-            )));
-        }
-        reorder_region(&mut self.operations, &checked);
-        Ok(())
     }
+    let eligible = reduction_outputs(operations, values, required)
+        .into_iter()
+        .map(|i| operations[i].results[0])
+        .collect::<BTreeSet<_>>();
+    let is_eligible =
+        |op: &MidOperation| op.results.first().is_some_and(|id| eligible.contains(id));
+    let mut start = 0;
+    while start < operations.len() {
+        if !is_eligible(&operations[start]) {
+            start += 1;
+            continue;
+        }
+        let mut selected = vec![start];
+        for next in start + 1..operations.len() {
+            let op = &operations[next];
+            if selected.len() >= limit
+                || !(matches!(
+                    op.kind,
+                    MidOperationKind::Copy { .. } | MidOperationKind::Compute(Compute::Sum { .. })
+                ) || matches!(&op.kind, MidOperationKind::Compute(Compute::Product(product)) if product.output_aliases.is_empty()))
+                || selected
+                    .iter()
+                    .any(|&i| conflicts(&operations[i], op, values))
+            {
+                break;
+            }
+            if is_eligible(op) {
+                selected.push(next);
+                if separate_homes(selected.iter().map(|&i| &operations[i]), values, tiles).is_none()
+                {
+                    selected.pop();
+                    break;
+                }
+            }
+        }
+        if selected.len() < 2 {
+            start += 1;
+            continue;
+        }
+        let homes =
+            separate_homes(selected.iter().map(|&i| &operations[i]), values, tiles).unwrap();
+        apply_homes(values, &homes, tiles)?;
+        let insertion = selected.last().copied().unwrap() + 1 - selected.len();
+        let mut sums = selected
+            .into_iter()
+            .rev()
+            .map(|i| operations.remove(i))
+            .collect::<Vec<_>>();
+        sums.reverse();
+        start = insertion + sums.len();
+        operations.splice(insertion..insertion, sums);
+    }
+    Ok(())
+}
+
+// Assign aliases together, preserving their relative rotations and embeddings.
+fn apply_homes(
+    values: &mut [MidValue],
+    homes: &BTreeMap<MidValueId, OwnerMap>,
+    tiles: u16,
+) -> Result<(), ProgramError> {
+    for (&id, home) in homes {
+        let value = &values[id.index() as usize];
+        let group = value.storage_group;
+        let rotation = value.owners.rotation();
+        for alias in values
+            .iter_mut()
+            .filter(|value| value.storage_group == group)
+        {
+            let owners = home
+                .shifted(
+                    i32::from(alias.owners.rotation()) - i32::from(rotation),
+                    tiles,
+                )
+                .ok_or_else(|| ProgramError::Invalid("invalid owner domain".into()))?;
+            owners.validate(alias.tensor_type.format.layout.tiling.tile_count, tiles)?;
+            alias.owners = owners;
+        }
+    }
+    Ok(())
 }
 
 fn visit_regions(
@@ -287,7 +231,6 @@ fn reduction_outputs(
         .filter_map(|(i, op)| {
             (matches!(op.kind, MidOperationKind::Compute(Compute::Sum { .. }))
                 && op.results.len() == 1
-                && op.work_site().is_some()
                 && used.contains(&group(op.results[0]))
                 && !forbidden.contains(&group(op.results[0])))
             .then_some(i)
@@ -301,9 +244,14 @@ fn separate_homes<'a>(
     operations: impl Iterator<Item = &'a MidOperation>,
     values: &[MidValue],
     tiles: u16,
-) -> Option<BTreeMap<ResultSite, OwnerMap>> {
+) -> Option<BTreeMap<MidValueId, OwnerMap>> {
     let sources = operations
-        .map(|op| Some((op.result_site(0)?, &values[op.results[0].index() as usize])))
+        .map(|op| {
+            Some((
+                *op.results.first()?,
+                &values[op.results[0].index() as usize],
+            ))
+        })
         .collect::<Option<Vec<_>>>()?;
     if sources.len() < 2
         || sources
@@ -317,7 +265,7 @@ fn separate_homes<'a>(
     let mut occupied = BTreeSet::new();
     let mut offset = sources[0].1.owners.rotation();
     let mut homes = BTreeMap::new();
-    for (site, value) in sources {
+    for (id, value) in sources {
         let count = value.tensor_type.format.layout.tiling.tile_count;
         let (home, used) = (0..tiles).find_map(|shift| {
             let home = value
@@ -331,40 +279,9 @@ fn separate_homes<'a>(
         })?;
         occupied.extend(used);
         offset = ((u32::from(home.rotation()) + u32::from(count)) % u32::from(tiles)) as u16;
-        homes.insert(site, home);
+        homes.insert(id, home);
     }
     Some(homes)
-}
-
-fn reorder_region(
-    operations: &mut Vec<MidOperation>,
-    groups: &BTreeMap<WorkSite, BTreeSet<WorkSite>>,
-) {
-    let mut delayed = BTreeMap::new();
-    for (last, members) in groups {
-        for site in members {
-            delayed.insert(site.clone(), last);
-        }
-    }
-    let mut pending = BTreeMap::<WorkSite, Vec<MidOperation>>::new();
-    let mut result = Vec::with_capacity(operations.len());
-    for mut operation in std::mem::take(operations) {
-        if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
-            reorder_region(&mut repeat.body.operations, groups);
-        }
-        if let Some(site) = operation.work_site()
-            && let Some(last) = delayed.get(&site)
-        {
-            pending.entry((*last).clone()).or_default().push(operation);
-            if site == **last {
-                result.extend(pending.remove(*last).unwrap());
-            }
-        } else {
-            result.push(operation);
-        }
-    }
-    debug_assert!(pending.is_empty());
-    *operations = result;
 }
 
 #[cfg(test)]
@@ -377,35 +294,17 @@ mod tests {
 
     impl MidProgram {
         fn separate_preparation(&self, checkpoints: bool) -> Option<Self> {
-            let homes = self.propose_preparation_homes(checkpoints);
-            if homes.is_empty() {
-                return None;
-            }
             let mut program = self.clone();
-            program
-                .apply_ownership(&super::super::OwnerChoices {
-                    results: homes,
-                    ..Default::default()
-                })
-                .unwrap();
+            program.distribute_preparation(checkpoints).unwrap();
             (program != *self).then_some(program)
         }
         fn overlap_reductions(&self, limit: usize) -> Option<Self> {
-            let proposal = self.propose_reduction_groups(limit);
-            if proposal.reductions.is_empty() {
-                return None;
-            }
             let mut program = self.clone();
-            program
-                .apply_ownership(&super::super::OwnerChoices {
-                    results: proposal.homes,
-                    ..Default::default()
-                })
-                .unwrap();
-            program.group_reductions(&proposal.reductions).unwrap();
+            program.group_reductions(limit).unwrap();
             (program != *self).then_some(program)
         }
     }
+
     #[test]
     fn independent_copy_roots_rotate_without_moving_partials_or_shared_results() {
         let mut provenance = ComputeGraph::new();
@@ -428,7 +327,6 @@ mod tests {
             });
         }
         let operation = |input, output, primitive| MidOperation {
-            site: Some(format!("output.{output}").as_str().into()),
             source: Some(source),
             inputs: vec![MidValueId::from_index(input)],
             results: vec![MidValueId::from_index(output)],
@@ -483,10 +381,11 @@ mod tests {
         let mut domains = program.clone();
         domains.values[0].owners = OwnerMap::embedded(vec![4, 5, 6, 7, 0, 1, 2, 3]);
         domains.values[1].owners = OwnerMap::embedded((0..8).collect::<Vec<_>>());
-        let proposed = domains.propose_preparation_homes(true);
-        let tiles = proposed
-            .values()
-            .map(|home| {
+        domains.distribute_preparation(true).unwrap();
+        let tiles = domains.values[..2]
+            .iter()
+            .map(|value| {
+                let home = &value.owners;
                 (0..4)
                     .map(|i| home.tile(i, 16).unwrap())
                     .collect::<BTreeSet<_>>()
@@ -499,7 +398,9 @@ mod tests {
         );
         domains.values[0].owners = OwnerMap::embedded(vec![0, 1, 2, 3]);
         domains.values[1].owners = domains.values[0].owners.clone();
-        assert!(domains.propose_preparation_homes(true).is_empty());
+        let before = domains.clone();
+        domains.distribute_preparation(true).unwrap();
+        assert_eq!(domains, before);
         assert_eq!(
             rotated
                 .values
@@ -516,18 +417,6 @@ mod tests {
         );
         let mut delayed = program.clone();
         delayed.operations.insert(1, copy(4, 5));
-        let choice = delayed.propose_reduction_groups(2);
-        let mut ordered = delayed.clone();
-        ordered.group_reductions(&choice.reductions).unwrap();
-        assert_eq!(
-            ordered.values, delayed.values,
-            "grouping must preserve selected result homes"
-        );
-        let mut duplicate = choice.reductions.clone();
-        duplicate.extend(choice.reductions.clone());
-        let before = ordered.clone();
-        assert!(ordered.group_reductions(&duplicate).is_err());
-        assert_eq!(ordered, before);
         let overlapped = delayed.overlap_reductions(2).unwrap();
         assert_eq!(
             overlapped.operations[0].results,
@@ -548,7 +437,6 @@ mod tests {
             let operations = std::mem::take(&mut body.operations);
             body.outputs.clear();
             body.operations.push(MidOperation {
-                site: None,
                 source: None,
                 inputs: vec![],
                 results: vec![],

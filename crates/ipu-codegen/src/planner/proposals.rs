@@ -24,120 +24,38 @@ pub(crate) fn proposals(
         .walk_operations()
         .filter(|op| !matches!(op.kind, crate::OperationKind::Repeat(_)))
         .collect::<Vec<_>>();
-    let cast_sources = incumbent
-        .cast_storage_sites
-        .iter()
-        .map(|site| site.source)
-        .collect();
-    // Preserve the former joint donation alternative as an ordinary scoped
-    // proposal, alongside individual cast choices. The default never toggles.
     let mut candidates = Vec::new();
-    // Operator defaults cover casts introduced by a layout change. Pair that
-    // change with donation only for the affected families and direct consumers.
-    let mut propose = |recipe: Recipe, sources: &BTreeSet<crate::OperationId>| {
-        let mut variants = vec![recipe];
-        // Layout/cast changes can remove named work or change its capacity.
-        // Propose dropping affected packing, grouping and result homes explicitly; rebuilding never
-        // silently ignores an unavailable request.
-        if (!variants[0].packing.is_empty()
-            || !variants[0].reduction_groups.is_empty()
-            || !variants[0].owners.results.is_empty())
-            && (variants[0].plans != incumbent.recipe.plans
-                || variants[0].open_boundaries != incumbent.recipe.open_boundaries
-                || variants[0].cast_before_copies != incumbent.recipe.cast_before_copies)
-        {
-            let mut cleared = variants[0].clone();
-            cleared
-                .packing
-                .retain(|site, _| !sources.contains(&site.source));
-            cleared.reduction_groups.retain(|group| {
-                !group
-                    .members
-                    .iter()
-                    .any(|site| sources.contains(&site.source))
-            });
-            cleared
-                .owners
-                .results
-                .retain(|site, _| !sources.contains(&site.work.source));
-            if cleared != variants[0] {
-                variants.push(cleared);
-            }
-        }
-        for mut recipe in variants {
-            candidates.push(recipe.clone());
-            if config.diagnostic_checkpoints || sources.is_empty() {
-                continue;
-            }
-            let storage = recipe
-                .cast_storage
-                .as_mut()
-                .expect("candidate recipe has effective defaults");
-            for &source in sources {
-                let opposite = storage.for_operator(Some(source)).opposite();
-                storage.operators.insert(source, opposite);
-                storage.sites.retain(|site, _| site.source != source);
-            }
-            candidates.push(recipe);
+    let mut propose = |recipe: Recipe| {
+        candidates.push(recipe.clone());
+        if !config.diagnostic_checkpoints {
+            let mut donated = recipe;
+            donated.options.reuse_cast_inputs = !donated.options.reuse_cast_inputs;
+            candidates.push(donated);
         }
     };
-    let unchanged = BTreeSet::new();
-    propose(incumbent.recipe.clone(), &cast_sources);
+    propose(incumbent.recipe.clone());
+    let mut early = incumbent.recipe.clone();
+    early.options.cast_before_copies = !early.options.cast_before_copies;
+    propose(early);
     if !config.diagnostic_checkpoints {
-        for site in &incumbent.cast_storage_sites {
+        for rows in std::iter::once(0).chain(PACKING_ROWS) {
             let mut recipe = incumbent.recipe.clone();
-            let storage = recipe.cast_storage.as_mut().unwrap();
-            storage
-                .sites
-                .insert(site.clone(), storage.for_site(site).opposite());
-            propose(recipe, &unchanged);
+            recipe.options.packing_rows = rows;
+            propose(recipe);
         }
-    }
-    for rows in PACKING_ROWS {
-        let mut recipe = incumbent.recipe.clone();
-        recipe.packing = incumbent
-            .packing_choices
-            .iter()
-            .filter_map(|(site, choices)| {
-                choices
-                    .iter()
-                    .find(|choice| choice.rows.get() == rows)
-                    .cloned()
-                    .map(|choice| (site.clone(), choice))
-            })
-            .collect();
-        if recipe.packing != incumbent.recipe.packing {
-            propose(recipe, &cast_sources);
+        for limit in 0..=config.max_parallel_reductions {
+            if limit == 1 {
+                continue;
+            }
+            let mut recipe = incumbent.recipe.clone();
+            recipe.options.parallel_reductions = limit;
+            propose(recipe);
         }
-    }
-    for choice in &incumbent.grouping_choices {
         let mut recipe = incumbent.recipe.clone();
-        recipe.reduction_groups = choice.reductions.clone();
-        recipe.owners.results.extend(choice.homes.clone());
-        let sources = choice.homes.keys().map(|site| site.work.source).collect();
-        propose(recipe, &sources);
+        recipe.options.disjoint_copy_sources = !recipe.options.disjoint_copy_sources;
+        propose(recipe);
     }
-
-    for site in &incumbent.cast_sites {
-        let mut recipe = incumbent.recipe.clone();
-        if !recipe.cast_before_copies.insert(site.clone()) {
-            recipe.cast_before_copies.remove(site);
-        }
-        propose(recipe, &BTreeSet::from([site.source]));
-    }
-
     for operation in &operations {
-        let related = operations
-            .iter()
-            .filter(|candidate| {
-                candidate.id == operation.id
-                    || candidate
-                        .inputs
-                        .iter()
-                        .any(|input| operation.results.contains(input))
-            })
-            .map(|candidate| candidate.id)
-            .collect();
         let alternatives = incumbent
             .alternatives
             .get(&operation.id)
@@ -148,7 +66,7 @@ pub(crate) fn proposals(
         for plan in alternatives.clone() {
             let mut recipe = incumbent.recipe.clone();
             recipe.plans.insert(operation.id, plan.clone());
-            propose(recipe, &related);
+            propose(recipe);
         }
         for &output in &operation.results {
             if graph.outputs().contains(&output)
@@ -175,9 +93,9 @@ pub(crate) fn proposals(
             for plan in alternatives.clone() {
                 let mut joint = recipe.clone();
                 joint.plans.insert(operation.id, plan.clone());
-                propose(joint, &related);
+                propose(joint);
             }
-            propose(recipe, &related);
+            propose(recipe);
         }
     }
     let mut candidates = candidates
@@ -188,7 +106,7 @@ pub(crate) fn proposals(
         })
         .collect::<Vec<_>>();
     if let Some(traffic) = traffic {
-        match owner_mapping(graph, incumbent, traffic) {
+        match owner_mapping(incumbent, traffic) {
             Ok(Some(proposal)) => candidates.push(proposal),
             Ok(None) => {}
             Err(error) => tracing::info!(%error, "could not propose owner mapping"),
@@ -203,7 +121,6 @@ pub(crate) fn proposals(
 /// A permutation preserves the coarse mid estimate, so use the model's predicted
 /// cycle saving to rank this proposal with layout changes in the same shortlist.
 fn owner_mapping(
-    graph: &ComputeGraph,
     incumbent: &Candidate,
     traffic: &crate::exchange::MappingTraffic,
 ) -> Result<Option<RecipeProposal>, crate::mid::ProgramError> {
@@ -255,9 +172,7 @@ fn owner_mapping(
         "screened ownership proposal by exchange resource load");
     best.map(|mapping| {
         Ok(RecipeProposal {
-            recipe: incumbent
-                .recipe
-                .remapped(graph, &mapping, program.tile_count)?,
+            recipe: incumbent.recipe.remapped(&mapping, program.tile_count)?,
             estimated_cycles: Some(
                 program
                     .estimated_cycles
@@ -314,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_donation_proposals_leave_unrelated_families_fixed() {
+    fn layout_proposals_include_whole_program_donation() {
         let (graph, config) = mlp();
         let incumbent = build::build_candidate(
             &graph,
@@ -324,55 +239,57 @@ mod tests {
             &Recipe::default(),
         )
         .unwrap();
-        let first = graph.operations()[0].id;
-        let consumer = graph.operations()[1].id;
-        let unrelated = graph.operations()[2].id;
-        let default = incumbent.recipe.cast_storage.as_ref().unwrap().default;
-        let mut joint = 0;
-        for proposal in proposals(&graph, &config, &incumbent, None) {
-            let recipe = proposal.recipe;
-            let policy = recipe.cast_storage.as_ref().unwrap();
-            assert_eq!(policy.default, default);
-            if recipe.open_boundaries != incumbent.recipe.open_boundaries
-                || recipe.plans.get(&first) == incumbent.recipe.plans.get(&first)
-                || recipe.plans.get(&consumer) != incumbent.recipe.plans.get(&consumer)
-                || recipe.plans.get(&unrelated) != incumbent.recipe.plans.get(&unrelated)
-                || policy.operators.is_empty()
-            {
-                continue;
-            }
-            assert_eq!(policy.for_operator(Some(unrelated)), default);
-            assert_eq!(policy.for_operator(Some(first)), default.opposite());
-            assert_eq!(policy.for_operator(Some(consumer)), default.opposite());
-            joint += 1;
-        }
+        let choices = proposals(&graph, &config, &incumbent, None);
+        let changed = choices
+            .iter()
+            .find(|p| p.recipe.plans != incumbent.recipe.plans)
+            .unwrap();
         assert!(
-            joint > 0,
-            "layout search must retain joint donation proposals"
+            choices
+                .iter()
+                .any(|p| p.recipe.plans == changed.recipe.plans
+                    && p.recipe.options.reuse_cast_inputs
+                        != changed.recipe.options.reuse_cast_inputs)
         );
+        for proposal in choices {
+            let encoded = serde_json::to_vec(&proposal.recipe).unwrap();
+            let restored: Recipe = serde_json::from_slice(&encoded).unwrap();
+            assert!(restored == proposal.recipe);
+        }
     }
-
     #[test]
-    fn implicit_cast_policy_has_one_checkpoint_identity() {
-        for capacity_baseline in [false, true] {
-            let config = PipelineConfig {
-                capacity_baseline,
-                ..PipelineConfig::new(8)
-            };
-            let mut implicit = Recipe::default();
-            let mut explicit = Recipe {
-                cast_storage: Some(crate::mid::cast::CastStoragePolicy::new(
-                    if capacity_baseline {
-                        crate::mid::cast::CastStorage::ReuseIfSmaller
-                    } else {
-                        crate::mid::cast::CastStorage::Separate
-                    },
-                )),
-                ..Recipe::default()
-            };
-            implicit.normalize(&config);
-            explicit.normalize(&config);
-            assert!(implicit == explicit);
+    fn global_mapping_replays_without_changing_logical_work() {
+        let (graph, config) = mlp();
+        let cache = crate::planner::cache::FragmentCache::default();
+        let baseline = build::build_candidate(
+            &graph,
+            &config,
+            &Ipu21CostModel,
+            &cache,
+            &Recipe::baseline(&config),
+        )
+        .unwrap();
+        let mapping = (0..config.tile_count).rev().collect::<Vec<_>>();
+        let recipe = baseline
+            .recipe
+            .remapped(&mapping, config.tile_count)
+            .unwrap();
+        let mapped =
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, &recipe).unwrap();
+        let mut expected = baseline.program.clone();
+        expected.remap_tiles(&mapping).unwrap();
+        expected.refresh_estimates().unwrap();
+        assert_eq!(mapped.program, expected);
+        let inverse = recipe.remapped(&mapping, config.tile_count).unwrap();
+        let restored =
+            build::build_candidate(&graph, &config, &Ipu21CostModel, &cache, &inverse).unwrap();
+        for (old, new) in baseline.program.values.iter().zip(&restored.program.values) {
+            for tile in 0..old.tensor_type.format.layout.tiling.tile_count {
+                assert_eq!(
+                    old.owners.tile(tile, config.tile_count),
+                    new.owners.tile(tile, config.tile_count)
+                );
+            }
         }
     }
 }

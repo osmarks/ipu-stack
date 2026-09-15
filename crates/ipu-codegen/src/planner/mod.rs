@@ -41,7 +41,7 @@ pub(crate) fn build_baseline(
         config,
         costs,
         &FragmentCache::default(),
-        &Recipe::default(),
+        &Recipe::baseline(config),
     )?
     .program)
 }

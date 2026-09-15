@@ -16,6 +16,10 @@ BINARY = ROOT.parent.parent / "target/reduction-gate/release/ipu-reduction-metri
 
 
 class Rules(unittest.TestCase):
+    def test_generator_detection_does_not_match_planner_module(self):
+        self.assertTrue(gate.protected("crates/ipu-codegen/build.rs"))
+        self.assertFalse(gate.protected("crates/ipu-codegen/src/planner/build.rs"))
+
     def test_all_inequalities(self):
         before = dict.fromkeys(gate.METRICS, 10)
         self.assertTrue(gate.violations(before, before))

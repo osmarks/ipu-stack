@@ -47,11 +47,10 @@ pub(crate) fn lower(
     }
     let mut recipe = Recipe::default();
     outputs(graph.operations(), &mut recipe.open_boundaries);
-    recipe
-        .early_casts
-        .extend(graph.operations().iter().map(|op| op.id));
+    recipe.options.cast_before_copies = true;
     let mut program =
         build::select(graph, &config, costs, &FragmentCache::default(), &recipe)?.program;
+    program.reorder_casts();
     program.compose_copies();
     program
         .refresh_estimates()

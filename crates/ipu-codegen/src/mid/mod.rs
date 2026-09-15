@@ -11,17 +11,11 @@ mod compute;
 mod copy;
 pub(crate) mod elementwise;
 mod fragment;
-mod output_fusion;
-mod ownership;
-pub(crate) use ownership::OwnerChoices;
 mod grouping;
-pub(crate) use grouping::{GroupProposal, ReductionGroup};
+mod output_fusion;
+pub(crate) mod ownership;
 mod packing;
-pub(crate) use packing::PanelPacking;
 mod residual;
-mod site;
-pub(crate) use site::map as site_map;
-pub use site::{LocalSite, ResultSite, WorkSite};
 pub(crate) mod rewrite;
 mod validate;
 pub use compute::*;
@@ -81,29 +75,12 @@ pub enum MidOperationKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MidOperation {
     pub source: Option<OperationId>,
-    /// Stable role within the constructing family, retained through rewrites
-    /// that still implement that work. Anonymous hand-built mid is also valid.
-    pub site: Option<LocalSite>,
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
 }
 
 impl MidOperation {
-    pub(crate) fn work_site(&self) -> Option<WorkSite> {
-        Some(WorkSite {
-            source: self.source?,
-            local: self.site.clone()?,
-        })
-    }
-
-    pub(crate) fn result_site(&self, result: usize) -> Option<ResultSite> {
-        Some(ResultSite {
-            work: self.work_site()?,
-            result: result.try_into().ok()?,
-        })
-    }
-
     /// Values read in the enclosing region, including a repeat's parameter sequences.
     pub(crate) fn read_values(&self) -> impl Iterator<Item = &MidValueId> {
         let sequences = match &self.kind {
@@ -154,35 +131,6 @@ pub struct MidProgram {
 }
 
 impl MidProgram {
-    pub(crate) fn named_results(&self) -> impl Iterator<Item = (ResultSite, MidValueId)> {
-        self.walk_operations().flat_map(|operation| {
-            operation
-                .results
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &value)| {
-                    operation.result_site(index).map(|site| (site, value))
-                })
-        })
-    }
-
-    /// Visit nested work once, without unrolling Repeat or changing its scope.
-    pub(crate) fn walk_operations(&self) -> impl Iterator<Item = &MidOperation> {
-        let mut regions = vec![self.operations.iter()];
-        std::iter::from_fn(move || {
-            loop {
-                if let Some(operation) = regions.last_mut()?.next() {
-                    if let MidOperationKind::Repeat(repeat) = &operation.kind {
-                        regions.push(repeat.body.operations.iter());
-                    }
-                    return Some(operation);
-                }
-                regions.pop();
-            }
-        })
-    }
-
-    /// Refresh derived costs after constructing or rewriting a complete program.
     pub(crate) fn refresh_estimates(&mut self) -> Option<()> {
         self.validate().ok()?;
         let (cycles, peak) = crate::estimate::analyze_mid(self, &BTreeMap::new())?;

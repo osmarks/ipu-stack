@@ -39,7 +39,7 @@ The four declaration counts cover handwritten Rust syntax:
 
 Test-only items, fields, and variants are excluded. Macro expansions and
 generated code are not counted; changes to macro definitions, includes,
-`build.rs`, `.capnp`, or `.def` inputs require review. Third-party procedural
+crate-root `build.rs`, `.capnp`, or `.def` inputs require review. Third-party procedural
 macros are not expanded. The metric does not count C++ declarations or
 assembly entry points, HTML/JS, `.hpp` files, documentation, or Python tools.
 These limits preserve the existing audit scope; moving code outside that

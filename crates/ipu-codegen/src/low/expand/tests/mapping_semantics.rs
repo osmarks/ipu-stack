@@ -310,7 +310,6 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                 .iter()
                 .enumerate()
                 .map(|(index, mapping)| MidOperation {
-                    site: None,
                     source: None,
                     inputs: vec![MidValueId::from_index(index as u32)],
                     results: vec![MidValueId::from_index(index as u32 + 1)],
@@ -381,7 +380,6 @@ fn forced_destination_packing_and_direct_transfers_preserve_the_same_values() {
                 outputs: vec![MidValueId::from_index(2)],
                 operations: (0..2)
                     .map(|index| MidOperation {
-                        site: None,
                         source: None,
                         inputs: vec![MidValueId::from_index(index)],
                         results: vec![MidValueId::from_index(index + 1)],

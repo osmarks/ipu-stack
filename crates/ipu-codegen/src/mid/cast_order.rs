@@ -1,9 +1,9 @@
-//! Cast motion on executable mid, selected by stable construction sites.
+//! Move eligible FP8 conversions ahead of copies on executable mid.
 
 use crate::kernel::TileKernelSpec;
 use crate::mid::{
     Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    OperandIndexing, WorkSite,
+    OperandIndexing,
 };
 use crate::tensor::{
     AmpOrder, AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
@@ -93,16 +93,8 @@ pub(crate) fn cast_layout(input: &TensorType) -> Option<Layout> {
 }
 
 impl MidProgram {
-    pub(crate) fn reorder_casts(&mut self, selected: &BTreeSet<WorkSite>) -> BTreeSet<WorkSite> {
-        let mut available = BTreeSet::new();
-        reorder_region(
-            &mut self.operations,
-            &mut self.values,
-            &self.outputs,
-            selected,
-            &mut available,
-        );
-        available
+    pub(crate) fn reorder_casts(&mut self) {
+        reorder_region(&mut self.operations, &mut self.values, &self.outputs);
     }
 }
 
@@ -110,8 +102,6 @@ fn reorder_region(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
     required: &[MidValueId],
-    selected: &BTreeSet<WorkSite>,
-    available: &mut BTreeSet<WorkSite>,
 ) {
     let producers = super::rewrite::single_use_producers(operations, required);
     let mut shared = Vec::<(MidValueId, MidValueId, usize)>::new();
@@ -119,20 +109,11 @@ fn reorder_region(
     let mut before = BTreeMap::<usize, Vec<MidOperation>>::new();
     for index in 0..operations.len() {
         if let MidOperationKind::Repeat(repeat) = &mut operations[index].kind {
-            reorder_region(
-                &mut repeat.body.operations,
-                values,
-                &repeat.body.yields,
-                selected,
-                available,
-            );
+            reorder_region(&mut repeat.body.operations, values, &repeat.body.yields);
             continue;
         }
         let cast = &operations[index];
         let Some((mut input, output)) = super::rewrite::fp8_cast(cast, values) else {
-            continue;
-        };
-        let Some(site) = cast.work_site() else {
             continue;
         };
         let mut chain = Vec::new();
@@ -192,14 +173,10 @@ fn reorder_region(
             best = Some((source, format, chain.clone()));
         }
         let Some((input, format, chain)) = best else {
-            tracing::debug!(?site, ?input, ?chain, tensor = ?values[input.index() as usize].tensor_type, "no early cast layout");
+            tracing::debug!(?input, ?chain, tensor = ?values[input.index() as usize].tensor_type, "no early cast layout");
             continue;
         };
-        tracing::debug!(?site, ?input, ?format, "available mid cast motion");
-        available.insert(site.clone());
-        if !selected.contains(&site) {
-            continue;
-        }
+        tracing::debug!(?input, ?format, "available mid cast motion");
         let at = *chain.last().unwrap();
         let existing = shared
             .iter()
@@ -220,7 +197,6 @@ fn reorder_region(
             value.tensor_type.format = format;
             values.push(value);
             let early = MidOperation {
-                site: cast.site.clone(),
                 source: cast.source,
                 inputs: vec![input],
                 results: vec![id],
@@ -238,7 +214,7 @@ fn reorder_region(
             id
         });
         let mut copy = cast.clone();
-        copy.site = cast.site.as_ref().map(|site| site.child("distribute"));
+
         copy.inputs = vec![id];
         copy.kind = MidOperationKind::Copy {
             policy: crate::CopyPolicy::Automatic,
@@ -321,7 +297,6 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, kind)| MidOperation {
-                    site: Some(crate::mid::LocalSite::from(["copy", "cast"][i])),
                     source: Some(source),
                     inputs: vec![MidValueId(i as u32)],
                     results: vec![MidValueId(i as u32 + 1)],
@@ -338,7 +313,9 @@ mod tests {
         let mut mid = fixture();
         let intermediate = mid.operations[0].results[0];
         mid.outputs.push(intermediate);
-        assert!(mid.reorder_casts(&BTreeSet::new()).is_empty());
+        let before = mid.clone();
+        mid.reorder_casts();
+        assert_eq!(mid, before);
         mid.outputs.pop();
         let source = mid.operations[0].inputs[0];
         let mut alias = mid.values[source.index() as usize].clone();
@@ -346,7 +323,6 @@ mod tests {
         mid.operations.insert(
             1,
             MidOperation {
-                site: None,
                 source: None,
                 inputs: vec![source],
                 results: vec![alias.id],
@@ -358,7 +334,9 @@ mod tests {
             },
         );
         mid.values.push(alias);
-        assert!(mid.reorder_casts(&BTreeSet::new()).is_empty());
+        let before = mid.clone();
+        mid.reorder_casts();
+        assert_eq!(mid, before);
     }
 
     #[test]
@@ -366,7 +344,6 @@ mod tests {
         let mut mid = fixture();
         let yields = mid.outputs.clone();
         mid.operations = vec![MidOperation {
-            site: None,
             source: None,
             inputs: vec![MidValueId(0)],
             results: yields.clone(),
@@ -382,9 +359,7 @@ mod tests {
                 },
             }),
         }];
-        let sites = mid.reorder_casts(&BTreeSet::new());
-        assert_eq!(sites.len(), 1);
-        mid.reorder_casts(&sites);
+        mid.reorder_casts();
         let MidOperationKind::Repeat(repeat) = &mid.operations[0].kind else {
             panic!()
         };
@@ -404,7 +379,6 @@ mod tests {
         mid.operations.insert(
             0,
             MidOperation {
-                site: None,
                 source: None,
                 inputs: vec![original.id],
                 results: vec![source],
@@ -418,9 +392,7 @@ mod tests {
         );
         mid.values.push(original);
         let mut rewritten = mid;
-        let sites = rewritten.reorder_casts(&BTreeSet::new());
-        assert_eq!(sites.len(), 1);
-        rewritten.reorder_casts(&sites);
+        rewritten.reorder_casts();
         rewritten.compose_copies();
         let cast = rewritten
             .operations

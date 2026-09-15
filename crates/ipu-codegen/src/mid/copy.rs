@@ -207,7 +207,7 @@ fn independent_prefix(
         .count()
 }
 
-// Forced packing belongs to the present source/destination site. Composition
+// Forced packing belongs to the present source/destination pair. Composition
 // preserves that boundary until it can prove the requested realization survives.
 fn mapping(operation: &MidOperation) -> Option<(CoordinateMapping, bool, CopyPolicy)> {
     match &operation.kind {
@@ -455,7 +455,6 @@ mod tests {
             .collect();
         let operations = (1..4)
             .map(|index| MidOperation {
-                site: None,
                 source: None,
                 inputs: vec![MidValueId(index - 1)],
                 results: vec![MidValueId(index)],

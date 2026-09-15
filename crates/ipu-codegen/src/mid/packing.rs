@@ -3,116 +3,33 @@
 use crate::kernel::TileKernelSpec;
 use crate::mid::{
     Compute, CoordinateMapping, MidOperation, MidOperationKind, MidProgram, MidValue, MidValueId,
-    OperandIndexing, ProgramError, WorkSite,
+    OperandIndexing,
 };
 use crate::tensor::{
-    AxisTiling, BlockMajorOrder, ElementOrder, Layout, OwnerMap, Padding, Precision, TensorAxis,
+    AxisTiling, BlockMajorOrder, ElementOrder, Layout, Padding, Precision, TensorAxis,
     TensorTiling, TensorType,
 };
 
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::num::NonZeroU16;
-
-/// Retile a copy through smaller panels on an explicit working domain. The
-/// destination keeps its selected layout and home; workspace ownership is an
-/// absolute assignment, independent of constructor result-base rotations.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PanelPacking {
-    pub rows: NonZeroU16,
-    pub workspace: OwnerMap,
-}
-
 impl MidProgram {
-    /// Report inexpensive choices before packing replaces the original copy.
-    /// The planner supplies its row neighborhood; this module owns feasibility.
-    pub(crate) fn packing_choices(
-        &self,
-        rows: &[u16],
-        selected: &BTreeMap<WorkSite, PanelPacking>,
-    ) -> BTreeMap<WorkSite, Vec<PanelPacking>> {
-        self.walk_operations()
-            .filter_map(|operation| {
-                let target = packing_target(operation, &self.values)?;
-                let site = operation.work_site()?;
-                let workspace = selected
-                    .get(&site)
-                    .map_or(&target.owners, |choice| &choice.workspace);
-                let choices = rows
-                    .iter()
-                    .copied()
-                    .filter_map(NonZeroU16::new)
-                    .filter_map(|rows| {
-                        let layout = packing_layout(&target.tensor_type, self.tile_count, rows)?;
-                        let workspace = if workspace
-                            .tile(layout.tiling.tile_count - 1, self.tile_count)
-                            .is_some()
-                        {
-                            workspace.clone()
-                        } else {
-                            OwnerMap::default()
-                        };
-                        Some(PanelPacking { rows, workspace })
-                    })
-                    .collect::<Vec<_>>();
-                (!choices.is_empty()).then_some((site, choices))
-            })
-            .collect()
-    }
-
-    pub(crate) fn apply_packing(
-        &mut self,
-        choices: &BTreeMap<WorkSite, PanelPacking>,
-    ) -> Result<(), ProgramError> {
-        if choices.is_empty() {
-            return Ok(());
+    pub(crate) fn with_distributed_packing(&self, rows: u16) -> Option<Self> {
+        let mut result = self.clone();
+        if !distribute_region(
+            &mut result.operations,
+            &mut result.values,
+            self.tile_count,
+            rows,
+        ) {
+            return None;
         }
-        let mut layouts = BTreeMap::new();
-        for operation in self.walk_operations() {
-            let Some(site) = operation.work_site() else {
-                continue;
-            };
-            let Some(choice) = choices.get(&site) else {
-                continue;
-            };
-            let layout = packing_target(operation, &self.values)
-                .and_then(|value| packing_layout(&value.tensor_type, self.tile_count, choice.rows))
-                .ok_or_else(|| {
-                    ProgramError::Invalid(format!("packing choice cannot apply at {site:?}"))
-                })?;
-            choice
-                .workspace
-                .validate(layout.tiling.tile_count, self.tile_count)?;
-            layouts.insert(site, layout);
-        }
-        if let Some(site) = choices.keys().find(|site| !layouts.contains_key(site)) {
-            return Err(ProgramError::Invalid(format!(
-                "packing choice is unavailable at {site:?}"
-            )));
-        }
-        // All requested geometry and workspaces are checked before modifying work.
-        distribute_region(&mut self.operations, &mut self.values, choices, &layouts);
-        Ok(())
+        result.refresh_estimates()?;
+        Some(result)
     }
 }
 
-fn packing_target<'a>(operation: &MidOperation, values: &'a [MidValue]) -> Option<&'a MidValue> {
-    if !matches!(operation.kind, MidOperationKind::Copy { .. }) {
+fn packing_layout(tensor: &TensorType, capacity: u16, block_rows: u16) -> Option<Layout> {
+    if block_rows == 0 {
         return None;
     }
-    let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice()) else {
-        return None;
-    };
-    let input = &values[input.index() as usize].tensor_type.format;
-    let output = &values[output.index() as usize];
-    (input.precision == Precision::F16
-        && input.layout.order == ElementOrder::RowMajor
-        && output.tensor_type.format.precision == Precision::F16)
-        .then_some(output)
-}
-
-fn packing_layout(tensor: &TensorType, capacity: u16, block_rows: NonZeroU16) -> Option<Layout> {
-    let block_rows = block_rows.get();
     let ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
         row_block,
         column_block,
@@ -170,69 +87,87 @@ fn packing_layout(tensor: &TensorType, capacity: u16, block_rows: NonZeroU16) ->
 fn distribute_region(
     operations: &mut Vec<MidOperation>,
     values: &mut Vec<MidValue>,
-    choices: &BTreeMap<WorkSite, PanelPacking>,
-    layouts: &BTreeMap<WorkSite, Layout>,
-) {
+    capacity: u16,
+    rows: u16,
+) -> bool {
     let mut result = Vec::new();
+    let mut changed = false;
     for mut operation in std::mem::take(operations) {
         if let MidOperationKind::Repeat(repeat) = &mut operation.kind {
-            distribute_region(&mut repeat.body.operations, values, choices, layouts);
+            changed |= distribute_region(&mut repeat.body.operations, values, capacity, rows);
         }
-        let Some(site) = operation
-            .work_site()
-            .filter(|site| layouts.contains_key(site))
-        else {
-            result.push(operation);
-            continue;
-        };
-        let target = values[operation.results[0].index() as usize].clone();
-        let layout = layouts[&site].clone();
-        let choice = &choices[&site];
-        let logical = MidValueId(values.len() as u32);
-        let packed = MidValueId(logical.index() + 1);
-        let mut tensor = target.tensor_type.clone();
-        tensor.format.layout = layout.clone();
-        let mut row_major = tensor.clone();
-        row_major.format.layout.order = ElementOrder::RowMajor;
-        for (id, tensor_type) in [(logical, row_major.clone()), (packed, tensor)] {
-            values.push(MidValue {
-                id,
-                tensor_type,
-                storage_group: id,
-                owners: choice.workspace.clone(),
-                ..target
-            });
+        if let MidOperationKind::Copy { .. } = &operation.kind
+            && let ([input], [output]) = (operation.inputs.as_slice(), operation.results.as_slice())
+            && values[input.index() as usize].tensor_type.format.precision == Precision::F16
+            && values[input.index() as usize]
+                .tensor_type
+                .format
+                .layout
+                .order
+                == ElementOrder::RowMajor
+            && values[output.index() as usize].tensor_type.format.precision == Precision::F16
+        {
+            let target = values[output.index() as usize].clone();
+            if let Some(layout) = packing_layout(&target.tensor_type, capacity, rows) {
+                let workspace = if target
+                    .owners
+                    .validate(layout.tiling.tile_count, capacity)
+                    .is_ok()
+                {
+                    target.owners.clone()
+                } else {
+                    crate::tensor::OwnerMap::default()
+                };
+                let start = values.len();
+                let packed = MidValueId(start as u32 + 1);
+                let logical = MidValueId(start as u32);
+                let mut tensor = target.tensor_type.clone();
+                tensor.format.layout = layout.clone();
+                let mut row_major = tensor.clone();
+                row_major.format.layout.order = ElementOrder::RowMajor;
+                for (id, tensor_type) in [(logical, row_major.clone()), (packed, tensor)] {
+                    values.push(MidValue {
+                        id,
+                        tensor_type,
+                        storage_group: id,
+                        owners: workspace.clone(),
+                        ..target
+                    });
+                }
+                let pack = MidOperation {
+                    inputs: vec![logical],
+                    results: vec![packed],
+                    source: operation.source,
+                    kind: MidOperationKind::Compute(Compute::Kernel {
+                        kernel: TileKernelSpec::Rearrange {
+                            from: row_major.format.layout,
+                            to: layout,
+                        },
+                        operands: vec![OperandIndexing::Elementwise { result: 0 }],
+                        output_aliases: Vec::new(),
+                    }),
+                };
+                let transfer = MidOperation {
+                    inputs: vec![packed],
+                    results: vec![*output],
+                    source: operation.source,
+                    kind: MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
+                        packing: crate::PackingPolicy::Automatic,
+                        mapping: CoordinateMapping::default(),
+                        reuse_local: true,
+                    },
+                };
+                operation.results = vec![logical];
+                result.extend([operation, pack, transfer]);
+                changed = true;
+                continue;
+            }
         }
-        let pack = MidOperation {
-            site: operation.site.as_ref().map(|site| site.child("pack")),
-            inputs: vec![logical],
-            results: vec![packed],
-            source: operation.source,
-            kind: MidOperationKind::Compute(Compute::Kernel {
-                kernel: TileKernelSpec::Rearrange {
-                    from: row_major.format.layout,
-                    to: layout,
-                },
-                operands: vec![OperandIndexing::Elementwise { result: 0 }],
-                output_aliases: Vec::new(),
-            }),
-        };
-        let transfer = MidOperation {
-            site: operation.site.as_ref().map(|site| site.child("distribute")),
-            inputs: vec![packed],
-            results: operation.results.clone(),
-            source: operation.source,
-            kind: MidOperationKind::Copy {
-                policy: crate::CopyPolicy::Automatic,
-                packing: crate::PackingPolicy::Automatic,
-                mapping: CoordinateMapping::default(),
-                reuse_local: true,
-            },
-        };
-        operation.results = vec![logical];
-        result.extend([operation, pack, transfer]);
+        result.push(operation);
     }
     *operations = result;
+    changed
 }
 
 #[cfg(test)]
@@ -243,194 +178,83 @@ mod tests {
     use crate::tensor::{AxisFactorView, MemoryClass};
 
     use super::*;
-    fn packing_copy(view: bool) -> (crate::ComputeGraph, MidProgram) {
-        let mut provenance = crate::ComputeGraph::new();
-        let argument = provenance.host_input("x", [1, 16]).unwrap();
-        provenance.gelu(argument).unwrap();
-        let source = TensorType::new(
-            if view {
-                vec![1, 729, 144]
-            } else {
-                vec![2, 729, 72]
-            },
-            Precision::F16,
-            Layout::row_sharded(64),
-        );
-        let target = TensorType::new(
-            [2, 729, 72],
-            Precision::F16,
-            Layout {
-                order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-                    row_block: 768,
-                    column_block: 16,
-                }),
-                memory_class: MemoryClass::Ipu21Standard,
-                tiling: TensorTiling {
-                    tile_count: 10,
-                    replicas: 1,
-                    axes: vec![
-                        AxisTiling::new(TensorAxis::FromEnd(1), 5, 16, Padding::Zero)
-                            .with_tile_stride(1),
-                        AxisTiling::new(TensorAxis::FromEnd(2), 1, 768, Padding::Zero)
-                            .with_tile_stride(5),
-                        AxisTiling::new(TensorAxis::FromEnd(3), 2, 1, Padding::Reject)
-                            .with_tile_stride(5),
-                    ],
-                },
-            },
-        );
-        let values = [source, target]
-            .into_iter()
-            .enumerate()
-            .map(|(index, tensor_type)| {
-                let id = MidValueId(index as u32);
-                MidValue {
-                    id,
-                    tensor_type,
-                    origin: ValueId::from_index(index as u32),
-                    storage_group: id,
-                    owners: crate::tensor::OwnerMap::default(),
-                }
-            })
-            .collect();
-        let program = MidProgram {
-            tile_count: 64,
-            values,
-            inputs: vec![MidInput {
-                name: "x".into(),
-                kind: GraphInputKind::Host,
-                value: MidValueId(0),
-            }],
-            outputs: vec![MidValueId(1)],
-            operations: vec![MidOperation {
-                site: Some("packing".into()),
-                source: Some(provenance.operations()[0].id),
-                inputs: vec![MidValueId(0)],
-                results: vec![MidValueId(1)],
-                kind: MidOperationKind::Copy {
-                    policy: crate::CopyPolicy::Automatic,
-                    packing: crate::PackingPolicy::Automatic,
-                    mapping: CoordinateMapping {
-                        offsets: vec![],
-                        view: view.then_some(AxisFactorView::new(2, 0, 2)),
-                    },
-                    reuse_local: true,
-                },
-            }],
-            ..MidProgram::default()
-        };
-        (provenance, program)
-    }
-
-    #[test]
-    fn packing_choices_preserve_other_copies_and_independent_result_homes() {
-        let (graph, mut raw) = packing_copy(false);
-        let mut other = raw.values[1].clone();
-        other.id = MidValueId(2);
-        other.storage_group = other.id;
-        raw.values.push(other);
-        let mut copy = raw.operations[0].clone();
-        copy.site = Some("other".into());
-        copy.results = vec![MidValueId(2)];
-        raw.operations.push(copy.clone());
-        raw.outputs.push(MidValueId(2));
-        let site = raw.operations[0].work_site().unwrap();
-        let small_home = OwnerMap::embedded((0..10).map(|i| 1 + 4 * i).collect::<Vec<_>>());
-        let workspace = OwnerMap::embedded((0..64).rev().collect::<Vec<_>>());
-        let mut recipe = crate::planner::Recipe::default();
-        recipe.owners.results.insert(
-            raw.operations[0].result_site(0).unwrap(),
-            small_home.clone(),
-        );
-        recipe.packing.insert(
-            site.clone(),
-            PanelPacking {
-                rows: NonZeroU16::new(128).unwrap(),
-                workspace: workspace.clone(),
-            },
-        );
-        let replay: crate::planner::Recipe =
-            serde_json::from_slice(&serde_json::to_vec(&recipe).unwrap()).unwrap();
-        assert!(recipe == replay);
-        let mut bound = raw.clone();
-        bound.apply_ownership(&recipe.owners).unwrap();
-        let choices = bound.packing_choices(&[128], &BTreeMap::new());
-        assert_eq!(
-            choices[&site][0].workspace,
-            OwnerMap::default(),
-            "the small result domain cannot hold the packing workspace"
-        );
-        let before = bound.clone();
-        let mut invalid = recipe.packing.clone();
-        invalid.get_mut(&site).unwrap().workspace = OwnerMap::embedded(vec![0]);
-        assert!(bound.apply_packing(&invalid).is_err());
-        assert_eq!(bound, before);
-        let mut missing = site.clone();
-        missing.local = missing.local.child("missing");
-        invalid = BTreeMap::from([(missing, recipe.packing[&site].clone())]);
-        assert!(bound.apply_packing(&invalid).is_err());
-        assert_eq!(bound, before);
-        bound.apply_packing(&recipe.packing).unwrap();
-        bound.refresh_estimates().unwrap();
-        assert_eq!(bound.values[1].owners, small_home);
-        assert_eq!(bound.operations.last().unwrap(), &copy);
-        let packed = bound
-            .operations
-            .iter()
-            .find(|op| matches!(op.kind, MidOperationKind::Compute(_)))
-            .unwrap()
-            .results[0];
-        let low = crate::lower_to_tiles(
-            &crate::low::expand::expand_tiles(&bound, false).unwrap(),
-            false,
-        );
-        crate::place(&low).unwrap();
-        let actual_tiles = low
-            .value_views(packed)
-            .iter()
-            .map(|id| low.shards[id.shard.index() as usize].tile)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            actual_tiles,
-            (0..60)
-                .map(|owner| workspace.tile(owner, 64).unwrap())
-                .collect()
-        );
-
-        let mapping = (0..64)
-            .map(|tile| tile % 8 * 8 + tile / 8)
-            .collect::<Vec<_>>();
-        let mapped = recipe.remapped(&graph, &mapping, 64).unwrap();
-        raw.apply_ownership(&mapped.owners).unwrap();
-        raw.apply_packing(&mapped.packing).unwrap();
-        bound.remap_tiles(&mapping).unwrap();
-        assert_eq!(raw.values, bound.values);
-        assert_eq!(raw.operations, bound.operations);
-        let mut encoded = serde_json::to_value(recipe).unwrap();
-        encoded["packing"][0][1]["rows"] = 0.into();
-        assert!(serde_json::from_value::<crate::planner::Recipe>(encoded).is_err());
-    }
-
     #[test]
     fn distributed_panels_retile_without_unpacking_the_packed_intermediate() {
         for view in [false, true] {
-            let (_, program) = packing_copy(view);
+            let source = TensorType::new(
+                if view {
+                    vec![1, 729, 144]
+                } else {
+                    vec![2, 729, 72]
+                },
+                Precision::F16,
+                Layout::row_sharded(64),
+            );
+            let target = TensorType::new(
+                [2, 729, 72],
+                Precision::F16,
+                Layout {
+                    order: ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
+                        row_block: 768,
+                        column_block: 16,
+                    }),
+                    memory_class: MemoryClass::Ipu21Standard,
+                    tiling: TensorTiling {
+                        tile_count: 10,
+                        replicas: 1,
+                        axes: vec![
+                            AxisTiling::new(TensorAxis::FromEnd(1), 5, 16, Padding::Zero)
+                                .with_tile_stride(1),
+                            AxisTiling::new(TensorAxis::FromEnd(2), 1, 768, Padding::Zero)
+                                .with_tile_stride(5),
+                            AxisTiling::new(TensorAxis::FromEnd(3), 2, 1, Padding::Reject)
+                                .with_tile_stride(5),
+                        ],
+                    },
+                },
+            );
+            let values = [source, target]
+                .into_iter()
+                .enumerate()
+                .map(|(index, tensor_type)| {
+                    let id = MidValueId(index as u32);
+                    MidValue {
+                        id,
+                        tensor_type,
+                        origin: ValueId::from_index(index as u32),
+                        storage_group: id,
+                        owners: crate::tensor::OwnerMap::default(),
+                    }
+                })
+                .collect();
+            let program = MidProgram {
+                tile_count: 64,
+                values,
+                inputs: vec![MidInput {
+                    name: "x".into(),
+                    kind: GraphInputKind::Host,
+                    value: MidValueId(0),
+                }],
+                outputs: vec![MidValueId(1)],
+                operations: vec![MidOperation {
+                    source: None,
+                    inputs: vec![MidValueId(0)],
+                    results: vec![MidValueId(1)],
+                    kind: MidOperationKind::Copy {
+                        policy: crate::CopyPolicy::Automatic,
+                        packing: crate::PackingPolicy::Automatic,
+                        mapping: CoordinateMapping {
+                            offsets: vec![],
+                            view: view.then_some(AxisFactorView::new(2, 0, 2)),
+                        },
+                        reuse_local: true,
+                    },
+                }],
+                ..MidProgram::default()
+            };
             let candidates = [32, 64, 128, 256]
                 .into_iter()
-                .filter_map(|rows| {
-                    let choices = program
-                        .packing_choices(&[rows], &BTreeMap::new())
-                        .into_iter()
-                        .map(|(site, choices)| (site, choices.into_iter().next().unwrap()))
-                        .collect::<BTreeMap<_, _>>();
-                    if choices.is_empty() {
-                        return None;
-                    }
-                    let mut packed = program.clone();
-                    packed.apply_packing(&choices).unwrap();
-                    packed.refresh_estimates().unwrap();
-                    Some(packed)
-                })
+                .filter_map(|rows| program.with_distributed_packing(rows))
                 .collect::<Vec<_>>();
             assert!(!candidates.is_empty() && candidates.len() <= 4);
             for packed in candidates {

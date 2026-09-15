@@ -6,8 +6,8 @@ use crate::graph::{
     ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, ValueId,
 };
 use crate::mid::{
-    CoordinateMapping, LocalSite, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion,
-    MidRepeat, MidValueId,
+    CoordinateMapping, MidInput, MidOperation, MidOperationKind, MidProgram, MidRegion, MidRepeat,
+    MidValueId,
 };
 use crate::planner::bind::{ValueBuilder, canonical, emit_selected, ensure_format, flat, lookup};
 use crate::planner::cache::FragmentCache;
@@ -21,7 +21,7 @@ use crate::planner::operator::{OperandMaterialization, OperatorDispatch, Operato
 use crate::planner::parameter_homes;
 use crate::planner::recipe::{Candidate, Recipe};
 use crate::tensor::{TensorFormat, TensorShape, TensorType};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub(crate) fn build_candidate(
     graph: &ComputeGraph,
@@ -31,77 +31,36 @@ pub(crate) fn build_candidate(
     recipe: &Recipe,
 ) -> LoweringResult<Candidate> {
     let mut selected = select(graph, config, costs, fragments, recipe)?;
-    selected.recipe.normalize(config);
+    let options = &selected.recipe.options;
     let mut program = selected.program;
-    selected.cast_sites = program.reorder_casts(&BTreeSet::new());
-    selected.recipe.resolve_cast_choices(&selected.cast_sites)?;
-    if !selected.recipe.cast_before_copies.is_empty() {
-        program.reorder_casts(&selected.recipe.cast_before_copies);
+    if options.cast_before_copies {
+        program.reorder_casts();
     }
     program.compose_copies();
-    selected.program = if config.diagnostic_checkpoints {
-        program
-    } else {
-        program
+    if !config.diagnostic_checkpoints {
+        program = program
             .with_elementwise_fusions(
                 config.standard_memory_reservation_bytes,
                 config.tile_memory_budget_bytes,
             )
-            .unwrap_or(program)
-    };
-    if !config.diagnostic_checkpoints {
-        selected.packing_choices = selected
-            .program
-            .packing_choices(&super::proposals::PACKING_ROWS, &selected.recipe.packing);
-        selected.program.apply_packing(&selected.recipe.packing)?;
-        selected.grouping_choices = (2..=config.max_parallel_reductions)
-            .map(|limit| selected.program.propose_reduction_groups(limit))
-            .filter(|proposal| !proposal.reductions.is_empty())
-            .collect();
-    } else {
-        if !selected.recipe.packing.is_empty() {
-            return Err(crate::mid::ProgramError::Invalid(
-                "packing choices cannot apply with diagnostic checkpoints".into(),
-            )
-            .into());
+            .unwrap_or(program);
+        if options.packing_rows != 0 {
+            program = program
+                .with_distributed_packing(options.packing_rows)
+                .unwrap_or(program);
+        }
+        program.group_reductions(options.parallel_reductions)?;
+        if options.disjoint_copy_sources {
+            program.distribute_preparation(config.diagnostic_checkpoints)?;
+        }
+        if options.reuse_cast_inputs {
+            program.reuse_cast_inputs();
         }
     }
-    if config.diagnostic_checkpoints && !selected.recipe.reduction_groups.is_empty() {
-        return Err(crate::mid::ProgramError::Invalid(
-            "reduction grouping cannot apply with diagnostic checkpoints".into(),
-        )
-        .into());
+    if !options.tile_mapping.is_empty() {
+        program.remap_tiles(&options.tile_mapping)?;
     }
-    selected
-        .program
-        .group_reductions(&selected.recipe.reduction_groups)?;
-    let homes = selected
-        .program
-        .propose_preparation_homes(config.diagnostic_checkpoints);
-    if !homes.is_empty() {
-        selected.grouping_choices.push(crate::mid::GroupProposal {
-            reductions: selected.recipe.reduction_groups.clone(),
-            homes,
-        });
-    }
-    let storage = selected.recipe.cast_storage.as_ref().unwrap();
-    if config.diagnostic_checkpoints {
-        if !storage.sites.is_empty() || !storage.operators.is_empty() {
-            return Err(crate::mid::ProgramError::Invalid(
-                "cast-storage overrides cannot apply with diagnostic checkpoints".into(),
-            )
-            .into());
-        }
-    } else {
-        selected.cast_storage_sites = selected.program.reuse_cast_inputs(storage);
-        if let Some(site) = storage
-            .sites
-            .keys()
-            .find(|site| !selected.cast_storage_sites.contains(site))
-        {
-            return Err(LoweringError::UnavailableCastStorageChoice(site.clone()));
-        }
-    }
+    selected.program = program;
     selected
         .program
         .refresh_estimates()
@@ -118,33 +77,6 @@ pub(crate) fn select(
 ) -> LoweringResult<Candidate> {
     if config.tile_count == 0 {
         return Err(LoweringError::EmptyTileGroup);
-    }
-    // Defaults may name an operator whose selected implementation emits no
-    // work. Validate provenance against the graph, not the surviving mid sites.
-    let sources = graph
-        .walk_operations()
-        .map(|op| op.id)
-        .collect::<BTreeSet<_>>();
-    let requests = recipe
-        .owners
-        .operators
-        .keys()
-        .map(|source| ("ownership", source))
-        .chain(
-            recipe
-                .cast_storage
-                .iter()
-                .flat_map(|policy| policy.operators.keys())
-                .map(|source| ("cast-storage", source)),
-        );
-    if let Some((policy, source)) = requests
-        .into_iter()
-        .find(|(_, source)| !sources.contains(source))
-    {
-        return Err(crate::mid::ProgramError::Invalid(format!(
-            "{policy} policy names unknown operator {source:?}"
-        ))
-        .into());
     }
     let expanded_config = (config.shape_aware_active_tile_counts
         && config.operator_candidates == default_operator_candidates(config.tile_count))
@@ -234,13 +166,9 @@ pub(crate) fn select(
         estimated_exchange_cycles: 0,
         peak_memory: MemoryPeaks::default(),
     };
-    program.apply_ownership(&builder.recipe.owners)?;
+    crate::mid::ownership::bind_owners(&mut program.operations, &mut program.values)?;
     program.validate()?;
     Ok(Candidate {
-        cast_sites: BTreeSet::new(),
-        cast_storage_sites: BTreeSet::new(),
-        packing_choices: BTreeMap::new(),
-        grouping_choices: Vec::new(),
         program,
         recipe: builder.recipe,
         alternatives: builder.alternatives,
@@ -346,32 +274,19 @@ impl<C: CostModel> Builder<'_, C> {
                     last,
                 )
             };
-            let (selected, early_cast) = if let Some(plan) = self.recipe.plans.get(&operation.id) {
-                (
-                    plan.clone(),
-                    self.recipe.early_casts.contains(&operation.id),
-                )
+            let selected = if let Some(plan) = self.recipe.plans.get(&operation.id) {
+                plan.clone()
             } else {
                 plans
                     .iter()
-                    .flat_map(|plan| [(plan, false), (plan, true)])
-                    .filter(|(plan, early)| {
-                        !early
-                            || self.config.capacity_baseline
-                                && types.iter().zip(&plan.inputs).any(|(input, requirement)| {
-                                    input.format.precision != requirement.format.precision
-                                })
-                    })
-                    .filter_map(|(plan, early_cast)| {
-                        let early_cast =
-                            early_cast || self.recipe.early_casts.contains(&operation.id);
+                    .filter_map(|plan| {
                         if !self.config.capacity_baseline {
                             let (inputs, output) = plan.tensor_types(&types, shape);
                             let implementation = self.fragments.get(plan, &inputs, &output)?;
                             let mut state = ValueBuilder::default();
                             let mut conversions = Vec::new();
-                            for (index, ((source, requirement), &automatic)) in
-                                types.iter().zip(&plan.inputs).zip(&automatic).enumerate()
+                            for ((source, requirement), &automatic) in
+                                types.iter().zip(&plan.inputs).zip(&automatic)
                             {
                                 let id = state.value(operation.results[0], source.clone());
                                 if automatic {
@@ -385,7 +300,6 @@ impl<C: CostModel> Builder<'_, C> {
                                     // represented by the family fragment's memory peak.
                                     OperandMaterialization::Complete,
                                     operation.id,
-                                    LocalSite::from("input").at(index as u32),
                                     self.costs,
                                     &mut state,
                                     &mut conversions,
@@ -397,7 +311,7 @@ impl<C: CostModel> Builder<'_, C> {
                                 .operator_cycle_override(plan, &inputs, &output)
                                 .unwrap_or(implementation.estimated_cycles)
                                 .saturating_add(state.conversion_cycles);
-                            return Some((rank(cycles, memory), (plan, early_cast)));
+                            return Some((rank(cycles, memory), plan));
                         }
                         // Lower the actual boundary -> operator -> boundary sequence.
                         // The operator alone omits live source buffers and cast/pack
@@ -450,9 +364,8 @@ impl<C: CostModel> Builder<'_, C> {
                             &state.values,
                         );
                         let mut fragment = fragment;
-                        if early_cast {
-                            let sites = fragment.reorder_casts(&BTreeSet::new());
-                            fragment.reorder_casts(&sites);
+                        if self.recipe.options.cast_before_copies {
+                            fragment.reorder_casts();
                         }
                         fragment.compose_copies();
                         let (cycles, memory) = crate::estimate::analyze_with_budget(
@@ -462,15 +375,12 @@ impl<C: CostModel> Builder<'_, C> {
                         )?;
                         let cycles = cycles.total;
 
-                        Some((rank(cycles, memory), (plan, early_cast)))
+                        Some((rank(cycles, memory), plan))
                     })
                     .min_by_key(|(score, _)| *score)
-                    .map(|(_, (plan, early_cast))| (plan.clone(), early_cast))
+                    .map(|(_, plan)| plan.clone())
                     .ok_or(LoweringError::NoCandidate(operation.id))?
             };
-            if early_cast {
-                self.recipe.early_casts.insert(operation.id);
-            }
             if !self.recipe.plans.contains_key(&operation.id) {
                 self.alternatives.insert(operation.id, plans);
             }
@@ -515,7 +425,6 @@ impl<C: CostModel> Builder<'_, C> {
                 let result = self.state.value(source.origin, source.tensor_type);
                 self.state.values[result.index() as usize].owners = source.owners.clone();
                 operations.push(MidOperation {
-                    site: None,
                     source: Some(operation.id),
                     inputs: vec![*input],
                     results: vec![result],
@@ -582,7 +491,6 @@ impl<C: CostModel> Builder<'_, C> {
                 target,
                 OperandMaterialization::Complete,
                 operation.id,
-                LocalSite::from("repeat.invariant").at(index as u32),
                 self.costs,
                 &mut self.state,
                 operations,
@@ -598,16 +506,12 @@ impl<C: CostModel> Builder<'_, C> {
                 .clone();
             let converted = sequence
                 .iter()
-                .enumerate()
-                .map(|(element, &id)| {
+                .map(|&id| {
                     ensure_format(
                         id,
                         target.clone(),
                         OperandMaterialization::Complete,
                         operation.id,
-                        LocalSite::from("repeat.sequence")
-                            .at(index as u32)
-                            .at(element as u32),
                         self.costs,
                         &mut self.state,
                         operations,
@@ -624,7 +528,6 @@ impl<C: CostModel> Builder<'_, C> {
                 self.state.get(inputs[index]).tensor_type.format.clone(),
                 OperandMaterialization::Complete,
                 operation.id,
-                LocalSite::from("repeat.yield").at(index as u32),
                 self.costs,
                 &mut self.state,
                 &mut body,
@@ -644,7 +547,6 @@ impl<C: CostModel> Builder<'_, C> {
             })
             .collect();
         operations.push(MidOperation {
-            site: None,
             source: Some(operation.id),
             inputs,
             results,
@@ -690,7 +592,7 @@ mod tests {
             &config,
             &Ipu21CostModel,
             &crate::planner::cache::FragmentCache::default(),
-            &Recipe::default(),
+            &Recipe::baseline(&config),
         )
         .unwrap();
         let op = baseline
@@ -760,7 +662,7 @@ mod tests {
                 &config,
                 &costs,
                 &crate::planner::cache::FragmentCache::default(),
-                &Recipe::default(),
+                &Recipe::baseline(&config),
             )
             .unwrap();
             let repeat = baseline

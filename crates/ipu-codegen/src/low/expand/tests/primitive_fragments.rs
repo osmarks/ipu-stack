@@ -36,7 +36,6 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                 }],
                 outputs: vec![output],
                 operations: vec![MidOperation {
-                    site: None,
                     source: None,
                     inputs: vec![input],
                     results: vec![output],
@@ -141,7 +140,6 @@ fn reduction_can_place_its_result_outside_the_partial_owners() {
             },
         ],
         operations: vec![MidOperation {
-            site: None,
             source: None,
             inputs: vec![id(0)],
             results: vec![id(1)],

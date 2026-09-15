@@ -41,64 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const RANDOM_CASES: usize = 128;
 
 #[test]
-fn recipe_moves_one_consumer_without_moving_its_shared_input() {
-    use crate::tensor::OwnerMap;
-
-    let mut graph = ComputeGraph::new();
-    let x = graph.host_input("x", [8, 16]).unwrap();
-    let a = graph.gelu(x).unwrap();
-    let b = graph.gelu(x).unwrap();
-    graph.set_outputs([a, b]).unwrap();
-    let config = PipelineConfig::new(8).with_input(
-        x,
-        TensorFormat {
-            precision: Precision::F16,
-            layout: Layout::row_sharded(8),
-        },
-    );
-    let fragments = FragmentCache::default();
-    let baseline = build::select(
-        &graph,
-        &config,
-        &Ipu21CostModel,
-        &fragments,
-        &Recipe::default(),
-    )
-    .unwrap();
-    let first = graph.operations()[0].id;
-    let mut recipe = baseline.recipe;
-    recipe.owners.operators.insert(first, OwnerMap::rotated(3));
-    let selected = build::select(&graph, &config, &Ipu21CostModel, &fragments, &recipe).unwrap();
-    selected.program.validate().unwrap();
-    crate::low::expand::expand_tiles(&selected.program, false).unwrap();
-    let input = selected.program.inputs[0].value;
-    assert_eq!(
-        selected.program.values[input.index() as usize].owners,
-        baseline.program.values[input.index() as usize].owners
-    );
-    for (index, &output) in selected.program.outputs.iter().enumerate() {
-        assert_eq!(
-            selected.program.values[output.index() as usize]
-                .owners
-                .rotation(),
-            if index == 0 { 3 } else { 0 }
-        );
-    }
-    let first = selected
-        .program
-        .walk_operations()
-        .find(|op| op.source == Some(first) && matches!(op.kind, MidOperationKind::Compute(_)))
-        .unwrap();
-    assert_ne!(first.inputs[0], input);
-    let mut stale = recipe;
-    let mut site = first.result_site(0).unwrap();
-    site.result = 1;
-    stale.owners.results.insert(site, OwnerMap::default());
-    assert!(build::select(&graph, &config, &Ipu21CostModel, &fragments, &stale).is_err());
-}
-
-#[test]
-fn named_reduction_groups_replay_through_normal_ownership_and_lowering() {
+fn whole_program_reduction_grouping_replays_and_lowers() {
     let mut graph = ComputeGraph::new();
     let x = graph.host_input("x", [16, 128]).unwrap();
     let wa = graph.parameter("wa", [128, 64]).unwrap();
@@ -141,156 +84,28 @@ fn named_reduction_groups_replay_through_normal_ownership_and_lowering() {
     };
     let baseline =
         build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &initial).unwrap();
-    let choice = baseline
-        .grouping_choices
-        .iter()
-        .find(|choice| !choice.reductions.is_empty())
-        .unwrap_or_else(|| panic!("no reduction groups: {:#?}", baseline.program.operations));
     let mut recipe = baseline.recipe.clone();
-    recipe.reduction_groups = choice.reductions.clone();
-    recipe.owners.results.extend(choice.homes.clone());
-    let grouped =
-        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &recipe).unwrap();
-    let expanded = crate::low::expand::expand_tiles(&grouped.program, false).unwrap();
-    crate::place(&crate::low::lower_to_tiles(&expanded, false)).unwrap();
-    let replay: Recipe =
-        serde_json::from_slice(&serde_json::to_vec(&grouped.recipe).unwrap()).unwrap();
-    let rebuilt =
-        build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &replay).unwrap();
-    assert_eq!(rebuilt.program, grouped.program);
-    // An explicit home denotes the actual output assignment even when a
-    // constructor has already rotated that storage group.
-    let mut rotated = baseline.program.clone();
-    let (site, requested) = choice.homes.first_key_value().unwrap();
-    let value = rotated
-        .named_results()
-        .find(|(name, _)| name == site)
-        .unwrap()
-        .1;
-    let storage = rotated.values[value.index() as usize].storage_group;
-    for alias in rotated
-        .values
-        .iter_mut()
-        .filter(|v| v.storage_group == storage)
-    {
-        alias.owners = alias.owners.shifted(5, rotated.tile_count).unwrap();
-    }
-    rotated
-        .apply_ownership(&crate::mid::OwnerChoices {
-            results: choice.homes.clone(),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(rotated.values[value.index() as usize].owners, *requested);
-    crate::low::expand::expand_tiles(&rotated, false).unwrap();
-    let mut stale = recipe;
-    stale.reduction_groups[0].members[0]
-        .local
-        .role
-        .push_str(".missing");
-    assert!(build::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &stale).is_err());
-}
-
-#[test]
-fn recipe_can_place_gemm_partials_and_reduction_on_different_tiles() {
-    use crate::tensor::OwnerMap;
-
-    let mut graph = ComputeGraph::new();
-    let x = graph.host_input("x", [16, 128]).unwrap();
-    let w = graph.parameter("w", [128, 64]).unwrap();
-    let y = graph.gemm(x, w).unwrap();
-    graph.set_outputs([y]).unwrap();
-    let config = PipelineConfig::new(32)
-        .with_automatic_input(x, Precision::F16)
-        .with_automatic_input(w, Precision::F16)
-        .with_gemm_plan_constraint(GemmPlanConstraint {
-            source_operation: 0,
-            orientation: GemmOrientation::Normal,
-            row_partitions: 2,
-            column_partitions: 2,
-            inner_partitions: 2,
-            result_row_partitions: 1,
-            result_column_partitions: 1,
-            output_column_block: 32,
-            weight_memory_class: MemoryClass::Ipu21Interleaved,
-            reduction_staging: ReductionStaging::Complete,
-            local_weight_staging: LocalOperandStaging::Direct,
-        });
-    let fragments = FragmentCache::default();
-    let baseline = build::select(
+    recipe.options.parallel_reductions = 2;
+    let grouped = build::build_candidate(
         &graph,
         &config,
         &Ipu21CostModel,
-        &fragments,
-        &Recipe::default(),
+        &FragmentCache::default(),
+        &recipe,
     )
     .unwrap();
-    let site = |predicate: fn(&MidOperationKind) -> bool| {
-        baseline
-            .program
-            .walk_operations()
-            .find(|op| predicate(&op.kind))
-            .unwrap()
-            .result_site(0)
-            .unwrap()
-    };
-    let product = site(|kind| matches!(kind, MidOperationKind::Compute(Compute::Product(_))));
-    let sum = site(|kind| matches!(kind, MidOperationKind::Compute(Compute::Sum { .. })));
-    let mut recipe = baseline.recipe;
-    recipe.owners.results.insert(
-        product.clone(),
-        OwnerMap::embedded((0..8).map(|i| 2 * i).collect::<Vec<_>>()),
-    );
-    recipe
-        .owners
-        .results
-        .insert(sum.clone(), OwnerMap::embedded(vec![17, 21, 25, 29]));
-    let replay: Recipe = serde_json::from_slice(&serde_json::to_vec(&recipe).unwrap()).unwrap();
-    assert!(recipe == replay);
-    let selected = build::select(&graph, &config, &Ipu21CostModel, &fragments, &replay).unwrap();
-    selected.program.validate().unwrap();
-    let expanded = crate::low::expand::expand_tiles(&selected.program, false).unwrap();
-    let low = crate::low::lower_to_tiles(&expanded, false);
-    let tiles = |result: &crate::mid::ResultSite| {
-        let op = selected
-            .program
-            .walk_operations()
-            .find(|op| op.result_site(0).as_ref() == Some(result))
-            .unwrap();
-        low.value_views(op.results[0])
-            .iter()
-            .map(|id| low.shards[id.shard.index() as usize].tile)
-            .collect::<BTreeSet<_>>()
-    };
-    assert_eq!(tiles(&product), (0..8).map(|i| 2 * i).collect());
-    assert_eq!(tiles(&sum), BTreeSet::from([17, 21, 25, 29]));
-    for input in &baseline.program.inputs {
-        let before = &baseline.program.values[input.value.index() as usize];
-        let after = &selected.program.values[input.value.index() as usize];
-        assert_eq!(
-            before.owners, after.owners,
-            "moving compute must preserve resident inputs"
-        );
-    }
-    assert!(selected.program.operations.iter().any(|op| {
-        matches!(op.kind, MidOperationKind::Copy { .. })
-            && selected.program.values[op.inputs[0].index() as usize].owners
-                != selected.program.values[op.results[0].index() as usize].owners
-    }));
-    // Joint search proposals compose with the already independent homes; they
-    // must have the same meaning as relabeling the finished executable program.
-    let mapping = (0..config.tile_count).rev().collect::<Vec<_>>();
-    let remapped = replay
-        .remapped(&graph, &mapping, config.tile_count)
-        .unwrap();
-    let actual = build::select(&graph, &config, &Ipu21CostModel, &fragments, &remapped).unwrap();
-    let mut expected = selected.program;
-    expected.remap_tiles(&mapping).unwrap();
-    assert_eq!(actual.program.values, expected.values);
-    assert_eq!(actual.program.operations, expected.operations);
-    let valid = expected.clone();
-    assert!(expected.remap_tiles(&[0, 0, 2, 3]).is_err());
-    assert_eq!(expected, valid);
+    grouped.program.validate().unwrap();
+    let tiles = crate::expand_tiles(&grouped.program).unwrap();
+    crate::KernelBuildPlan::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
+    let replay = build::build_candidate(
+        &graph,
+        &config,
+        &Ipu21CostModel,
+        &FragmentCache::default(),
+        &grouped.recipe,
+    )
+    .unwrap();
+    assert_eq!(grouped.program, replay.program);
 }
 
 #[test]
@@ -499,9 +314,7 @@ fn fp8_mlp_can_quantize_before_replication() {
         .operator_candidates
         .push(OperatorCandidate::fp8_gemm(1472, -4));
     let mut recipe = Recipe::default();
-    recipe
-        .early_casts
-        .extend(graph.operations().iter().map(|op| op.id));
+    recipe.options.cast_before_copies = true;
     let lowered = build::build_candidate(
         &graph,
         &config,
@@ -510,8 +323,7 @@ fn fp8_mlp_can_quantize_before_replication() {
         &recipe,
     )
     .unwrap();
-    assert!(lowered.recipe.early_casts.is_empty());
-    assert!(!lowered.recipe.cast_before_copies.is_empty());
+    assert!(lowered.recipe.options.cast_before_copies);
     let mid = lowered.program;
     // Casts may now be fused with the producer. Check the typed data flow,
     // rather than requiring a standalone conversion operation to survive.
@@ -550,7 +362,6 @@ fn fp8_conversion_precedes_operand_replication() {
         target.clone(),
         OperandMaterialization::Complete,
         graph.operations()[0].id,
-        "input",
         &crate::estimate::Ipu21CostModel,
         &mut state,
         &mut operations,
@@ -560,9 +371,7 @@ fn fp8_conversion_precedes_operand_replication() {
         operations,
         ..MidProgram::default()
     };
-    let sites = mid.reorder_casts(&BTreeSet::new());
-    assert_eq!(sites.len(), 1);
-    mid.reorder_casts(&sites);
+    mid.reorder_casts();
     assert_eq!(mid.operations.len(), 2);
     let cast = &mid.operations[0];
     assert!(matches!(
@@ -2355,13 +2164,12 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
         };
         let mut operations = Vec::new();
         let mut results = Vec::new();
-        for index in 0..2 {
+        for _ in 0..2 {
             results.push(bind::ensure_format(
                 input,
                 target.clone(),
                 OperandMaterialization::Complete,
                 graph.operations()[0].id,
-                crate::mid::LocalSite::from("input").at(index),
                 &crate::estimate::Ipu21CostModel,
                 &mut state,
                 &mut operations,
@@ -2380,9 +2188,7 @@ fn row_major_fp8_packing_is_local_shared_and_valid_through_lowering() {
             outputs: results.clone(),
             ..MidProgram::default()
         };
-        let sites = mid.reorder_casts(&BTreeSet::new());
-        assert_eq!(sites.len(), 2);
-        mid.reorder_casts(&sites);
+        mid.reorder_casts();
         assert_eq!(
             mid.operations.len(),
             3,
@@ -2597,7 +2403,6 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
         formats[2].clone(),
         OperandMaterialization::DispatchSlices,
         graph.operations()[0].id,
-        "input",
         &Ipu21CostModel,
         &mut state,
         &mut operations,
@@ -2747,21 +2552,10 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             &Recipe::default(),
         )
         .unwrap();
-        assert_eq!(
-            late.cast_sites.len(),
-            2,
-            "both internal QK casts must be exposed"
-        );
-        if packed_key {
-            assert_eq!(
-                late.cast_sites.len(),
-                2,
-                "native K panels expose the K cast too"
-            );
-        }
-        for site in &late.cast_sites {
+        for with_v in [false, true] {
+            config.attention_fp8_scales[1] = with_v.then_some(-4);
             let mut recipe = late.recipe.clone();
-            recipe.cast_before_copies.insert(site.clone());
+            recipe.options.cast_before_copies = true;
             let serialized = serde_json::to_vec(&recipe).unwrap();
             let recipe: Recipe = serde_json::from_slice(&serialized).unwrap();
             let early = build::build_candidate(
@@ -2773,7 +2567,7 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             )
             .unwrap();
             assert_ne!(early.program.operations, late.program.operations);
-            assert_eq!(early.recipe.cast_before_copies, recipe.cast_before_copies);
+            assert_eq!(early.recipe.options, recipe.options);
             let tiles = crate::expand_tiles(&early.program).unwrap();
             let low = crate::lower_to_tiles(&tiles, false);
             crate::KernelBuildPlan::from_program(&low).unwrap();
@@ -2787,191 +2581,5 @@ fn internal_qk_cast_order_is_searchable_and_replayable() {
             .unwrap();
             assert_eq!(replay.program, early.program);
         }
-
-        // V quantization is emitted before QK construction. Its addition must
-        // not redirect the saved Q/K requests to different numeric operations.
-        let casts = |candidate: &crate::planner::Candidate, config: &PipelineConfig| {
-            let raw = build::select(
-                &graph,
-                config,
-                &Ipu21CostModel,
-                &FragmentCache::default(),
-                &candidate.recipe,
-            )
-            .unwrap();
-            raw.program
-                .operations
-                .iter()
-                .filter(|operation| {
-                    crate::mid::rewrite::fp8_cast(operation, &raw.program.values).is_some()
-                })
-                .map(|operation| operation.work_site().unwrap())
-                .collect::<Vec<_>>()
-        };
-        let old_order = casts(&late, &config);
-        config.attention_fp8_scales[1] = Some(-4);
-        let with_v = build::build_candidate(
-            &graph,
-            &config,
-            &Ipu21CostModel,
-            &FragmentCache::default(),
-            &Recipe::default(),
-        )
-        .unwrap();
-        let new_order = casts(&with_v, &config);
-        assert!(late.cast_sites.is_subset(&with_v.cast_sites));
-        for site in &late.cast_sites {
-            let old = old_order
-                .iter()
-                .position(|candidate| candidate == site)
-                .unwrap();
-            let new = new_order
-                .iter()
-                .position(|candidate| candidate == site)
-                .unwrap();
-            assert!(
-                new > old,
-                "the fixture must actually change the old cast ordinals"
-            );
-        }
-        let mut recipe = with_v.recipe.clone();
-        recipe.cast_before_copies = late.cast_sites;
-        let early = build::build_candidate(
-            &graph,
-            &config,
-            &Ipu21CostModel,
-            &FragmentCache::default(),
-            &recipe,
-        )
-        .unwrap();
-        assert_eq!(early.recipe.cast_before_copies, recipe.cast_before_copies);
-        let tiles = crate::expand_tiles(&early.program).unwrap();
-        crate::KernelBuildPlan::from_program(&crate::lower_to_tiles(&tiles, false)).unwrap();
-
-        let mut unavailable = recipe.cast_before_copies.first().unwrap().clone();
-        unavailable.local = crate::mid::LocalSite::from("nonexistent operand");
-        recipe.cast_before_copies.insert(unavailable.clone());
-        assert!(matches!(
-            build::build_candidate(&graph, &config, &Ipu21CostModel, &FragmentCache::default(), &recipe),
-            Err(LoweringError::UnavailableCastChoice(site)) if site == unavailable
-        ));
-        recipe.cast_before_copies.remove(&unavailable);
-        recipe
-            .cast_storage
-            .as_mut()
-            .unwrap()
-            .sites
-            .insert(unavailable.clone(), crate::mid::cast::CastStorage::Separate);
-        assert!(matches!(
-            build::build_candidate(&graph, &config, &Ipu21CostModel, &FragmentCache::default(), &recipe),
-            Err(LoweringError::UnavailableCastStorageChoice(site)) if site == unavailable
-        ));
     }
-}
-
-#[test]
-fn layout_search_can_replace_scoped_packing() {
-    use crate::planner::catalogue::pointwise_operator_candidate;
-
-    use crate::tensor::{BlockMajorOrder, ElementOrder, Layout, Precision, TensorFormat};
-
-    let mut graph = ComputeGraph::new();
-    let x = graph.host_input("x", [512, 32]).unwrap();
-    let z = graph.host_input("z", [512, 32]).unwrap();
-    let a = graph.gelu(x).unwrap();
-    let b = graph.gelu(z).unwrap();
-    graph.set_outputs([a, b]).unwrap();
-    let plain = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::row_sharded(64),
-    };
-    let mut target = TensorFormat {
-        precision: Precision::F16,
-        layout: Layout::row_sharded(2),
-    };
-    target.layout.order = ElementOrder::BlockMajor(BlockMajorOrder::Matrix {
-        row_block: 256,
-        column_block: 16,
-    });
-    let plan = |format: TensorFormat| {
-        pointwise_operator_candidate(
-            crate::planner::OperatorFamily::Gelu,
-            [format.clone()],
-            format,
-        )
-        .with_reusable_inputs([0])
-        .plan
-    };
-    let config = PipelineConfig::new(64)
-        .with_input(x, plain.clone())
-        .with_input(z, plain.clone());
-    let mut recipe = Recipe::default();
-    recipe.open_boundaries.extend([a, b]);
-    for operation in graph.operations() {
-        recipe.plans.insert(operation.id, plan(target.clone()));
-    }
-    let fragments = crate::planner::FragmentCache::default();
-    let baseline =
-        crate::planner::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &recipe)
-            .unwrap();
-    assert_eq!(baseline.packing_choices.len(), 2);
-    let mut scoped = baseline.recipe.clone();
-    scoped.packing = baseline
-        .packing_choices
-        .iter()
-        .map(|(site, choices)| {
-            (
-                site.clone(),
-                choices
-                    .iter()
-                    .find(|choice| choice.rows.get() == 128)
-                    .unwrap()
-                    .clone(),
-            )
-        })
-        .collect();
-    let mut actual =
-        crate::planner::build_candidate(&graph, &config, &Ipu21CostModel, &fragments, &scoped)
-            .unwrap();
-
-    let source = graph.operations()[0].id;
-    let alternative = plan(plain);
-    actual
-        .alternatives
-        .insert(source, vec![alternative.clone()]);
-    let proposals = crate::planner::proposals(&graph, &config, &actual, None);
-    let changed = |recipe: &Recipe| recipe.plans.get(&source) == Some(&alternative);
-    let preserved = proposals
-        .iter()
-        .find(|p| changed(&p.recipe) && p.recipe.packing == actual.recipe.packing)
-        .unwrap();
-    assert!(
-        crate::planner::build_candidate(
-            &graph,
-            &config,
-            &Ipu21CostModel,
-            &fragments,
-            &preserved.recipe
-        )
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("packing")
-    );
-    let cleared = proposals
-        .iter()
-        .find(|p| {
-            changed(&p.recipe)
-                && p.recipe.packing.len() == 1
-                && p.recipe.packing.keys().all(|site| site.source != source)
-        })
-        .unwrap();
-    crate::planner::build_candidate(
-        &graph,
-        &config,
-        &Ipu21CostModel,
-        &fragments,
-        &cleared.recipe,
-    )
-    .unwrap();
 }

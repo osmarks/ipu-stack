@@ -6,7 +6,7 @@ use crate::graph::{Operation, OperationId, OperationKind, ValueId};
 use crate::kernel::TileKernelSpec;
 use crate::low::default_copy_policy;
 use crate::mid::{
-    Compute, CoordinateMapping, LocalSite, MidOperation, MidOperationKind, MidValue, MidValueId,
+    Compute, CoordinateMapping, MidOperation, MidOperationKind, MidValue, MidValueId,
     OperandIndexing, cast_order,
 };
 
@@ -109,13 +109,12 @@ pub(super) fn emit_selected(
         .collect::<BTreeSet<_>>();
     let previous_values = state.values.len();
     let mut bound = Vec::with_capacity(inputs.len());
-    for (index, (&input, requirement)) in inputs.iter().zip(&plan.inputs).enumerate() {
+    for (&input, requirement) in inputs.iter().zip(&plan.inputs) {
         bound.push(ensure_format(
             input,
             requirement.format.clone(),
             requirement.materialization,
             operation.id,
-            LocalSite::from("input").at(index as u32),
             costs,
             state,
             operations,
@@ -173,7 +172,6 @@ pub(super) fn emit_selected(
                 },
                 OperandMaterialization::Complete,
                 operation.id,
-                "boundary",
                 costs,
                 state,
                 operations,
@@ -241,12 +239,11 @@ pub(super) fn ensure_format(
     target: TensorFormat,
     materialization: OperandMaterialization,
     source: OperationId,
-    site: impl Into<LocalSite>,
+
     costs: &impl CostModel,
     state: &mut ValueBuilder,
     operations: &mut Vec<MidOperation>,
 ) -> MidValueId {
-    let site = site.into();
     let from = state.get(value).tensor_type.format.precision;
     let fp8_cast = from != target.precision
         && (matches!(from, Precision::F8F143 { .. })
@@ -371,7 +368,6 @@ pub(super) fn ensure_format(
         state.conversion_cycles = state.conversion_cycles.saturating_add(cycles);
         let result = state.derived_value(value, output.clone());
         operations.push(MidOperation {
-            site: Some(site.child(["input.copy", "cast", "output.copy"][index])),
             source: Some(source),
             inputs: vec![value],
             results: vec![result],

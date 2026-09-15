@@ -167,7 +167,6 @@ mod tests {
             values[i].storage_group = id(1);
         }
         let add = MidOperation {
-            site: None,
             source: None,
             inputs: vec![id(4), id(5)],
             results: vec![id(6)],
@@ -183,7 +182,6 @@ mod tests {
             inputs: (0..3).map(input).collect(),
             outputs: vec![id(3)],
             operations: vec![MidOperation {
-                site: None,
                 source: None,
                 inputs: vec![id(0)],
                 results: vec![id(3)],
@@ -279,27 +277,7 @@ mod tests {
         };
         let add = repeat.body.operations.last_mut().unwrap();
         add.source = Some(source);
-        add.site = Some("add".into());
-        let site = add.result_site(0).unwrap();
-        let home = program.values[add.results[0].index() as usize]
-            .owners
-            .clone();
-        let mut choices = crate::mid::OwnerChoices::default();
-        choices.results.insert(site.clone(), home);
-        let original = program.clone();
-        program.apply_ownership(&choices).unwrap();
-        assert_eq!(
-            program, original,
-            "an explicit current assignment preserves the input's home"
-        );
-        choices
-            .results
-            .insert(site, crate::tensor::OwnerMap::embedded(vec![3]));
-        assert!(program.apply_ownership(&choices).is_err());
-        assert_eq!(
-            program, original,
-            "a result choice cannot move aliased input storage"
-        );
+
         let MidOperationKind::Repeat(repeat) = &mut program.operations[0].kind else {
             unreachable!()
         };
@@ -310,9 +288,9 @@ mod tests {
         };
         output_aliases.clear();
         program.values[6].storage_group = id(6);
-        program.values[6].owners = crate::tensor::OwnerMap::default();
+        program.values[6].owners = crate::tensor::OwnerMap::embedded(vec![3]);
         let inputs = program.values[..3].to_vec();
-        program.apply_ownership(&choices).unwrap();
+        super::super::ownership::bind_owners(&mut program.operations, &mut program.values).unwrap();
         program.validate().unwrap();
         crate::low::expand::expand_tiles(&program, false).unwrap();
         assert_eq!(program.values[..3], inputs);
@@ -350,7 +328,7 @@ mod tests {
         for index in 0..2 {
             fragment.operations.push(MidOperation {
                 source: None,
-                site: None,
+
                 inputs: vec![id(index)],
                 results: vec![id(index + 1)],
                 kind: MidOperationKind::Copy {
@@ -370,9 +348,6 @@ mod tests {
         bound.values[0].owners = OwnerMap::embedded(vec![1, 4, 7, 9]);
         let original = bound.clone();
         let working = OwnerMap::embedded(vec![2, 3, 5, 6]);
-        for (index, operation) in fragment.operations.iter_mut().enumerate() {
-            operation.site = Some(super::super::LocalSite::from("copy").at(index as u32));
-        }
         bound.outputs = append_fragment(
             &fragment,
             &[id(0)],
@@ -384,10 +359,8 @@ mod tests {
             &mut bound.operations,
         )
         .unwrap();
-        let site = bound.operations.last().unwrap().result_site(0).unwrap();
-        let mut choices = crate::mid::OwnerChoices::default();
-        choices.results.insert(site, OwnerMap::embedded(vec![10]));
-        bound.apply_ownership(&choices).unwrap();
+        bound.values[bound.outputs[0].index() as usize].owners = OwnerMap::embedded(vec![10]);
+        super::super::ownership::bind_owners(&mut bound.operations, &mut bound.values).unwrap();
         assert_eq!(bound.values[..1], original.values);
         assert_eq!(bound.values[2].owners, working);
         assert_eq!(

@@ -154,104 +154,23 @@ refactor. Changes to selected value ownership remain ordinary mid transformation
 they must update affected bindings/copies and costs, rather than depend on a later
 operator-resolution pass to repair compute placement.
 
-### Scope choices to the work they affect
+### Keep optimization settings at whole-program scope
 
-Representing a decision does not require searching it. Separate three things:
+The per-work scoping proposal was rejected. `Recipe` retains operator layout
+selections and boundary choices, plus one whole-program `Options` struct for cast
+ordering, cast-buffer reuse, packing rows, reduction grouping, preparation
+ownership and tile mapping. Family constructors emit executable operations directly;
+they do not name generated work for later recipe replay.
 
-1. The choice or policy recorded by a recipe, scoped to the work it affects.
-2. The default rule that fills in an unspecified choice or realizes an automatic
-   policy from actual geometry.
-3. The search neighborhood that currently proposes changes to those settings.
+Mid passes determine where a global setting is safe to apply, using tensor values,
+read/write dependencies, alias groups and Repeat boundaries. They do not export
+site inventories, override maps or named grouping proposals back to search. Missing
+opportunities can reduce search quality temporarily; do not reconstruct a second
+configuration language to recover that quality.
 
-The refactor can preserve today's defaults and search effort. A plausibly useful
-alternative must be expressible without editing an unrelated implementation
-module; it need not receive another search dimension now. A recorded automatic
-policy is legitimate when the answer depends on shard geometry or final
-placement. Its selection routine must be visible, take that policy explicitly,
-and expose the resulting choice in the normal low graph or schedule diagnostics.
-An explicit request that cannot apply must be reported as such, rather than
-silently treated as another implementation.
-
-Low and exchange modules receive the relevant typed policy, not the entire
-planner `Recipe`. The policy type belongs to the subsystem that implements it;
-the recipe/configuration refers to it. This keeps dependency direction clear.
-There is no need for a global option registry, an enum for each implementation
-constant, or a second record of every generated instruction. Hardware legality,
-alias safety and numerical contracts remain requirements, not tunable choices.
-
-The current one-off tile-mapping search is too global to be the intended design.
-`package/placement::model_mapping` scores block-transpose permutations of all
-active tiles. `map_tiles` applies the winning permutation to every shard, local
-operation and Repeat binding. Mid separately supports `tile_offset` rotations
-per value/ownership group, but not those more general local embeddings.
-
-There are three different concepts to keep separate:
-
-- A tensor distribution determines which coordinates each owner ordinal holds.
-- An owner map assigns those ordinals to device tiles. This is a plan choice.
-- The target topology describes hardware tile identities and fabric connections.
-  It is a shared device fact, not a layout optimization variable.
-
-Let an operator or connected group propose owner maps for its produced values
-and intermediate distributions. The resulting maps belong to those values;
-one GEMM may use different maps for its partials and reduced output. Evolve the
-existing ownership-group/rotation representation to express reusable embeddings.
-Do not copy a full device-sized map into every operation or require every map to
-be a permutation of the entire active device.
-
-A consumer cannot independently reinterpret the producer's resident buffer as
-being on different tiles. Either its computation uses the existing ownership,
-it emits an input copy into the desired ownership, or a joint proposal changes
-the producer's output and affected consumer bindings. Shared values must have
-consistent homes; required alias and Repeat-sequence relationships must remain
-consistent too. Persistent parameters can keep one home while individual users
-choose different temporary compute distributions.
-
-Owner maps therefore belong to the recipe and the produced mid values, where
-their boundary movement is visible and costed with the computation. Their
-defaults can initially reproduce current mappings. The existing whole-graph
-proposal can become an ordinary joint recipe change; searching independent
-embeddings is not a prerequisite for this ownership change. When adding those
-proposals, reuse the existing fabric-load model with the source and destination
-assignments relevant to each transfer. Its current whole-graph permutation
-argument cannot evaluate independent embeddings. The endpoint has no separate
-one-off mapping optimizer beside the main search loop.
-
-Other current global switches should be scoped similarly:
-
-| Current choice | Appropriate scope |
-| --- | --- |
-| `Recipe::packing_rows` applied throughout the program | Each eligible packing/copy site or coupled preparation group |
-| `Recipe::in_place_casts` toggled for every eligible cast, including with every layout proposal | Each donation site and its producer; retain joint layout/donation proposals where needed |
-| `parallel_reductions` and `disjoint_copy_sources` rewrites across all regions | Particular independent reduction/preparation groups and their owner choices |
-| One `exchange_stream_words` setting | A default scheduling policy, with phase-specific choices where worth evaluating; this belongs to low scheduling, since phases can contain work from several semantic operations |
-| One address-placement offset used as a global alternative | An allocator heuristic, not an operator's layout; useful address/bank preferences concern allocation conflict groups under joint placement constraints |
-| `CopyPlan`'s implicit direct-versus-staging selection | An explicit movement policy for the copy/preparation site; automatic selection may retain the current heuristic |
-| `relay::select`'s gather/pack/multicast acceptance rule | An explicit low routing policy, with added work and scratch recorded in the graph |
-
-The exchange scheduler is a concrete instance of misplaced policy today:
-`ExchangeScheduleCache::with_stream_words` selects an algorithm setting, and
-the cache's `select` method invokes scheduling with it. Scheduling should receive
-policy and a cache as separate inputs. A cache owns reusable results, not the
-authority to choose the algorithm. Replay must account for the effective policy
-as well as transfer structure and address-dependent legality. This change does
-not require scheduling multiple alternatives for each candidate.
-
-Global defaults and effort caps remain useful. They should initialize or bound
-local choices, not force unrelated sites to change together. Retain device-wide
-capacity checks: local decisions interact through live storage, exchange rows
-and phase grouping. Local scope does not imply independent feasibility.
-
-Use source-operation provenance and stable family-local sites for replayable
-mid choices, validating their applicability when rebuilding a changed recipe.
-Final phase numbers or incidental low arena indexes are unsuitable identities.
-Keep the current alternative sets initially. Later additions to search can target
-individual sites or coupled groups without changing the representation again.
-Do not enumerate their Cartesian product or schedule every exchange variant.
-Search checkpoints retain requested choices and effective defaults in the same
-state, with explicit compatibility handling for old global settings. Addresses,
-per-transfer instruction choices and cache contents are compilation results,
-not additional executable structure inside `Recipe`.
+Hardware legality, alias safety and numerical contracts remain mandatory. Owner
+embeddings stay part of the tensor representation. Checkpoints store the global
+settings and reject incompatible versions without migration.
 
 ### 2. Give movement one path and separate geometry from policy
 
@@ -435,7 +354,7 @@ evaluate_candidate(baseline); fail the build if no feasible incumbent exists
 fix logical input homes and save the accepted checkpoint
 
 while attempt budget remains:
-    propose recipes, including scoped ownership/preparation choices
+    propose recipes, including whole-program optimization settings
     build valid mid candidates and compute compact costs concurrently
     discard visited/invalid/non-improving candidates; deduplicate identical mid
     sort and truncate using the current shortlist and budget rules
@@ -864,11 +783,10 @@ kernels.
 ## Migration and completion criteria
 
 The driver extraction can first preserve current behavior as a contained step.
-The main refactor spans direct executable mid construction, scoped choices,
+The main refactor spans direct executable mid construction, global options,
 storage/view binding, movement realization and complete family call construction.
 It includes all supported operation families and Repeat. Existing global mapping
-proposals become joint recipe choices when owner maps are represented in mid;
-additional per-site search can wait. The live-low-graph, storage-contract and
+proposals use the whole-program recipe permutation. The live-low-graph, storage-contract and
 relocation changes do not depend on expanding the search and should not be
 deferred behind it. Moving constants can be a separate contained commit.
 
@@ -877,7 +795,7 @@ deferred behind it. Moving constants can be a separate contained commit.
 | Compiler driver | One visible search loop and one visible candidate evaluation; package code consumes final placements/schedules | `local::optimize` finalization callback, `validate<T>` indirection, nested scheduling in package placement improvement, duplicated provisional/final result ownership |
 | Target/ABI ownership | One definition per hardware fact or shared protocol constant; compiler no longer imports driver for constants | Duplicate SRAM/register constants; generic instruction encoders and tile mapping misplaced in exchange; runtime policy mixed into architectural definitions |
 | Direct mid construction | Graph plus recipe emits only Copy, Compute and Repeat; both candidate costing and insertion use the same emitter | `Operator`, `Convert`, `Primitive` wrapper, `resolve_region`, `CostModel::implementation`, deferred offers/claims/cost restoration, dual cast/copy recognition |
-| Scoped choices and explicit defaults | Recipe/policies describe owner maps, preparation/donation, movement and scheduling choices; search may retain its current coverage | One-off global mapping search and `mapping_checked`, program-wide rewrites as the only representation, algorithm policy hidden in geometry or caches |
+| Global optimization options | One recipe options struct drives mid transformations | Named work sites, per-work overrides, candidate discovery lists and replay validation |
 | Movement/geometry consolidation | One mapping-to-movement path, pure reusable facts, explicit physical selection | Independent identity-intersection path and repeated geometry-key/traversal construction; custom cache policy where no longer justified |
 | Compute and kernel binding | Sum is a compute family; complete indexed operands/results and access contracts cover arithmetic, mixed state and local-copy helpers | Separate top-level Sum, product/reduction-specific generic orchestration, scattered broadcast/ABI derivation, primary/additional-output paths, name-based mixed-state exceptions |
 | Low construction and access | Appenders record work; storage binding resolves access geometry; explicit transformations own copy motion/routing/phase changes | Hidden GEMM splitting and exchange/copy motion in appenders, caller-by-caller borrowed-view repair, cast chunk implementation owned by mid |
@@ -909,9 +827,7 @@ pattern must modify. A refactor that only moves files or adds adapters without
 removing the previous paths has not met the objective. No credible percentage
 reduction can be promised from this source review alone.
 
-The incumbent-search strategy can stay. Its choices become more appropriately
-scoped, and owner embeddings become more expressive; existing layouts remain
-representable. Those changes need explicit performance/feasibility comparisons
-in addition to the behavior-preserving ownership moves. The goal is to make the
-lower-level algorithms and data contracts understandable from their source, as
-well as make the overall compiler sequence visible.
+The incumbent-search strategy can stay, with whole-program options controlling
+the optional transformations. Performance and feasibility can suffer while that
+search is less expressive. The goal is to make the algorithms and data contracts
+understandable from their source, as well as make the compiler sequence visible.

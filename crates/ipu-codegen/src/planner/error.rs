@@ -5,10 +5,6 @@ use crate::tensor::LayoutError;
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LoweringError {
-    #[error("cast-before-copy choice is unavailable at {0:?}")]
-    UnavailableCastChoice(crate::mid::WorkSite),
-    #[error("cast-storage choice is unavailable at {0:?}")]
-    UnavailableCastStorageChoice(crate::mid::WorkSite),
     #[error("selected operator implementation is invalid")]
     InvalidImplementation,
     #[error(transparent)]

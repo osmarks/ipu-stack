@@ -6,7 +6,7 @@ use crate::planner::{Candidate, Recipe};
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {
@@ -37,8 +37,8 @@ impl State {
         let context = format!("{graph:?}\n{normalized:?}\n{mapping:?}");
         let Some(path) = &config.load_search_state else {
             let recipe = match mapping {
-                Some(mapping) => Recipe::default().remapped(graph, mapping, config.tile_count)?,
-                None => Recipe::default(),
+                Some(mapping) => Recipe::baseline(config).remapped(mapping, config.tile_count)?,
+                None => Recipe::baseline(config),
             };
             return Ok(Self {
                 version: VERSION,
@@ -57,7 +57,7 @@ impl State {
                 saved["version"]
             )));
         }
-        let mut state: Self = serde_json::from_value(saved).map_err(|error| {
+        let state: Self = serde_json::from_value(saved).map_err(|error| {
             invalid(format!("invalid search state {}: {error}", path.display()))
         })?;
         if state.context != context {
@@ -65,10 +65,6 @@ impl State {
                 "search state does not match this graph/configuration: {}; rerun without --load-search-state",
                 context_difference(&state.context, &context)
             )));
-        }
-        state.recipe.normalize(config);
-        for recipe in &mut state.visited {
-            recipe.normalize(config);
         }
         tracing::info!(path = %path.display(), attempts = state.attempts, "loaded mid-plan search state");
         Ok(state)

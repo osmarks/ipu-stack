@@ -71,12 +71,6 @@ fn saved_search_preserves_budget_aliases_and_order() {
         state.visited.len() > state.attempts,
         "equivalent recipes travel together"
     );
-    assert!(
-        state
-            .visited
-            .iter()
-            .all(|recipe| recipe.cast_storage.is_some())
-    );
     config.pipeline.optimization_steps = 0;
     let rebuilt = run(&config, 2);
     assert_eq!(resumed.program, rebuilt.program);

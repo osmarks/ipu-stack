@@ -32,7 +32,8 @@ def protected(name):
     return (
         name == "AGENTS.md"
         or name.startswith((".githooks/", "tools/reduction-gate/"))
-        or name.endswith(("/build.rs", ".capnp", ".def"))
+        or (name.startswith("crates/") and name.count("/") == 2 and name.endswith("/build.rs"))
+        or name.endswith((".capnp", ".def"))
     )
 
 

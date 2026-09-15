@@ -116,71 +116,32 @@ another representation. Persistent parameter-home selection belongs to
 `mid/ownership.rs`. Cross-module imports name their owners instead of inheriting
 planner/tensor/configuration names through the mid module.
 
-Constructors label their work using [mid/site.rs](../crates/ipu-codegen/src/mid/site.rs):
-a role within the family, algorithmic block coordinates, and the containing
-source operation. Binding retains the role when substituting actual values;
-rewrites retain it for the same work and name generated copies as children.
-Names never depend on arena IDs or the number of earlier emitted operations.
-Cast-order requests in Recipe refer to these sites. Missing cast choices are
-errors, and mid validation rejects names
-that ambiguously refer to more than one operation.
+Whole-program settings live in `Recipe.options` in
+[planner/recipe.rs](../crates/ipu-codegen/src/planner/recipe.rs): early FP8 casts,
+cast-buffer reuse, packing row size, reduction-group limit, disjoint preparation,
+and a device tile permutation. Operator layout selections remain in `Recipe.plans`.
+`Candidate` holds the executable program, recipe, and alternative operator layouts.
+There are no named work identities, override maps, or available-choice inventories.
 
-Cast-storage policy belongs to [mid/cast.rs](../crates/ipu-codegen/src/mid/cast.rs).
-Recipe stores an effective default, operator defaults and individual site
-overrides. Operator defaults also cover casts introduced by a new layout. The
-rewrite realizes reuse only for safe, storage-saving donations and records the
-result in the ordinary allocation aliases. Search proposes individual choices
-and joint layout/donation changes for an operator and its direct consumers;
-unrelated policies stay fixed.
+[planner/build.rs](../crates/ipu-codegen/src/planner/build.rs) constructs mid,
+moves casts when enabled, composes copies, applies elementwise fusion and the
+optional packing/grouping/donation passes, then applies the tile permutation and
+costs the result. Each pass determines where its global option can legally apply.
+Cast donation retains live-input and Repeat protections. Packing retains the
+original destination and uses a larger workspace only when its layout is feasible.
+Grouping checks dependencies and physical tile overlap within each Repeat region.
 
-[Panel packing](../crates/ipu-codegen/src/mid/packing.rs) has a separate choice
-for each named copy: panel rows and an absolute workspace owner map. It inserts
-a copy into that workspace, local packing compute, and a copy to the original
-result. The result retains its selected layout and home; the workspace can use
-more tiles. Before rewriting, the planner asks for feasible choices from its
-existing four row sizes. An unavailable requested site or workspace is an error.
-Layout/cast proposals may explicitly remove affected packing choices, while
-unrelated choices remain fixed. Joint tile-mapping proposals also remap packing
-workspaces.
+Mid values retain [OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs) embeddings;
+removing recipe overrides does not restrict the tensor representation to flat tile
+ranges. Grouping moves aliases together, preserving their relative rotations.
+[Ownership binding](../crates/ipu-codegen/src/mid/ownership.rs) inserts copies for
+compute operands that need a result's owners and restores carried Repeat homes.
 
-[Grouping](../crates/ipu-codegen/src/mid/grouping.rs) proposes named independent
-reductions and disjoint result homes. The homes enter the ordinary ownership
-policy; the grouping rewrite only delays the named reductions to form a contiguous
-group. It checks read/write hazards and region boundaries before changing order.
-Preparation proposals use the same result-home policy without an ordering rewrite.
-Both proposals check actual tiles when domains differ. The existing bounded joint
-neighborhood remains; recipes can retain unrelated groups independently.
-Layout changes can explicitly remove affected groups and homes, as with packing
-choices.
-
-Mid values carry an
-[OwnerMap](../crates/ipu-codegen/src/tensor/owners.rs): a reusable embedding onto
-any subset of device tiles, applied after the selected owner-ordinal rotation.
-Explicit maps share their array through `Arc`; distribution stays in the tensor layout.
-Expansion and memory accounting resolve owners through this same map. Mid
-[ownership binding](../crates/ipu-codegen/src/mid/ownership.rs) inserts explicit
-copies when a local compute operand or allocation alias needs another result's
-owners; distributed Sum retains its own contributor traffic. Repeat and fragment
-binding preserve the maps. Recipe's `OwnerChoices` gives inputs a base home,
-individual results an actual home, and operators a working domain for new storage.
-An explicit result request does not inherit an extra constructor rotation; aliases
-retain their relative rotations within that result's storage group. Family-local
-embeddings and relative rotations are interpreted within operator domains. Input
-homes and explicit result choices take precedence; conflicting choices for a
-shared storage group fail. A moved Repeat body copies its yield back to the
-carried state's home. The graph builder applies these choices after selecting
-default parameter homes and constructing boundaries, before the ordinary mid
-rewrites and their costing.
-
-[planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs) retains the
-existing block-transpose neighborhood as a joint change to those choices.
-Its fabric-load estimate ranks it alongside layout proposals; exact evaluation,
-acceptance, budget and visited-state handling use the same compiler loop. The
-model scores the proposed permutation of both endpoints in each existing
-transfer. Independently scoped embeddings are representable, but this search
-does not yet enumerate them or pretend that a single permutation prices them.
-Checkpoint version four moves legacy mappings into input/operator choices;
-there is no separate mapping state or low endpoint that mutates projected work.
+[planner/proposals.rs](../crates/ipu-codegen/src/planner/proposals.rs) proposes global
+option changes alongside operator layouts and boundary changes. Its tile-mapping
+proposal retains the existing block-transpose neighborhood and fabric-load ranking.
+Checkpoint version eight records the global options; older schemas are rejected
+without migration. Local optimization of these options is intentionally absent.
 
 Fragment binding receives an explicit working embedding for unbound temporary
 groups. Input and result groups retain their separate, checked homes. A small
@@ -208,8 +169,7 @@ now live under [planner](../crates/ipu-codegen/src/planner/mod.rs). Checkpoints
 require the current schema and matching graph/configuration; obsolete states
 are rejected and the search must be rerun. There is no migration path.
 [compile/config.rs](../crates/ipu-codegen/src/compile/config.rs) owns pipeline
-configuration. Mid contains executable semantics, binding and rewrites. Mapping
-proposals still need scoped recipes.
+configuration. Mid contains executable semantics, binding and rewrites. Mapping proposals use the global recipe permutation.
 
 The reported final cycles still combine modelled kernel work with scheduled
 exchange horizons. They are not hardware measurements.

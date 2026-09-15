@@ -183,7 +183,6 @@ fn fuse_fp8_outputs_at(
                 output_aliases: vec![],
             });
             let copy = MidOperation {
-                site: cast.site.as_ref().map(|site| site.child("distribute")),
                 inputs: vec![value.id],
                 kind: MidOperationKind::Copy {
                     mapping: CoordinateMapping::default(),
@@ -251,7 +250,7 @@ fn fuse_fp8_outputs_at(
                 continue;
             }
             let mut legal = true;
-            for (index, &parameter) in producer.inputs.iter().enumerate().skip(1) {
+            for &parameter in producer.inputs.iter().skip(1) {
                 let old = &values[parameter.index() as usize];
                 let Some(tiling) =
                     crate::tensor::broadcast_operand_tiling(&old.tensor_type, &input.tensor_type)
@@ -269,10 +268,6 @@ fn fuse_fp8_outputs_at(
                 value.id = MidValueId((original_value_count + new_values.len()) as u32);
                 value.storage_group = value.id;
                 copies.push(MidOperation {
-                    site: producer
-                        .site
-                        .as_ref()
-                        .map(|site| site.child("parameter.copy").at(index as u32)),
                     source: producer.source,
                     inputs: vec![parameter],
                     results: vec![value.id],

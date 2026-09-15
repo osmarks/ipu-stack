@@ -2002,7 +2002,6 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
     let id = MidValueId::from_index;
     let tensor_type = TensorType::new([8, 16], Precision::F16, Layout::row_sharded(1));
     let operation = |inputs: &[u32], result, kind| MidOperation {
-        site: None,
         source: None,
         inputs: inputs.iter().copied().map(id).collect(),
         results: vec![id(result)],
