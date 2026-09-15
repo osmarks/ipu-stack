@@ -8,148 +8,20 @@ and call direction; they are not existing APIs. The follow-up review separates
 explicit choices from search coverage and traces additional low/backend ownership
 problems, including a reproduced disagreement about which work executes.
 
-Implementation has started: padding removal now transforms the authoritative low
-graph before pure tile projection, and Repeat projections use the common storage
-binding record. The corresponding regression covers both straight-line and
-repeated execution. Exchange selection now takes policy separately from its cache,
-and replay rejects policy mismatches without expanding search. Repeat sequence
-sizing now belongs to placement; the preliminary GEMM scan and emission's stride
-reconstruction are removed. Selection now directly binds executable family
-fragments: `Operator`, nested implementations, deferred offers/claims and the
-resolution pass are removed. Parameter-home changes insert their own required
-copies, and a binding validator checks constructed/rewritten mid programs.
-The family-fragment cache is also separate from costing: selection and insertion
-share it explicitly, and `CostModel::implementation` is removed. Mid now has
-only Copy, Compute and Repeat: numerical casts and sums are Compute, the
-primitive wrapper and `ConversionPlan` are removed, and identity and mapped
-copies enter one low movement owner with an explicit copy policy. Composition
-retains incompatible policy boundaries. Products now carry axes and blocking
-explicitly; GEMM expansion owns contraction and batch splitting, and Sum owns
-contributor grouping. Kernel append only records work. Callable specifications
-are owned by kernel rather than planner/operator. Shifted FP16-to-FP8 cast
-chunking belongs to the cast family; donation profitability remains in mid.
-Exchange append now only records work too; the explicit low simplification pass
-owns copy motion and exchange grouping, including phase compaction through Repeat.
-Copy geometry now lives in storage, with exact coverage and shared span matching;
-movement lowering owns destination-packing selection from an explicit per-copy
-policy. The cache retains geometry instead of selected staging, uses foldhash and
-a hash table instead of custom buckets, and excludes ownership from geometry keys.
-Low kernel calls now bind all results together in one indexed list, with matching
-access requirements; element-separation constraints can name every result.
-Input bindings are direct views too; the single-view `KernelOperand` list wrapper
-and its nested consumer paths are removed.
-Mid operands now declare elementwise/result indexing or local windows. Graph
-validation, ownership projection, low binding and product batch selection share
-the logical broadcast relation; generic low kernel-name broadcasting is removed.
-Tensor shapes, layout definitions and resolved ownership geometry now have a
-neutral tensor owner. Cast-motion preferences and candidate population policy
-are outside those geometry types, and row-major packing availability comes from
-the rearrangement family rather than a duplicate format list.
-Kernel construction now enters `KernelRun::bind` with complete local views.
-The kernel owner interns access requirements and checks the existing ABI,
-scalars, specialization and physical view interpretation before work enters low.
-GEMM batches and shifted casts select their final views before binding. Generic
-low no longer derives kernel requirements, `low/call.rs` is removed, and final
-materialization shares relative-view addressing with construction. This exposed
-two test fixtures that requested nonexistent GeLU/rearrangement implementations;
-they now construct supported conversions and exercise the early failure boundary.
-Family call construction now replaces the separate ABI, scalar-getter and
-specialization-reconstruction tables. Each family produces a complete build
-identity and encoded arguments; inventory and final emission use that same
-description. Shared FP8 output validation lives beside the fusion capabilities,
-and optimistic conversion checks query the cast/rearrangement families directly.
-The compiler now has direct search and candidate-evaluation routines in `compile.rs`.
-Package sizing returns concrete reservations without tensor placement or scheduling;
-final emission consumes the retained physical result. Provisional addresses remain
-local to evaluation, which exposes both final scheduling and the one detailed
-address alternative. The finalization callback, `validate`, `ScheduledPlan` and
-separate `BuiltApplication` are removed. Failed alternatives cannot replace the
-incumbent schedule cache; accepted address alternatives promote their own cache.
-Recipe proposals and checkpoints are outside package. Graph construction, family
-choices/catalogues, executable fragment construction/cache and persistent home
-selection now belong to planner; pipeline configuration belongs to compile.
-Mid no longer supplies those definitions through parent imports. Broadcast and
-ownership projection are neutral tensor geometry, while rewrite sequence costing
-belongs to estimate. Fragment binding checks input contracts, preserves ownership
-groups and relative offsets, remaps Repeat recursively, and returns the actual
-result values. Result homes use the ownership pass; binding does not preallocate
-outputs or manufacture identity copies for returned inputs.
-Invalid bindings cannot leave partially appended values or operations. Program
-validation has its own error type, independent of planning failures.
-Mid values now use shared `OwnerMap` embeddings instead of scalar tile offsets.
-Maps may select arbitrary subsets; expansion, memory accounting and ownership
-comparisons observe the same assignment. Existing rotation behavior remains.
-Ownership-copy insertion belongs to mid and covers allocation aliases as well
-as callable operands. Recipe now selects input homes, operator working domains
-and individual result homes. The old whole-device mapping neighborhood is an
-ordinary joint Recipe proposal, ranked with its fabric-load estimate; the
-separate mapping optimizer and low remapping pass are removed. Family storage
-and cache boundaries below still require work.
-Architectural SRAM, supervisor encodings, register IDs and physical routing now
-belong to the dependency-leaf `ipu-target` crate. Exchange construction consumes
-the target topology through explicit functions. Package validation and the driver
-share the secondary-loader ABI; codegen no longer depends on the driver. Runtime
-placement defaults live in codegen, and host packet encoding takes the configured
-window base. Rust and device assembly share register, opcode and runtime-layout
-definition inputs instead of separately maintained copies.
-Exchange encoding now retains send identities/relative offsets, receive-pointer
-sites and outgoing-base writes in an `EncodedRow`. Prefix reuse preserves those
-sites with the words. Repeat relocation, row sharing and schedule replay consume
-the retained sites; their address/group reconstruction walks are removed.
-The independent decoders live in exchange diagnostics and check emitted metadata
-in the randomized encoding tests. This does not change scheduling policy.
-Family constructors now label executable work with stable local roles and block
-coordinates. Cast-order requests use these sites and source-operation provenance.
-Missing requests and ambiguous names are rejected. Cast storage now
-uses a typed mid policy with site overrides, operator defaults and an effective
-initial default. Layout proposals pair donation with the affected operator and
-its direct consumers; they do not toggle donation throughout the graph. Packing now selects
-panel rows and an explicit workspace per named copy, preserving the destination's
-layout and home. Construction rejects unavailable choices; layout proposals can
-explicitly remove affected choices, and physical relabeling includes packing workspaces.
-Grouping now names independent reductions. Its rewrite only changes order;
-disjoint reduction/preparation homes use the ordinary ownership choices and
-check physical overlap across different domains. Explicit result homes name the
-actual assignment, preserving alias-relative rotations without an implicit
-constructor offset. Unrelated groups and result homes remain fixed when
-search explicitly removes choices affected by a layout change. Checkpoint migrations
-and their deferred legacy choices have been removed; old states require a new search.
-Attention softmax now declares separate typed probability, statistics and worker
-workspace results through the same multi-result compute constructor. Its family
-shares workspace geometry between construction and local call validation;
-assembly receives explicit pointers. PV no longer copies a probability prefix,
-merge consumes FP32 statistics without key-size/weight-precision specialization,
-and the finite-padding proof no longer recognizes attention names. Initial merge
-calls also no longer fabricate a previous-state operand.
-Low now retains concrete value views separately from logical shapes. Borrowed
-copies update those bindings; kernels and copies consume them before geometry.
-The borrowed-view repair map and its late resolution calls are removed. Source
-region ownership and diagnostics retain selections as well as backing storage.
-Compute dispatch owns its canonical-allocation declarations, while Repeat keeps
-explicit region requirements. Low storage binding now combines the selected
-format/strides with its allocation root and signed origin; kernels, copies,
-exchange expansion and detailed costing share it. Copy reordering observes
-backing identity, and dependency checks compare translated byte ranges. Placed
-address binding also belongs to low storage, retaining intermediate Repeat
-overrides through alias chains. Halfword copies now use an ordinary callable
-ABI, removing the emitter's inline-address table exception and supporting both
-multi-element and Repeat-relative calls. Local copies now retain a checked
-helper binding before append; coalescing rebinds changed geometry. The helper
-owns raw access requirements, ABI and detailed cost, shared by placement,
-runtime retention and emission. Late helper selection and screening are removed.
-Movement and costing now share normalized geometry and matched rows. The separate
-expansion and costing caches, cached unit-buffer copy recipes, and repeated
-fragment-count implementation are removed. Local launch selection belongs to
-the copy family. Copy useful-work coverage and remaining movement policies
-are still unfinished.
-Fragment binding now takes an explicit working embedding; it no longer derives
-every temporary group's domain from the first result's potentially smaller home.
-Input/result bindings remain independent and checked. Mid applies scoped owner
-choices after default persistent homes are selected, then binds required operand
-movement. A moved Repeat body explicitly copies its yield to the carried home.
-The diagnoses below describe the reviewed starting point;
-[current data flow](COMPILER_DATA_FLOW.md) tracks
-implemented changes.
+## Implementation status
+
+The refactor is incomplete. The implementation at `b3b1bcd1` contains **49,987
+non-test implementation lines**, versus **48,402** at the reviewed baseline:
+**+1,585**, after removing 1,083 lines from the peak.
+
+See [the itemized growth and representation ledger](COMPILER_REFACTOR_ACCOUNTING.md)
+for every growth-producing commit, new/replacement types, added fields and
+subsequent removals. The former implementation paragraph was an accumulated
+changelog, not an assessment of whether the proposed simplification had succeeded.
+Passing behavior checks does not establish that success.
+
+The diagnoses below describe the reviewed starting point. [Current data flow](COMPILER_DATA_FLOW.md)
+describes implemented paths; the proposal's remaining completion criteria still apply.
 
 ## Diagnosis
 
