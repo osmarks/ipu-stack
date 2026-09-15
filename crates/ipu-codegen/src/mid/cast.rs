@@ -324,6 +324,7 @@ mod tests {
                 &fragment,
                 &[MidValueId(0)],
                 &[output],
+                &crate::tensor::OwnerMap::default(),
                 Some(source),
                 1,
                 &mut program.values,

@@ -104,6 +104,10 @@ initial default. Layout proposals pair donation with the affected operator and
 its direct consumers; they do not toggle donation throughout the graph. Old
 global cast-storage settings migrate at checkpoint loading. Ownership, packing
 and grouping policies below have not yet all moved to that scope.
+Fragment binding now takes an explicit working embedding; it no longer derives
+every temporary group's domain from the first result's potentially smaller home.
+Input/result bindings remain independent and checked. Scoped ownership requests
+and the removal of the global mapping optimizer are still outstanding.
 The diagnoses below describe the reviewed starting point;
 [current data flow](COMPILER_DATA_FLOW.md) tracks
 implemented changes.

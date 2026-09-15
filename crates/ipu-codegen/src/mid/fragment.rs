@@ -5,8 +5,9 @@ use crate::low::{CopyPolicy, PackingPolicy};
 use std::collections::BTreeMap;
 
 /// Substitute complete boundary bindings, preserving the fragment's operations
-/// and ownership groups. Unbound groups inherit the first result's (or input's)
-/// embedding unless the fragment declares one, preserving relative rotations.
+/// and ownership groups. Unbound groups use the explicit working embedding
+/// unless the fragment declares one, preserving relative rotations. A small
+/// result's embedding does not restrict the fragment's intermediate work.
 /// Groups shared with a boundary retain that boundary's mapping instead.
 /// New temporaries belong to the caller's semantic result for diagnostics.
 /// A returned input is connected to a distinct caller result by an explicit
@@ -16,6 +17,7 @@ pub(crate) fn append_fragment(
     fragment: &MidProgram,
     inputs: &[MidValueId],
     outputs: &[MidValueId],
+    working: &crate::tensor::OwnerMap,
     source: Option<OperationId>,
     tile_count: u16,
     values: &mut Vec<MidValue>,
@@ -96,30 +98,10 @@ pub(crate) fn append_fragment(
         *group = Some(binding);
         ids[from.index() as usize] = Some(to);
     }
-    let anchor = fragment
-        .outputs
+    let origin = outputs
         .first()
-        .copied()
-        .zip(outputs.first().copied())
-        .or_else(|| {
-            fragment
-                .inputs
-                .first()
-                .map(|v| v.value)
-                .zip(inputs.first().copied())
-        });
-    let (origin, relative_owners) = if let Some((from, to)) = anchor {
-        let actual = &values[to.index() as usize];
-        (
-            Some(actual.origin),
-            actual.owners.shifted(
-                -i32::from(fragment.values[from.index() as usize].owners.rotation()),
-                tile_count,
-            )?,
-        )
-    } else {
-        (None, crate::tensor::OwnerMap::default())
-    };
+        .or_else(|| inputs.first())
+        .map(|to| values[to.index() as usize].origin);
     let mut next = values.len();
     for value in &fragment.values {
         let binding = &mut ids[value.id.index() as usize];
@@ -128,9 +110,9 @@ pub(crate) fn append_fragment(
             next = next.checked_add(1)?;
             *binding = Some(id);
             let owners = if value.owners.has_embedding() {
-                value.owners.with_rotation(relative_owners.rotation())
+                value.owners.with_rotation(working.rotation())
             } else {
-                relative_owners.clone()
+                working.clone()
             };
             groups[value.storage_group.index() as usize].get_or_insert((id, owners));
         }
@@ -353,6 +335,85 @@ mod tests {
     }
 
     #[test]
+    fn small_result_home_does_not_restrict_working_owners() {
+        let mut fragment = MidProgram {
+            tile_count: 4,
+            inputs: vec![input(0)],
+            outputs: vec![id(2)],
+            values: (0..3).map(value).collect(),
+            ..MidProgram::default()
+        };
+        for index in 0..3 {
+            fragment.values[index].tensor_type = TensorType::new(
+                [4, 16],
+                Precision::F16,
+                Layout::row_sharded(if index == 2 { 1 } else { 4 }),
+            );
+        }
+        for index in 0..2 {
+            fragment.operations.push(MidOperation {
+                source: None,
+                site: None,
+                inputs: vec![id(index)],
+                results: vec![id(index + 1)],
+                kind: MidOperationKind::Copy {
+                    mapping: CoordinateMapping::default(),
+                    reuse_local: false,
+                    policy: CopyPolicy::Automatic,
+                    packing: PackingPolicy::Automatic,
+                },
+                estimated_cycles: 0,
+                estimated_exchange_cycles: 0,
+            });
+        }
+        let mut result = fragment.values[2].clone();
+        result.id = id(1);
+        result.storage_group = id(1);
+        result.owners = crate::tensor::OwnerMap::embedded(vec![10]);
+        let mut bound = MidProgram {
+            tile_count: 16,
+            inputs: vec![input(0)],
+            outputs: vec![id(1)],
+            values: vec![fragment.values[0].clone(), result],
+            ..MidProgram::default()
+        };
+        bound.values[0].owners = crate::tensor::OwnerMap::embedded(vec![1, 4, 7, 9]);
+        let original = bound.clone();
+        let working = crate::tensor::OwnerMap::embedded(vec![2, 3, 5, 6]);
+        append_fragment(
+            &fragment,
+            &[id(0)],
+            &[id(1)],
+            &working,
+            None,
+            bound.tile_count,
+            &mut bound.values,
+            &mut bound.operations,
+        )
+        .unwrap();
+        assert_eq!(bound.values[0..2], original.values);
+        assert_eq!(bound.values[2].owners, working);
+        bound.validate().unwrap();
+        crate::low::expand::expand_tiles(&bound, false).unwrap();
+
+        let mut invalid = original.clone();
+        assert!(
+            append_fragment(
+                &fragment,
+                &[id(0)],
+                &[id(1)],
+                &crate::tensor::OwnerMap::embedded(vec![2]),
+                None,
+                invalid.tile_count,
+                &mut invalid.values,
+                &mut invalid.operations
+            )
+            .is_none()
+        );
+        assert_eq!(invalid, original);
+    }
+
+    #[test]
     fn binding_preserves_repeat_execution_ownership_and_aliases() {
         for embedded in [false, true] {
             let fragment = repeated_add();
@@ -368,10 +429,15 @@ mod tests {
                 }
             }
             fragment.validate().unwrap();
+            let working = bound.values[5]
+                .owners
+                .shifted(-1, bound.tile_count)
+                .unwrap();
             append_fragment(
                 &fragment,
                 &[id(2), id(3), id(4)],
                 &[id(5)],
+                &working,
                 None,
                 bound.tile_count,
                 &mut bound.values,
@@ -433,6 +499,7 @@ mod tests {
                     &fragment,
                     &[id(2), id(3), id(4)],
                     &[id(5)],
+                    &crate::tensor::OwnerMap::default(),
                     None,
                     bound.tile_count,
                     &mut bound.values,
@@ -464,6 +531,7 @@ mod tests {
             &fragment,
             &[id(1)],
             &[id(2), id(3)],
+            &crate::tensor::OwnerMap::default(),
             None,
             1,
             &mut bound.values,

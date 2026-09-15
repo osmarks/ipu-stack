@@ -134,6 +134,7 @@ pub(super) fn emit_selected(
         &fragment,
         &bound,
         &[result],
+        &crate::tensor::OwnerMap::default(),
         Some(operation.id),
         tile_count,
         &mut state.values,

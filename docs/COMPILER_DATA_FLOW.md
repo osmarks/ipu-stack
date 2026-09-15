@@ -152,6 +152,12 @@ binding preserve the maps. The existing search still proposes only its old
 global permutations. Moving those proposals into scoped Recipe choices remains
 unfinished; representation support does not imply that search already uses it.
 
+Fragment binding receives an explicit working embedding for unbound temporary
+groups. Input and result groups retain their separate, checked homes. A small
+result subset therefore cannot accidentally restrict a larger workspace. The
+planner currently supplies the ordinary device embedding; this argument is a
+binding contract, not an additional mapping search.
+
 [screen::expand_and_screen](../crates/ipu-codegen/src/compile/screen.rs)
 expands each retained candidate and checks transfer geometry before scheduling.
 `evaluate_candidate` keeps provisional addresses local while
