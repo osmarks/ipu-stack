@@ -12,8 +12,8 @@ pub(super) const FP8_OUTPUT: OutputCapability = OutputCapability {
 
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     let arity = match kernel {
         MidOperationKind::LayerNorm => 3,
@@ -41,8 +41,7 @@ pub(super) fn call(
         let width = f16_row_width(kernel, inputs, output)?;
         if output.matrix_extent(false, true)? != width
             || (*kernel == MidOperationKind::AddLayerNorm
-                && (!input.extents().eq(output.extents())
-                    || !inputs[1].extents().eq(output.extents())))
+                && (input.extents != output.extents || inputs[1].extents != output.extents))
         {
             return Err(KernelAbiError::RequirementMismatch);
         }
@@ -56,10 +55,10 @@ pub(super) fn call(
         ));
     }
     if *kernel == MidOperationKind::AddLayerNormMoments
-        && (!input.extents().eq(inputs[1].extents())
-            || !outputs[1].extents().eq(input.extents())
-            || outputs[1].format() != input.format()
-            || inputs[1].format() != input.format())
+        && (input.extents != inputs[1].extents
+            || outputs[1].extents != input.extents
+            || outputs[1].format != input.format
+            || inputs[1].format != input.format)
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
@@ -73,15 +72,15 @@ pub(super) fn call(
         .ok_or(KernelAbiError::ElementCountOverflow)?;
     if !width.is_multiple_of(4)
         || input.matrix_extent(false, true)? != width
-        || input.format().precision != Precision::F16
-        || input.format().layout.order != ElementOrder::RowMajor
-        || output.format().layout.order != ElementOrder::RowMajor
+        || input.format.precision != Precision::F16
+        || input.format.layout.order != ElementOrder::RowMajor
+        || output.format.layout.order != ElementOrder::RowMajor
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
     let (symbol, arguments) = match kernel {
         MidOperationKind::LayerNormMoments | MidOperationKind::AddLayerNormMoments => {
-            if output.format().precision != Precision::F32
+            if output.format.precision != Precision::F32
                 || output_elements != statistics
                 || output.matrix_extent(false, true)? != 2
                 || (*kernel == MidOperationKind::AddLayerNormMoments
@@ -103,11 +102,11 @@ pub(super) fn call(
                 .checked_mul(u32::from(*parts))
                 .ok_or(KernelAbiError::ElementCountOverflow)?;
             if *parts == 0
-                || output.format().precision != Precision::F16
+                || output.format.precision != Precision::F16
                 || inputs[1..3]
                     .iter()
-                    .any(|input| input.format().precision != Precision::F16)
-                || inputs[3].format().precision != Precision::F32
+                    .any(|input| input.format.precision != Precision::F16)
+                || inputs[3].format.precision != Precision::F32
                 || inputs[3].logical_elements()? != statistics
                 || output.matrix_extent(true, true)? != width
                 || output_elements != source_count

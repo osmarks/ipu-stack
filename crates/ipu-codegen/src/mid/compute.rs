@@ -49,15 +49,16 @@ impl OperandWindow {
         Some(e)
     }
 
-    /// Largest selected local dimensions, retaining real partition origins for
-    /// global windows. This visits axis partitions, not their Cartesian product.
-    pub(crate) fn local_tensor(
+    /// Representative local extents for planning/costing. Choose the largest
+    /// physical partition per axis, preferring more logical work and then the
+    /// earliest origin. Preserve padding; do not turn it into logical elements.
+    pub(crate) fn local_extents(
         &self,
         tensor: &crate::TensorType,
         relative: bool,
-    ) -> Option<crate::TensorType> {
+    ) -> Option<Vec<crate::ShardExtent>> {
         let resolved = tensor.format.layout.resolve(&tensor.shape).ok()?;
-        let shape = if let Some(axes) = resolved.axes() {
+        if let Some(axes) = resolved.axes() {
             if self
                 .0
                 .iter()
@@ -70,11 +71,18 @@ impl OperandWindow {
                     axis.partitions()
                         .iter()
                         .filter_map(|&e| self.select_axis(e, relative))
-                        .map(|e| e.physical_end - e.start)
-                        .max()
+                        .max_by_key(|e| {
+                            (
+                                e.physical_end - e.start,
+                                e.logical_end - e.start,
+                                std::cmp::Reverse(e.start),
+                            )
+                        })
                 })
-                .collect::<Option<Vec<_>>>()?
+                .collect()
         } else {
+            // Coarse linear-owner estimate: aggregate its row fragments into
+            // one dense vector. There is no implicit kernel-side conversion.
             let elements = u32::try_from(resolved.maximum_tile_elements()).ok()?;
             self.select(
                 &[crate::ShardExtent {
@@ -84,15 +92,8 @@ impl OperandWindow {
                     physical_end: elements,
                 }],
                 relative,
-            )?
-            .iter()
-            .map(|e| e.physical_end - e.start)
-            .collect()
-        };
-        Some(crate::TensorType {
-            shape: crate::TensorShape(shape),
-            format: tensor.format.clone(),
-        })
+            )
+        }
     }
 }
 
@@ -123,6 +124,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn representative_extents_retain_origins_and_padding() {
+        use crate::{Layout, Precision, TensorAxis, TensorTiling, TensorType};
+        let tensor = TensorType::new([5, 30], Precision::F16, Layout::amp_left(16, 1));
+        let actual = tensor.format.layout.shard_extents(&tensor.shape).unwrap();
+        let extents = OperandWindow::default()
+            .local_extents(&tensor, false)
+            .unwrap();
+        assert_eq!(extents, actual[0].1);
+        assert_eq!(extents[1].logical_end, 30);
+        assert!(extents[1].physical_end > extents[1].logical_end);
+
+        let tensor = TensorType::new(
+            [64, 16],
+            Precision::F16,
+            Layout::row_major(TensorTiling::sharded(TensorAxis::FromStart(0), 4)),
+        );
+        let window = OperandWindow(vec![(0, 36, 44)]);
+        let extents = window.local_extents(&tensor, false).unwrap();
+        assert_eq!(
+            (
+                extents[0].start,
+                extents[0].logical_end,
+                extents[0].physical_end
+            ),
+            (36, 44, 44)
+        );
+    }
+
+    #[test]
     fn window_estimates_match_explicit_shard_selection() {
         use crate::{Layout, Precision, TensorAxis, TensorTiling, TensorType};
         for length in [31, 64, 65] {
@@ -141,7 +171,9 @@ mod tests {
                             .filter_map(|(_, extents)| window.select(extents, relative))
                             .map(|extents| extents[0].physical_end - extents[0].start)
                             .max();
-                        let actual = window.local_tensor(&tensor, relative).map(|t| t.shape.0[0]);
+                        let actual = window
+                            .local_extents(&tensor, relative)
+                            .map(|e| e[0].physical_end - e[0].start);
                         assert_eq!(
                             actual, expected,
                             "{length}: {start}..{end}, relative={relative}"
@@ -153,15 +185,16 @@ mod tests {
         let tensor = TensorType::new([32, 16], Precision::F16, Layout::row_sharded(1));
         assert!(
             OperandWindow(vec![(0, 40, 48)])
-                .local_tensor(&tensor, false)
+                .local_extents(&tensor, false)
                 .is_none()
         );
         assert_eq!(
             OperandWindow(vec![(0, 24, 48)])
-                .local_tensor(&tensor, true)
+                .local_extents(&tensor, true)
                 .unwrap()
-                .shape
-                .0,
+                .iter()
+                .map(|e| e.physical_end - e.start)
+                .collect::<Vec<_>>(),
             [8, 16]
         );
     }

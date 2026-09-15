@@ -13,8 +13,8 @@ pub(super) const GELU_FP8_OUTPUT: OutputCapability = OutputCapability {
 
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     check_arity(
         inputs,
@@ -43,9 +43,9 @@ pub(super) fn call(
     let count = output.count()?;
     match kernel {
         MidOperationKind::Gelu => {
-            if inputs[0].format().precision != Precision::F16
-                || output.format().precision != Precision::F16
-                || inputs[0].format().layout != output.format().layout
+            if inputs[0].format.precision != Precision::F16
+                || output.format.precision != Precision::F16
+                || inputs[0].format.layout != output.format.layout
             {
                 return Err(KernelAbiError::Unavailable(kernel.clone()));
             }
@@ -61,7 +61,7 @@ pub(super) fn call(
         }
         MidOperationKind::BiasGelu => {
             let width = f16_row_width(kernel, inputs, output)?;
-            if !inputs[0].extents().eq(output.extents()) || inputs[1].count()? != width {
+            if inputs[0].extents != output.extents || inputs[1].count()? != width {
                 return Err(KernelAbiError::RequirementMismatch);
             }
             Ok(KernelCall::exact(
@@ -70,18 +70,19 @@ pub(super) fn call(
             ))
         }
         MidOperationKind::Add => {
-            if output.format().precision != Precision::F16 {
+            if output.format.precision != Precision::F16 {
                 return Err(KernelAbiError::Unavailable(kernel.clone()));
             }
             for &input in inputs {
-                if input.rank() > output.rank() {
+                if input.extents.len() > output.extents.len() {
                     return Err(KernelAbiError::RequirementMismatch);
                 }
                 let mut suffix = false;
-                for (n, m) in input
-                    .widths()
-                    .zip(output.widths().skip(output.rank() - input.rank()))
-                {
+                for (n, m) in input.widths().zip(
+                    output
+                        .widths()
+                        .skip(output.extents.len() - input.extents.len()),
+                ) {
                     suffix |= n != 1;
                     // The codelet repeats a contiguous suffix, not arbitrary strides.
                     if (suffix && n != m) || n == 0 {

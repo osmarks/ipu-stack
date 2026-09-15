@@ -91,13 +91,13 @@ impl RowWorkspace {
         Some(tensor)
     }
 
-    fn accepts(&self, geometry: Geometry<'_>, rows: u32) -> bool {
-        if geometry.format().precision != self.precision
-            || geometry.format().layout.order != ElementOrder::RowMajor
+    fn accepts(&self, geometry: TensorStorage<'_>, rows: u32) -> bool {
+        if geometry.format.precision != self.precision
+            || geometry.format.layout.order != ElementOrder::RowMajor
         {
             return false;
         }
-        let mut dimensions = geometry.extents();
+        let mut dimensions = geometry.extents.iter().copied();
         for (width, leading) in [(self.leading, true), (self.trailing, false)] {
             if let Some(width) = width {
                 let axis = if leading {
@@ -130,13 +130,13 @@ pub(crate) fn softmax_workspaces(
 
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     let output = outputs
         .first()
         .ok_or(KernelAbiError::RequirementMismatch)?
-        .format()
+        .format
         .precision;
     let (implementation, arguments) = match *kernel {
         MidOperationKind::FlashAttention { .. } => {
@@ -144,7 +144,7 @@ pub(super) fn call(
             if output != Precision::F32
                 || inputs
                     .iter()
-                    .any(|input| input.format().precision != Precision::F16)
+                    .any(|input| input.format.precision != Precision::F16)
             {
                 return Err(KernelAbiError::Unavailable(kernel.clone()));
             }
@@ -164,9 +164,9 @@ pub(super) fn call(
             let rows = gemm_rows(outputs[0])?;
             if key_columns == 0
                 || key_columns > padded_key_columns
-                || inputs[0].format().precision != Precision::F16
-                || inputs[0].format().layout.order != ElementOrder::Amp(AmpOrder::Left)
-                || outputs[0].format().layout.order != ElementOrder::Amp(AmpOrder::Left)
+                || inputs[0].format.precision != Precision::F16
+                || inputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
+                || outputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
                 || outputs[0].matrix_extent(false, true)? != padded_key_columns
                 || inputs[0].matrix_extent(false, true)? != padded_key_columns
                 || u32::try_from(inputs[0].rows())
@@ -215,13 +215,13 @@ pub(super) fn call(
                 .ok_or(KernelAbiError::ElementCountOverflow)?;
             if value_dimension == 0
                 || value_dimension > padded_value_dimension
-                || inputs[0].format().precision != Precision::F16
-                || inputs[0].format().layout.order != ElementOrder::Amp(AmpOrder::Left)
+                || inputs[0].format.precision != Precision::F16
+                || inputs[0].format.layout.order != ElementOrder::Amp(AmpOrder::Left)
                 || inputs[0].matrix_extent(false, true)? != padded_value_dimension
                 || u32::try_from(inputs[0].rows())
                     .map_err(|_| KernelAbiError::ElementCountOverflow)?
                     != rows
-                || outputs[0].format().layout.order != ElementOrder::RowMajor
+                || outputs[0].format.layout.order != ElementOrder::RowMajor
                 || outputs[0].matrix_extent(false, true)?
                     != if output == Precision::F16 {
                         padded_value_dimension
@@ -230,8 +230,8 @@ pub(super) fn call(
                     }
                 || !SOFTMAX_WORKSPACES[0].accepts(inputs[1], rows)
                 || (previous
-                    && (inputs[2].format().precision != Precision::F32
-                        || inputs[2].format().layout.order != ElementOrder::RowMajor
+                    && (inputs[2].format.precision != Precision::F32
+                        || inputs[2].format.layout.order != ElementOrder::RowMajor
                         || inputs[2].matrix_extent(false, true)? != accumulator_width
                         || u32::try_from(inputs[2].rows())
                             .map_err(|_| KernelAbiError::ElementCountOverflow)?
@@ -271,7 +271,7 @@ pub(crate) struct AttentionKernelShape {
 
 fn attention_shape<'a>(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'a>],
+    inputs: &[TensorStorage<'a>],
 ) -> Result<AttentionKernelShape, KernelAbiError> {
     let MidOperationKind::FlashAttention {
         options,
@@ -291,10 +291,10 @@ fn attention_shape<'a>(
     ) else {
         return Err(KernelAbiError::RequirementMismatch);
     };
-    let rank = query.rank();
+    let rank = query.extents.len();
     if rank < 2
-        || key.rank() != rank
-        || value.rank() != rank
+        || key.extents.len() != rank
+        || value.extents.len() != rank
         || (0..rank - 2).any(|axis| {
             query.dimension(axis) != key.dimension(axis)
                 || query.dimension(axis) != value.dimension(axis)

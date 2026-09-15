@@ -147,8 +147,8 @@ pub(super) fn product_flops(run: &KernelRun) -> Result<[u64; 2], KernelAbiError>
 
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     check_arity(inputs, outputs, 2, 1)?;
     let output = outputs[0];
@@ -167,7 +167,7 @@ pub(super) fn call(
     if (weights == GemmWeightLoad::Interleaved && multiply == Precision::F32)
         || (matches!(multiply, Precision::F8F143 { .. })
             && (accumulate != AccumulationPrecision::F16
-                || output.format().precision != Precision::F16))
+                || output.format.precision != Precision::F16))
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
@@ -187,12 +187,7 @@ pub(super) fn call(
             output_columns,
             mode,
             gemm_rows(output)?,
-            output
-                .format()
-                .layout
-                .order
-                .gemm_output_group()
-                .unwrap_or(0),
+            output.format.layout.order.gemm_output_group().unwrap_or(0),
         ),
         arguments,
     })
@@ -241,10 +236,11 @@ pub(super) fn packed_output(run: &KernelRun, shard: &BlockValue) -> Result<bool,
     Ok(true)
 }
 
-pub(crate) fn gemm_rows(output: Geometry<'_>) -> Result<u32, KernelAbiError> {
+pub(crate) fn gemm_rows(output: TensorStorage<'_>) -> Result<u32, KernelAbiError> {
     let column = output
-        .rank()
-        .checked_sub(if output.format().layout.order.gemm_output_transposed() {
+        .extents
+        .len()
+        .checked_sub(if output.format.layout.order.gemm_output_transposed() {
             2
         } else {
             1

@@ -385,7 +385,7 @@ pub(crate) fn operation_cost(
                 .output_windows
                 .get(index)
                 .unwrap_or(&crate::OperandWindow::default())
-                .local_tensor(tensor(id), true)
+                .local_extents(tensor(id), true)
         })
         .collect::<Option<Vec<_>>>()?;
     let out = &outputs[0];
@@ -456,8 +456,14 @@ pub(crate) fn operation_cost(
                         .total
                         .saturating_add(crate::kernel::rearrange::estimate(
                             from,
-                            crate::kernel::Geometry::Tensor(out),
-                            crate::kernel::Geometry::Tensor(out),
+                            crate::storage::TensorStorage {
+                                format: &output.format,
+                                extents: out,
+                            },
+                            crate::storage::TensorStorage {
+                                format: &output.format,
+                                extents: out,
+                            },
                         ));
                 }
             }
@@ -469,22 +475,32 @@ pub(crate) fn operation_cost(
                 .iter()
                 .zip(&operation.operands)
                 .map(|(&id, indexing)| match indexing {
-                    crate::OperandIndexing::Local(window) => window.local_tensor(tensor(id), false),
+                    crate::OperandIndexing::Local(window) => {
+                        window.local_extents(tensor(id), false)
+                    }
                     crate::OperandIndexing::Fragment(window) => {
-                        window.local_tensor(tensor(id), true)
+                        window.local_extents(tensor(id), true)
                     }
                     crate::OperandIndexing::Elementwise { .. } => {
-                        crate::OperandWindow::default().local_tensor(tensor(id), false)
+                        crate::OperandWindow::default().local_extents(tensor(id), false)
                     }
                 })
                 .collect::<Option<Vec<_>>>()?;
             let inputs = inputs
                 .iter()
-                .map(crate::kernel::Geometry::Tensor)
+                .zip(&operation.inputs)
+                .map(|(extents, &id)| crate::storage::TensorStorage {
+                    format: &tensor(id).format,
+                    extents,
+                })
                 .collect::<Vec<_>>();
             let outputs = outputs
                 .iter()
-                .map(crate::kernel::Geometry::Tensor)
+                .zip(&operation.results)
+                .map(|(extents, &id)| crate::storage::TensorStorage {
+                    format: &tensor(id).format,
+                    extents,
+                })
                 .collect::<Vec<_>>();
             price.total = crate::kernel::KernelCall::select(kernel, &inputs, &outputs)
                 .map_or(u64::MAX, |call| call.cycles());

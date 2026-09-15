@@ -6,14 +6,14 @@ use crate::mid::MidOperationKind;
 
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     let MidOperationKind::ReductionSum { partials } = *kernel else {
         return Err(KernelAbiError::RequirementMismatch);
     };
     check_arity(inputs, outputs, if partials == 1 { 1 } else { 2 }, 1)?;
-    if outputs[0].format().precision != Precision::F16 {
+    if outputs[0].format.precision != Precision::F16 {
         return Err(KernelAbiError::RequirementMismatch);
     }
     let count = outputs[0].count()?;
@@ -100,7 +100,16 @@ mod tests {
         for elements in (4..=512).step_by(4) {
             let tensor =
                 crate::TensorType::new([elements], Precision::F16, crate::Layout::row_sharded(1));
-            let geometry = Geometry::Tensor(&tensor);
+            let extents = [crate::ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: elements,
+                physical_end: elements,
+            }];
+            let geometry = TensorStorage {
+                format: &tensor.format,
+                extents: &extents,
+            };
             let call = KernelCall::select(
                 &MidOperationKind::ReductionSum { partials: 1 },
                 &[geometry],

@@ -220,8 +220,8 @@ pub const FILL_ZERO_U64_SYMBOL: &str = "fill_zero_u64";
 
 pub(super) fn fill_call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     check_arity(inputs, outputs, 0, 1)?;
     let MidOperationKind::FillZero { bytes, .. } = *kernel else {

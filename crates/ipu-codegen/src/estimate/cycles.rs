@@ -182,8 +182,8 @@ impl CostModel for Ipu21CostModel {
             format: output.clone(),
         };
         let (Some(source), Some(destination)) = (
-            crate::OperandWindow::default().local_tensor(input, false),
-            crate::OperandWindow::default().local_tensor(&destination, false),
+            crate::OperandWindow::default().local_extents(input, false),
+            crate::OperandWindow::default().local_extents(&destination, false),
         ) else {
             return u64::MAX;
         };
@@ -192,8 +192,14 @@ impl CostModel for Ipu21CostModel {
                 from: input.format.precision,
                 to: output.precision,
             },
-            &[crate::kernel::Geometry::Tensor(&source)],
-            &[crate::kernel::Geometry::Tensor(&destination)],
+            &[crate::storage::TensorStorage {
+                format: &input.format,
+                extents: &source,
+            }],
+            &[crate::storage::TensorStorage {
+                format: output,
+                extents: &destination,
+            }],
         )
         .map_or(u64::MAX, |call| call.cycles())
     }

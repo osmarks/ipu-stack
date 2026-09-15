@@ -710,14 +710,14 @@ fn select_destination_packing(
                 .saturating_add(clear_cycles)
                     < crate::kernel::rearrange::estimate(
                         ElementOrder::RowMajor,
-                        crate::kernel::Geometry::Storage(crate::storage::TensorStorage {
+                        crate::storage::TensorStorage {
                             format: &destination.format,
                             extents,
-                        }),
-                        crate::kernel::Geometry::Storage(crate::storage::TensorStorage {
+                        },
+                        crate::storage::TensorStorage {
                             format: &destination.format,
                             extents,
-                        }),
+                        },
                     )
             });
             !direct

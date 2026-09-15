@@ -2,6 +2,8 @@
 //! `binding` shares ABI and operand checks; `build` collects implementations
 //! and supplies compilation/wrapper helpers. Placement only supplies addresses.
 
+use crate::storage::TensorStorage;
+
 pub mod abi;
 pub mod copy;
 pub(crate) use copy::CopyRun;
@@ -60,8 +62,8 @@ impl KernelCall {
     /// select a concrete ABI from local geometry, before addresses exist.
     pub(crate) fn select(
         kernel: &crate::mid::MidOperationKind,
-        inputs: &[Geometry<'_>],
-        outputs: &[Geometry<'_>],
+        inputs: &[TensorStorage<'_>],
+        outputs: &[TensorStorage<'_>],
     ) -> Result<Self, KernelAbiError> {
         use crate::mid::MidOperationKind::*;
         match kernel {

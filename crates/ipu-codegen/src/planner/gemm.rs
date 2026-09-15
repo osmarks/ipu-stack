@@ -54,9 +54,10 @@ impl FragmentBuilder {
                 windows
                     .get(i)
                     .unwrap_or(&OperandWindow::default())
-                    .local_tensor(tensor, false)?
-                    .shape
-                    .0,
+                    .local_extents(tensor, false)?
+                    .iter()
+                    .map(|e| e.physical_end - e.start)
+                    .collect::<Vec<_>>(),
             );
         }
         let axes = product.axes;

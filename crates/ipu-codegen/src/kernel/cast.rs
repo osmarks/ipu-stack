@@ -57,8 +57,8 @@ pub(super) fn stream_cycles(elements: u64, input_bytes: u64, output_bytes: u64) 
 /// assembly loops, without a separate scalar getter recipe.
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     check_arity(inputs, outputs, 1, 1)?;
     let MidOperationKind::Cast { from, to } = *kernel else {
@@ -69,8 +69,8 @@ pub(super) fn call(
     if !matches!(from, Precision::F8F143 { .. }) && !matches!(to, Precision::F8F143 { .. }) {
         return Ok(KernelCall::exact(symbol, vec![count]));
     }
-    let order = outputs[0].format().layout.order;
-    let row_pack = inputs[0].format().layout.order == ElementOrder::RowMajor
+    let order = outputs[0].format.layout.order;
+    let row_pack = inputs[0].format.layout.order == ElementOrder::RowMajor
         && order == ElementOrder::Amp(AmpOrder::Left);
     let f16_to_f8 = from == Precision::F16 && matches!(to, Precision::F8F143 { .. });
     let panel_rows = if f16_to_f8 {
@@ -127,18 +127,18 @@ pub(super) fn call(
 }
 
 /// Select and validate the FP16-to-FP8 traversal once for both calls and costs.
-fn panel_rows(input: Geometry<'_>, output: Geometry<'_>) -> Result<u32, KernelAbiError> {
-    let order = output.format().layout.order;
-    let row_pack = input.format().layout.order == ElementOrder::RowMajor
+fn panel_rows(input: TensorStorage<'_>, output: TensorStorage<'_>) -> Result<u32, KernelAbiError> {
+    let order = output.format.layout.order;
+    let row_pack = input.format.layout.order == ElementOrder::RowMajor
         && order == ElementOrder::Amp(AmpOrder::Left);
-    if (input.format().layout.order != order && !row_pack)
-        || input.rank() != output.rank()
-        || (0..input.rank()).any(|axis| {
+    if (input.format.layout.order != order && !row_pack)
+        || input.extents.len() != output.extents.len()
+        || (0..input.extents.len()).any(|axis| {
             let width = input.dimension(axis);
             let target = output.dimension(axis);
             width != target
                 && !(order == ElementOrder::Amp(AmpOrder::Left)
-                    && axis + 1 == input.rank()
+                    && axis + 1 == input.extents.len()
                     && if row_pack {
                         width.is_multiple_of(4) && target >= width
                     } else {
@@ -151,14 +151,14 @@ fn panel_rows(input: Geometry<'_>, output: Geometry<'_>) -> Result<u32, KernelAb
     if order.fp8_cast_panel_rows(1, 1) == 0 {
         return Ok(0);
     }
-    if input.rank() < 2 {
+    if input.extents.len() < 2 {
         return Err(KernelAbiError::RequirementMismatch);
     }
     let columns = u64::from(output.trailing_dimension(0).unwrap());
     if columns == 0
         || (row_pack
             && (!columns.is_multiple_of(32)
-                || !input.dimension(input.rank() - 1).is_multiple_of(4)))
+                || !input.dimension(input.extents.len() - 1).is_multiple_of(4)))
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
@@ -167,7 +167,7 @@ fn panel_rows(input: Geometry<'_>, output: Geometry<'_>) -> Result<u32, KernelAb
     if order == ElementOrder::Amp(AmpOrder::Left)
         && rows == 1
         && input.elements() == count
-        && (input.rank() - 2..input.rank())
+        && (input.extents.len() - 2..input.extents.len())
             .all(|axis| input.logical_dimension(axis) == input.dimension(axis))
     {
         return Ok(0);

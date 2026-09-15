@@ -24,14 +24,14 @@ pub(crate) fn supported(from: ElementOrder, to: ElementOrder, precision: Precisi
 
 pub(super) fn call(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
 ) -> Result<KernelCall, KernelAbiError> {
     check_arity(inputs, outputs, 1, 1)?;
     let MidOperationKind::Rearrange { from, to } = kernel else {
         return Err(KernelAbiError::RequirementMismatch);
     };
-    if !supported(from.order, to.order, outputs[0].format().precision) {
+    if !supported(from.order, to.order, outputs[0].format.precision) {
         return Err(KernelAbiError::Unavailable(kernel.clone()));
     }
     let rows = outputs[0].matrix_extent(true, false)?;
@@ -40,7 +40,7 @@ pub(super) fn call(
     let physical_columns = outputs[0].matrix_extent(false, true)?;
     let matrices = inputs[0]
         .widths()
-        .take(inputs[0].rank().saturating_sub(2))
+        .take(inputs[0].extents.len().saturating_sub(2))
         .try_fold(1u32, |count, width| count.checked_mul(width))
         .ok_or(KernelAbiError::ElementCountOverflow)?;
     let unpack = from.order != ElementOrder::RowMajor;
@@ -81,15 +81,19 @@ pub(crate) fn supports_row_major_population(order: ElementOrder) -> bool {
     order == ElementOrder::RowMajor || order_index(order, false).is_some()
 }
 
-pub(crate) fn estimate(from: ElementOrder, input: Geometry<'_>, output: Geometry<'_>) -> u64 {
-    if from == output.format().layout.order {
+pub(crate) fn estimate(
+    from: ElementOrder,
+    input: TensorStorage<'_>,
+    output: TensorStorage<'_>,
+) -> u64 {
+    if from == output.format.layout.order {
         return 0;
     }
-    let mut source = input.format().layout.clone();
+    let mut source = input.format.layout.clone();
     source.order = from;
     let kernel = MidOperationKind::Rearrange {
         from: source,
-        to: output.format().layout.clone(),
+        to: output.format.layout.clone(),
     };
     KernelCall::select(&kernel, &[input], &[output]).map_or(u64::MAX, |call| call.cycles())
 }

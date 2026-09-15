@@ -7,43 +7,22 @@ use crate::mid::MidOperationKind;
 use crate::tensor::TensorFormat;
 use std::sync::Arc;
 
-/// Local geometry: planned tensors already contain physical shard dimensions.
-/// Bound views additionally retain logical tails; estimates without those tails
-/// treat the whole physical extent as logical.
-#[derive(Clone, Copy)]
-pub(crate) enum Geometry<'a> {
-    Tensor(&'a crate::TensorType),
-    Storage(crate::storage::TensorStorage<'a>),
-}
-impl<'a> Geometry<'a> {
+// Kernel-specific arithmetic on address-free local storage geometry.
+impl TensorStorage<'_> {
     pub(super) fn logical_elements(self) -> Result<u32, KernelAbiError> {
-        self.extents().try_fold(1u32, |count, extent| {
+        self.extents.iter().try_fold(1u32, |count, extent| {
             count
                 .checked_mul(extent.logical_end - extent.start)
                 .ok_or(KernelAbiError::ElementCountOverflow)
         })
     }
-    pub(super) fn extents(
-        self,
-    ) -> impl ExactSizeIterator<Item = crate::ShardExtent> + DoubleEndedIterator {
-        (0..self.rank()).map(move |axis| match self {
-            Self::Tensor(t) => crate::ShardExtent {
-                axis: axis as u16,
-                start: 0,
-                logical_end: t.shape.0[axis],
-                physical_end: t.shape.0[axis],
-            },
-            Self::Storage(s) => s.extents[axis],
-        })
-    }
-
     pub(super) fn count(self) -> Result<u32, KernelAbiError> {
         u32::try_from(self.elements()).map_err(|_| KernelAbiError::ElementCountOverflow)
     }
-
     pub(super) fn matrix_extent(self, logical: bool, columns: bool) -> Result<u32, KernelAbiError> {
         let axis = self
-            .rank()
+            .extents
+            .len()
             .checked_sub(if columns { 1 } else { 2 })
             .ok_or(KernelAbiError::RequirementMismatch)?;
         Ok(if logical {
@@ -52,47 +31,28 @@ impl<'a> Geometry<'a> {
             self.dimension(axis)
         })
     }
-    pub(crate) fn format(self) -> &'a TensorFormat {
-        match self {
-            Self::Tensor(t) => &t.format,
-            Self::Storage(s) => s.format,
-        }
-    }
-    pub(crate) fn rank(self) -> usize {
-        match self {
-            Self::Tensor(t) => t.shape.0.len(),
-            Self::Storage(s) => s.extents.len(),
-        }
-    }
     pub(crate) fn dimension(self, axis: usize) -> u32 {
-        match self {
-            Self::Tensor(t) => t.shape.0[axis],
-            Self::Storage(s) => s.extents[axis].physical_end - s.extents[axis].start,
-        }
+        self.extents[axis].physical_end - self.extents[axis].start
     }
     pub(crate) fn trailing_dimension(self, offset: usize) -> Option<u32> {
-        self.rank()
+        self.extents
+            .len()
             .checked_sub(offset + 1)
             .map(|axis| self.dimension(axis))
     }
     pub(crate) fn widths(self) -> impl DoubleEndedIterator<Item = u32> + ExactSizeIterator {
-        (0..self.rank()).map(move |axis| self.dimension(axis))
+        self.extents.iter().map(|e| e.physical_end - e.start)
     }
     pub(crate) fn elements(self) -> u64 {
         self.widths()
             .fold(1u64, |n, width| n.saturating_mul(u64::from(width)))
     }
-
     pub(super) fn logical_dimension(self, axis: usize) -> u32 {
-        match self {
-            Self::Tensor(t) => t.shape.0[axis],
-            Self::Storage(s) => s.extents[axis].logical_end - s.extents[axis].start,
-        }
+        self.extents[axis].logical_end - self.extents[axis].start
     }
-
     pub(super) fn rows(self) -> u64 {
         self.widths()
-            .take(self.rank().saturating_sub(1))
+            .take(self.extents.len().saturating_sub(1))
             .fold(1u64, |n, width| n.saturating_mul(u64::from(width)))
     }
 }
@@ -168,7 +128,7 @@ impl KernelRun {
         self.call().map_or(u64::MAX, |call| call.cycles())
     }
 
-    pub(super) fn geometry(&self, operand: MemoryOperand) -> Geometry<'_> {
+    pub(super) fn geometry(&self, operand: MemoryOperand) -> TensorStorage<'_> {
         let (view, access) = match operand {
             MemoryOperand::Input(index) => (
                 &self.inputs[usize::from(index)],
@@ -179,10 +139,10 @@ impl KernelRun {
                 &self.requirements.outputs[usize::from(index)],
             ),
         };
-        Geometry::Storage(crate::storage::TensorStorage {
+        TensorStorage {
             format: &access.format,
             extents: &view.extents,
-        })
+        }
     }
 
     /// Bind a complete local invocation. The low builder supplies resolved views;
@@ -382,8 +342,8 @@ impl KernelRun {
 }
 
 pub(super) fn check_arity(
-    inputs: &[Geometry<'_>],
-    outputs: &[Geometry<'_>],
+    inputs: &[TensorStorage<'_>],
+    outputs: &[TensorStorage<'_>],
     expected_inputs: usize,
     expected_outputs: usize,
 ) -> Result<(), KernelAbiError> {
@@ -423,41 +383,38 @@ impl MidOperationKind {
 
 pub(super) fn fp8_arguments(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    output: Geometry<'_>,
+    inputs: &[TensorStorage<'_>],
+    output: TensorStorage<'_>,
 ) -> Result<Option<Vec<u32>>, KernelAbiError> {
-    let Some(capability) = kernel.output_capability(output.format().precision) else {
+    let Some(capability) = kernel.output_capability(output.format.precision) else {
         return Ok(None);
     };
     let input = inputs[0];
     let width = input.matrix_extent(false, true)?;
     let columns = output.matrix_extent(false, true)?;
-    let packed = output.format().layout.order == ElementOrder::Amp(AmpOrder::Left);
+    let packed = output.format.layout.order == ElementOrder::Amp(AmpOrder::Left);
     if width == 0
         || !width.is_multiple_of(capability.column_multiple)
         || input.matrix_extent(true, true)? != width
         || !capability
             .output_orders
-            .contains(&output.format().layout.order)
+            .contains(&output.format.layout.order)
         || columns
             != if packed {
                 width.next_multiple_of(32)
             } else {
                 width
             }
-        || input.rank() != output.rank()
-        || !input
-            .extents()
-            .take(input.rank() - 1)
-            .eq(output.extents().take(output.rank() - 1))
+        || input.extents.len() != output.extents.len()
+        || input.extents[..input.extents.len() - 1] != output.extents[..output.extents.len() - 1]
         || inputs.iter().any(|input| {
-            input.format().precision != Precision::F16
-                || input.format().layout.order != capability.input_order
+            input.format.precision != Precision::F16
+                || input.format.layout.order != capability.input_order
         })
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
-    let Precision::F8F143 { scale_exponent } = output.format().precision else {
+    let Precision::F8F143 { scale_exponent } = output.format.precision else {
         unreachable!();
     };
     Ok(Some(vec![
@@ -471,19 +428,19 @@ pub(super) fn fp8_arguments(
 /// The bias and normalization codelets consume complete, dense FP16 rows.
 pub(super) fn f16_row_width(
     kernel: &MidOperationKind,
-    inputs: &[Geometry<'_>],
-    output: Geometry<'_>,
+    inputs: &[TensorStorage<'_>],
+    output: TensorStorage<'_>,
 ) -> Result<u32, KernelAbiError> {
-    if output.format().precision != Precision::F16 {
+    if output.format.precision != Precision::F16 {
         return Err(KernelAbiError::Unavailable(kernel.clone()));
     }
     let width = output.matrix_extent(true, true)?;
     if width == 0
         || !width.is_multiple_of(2)
-        || output.format().layout.order != ElementOrder::RowMajor
+        || output.format.layout.order != ElementOrder::RowMajor
         || inputs
             .iter()
-            .any(|input| input.format().precision != Precision::F16)
+            .any(|input| input.format.precision != Precision::F16)
     {
         return Err(KernelAbiError::RequirementMismatch);
     }
