@@ -1,7 +1,7 @@
 //! Per-build caches for relative copy descriptors and destination geometry.
 //! Packing selection and low graph mutation remain in movement construction.
-use super::{ExpansionResult, view_byte_traversal};
-use crate::low::{BlockValue, BlockValueId, CopyOperation, LocalCopy, ShardView};
+use super::ExpansionResult;
+use crate::low::{BlockValue, BlockValueId, CopyOperation, ShardView};
 use crate::storage::{CopyGeometry, CopyMapping, CopyOrder, ViewGeometry};
 use crate::tensor::{ElementOrder, Precision, ShardExtent};
 use hashbrown::HashTable;
@@ -139,6 +139,13 @@ impl ExpansionCache {
         order: CopyOrder,
     ) -> ExpansionResult<Arc<CopyGeometry>> {
         let shard = &shards[destination.index() as usize];
+        for (source, target) in mappings {
+            source.bind(shards)?;
+            target.bind(shards)?;
+            if target.shard != destination {
+                return Err(super::ExpansionError::InvalidCopyPlan);
+            }
+        }
         let generate = || {
             let mappings = mappings
                 .iter()
@@ -227,28 +234,29 @@ impl ExpansionCache {
         destination: &ShardView,
         order: CopyOrder,
     ) -> ExpansionResult<Arc<Vec<CopyOperation<()>>>> {
+        let source = source.bind(shards)?;
+        let destination = destination.bind(shards)?;
         let generate = || -> ExpansionResult<Vec<CopyOperation<()>>> {
-            let a = view_byte_traversal(&shards[source.shard.index() as usize], source, order)?;
-            let b = view_byte_traversal(
-                &shards[destination.shard.index() as usize],
-                destination,
-                order,
-            )?;
-            let copies = LocalCopy::from_traversals(source.shard, destination.shard, &a, &b)?
-                .into_iter()
-                .map(|c| CopyOperation {
-                    source: (),
-                    destination: (),
-                    source_offset: c.source_offset,
-                    destination_offset: c.destination_offset,
-                    bytes: c.bytes,
-                    pattern: c.pattern,
-                })
-                .collect();
+            let a = source.traversal(order)?;
+            let b = destination.traversal(order)?;
+            // Alias IDs can differ while their storage overlaps. Reordering
+            // copy spans is only safe between different backing allocations.
+            let copies =
+                CopyOperation::from_traversals(source.backing.0, destination.backing.0, &a, &b)?
+                    .into_iter()
+                    .map(|c| CopyOperation {
+                        source: (),
+                        destination: (),
+                        source_offset: c.source_offset,
+                        destination_offset: c.destination_offset,
+                        bytes: c.bytes,
+                        pattern: c.pattern,
+                    })
+                    .collect();
             Ok(copies)
         };
-        let left = &shards[source.shard.index() as usize];
-        let right = &shards[destination.shard.index() as usize];
+        let left = source.shard;
+        let right = destination.shard;
         let whole_copy = source.extents == left.extents
             && destination.extents == right.extents
             && (order == CopyOrder::Physical
@@ -259,10 +267,10 @@ impl ExpansionCache {
             return Ok(Arc::new(generate()?));
         }
         let key = CopyKey {
-            source: ViewGeometry::new(left.storage(), &source.extents)?,
-            destination: ViewGeometry::new(right.storage(), &destination.extents)?,
+            source: ViewGeometry::new(left.storage(), source.extents)?,
+            destination: ViewGeometry::new(right.storage(), destination.extents)?,
             order,
-            same_buffer: source.shard == destination.shard,
+            same_buffer: source.backing.0 == destination.backing.0,
         };
         let mut hash = foldhash::fast::FixedState::default().build_hasher();
         key.hash(&mut hash);
@@ -414,5 +422,127 @@ mod tests {
         assert!(!Arc::ptr_eq(&before, &wider));
         assert_eq!(wider.bytes, before.bytes * 2);
         assert_eq!(cache.geometry_stats(), (2, 1, 2));
+    }
+    #[test]
+    fn copy_preparation_preserves_order_when_distinct_values_share_storage() {
+        fn mapping(copies: &[CopyOperation<()>]) -> Vec<(u32, u32)> {
+            copies
+                .iter()
+                .flat_map(|copy| {
+                    let (rows, bytes, source_stride, destination_stride) = match copy.pattern {
+                        crate::CopyPattern::Contiguous => (1, copy.bytes, 0, 0),
+                        crate::CopyPattern::Strided {
+                            rows,
+                            row_bytes,
+                            source_stride,
+                            destination_stride,
+                        } => (rows, row_bytes, source_stride, destination_stride),
+                    };
+                    (0..rows).flat_map(move |row| {
+                        (0..bytes).map(move |byte| {
+                            (
+                                copy.source_offset + row * source_stride + byte,
+                                copy.destination_offset + row * destination_stride + byte,
+                            )
+                        })
+                    })
+                })
+                .collect()
+        }
+        let orders = [
+            ElementOrder::RowMajor,
+            ElementOrder::Amp(crate::AmpOrder::Left),
+            ElementOrder::Amp(crate::AmpOrder::Output),
+            ElementOrder::Amp(crate::AmpOrder::TransposedLeft),
+            ElementOrder::Amp(crate::AmpOrder::TransposedOutput),
+            ElementOrder::BlockMajor(crate::BlockMajorOrder::Matrix {
+                row_block: 16,
+                column_block: 32,
+            }),
+        ];
+        let mut reordered = 0;
+        for precision in [Precision::F16, Precision::F32] {
+            for source_order in orders {
+                for destination_order in orders {
+                    let mut shards = [source_order, destination_order]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, order)| {
+                            let mut layout = Layout::row_sharded(1);
+                            layout.order = order;
+                            BlockValue {
+                                id: BlockValueId(index as u32),
+                                tile: 0,
+                                tensor_type: TensorType::new([48, 96], precision, layout),
+                                extents: [48, 96]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(axis, end)| ShardExtent {
+                                        axis: axis as u16,
+                                        start: 0,
+                                        logical_end: end,
+                                        physical_end: end,
+                                    })
+                                    .collect(),
+                                definition: ShardDefinition::Staging,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let view = |id| ShardView {
+                        shard: BlockValueId(id),
+                        extents: vec![
+                            ShardExtent {
+                                axis: 0,
+                                start: 0,
+                                logical_end: 32,
+                                physical_end: 32,
+                            },
+                            ShardExtent {
+                                axis: 1,
+                                start: 0,
+                                logical_end: 64,
+                                physical_end: 64,
+                            },
+                        ],
+                    };
+                    let (source, destination) = (view(0), view(1));
+                    let a = source
+                        .bind(&shards)
+                        .unwrap()
+                        .traversal(CopyOrder::Semantic)
+                        .unwrap();
+                    let b = destination
+                        .bind(&shards)
+                        .unwrap()
+                        .traversal(CopyOrder::Semantic)
+                        .unwrap();
+                    let mut expected = Vec::new();
+                    crate::storage::for_each_copy_span(a.spans(), b.spans(), |a, b, bytes| {
+                        expected.extend((0..bytes).map(|byte| (a + byte, b + byte)));
+                        Ok(())
+                    })
+                    .unwrap();
+                    let cache = ExpansionCache::default();
+                    let separate = cache
+                        .copy(&shards, &source, &destination, CopyOrder::Semantic)
+                        .unwrap();
+                    reordered += usize::from(mapping(&separate) != expected);
+                    for offset in [0, 64] {
+                        shards[1].definition = ShardDefinition::ShiftedAlias {
+                            source: BlockValueId(0),
+                            offset,
+                        };
+                        let shared = cache
+                            .copy(&shards, &source, &destination, CopyOrder::Semantic)
+                            .unwrap();
+                        assert_eq!(mapping(&shared), expected);
+                    }
+                }
+            }
+        }
+        assert!(
+            reordered > 0,
+            "fixture must expose unsafe reuse of a reordered disjoint copy"
+        );
     }
 }

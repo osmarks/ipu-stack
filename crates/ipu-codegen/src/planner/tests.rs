@@ -2659,27 +2659,25 @@ fn streamed_layout_conversion_is_materialized_before_a_cast() {
             transfer
                 .destinations
                 .iter()
-                .map(|view| crate::storage_root(&low.shards, view.shard))
+                .map(|view| crate::low::storage::storage_root(&low.shards, view.shard))
         })
         .chain(
             low.local_copies
                 .iter()
-                .map(|copy| crate::storage_root(&low.shards, copy.destination)),
+                .map(|copy| crate::low::storage::storage_root(&low.shards, copy.destination)),
         )
         .chain(
             low.inputs
                 .iter()
                 .flat_map(|input| low.value_views(input.value))
-                .map(|view| crate::storage_root(&low.shards, view.shard)),
+                .map(|view| crate::low::storage::storage_root(&low.shards, view.shard)),
         )
         .collect::<BTreeSet<_>>();
     for run in &low.kernel_runs {
         if matches!(run.kernel, TileKernelSpec::Cast { .. }) {
-            assert!(
-                run.inputs
-                    .iter()
-                    .all(|view| written.contains(&crate::storage_root(&low.shards, view.shard)))
-            );
+            assert!(run.inputs.iter().all(|view| {
+                written.contains(&crate::low::storage::storage_root(&low.shards, view.shard))
+            }));
         }
     }
 }

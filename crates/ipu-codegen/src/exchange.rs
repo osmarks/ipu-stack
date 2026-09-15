@@ -266,7 +266,7 @@ fn repeat_source_bases(
         .shards
         .iter()
         .filter_map(|shard| {
-            crate::storage_chain(&program.shards, shard.id)
+            crate::low::storage::storage_chain(&program.shards, shard.id)
                 .find_map(|(source, offset)| {
                     repeat_inputs.get(&source).map(|inputs| (inputs, offset))
                 })
@@ -348,8 +348,11 @@ pub(crate) fn capture_exchange_schedule(
                 for transfer in &phase.transfers {
                     let source = &program.shards[transfer.source.shard.index() as usize];
                     let order = transfer.span_order(&program.shards);
-                    let bytes =
-                        crate::view_byte_traversal(source, &transfer.source, order)?.byte_len();
+                    let bytes = transfer
+                        .source
+                        .bind(&program.shards)?
+                        .traversal(order)?
+                        .byte_len();
                     let describe = |shard: &crate::BlockValue, view: &crate::ShardView| {
                         let widths = |extents: &[crate::ShardExtent]| {
                             extents
@@ -637,14 +640,14 @@ fn prepare_transfer(
                     .get(&view.shard)
                     .copied()
                     .ok_or(ExchangeLoweringError::UnplacedShard)?,
-                crate::view_byte_traversal(shard, view, order)?,
+                view.bind(&program.shards)?.traversal(order)?,
             ))
         })
         .collect::<Result<Vec<_>, ExchangeLoweringError>>()?;
     if destinations.is_empty() {
         return Err(ExchangeLoweringError::SizeMismatch);
     }
-    let source_spans = crate::view_byte_traversal(source, &transfer.source, order)?;
+    let source_spans = transfer.source.bind(&program.shards)?.traversal(order)?;
     if destinations
         .iter()
         .any(|(_, _, spans)| spans.byte_len() != source_spans.byte_len())

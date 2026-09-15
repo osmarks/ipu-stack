@@ -78,12 +78,15 @@ impl GeometryAnalysis {
         view: &ShardView,
         order: CopyOrder,
     ) -> ExpansionResult<usize> {
-        let shard = &program.shards[view.shard.index() as usize];
-        let key = (order, ViewGeometry::new(shard.storage(), &view.extents)?);
+        let view = view.bind(&program.shards)?;
+        let key = (
+            order,
+            ViewGeometry::new(view.shard.storage(), view.extents)?,
+        );
         if let Some(&id) = self.views.get(&key) {
             return Ok(id);
         }
-        let traversal = crate::view_byte_traversal(shard, view, order)?;
+        let traversal = view.traversal(order)?;
         let id = self.traversals.len();
         self.traversals.push(traversal);
         self.views.insert(key, id);

@@ -15,20 +15,21 @@ mod ownership;
 mod reduce;
 mod relay;
 mod repeat;
+#[cfg(test)]
+use super::{view_byte_spans, view_byte_traversal};
 use crate::graph::OperationId;
 use crate::low::*;
 use crate::mid::Compute;
-use crate::storage::{ByteSpan, StorageError};
+#[cfg(test)]
+use crate::storage::ByteSpan;
+use crate::storage::StorageError;
 use crate::{
     AMP_COLUMN_MICRO, AmpOrder, AxisFactorView, CopyOrder, CopyPolicy, ElementOrder, Layout,
     LayoutError, MemoryClass, MidOperation, MidOperationKind, MidProgram, MidRepeat, MidValueId,
     Precision, ShardExtent, TensorTiling, TensorType, TileKernelSpec,
 };
-#[cfg(test)]
-pub use copies::view_byte_spans;
-pub(crate) use copies::view_byte_traversal;
 use copies::*;
-pub use copies::{logical_view_byte_spans, shard_storage_bytes};
+
 use mapping::*;
 use ownership::CopyRegions;
 use std::collections::{BTreeMap, BTreeSet};

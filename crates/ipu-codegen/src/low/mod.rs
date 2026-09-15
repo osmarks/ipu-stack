@@ -5,12 +5,15 @@ pub(crate) mod expand;
 mod graph;
 mod initialization;
 mod passes;
+pub(crate) mod storage;
 pub use copy::*;
-#[cfg(test)]
-pub use expand::view_byte_spans;
-pub(crate) use expand::view_byte_traversal;
-pub use expand::{ExpansionError, ExpansionResult, logical_view_byte_spans, shard_storage_bytes};
+pub use expand::{ExpansionError, ExpansionResult};
 pub use graph::*;
+#[cfg(test)]
+pub use storage::view_byte_spans;
+#[cfg(test)]
+pub(crate) use storage::view_byte_traversal;
+pub use storage::{logical_view_byte_spans, shard_storage_bytes};
 
 use crate::graph::OperationId;
 use std::sync::Arc;

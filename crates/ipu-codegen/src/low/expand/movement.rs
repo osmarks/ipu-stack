@@ -540,9 +540,10 @@ impl TileGraphBuilder {
                 destination,
             )?;
             for (source, destination) in pieces {
-                let source_spans = view_byte_traversal(source_shard, &source, CopyOrder::Physical)?;
-                let destination_spans =
-                    view_byte_traversal(destination_shard, &destination, CopyOrder::Physical)?;
+                let source_spans = source.bind(&self.shards)?.traversal(CopyOrder::Physical)?;
+                let destination_spans = destination
+                    .bind(&self.shards)?
+                    .traversal(CopyOrder::Physical)?;
                 if !source_spans.word_aligned()
                     || !destination_spans.word_aligned()
                     || source_spans.byte_len() != destination_spans.byte_len()
@@ -688,12 +689,10 @@ impl TileGraphBuilder {
                     )?;
                 } else {
                     if exchange_order != CopyOrder::Panels
-                        && !view_byte_traversal(
-                            &self.shards[source.shard.index() as usize],
-                            &source,
-                            exchange_order,
-                        )?
-                        .word_aligned()
+                        && !source
+                            .bind(&self.shards)?
+                            .traversal(exchange_order)?
+                            .word_aligned()
                     {
                         source = self.pack_exchange_source(
                             source,
@@ -752,7 +751,7 @@ impl TileGraphBuilder {
         }
         let shard = &self.shards[source.shard.index() as usize];
         let tile = shard.tile;
-        let bytes = view_byte_traversal(shard, &source, order)?.byte_len();
+        let bytes = source.bind(&self.shards)?.traversal(order)?.byte_len();
         if bytes == 0 || !bytes.is_multiple_of(4) {
             return Err(ExpansionError::InvalidCopyPlan);
         }
@@ -787,19 +786,15 @@ impl TileGraphBuilder {
             let transfers = batch.transfers.entry(order).or_default();
             // Keep the existing multicast send; only add its local receiver.
             // Placement separates same-class source/receiver SRAM elements.
-            let spans = |shard, view| view_byte_traversal(shard, view, order);
-            let source_spans = spans(&self.shards[source.shard.index() as usize], &source)?;
-            let destination_spans = spans(
-                &self.shards[destination.shard.index() as usize],
-                &destination,
-            )?;
+            let source_spans = source.bind(&self.shards)?.traversal(order)?;
+            let destination_spans = destination.bind(&self.shards)?.traversal(order)?;
             let aligned = source_spans.word_aligned() && destination_spans.word_aligned();
             if let Some(destinations) = transfers.get_mut(&source)
                 && destinations.len() >= 2
                 && aligned
                 // The local receiver must not split existing messages further.
                 && destinations.iter().any(|view| {
-                    spans(&self.shards[view.shard.index() as usize], view).is_ok_and(|remote|
+                    view.bind(&self.shards).and_then(|bound| bound.traversal(order)).is_ok_and(|remote|
                         remote.spans().map(|span| span.bytes)
                             .eq(destination_spans.spans().map(|span| span.bytes)))
                 })

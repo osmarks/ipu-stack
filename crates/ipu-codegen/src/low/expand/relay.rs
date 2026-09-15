@@ -1,6 +1,7 @@
 //! Direct multicast versus gathering native panels once and forwarding them.
 //! Both use the same exchange phase; scratch is visible to normal placement.
 use super::*;
+use crate::low::storage::storage_root;
 
 pub(super) fn select(
     program: &mut TileGraph,

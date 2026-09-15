@@ -4,10 +4,9 @@ use super::copy::CopyPattern;
 use super::graph::{
     BlockOperation, BlockRegion, BlockValue, BlockValueId, ExchangePhase, ExchangePhaseId,
     LocalCopy, LocalCopyId, LogicalExchange, ShardView, TileGraph, WorkProvenance, WorkReason,
-    storage_location, storage_root,
 };
-use super::view_byte_traversal;
-use crate::storage::{ByteSpan, CopyOrder, StorageResult};
+use super::storage::{storage_location, storage_root};
+use crate::storage::{CopyOrder, StorageResult, StridedSpan};
 use std::collections::BTreeMap;
 
 /// Move copy-only gaps before or after a shared exchange when they commute
@@ -184,13 +183,10 @@ fn copy_overlaps_view(
     } else {
         (copy.destination, copy.destination_offset)
     };
-    if storage_root(shards, shard) != storage_root(shards, view.shard) {
+    let (root, origin) = storage_location(shards, shard);
+    let view = view.bind(shards)?;
+    if root != view.backing.0 {
         return Ok(false);
-    }
-    // Different alias origins need translated byte coordinates. Conservatively
-    // retain ordering here; these casts already form a compute boundary.
-    if storage_location(shards, shard).1 != storage_location(shards, view.shard).1 {
-        return Ok(true);
     }
     let (rows, bytes, stride) = match copy.pattern {
         CopyPattern::Contiguous => (1, copy.bytes, 0),
@@ -209,28 +205,16 @@ fn copy_overlaps_view(
             },
         ),
     };
-    let traversal = view_byte_traversal(&shards[view.shard.index() as usize], view, order)?;
-    Ok(traversal
-        .spans()
-        .any(|span| strided_overlap(offset, rows, bytes, stride, span)))
-}
-/// Compare a span with an affine row sequence without enumerating its rows.
-fn strided_overlap(offset: u32, rows: u32, bytes: u32, stride: u32, span: ByteSpan) -> bool {
-    if rows == 0 || bytes == 0 || span.bytes == 0 {
-        return false;
-    }
-    let (offset, bytes, stride) = (u64::from(offset), u64::from(bytes), u64::from(stride));
-    let start = u64::from(span.offset);
-    let end = start + u64::from(span.bytes);
-    if stride == 0 {
-        return offset < end && start < offset + bytes;
-    }
-    let first = if start < offset + bytes {
-        0
-    } else {
-        (start - offset - bytes) / stride + 1
+    let copy = StridedSpan {
+        offset,
+        rows,
+        bytes,
+        stride,
     };
-    first < u64::from(rows) && offset + first * stride < end
+    Ok(view
+        .traversal(order)?
+        .spans()
+        .any(|span| copy.overlaps(origin, span, view.backing.1)))
 }
 
 /// Merge contiguous copies between distinct allocations while preserving each
@@ -473,25 +457,69 @@ mod tests {
         assert!(compact[1..].iter().all(|copy| copy.bytes == 8));
         assert_eq!(merge_copies(&mut region, &mut compact, &roots), 0);
     }
+
     #[test]
-    fn affine_overlap_matches_explicit_rows() {
-        let mut random = fastrand::Rng::with_seed(1729);
-        for _ in 0..10_000 {
-            let offset = random.u32(0..64);
-            let rows = random.u32(0..16);
-            let bytes = random.u32(0..32);
-            let stride = random.u32(0..64);
-            let span = ByteSpan {
-                offset: random.u32(0..1024),
-                bytes: random.u32(0..128),
+    fn copy_hazards_translate_both_signed_alias_origins() {
+        let root = BlockValue {
+            id: BlockValueId(0),
+            tile: 0,
+            tensor_type: crate::TensorType::new(
+                [128],
+                crate::Precision::F16,
+                crate::Layout::row_sharded(1),
+            ),
+            extents: vec![crate::ShardExtent {
+                axis: 0,
+                start: 0,
+                logical_end: 128,
+                physical_end: 128,
+            }],
+            definition: crate::ShardDefinition::Staging,
+        };
+        let mut other = root.clone();
+        other.id = BlockValueId(1);
+        let mut alias = root.clone();
+        alias.id = BlockValueId(2);
+        alias.tensor_type.format.precision = crate::Precision::F8F143 { scale_exponent: 0 };
+        let view = ShardView {
+            shard: alias.id,
+            extents: vec![crate::ShardExtent {
+                axis: 0,
+                start: 4,
+                logical_end: 8,
+                physical_end: 8,
+            }],
+        };
+        let copy = LocalCopy {
+            source: root.id,
+            destination: other.id,
+            source_offset: 32,
+            destination_offset: 0,
+            bytes: 8,
+            pattern: CopyPattern::Contiguous,
+        };
+        let mut shards = vec![root, other, alias];
+        for (shift, overlap) in [(-8, false), (28, true), (36, false), (1024, false)] {
+            shards[2].definition = crate::ShardDefinition::ShiftedAlias {
+                source: BlockValueId(0),
+                offset: shift,
             };
-            let expected = bytes != 0
-                && span.bytes != 0
-                && (0..rows).any(|row| {
-                    let at = offset + row * stride;
-                    at < span.offset + span.bytes && span.offset < at + bytes
-                });
-            assert_eq!(strided_overlap(offset, rows, bytes, stride, span), expected);
+            assert_eq!(
+                copy_overlaps_view(&shards, &copy, true, &view, CopyOrder::Physical).unwrap(),
+                overlap
+            );
+            assert!(
+                !copy_overlaps_view(&shards, &copy, false, &view, CopyOrder::Physical).unwrap()
+            );
         }
+        shards[0].definition = crate::ShardDefinition::ShiftedAlias {
+            source: BlockValueId(1),
+            offset: -16,
+        };
+        shards[2].definition = crate::ShardDefinition::ShiftedAlias {
+            source: BlockValueId(1),
+            offset: 12,
+        };
+        assert!(copy_overlaps_view(&shards, &copy, true, &view, CopyOrder::Physical).unwrap());
     }
 }

@@ -143,14 +143,10 @@ pub enum KernelError {
     Abi(#[from] KernelAbiError),
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error("kernel references missing shard {0}")]
-    UnknownShard(u32),
-    #[error("shard {0} has no assigned address")]
-    UnplacedShard(u32),
+    #[error(transparent)]
+    Address(#[from] crate::low::storage::AddressError),
     #[error("kernel operand view of shard {shard} has {spans} physical byte spans")]
     FragmentedView { shard: u32, spans: usize },
-    #[error("placed kernel address overflowed")]
-    AddressOverflow,
 }
 
 impl KernelRun {
@@ -166,23 +162,11 @@ impl KernelRun {
         metadata: &mut Vec<Arc<KernelRunMetadata>>,
     ) -> Result<Self, KernelError> {
         let output = outputs.first().ok_or(KernelAbiError::RequirementMismatch)?;
-        let tile = shards
-            .get(output.shard.index() as usize)
-            .ok_or(KernelError::UnknownShard(output.shard.index()))?
-            .tile;
+        let tile = output.bind(shards)?.shard.tile;
         for view in inputs.iter().chain(&outputs) {
-            let shard = shards
-                .get(view.shard.index() as usize)
-                .ok_or(KernelError::UnknownShard(view.shard.index()))?;
-            if view.shard != shard.id || shard.tile != tile {
+            if view.bind(shards)?.shard.tile != tile {
                 return Err(KernelAbiError::RequirementMismatch.into());
             }
-            if shards[crate::storage_root(shards, view.shard).index() as usize].definition
-                == crate::ShardDefinition::Unmaterialized
-            {
-                return Err(StorageError::InvalidView.into());
-            }
-            crate::storage::validate_view(shard.storage(), &view.extents)?;
         }
         let format = |view: &ShardView| &shards[view.shard.index() as usize].tensor_type.format;
         let shared = metadata.iter().find(|metadata| {
@@ -238,11 +222,9 @@ pub(super) fn view_offset(
     let view = run
         .operand_view(operand)
         .ok_or(KernelAbiError::RequirementMismatch)?;
-    let shard = shards
-        .get(view.shard.index() as usize)
-        .ok_or(KernelError::UnknownShard(view.shard.index()))?;
-    let spans = view_byte_traversal(shard, view, crate::CopyOrder::Physical)?;
-    let packed = operand == MemoryOperand::Output(0) && gemm::packed_output(run, shard)?;
+    let bound = view.bind(shards)?;
+    let spans = bound.traversal(crate::CopyOrder::Physical)?;
+    let packed = operand == MemoryOperand::Output(0) && gemm::packed_output(run, bound.shard)?;
     let span = if packed {
         spans.spans().next()
     } else {
@@ -262,7 +244,7 @@ pub(super) fn view_offset(
         return span
             .offset
             .checked_add(offset)
-            .ok_or(KernelError::AddressOverflow);
+            .ok_or_else(|| crate::low::storage::AddressError::Overflow.into());
     }
     Ok(span.offset)
 }

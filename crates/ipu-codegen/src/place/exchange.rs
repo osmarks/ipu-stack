@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::storage::ByteTraversal;
-use crate::view_byte_traversal;
 
 struct Access {
     shard: BlockValueId,
@@ -37,7 +36,9 @@ impl ExchangeConflicts {
                     };
                     accesses.push(Access {
                         shard: view.shard,
-                        traversal: view_byte_traversal(shard, view, crate::CopyOrder::Physical)?,
+                        traversal: view
+                            .bind(&program.shards)?
+                            .traversal(crate::CopyOrder::Physical)?,
                     });
                 }
             }

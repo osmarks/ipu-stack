@@ -356,33 +356,3 @@ impl TileGraph {
         })
     }
 }
-
-pub(crate) fn storage_root(shards: &[BlockValue], shard: BlockValueId) -> BlockValueId {
-    storage_location(shards, shard).0
-}
-
-/// Byte origin relative to the ultimate backing value, before placement.
-pub(crate) fn storage_location(shards: &[BlockValue], shard: BlockValueId) -> (BlockValueId, i64) {
-    storage_chain(shards, shard).last().unwrap()
-}
-
-/// Follow backing storage while retaining the byte displacement at each binding.
-/// Repeat arguments may acquire other shard IDs through views and reductions.
-pub(crate) fn storage_chain(
-    shards: &[BlockValue],
-    shard: BlockValueId,
-) -> impl Iterator<Item = (BlockValueId, i64)> + '_ {
-    std::iter::successors(Some((shard, 0i64)), |&(shard, offset)| {
-        match shards[shard.index() as usize].definition {
-            ShardDefinition::Alias(source) | ShardDefinition::WritableAlias(source) => {
-                Some((source, offset))
-            }
-            ShardDefinition::ShiftedAlias {
-                source,
-                offset: delta,
-            } => Some((source, offset + i64::from(delta))),
-            _ => None,
-        }
-    })
-    .take(shards.len().saturating_add(2))
-}

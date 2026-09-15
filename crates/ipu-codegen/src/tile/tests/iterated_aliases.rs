@@ -277,11 +277,12 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
         source = alias.id;
         shards.push(alias);
         assert_eq!(
-            crate::kernel::resolve_shard_address(
+            crate::low::storage::resolve_address(
                 &shards,
                 &placement.shard_addresses,
                 &overrides,
-                source
+                source,
+                0,
             )
             .unwrap(),
             TileAddress::RepeatPointer {
@@ -290,11 +291,12 @@ fn pointer_resolution_preserves_signed_offsets_through_alias_chains() {
             }
         );
         assert_eq!(
-            crate::kernel::resolve_shard_address(
+            crate::low::storage::resolve_address(
                 &shards,
                 &placement.shard_addresses,
                 &BTreeMap::new(),
-                source
+                source,
+                0,
             )
             .unwrap(),
             TileAddress::Absolute(placement.shard_addresses[&source])

@@ -360,8 +360,8 @@ ABI lookup, symbolic scalar-getter list and specialization reconstruction are
 removed. Fixed entry points and parameterized implementations use one identity
 enum; there is no unspecified specialization for another pass to discover.
 FP8 output epilogues share their contract with mid fusion, and optimistic cast
-and packing queries use their families' capabilities. Local-copy contracts and
-wider sharing of alias-relative access geometry remain to be refactored.
+and packing queries use their families' capabilities. Local-copy helper contracts
+remain to be brought under their family owner.
 After construction, [low/passes.rs](../crates/ipu-codegen/src/low/passes.rs)
 groups exchanges across commuting local copies, then merges adjacent copies.
 It checks read/write hazards against completed storage bindings and respects
@@ -381,8 +381,21 @@ the scalar or cropped rows do not acquire a fictitious dense stride. Copy-region
 ownership indexes source views, allowing several selections of one backing shard.
 Compute dispatch declares its current canonical-allocation needs (Sum's axis
 reinterpretation and in-place results); Repeat declares its structured bindings.
-Both validate complete storage where required. Wider consolidation of these view
-bindings with signed allocation-relative alias addressing remains unfinished.
+Both validate complete storage where required.
+
+[low/storage.rs](../crates/ipu-codegen/src/low/storage.rs) owns physical access
+binding. `ShardView::bind` checks the selected region and backing allocation, then
+returns its format/strides, selection and signed origin in that allocation.
+Kernels, movement, exchange expansion and detailed geometry costing use this
+binding. Following an alias changes the byte origin; it never reinterprets FP8
+data using the FP16 backing allocation's format. Copy preparation distinguishes
+disjoint allocations from aliases before reordering spans. Dependency checks
+translate both accesses into common byte coordinates, including negative origins.
+
+The same owner resolves placed addresses and Repeat pointers. It retains the
+alias chain so a Repeat override on an intermediate argument takes precedence
+over a more distant backing value. Kernel calls, local copies and exchange-base
+setup use that resolution with their selected byte offset.
 
 ## What each later representation is for
 

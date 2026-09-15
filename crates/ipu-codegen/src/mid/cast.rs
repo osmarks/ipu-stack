@@ -422,7 +422,10 @@ mod tests {
             else {
                 panic!("cast must donate its input")
             };
-            assert_ne!(crate::storage_root(&low.shards, input), parameter);
+            assert_ne!(
+                crate::low::storage::storage_root(&low.shards, input),
+                parameter
+            );
             assert_eq!(
                 placement.shard_addresses[&input],
                 placement.shard_addresses[&output] + 32768

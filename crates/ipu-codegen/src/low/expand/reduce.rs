@@ -177,7 +177,9 @@ impl TileGraphBuilder {
                 // stages may overwrite it, so retain staging for those plans.
                 let direct_seed = reduction_stages == 1
                     && seed_shard.tile == owner.tile
-                    && view_byte_traversal(seed_shard, &seed_source, CopyOrder::Physical)?
+                    && seed_source
+                        .bind(&self.shards)?
+                        .traversal(CopyOrder::Physical)?
                         .contiguous_span()
                         .is_some_and(|span| {
                             span.offset.is_multiple_of(8)
@@ -218,7 +220,9 @@ impl TileGraphBuilder {
                         | ShardDefinition::Staging
                         | ShardDefinition::ExchangeStaging
                 ) && !contributors.iter().any(|view| view.shard == output)
-                    && view_byte_traversal(&owner, &destination, CopyOrder::Physical)?
+                    && destination
+                        .bind(&self.shards)?
+                        .traversal(CopyOrder::Physical)?
                         .contiguous_span()
                         .is_some_and(|span| {
                             span.offset.is_multiple_of(8)

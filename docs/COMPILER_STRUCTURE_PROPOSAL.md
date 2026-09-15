@@ -129,8 +129,13 @@ copies update those bindings; kernels and copies consume them before geometry.
 The borrowed-view repair map and its late resolution calls are removed. Source
 region ownership and diagnostics retain selections as well as backing storage.
 Compute dispatch owns its canonical-allocation declarations, while Repeat keeps
-explicit region requirements. Shared alias-relative access geometry, local-copy
-binding, remaining movement policies and cache consolidation are still unfinished.
+explicit region requirements. Low storage binding now combines the selected
+format/strides with its allocation root and signed origin; kernels, copies,
+exchange expansion and detailed costing share it. Copy reordering observes
+backing identity, and dependency checks compare translated byte ranges. Placed
+address binding also belongs to low storage, retaining intermediate Repeat
+overrides through alias chains. Local-copy helper binding, remaining movement
+policies and cache consolidation are still unfinished.
 Fragment binding now takes an explicit working embedding; it no longer derives
 every temporary group's domain from the first result's potentially smaller home.
 Input/result bindings remain independent and checked. Mid applies scoped owner

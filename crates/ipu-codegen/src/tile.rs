@@ -37,6 +37,8 @@ pub enum TileLoweringError {
     #[error(transparent)]
     Kernel(#[from] crate::KernelError),
     #[error(transparent)]
+    Address(#[from] crate::low::storage::AddressError),
+    #[error(transparent)]
     ExchangeDiagnostic(#[from] crate::ExchangeLoweringError),
     #[error("tile schedule refers to an unknown exchange phase")]
     UnknownExchange,
@@ -199,16 +201,17 @@ fn lower_work(
                         .copied()
                         .flatten()
                         .map(|(shard, offset)| {
-                            let base = crate::kernel::resolve_shard_address(
+                            let base = crate::low::storage::resolve_address(
                                 &program.shards,
                                 &placement.shard_addresses,
                                 overrides,
                                 shard,
+                                offset,
                             )?;
                             if !matches!(base, TileAddress::RepeatPointer { .. }) {
                                 return Err(TileLoweringError::InvalidRepeat);
                             }
-                            Ok(crate::kernel::add_address_offset(base, offset)?)
+                            Ok(base)
                         })
                         .transpose()?,
                     setup_patch: placed.setup_patch.clone(),
@@ -227,13 +230,13 @@ fn lower_work(
                 };
                 let (symbol, arguments) = local_copy_call(copy).ok_or_else(invalid)?;
                 let resolve = |shard, offset| {
-                    crate::kernel::resolve_shard_address(
+                    crate::low::storage::resolve_address(
                         &program.shards,
                         &placement.shard_addresses,
                         overrides,
                         shard,
+                        offset,
                     )
-                    .and_then(|base| crate::kernel::add_address_offset(base, offset))
                     .map_err(|_| invalid())
                 };
                 TileStep::Compute(crate::ComputeStep {

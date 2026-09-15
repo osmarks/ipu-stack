@@ -478,6 +478,30 @@ pub(crate) struct StridedSpan {
     pub stride: u32,
 }
 
+impl StridedSpan {
+    /// Compare allocation-relative accesses with possibly different signed alias
+    /// origins. The affine rows need not be expanded into individual spans.
+    pub(crate) fn overlaps(self, origin: i64, span: ByteSpan, span_origin: i64) -> bool {
+        if self.rows == 0 || self.bytes == 0 || span.bytes == 0 {
+            return false;
+        }
+        let offset = i128::from(origin) + i128::from(self.offset);
+        let bytes = i128::from(self.bytes);
+        let stride = i128::from(self.stride);
+        let start = i128::from(span_origin) + i128::from(span.offset);
+        let end = start + i128::from(span.bytes);
+        if stride == 0 {
+            return offset < end && start < offset + bytes;
+        }
+        let first = if start < offset + bytes {
+            0
+        } else {
+            (start - offset - bytes) / stride + 1
+        };
+        first < i128::from(self.rows) && offset + first * stride < end
+    }
+}
+
 impl ByteTraversal {
     pub(crate) fn regular_span(&self) -> Option<StridedSpan> {
         fn regular(node: &Node) -> Option<StridedSpan> {
@@ -983,5 +1007,46 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn affine_overlap_matches_explicit_rows_with_signed_origins() {
+        let mut random = fastrand::Rng::with_seed(1729);
+        for _ in 0..20_000 {
+            let copy = StridedSpan {
+                offset: random.u32(0..64),
+                rows: random.u32(0..16),
+                bytes: random.u32(0..32),
+                stride: random.u32(0..64),
+            };
+            let span = ByteSpan {
+                offset: random.u32(0..1024),
+                bytes: random.u32(0..128),
+            };
+            let origin = random.i64(-1024..1024);
+            let span_origin = random.i64(-1024..1024);
+            let expected = copy.bytes != 0
+                && span.bytes != 0
+                && (0..copy.rows).any(|row| {
+                    let at = origin + i64::from(copy.offset + row * copy.stride);
+                    let start = span_origin + i64::from(span.offset);
+                    at < start + i64::from(span.bytes) && start < at + i64::from(copy.bytes)
+                });
+            assert_eq!(copy.overlaps(origin, span, span_origin), expected);
+        }
+        // Wide offsets/strides and both ends of signed alias-origin space must
+        // still compare without unsigned wrapping or intermediate overflow.
+        let copy = StridedSpan {
+            offset: u32::MAX,
+            rows: u32::MAX,
+            bytes: u32::MAX,
+            stride: u32::MAX,
+        };
+        let span = ByteSpan {
+            offset: 0,
+            bytes: 1,
+        };
+        assert!(copy.overlaps(i64::MIN, span, 0));
+        assert!(!copy.overlaps(0, span, i64::MIN));
+        assert!(!copy.overlaps(i64::MAX, span, i64::MIN));
     }
 }
