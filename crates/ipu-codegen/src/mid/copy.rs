@@ -334,8 +334,6 @@ pub(super) fn compose(
                 mapping: next,
                 reuse_local,
             };
-            operations[index].estimated_cycles = 0;
-            operations[index].estimated_exchange_cycles = 0;
         }
         producers.insert(output, index);
     }
@@ -467,8 +465,6 @@ mod tests {
                     mapping: CoordinateMapping::default(),
                     reuse_local: true,
                 },
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             })
             .collect();
         (operations, values)

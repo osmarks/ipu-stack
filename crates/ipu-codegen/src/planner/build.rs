@@ -1,7 +1,7 @@
 //! Deterministic whole-device lowering with explicit, canonical boundaries.
 
 use crate::compile::PipelineConfig;
-use crate::estimate::{CostModel, MemoryPeaks, region_peak_memory_with_multiplicity};
+use crate::estimate::{CostModel, MemoryPeaks};
 use crate::graph::{
     ComputeGraph, GraphInputKind, Operation, OperationId, OperationKind, Repeat, ValueId,
 };
@@ -446,12 +446,7 @@ impl<C: CostModel> Builder<'_, C> {
                                 .costs
                                 .operator_cycle_override(plan, &inputs, &output)
                                 .unwrap_or(implementation.estimated_cycles)
-                                .saturating_add(
-                                    conversions
-                                        .iter()
-                                        .map(|op| op.estimated_cycles)
-                                        .sum::<u64>(),
-                                );
+                                .saturating_add(state.conversion_cycles);
                             return Some((rank(cycles, memory), (plan, early_cast)));
                         }
                         // Lower the actual boundary -> operator -> boundary sequence.
@@ -658,8 +653,6 @@ impl<C: CostModel> Builder<'_, C> {
                         mapping: CoordinateMapping::default(),
                         reuse_local: false,
                     },
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 });
                 *input = result;
             }
@@ -765,26 +758,6 @@ impl<C: CostModel> Builder<'_, C> {
                 &mut body,
             ));
         }
-        let mut retained = yields.clone();
-        retained.extend(
-            arguments
-                .iter()
-                .copied()
-                .filter(|id| self.state.parameter_values.contains(id)),
-        );
-        let peak = region_peak_memory_with_multiplicity(
-            self.config,
-            &arguments,
-            &body,
-            &retained,
-            &self.state.values,
-            &self.copies,
-        );
-        let cycles = body.iter().map(|op| op.estimated_cycles).sum::<u64>();
-        let exchange = body
-            .iter()
-            .map(|op| op.estimated_exchange_cycles)
-            .sum::<u64>();
         let results = operation
             .results
             .iter()
@@ -812,12 +785,8 @@ impl<C: CostModel> Builder<'_, C> {
                     arguments,
                     operations: body,
                     yields,
-                    estimated_cycles: cycles,
-                    peak_memory: peak,
                 },
             }),
-            estimated_cycles: cycles.saturating_mul(u64::from(repeat.count)),
-            estimated_exchange_cycles: exchange.saturating_mul(u64::from(repeat.count)),
         });
         Ok(())
     }

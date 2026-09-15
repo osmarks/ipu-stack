@@ -370,7 +370,6 @@ fn reorder_region(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::estimate::MemoryPeaks;
     use crate::graph::{ComputeGraph, ValueId};
     use crate::kernel::TileKernelSpec;
     use crate::mid::{CoordinateMapping, MidRegion, MidRepeat, ReductionStaging};
@@ -434,8 +433,6 @@ mod tests {
             inputs: vec![MidValueId::from_index(input)],
             results: vec![MidValueId::from_index(output)],
             kind: primitive,
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let copy = |input, output| {
             operation(
@@ -564,12 +561,8 @@ mod tests {
                         arguments: vec![],
                         operations,
                         yields,
-                        estimated_cycles: 0,
-                        peak_memory: MemoryPeaks::default(),
                     },
                 }),
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             });
             body
         };

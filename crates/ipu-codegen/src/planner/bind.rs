@@ -24,6 +24,7 @@ pub(super) struct ValueBuilder {
     pub(super) values: Vec<MidValue>,
     pub(super) automatic_inputs: BTreeSet<MidValueId>,
     pub(super) parameter_values: BTreeSet<MidValueId>,
+    pub(super) conversion_cycles: u64,
 }
 
 impl ValueBuilder {
@@ -298,20 +299,20 @@ pub(super) fn ensure_format(
         }
         let cast = input.format.precision != output.format.precision;
         let policy = default_copy_policy(&input.format.layout, &output.format.layout);
-        let cost = if cast {
-            crate::estimate::RearrangementCost {
-                cycles: costs.cast_format_cycles(&input, &output.format),
-                ..Default::default()
-            }
+        let cycles = if cast {
+            costs.cast_format_cycles(&input, &output.format)
         } else {
-            costs.rearrangement_cost(
-                &output.shape,
-                output.format.precision,
-                policy,
-                &input.format.layout,
-                &output.format.layout,
-            )
+            costs
+                .rearrangement_cost(
+                    &output.shape,
+                    output.format.precision,
+                    policy,
+                    &input.format.layout,
+                    &output.format.layout,
+                )
+                .cycles
         };
+        state.conversion_cycles = state.conversion_cycles.saturating_add(cycles);
         let result = state.derived_value(value, output.clone());
         operations.push(MidOperation {
             site: Some(site.child(["input.copy", "cast", "output.copy"][index])),
@@ -331,8 +332,6 @@ pub(super) fn ensure_format(
                     packing: crate::PackingPolicy::Automatic,
                 }
             },
-            estimated_cycles: cost.cycles,
-            estimated_exchange_cycles: cost.exchange_cycles,
         });
         value = result;
     }

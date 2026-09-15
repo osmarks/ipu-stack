@@ -259,8 +259,6 @@ mod tests {
             inputs: vec![MidValueId(input)],
             results: vec![MidValueId(result)],
             kind,
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let mut program = MidProgram {
             tile_count: 12,
@@ -472,8 +470,6 @@ mod tests {
                         output_aliases: Vec::new(),
                     }),
                     inputs,
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 };
                 let mut identity = values[3].clone();
                 identity.id = MidValueId(5);
@@ -501,8 +497,6 @@ mod tests {
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 };
                 let cast = MidOperation {
                     site: None,
@@ -513,8 +507,6 @@ mod tests {
                         Precision::F16,
                         output.format.precision,
                     )),
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 };
                 let mut program = MidProgram {
                     tile_count: 1,

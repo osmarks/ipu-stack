@@ -272,8 +272,6 @@ mod tests {
                                 &output.format.layout,
                             ),
                         },
-                        estimated_cycles: 0,
-                        estimated_exchange_cycles: 0,
                     }],
                     outputs: vec![MidValueId::from_index(1)],
                     ..Default::default()

@@ -232,8 +232,6 @@ fn reorder_region(
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![],
                 }),
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             };
             before.entry(at).or_default().push(early);
             shared.push((input, id, at));
@@ -248,8 +246,6 @@ fn reorder_region(
             mapping: CoordinateMapping::default(),
             reuse_local: false,
         };
-        copy.estimated_cycles = 0;
-        copy.estimated_exchange_cycles = 0;
         before.entry(index).or_default().push(copy);
         removed.extend(chain);
         removed.insert(index);
@@ -270,7 +266,6 @@ fn may_write_existing_storage(op: &MidOperation) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::estimate::MemoryPeaks;
     use crate::graph::{GraphInputKind, ValueId};
     use crate::low::CopyPolicy;
     use crate::mid::{MidInput, MidRegion, MidRepeat, rewrite};
@@ -331,8 +326,6 @@ mod tests {
                     inputs: vec![MidValueId(i as u32)],
                     results: vec![MidValueId(i as u32 + 1)],
                     kind,
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 })
                 .collect(),
             outputs: vec![MidValueId(2)],
@@ -362,8 +355,6 @@ mod tests {
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![(0, 0)],
                 }),
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             },
         );
         mid.values.push(alias);
@@ -388,12 +379,8 @@ mod tests {
                     arguments: vec![MidValueId(0)],
                     operations: std::mem::take(&mut mid.operations),
                     yields: yields.clone(),
-                    estimated_cycles: 0,
-                    peak_memory: MemoryPeaks::default(),
                 },
             }),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }];
         let sites = mid.reorder_casts(&BTreeSet::new());
         assert_eq!(sites.len(), 1);
@@ -427,8 +414,6 @@ mod tests {
                     mapping: CoordinateMapping::default(),
                     reuse_local: false,
                 },
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             },
         );
         mid.values.push(original);

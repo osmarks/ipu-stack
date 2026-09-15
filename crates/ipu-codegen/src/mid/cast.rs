@@ -218,7 +218,6 @@ fn donate(
 
 #[cfg(test)]
 mod tests {
-    use crate::estimate::MemoryPeaks;
     use crate::graph::{GraphInputKind, ValueId};
     use crate::low::CopyPolicy;
     use crate::mid::{CoordinateMapping, MidInput, MidRegion, MidRepeat};
@@ -268,8 +267,6 @@ mod tests {
                         mapping: CoordinateMapping::default(),
                         reuse_local: true,
                     },
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 },
                 MidOperation {
                     site: None,
@@ -284,8 +281,6 @@ mod tests {
                         operands: vec![OperandIndexing::Elementwise { result: 0 }],
                         output_aliases: vec![],
                     }),
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 },
             ],
             ..MidProgram::default()
@@ -496,8 +491,6 @@ mod tests {
             arguments: vec![MidValueId(3)],
             operations: std::mem::take(&mut mid.operations),
             yields: vec![],
-            estimated_cycles: 0,
-            peak_memory: MemoryPeaks::default(),
         };
         mid.outputs.clear();
         mid.operations.push(MidOperation {
@@ -512,8 +505,6 @@ mod tests {
                 iterated_inputs: vec![],
                 body,
             }),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         });
         mid.reuse_cast_inputs(&CastStoragePolicy::new(CastStorage::ReuseIfSmaller));
         let graph = crate::low::expand::expand_tiles(&mid, false).unwrap();
@@ -553,8 +544,6 @@ mod tests {
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         });
         let old = mid.clone();
         donate(

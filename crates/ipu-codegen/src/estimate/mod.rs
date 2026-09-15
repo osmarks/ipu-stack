@@ -15,8 +15,7 @@ pub(crate) use mid::operation_cost;
 mod primitive;
 mod program;
 pub(crate) use mid::{
-    analyze as analyze_mid, analyze_with_budget, operation_cycles,
-    region_peak_memory_with_multiplicity, region_program,
+    analyze as analyze_mid, analyze_with_budget, operation_cycles, region_program,
 };
 #[cfg(test)]
 pub(crate) use program::program_cycles;
@@ -34,9 +33,9 @@ use crate::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub use cycles::{
-    CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel, RearrangementCost,
-};
+#[cfg(test)]
+pub(crate) use cycles::RearrangementCost;
+pub use cycles::{CostModel, ExchangeFootprint, IPU21_TARGET_COSTS, Ipu21CostModel};
 pub(crate) use cycles::{
     EXCHANGE_FRAGMENT_CONTROLS, MemoizedCostModel, exchange_work_cycles, row_major_pack_cycles,
 };
@@ -50,6 +49,3 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use program::program_footprint;
-
-#[cfg(test)]
-use mid::region_estimate;

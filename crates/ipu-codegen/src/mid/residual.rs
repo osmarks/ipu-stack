@@ -189,8 +189,6 @@ pub(super) fn fuse(
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             };
             values.push(MidValue {
                 id,
@@ -397,8 +395,6 @@ mod tests {
                     output_aliases: Vec::new(),
                 }),
                 inputs,
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             });
         }
         program.outputs = vec![MidValueId(4), MidValueId(5)];
@@ -496,8 +492,6 @@ mod tests {
                     policy: CopyPolicy::DirectRetile,
                     packing: crate::PackingPolicy::Automatic,
                 },
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             });
             *operand = value.id;
             program.values.push(value);

@@ -399,8 +399,6 @@ mod tests {
                         operands: Default::default(),
                         output_aliases: Vec::new(),
                     })),
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 }],
                 ..MidProgram::default()
             };

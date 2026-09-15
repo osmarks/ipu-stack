@@ -186,8 +186,6 @@ impl FragmentBuilder {
             inputs,
             results: results.clone(),
             kind,
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         });
         results
     }

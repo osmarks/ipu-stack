@@ -331,8 +331,6 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
                 mapping: CoordinateMapping::default(),
                 reuse_local: false,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }],
         outputs: vec![id(1), id(2)],
         ..MidProgram::default()
@@ -354,15 +352,7 @@ fn live_memory_uses_physical_owners_including_wrapped_offsets() {
     config.standard_memory_reservation_bytes = 0;
     let mut screened_peak = |budget| {
         config.tile_memory_budget_bytes = budget;
-        let (_, peak) = region_estimate(
-            &config,
-            &[id(0), id(1)],
-            &program.operations,
-            &program.outputs,
-            &program.values,
-            &BTreeMap::new(),
-        )
-        .unwrap();
+        let (_, peak) = analyze_with_budget(&program, &BTreeMap::new(), &config).unwrap();
         peak.total
     };
     assert_eq!(
@@ -419,8 +409,6 @@ fn memory_retains_repeat_yields_until_the_backedge() {
             mapping: CoordinateMapping::default(),
             reuse_local: false,
         },
-        estimated_cycles: 0,
-        estimated_exchange_cycles: 0,
     };
     let mut program = MidProgram {
         tile_count: 1,
@@ -458,12 +446,8 @@ fn memory_retains_repeat_yields_until_the_backedge() {
                     arguments: vec![id(2), id(3)],
                     operations: vec![copy(2, 4), copy(3, 5), copy(5, 6)],
                     yields: vec![id(4), id(6)],
-                    estimated_cycles: 0,
-                    peak_memory: MemoryPeaks::default(),
                 },
             }),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }];
         let (_, peak) = analyze_mid(&program, &BTreeMap::new()).unwrap();
         // Both carried buffers, the earlier yield, and the final copy's input
@@ -518,8 +502,6 @@ fn explicit_zero_copy_offsets_have_identity_cost() {
                 },
                 reuse_local: false,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let (cost, _, rows) = operation_cost(&op, &values).unwrap();
         (cost.total, cost.exchange, rows)

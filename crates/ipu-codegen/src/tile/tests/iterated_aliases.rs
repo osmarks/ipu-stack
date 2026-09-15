@@ -48,8 +48,6 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
             source: None,
             inputs: vec![id(0)],
             results: vec![id(6)],
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
             kind: MidOperationKind::Repeat(MidRepeat {
                 count: 2,
                 carried_inputs: 1,
@@ -58,15 +56,11 @@ fn iterated_sum(partials: u16) -> (LowProgram, Placement) {
                 body: MidRegion {
                     arguments: vec![id(3), id(4)],
                     yields: vec![id(5)],
-                    estimated_cycles: 0,
-                    peak_memory: Default::default(),
                     operations: vec![MidOperation {
                         site: None,
                         source: None,
                         inputs: vec![id(4)],
                         results: vec![id(5)],
-                        estimated_cycles: 0,
-                        estimated_exchange_cycles: 0,
                         kind: MidOperationKind::Compute(Compute::Sum {
                             axis: 0,
                             staging: ReductionStaging::Complete,

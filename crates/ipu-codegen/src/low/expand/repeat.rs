@@ -180,8 +180,6 @@ mod tests {
             inputs: vec![id(input)],
             results: vec![id(output)],
             kind: kind,
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let gelu = || {
             MidOperationKind::Compute(Compute::Kernel {

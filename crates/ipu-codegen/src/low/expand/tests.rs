@@ -2012,8 +2012,6 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
         inputs: inputs.iter().copied().map(id).collect(),
         results: vec![id(result)],
         kind,
-        estimated_cycles: 0,
-        estimated_exchange_cycles: 0,
     };
     let mid = MidProgram {
         tile_count: 1,
@@ -2064,8 +2062,6 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
                             },
                         ),
                     ],
-                    estimated_cycles: 0,
-                    peak_memory: Default::default(),
                 },
             }),
         )],

@@ -87,8 +87,6 @@ pub struct MidOperation {
     pub inputs: Vec<MidValueId>,
     pub results: Vec<MidValueId>,
     pub kind: MidOperationKind,
-    pub estimated_cycles: u64,
-    pub estimated_exchange_cycles: u64,
 }
 
 impl MidOperation {
@@ -121,8 +119,6 @@ pub struct MidRegion {
     pub arguments: Vec<MidValueId>,
     pub operations: Vec<MidOperation>,
     pub yields: Vec<MidValueId>,
-    pub estimated_cycles: u64,
-    pub peak_memory: MemoryPeaks,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

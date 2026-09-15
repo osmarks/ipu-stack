@@ -632,58 +632,6 @@ fn exchange_price(bytes: u64, phases: u64, fragment_bytes: u64) -> (u64, u64) {
     exchange_fragment_price(bytes, phases, bytes.div_ceil(fragment_bytes.max(1)))
 }
 
-pub(crate) fn region_peak_memory_with_multiplicity(
-    config: &crate::PipelineConfig,
-    initial: &[MidValueId],
-    operations: &[MidOperation],
-    outputs: &[MidValueId],
-    values: &[MidValue],
-    allocation_multiplicity: &BTreeMap<MidValueId, u32>,
-) -> MemoryPeaks {
-    region_estimate(
-        config,
-        initial,
-        operations,
-        outputs,
-        values,
-        allocation_multiplicity,
-    )
-    .map_or_else(unavailable_memory, |(_, peak)| peak)
-}
-
-pub(crate) fn unavailable_memory() -> MemoryPeaks {
-    MemoryPeaks {
-        standard: u64::MAX,
-        interleaved: u64::MAX,
-        total: u64::MAX,
-        ..MemoryPeaks::default()
-    }
-}
-
-pub(crate) fn region_estimate(
-    config: &crate::PipelineConfig,
-    initial: &[MidValueId],
-    operations: &[MidOperation],
-    outputs: &[MidValueId],
-    values: &[MidValue],
-    allocation_multiplicity: &BTreeMap<MidValueId, u32>,
-) -> Option<(ProgramCycles, MemoryPeaks)> {
-    let program = composed_region(config.tile_count, initial, operations, outputs, values)?;
-    analyze_with_budget(&program, allocation_multiplicity, config)
-}
-
-pub(super) fn composed_region(
-    tile_count: u16,
-    initial: &[MidValueId],
-    operations: &[MidOperation],
-    outputs: &[MidValueId],
-    values: &[MidValue],
-) -> Option<MidProgram> {
-    let mut program = region_program(tile_count, initial, operations, outputs, values);
-    program.compose_copies();
-    Some(program)
-}
-
 pub(crate) fn region_program(
     tile_count: u16,
     initial: &[MidValueId],

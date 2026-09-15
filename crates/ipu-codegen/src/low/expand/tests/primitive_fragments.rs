@@ -48,8 +48,6 @@ fn primitive_casts_pair_corresponding_linear_fragments() {
                         operands: vec![OperandIndexing::Elementwise { result: 0 }],
                         output_aliases: vec![],
                     }),
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 }],
                 ..MidProgram::default()
             };
@@ -151,8 +149,6 @@ fn reduction_can_place_its_result_outside_the_partial_owners() {
                 axis: 0,
                 staging: ReductionStaging::Complete,
             }),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }],
         ..MidProgram::default()
     };

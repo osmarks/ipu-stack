@@ -216,8 +216,6 @@ fn distribute_region(
                 operands: vec![OperandIndexing::Elementwise { result: 0 }],
                 output_aliases: Vec::new(),
             }),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let transfer = MidOperation {
             site: operation.site.as_ref().map(|site| site.child("distribute")),
@@ -230,8 +228,6 @@ fn distribute_region(
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         operation.results = vec![logical];
         result.extend([operation, pack, transfer]);
@@ -320,8 +316,6 @@ mod tests {
                     },
                     reuse_local: true,
                 },
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             }],
             ..MidProgram::default()
         };

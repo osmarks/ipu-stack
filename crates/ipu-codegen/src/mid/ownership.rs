@@ -338,8 +338,6 @@ fn append_owner_copy(
             mapping: CoordinateMapping::default(),
             reuse_local: true,
         },
-        estimated_cycles: 0,
-        estimated_exchange_cycles: 0,
     });
     id
 }
@@ -389,8 +387,6 @@ mod tests {
                     operands: vec![OperandIndexing::Elementwise { result: 0 }],
                     output_aliases: vec![(0, 1)],
                 }),
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             }],
             ..MidProgram::default()
         };

@@ -43,8 +43,6 @@ fn copied_columns(columns: u32) -> MidProgram {
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }],
         ..MidProgram::default()
     }
@@ -184,8 +182,6 @@ fn intersection_conversions_read_the_backing_storage_of_reused_subviews() {
                 policy: CopyPolicy::DirectRetile,
                 packing: crate::PackingPolicy::Automatic,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         });
         mid.outputs.push(value.id);
         mid.values.push(value);
@@ -279,8 +275,6 @@ fn borrowed_scalar_keeps_its_semantic_broadcast_shape() {
             operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
             output_aliases: vec![],
         }),
-        estimated_cycles: 0,
-        estimated_exchange_cycles: 0,
     });
     mid.values.push(result);
     let graph = expand_tiles(&mid, false).unwrap();
@@ -351,8 +345,6 @@ fn multi_result_compute_pairs_every_resident_row_with_its_statistics() {
                     operands: vec![OperandIndexing::Elementwise { result: 1 }; 2],
                     output_aliases: vec![(1, 0)],
                 }),
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             }],
             outputs: vec![MidValueId::from_index(2), MidValueId::from_index(3)],
             ..MidProgram::default()
@@ -443,8 +435,6 @@ fn writable_aliases_and_reductions_require_complete_copy_buffers() {
                     output_aliases: vec![(0, 0)],
                 })
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         });
         mid.values.push(result);
         let graph = expand_tiles(&mid, false).unwrap();

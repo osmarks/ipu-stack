@@ -152,8 +152,6 @@ pub(crate) fn append_fragment(
             policy: CopyPolicy::Automatic,
             packing: PackingPolicy::Automatic,
         },
-        estimated_cycles: 0,
-        estimated_exchange_cycles: 0,
     }));
     values.extend(added);
     operations.extend(bound);
@@ -236,8 +234,6 @@ mod tests {
                 operands: vec![OperandIndexing::Elementwise { result: 0 }; 2],
                 output_aliases: vec![(0, 0)],
             }),
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         };
         let mut program = MidProgram {
             tile_count: 4,
@@ -258,12 +254,8 @@ mod tests {
                         arguments: vec![id(4), id(5)],
                         operations: vec![add],
                         yields: vec![id(6)],
-                        estimated_cycles: 0,
-                        peak_memory: Default::default(),
                     },
                 }),
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             }],
             ..MidProgram::default()
         };
@@ -423,8 +415,6 @@ mod tests {
                     policy: CopyPolicy::Automatic,
                     packing: PackingPolicy::Automatic,
                 },
-                estimated_cycles: 0,
-                estimated_exchange_cycles: 0,
             });
         }
         let mut result = fragment.values[2].clone();

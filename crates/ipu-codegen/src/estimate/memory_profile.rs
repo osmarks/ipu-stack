@@ -227,8 +227,8 @@ fn profile(
     values: &[MidValue],
     copies: &BTreeMap<MidValueId, u32>,
 ) -> Option<Profile> {
-    let mut program =
-        mid::composed_region(config.tile_count, initial, operations, outputs, values)?;
+    let mut program = mid::region_program(config.tile_count, initial, operations, outputs, values);
+    program.compose_copies();
     for input in &mut program.inputs {
         let origin = program.values[input.value.index() as usize].origin;
         if let Some(source) = graph.inputs().iter().find(|source| source.value == origin) {

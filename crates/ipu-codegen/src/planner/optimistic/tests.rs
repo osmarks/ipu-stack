@@ -237,8 +237,6 @@ fn existing_word_unpack_is_not_reported_as_a_missing_kernel() {
                 mapping: CoordinateMapping::default(),
                 reuse_local: true,
             },
-            estimated_cycles: 0,
-            estimated_exchange_cycles: 0,
         }],
         ..MidProgram::default()
     };

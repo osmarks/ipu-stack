@@ -282,8 +282,6 @@ fn fuse_fp8_outputs_at(
                         policy: CopyPolicy::DirectRetile,
                         packing: crate::PackingPolicy::Automatic,
                     },
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 });
                 replacement.inputs.push(value.id);
                 new_values.push(value);

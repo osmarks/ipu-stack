@@ -205,8 +205,6 @@ fn known_fusion_cost(
             .into_iter()
             .map(|id| MidValueId::from_index(id as u32))
             .collect(),
-        estimated_cycles: 0,
-        estimated_exchange_cycles: 0,
     };
     crate::estimate::operation_cycles([&op], &values)
 }

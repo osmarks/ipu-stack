@@ -324,8 +324,6 @@ fn random_copy_chains_preserve_bytes_across_ownership_and_padding() {
                         mapping: mapping.clone(),
                         reuse_local: true,
                     },
-                    estimated_cycles: 0,
-                    estimated_exchange_cycles: 0,
                 })
                 .collect(),
             ..MidProgram::default()
@@ -397,8 +395,6 @@ fn forced_destination_packing_and_direct_transfers_preserve_the_same_values() {
                             mapping: CoordinateMapping::default(),
                             reuse_local: true,
                         },
-                        estimated_cycles: 0,
-                        estimated_exchange_cycles: 0,
                     })
                     .collect(),
                 ..MidProgram::default()
