@@ -57,17 +57,11 @@ pub(super) fn instrument_profile(
 ) -> PackageBuildResult<TileProfilePlan> {
     let mut plans = Vec::with_capacity(tile_program.steps.len());
     if logical_tile < program.tile_count {
-        let schedule = program
-            .work(&program.tiles[usize::from(logical_tile)])
-            .collect::<Vec<_>>();
-        if schedule.len() != tile_program.steps.len() {
-            return Err(invalid("tile profile work does not match finalized steps"));
-        }
         instrument_active_steps(
             program,
             exchanges,
             logical_tile,
-            &schedule,
+            &program.tiles[usize::from(logical_tile)].work,
             &mut tile_program.steps,
             address,
             &mut plans,
@@ -84,8 +78,10 @@ pub(super) fn instrument_profile(
             .zip(&mut tile_program.steps)
             .enumerate()
         {
-            if let (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) =
-                (work, &*step)
+            if let (
+                crate::BlockOperation::Checkpoint(operation, _),
+                crate::TileStep::Checkpoint(_),
+            ) = (work, &*step)
             {
                 step_profile(step).before = Some(profile_address(address, index)?);
                 plans.push(ProfileStep {
@@ -102,13 +98,14 @@ pub(super) fn instrument_profile(
                 continue;
             }
             let (phase, provenance) = match (work, &*step) {
-                (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(_)) => {
+                (crate::BlockOperation::Exchange(id), crate::TileStep::Exchange(_)) => {
                     let phase = &program.exchange_phases[id.index() as usize];
                     (0x8000_0000 | id.index(), &phase.provenance)
                 }
-                (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => {
-                    (u32::try_from(index)?, &repeat.provenance)
-                }
+                (crate::BlockOperation::Repeat(repeat), crate::TileStep::Repeat(_)) => (
+                    u32::try_from(index)?,
+                    &program.repeat_runs[*repeat].provenance,
+                ),
                 _ => return Err(invalid("inactive tile contains executable work")),
             };
             step_profile(step).before = Some(profile_address(address, index)?);
@@ -129,7 +126,7 @@ fn instrument_active_steps(
     program: &LowProgram,
     exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
-    schedule: &[crate::TileWorkRef<'_>],
+    schedule: &[crate::BlockOperation<usize>],
     steps: &mut [crate::TileStep],
     address: u32,
     plans: &mut Vec<ProfileStep>,
@@ -143,18 +140,18 @@ fn instrument_active_steps(
             matches!((&pair[0], &pair[1]), (crate::TileStep::Compute(a), crate::TileStep::Compute(b))
                 if a.symbol == b.symbol && a.arguments == b.arguments)
         })).collect::<Vec<_>>();
-    for (index, (&work, step)) in schedule.iter().zip(steps.iter_mut()).enumerate() {
-        if let (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(finalized)) =
+    for (index, (work, step)) in schedule.iter().zip(steps.iter_mut()).enumerate() {
+        if let (crate::BlockOperation::Repeat(repeat), crate::TileStep::Repeat(finalized)) =
             (work, &mut *step)
+            && let repeat = &program.repeat_runs[*repeat]
             && !repeat.body.work.is_empty()
         {
             let first = plans.len();
-            let schedule = program.work(&repeat.body).collect::<Vec<_>>();
             instrument_active_steps(
                 program,
                 exchanges,
                 logical_tile,
-                &schedule,
+                &repeat.body.work,
                 &mut finalized.body,
                 address,
                 plans,
@@ -184,15 +181,17 @@ fn instrument_active_steps(
             }
             continue;
         }
-        if index != 0 && profile_work_can_merge(schedule[index - 1], work) {
+        if index != 0 && profile_work_can_merge(program, &schedule[index - 1], work) {
             continue;
         }
         let following = schedule[index + 1..].iter().find_map(|work| match work {
-            crate::TileWorkRef::Kernel(run) => Some(&run.provenance),
-            crate::TileWorkRef::Repeat(repeat) => Some(&repeat.provenance),
-            crate::TileWorkRef::Exchange(_)
-            | crate::TileWorkRef::LocalCopy(_)
-            | crate::TileWorkRef::Checkpoint(..) => None,
+            crate::BlockOperation::Compute { run, .. } => {
+                Some(&program.kernel_runs[run.0 as usize].provenance)
+            }
+            crate::BlockOperation::Repeat(repeat) => Some(&program.repeat_runs[*repeat].provenance),
+            crate::BlockOperation::Exchange(_)
+            | crate::BlockOperation::Copy { .. }
+            | crate::BlockOperation::Checkpoint(..) => None,
         });
         step_profile(step).before = Some(profile_address(address, plans.len())?);
         let mut description = profile_step(
@@ -206,11 +205,12 @@ fn instrument_active_steps(
         )?;
         let invocations = schedule[index + 1..]
             .iter()
-            .take_while(|&&next| profile_work_can_merge(work, next))
+            .take_while(|&next| profile_work_can_merge(program, work, next))
             .count()
             + 1;
         super::profile_work::append_work_estimate(
             &mut description.metadata,
+            program,
             &schedule[index..index + invocations],
         );
         description.metadata.push(ProfileMetadata {
@@ -243,18 +243,18 @@ fn instrument_active_steps(
     Ok(())
 }
 
-pub(super) fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWorkRef<'_>> {
+pub(super) fn inactive_profile_work(program: &LowProgram) -> Vec<&crate::BlockOperation<usize>> {
     program
         .tiles
         .first()
         .into_iter()
-        .flat_map(|tile| program.work(tile))
+        .flat_map(|tile| tile.work.iter())
         .filter(|work| {
             matches!(
                 work,
-                crate::TileWorkRef::Exchange(_)
-                    | crate::TileWorkRef::Repeat(_)
-                    | crate::TileWorkRef::Checkpoint(..)
+                crate::BlockOperation::Exchange(_)
+                    | crate::BlockOperation::Repeat(_)
+                    | crate::BlockOperation::Checkpoint(..)
             )
         })
         .collect()
@@ -263,10 +263,11 @@ pub(super) fn inactive_profile_work(program: &LowProgram) -> Vec<crate::TileWork
 pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkList) -> usize {
     let mut previous = None;
     let mut count = 0;
-    for work in program.work(tile) {
-        if previous.is_none_or(|previous| !profile_work_can_merge(previous, work)) {
+    for work in tile.work.iter() {
+        if previous.is_none_or(|previous| !profile_work_can_merge(program, previous, work)) {
             count += match work {
-                crate::TileWorkRef::Repeat(repeat) => {
+                crate::BlockOperation::Repeat(repeat) => {
+                    let repeat = &program.repeat_runs[*repeat];
                     if repeat.body.work.is_empty() {
                         1 // The loop executes, but has no first-iteration body samples.
                     } else {
@@ -282,22 +283,35 @@ pub(super) fn profile_step_count(program: &LowProgram, tile: &crate::TileWorkLis
 }
 
 fn profile_work_can_merge(
-    previous: crate::TileWorkRef<'_>,
-    current: crate::TileWorkRef<'_>,
+    program: &LowProgram,
+    previous: &crate::BlockOperation<usize>,
+    current: &crate::BlockOperation<usize>,
 ) -> bool {
-    matches!(
-        (previous, current),
-        (crate::TileWorkRef::Kernel(previous), crate::TileWorkRef::Kernel(current))
-            if previous.kernel == current.kernel && previous.provenance == current.provenance
-    ) || matches!(
-        (previous, current),
+    match (previous, current) {
         (
-            crate::TileWorkRef::LocalCopy(previous),
-            crate::TileWorkRef::LocalCopy(current)
-        ) if previous.symbol() == current.symbol()
-            && previous.movement().bytes == current.movement().bytes
-            && previous.movement().pattern == current.movement().pattern
-    )
+            crate::BlockOperation::Compute { run: a, .. },
+            crate::BlockOperation::Compute { run: b, .. },
+        ) => {
+            let (a, b) = (
+                &program.kernel_runs[a.0 as usize],
+                &program.kernel_runs[b.0 as usize],
+            );
+            a.kernel == b.kernel && a.provenance == b.provenance
+        }
+        (
+            crate::BlockOperation::Copy { copy: a, .. },
+            crate::BlockOperation::Copy { copy: b, .. },
+        ) => {
+            let (a, b) = (
+                &program.local_copies[a.0 as usize],
+                &program.local_copies[b.0 as usize],
+            );
+            a.symbol() == b.symbol()
+                && a.movement().bytes == b.movement().bytes
+                && a.movement().pattern == b.movement().pattern
+        }
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,12 +320,12 @@ fn profile_step(
     exchanges: &[crate::PhysicalExchangePhase],
     logical_tile: u16,
     index: usize,
-    work: crate::TileWorkRef<'_>,
+    work: &crate::BlockOperation<usize>,
     step: &mut crate::TileStep,
     following: Option<&crate::WorkProvenance>,
 ) -> PackageBuildResult<ProfileStep> {
     match (work, step) {
-        (crate::TileWorkRef::Exchange(id), crate::TileStep::Exchange(exchange)) => {
+        (crate::BlockOperation::Exchange(id), crate::TileStep::Exchange(exchange)) => {
             let phase = &program.exchange_phases[id.index() as usize];
             if !exchange.active {
                 exchange_synchronization_description(
@@ -355,7 +369,8 @@ fn profile_step(
                 Ok(description)
             }
         }
-        (crate::TileWorkRef::Kernel(run), crate::TileStep::Compute(compute)) => {
+        (crate::BlockOperation::Compute { run, .. }, crate::TileStep::Compute(compute)) => {
+            let run = &program.kernel_runs[run.0 as usize];
             let mut description = profile_description(
                 index,
                 u32::try_from(index)?,
@@ -379,8 +394,8 @@ fn profile_step(
             }
             Ok(description)
         }
-        (crate::TileWorkRef::LocalCopy(copy), crate::TileStep::Compute(compute)) => {
-            let copy = copy.movement();
+        (crate::BlockOperation::Copy { copy, .. }, crate::TileStep::Compute(compute)) => {
+            let copy = program.local_copies[copy.0 as usize].movement();
             if let Some(provenance) = following {
                 let mut description = profile_description(
                     index,
@@ -428,7 +443,8 @@ fn profile_step(
                 })
             }
         }
-        (crate::TileWorkRef::Repeat(repeat), crate::TileStep::Repeat(_)) => {
+        (crate::BlockOperation::Repeat(repeat), crate::TileStep::Repeat(_)) => {
+            let repeat = &program.repeat_runs[*repeat];
             let mut description = profile_description(
                 index,
                 u32::try_from(index)?,
@@ -442,7 +458,7 @@ fn profile_step(
             });
             Ok(description)
         }
-        (crate::TileWorkRef::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) => {
+        (crate::BlockOperation::Checkpoint(operation, _), crate::TileStep::Checkpoint(_)) => {
             Ok(ProfileStep {
                 local_index: u32::try_from(index)?,
                 phase: u32::try_from(index)?,

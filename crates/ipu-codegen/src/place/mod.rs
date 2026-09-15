@@ -8,7 +8,7 @@ mod search;
 
 use crate::MemoryClass;
 use crate::low::storage::StorageAccess;
-use crate::low::{LowProgram, TileWorkList, TileWorkRef};
+use crate::low::{BlockOperation, LowProgram, TileWorkList};
 use crate::{BlockValueId, ShardDefinition};
 use crate::{StorageError, shard_storage_bytes};
 use ipu_target::ipu21::loader_abi::APPLICATION_LOAD_LIMIT;
@@ -456,7 +456,7 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
     }
     for tile in &program.tiles {
         let mut event = 1u32;
-        for work in program.work(tile) {
+        for work in tile.work.iter() {
             touch_work(
                 program,
                 work,
@@ -488,7 +488,7 @@ fn collect_lifetimes(program: &LowProgram) -> Vec<Lifetime> {
 
 fn touch_work(
     program: &LowProgram,
-    work: TileWorkRef<'_>,
+    work: &BlockOperation<usize>,
     tile: u16,
     event: &mut u32,
     lifetimes: &mut [Lifetime],
@@ -497,27 +497,29 @@ fn touch_work(
     let current = *event;
     let mut touch = |shard: BlockValueId| lifetimes[shard.index() as usize].touch(current);
     match work {
-        TileWorkRef::Kernel(run) => {
+        BlockOperation::Compute { run, .. } => {
+            let run = &program.kernel_runs[run.0 as usize];
             for view in run.inputs.iter().chain(&run.outputs) {
                 touch(view.shard);
             }
         }
-        TileWorkRef::LocalCopy(copy) => {
-            for (shard, _) in copy.accesses() {
+        BlockOperation::Copy { copy, .. } => {
+            for (shard, _) in program.local_copies[copy.0 as usize].accesses() {
                 touch(shard);
             }
         }
-        TileWorkRef::Exchange(id) => {
+        BlockOperation::Exchange(id) => {
             for &shard in &exchanges[id.index() as usize][usize::from(tile)] {
                 touch(shard);
             }
         }
-        TileWorkRef::Repeat(repeat) => {
+        BlockOperation::Repeat(repeat) => {
+            let repeat = &program.repeat_runs[*repeat];
             for shard in repeat.binding.bound_shards() {
                 touch(shard);
             }
             *event = event.saturating_add(1);
-            for nested in program.work(&repeat.body) {
+            for nested in repeat.body.work.iter() {
                 touch_work(program, nested, tile, event, lifetimes, exchanges);
             }
             let end = *event;
@@ -527,7 +529,7 @@ fn touch_work(
             *event = event.saturating_add(1);
             return;
         }
-        TileWorkRef::Checkpoint(..) => {}
+        BlockOperation::Checkpoint(..) => {}
     }
     *event = event.saturating_add(1);
 }
@@ -538,10 +540,11 @@ fn collect_repeat_constraints(
     sets: &mut DisjointSets,
     iterated: &mut Vec<IteratedGroup>,
 ) -> Result<(), PlacementError> {
-    for work in program.work(tile) {
-        let TileWorkRef::Repeat(repeat) = work else {
+    for work in tile.work.iter() {
+        let BlockOperation::Repeat(repeat) = work else {
             continue;
         };
+        let repeat = &program.repeat_runs[*repeat];
         for carried in &repeat.binding.carried {
             checked_union(program, sets, carried.initial, carried.argument)?;
             checked_union(program, sets, carried.initial, carried.yielded)?;
@@ -570,9 +573,10 @@ fn collect_requirements(
     requirements: &mut [StorageAccess],
     pairs: &mut Vec<(usize, usize)>,
 ) {
-    for work in program.work(tile) {
+    for work in tile.work.iter() {
         match work {
-            TileWorkRef::Kernel(run) => {
+            BlockOperation::Compute { run, .. } => {
+                let run = &program.kernel_runs[run.0 as usize];
                 for operands in &run.requirements.distinct_elements {
                     let shards = operands
                         .iter()
@@ -598,15 +602,18 @@ fn collect_requirements(
                     requirements[view.shard.index() as usize].include(requirement.storage);
                 }
             }
-            TileWorkRef::LocalCopy(copy) => {
-                for (shard, access) in copy.accesses() {
+            BlockOperation::Copy { copy, .. } => {
+                for (shard, access) in program.local_copies[copy.0 as usize].accesses() {
                     requirements[shard.index() as usize].include(access);
                 }
             }
-            TileWorkRef::Repeat(repeat) => {
-                collect_requirements(program, &repeat.body, requirements, pairs)
-            }
-            TileWorkRef::Exchange(_) | TileWorkRef::Checkpoint(..) => {}
+            BlockOperation::Repeat(repeat) => collect_requirements(
+                program,
+                &program.repeat_runs[*repeat].body,
+                requirements,
+                pairs,
+            ),
+            BlockOperation::Exchange(_) | BlockOperation::Checkpoint(..) => {}
         }
     }
 }
@@ -1730,10 +1737,11 @@ mod tests {
             .unwrap(),
         ] {
             for tile in &low.tiles {
-                for work in low.work(tile) {
-                    let crate::TileWorkRef::Repeat(repeat) = work else {
+                for work in tile.work.iter() {
+                    let crate::BlockOperation::Repeat(repeat) = work else {
                         continue;
                     };
+                    let repeat = &low.repeat_runs[*repeat];
                     for input in &repeat.binding.iterated {
                         assert!(
                             placement.sequence_strides[&input.argument] < TILE_MEMORY_ELEMENT_SIZE
@@ -1906,8 +1914,9 @@ mod tests {
                 }
             }
             for tile in &low.tiles {
-                for work in low.work(tile) {
-                    if let TileWorkRef::Kernel(run) = work {
+                for work in tile.work.iter() {
+                    if let BlockOperation::Compute { run, .. } = work {
+                        let run = &low.kernel_runs[run.0 as usize];
                         materialize_kernel_run(
                             run,
                             &low.shards,

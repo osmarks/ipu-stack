@@ -14,50 +14,50 @@ pub(super) struct KernelInventory {
 }
 
 impl KernelInventory {
-    pub(super) fn collect(
-        &mut self,
-        program: &LowProgram,
-        tile: &TileWorkList,
-    ) -> Result<(), KernelAbiError> {
-        for work in program.work(tile) {
+    pub(super) fn collect(&mut self, program: &crate::TileGraph) -> Result<(), KernelAbiError> {
+        for work in program.body.walk() {
             match work {
-                TileWorkRef::Kernel(run) => match run.call()?.implementation {
-                    KernelImplementation::Exact(symbol) => {
-                        self.exact_symbols.insert(symbol);
+                BlockOperation::Compute { run, .. } => {
+                    match program.kernel_runs[run.0 as usize].call()?.implementation {
+                        KernelImplementation::Exact(symbol) => {
+                            self.exact_symbols.insert(symbol);
+                        }
+                        KernelImplementation::Gemm(
+                            precision,
+                            weights,
+                            inner,
+                            columns,
+                            mode,
+                            rows,
+                            output_group,
+                        ) => {
+                            self.rows
+                                .entry((precision, weights, inner, columns, output_group))
+                                .or_default()
+                                .insert((rows, mode));
+                        }
+                        KernelImplementation::Attention(shape) => {
+                            self.attention.insert(shape);
+                        }
+                        KernelImplementation::Rearrange(shape) => {
+                            self.rearrangements.insert(shape);
+                        }
+                        KernelImplementation::Unpack(shape) => {
+                            self.unpacks.insert(shape);
+                        }
+                        stage @ (KernelImplementation::Softmax(..)
+                        | KernelImplementation::Merge(..)) => {
+                            self.attention_stages.insert(stage);
+                        }
                     }
-                    KernelImplementation::Gemm(
-                        precision,
-                        weights,
-                        inner,
-                        columns,
-                        mode,
-                        rows,
-                        output_group,
-                    ) => {
-                        self.rows
-                            .entry((precision, weights, inner, columns, output_group))
-                            .or_default()
-                            .insert((rows, mode));
-                    }
-                    KernelImplementation::Attention(shape) => {
-                        self.attention.insert(shape);
-                    }
-                    KernelImplementation::Rearrange(shape) => {
-                        self.rearrangements.insert(shape);
-                    }
-                    KernelImplementation::Unpack(shape) => {
-                        self.unpacks.insert(shape);
-                    }
-                    stage @ (KernelImplementation::Softmax(..)
-                    | KernelImplementation::Merge(..)) => {
-                        self.attention_stages.insert(stage);
-                    }
-                },
-                TileWorkRef::Repeat(repeat) => self.collect(program, &repeat.body)?,
-                TileWorkRef::LocalCopy(copy) => {
-                    self.exact_symbols.insert(copy.symbol());
                 }
-                TileWorkRef::Exchange(_) | TileWorkRef::Checkpoint(..) => {}
+                BlockOperation::Copy { copy, .. } => {
+                    self.exact_symbols
+                        .insert(program.local_copies[copy.0 as usize].symbol());
+                }
+                BlockOperation::Exchange(_)
+                | BlockOperation::Checkpoint(..)
+                | BlockOperation::Repeat(_) => {}
             }
         }
         Ok(())

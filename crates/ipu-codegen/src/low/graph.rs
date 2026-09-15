@@ -252,11 +252,13 @@ impl BlockRegion {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BlockOperation {
+/// Executable work, with either a device-wide repeat body or a projected
+/// per-tile repeat index. Kernel and copy identities are shared by both views.
+pub enum BlockOperation<R = Box<BlockRepeat>> {
     Exchange(ExchangePhaseId),
     Copy { tile: u16, copy: LocalCopyId },
     Compute { tile: u16, run: KernelRunId },
-    Repeat(Box<BlockRepeat>),
+    Repeat(R),
     Checkpoint(OperationId, u8),
 }
 

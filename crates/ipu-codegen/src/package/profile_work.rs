@@ -4,11 +4,7 @@
 use super::*;
 use crate::TileKernelSpec;
 
-pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &'static str)> {
-    let crate::TileWorkRef::Kernel(run) = work else {
-        // Physical local copies may contain padding without a semantic view.
-        return None;
-    };
+pub(super) fn work_estimate(run: &crate::KernelRun) -> Option<(f64, f64, &'static str)> {
     let logical: u64 = run.outputs[0]
         .extents
         .iter()
@@ -217,13 +213,17 @@ pub(super) fn work_estimate(work: crate::TileWorkRef<'_>) -> Option<(f64, f64, &
 
 pub(super) fn append_work_estimate(
     metadata: &mut Vec<ProfileMetadata>,
-    works: &[crate::TileWorkRef<'_>],
+    program: &LowProgram,
+    works: &[crate::BlockOperation<usize>],
 ) {
     let mut useful = 0.0;
     let mut physical = 0.0;
     let mut basis = "";
-    for &work in works {
-        let Some((u, p, b)) = work_estimate(work) else {
+    for work in works {
+        let crate::BlockOperation::Compute { run, .. } = work else {
+            return;
+        };
+        let Some((u, p, b)) = work_estimate(&program.kernel_runs[run.0 as usize]) else {
             return;
         };
         useful += u;

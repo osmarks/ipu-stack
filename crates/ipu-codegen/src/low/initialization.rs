@@ -418,7 +418,7 @@ mod tests {
             } else {
                 &low.repeat_runs[0].body
             };
-            let [TileWork::Kernel(id)] = work.work.as_slice() else {
+            let [BlockOperation::Compute { run: id, .. }] = work.work.as_slice() else {
                 panic!("projection did not retain exactly the live computation");
             };
             let mut executed = (*program).clone();

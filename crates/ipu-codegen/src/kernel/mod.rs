@@ -30,8 +30,8 @@ use rearrange::{RearrangeTarget, UnpackSource};
 use crate::{AMP_COLUMN_MICRO, AMP_INNER_BLOCK};
 
 use crate::{
-    AmpOrder, BlockMajorOrder, BlockValue, BlockValueId, ComputeStep, ElementOrder, KernelRun,
-    LowProgram, Precision, StepProfile, StorageError, TileAddress, TileWorkList, TileWorkRef,
+    AmpOrder, BlockMajorOrder, BlockOperation, BlockValue, BlockValueId, ComputeStep, ElementOrder,
+    KernelRun, Precision, StepProfile, StorageError, TileAddress,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

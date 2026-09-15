@@ -19,11 +19,9 @@ pub struct KernelBuildPlan {
 impl KernelBuildPlan {
     /// Derives device objects from the finalized schedule, so row variants are
     /// compiler specializations rather than a fixed collection of binaries.
-    pub fn from_program(program: &LowProgram) -> Result<Self, KernelAbiError> {
+    pub fn from_program(program: &crate::TileGraph) -> Result<Self, KernelAbiError> {
         let mut inventory = KernelInventory::default();
-        for tile in &program.tiles {
-            inventory.collect(program, tile)?;
-        }
+        inventory.collect(program)?;
         Self::from_inventory(inventory)
     }
 

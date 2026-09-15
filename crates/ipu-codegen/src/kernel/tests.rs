@@ -111,10 +111,11 @@ fn fp8_gemms_repack_casts_and_keep_half_outputs() {
     let mut casts = 0;
     let mut gemms = 0;
     for tile in &low.tiles {
-        for work in low.work(tile) {
-            let TileWorkRef::Kernel(run) = work else {
+        for work in tile.work.iter() {
+            let BlockOperation::Compute { run, .. } = work else {
                 continue;
             };
+            let run = &low.kernel_runs[run.0 as usize];
             match run.kernel {
                 TileKernelSpec::Cast { to, .. } if to == fp8 => {
                     casts += 1;
@@ -319,10 +320,10 @@ fn randomized_gemm_plans_compile_and_select_scheduled_row_specializations() {
         for run in low
             .tiles
             .iter()
-            .flat_map(|tile| low.work(tile))
+            .flat_map(|tile| tile.work.iter())
             .filter_map(|work| {
-                if let TileWorkRef::Kernel(run) = work {
-                    Some(run)
+                if let BlockOperation::Compute { run, .. } = work {
+                    Some(&low.kernel_runs[run.0 as usize])
                 } else {
                     None
                 }

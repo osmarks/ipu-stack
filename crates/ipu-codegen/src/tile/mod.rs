@@ -9,10 +9,10 @@ use ipu_target::ipu21::instruction::RETURN_M10_INSTRUCTION;
 mod iterated_aliases;
 
 use crate::{
-    BlockValueId, ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep,
+    BlockOperation, BlockValueId, ExchangePatch, ExchangePhaseId, ExchangeSetupPatch, ExchangeStep,
     KernelBuildPlan, LowProgram, PhysicalExchangePhase, PlacedExchangeRow, Placement,
     RepeatPointer, RepeatRun, RepeatStep, StepProfile, TileAddress, TileProgram, TileStep,
-    TileWorkList, TileWorkRef, materialize_kernel_run,
+    TileWorkList, materialize_kernel_run,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -185,9 +185,9 @@ fn lower_work(
     inside_repeat: bool,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
-    for work in program.work(tile) {
+    for work in tile.work.iter() {
         let step = match work {
-            TileWorkRef::Exchange(id) => {
+            BlockOperation::Exchange(id) => {
                 let phase = phases.get(&id).ok_or(TileLoweringError::UnknownExchange)?;
                 let placed = exchange_rows
                     .get(&id)
@@ -221,7 +221,8 @@ fn lower_work(
                     ..ExchangeStep::new(placed.active, placed.incoming_base, placed.program.clone())
                 })
             }
-            TileWorkRef::LocalCopy(run) => {
+            BlockOperation::Copy { copy: run, .. } => {
+                let run = &program.local_copies[run.0 as usize];
                 let copy = run.movement();
                 let resolve = |shard, offset| {
                     crate::low::storage::resolve_address(
@@ -240,14 +241,15 @@ fn lower_work(
                     profile: StepProfile::default(),
                 })
             }
-            TileWorkRef::Kernel(run) => TileStep::Compute(materialize_kernel_run(
-                run,
+            BlockOperation::Compute { run, .. } => TileStep::Compute(materialize_kernel_run(
+                &program.kernel_runs[run.0 as usize],
                 &program.shards,
                 &placement.shard_addresses,
                 kernels,
                 overrides,
             )?),
-            TileWorkRef::Repeat(repeat) => {
+            BlockOperation::Repeat(repeat) => {
+                let repeat = &program.repeat_runs[*repeat];
                 if inside_repeat {
                     return Err(TileLoweringError::NestedRepeat);
                 }
@@ -260,10 +262,10 @@ fn lower_work(
                     exchange_rows,
                 )?)
             }
-            TileWorkRef::Checkpoint(operation, breakpoint) => {
+            BlockOperation::Checkpoint(operation, breakpoint) => {
                 TileStep::Checkpoint(crate::CheckpointStep {
                     operation: operation.index(),
-                    breakpoint,
+                    breakpoint: *breakpoint,
                     profile: StepProfile::default(),
                 })
             }
@@ -324,9 +326,9 @@ fn lower_inactive_work(
     exchange_rows: &BTreeMap<ExchangePhaseId, PlacedExchange>,
 ) -> Result<Vec<TileStep>, TileLoweringError> {
     let mut steps = Vec::new();
-    for work in program.work(work) {
+    for work in work.work.iter() {
         match work {
-            TileWorkRef::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
+            BlockOperation::Exchange(id) => steps.push(TileStep::Exchange(ExchangeStep {
                 setup_patch: exchange_rows[&id].setup_patch.clone(),
                 ..ExchangeStep::new(
                     exchange_rows[&id].active,
@@ -334,17 +336,20 @@ fn lower_inactive_work(
                     exchange_rows[&id].program.clone(),
                 )
             })),
-            TileWorkRef::Repeat(repeat) => steps.push(TileStep::Repeat(RepeatStep {
-                count: repeat.count,
-                iterated_pointers: Vec::new(),
-                body: lower_inactive_work(program, &repeat.body, exchange_rows)?,
-                profile: StepProfile::default(),
-            })),
-            TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) => {}
-            TileWorkRef::Checkpoint(operation, breakpoint) => {
+            BlockOperation::Repeat(repeat) => {
+                let repeat = &program.repeat_runs[*repeat];
+                steps.push(TileStep::Repeat(RepeatStep {
+                    count: repeat.count,
+                    iterated_pointers: Vec::new(),
+                    body: lower_inactive_work(program, &repeat.body, exchange_rows)?,
+                    profile: StepProfile::default(),
+                }))
+            }
+            BlockOperation::Compute { .. } | BlockOperation::Copy { .. } => {}
+            BlockOperation::Checkpoint(operation, breakpoint) => {
                 steps.push(TileStep::Checkpoint(crate::CheckpointStep {
                     operation: operation.index(),
-                    breakpoint,
+                    breakpoint: *breakpoint,
                     profile: StepProfile::default(),
                 }))
             }
@@ -685,7 +690,10 @@ mod tests {
             repeat_runs: vec![],
             tiles: vec![TileWorkList {
                 tile: 0,
-                work: vec![crate::TileWork::LocalCopy(crate::LocalCopyId(0))],
+                work: vec![BlockOperation::Copy {
+                    tile: 0,
+                    copy: crate::LocalCopyId(0),
+                }],
             }],
         };
         let placement = Placement {

@@ -783,9 +783,9 @@ fn randomized_pointwise_dispatch_skips_empty_output_shards() {
         let runs = low
             .tiles
             .iter()
-            .flat_map(|tile| low.work(tile))
+            .flat_map(|tile| tile.work.iter())
             .filter_map(|work| match work {
-                TileWorkRef::Kernel(run) => Some(run),
+                BlockOperation::Compute { run, .. } => Some(&low.kernel_runs[run.0 as usize]),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -832,10 +832,15 @@ fn randomized_panel_consumers_have_bounded_materialized_operands() {
         for run in low
             .tiles
             .iter()
-            .flat_map(|tile| low.work(tile))
+            .flat_map(|tile| tile.work.iter())
             .filter_map(|work| match work {
-                TileWorkRef::Kernel(run) if matches!(run.kernel, TileKernelSpec::Gemm { .. }) => {
-                    Some(run)
+                BlockOperation::Compute { run, .. }
+                    if matches!(
+                        low.kernel_runs[run.0 as usize].kernel,
+                        TileKernelSpec::Gemm { .. }
+                    ) =>
+                {
+                    Some(&low.kernel_runs[run.0 as usize])
                 }
                 _ => None,
             })
@@ -917,10 +922,11 @@ fn randomized_tile_local_gelu_conversions_do_not_require_exchange() {
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         assert!(low.exchange_phases.is_empty(), "random case {case}");
         for tile in &low.tiles {
-            for work in low.work(tile) {
-                let TileWorkRef::Kernel(run) = work else {
+            for work in tile.work.iter() {
+                let BlockOperation::Compute { run, .. } = work else {
                     continue;
                 };
+                let run = &low.kernel_runs[run.0 as usize];
                 assert_eq!(
                     low.shards[run.inputs[0].shard.index() as usize].tile,
                     tile.tile
@@ -1417,8 +1423,9 @@ fn randomized_schedules_make_kernel_operands_resident() {
 
         assert_eq!(low.tiles.len(), usize::from(tiles), "case {case}");
         for tile in &low.tiles {
-            for work in low.work(tile) {
-                if let TileWorkRef::Kernel(run) = work {
+            for work in tile.work.iter() {
+                if let BlockOperation::Compute { run, .. } = work {
+                    let run = &low.kernel_runs[run.0 as usize];
                     run.call().unwrap();
                     assert_eq!(
                         low.shards[run.outputs[0].shard.index() as usize].tile,
@@ -1476,11 +1483,17 @@ fn randomized_broadcast_adds_schedule_remote_singleton_views() {
             "case {case}"
         );
         for tile in &low.tiles {
-            let add = low
-                .work(tile)
+            let add = tile
+                .work
+                .iter()
                 .find_map(|work| match work {
-                    TileWorkRef::Kernel(run) if matches!(run.kernel, TileKernelSpec::Add) => {
-                        Some(run)
+                    BlockOperation::Compute { run, .. }
+                        if matches!(
+                            low.kernel_runs[run.0 as usize].kernel,
+                            TileKernelSpec::Add
+                        ) =>
+                    {
+                        Some(&low.kernel_runs[run.0 as usize])
                     }
                     _ => None,
                 })
@@ -1529,7 +1542,6 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
         }
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
-        assert!(std::mem::size_of::<TileWork>() <= 8);
         let mut metadata = Vec::<&Arc<KernelRunMetadata>>::new();
         for run in &low.kernel_runs {
             if let Some(existing) = metadata
@@ -1543,13 +1555,17 @@ fn randomized_blocked_gemms_expand_to_tile_kernel_phases() {
         }
 
         for tile in &low.tiles {
-            let gemms = low
-                .work(tile)
+            let gemms = tile
+                .work
+                .iter()
                 .filter_map(|work| match work {
-                    TileWorkRef::Kernel(run)
-                        if matches!(run.kernel, TileKernelSpec::Gemm { .. }) =>
+                    BlockOperation::Compute { run, .. }
+                        if matches!(
+                            low.kernel_runs[run.0 as usize].kernel,
+                            TileKernelSpec::Gemm { .. }
+                        ) =>
                     {
-                        Some(run)
+                        Some(&low.kernel_runs[run.0 as usize])
                     }
                     _ => None,
                 })
@@ -1719,18 +1735,19 @@ fn randomized_resident_blocked_weights_lower_without_panel_copies() {
             );
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
-        assert!(low.tiles.iter().all(|tile| low.work(tile).all(|work| {
-            !matches!(work, TileWorkRef::LocalCopy(_)) && !matches!(work, TileWorkRef::Exchange(_))
+        assert!(low.tiles.iter().all(|tile| tile.work.iter().all(|work| {
+            !matches!(work, BlockOperation::Copy { .. })
+                && !matches!(work, BlockOperation::Exchange(_))
         })));
         assert!(
             low.tiles
                 .iter()
-                .flat_map(|tile| low.work(tile))
+                .flat_map(|tile| tile.work.iter())
                 .any(|work| {
                     matches!(
                         work,
-                        TileWorkRef::Kernel(run)
-                            if matches!(run.kernel, TileKernelSpec::Gemm {
+                        BlockOperation::Compute { run, .. }
+                            if matches!(low.kernel_runs[run.0 as usize].kernel, TileKernelSpec::Gemm {
                                 weights: crate::GemmWeightLoad::Interleaved,
                                 ..
                             })
@@ -1858,10 +1875,11 @@ fn randomized_repeats_remain_structured_per_tile() {
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
 
         for tile in &low.tiles {
-            let repeats = low
-                .work(tile)
+            let repeats = tile
+                .work
+                .iter()
                 .filter_map(|work| match work {
-                    TileWorkRef::Repeat(repeat) => Some(repeat),
+                    BlockOperation::Repeat(repeat) => Some(&low.repeat_runs[*repeat]),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1885,8 +1903,11 @@ fn randomized_repeats_remain_structured_per_tile() {
                 ShardDefinition::Alias(carried.initial)
             );
             assert!(
-                low.work(&repeats[0].body)
-                    .any(|work| matches!(work, TileWorkRef::Kernel(_)))
+                repeats[0]
+                    .body
+                    .work
+                    .iter()
+                    .any(|work| matches!(work, BlockOperation::Compute { .. }))
             );
         }
     }
@@ -1996,10 +2017,11 @@ fn randomized_repeats_alias_fresh_results_after_the_last_carried_use() {
         let mid = lower(&graph, &config, &Ipu21CostModel).unwrap();
         let low = lower_to_tiles(&mid, config.diagnostic_checkpoints).unwrap();
         for tile in &low.tiles {
-            let repeat = low
-                .work(tile)
+            let repeat = tile
+                .work
+                .iter()
                 .find_map(|work| match work {
-                    TileWorkRef::Repeat(repeat) => Some(repeat),
+                    BlockOperation::Repeat(repeat) => Some(&low.repeat_runs[*repeat]),
                     _ => None,
                 })
                 .unwrap();
@@ -2082,10 +2104,13 @@ fn repeat_copy_yield_reaches_the_carried_allocation() {
     let repeat = &low.repeat_runs[0];
     let target = placement.shard_addresses[&repeat.binding.carried[0].result];
     assert!(
-        low.work(&repeat.body).any(|work| match work {
-            TileWorkRef::Kernel(run) => placement.shard_addresses[&run.outputs[0].shard] == target,
-            TileWorkRef::LocalCopy(copy) =>
-                placement.shard_addresses[&copy.movement().destination] == target,
+        repeat.body.work.iter().any(|work| match work {
+            BlockOperation::Compute { run, .. } =>
+                placement.shard_addresses[&low.kernel_runs[run.0 as usize].outputs[0].shard]
+                    == target,
+            BlockOperation::Copy { copy, .. } =>
+                placement.shard_addresses[&low.local_copies[copy.0 as usize].movement().destination]
+                    == target,
             _ => false,
         }),
         "the body must write the allocation carried into its next iteration"
@@ -2188,10 +2213,14 @@ fn repeat_rejects_overwriting_an_indirectly_live_carried_input() {
 }
 
 fn contains_phase(program: &LowProgram, list: &TileWorkList, phase: ExchangePhaseId) -> bool {
-    program.work(list).any(|work| match work {
-        TileWorkRef::Exchange(candidate) => candidate == phase,
-        TileWorkRef::Repeat(repeat) => contains_phase(program, &repeat.body, phase),
-        TileWorkRef::Kernel(_) | TileWorkRef::LocalCopy(_) | TileWorkRef::Checkpoint(..) => false,
+    list.work.iter().any(|work| match work {
+        BlockOperation::Exchange(candidate) => *candidate == phase,
+        BlockOperation::Repeat(repeat) => {
+            contains_phase(program, &program.repeat_runs[*repeat].body, phase)
+        }
+        BlockOperation::Compute { .. }
+        | BlockOperation::Copy { .. }
+        | BlockOperation::Checkpoint(..) => false,
     })
 }
 
@@ -2267,10 +2296,12 @@ fn factor_copies_and_offset_windows_preserve_coordinates() {
                         let input_shard =
                             low.value_views(low.inputs[0].value)[0].shard.index() as usize;
                         buffers[input_shard] = (0..shape.iter().product::<u32>()).collect();
-                        for work in low.work(&low.tiles[0]) {
+                        for work in low.tiles[0].work.iter() {
                             let copy = match work {
-                                TileWorkRef::LocalCopy(copy) => copy.movement(),
-                                TileWorkRef::Exchange(phase) => {
+                                BlockOperation::Copy { copy, .. } => {
+                                    low.local_copies[copy.0 as usize].movement()
+                                }
+                                BlockOperation::Exchange(phase) => {
                                     assert!(
                                         low.exchange_phases[phase.index() as usize]
                                             .transfers

@@ -15,43 +15,22 @@ pub use storage::view_byte_spans;
 pub(crate) use storage::view_byte_traversal;
 pub use storage::{logical_view_byte_spans, shard_storage_bytes};
 
-use crate::graph::OperationId;
 use std::sync::Arc;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RepeatRunId(u32);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepeatRun {
     pub provenance: WorkProvenance,
     pub count: u32,
     pub binding: BlockRepeatBinding,
-    pub body: Box<TileWorkList>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TileWork {
-    /// All tiles encounter a phase marker, including tiles without transfers.
-    Exchange(ExchangePhaseId),
-    LocalCopy(LocalCopyId),
-    Kernel(KernelRunId),
-    Repeat(RepeatRunId),
-    Checkpoint(OperationId, u8),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TileWorkRef<'a> {
-    Exchange(ExchangePhaseId),
-    LocalCopy(&'a crate::kernel::CopyRun),
-    Kernel(&'a KernelRun),
-    Repeat(&'a RepeatRun),
-    Checkpoint(OperationId, u8),
+    pub body: TileWorkList,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileWorkList {
     pub tile: u16,
-    pub work: Vec<TileWork>,
+    /// Same operations as the device-wide graph; Repeat holds an index into
+    /// LowProgram::repeat_runs. Exchanges remain present on idle tiles for sync.
+    pub work: Vec<BlockOperation<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,25 +44,6 @@ impl std::ops::Deref for LowProgram {
     type Target = TileGraph;
     fn deref(&self) -> &Self::Target {
         &self.program
-    }
-}
-
-impl LowProgram {
-    /// Resolves compact schedule entries as they are consumed, without
-    /// constructing a second per-tile work list.
-    pub fn work<'a>(
-        &'a self,
-        tile: &'a TileWorkList,
-    ) -> impl Iterator<Item = TileWorkRef<'a>> + 'a {
-        tile.work.iter().map(|work| match *work {
-            TileWork::Exchange(id) => TileWorkRef::Exchange(id),
-            TileWork::LocalCopy(id) => TileWorkRef::LocalCopy(&self.local_copies[id.0 as usize]),
-            TileWork::Kernel(id) => TileWorkRef::Kernel(&self.kernel_runs[id.0 as usize]),
-            TileWork::Repeat(id) => TileWorkRef::Repeat(&self.repeat_runs[id.0 as usize]),
-            TileWork::Checkpoint(operation, breakpoint) => {
-                TileWorkRef::Checkpoint(operation, breakpoint)
-            }
-        })
     }
 }
 
@@ -106,38 +66,43 @@ pub fn lower_to_tiles(program: &Arc<TileGraph>, diagnostic_checkpoints: bool) ->
             match operation {
                 BlockOperation::Exchange(id) => {
                     for tile in &mut tiles {
-                        tile.work.push(TileWork::Exchange(*id));
+                        tile.work.push(BlockOperation::Exchange(*id));
                     }
                 }
-                BlockOperation::Copy { tile, copy } => tiles[usize::from(*tile)]
-                    .work
-                    .push(TileWork::LocalCopy(*copy)),
+                BlockOperation::Copy { tile, copy } => {
+                    tiles[usize::from(*tile)].work.push(BlockOperation::Copy {
+                        tile: *tile,
+                        copy: *copy,
+                    })
+                }
                 BlockOperation::Compute { tile, run } => {
-                    tiles[usize::from(*tile)].work.push(TileWork::Kernel(*run))
+                    tiles[usize::from(*tile)]
+                        .work
+                        .push(BlockOperation::Compute {
+                            tile: *tile,
+                            run: *run,
+                        })
                 }
                 BlockOperation::Checkpoint(operation, breakpoint) if checkpoints => {
                     for tile in &mut tiles {
                         tile.work
-                            .push(TileWork::Checkpoint(*operation, *breakpoint));
+                            .push(BlockOperation::Checkpoint(*operation, *breakpoint));
                     }
                 }
                 BlockOperation::Checkpoint(..) => {}
                 BlockOperation::Repeat(repeat) => {
                     let body = project(&repeat.body, program, repeats, false);
                     for binding in &repeat.bindings {
-                        let id = RepeatRunId(
-                            u32::try_from(repeats.len())
-                                .expect("too many projected repeat instances"),
-                        );
+                        let id = repeats.len();
                         repeats.push(RepeatRun {
                             provenance: repeat.provenance,
                             count: repeat.count,
                             binding: binding.clone(),
-                            body: Box::new(body[usize::from(binding.tile)].clone()),
+                            body: body[usize::from(binding.tile)].clone(),
                         });
                         tiles[usize::from(binding.tile)]
                             .work
-                            .push(TileWork::Repeat(id));
+                            .push(BlockOperation::Repeat(id));
                     }
                 }
             }
